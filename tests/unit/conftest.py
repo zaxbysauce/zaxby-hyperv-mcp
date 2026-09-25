@@ -1,6 +1,4 @@
-"""Shared fixtures for hyperv-mcp unit tests. No real Hyper-V is touched."""
-
-import subprocess
+"""Shared unit-test fixtures. No real Hyper-V is touched."""
 
 import pytest
 
@@ -27,17 +25,3 @@ def lab_cfg(tmp_path) -> Config:
         guest_read_roots=["C:\\guest-read"],
         guest_write_roots=["C:\\guest-write"],
     )
-
-
-def powershell_available() -> bool:
-    try:
-        subprocess.run(
-            [r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", "-NonInteractive", "-NoProfile", "-Command", "$null"],
-            capture_output=True, timeout=30, check=False,
-        )
-        return True
-    except OSError:
-        return False
-
-
-HAS_POWERSHELL = powershell_available()

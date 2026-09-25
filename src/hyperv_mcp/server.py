@@ -48,6 +48,7 @@ _INSTRUCTIONS = (
 _mcp: FastMCP | None = None
 _http_token_verifier = None
 _bootstrapped = False
+_compat_warning_shown = False
 CFG: Config | None = None
 
 
@@ -65,9 +66,24 @@ def configure_http_auth(token_verifier) -> None:
 
 def __getattr__(name: str):
     """`from hyperv_mcp.server import mcp` keeps working (0xntpower serve_http
-    compat): lazily bootstraps and returns the FastMCP instance."""
+    compat): lazily bootstraps and returns the FastMCP instance.
+
+    WARNING: this compat instance has NO bearer-token verifier installed —
+    serving it over streamable-http yields an unauthenticated endpoint.
+    Use the `hyperv-mcp-http` entry point for HTTP.
+    """
     if name == "mcp":
-        return get_mcp()
+        instance = get_mcp()
+        if not _compat_warning_shown:
+            print(
+                "[hyperv-mcp] WARNING: compat import of `server.mcp` yields a "
+                "FastMCP instance WITHOUT bearer-token auth; serving it over "
+                "streamable-http exposes an unauthenticated endpoint. Prefer "
+                "the `hyperv-mcp-http` entry point.",
+                file=sys.stderr,
+            )
+            globals()["_compat_warning_shown"] = True
+        return instance
     raise AttributeError(name)
 
 
@@ -110,17 +126,40 @@ def bootstrap(environ: dict[str, str] | None = None) -> Config:
 
 def _startup_banner(cfg: Config) -> None:
     print(f"[hyperv-mcp] policy: {cfg.policy_summary()}", file=sys.stderr)
-    if not cfg.unrestricted:
-        open_axes = cfg.open_axes()
-        if open_axes:
+    if cfg.unrestricted:
+        print(
+            "[hyperv-mcp] WARNING: UNRESTRICTED mode — every policy axis is "
+            "fully open and destructive operations are category-enabled. "
+            "Only appropriate on disposable lab hosts.",
+            file=sys.stderr,
+        )
+        return
+    configured = cfg.configured_axes()
+    if configured:
+        print(
+            f"[hyperv-mcp] INFO: configured axes (deny-by-default outside "
+            f"each allowlist): {', '.join(configured)}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "[hyperv-mcp] NOTE: every policy axis is currently DENIED. "
+            "Set HYPERV_MCP_CONFIG or HYPERV_MCP_UNRESTRICTED=1 to allow work.",
+            file=sys.stderr,
+        )
+    # A "*" pattern or a drive-root entry means the axis is effectively
+    # fully open even though it is "configured" — keep a WARNING for it.
+    if "*" in cfg.allowed_vm_patterns:
+        print(
+            "[hyperv-mcp] WARNING: allowed_vm_patterns contains '*' — every "
+            "VM on this host can be targeted.",
+            file=sys.stderr,
+        )
+    for axis in ("host_read_roots", "host_write_roots", "guest_read_roots", "guest_write_roots"):
+        if any(r.rstrip("\\/").endswith(":") for r in getattr(cfg, axis)):
             print(
-                f"[hyperv-mcp] WARNING: policy axes fully open: {', '.join(open_axes)}",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                "[hyperv-mcp] NOTE: every policy axis is currently DENIED. "
-                "Set HYPERV_MCP_CONFIG or HYPERV_MCP_UNRESTRICTED=1 to allow work.",
+                f"[hyperv-mcp] WARNING: {axis} contains a drive root — the "
+                "entire drive is within policy.",
                 file=sys.stderr,
             )
 
@@ -146,24 +185,44 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
     def _audit(tool: str, vm: str, category: str):
         return auditlog.operation(tool=tool, vm_name=vm, category=category)
 
-    def _run_guest_tool(tool: str, vm: str, category: str, fn, *args, **kwargs) -> dict:
-        """Run a guest/transfer tool, mapping policy/cred errors to ok:false."""
+    def _run_guest_tool(tool: str, vm: str, category: str, fn, *args, cred_factory=None, **kwargs) -> dict:
+        """Run a guest/transfer tool, mapping policy/cred errors to ok:false.
+
+        cred_factory resolves credentials INSIDE the audited region so a
+        CredentialError surfaces as {ok:false, error_class:"credential"} and
+        is audited, instead of escaping as a raw ToolError.
+        """
         op = auditlog.operation(tool=tool, vm_name=vm, category=category)
         try:
             with op:
+                if cred_factory is not None:
+                    kwargs["cred"] = cred_factory()
                 result = fn(*args, **kwargs)
-                if isinstance(result, dict) and result.get("exit_code") is not None:
-                    op.exit_code = result["exit_code"]
+                if isinstance(result, dict):
+                    if result.get("exit_code") is not None:
+                        op.exit_code = result["exit_code"]
+                    op.ok = bool(result.get("ok", True))
+                    op.error_class = str(result.get("error_class") or "")
                 return result
         except policy.PolicyDenied as exc:
+            op.ok = False
+            op.error_class = "policy"
             return {"ok": False, "error": str(exc), "error_class": "policy"}
         except CredentialError as exc:
+            op.ok = False
+            op.error_class = "credential"
             return {"ok": False, "error": str(exc), "error_class": "credential"}
         except VMBusy as exc:
+            op.ok = False
+            op.error_class = "busy"
             return {"ok": False, "error": str(exc), "error_class": "busy"}
         except ValueError as exc:
+            op.ok = False
+            op.error_class = "invalid"
             return {"ok": False, "error": str(exc), "error_class": "invalid"}
         except RuntimeError as exc:
+            op.ok = False
+            op.error_class = "transport"
             return {"ok": False, "error": str(exc), "error_class": "transport"}
 
     # ---- VM lifecycle --------------------------------------------------
@@ -422,7 +481,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 "hyperv_guest_run_ps", vm_name, "exec",
                 guestexec.guest_run_ps, _cfg(), vm_name, script,
                 timeout_ms=timeout_ms, elevated=elevated, confirm=confirm,
-                cred=_cred_args(username, password),
+                cred_factory=lambda: _cred_args(username, password),
             )
 
         @mcp.tool()
@@ -443,7 +502,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 "hyperv_guest_run", vm_name, "exec",
                 guestexec.guest_run, _cfg(), vm_name, command, args, cwd,
                 timeout_ms=timeout_ms, elevated=elevated, confirm=confirm,
-                cred=_cred_args(username, password),
+                cred_factory=lambda: _cred_args(username, password),
             )
 
         @mcp.tool()
@@ -462,7 +521,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return _run_guest_tool(
                 "hyperv_guest_put", vm_name, "transfer",
                 filetransfer.guest_put, _cfg(), vm_name, local_path, remote_path,
-                confirm=confirm, verify=verify, cred=_cred_args(username, password),
+                confirm=confirm, verify=verify, cred_factory=lambda: _cred_args(username, password),
             )
 
         @mcp.tool()
@@ -480,7 +539,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return _run_guest_tool(
                 "hyperv_guest_get", vm_name, "transfer",
                 filetransfer.guest_get, _cfg(), vm_name, remote_path, local_path,
-                verify=verify, cred=_cred_args(username, password),
+                verify=verify, cred_factory=lambda: _cred_args(username, password),
             )
 
         @mcp.tool()
@@ -497,7 +556,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return _run_guest_tool(
                 "hyperv_guest_read_file", vm_name, "transfer",
                 filetransfer.guest_read_file, _cfg(), vm_name, remote_path, max_bytes,
-                cred=_cred_args(username, password),
+                cred_factory=lambda: _cred_args(username, password),
             )
 
         @mcp.tool()
@@ -513,7 +572,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return _run_guest_tool(
                 "hyperv_guest_list_dir", vm_name, "transfer",
                 filetransfer.guest_list_dir, _cfg(), vm_name, remote_path,
-                cred=_cred_args(username, password),
+                cred_factory=lambda: _cred_args(username, password),
             )
 
     else:
@@ -536,7 +595,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 "hyperv_guest_run_ps", vm_name, "exec",
                 guestexec.guest_run_ps, _cfg(), vm_name, script,
                 timeout_ms=timeout_ms, elevated=elevated, confirm=confirm,
-                cred=credentials.resolve_guest(),
+                cred_factory=credentials.resolve_guest,
             )
 
         @mcp.tool()
@@ -558,7 +617,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 "hyperv_guest_run", vm_name, "exec",
                 guestexec.guest_run, _cfg(), vm_name, command, args, cwd,
                 timeout_ms=timeout_ms, elevated=elevated, confirm=confirm,
-                cred=credentials.resolve_guest(),
+                cred_factory=credentials.resolve_guest,
             )
 
         @mcp.tool()
@@ -576,7 +635,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return _run_guest_tool(
                 "hyperv_guest_put", vm_name, "transfer",
                 filetransfer.guest_put, _cfg(), vm_name, local_path, remote_path,
-                confirm=confirm, verify=verify, cred=credentials.resolve_guest(),
+                confirm=confirm, verify=verify, cred_factory=credentials.resolve_guest,
             )
 
         @mcp.tool()
@@ -593,7 +652,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return _run_guest_tool(
                 "hyperv_guest_get", vm_name, "transfer",
                 filetransfer.guest_get, _cfg(), vm_name, remote_path, local_path,
-                verify=verify, cred=credentials.resolve_guest(),
+                verify=verify, cred_factory=credentials.resolve_guest,
             )
 
         @mcp.tool()
@@ -609,7 +668,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return _run_guest_tool(
                 "hyperv_guest_read_file", vm_name, "transfer",
                 filetransfer.guest_read_file, _cfg(), vm_name, remote_path, max_bytes,
-                cred=credentials.resolve_guest(),
+                cred_factory=credentials.resolve_guest,
             )
 
         @mcp.tool()
@@ -622,7 +681,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return _run_guest_tool(
                 "hyperv_guest_list_dir", vm_name, "transfer",
                 filetransfer.guest_list_dir, _cfg(), vm_name, remote_path,
-                cred=credentials.resolve_guest(),
+                cred_factory=credentials.resolve_guest,
             )
 
     # ---- victim execution (env-only credentials, never elevated) --------
@@ -642,7 +701,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         return _run_guest_tool(
             "hyperv_victim_run", vm_name, "victim",
             guestexec.victim_run, _cfg(), vm_name, command, args, cwd,
-            timeout_ms=timeout_ms, cred=credentials.resolve_victim(),
+            timeout_ms=timeout_ms, cred_factory=credentials.resolve_victim,
         )
 
     @mcp.tool()
@@ -656,7 +715,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         return _run_guest_tool(
             "hyperv_victim_run_ps", vm_name, "victim",
             guestexec.victim_run_ps, _cfg(), vm_name, script,
-            timeout_ms=timeout_ms, cred=credentials.resolve_victim(),
+            timeout_ms=timeout_ms, cred_factory=credentials.resolve_victim,
         )
 
 

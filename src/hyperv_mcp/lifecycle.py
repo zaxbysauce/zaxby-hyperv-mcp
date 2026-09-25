@@ -76,6 +76,14 @@ _VM_KEY_ALIASES = {
     "memory_mb": "MemoryMB", "cpu_count": "CpuCount",
     "uptime_seconds": "UptimeSeconds",
 }
+# get_vm_info emits more fields than the list view; alias them all so 0.1.x
+# PascalCase consumers keep working through the 0.2.x deprecation window.
+_INFO_KEY_ALIASES = {
+    **_VM_KEY_ALIASES,
+    "generation": "Generation", "dynamic_memory": "DynamicMemory",
+    "checkpoint_count": "CheckpointCount", "com_ports": "ComPorts",
+    "network_adapters": "NetworkAdapters", "hard_drives": "HardDrives",
+}
 _SNAPSHOT_KEY_ALIASES = {
     "name": "Name", "type": "SnapshotType", "created": "Created",
     "parent_name": "ParentName",
@@ -95,7 +103,10 @@ $deadline = (Get-Date).AddSeconds({int(timeout_s)})
 while ([string]$vm.State -notin ({wanted_ps}) -and (Get-Date) -lt $deadline) {{
     Start-Sleep -Seconds 2
     $vm = Get-VM -Name {n} -ErrorAction SilentlyContinue
-    if (-not $vm) {{ throw "VM {pswindows.ps_quote(vm_name)} disappeared while waiting for state" }}
+    if (-not $vm) {{
+        # -f inserts the name as DATA (no expansion of $/sub-expressions).
+        throw ('VM {{0}} disappeared while waiting for state' -f {pswindows.ps_name(vm_name)})
+    }}
 }}
 [PSCustomObject]@{{ final_state=[string]$vm.State }} | ConvertTo-Json -Compress
 if ([string]$vm.State -notin ({wanted_ps})) {{ exit 3 }}
@@ -187,7 +198,7 @@ $snaps = (Get-VMSnapshot -VMName {n} | Measure-Object).Count
     rows = _parse_json_objects(result, "get_vm_info")
     if not rows:
         raise RuntimeError(f"hyperv_get_vm_info({vm_name}): no data returned")
-    return _add_legacy_aliases(rows[0], _VM_KEY_ALIASES)
+    return _add_legacy_aliases(rows[0], _INFO_KEY_ALIASES)
 
 
 def start_vm(cfg: Config, vm_name: str) -> dict:

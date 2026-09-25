@@ -189,7 +189,9 @@ def test_put_get_roundtrip_with_sha256(running_vm, tmp_path):
     assert decoded == payload[:16]
     del first16
 
-    cleanup = filetransfer.guest_run_ps(
+    from hyperv_mcp import guestexec
+
+    cleanup = guestexec.guest_run_ps(
         running_vm.cfg, running_vm.vm,
         "Remove-Item -LiteralPath 'C:\\Windows\\Temp\\mcp-it-payload.bin' -Force",
         cred=running_vm.creds,

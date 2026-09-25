@@ -46,7 +46,7 @@ class CanonicalPath:
     """A canonicalized Windows path plus the form used for comparisons."""
 
     original: str
-    normalized: str  # normpath'd, drive letters upper-cased, no \\?\ prefix
+    normalized: str  # normpath'd (case preserved; comparisons casefold later), no \\?\ prefix
     exists_prefix_resolved: str  # realpath-resolved (junctions/symlinks) form
 
 

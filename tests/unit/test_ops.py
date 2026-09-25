@@ -58,7 +58,7 @@ def test_audit_records_failures(tmp_path):
             raise ValueError("bad input")
     rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     assert rows[-1]["ok"] is False
-    assert rows[-1]["error_class"] == "ValueError"
+    assert rows[-1]["error_class"] == "invalid"  # ValueError maps via taxonomy
 
 
 def test_audit_redacts_secrets(tmp_path):

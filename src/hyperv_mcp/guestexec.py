@@ -1,12 +1,19 @@
 """Guest command/script execution via PowerShell Direct (VMBus, no network).
 
-Transport: the inner script is base64-encoded, written to a guest temp .ps1,
-and executed by a child powershell inside the guest:
+Transport: the inner script is base64-encoded, and the guest temp .ps1 is
+created INSIDE the guest scriptblock (PowerShell remoting does not carry
+caller scope — host-side variables would arrive as $null), then executed by a
+child powershell inside the guest:
   - non-elevated: Start-Process -RedirectStandardOutput/-RedirectStandardError
     gives TRUE stdout/stderr separation and a real exit code.
   - elevated: Start-Process -Verb RunAs cannot combine with the redirect
     parameters, so the child redirects its own merged stream (`*>`); stdout
     carries both streams and stderr is reported empty — documented behavior.
+Start-Process parameters are splatted so the invocation is ONE statement (a
+bare continuation line after `-ArgumentList @(...)` parses as a separate
+command on PS 5.1 — regression-tested). The scriptblock emits its result
+object raw and the host converts once (double-encoding would make the host
+see a JSON string instead of a dict).
 
 Host timeout kills the host-side process tree (Job Object); the guest-side
 child may keep running — the result says so explicitly. Guest temp files are
@@ -68,16 +75,22 @@ def _result_err(cfg: Config, error: str, error_class: str) -> dict:
 def _elevated_body() -> str:
     # -Verb RunAs rejects -RedirectStandardOutput; the child merges its own
     # streams via *> into one file, so stderr stays empty on this path.
+    # Splatting keeps Start-Process a single statement.
     return """
 $outf = [System.IO.Path]::GetTempFileName()
 try {
     $q  = [char]39
     $dq = "$q$q"
     $cmdStr = '& ' + $q + $tmp.Replace($q, $dq) + $q + ' *> ' + $q + $outf.Replace($q, $dq) + $q
-    $p = Start-Process -FilePath 'powershell.exe' -ArgumentList @(
-            '-NonInteractive', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $cmdStr)
-         -Verb RunAs -Wait -PassThru
-    $ec = $p.ExitCode
+    $sp = @{
+        FilePath     = 'powershell.exe'
+        ArgumentList = @('-NonInteractive', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $cmdStr)
+        Verb         = 'RunAs'
+        Wait         = $true
+        PassThru     = $true
+    }
+    $p = Start-Process @sp
+    $ec = if ($null -ne $p) { $null = $p.Handle; $p.ExitCode } else { $null }
     $so = if (Test-Path -LiteralPath $outf) { [System.IO.File]::ReadAllText($outf) } else { '' }
     $se = ''
 } finally {
@@ -91,11 +104,17 @@ def _normal_body() -> str:
 $outf = [System.IO.Path]::GetTempFileName()
 $errf = [System.IO.Path]::GetTempFileName()
 try {
-    $p = Start-Process -FilePath 'powershell.exe' -ArgumentList @(
-            '-NonInteractive', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $tmp)
-         -Wait -PassThru -WindowStyle Hidden
-         -RedirectStandardOutput $outf -RedirectStandardError $errf
-    $ec = $p.ExitCode
+    $sp = @{
+        FilePath               = 'powershell.exe'
+        ArgumentList           = @('-NonInteractive', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $tmp)
+        Wait                   = $true
+        PassThru               = $true
+        WindowStyle            = 'Hidden'
+        RedirectStandardOutput = $outf
+        RedirectStandardError  = $errf
+    }
+    $p = Start-Process @sp
+    $ec = if ($null -ne $p) { $null = $p.Handle; $p.ExitCode } else { $null }
     $so = if (Test-Path -LiteralPath $outf) { [System.IO.File]::ReadAllText($outf) } else { '' }
     $se = if (Test-Path -LiteralPath $errf) { [System.IO.File]::ReadAllText($errf) } else { '' }
 } finally {
@@ -107,16 +126,22 @@ try {
 def _host_script(vm_name: str, inner_script: str, cred: CredentialSet, elevated: bool) -> str:
     n = pswindows.ps_name(vm_name)
     body = _elevated_body() if elevated else _normal_body()
+    # $enc MUST be passed via -ArgumentList (the comment at the Invoke-Command
+    # says so — regression F-A round 2 caught it missing) and the temp .ps1 is
+    # created INSIDE the guest scriptblock: caller scope does not cross the
+    # remoting boundary. GetRandomFileName avoids GetTempFileName's base .tmp
+    # residue (a fresh unique name, no side-effect file to clean up).
     return f"""
 {psdirect_prefix(cred)}
-$enc  = '{pswindows.utf8_b64(inner_script)}'
-$text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($enc))
-$tmp  = [System.IO.Path]::GetTempFileName() + '.ps1'
-[System.IO.File]::WriteAllText($tmp, $text, [System.Text.UTF8Encoding]::new($false))
+$enc = '{pswindows.utf8_b64(inner_script)}'
 $r = Invoke-Command -VMName {n} -Credential $cred -ErrorAction Stop -ScriptBlock {{
+    param($enc)
+    $text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($enc))
+    $tmp  = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName() + '.ps1')
+    [System.IO.File]::WriteAllText($tmp, $text, [System.Text.UTF8Encoding]::new($false))
 {body}
-    [PSCustomObject]@{{ exit_code=$ec; stdout=$so; stderr=$se }} | ConvertTo-Json -Compress -Depth 2
-}}
+    [PSCustomObject]@{{ exit_code=$ec; stdout=$so; stderr=$se }}
+}} -ArgumentList $enc
 $r | ConvertTo-Json -Compress -Depth 2
 """
 
@@ -195,6 +220,7 @@ def guest_run_ps(
         raise ValueError("vm_name and script are required")
     if cred is None:
         raise ValueError("guest credentials are required")
+    policy.vm_allowed(cfg, vm_name)
     if elevated:
         policy.require_destructive(cfg, "elevated_exec", confirm, f"run an elevated script on '{vm_name}'")
     with vmlocks.vm_lock(vm_name):
@@ -218,6 +244,7 @@ def guest_run(
         raise ValueError("vm_name and command are required")
     if cred is None:
         raise ValueError("guest credentials are required")
+    policy.vm_allowed(cfg, vm_name)
     if elevated:
         policy.require_destructive(cfg, "elevated_exec", confirm, f"run '{command}' elevated on '{vm_name}'")
 
@@ -247,6 +274,7 @@ def victim_run_ps(
         raise ValueError("victim credentials are required")
     if not vm_name or not script:
         raise ValueError("vm_name and script are required")
+    policy.vm_allowed(cfg, vm_name)
     with vmlocks.vm_lock(vm_name):
         inner = f"{script}\n{_EXIT_PROPAGATION}"
         return _run_inner(cfg, vm_name, inner, cred, timeout_ms, elevated=False)
@@ -262,6 +290,9 @@ def victim_run(
     timeout_ms: int = 60000,
     cred: CredentialSet | None = None,
 ) -> dict:
+    if cred is None:
+        raise ValueError("victim credentials are required")
+    policy.vm_allowed(cfg, vm_name)
     return guest_run(
         cfg, vm_name, command, args, cwd,
         timeout_ms=timeout_ms, elevated=False, confirm=False, cred=cred,

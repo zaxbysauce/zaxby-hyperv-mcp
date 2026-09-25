@@ -69,14 +69,28 @@ def log_operation(
     _emit(json.dumps(record, ensure_ascii=False))
 
 
+# Documented error_class taxonomy. Exception class names not listed here pass
+# through unchanged (they indicate a bug worth surfacing verbatim).
+_TAXONOMY = {
+    "PolicyDenied": "policy",
+    "CredentialError": "credential",
+    "VMBusy": "busy",
+    "ValueError": "invalid",
+    "TimeoutError": "timeout",
+    "RuntimeError": "transport",
+}
+
+
 class operation:  # noqa: N801 - context manager reads like a decorator
     """Context manager that audits a tool operation end to end.
 
-    Guest/transfer tools attach the resulting exit code before returning:
+    Guest/transfer tools attach the result outcome before returning:
         op = auditlog.operation(...)
         with op as op:
             result = fn(...)
             op.exit_code = result.get("exit_code")
+            op.ok = bool(result.get("ok", True))
+            op.error_class = result.get("error_class") or ""
     """
 
     def __init__(self, *, tool: str, vm_name: str = "", category: str) -> None:
@@ -85,6 +99,8 @@ class operation:  # noqa: N801 - context manager reads like a decorator
         self.category = category
         self.start = 0.0
         self.exit_code: int | None = None
+        self.ok = True
+        self.error_class = ""
 
     def __enter__(self) -> operation:
         self.start = time.monotonic()
@@ -92,16 +108,17 @@ class operation:  # noqa: N801 - context manager reads like a decorator
 
     def __exit__(self, exc_type, exc, tb) -> Literal[False]:
         duration_ms = int((time.monotonic() - self.start) * 1000)
-        error_class = ""
         if exc is not None:
-            error_class = type(exc).__name__
+            self.error_class = _TAXONOMY.get(
+                type(exc).__name__, type(exc).__name__
+            )
         log_operation(
             tool=self.tool,
             vm_name=self.vm_name,
             category=self.category,
-            ok=exc is None,
+            ok=self.ok and exc is None,
             duration_ms=duration_ms,
             exit_code=self.exit_code,
-            error_class=error_class,
+            error_class=self.error_class,
         )
         return False  # never swallow

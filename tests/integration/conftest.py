@@ -41,14 +41,18 @@ def _integration_ready() -> tuple[bool, str]:
 
 READY, SKIP_REASON = _integration_ready()
 
+# Real restores can merge deep checkpoint subtrees (600s waits); the repo
+# default pytest timeout (120s) kills them. Give every integration test 900s.
+INTEGRATION_TIMEOUT_S = 900
+
 
 def pytest_collection_modifyitems(config, items):
-    """Skip the whole real-Hyper-V suite unless explicitly enabled."""
-    if READY:
-        return
-    skip = pytest.mark.skip(reason=SKIP_REASON)
+    """Skip the whole real-Hyper-V suite unless explicitly enabled, and give
+    surviving tests a timeout that accommodates real checkpoint merges."""
     for item in items:
-        item.add_marker(skip)
+        item.add_marker(pytest.mark.timeout(INTEGRATION_TIMEOUT_S))
+        if not READY:
+            item.add_marker(pytest.mark.skip(reason=SKIP_REASON))
 
 
 @pytest.fixture(scope="module")

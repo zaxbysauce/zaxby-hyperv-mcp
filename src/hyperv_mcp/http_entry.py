@@ -101,6 +101,9 @@ def main(argv: list[str] | None = None) -> int:
 
     host = ns.host or cfg.http.host
     port = ns.port or cfg.http.port
+    if not isinstance(port, int) or not (1 <= port <= 65535):
+        print(f"ERROR: --port must be an integer in 1..65535 (got {port!r})", file=sys.stderr)
+        return 2
 
     print(f"hyperv-mcp {VERSION} (streamable-http)", file=sys.stderr)
     print(f"elevated:            {_elevated()}", file=sys.stderr)
@@ -110,7 +113,8 @@ def main(argv: list[str] | None = None) -> int:
         "HYPERV_GUEST_VICTIM_PASSWORD_FILE",
     ):
         print(f"{name:20}{'set' if os.environ.get(name) else 'NOT SET'}", file=sys.stderr)
-    if not _elevated():
+    elevated = _elevated()
+    if not elevated:
         print(
             "NOTE: not elevated. Hyper-V cmdlets work without UAC when this "
             "process token carries the Hyper-V Administrators group; otherwise "
@@ -131,7 +135,12 @@ def main(argv: list[str] | None = None) -> int:
     mcp = get_mcp()
     mcp.settings.host = host
     mcp.settings.port = port
-    mcp.run(transport="streamable-http")
+    try:
+        mcp.run(transport="streamable-http")
+    except OSError as exc:
+        # e.g. port already bound — surface a clean operator error, not a traceback.
+        print(f"ERROR: streamable-http server failed: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

@@ -100,12 +100,12 @@ def test_wrong_schema_version_rejected(tmp_path):
         Config.load(environ={"HYPERV_MCP_CONFIG": str(p)})
 
 
-def test_open_axes_reporting():
+def test_configured_axes_reporting():
     unrestricted = Config(unrestricted=True)
-    assert set(unrestricted.open_axes()) == {"vm", "host_read", "host_write", "guest_read", "guest_write"}
+    assert set(unrestricted.configured_axes()) == {"vm", "host_read", "host_write", "guest_read", "guest_write"}
     restrictive = Config(allowed_vm_patterns=["*"], host_read_roots=["C:\\r"])
-    assert set(restrictive.open_axes()) == {"vm", "host_read"}
-    assert Config().open_axes() == []
+    assert set(restrictive.configured_axes()) == {"vm", "host_read"}
+    assert Config().configured_axes() == []
 
 
 def test_policy_summary_mentions_deny_all():

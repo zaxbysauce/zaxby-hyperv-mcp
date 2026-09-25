@@ -16,7 +16,7 @@ VICTIM = CredentialSet("victim", "placeholder-pass-2")
 
 def _inner_script(host_script: str) -> str:
     """The guest-visible inner script rides in the host script as b64."""
-    marker = "$enc  = '"
+    marker = "$enc = '"
     start = host_script.index(marker) + len(marker)
     end = host_script.index("'", start)
     return base64.b64decode(host_script[start:end]).decode("utf-8")
@@ -123,7 +123,7 @@ def test_elevated_uses_runas_merged_note(monkeypatch, unrestricted):
     out = guestexec.guest_run_ps(
         unrestricted, "vm1", "x", elevated=True, confirm=True, cred=CRED
     )
-    assert "-Verb RunAs" in fake.scripts[0]
+    assert "Verb" in fake.scripts[0] and "'RunAs'" in fake.scripts[0]
     assert "merged" in out["note"]
 
 
@@ -132,9 +132,9 @@ def test_normal_path_uses_separate_redirects(monkeypatch, unrestricted):
     fake = FakePS([pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     guestexec.guest_run_ps(unrestricted, "vm1", "x", cred=CRED)
-    assert "-RedirectStandardOutput" in fake.scripts[0]
-    assert "-RedirectStandardError" in fake.scripts[0]
-    assert "-Verb RunAs" not in fake.scripts[0]
+    assert "RedirectStandardOutput" in fake.scripts[0]
+    assert "RedirectStandardError" in fake.scripts[0]
+    assert "'RunAs'" not in fake.scripts[0]
 
 
 def test_password_via_stdin_not_script(monkeypatch, unrestricted):
@@ -181,12 +181,26 @@ def test_guest_run_ps_exit_propagation(monkeypatch, unrestricted):
     assert guestexec._EXIT_PROPAGATION in _inner_script(fake.scripts[0])
 
 
+def test_host_script_passes_enc_via_argument_list(monkeypatch, unrestricted):
+    """Round-2 regression: without -ArgumentList $enc the guest scriptblock
+    binds $enc=$null, silently executes an EMPTY script, and returns
+    {ok:true, exit_code:0, stdout:''} — a worse failure than an error."""
+    fake = FakePS([pswindows.PSResult(
+        stdout=json.dumps({"exit_code": 0, "stdout": "x", "stderr": ""}), returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    guestexec.guest_run_ps(unrestricted, "vm1", "Get-Date", cred=CRED)
+    # Rendered f-string turns }} into }: the Invoke-Command closes with a
+    # single brace followed by the ArgumentList carrying $enc across the
+    # remoting boundary.
+    assert "} -ArgumentList $enc" in fake.scripts[0]
+
+
 def test_victim_never_elevated(monkeypatch, unrestricted):
     fake = FakePS([pswindows.PSResult(
         stdout=json.dumps({"exit_code": 0, "stdout": "", "stderr": ""}), returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     guestexec.victim_run_ps(unrestricted, "vm1", "whoami", cred=VICTIM)
-    assert "-Verb RunAs" not in fake.scripts[0]
+    assert "'RunAs'" not in fake.scripts[0]
     assert VICTIM.username in fake.scripts[0]
 
 

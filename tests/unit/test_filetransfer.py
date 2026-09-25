@@ -107,14 +107,38 @@ def test_put_missing_source_no_ps_call(monkeypatch, rooted_cfg, tmp_path):
 def test_put_sha_mismatch_detected(monkeypatch, rooted_cfg, tmp_path):
     src = tmp_path / "host-src" / "a.bin"
     src.write_bytes(b"x" * 10)
-    payload = {"ok": True, "bytes_copied": 10, "sha256_local": "AAA", "sha256_remote": "BBB"}
-    fake = FakePS([pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
+    # Hash-before-move: the PS body throws on mismatch BEFORE the destination
+    # is replaced; the runner maps the thrown text to error_class "integrity".
+    fake = FakePS([pswindows.PSResult(
+        returncode=1, stderr="SHA-256 mismatch (staged copy differs from source)")])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = filetransfer.guest_put(
         rooted_cfg, "test-vm", str(src), r"C:\g-write\a.bin",
         confirm=True, verify=True, cred=CRED,
     )
     assert out["ok"] is False and out["error_class"] == "integrity"
+
+
+def test_put_verify_branch_emits_real_boolean_guard(monkeypatch, rooted_cfg, tmp_path):
+    """Round-2 regression: the PS body must compare hashes directly — a
+    bareword `$doVerify = true` is a command invocation on PS 5.1 (assigns
+    $null), which silently disabled the entire mismatch guard."""
+    src = tmp_path / "host-src" / "a.bin"
+    src.write_bytes(b"x" * 10)
+    fake = FakePS([pswindows.PSResult(
+        returncode=1, stderr="SHA-256 mismatch (staged copy differs from source)")])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    filetransfer.guest_put(
+        rooted_cfg, "test-vm", str(src), r"C:\g-write\a.bin",
+        confirm=True, verify=True, cred=CRED,
+    )
+    script = fake.scripts[0]
+    assert "$doVerify" not in script  # no bareword boolean variable at all
+    assert "if ($shaLocal -ne $shaStaged)" in script
+    # Copy-Item must sit INSIDE the staging-cleanup try (leak-on-copy regression).
+    copy_at = script.index("Copy-Item -ToSession")
+    try_at = script.index("try {")
+    assert try_at < copy_at
 
 
 def test_put_sha_match_passes(monkeypatch, rooted_cfg, tmp_path):
@@ -167,8 +191,9 @@ def test_get_guest_read_outside_roots_denied(monkeypatch, rooted_cfg, tmp_path):
 
 def test_get_sha_mismatch(monkeypatch, rooted_cfg, tmp_path):
     dest = tmp_path / "host-dst" / "out.bin"
-    payload = {"ok": True, "bytes_copied": 3, "sha256_local": "X", "sha256_remote": "Y"}
-    fake = FakePS([pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
+    # Hash-before-move: PS throws on mismatch; runner maps to integrity.
+    fake = FakePS([pswindows.PSResult(
+        returncode=1, stderr="SHA-256 mismatch (staged copy differs from guest source)")])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = filetransfer.guest_get(
         rooted_cfg, "test-vm", r"C:\g-read\a.bin", str(dest), verify=True, cred=CRED,

@@ -130,8 +130,14 @@ class Config:
 
     # -- introspection ---------------------------------------------------
 
-    def open_axes(self) -> list[str]:
-        """Axes that are fully open (used for startup warnings)."""
+    def configured_axes(self) -> list[str]:
+        """Axes with a configured allowlist (deny-by-default outside it).
+
+        Naming note: configured is NOT the same as fully open — a configured
+        axis still denies everything outside its allowlist. Fully open means
+        `unrestricted` (or a literal "*" pattern / drive-root entry the
+        operator chose). Used for the startup INFO line, not warnings.
+        """
         axes: list[str] = []
         if self.unrestricted:
             axes.extend(["vm", "host_read", "host_write", "guest_read", "guest_write"])

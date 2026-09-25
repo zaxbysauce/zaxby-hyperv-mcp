@@ -110,10 +110,17 @@ def test_parse_start_vm(monkeypatch, parsed_ps):
 
 @pytest.mark.parametrize("method", ["shutdown", "shutdown-force", "save", "turnoff"])
 def test_parse_stop_vm(monkeypatch, parsed_ps, method):
-    script = _collect(
-        monkeypatch, lifecycle.stop_vm, UNRESTRICTED, "vm1", method, True
-    )
-    assert _parse_errors(script) == []
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        lifecycle.stop_vm(UNRESTRICTED, "vm1", method, True)
+    except Exception:
+        pass  # canned responses may not satisfy post-capture stages
+    assert rec.scripts, "stop_vm produced no scripts"
+    # Parse EVERY captured script including the state-wait loop (regression:
+    # a syntax error in _wait_state_script is invisible to scripts[0]-only checks).
+    for script in rec.scripts:
+        assert _parse_errors(script) == []
 
 
 def test_parse_reset_vm(monkeypatch, parsed_ps):

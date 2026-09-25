@@ -110,18 +110,27 @@ def resolve_guest(
 ) -> CredentialSet:
     """Resolve admin guest credentials. Inline args only when policy allows."""
     env = dict(os.environ if environ is None else environ)
+    had_inline_args = bool(username or password)
     if _config is not None and not _config.allow_inline_credentials:
         username = password = ""
     u = username or env.get("HYPERV_GUEST_USERNAME", "")
-    p = password or _read_password_file("HYPERV_GUEST_PASSWORD_FILE", env) or env.get("HYPERV_GUEST_PASSWORD", "")
+    if password:
+        p, p_source = password, "inline argument"
+    else:
+        p = _read_password_file("HYPERV_GUEST_PASSWORD_FILE", env)
+        if p:
+            p_source = "HYPERV_GUEST_PASSWORD_FILE"
+        else:
+            p = env.get("HYPERV_GUEST_PASSWORD", "")
+            p_source = "HYPERV_GUEST_PASSWORD"
     if not u or not p:
         raise CredentialError(
             "Guest credentials are required. Set HYPERV_GUEST_USERNAME and "
             "HYPERV_GUEST_PASSWORD (or HYPERV_GUEST_PASSWORD_FILE)"
             + ("; inline arguments are disabled by policy (allow_inline_credentials)"
-               if username or password else "")
+               if had_inline_args else "")
         )
-    return CredentialSet(u, _validated_password(p, "HYPERV_GUEST_PASSWORD"))
+    return CredentialSet(u, _validated_password(p, p_source))
 
 
 def resolve_victim(environ: dict[str, str] | None = None) -> CredentialSet:
@@ -138,4 +147,9 @@ def resolve_victim(environ: dict[str, str] | None = None) -> CredentialSet:
             "HYPERV_GUEST_VICTIM_PASSWORD (or HYPERV_GUEST_VICTIM_PASSWORD_FILE) "
             "to an unprivileged guest account."
         )
-    return CredentialSet(u, _validated_password(p, "HYPERV_GUEST_VICTIM_PASSWORD"))
+    p_source = (
+        "HYPERV_GUEST_VICTIM_PASSWORD_FILE"
+        if env.get("HYPERV_GUEST_VICTIM_PASSWORD_FILE", "").strip() and not env.get("HYPERV_GUEST_VICTIM_PASSWORD")
+        else "HYPERV_GUEST_VICTIM_PASSWORD"
+    )
+    return CredentialSet(u, _validated_password(p, p_source))

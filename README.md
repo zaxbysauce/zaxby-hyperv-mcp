@@ -142,8 +142,8 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
   },
   "allow_inline_credentials": false,   // expose username/password tool params
   "unrestricted": false,               // explicit research mode: allow all
-  "audit_log_path": "C:\\Lab\\audit.jsonl",
-  "max_output_bytes": 1048576,         // guest output cap (truncated flag)
+  "audit_log_path": "C:\\Lab\\audit.jsonl",  // default: one line per op on stderr
+  "max_output_bytes": 1048576,         // guest output cap (applied after capture; truncated flag)
   "host_powershell_path": null,        // default: Windows PowerShell 5.1
   "verify_sha256": false,              // default integrity check for transfers
   "ps_timeout_s": 120,                 // default host PowerShell timeout
@@ -261,8 +261,9 @@ last observed state.
 | `hyperv_checkpoint_remove` | `vm_name`, `checkpoint_name`, `include_subtree`, `confirm` | `{status, vm_name, checkpoint_name}` |
 
 `checkpoint_name` auto-generates (`MCP-YYYYMMDD-HHMMSS`) only on **create**;
-restore/remove require it. Restore powers the VM off — call `hyperv_start_vm`
-afterwards. Removal merges disks; it cannot be undone.
+restore/remove require it. Restore stops the VM (waits up to 600 s for
+Off/Saved/Paused while any checkpoint merge completes) — call
+`hyperv_start_vm` afterwards. Removal merges disks; it cannot be undone.
 
 ### Kernel Debug Setup
 
@@ -282,11 +283,11 @@ cases and requires the VM Off/Saved for the `Set-VMComPort` step.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_guest_run` | `vm_name`, `command`, `args[]`, `cwd?`, `timeout_ms`, `elevated`, `confirm` | `{ok, exit_code, stdout, stderr, timed_out, truncated}` |
-| `hyperv_guest_run_ps` | `vm_name`, `script`, `timeout_ms`, `elevated`, `confirm` | same envelope |
+| `hyperv_guest_run` | `vm_name`, `command`, `args[]`, `cwd?`, `timeout_ms` (default 60000), `elevated`, `confirm` | `{ok, exit_code, stdout, stderr, timed_out, truncated}` |
+| `hyperv_guest_run_ps` | `vm_name`, `script`, `timeout_ms` (default 60000), `elevated`, `confirm` | same envelope |
 | `hyperv_guest_put` | `vm_name`, `local_path`, `remote_path`, `confirm`, `verify?` | `{ok, bytes_copied, sha256_local?, sha256_remote?}` |
 | `hyperv_guest_get` | `vm_name`, `remote_path`, `local_path`, `verify?` | same envelope |
-| `hyperv_guest_read_file` | `vm_name`, `remote_path`, `max_bytes>=1` | `{ok, content_b64, bytes_read, truncated}` |
+| `hyperv_guest_read_file` | `vm_name`, `remote_path`, `max_bytes>=1` (default 262144) | `{ok, content_b64, bytes_read, truncated}` |
 | `hyperv_guest_list_dir` | `vm_name`, `remote_path` | `{ok, entries[{name, is_dir, size_bytes, modified}]}` |
 
 **0.2.0 behavior changes (documented breaking):**
