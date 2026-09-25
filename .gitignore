@@ -30,3 +30,11 @@ ENV/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# local tooling artifacts (rebuildable caches) + integration-run residue
+.zcode/
+.zaxbygraph/
+.zvec-grep/
+graphify-out/
+.swarm/
+hyperv-it-cleanup-report.json
