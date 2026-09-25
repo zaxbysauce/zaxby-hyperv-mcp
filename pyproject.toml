@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hyperv-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server for Hyper-V VM management, checkpoints, kernel debug setup, and guest execution over PowerShell Direct."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,16 +27,25 @@ classifiers = [
     "Topic :: System :: Emulators",
 ]
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=1.0.0,<2",
 ]
 
 [project.urls]
-Homepage = "https://github.com/originsec/hyperv-mcp"
-Repository = "https://github.com/originsec/hyperv-mcp"
-Issues = "https://github.com/originsec/hyperv-mcp/issues"
+Homepage = "https://github.com/zaxbysauce/zaxby-hyperv-mcp"
+Repository = "https://github.com/zaxbysauce/zaxby-hyperv-mcp"
+Issues = "https://github.com/zaxbysauce/zaxby-hyperv-mcp/issues"
 
 [project.scripts]
 hyperv-mcp = "hyperv_mcp.server:main"
+hyperv-mcp-http = "hyperv_mcp.http_entry:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-timeout>=2",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hyperv_mcp"]
@@ -49,3 +58,27 @@ include = [
     "NOTICE",
     "pyproject.toml",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+addopts = "-q"
+timeout = 120
+timeout_method = "thread"
+pythonpath = ["src"]
+markers = [
+    "hyperv_real: drives a real disposable Hyper-V VM (opt-in via tests/integration + env guards)",
+]
+
+[tool.ruff]
+line-length = 110
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+check_untyped_defs = true
+files = ["src/hyperv_mcp"]
