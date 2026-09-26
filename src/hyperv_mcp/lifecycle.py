@@ -130,7 +130,10 @@ def _wait_for_state(cfg: Config, vm_name: str, wanted: list[str], timeout_s: int
     return final
 
 
-_VALID_STATES = ("Off", "Running", "Saved", "Paused", "Starting", "Stopping", "Resuming", "Pausing")
+VALID_STATES = ("Off", "Running", "Saved", "Paused", "Starting", "Stopping", "Resuming", "Pausing")
+
+# Single source of truth: server.py validates against this tuple too.
+_VALID_STATES = VALID_STATES
 
 
 def wait_for_vm_state(cfg: Config, vm_name: str, states: list[str], timeout_s: int = 300) -> str:

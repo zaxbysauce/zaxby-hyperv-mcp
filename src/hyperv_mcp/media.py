@@ -117,8 +117,6 @@ def vm_create(
     if not vhd_path:
         raise ValueError("vhd_path is required")
     vhd = _checked_file_path(cfg, vhd_path, write=True, must_exist=False, extensions=(".vhdx", ".vhd"))
-    if os.path.isfile(vhd):
-        raise MediaError(f"VHD already exists: {vhd} (refusing to overwrite)")
     if not (1 <= vhd_size_gb <= 2048):
         raise ValueError("vhd_size_gb must be within 1..2048")
 
@@ -128,14 +126,21 @@ def vm_create(
     pre = ""
     if switch_name:
         pre = (
-            "$vmsw = Get-VMSwitch -Name " + pswindows.ps_quote(switch_name)
+            "$vmsw = Get-VMSwitch -Name " + pswindows.ps_name(switch_name)
             + " -ErrorAction Stop\n"
         )
     lines = [pre] if pre else []
     lines += [
         f"$vhd = New-VHD -Path {pswindows.ps_quote(vhd)} -SizeBytes ({int(vhd_size_gb)}GB) -Fixed:$false -ErrorAction Stop",
-        f"$vm = New-VM -Name {pswindows.ps_name(name)} -MemoryStartupBytes ({int(memory_mb)}MB) "
-        f"-Generation {generation} -VHDPath $vhd.Path -ErrorAction Stop",
+        # If New-VM fails the fresh VHDX would orphan on the host and wedge
+        # every retry against the exists-refusal below — clean it up first.
+        "try {\n"
+        f"  $vm = New-VM -Name {pswindows.ps_name(name)} -MemoryStartupBytes ({int(memory_mb)}MB) "
+        f"-Generation {generation} -VHDPath $vhd.Path -ErrorAction Stop\n"
+        "} catch {\n"
+        f"  Remove-Item -LiteralPath {pswindows.ps_quote(vhd)} -Force -ErrorAction SilentlyContinue\n"
+        "  throw\n"
+        "}",
     ]
     if switch_name:
         lines.append(
@@ -147,6 +152,8 @@ def vm_create(
         "generation = $vm.Generation } | ConvertTo-Json -Compress"
     )
     with vmlocks.vm_lock(name):
+        if os.path.isfile(vhd):
+            raise MediaError(f"VHD already exists: {vhd} (refusing to overwrite)")
         result = _run(cfg, "\n".join(lines), f"vm_create({name})", timeout_s=300)
     out = _json_out(result, "vm_create")
     return {"ok": True, **out} if isinstance(out, dict) else {"ok": True}
@@ -161,18 +168,25 @@ def vm_disk_add(
     if controller_type not in ("SCSI", "IDE"):
         raise ValueError("controller_type must be SCSI or IDE")
     vhd = _checked_file_path(cfg, path, write=True, must_exist=False, extensions=(".vhdx", ".vhd"))
-    if os.path.isfile(vhd):
-        raise MediaError(f"VHD already exists: {vhd} (refusing to overwrite)")
     if not (1 <= size_gb <= 2048):
         raise ValueError("size_gb must be within 1..2048")
     lines = [
         f"$vhd = New-VHD -Path {pswindows.ps_quote(vhd)} -SizeBytes ({int(size_gb)}GB) -Fixed:$false -ErrorAction Stop",
-        f"Add-VMHardDiskDrive -VMName {pswindows.ps_name(vm_name)} -Path $vhd.Path "
-        f"-ControllerType {controller_type} -ErrorAction Stop",
+        # Same orphan hazard as vm_create: a failed attach must not leave the
+        # staged VHDX behind to wedge retries.
+        "try {\n"
+        f"  Add-VMHardDiskDrive -VMName {pswindows.ps_name(vm_name)} -Path $vhd.Path "
+        f"-ControllerType {controller_type} -ErrorAction Stop\n"
+        "} catch {\n"
+        f"  Remove-Item -LiteralPath {pswindows.ps_quote(vhd)} -Force -ErrorAction SilentlyContinue\n"
+        "  throw\n"
+        "}",
         f"(Get-VMHardDiskDrive -VMName {pswindows.ps_name(vm_name)} | Measure-Object).Count | "
         "ForEach-Object { [PSCustomObject]@{ disk_count = $_ } } | ConvertTo-Json -Compress",
     ]
     with vmlocks.vm_lock(vm_name):
+        if os.path.isfile(vhd):
+            raise MediaError(f"VHD already exists: {vhd} (refusing to overwrite)")
         result = _run(cfg, "\n".join(lines), f"vm_disk_add({vm_name})")
     out = _json_out(result, "vm_disk_add")
     return {"ok": True, "vhd_path": vhd, **out} if isinstance(out, dict) else {"ok": True, "vhd_path": vhd}

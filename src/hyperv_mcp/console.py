@@ -41,6 +41,7 @@ import hashlib
 import io
 import json
 import math
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -106,16 +107,14 @@ _KEY_SCANCODES: dict[str, tuple[int, int]] = {
     "9": (0x0A, 0x8A), "0": (0x0B, 0x8B),
 }
 # Extended (0xE0-prefixed) keys per the PS/2 set-1 controller stream.
+# rightctrl/rightalt share the left-side make/break bytes but the controller
+# requires the 0xE0 prefix to distinguish them from left-ctrl/left-alt.
 _EXTENDED_KEYS = {"up", "down", "left", "right", "delete", "insert",
-                  "home", "end", "pageup", "pagedown"}
+                  "home", "end", "pageup", "pagedown", "rightctrl", "rightalt"}
 # Aliases that map onto other entries.
 _KEY_SCANCODES["ctrl"] = _KEY_SCANCODES["leftctrl"]
 _KEY_SCANCODES["alt"] = _KEY_SCANCODES["leftalt"]
 _KEY_SCANCODES["shift"] = _KEY_SCANCODES["leftshift"]
-
-_STATE_ENUM = {
-    "Off", "Running", "Saved", "Paused", "Starting", "Stopping", "Resuming", "Pausing",
-}
 
 
 class ConsoleError(RuntimeError):
@@ -195,7 +194,7 @@ foreach ($m in $mice) {
     if ($owner -and $owner.Name -eq $vm.Name) { $mouse = $m; break }
 }
 [PSCustomObject]@{
-    enabledState = $vm.EnabledState
+    enabled_state = $vm.EnabledState
     head_horizontal = if ($vh) { $vh.CurrentHorizontalResolution } else { $null }
     head_vertical = if ($vh) { $vh.CurrentVerticalResolution } else { $null }
     keyboard_present = [bool]$kb
@@ -207,7 +206,10 @@ foreach ($m in $mice) {
 
 # Poll loop: bounded by max_polls. When %BASELINE% is empty the FIRST polled
 # frame becomes the baseline (first-poll-is-baseline semantics); change is
-# reported only when a later poll's hash differs from that baseline.
+# reported only when a later poll's hash differs from that baseline. HASH is
+# always the full lowercase-hex sha256 of the raw payload — byte-identical to
+# the host-side _frame_hash, so a returned frame_hash round-trips as a
+# baseline_hash for cross-call change detection.
 _WAIT_FRAME_SCRIPT_TMPL = """
 $vm = Get-CimInstance -Namespace '%NS%' -ClassName Msvm_ComputerSystem -Filter "Name='%GUID%'"
 if (-not $vm) { throw 'VM not found in WMI namespace (is it running?)' }
@@ -226,7 +228,7 @@ while ($polls -lt %MAX_POLLS%) {
     }
     if ($r.ReturnValue -ne 0) { throw ('GetVirtualSystemThumbnailImage failed with ReturnValue=' + $r.ReturnValue) }
     $polls++
-    $hash = [Convert]::ToBase64String($sha.ComputeHash($r.ImageData)).Substring(0, 32)
+    $hash = ([System.BitConverter]::ToString($sha.ComputeHash($r.ImageData)) -replace '-','').ToLowerInvariant()
     $lastHash = $hash
     if ($baseline -eq '') { $baseline = $hash }
     if ($hash -ne $baseline) {
@@ -383,7 +385,9 @@ def _scancodes_for_key(key: str) -> list[int]:
 
 
 def _scancodes_for_combo(keys: list[str]) -> list[int]:
-    """Combo: modifier makes first, then each key in order, modifier breaks last."""
+    """Combo: modifier makes first, then each key in order, modifier breaks last.
+    Modifiers go through the same extended-prefix rule as _scancodes_for_key
+    (rightctrl/rightalt carry 0xE0 even as combo modifiers)."""
     mods = [k for k in keys if k.strip().lower() in ("ctrl", "alt", "shift",
                                                      "leftctrl", "rightctrl",
                                                      "leftalt", "rightalt",
@@ -392,14 +396,20 @@ def _scancodes_for_combo(keys: list[str]) -> list[int]:
     if not rest:
         raise ValueError("combo needs at least one non-modifier key")
     codes: list[int] = []
+
+    def _mod_code(name: str, which: int) -> list[int]:
+        n = name.strip().lower()
+        codes_one = [_KEY_SCANCODES[n][which]]
+        if n in _EXTENDED_KEYS:
+            return [0xE0, codes_one[0]]
+        return codes_one
+
     for m in mods:
-        make, _ = _KEY_SCANCODES[m.strip().lower()]
-        codes.append(make)
+        codes.extend(_mod_code(m, 0))
     for k in rest:
         codes.extend(_scancodes_for_key(k))
     for m in reversed(mods):
-        _, brk = _KEY_SCANCODES[m.strip().lower()]
-        codes.append(brk)
+        codes.extend(_mod_code(m, 1))
     return codes
 
 
@@ -461,6 +471,9 @@ def screenshot(
     }
     if save_path:
         policy.check_host_write(cfg, save_path)
+        parent = os.path.dirname(save_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(save_path, "wb") as fh:
             fh.write(png)
         meta["saved_path"] = save_path

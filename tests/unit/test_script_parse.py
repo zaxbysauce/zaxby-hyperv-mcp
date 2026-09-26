@@ -366,6 +366,28 @@ def test_parse_console_wait_frame_change(monkeypatch, parsed_ps):
         assert _parse_errors(script) == []
 
 
+def test_wait_script_hash_is_full_hex_sha256(monkeypatch, parsed_ps):
+    """Review PRR-005 pin: the PS-side HASH must be the full lowercase-hex
+    sha256 — the same bytes/format as the host-side _frame_hash — so a
+    returned frame_hash round-trips through baseline_hash validation
+    (64-hex) and matches PS-side comparisons. The old base64 Substring(0,32)
+    form broke the documented chaining contract."""
+    monkeypatch.setattr(console, "_vm_guid", lambda cfg, vm: "guid-1")
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        console.wait_frame_change(UNRESTRICTED, "vm1", "", 640, 480, 5, 1)
+    except Exception:
+        pass
+    wait_scripts = [s for s in rec.scripts if "$baseline" in s]
+    assert wait_scripts, "wait script not generated"
+    for script in wait_scripts:
+        assert "BitConverter]::ToString" in script
+        assert "ToLowerInvariant()" in script
+        assert "Substring(0, 32)" not in script
+        assert "$hash -ne $baseline" in script
+
+
 # ---------------------------------------------------------------------------
 # media templates
 # ---------------------------------------------------------------------------

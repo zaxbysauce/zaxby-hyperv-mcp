@@ -195,3 +195,16 @@ def test_unknown_attr_raises(fresh_server):
     name = "mcp_does_not_exist"
     with pytest.raises(AttributeError):
         getattr(mod, name)  # exercises PEP 562 module __getattr__
+
+
+def test_state_enum_single_source():
+    """Review PRR-020 pin: the Hyper-V state enum lives only in lifecycle.py;
+    server.py validates against lifecycle.VALID_STATES and console's dead
+    duplicate is gone."""
+    from hyperv_mcp import console, lifecycle
+
+    assert lifecycle.VALID_STATES == (
+        "Off", "Running", "Saved", "Paused", "Starting", "Stopping", "Resuming", "Pausing",
+    )
+    assert lifecycle._VALID_STATES is lifecycle.VALID_STATES
+    assert not hasattr(console, "_STATE_ENUM")

@@ -27,11 +27,6 @@ def unrestricted():
     return Config(unrestricted=True)
 
 
-@pytest.fixture(autouse=True)
-def _no_sleep(monkeypatch):
-    monkeypatch.setattr(media.pswindows.time if hasattr(media.pswindows, "time") else media, "sleep", lambda s: None) if False else None
-
-
 # ---------------------------------------------------------------------------
 # vm_create
 # ---------------------------------------------------------------------------
@@ -353,3 +348,171 @@ def test_ps_failure_maps_to_media_error(monkeypatch, unrestricted, tmp_path):
     monkeypatch.setattr(pswindows, "run_ps", fake)
     with pytest.raises(MediaError, match="Access denied"):
         media.vm_secureboot_set(unrestricted, "vm", True, confirm=True)
+
+
+# ---------------------------------------------------------------------------
+# review-fix coverage: Gen1 denial breadth, confirm/category matrix,
+# injection-negative quoting, orphaned-VHD cleanup, lock-scoped existence
+# ---------------------------------------------------------------------------
+
+def test_gen1_denied_for_boot_order_tpm_secureboot(monkeypatch, unrestricted):
+    """_generation_guard denial is shared — every Gen2-only op must refuse."""
+    fake = FakePS([pswindows.PSResult(stdout="1", returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(MediaError, match="Generation 1"):
+        media.vm_firmware_set_boot_order(unrestricted, "vm", "Drive", confirm=True)
+    fake = FakePS([pswindows.PSResult(stdout="1", returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(MediaError, match="Generation 1"):
+        media.vm_tpm_set(unrestricted, "vm", True, confirm=True)
+    fake = FakePS([pswindows.PSResult(stdout="1", returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(MediaError, match="Generation 1"):
+        media.vm_secureboot_set(unrestricted, "vm", True, confirm=True)
+
+
+def test_tpm_set_requires_confirm():
+    cfg = Config(allowed_vm_patterns=["test-*"])
+    with pytest.raises(PolicyDenied, match="confirm=true"):
+        media.vm_tpm_set(cfg, "test-vm", True, confirm=False)
+    with pytest.raises(PolicyDenied, match="vm_provision"):
+        media.vm_tpm_set(cfg, "test-vm", True, confirm=True)
+
+
+def test_provision_category_denied_for_all_destructive_ops(tmp_path):
+    """Only vm_create had a category-denial test; every require_destructive
+    vm_provision user must refuse when the category is off."""
+    cfg = Config(allowed_vm_patterns=["test-*"])
+    with pytest.raises(PolicyDenied, match="vm_provision"):
+        media.vm_disk_add(cfg, "test-vm", str(tmp_path / "d.vhdx"), 10, confirm=True)
+    with pytest.raises(PolicyDenied, match="vm_provision"):
+        media.vm_firmware_set_boot_order(cfg, "test-vm", "Drive", confirm=True)
+    with pytest.raises(PolicyDenied, match="vm_provision"):
+        media.vm_secureboot_set(cfg, "test-vm", True, confirm=True)
+    # vm_tpm_set's confirm-then-category ordering is covered above
+
+
+def test_media_category_denied_for_network_set_and_detach(tmp_path):
+    cfg = Config(allowed_vm_patterns=["test-*"])
+    with pytest.raises(PolicyDenied, match="media"):
+        media.vm_network_set(cfg, "test-vm", "LabSwitch")
+    with pytest.raises(PolicyDenied, match="media"):
+        media.vm_media_detach(cfg, "test-vm")
+
+
+def test_vm_create_vhd_path_injection_negative(monkeypatch, unrestricted, tmp_path):
+    """Hostile vhd_path must arrive ps_quote'd (doubled quotes), never raw."""
+    fake = FakePS([pswindows.PSResult(
+        stdout='{"id": "GUID-1", "name": "test-vm-1", "state": "Off", "generation": 2}',
+        returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    hostile = str(tmp_path / "x'; Invoke-Expression 'calc'; '.vhdx")
+    media.vm_create(unrestricted, "test-vm-1", vhd_path=hostile, confirm=True)
+    script = fake.scripts[0]
+    assert "Invoke-Expression" not in script.replace("'" + hostile.replace("'", "''") + "'", "")
+    assert hostile.replace("'", "''") in script
+    # New-VM failure path must clean up the staged VHD (orphan guard)
+    # cleanup uses Remove-Item (Remove-VHD does not exist in the Hyper-V module)
+    assert "Remove-Item -LiteralPath" in script and "} catch {" in script
+
+
+def test_disk_add_path_injection_negative_and_cleanup(monkeypatch, unrestricted, tmp_path):
+    fake = FakePS([pswindows.PSResult(stdout='{"disk_count": 2}', returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    hostile = str(tmp_path / "y'; Invoke-Expression 'calc'; '.vhdx")
+    media.vm_disk_add(unrestricted, "test-vm", hostile, 10, "SCSI", confirm=True)
+    script = fake.scripts[0]
+    assert "Invoke-Expression" not in script.replace("'" + hostile.replace("'", "''") + "'", "")
+    assert hostile.replace("'", "''") in script
+    # cleanup uses Remove-Item (Remove-VHD does not exist in the Hyper-V module)
+    assert "Remove-Item -LiteralPath" in script and "} catch {" in script
+
+
+def test_media_attach_iso_injection_negative(monkeypatch, tmp_path):
+    cfg = Config(allowed_vm_patterns=["test-*"], host_read_roots=[str(tmp_path)])
+    cfg.destructive.media = True
+    iso = tmp_path / "z'; Invoke-Expression 'calc'; '.iso"
+    iso.write_bytes(b"x")
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    media.vm_media_attach(cfg, "test-vm", str(iso))
+    script = fake.scripts[0]
+    assert "Invoke-Expression" not in script.replace("'" + str(iso).replace("'", "''") + "'", "")
+    assert str(iso).replace("'", "''") in script
+
+
+def test_network_set_injection_negative(monkeypatch, unrestricted):
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    hostile = "Sw'; Invoke-Expression 'calc'; '"
+    media.vm_network_set(unrestricted, "vm", hostile)
+    script = fake.scripts[0]
+    assert "Invoke-Expression" not in script.replace("'" + hostile.replace("'", "''") + "'", "")
+    assert hostile.replace("'", "''") in script
+
+
+def test_vm_create_switch_probe_wildcard_escaped(monkeypatch, unrestricted, tmp_path):
+    """Get-VMSwitch -Name DOES wildcard-match; the pre-check must ps_name-escape
+    so a probe name like 'Lab*' cannot match the wrong switch."""
+    fake = FakePS([pswindows.PSResult(
+        stdout='{"id": "GUID-1", "name": "test-vm-1", "state": "Off", "generation": 2}',
+        returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    hostile = "Lab*'; Invoke-Expression 'calc'"
+    media.vm_create(unrestricted, "test-vm-1", vhd_path=str(tmp_path / "a.vhdx"),
+                    switch_name=hostile, confirm=True)
+    script = fake.scripts[0]
+    assert pswindows.ps_name(hostile) in script       # probe: backtick-escaped wildcard
+    assert pswindows.ps_quote(hostile) in script      # -SwitchName: literal single-quoted
+    sanitized = script.replace(pswindows.ps_name(hostile), "").replace(
+        pswindows.ps_quote(hostile), "")
+    assert "Invoke-Expression" not in sanitized
+
+
+def test_vm_create_cleanup_removes_staged_vhd_on_new_vm_failure(monkeypatch, unrestricted, tmp_path):
+    fake = FakePS([pswindows.PSResult(returncode=1, stderr="New-VM : name collision")])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(MediaError, match="name collision"):
+        media.vm_create(unrestricted, "test-vm-1", vhd_path=str(tmp_path / "a.vhdx"), confirm=True)
+    script = fake.scripts[0]
+    assert script.index("try {") < script.index("New-VM -Name")
+    assert "Remove-Item -LiteralPath" in script.split("} catch {", 1)[1]
+
+
+def test_disk_add_cleanup_removes_staged_vhd_on_attach_failure(monkeypatch, unrestricted, tmp_path):
+    fake = FakePS([pswindows.PSResult(returncode=1, stderr="Add-VMHardDiskDrive : no SCSI")])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(MediaError, match="no SCSI"):
+        media.vm_disk_add(unrestricted, "test-vm", str(tmp_path / "d.vhdx"), 10, "SCSI", confirm=True)
+    script = fake.scripts[0]
+    assert script.index("try {") < script.index("Add-VMHardDiskDrive")
+    assert "Remove-Item -LiteralPath" in script.split("} catch {", 1)[1]
+
+
+def test_vhd_existence_check_runs_inside_vm_lock(monkeypatch, unrestricted, tmp_path):
+    """The exists-refusal must be decided under the per-VM lock so a concurrent
+    caller gets the structured MediaError, not a PowerShell transport error."""
+    import contextlib
+
+    vhd = tmp_path / "race.vhdx"
+    order = []
+    real_lock = media.vmlocks.vm_lock
+
+    @contextlib.contextmanager
+    def spy_lock(name):
+        order.append("lock")
+        with real_lock(name):
+            yield
+
+    real_isfile = media.os.path.isfile
+
+    def spy_isfile(p):
+        order.append("isfile")
+        return real_isfile(p)
+
+    monkeypatch.setattr(media.vmlocks, "vm_lock", spy_lock)
+    monkeypatch.setattr(media.os.path, "isfile", spy_isfile)
+    fake = FakePS([pswindows.PSResult(stdout='{"disk_count": 1}', returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    media.vm_disk_add(unrestricted, "test-vm", str(vhd), 10, confirm=True)
+    assert order == ["lock", "isfile"]

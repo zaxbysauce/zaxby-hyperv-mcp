@@ -1,8 +1,9 @@
 """
 hyperv_mcp.server -- MCP server for Hyper-V VM management (hardened fork).
 
-Exposes 19 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
-guest execution and file transfer via PowerShell Direct. Security model:
+Exposes 43 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
+guest execution and file transfer via PowerShell Direct, console observation
+and input (WMI), VM/media provisioning, and orchestration waits. Security model:
 
   - Credentials resolve from env vars / credential files; username/password
     tool parameters exist only when config allow_inline_credentials=true.
@@ -943,8 +944,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         """Capture a bounded sequence of console frames with per-frame hashes
         and changed-byte counts vs the previous frame (transition evidence,
         not progress inference). Returns [first Image, last Image, meta_text]
-        where meta carries frames[] (index, frame_hash, changed_bytes,
-        captured_at), elapsed_ms, dimensions.
+        (a single Image when count==1) where meta carries frames[] (index,
+        frame_hash, changed_bytes_vs_previous, captured_at), elapsed_ms, dimensions.
         """
         try:
             with _audit("hyperv_console_capture_sequence", vm_name, "read"):
@@ -974,13 +975,13 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         Windows boots — verify hyperv_console_get_display_info before
         switching channels.
 
-        Returns: {ok, final_state, elapsed_ms} or raises with the last state.
+        Returns: {ok, final_state, guest_channel} — raises RuntimeError with
+        the last observed state if the deadline expires first.
         """
-        valid = ("Off", "Running", "Saved", "Paused", "Starting", "Stopping", "Resuming", "Pausing")
         for s in states:
-            if s not in valid:
+            if s not in lifecycle.VALID_STATES:
                 raise ValueError(
-                    f"invalid state {s!r}; must be one of {valid} "
+                    f"invalid state {s!r}; must be one of {lifecycle.VALID_STATES} "
                     "(strict validation: no shell metacharacters possible)"
                 )
         with _audit("hyperv_wait_vm_state", vm_name, "read"):

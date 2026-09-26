@@ -338,9 +338,9 @@ Environment-only victim credentials; never elevated.
 | `hyperv_console_button` | `vm_name`, `button`, `is_down` | `{ok, operation}` |
 | `hyperv_console_scroll` | `vm_name`, `delta` | `{ok, operation}` |
 | `hyperv_console_wait_frame_change` | `vm_name`, `baseline_hash=""`, `width=640`, `height=480`, `timeout_s=60`, `interval_s=2` | list[ImageContent(image/png), TextContent({stop_reason: changed\|deadline, polls, elapsed_ms, frame_hash})] or deadline dict |
-| `hyperv_console_capture_sequence` | `vm_name`, `count=3`, `interval_s=2`, `width=640`, `height=480` | [first Image, last Image, meta_text(frames[] with per-frame hash + changed_bytes)] |
+| `hyperv_console_capture_sequence` | `vm_name`, `count=3`, `interval_s=2`, `width=640`, `height=480` | [first Image, last Image (a single Image when count==1), meta_text(frames[] with per-frame hash + changed_bytes_vs_previous)] |
 
-Console notes: text rides the stdin channel (never in argv/script/errors); non-ASCII input must use type_scancodes; mouse coordinates are in the space of the observed image — pass `frame_width`/`frame_height` matching your screenshot dimensions to scale to head space, or omit them to use head coordinates directly; `wait_frame_change` with `baseline_hash=""` treats the first polled frame as the baseline; WinPE errors and wizard screens are returned as images for visual interpretation (no OCR is performed).
+Console notes: text rides the stdin channel (never in argv/script/errors); non-ASCII input must use type_scancodes; mouse coordinates are in the space of the observed image — pass `frame_width`/`frame_height` matching your screenshot dimensions to scale to head space, or omit them to use head coordinates directly; `wait_frame_change` with `baseline_hash=""` treats the first polled frame as the baseline, and a returned `frame_hash` can be passed back as `baseline_hash` to detect changes across calls (both are the full lowercase-hex sha256 of the raw frame payload); WinPE errors and wizard screens are returned as images for visual interpretation (no OCR is performed).
 
 ### VM & Media Preparation (deployment testing)
 
@@ -356,7 +356,7 @@ Console notes: text rides the stdin channel (never in argv/script/errors); non-A
 | `hyperv_vm_firmware_set_boot_order` | `vm_name`, `boot_type (Drive\|Network\|File)`, `confirm` | `{ok, first_boot}` |
 | `hyperv_vm_tpm_set` | `vm_name`, `enabled`, `confirm` | `{ok, tpm_enabled}` |
 | `hyperv_vm_secureboot_set` | `vm_name`, `enabled`, `template?`, `confirm` | `{ok, secure_boot, secure_boot_template}` |
-| `hyperv_vm_network_set` | `vm_name`, `switch_name` | `{ok, connected}` |
+| `hyperv_vm_network_set` | `vm_name`, `switch_name` | `{ok, switch_name}` |
 
 ### Orchestration
 

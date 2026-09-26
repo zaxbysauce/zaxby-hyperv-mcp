@@ -116,6 +116,23 @@ def test_combo_requires_non_modifier():
         _scancodes_for_combo(["ctrl", "alt"])
 
 
+def test_right_modifiers_use_extended_prefix():
+    # PS/2 set-1: right-ctrl = E0 1D, right-alt = E0 38 — the bare 0x1D/0x38
+    # bytes are indistinguishable from left-ctrl/left-alt.
+    assert _scancodes_for_key("rightctrl") == [0xE0, 0x1D, 0xE0, 0x9D]
+    assert _scancodes_for_key("rightalt") == [0xE0, 0x38, 0xE0, 0xB8]
+    assert _scancodes_for_key("leftctrl") == [0x1D, 0x9D]
+    assert _scancodes_for_key("leftalt") == [0x38, 0xB8]
+
+
+def test_combo_right_modifiers_carry_prefix():
+    codes = _scancodes_for_combo(["rightctrl", "a"])
+    assert codes[:2] == [0xE0, 0x1D]    # make carries the prefix
+    assert codes[-2:] == [0xE0, 0x9D]   # break carries the prefix
+    codes = _scancodes_for_combo(["ctrl", "a"])
+    assert codes[0] == 0x1D and codes[-1] == 0x9D  # left side stays unprefixed
+
+
 def test_case_insensitive_keys():
     assert _scancodes_for_key("ENTER") == _scancodes_for_key("enter")
 
@@ -367,3 +384,133 @@ def test_capture_sequence_diff_metrics(monkeypatch, unrestricted):
     assert [f["changed_bytes_vs_previous"] for f in out["frames"]] == [0, 2, 0]
     assert out["frames"][0]["frame_hash"] != out["frames"][1]["frame_hash"]
     assert out["frames"][1]["frame_hash"] == out["frames"][2]["frame_hash"]
+
+
+# ---------------------------------------------------------------------------
+# screenshot save_path policy (review PRR-016/PRR-021)
+# ---------------------------------------------------------------------------
+
+def test_screenshot_save_path_writes_and_creates_parent(monkeypatch, tmp_path):
+    cfg = Config(unrestricted=True, host_write_roots=[str(tmp_path)])
+    dest = tmp_path / "shots" / "sub" / "frame.png"
+    fake = FakePS()  # adaptive: guid, head, capture (lands on 640x480 fallback)
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    img, meta = console.screenshot(cfg, "vm1", save_path=str(dest))
+    assert meta["saved_path"] == str(dest)
+    assert dest.is_file() and dest.stat().st_size > 8
+    assert img.size == (640, 480)
+
+
+def test_screenshot_save_path_denied_outside_write_roots(monkeypatch, tmp_path):
+    cfg = Config(allowed_vm_patterns=["*"], host_write_roots=[str(tmp_path / "allowed")])
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    outside = tmp_path / "elsewhere.png"
+    with pytest.raises(PolicyDenied, match="host write"):
+        console.screenshot(cfg, "vm1", save_path=str(outside))
+    assert not outside.exists()  # the write itself never happens
+
+
+def test_screenshot_fallback_chain_recovers(monkeypatch, unrestricted):
+    """Requested size fails -> chain falls through to 640x480 (TI-4)."""
+    w, h = 640, 480
+    payload = b"\x00\x00\x00\x00" + b"\x00\x00" * (w * h)
+    ok = pswindows.PSResult(stdout=json.dumps(
+        {"returnValue": 0, "imageDataB64": base64.b64encode(payload).decode()}),
+        returncode=0)
+    fake = FakePS([
+        pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
+        pswindows.PSResult(stdout='{"horizontal": 1024, "vertical": 768}', returncode=0),
+        pswindows.PSResult(returncode=1, stderr="capture boom"),  # 1024x768 fails
+        ok,                                                       # 640x480 succeeds
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    img, meta = console.screenshot(unrestricted, "vm1")
+    assert img.size == (640, 480)
+    assert meta["fallback_used"] == "1024x768 failed; captured at 640x480"
+
+
+def test_dimension_bounds_rejected_everywhere(unrestricted):
+    for kwargs in ({"width": 159}, {"height": 4097}):
+        with pytest.raises(ValueError, match="160..4096"):
+            console.screenshot(unrestricted, "vm1", **kwargs)
+        with pytest.raises(ValueError, match="160..4096"):
+            console.wait_frame_change(unrestricted, "vm1", **kwargs)
+        with pytest.raises(ValueError, match="160..4096"):
+            console.capture_sequence(unrestricted, "vm1", **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# wait_frame_change hash round-trip (review PRR-005)
+# ---------------------------------------------------------------------------
+
+def test_wait_frame_change_hash_roundtrips_as_baseline(monkeypatch, unrestricted):
+    """The HASH= value must be full lowercase-hex sha256 — byte-identical to
+    _frame_hash — so it passes baseline_hash validation and can be chained."""
+    import hashlib
+
+    w, h = 320, 240
+    payload = b"\x00\x00\x00\x00" + b"\x5a\xa5" * (w * h)
+    expected = hashlib.sha256(payload).hexdigest()
+    fake = FakePS([
+        pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
+        pswindows.PSResult(stdout=f"STOP=deadline POLLS=4 HASH={expected}", returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = console.wait_frame_change(unrestricted, "vm1", width=w, height=h)
+    assert out["frame_hash"] == expected
+    # the deadline-path hash must now be ACCEPTED as a baseline
+    changed = pswindows.PSResult(
+        stdout=f"STOP=changed POLLS=1 HASH={'f' * 64}\n"
+               f"FRAME={base64.b64encode(payload).decode()}", returncode=0)
+    fake2 = FakePS([
+        pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
+        changed,
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake2)
+    out2 = console.wait_frame_change(
+        unrestricted, "vm1", baseline_hash=out["frame_hash"], width=w, height=h)
+    assert out2["stop_reason"] == "changed"
+    assert out2["frame_hash"] == expected  # host/PS hash formats agree
+
+
+def test_display_info_emits_snake_case_enabled_state(monkeypatch, unrestricted):
+    fake = FakePS([
+        pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
+        pswindows.PSResult(stdout=json.dumps({
+            "enabled_state": 2, "head_horizontal": 1024, "head_vertical": 768,
+            "keyboard_present": True, "keyboard_enabled": None,
+            "mouse_present": False, "mouse_enabled": None}), returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = console.get_display_info(unrestricted, "vm1")
+    assert out["enabled_state"] == 2
+    assert "enabledState" not in fake.scripts[-1]
+
+
+# ---------------------------------------------------------------------------
+# click positioning branches (review TI-7)
+# ---------------------------------------------------------------------------
+
+def test_click_with_coordinates_positions_first(monkeypatch, unrestricted):
+    fake = FakePS([pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
+        pswindows.PSResult(stdout='{"horizontal": 1024, "vertical": 768}', returncode=0),
+        pswindows.PSResult(stdout="RC=0 DOWN=1", returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = console.click(unrestricted, "vm1", 160, 120, frame_width=320, frame_height=240)
+    assert out["head_x"] == 512 and out["head_y"] == 384  # scaled to head space
+    script = fake.scripts[-1]
+    assert "SetAbsolutePosition" in script and "ClickButton" in script
+
+
+def test_click_at_origin_skips_positioning(monkeypatch, unrestricted):
+    """x=0,y=0 means 'click at current position' — no SetAbsolutePosition."""
+    fake = FakePS([pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
+        pswindows.PSResult(stdout='{"horizontal": 1024, "vertical": 768}', returncode=0),
+        pswindows.PSResult(stdout="RC=0 DOWN=1", returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = console.click(unrestricted, "vm1", 0, 0)
+    assert "head_x" not in out and "head_y" not in out
+    script = fake.scripts[-1]
+    assert "SetAbsolutePosition" not in script
+    assert "ClickButton" in script
