@@ -28,7 +28,7 @@ class ConfigError(RuntimeError):
 
 @dataclass
 class DestructivePolicy:
-    """Per-category switches for destructive operations."""
+    """Per-category switches for destructive and interactive operations."""
 
     stop: bool = False
     reset: bool = False
@@ -37,6 +37,9 @@ class DestructivePolicy:
     kd_reboot: bool = False
     elevated_exec: bool = False
     guest_write: bool = False
+    console_input: bool = False
+    media: bool = False
+    vm_provision: bool = False
     require_confirm: bool = True
 
 

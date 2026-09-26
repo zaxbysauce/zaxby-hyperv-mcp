@@ -163,6 +163,22 @@ def vm_allowed(cfg: Config, vm_name: str) -> None:
     raise PolicyDenied("vm", "name does not match allowed_vm_patterns")
 
 
+def require_category(cfg: Config, category: str, detail: str) -> None:
+    """Gate an operation behind its category switch WITHOUT a confirm leg.
+
+    Used for reversible/interactive operations (console input, ISO
+    attach/detach, network connect) that must not force a human prompt per
+    call but must still be explicitly enabled. Destructive operations use
+    require_destructive instead.
+    """
+    if cfg.unrestricted or getattr(cfg.destructive, category, False):
+        return
+    raise PolicyDenied(
+        f"category:{category}",
+        f"disabled by config ({category}=false) — would {detail}",
+    )
+
+
 def require_destructive(cfg: Config, category: str, confirm: bool, detail: str) -> None:
     """Gate a destructive operation behind its config category + confirm.
 

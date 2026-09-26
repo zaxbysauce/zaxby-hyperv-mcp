@@ -19,6 +19,9 @@ def test_defaults_deny_every_axis():
     assert not cfg.destructive.kd_reboot
     assert not cfg.destructive.elevated_exec
     assert not cfg.destructive.guest_write
+    assert not cfg.destructive.console_input
+    assert not cfg.destructive.media
+    assert not cfg.destructive.vm_provision
     assert cfg.destructive.require_confirm
     assert not cfg.allow_inline_credentials
 

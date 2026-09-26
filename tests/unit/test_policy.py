@@ -221,6 +221,43 @@ def test_unrestricted_with_confirm_disabled_allows():
     require_destructive(cfg, "reset", confirm=False, detail="reset VM")
 
 
+def test_require_category_allows_enabled():
+    from hyperv_mcp.policy import require_category
+
+    cfg = Config()
+    cfg.destructive.console_input = True
+    require_category(cfg, "console_input", "type text")
+    cfg.destructive.media = True
+    require_category(cfg, "media", "attach iso")
+
+
+def test_require_category_denies_default():
+    from hyperv_mcp.policy import require_category
+
+    with pytest.raises(PolicyDenied, match="category:console_input"):
+        require_category(Config(), "console_input", "type text")
+    with pytest.raises(PolicyDenied, match="category:media"):
+        require_category(Config(), "media", "attach iso")
+    with pytest.raises(PolicyDenied, match="category:vm_provision"):
+        require_category(Config(), "vm_provision", "create vm")
+
+
+def test_require_category_unrestricted_bypasses():
+    from hyperv_mcp.policy import require_category
+
+    require_category(Config(unrestricted=True), "console_input", "type text")
+
+
+def test_require_category_has_no_confirm_leg():
+    """Interactive/reversible ops must not force a human prompt per call."""
+    from hyperv_mcp.policy import require_category
+
+    cfg = Config()
+    cfg.destructive.media = True
+    cfg.destructive.require_confirm = True  # must be irrelevant here
+    require_category(cfg, "media", "attach iso")  # no confirm arg at all
+
+
 def test_restricted_category_with_confirm_disabled_allows():
     cfg = Config()
     cfg.destructive.stop = True

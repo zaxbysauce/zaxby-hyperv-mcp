@@ -12,7 +12,7 @@ import json
 
 import pytest
 
-from hyperv_mcp import filetransfer, guestexec, lifecycle, pswindows
+from hyperv_mcp import console, filetransfer, guestexec, lifecycle, media, pswindows
 from hyperv_mcp.config import Config
 from hyperv_mcp.credentials import CredentialSet
 
@@ -261,3 +261,238 @@ def test_parse_guest_list_dir(monkeypatch, parsed_ps):
         r"C:\g-read", cred=CRED,
     )
     assert _parse_errors(script) == []
+
+
+# ---------------------------------------------------------------------------
+# console (WMI) templates — every generated script, all captured variants
+# ---------------------------------------------------------------------------
+
+def test_parse_console_capture(monkeypatch, parsed_ps):
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        console._capture_raw(UNRESTRICTED, "guid-1", 640, 480)
+    except Exception:
+        pass
+    assert rec.scripts, "capture produced no script"
+    for script in rec.scripts:
+        assert _parse_errors(script) == []
+
+
+def test_parse_console_capture_all_fallback_sizes(monkeypatch, parsed_ps):
+    """The fallback chain (requested → head → 640x480 → 320x240) must emit
+    parseable scripts for every size."""
+    for w, h in ((1024, 768), (640, 480), (320, 240), (160, 120)):
+        rec = Recorder()
+        monkeypatch.setattr(pswindows, "run_ps", rec)
+        try:
+            console._capture_raw(UNRESTRICTED, "guid-1", w, h)
+        except Exception:
+            pass
+        for script in rec.scripts:
+            assert _parse_errors(script) == []
+
+
+def test_parse_console_keyboard_type_text(monkeypatch, parsed_ps):
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        console.type_text(UNRESTRICTED, "vm1", "hello world 123")
+    except Exception:
+        pass
+    for script in rec.scripts:
+        assert _parse_errors(script) == []
+
+
+def test_parse_console_keyboard_press_key_all_variants(monkeypatch, parsed_ps):
+    """Named keys (plain + extended 0xE0) and combos — every array shape."""
+    for key in ("enter", "escape", "space", "up", "delete", "f12", "a", "5"):
+        rec = Recorder()
+        monkeypatch.setattr(pswindows, "run_ps", rec)
+        try:
+            console.press_key(UNRESTRICTED, "vm1", key)
+        except Exception:
+            pass
+        for script in rec.scripts:
+            assert _parse_errors(script) == []
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        console.key_combo(UNRESTRICTED, "vm1", ["ctrl", "alt", "delete"])
+    except Exception:
+        pass
+    for script in rec.scripts:
+        assert _parse_errors(script) == []
+
+
+def test_parse_console_mouse_ops(monkeypatch, parsed_ps):
+    for op in (
+        lambda: console.mouse_move(UNRESTRICTED, "vm1", 100, 50),
+        lambda: console.mouse_move(UNRESTRICTED, "vm1", 100, 50, 640, 480),
+        lambda: console.click(UNRESTRICTED, "vm1", 100, 50, 640, 480),
+        lambda: console.click(UNRESTRICTED, "vm1"),
+        lambda: console.mouse_button(UNRESTRICTED, "vm1", 1, True),
+        lambda: console.scroll(UNRESTRICTED, "vm1", 3),
+    ):
+        rec = Recorder()
+        monkeypatch.setattr(pswindows, "run_ps", rec)
+        try:
+            op()
+        except Exception:
+            pass
+        for script in rec.scripts:
+            assert _parse_errors(script) == []
+
+
+def test_parse_console_display_info(monkeypatch, parsed_ps):
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        console.get_display_info(UNRESTRICTED, "vm1")
+    except Exception:
+        pass
+    for script in rec.scripts:
+        assert _parse_errors(script) == []
+
+
+def test_parse_console_wait_frame_change(monkeypatch, parsed_ps):
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        console.wait_frame_change(UNRESTRICTED, "vm1", "abc", 640, 480, 5, 1)
+    except Exception:
+        pass
+    for script in rec.scripts:
+        assert _parse_errors(script) == []
+
+
+def test_wait_script_hash_is_full_hex_sha256(monkeypatch, parsed_ps):
+    """Review PRR-005 pin: the PS-side HASH must be the full lowercase-hex
+    sha256 — the same bytes/format as the host-side _frame_hash — so a
+    returned frame_hash round-trips through baseline_hash validation
+    (64-hex) and matches PS-side comparisons. The old base64 Substring(0,32)
+    form broke the documented chaining contract."""
+    monkeypatch.setattr(console, "_vm_guid", lambda cfg, vm: "guid-1")
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        console.wait_frame_change(UNRESTRICTED, "vm1", "", 640, 480, 5, 1)
+    except Exception:
+        pass
+    wait_scripts = [s for s in rec.scripts if "$baseline" in s]
+    assert wait_scripts, "wait script not generated"
+    for script in wait_scripts:
+        assert "BitConverter]::ToString" in script
+        assert "ToLowerInvariant()" in script
+        assert "Substring(0, 32)" not in script
+        assert "$hash -ne $baseline" in script
+
+
+# ---------------------------------------------------------------------------
+# media templates
+# ---------------------------------------------------------------------------
+
+def test_parse_media_vm_create(monkeypatch, parsed_ps, tmp_path):
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        media.vm_create(
+            UNRESTRICTED, "test-vm-1", memory_mb=1024, cpu_count=2, generation=2,
+            vhd_path=str(tmp_path / "disk.vhdx"), vhd_size_gb=30,
+            switch_name="LabSwitch", confirm=True,
+        )
+    except Exception:
+        pass
+    for script in rec.scripts:
+        assert _parse_errors(script) == []
+
+
+def test_parse_media_vm_create_no_switch(monkeypatch, parsed_ps, tmp_path):
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        media.vm_create(
+            UNRESTRICTED, "test-vm-1", vhd_path=str(tmp_path / "disk.vhdx"),
+            confirm=True,
+        )
+    except Exception:
+        pass
+    for script in rec.scripts:
+        assert _parse_errors(script) == []
+
+
+def test_parse_media_disk_add(monkeypatch, parsed_ps, tmp_path):
+    for ctype in ("SCSI", "IDE"):
+        rec = Recorder()
+        monkeypatch.setattr(pswindows, "run_ps", rec)
+        try:
+            media.vm_disk_add(
+                UNRESTRICTED, "vm1", str(tmp_path / "d.vhdx"), 50, ctype, confirm=True,
+            )
+        except Exception:
+            pass
+        for script in rec.scripts:
+            assert _parse_errors(script) == []
+
+
+def test_parse_media_attach_detach_list(monkeypatch, parsed_ps, tmp_path):
+    iso = tmp_path / "media.iso"
+    iso.write_bytes(b"x")
+    for op in (
+        lambda: media.vm_media_attach(UNRESTRICTED, "vm1", str(iso)),
+        lambda: media.vm_media_detach(UNRESTRICTED, "vm1"),
+        lambda: media.vm_media_list(UNRESTRICTED, "vm1"),
+        lambda: media.vm_network_set(UNRESTRICTED, "vm1", "LabSwitch"),
+    ):
+        rec = Recorder()
+        monkeypatch.setattr(pswindows, "run_ps", rec)
+        try:
+            op()
+        except Exception:
+            pass
+        for script in rec.scripts:
+            assert _parse_errors(script) == []
+
+
+def test_parse_media_firmware_and_security(monkeypatch, parsed_ps):
+    for op in (
+        lambda: media.vm_firmware_get(UNRESTRICTED, "vm1"),
+        lambda: media.vm_firmware_set_boot_order(UNRESTRICTED, "vm1", "Drive", True),
+        lambda: media.vm_firmware_set_boot_order(UNRESTRICTED, "vm1", "Network", True),
+        lambda: media.vm_tpm_set(UNRESTRICTED, "vm1", True, True),
+        lambda: media.vm_tpm_set(UNRESTRICTED, "vm1", False, True),
+        lambda: media.vm_secureboot_set(UNRESTRICTED, "vm1", True, "", True),
+        lambda: media.vm_secureboot_set(UNRESTRICTED, "vm1", False, "", True),
+        lambda: media.vm_secureboot_set(UNRESTRICTED, "vm1", True, "MicrosoftWindows", True),
+    ):
+        rec = Recorder()
+        monkeypatch.setattr(pswindows, "run_ps", rec)
+        try:
+            op()
+        except Exception:
+            pass
+        for script in rec.scripts:
+            assert _parse_errors(script) == []
+
+
+def test_parse_media_disk_list(monkeypatch, parsed_ps):
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        media.vm_disk_list(UNRESTRICTED, "vm1")
+    except Exception:
+        pass
+    for script in rec.scripts:
+        assert _parse_errors(script) == []
+
+
+def test_parse_wait_vm_state(monkeypatch, parsed_ps):
+    for states in (["Off"], ["Running", "Saved"], ["Stopping", "Off"]):
+        rec = Recorder()
+        monkeypatch.setattr(pswindows, "run_ps", rec)
+        try:
+            lifecycle.wait_for_vm_state(UNRESTRICTED, "vm1", states, 30)
+        except Exception:
+            pass
+        for script in rec.scripts:
+            assert _parse_errors(script) == []

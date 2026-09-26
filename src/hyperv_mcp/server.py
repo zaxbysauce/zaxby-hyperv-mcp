@@ -1,8 +1,9 @@
 """
 hyperv_mcp.server -- MCP server for Hyper-V VM management (hardened fork).
 
-Exposes 19 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
-guest execution and file transfer via PowerShell Direct. Security model:
+Exposes 43 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
+guest execution and file transfer via PowerShell Direct, console observation
+and input (WMI), VM/media provisioning, and orchestration waits. Security model:
 
   - Credentials resolve from env vars / credential files; username/password
     tool parameters exist only when config allow_inline_credentials=true.
@@ -19,14 +20,16 @@ worked examples. Run `hyperv-mcp --check-env` to print the effective policy.
 """
 
 import argparse
+import io
 import os
 import sys
+from typing import Any
 
 from mcp.server.auth.settings import AuthSettings
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 from pydantic import AnyHttpUrl
 
-from . import auditlog, credentials, filetransfer, guestexec, lifecycle, policy, pswindows
+from . import auditlog, console, credentials, filetransfer, guestexec, lifecycle, media, policy, pswindows
 from .config import Config, ConfigError
 from .credentials import CredentialError
 from .vmlocks import VMBusy
@@ -717,6 +720,405 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             guestexec.victim_run_ps, _cfg(), vm_name, script,
             timeout_ms=timeout_ms, cred_factory=credentials.resolve_victim,
         )
+
+    # ---- console (WMI screenshot / keyboard / mouse) --------------------
+    # Image-returning tools (screenshot/wait_frame_change/capture_sequence)
+    # return a LIST [Image, meta_dict] on success and RAISE on failure, so
+    # the success shape is uniformly image content + a metadata text block
+    # (FastMCP converts the list: ImageContent + TextContent). Input tools
+    # use the {ok,...}/{ok:false,error,error_class} envelope.
+
+    def _run_console_tool(tool: str, vm: str, category: str, fn, *args, **kwargs):
+        try:
+            with _audit(tool, vm, category):
+                return fn(*args, **kwargs)
+        except policy.PolicyDenied as exc:
+            return {"ok": False, "error": str(exc), "error_class": "policy"}
+        except console.ConsoleError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "transport"}
+        except VMBusy as exc:
+            return {"ok": False, "error": str(exc), "error_class": "busy"}
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "invalid"}
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "transport"}
+
+    @mcp.tool()
+    def hyperv_console_screenshot(
+        vm_name: str, width: int = 1024, height: int = 768, save_path: str = ""
+    ) -> Any:
+        """Capture the VM console via Hyper-V WMI (works from firmware through
+        WinPE; independent of VMConnect, host foreground, guest login/network).
+        Returns MCP image content (image/png) plus a metadata text block:
+        vm_id, dimensions, frame_hash, head resolution and scale note,
+        fallback_used, capture method. Fallback chain: requested → head
+        native → 640x480 → 320x240. A corrupt/short payload is a structured
+        error, never a successful image.
+
+        Args:
+            vm_name:  VM name (must match allowed_vm_patterns)
+            width:    requested snapshot width (160..4096)
+            height:   requested snapshot height (160..4096)
+            save_path: optional host path to also save the PNG (host_write policy)
+
+        Returns: [ImageContent(image/png), TextContent(json metadata)]
+        """
+        try:
+            with _audit("hyperv_console_screenshot", vm_name, "read"):
+                img, meta = console.screenshot(_cfg(), vm_name, width, height, save_path)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                # ImageContent is a pydantic model; the raw FastMCP Image
+                # wrapper is not and breaks serialization across the mcp
+                # versions in the CI matrix.
+                return [Image(data=buf.getvalue(), format="png").to_image_content(), meta]
+        except policy.PolicyDenied as exc:
+            return {"ok": False, "error": str(exc), "error_class": "policy"}
+
+    @mcp.tool()
+    def hyperv_console_get_display_info(vm_name: str) -> dict:
+        """Display head resolution, keyboard/mouse device presence and state,
+        and guest-channel readiness (console works in firmware/WinPE;
+        PowerShell Direct needs a running supported guest OS).
+
+        Returns: {ok, enabled_state, head_horizontal, head_vertical,
+                  keyboard_present, keyboard_enabled, mouse_present,
+                  mouse_enabled, guest_channel, guest_channel_note, vm_id}
+        """
+        return _run_console_tool(
+            "hyperv_console_get_display_info", vm_name, "read",
+            console.get_display_info, _cfg(), vm_name,
+        )
+
+    @mcp.tool()
+    def hyperv_console_type_text(vm_name: str, text: str) -> dict:
+        """Type ASCII text into the VM console via Msvm_Keyboard.TypeText
+        (works pre-login, in WinPE). Text rides the stdin channel — it never
+        appears in process argv, the PowerShell script, or error records.
+        Chunks over 512 chars with pacing. For non-ASCII input use
+        hyperv_console_type_scancodes. Policy: console_input category.
+
+        Returns: {ok, chunks, chars} or {ok: false, error, error_class}
+        """
+        return _run_console_tool(
+            "hyperv_console_type_text", vm_name, "console_input",
+            console.type_text, _cfg(), vm_name, text,
+        )
+
+    @mcp.tool()
+    def hyperv_console_press_key(
+        vm_name: str, key: str, modifiers: list[str] | None = None,
+    ) -> dict:
+        """Press a named key (scan-code make/break pair) with optional
+        modifiers (ctrl/alt/shift). Supported keys: enter, escape, tab,
+        backspace, space, up/down/left/right, delete, home, end, pageup,
+        pagedown, insert, f1-f12, a-z, 0-9. Policy: console_input.
+
+        Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class}
+        """
+        return _run_console_tool(
+            "hyperv_console_press_key", vm_name, "console_input",
+            console.press_key, _cfg(), vm_name, key, modifiers,
+        )
+
+    @mcp.tool()
+    def hyperv_console_key_combo(vm_name: str, keys: list[str]) -> dict:
+        """Send a key combination: modifier makes first, keys in order,
+        modifier breaks last (e.g. ["ctrl", "alt", "delete"]).
+        Policy: console_input.
+
+        Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class}
+        """
+        return _run_console_tool(
+            "hyperv_console_key_combo", vm_name, "console_input",
+            console.key_combo, _cfg(), vm_name, keys,
+        )
+
+    @mcp.tool()
+    def hyperv_console_type_scancodes(vm_name: str, scancodes: list[int]) -> dict:
+        """Send raw PS/2 scan codes (0..255 ints, make/break pairs included)
+        via Msvm_Keyboard.TypeScancodes; chunked at 64 codes with pacing.
+        Policy: console_input.
+
+        Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class}
+        """
+        return _run_console_tool(
+            "hyperv_console_type_scancodes", vm_name, "console_input",
+            console.type_scancodes, _cfg(), vm_name, scancodes,
+        )
+
+    @mcp.tool()
+    def hyperv_console_mouse_move(
+        vm_name: str, x: int, y: int, frame_width: int = 0, frame_height: int = 0,
+    ) -> dict:
+        """Position the synthetic mouse. Coordinates are in the space of the
+        image you observed; give frame_width/frame_height (the snapshot
+        dimensions) to scale them to display-head space. Without frame dims
+        the head resolution must be available, else the tool errors rather
+        than clicking blind. Policy: console_input.
+
+        Returns: {ok, operation, head_x, head_y} or {ok: false, error, error_class}
+        """
+        return _run_console_tool(
+            "hyperv_console_mouse_move", vm_name, "console_input",
+            console.mouse_move, _cfg(), vm_name, x, y, frame_width, frame_height,
+        )
+
+    @mcp.tool()
+    def hyperv_console_click(
+        vm_name: str, x: int = 0, y: int = 0, frame_width: int = 0,
+        frame_height: int = 0, button: int = 1,
+    ) -> dict:
+        """Click at frame-space coordinates (optional; positions first when
+        x/y are given, else clicks at the current position). button: 1=left,
+        2=right. Verify placement with a screenshot between steps — never
+        assume focus from a prior frame. Policy: console_input.
+
+        Returns: {ok, operation, head_x?, head_y?} or {ok: false, error, error_class}
+        """
+        return _run_console_tool(
+            "hyperv_console_click", vm_name, "console_input",
+            console.click, _cfg(), vm_name, x, y, frame_width, frame_height, button,
+        )
+
+    @mcp.tool()
+    def hyperv_console_button(vm_name: str, button: int, is_down: bool) -> dict:
+        """Hold or release a mouse button (raw SetButtonState; for drag
+        gestures). Policy: console_input.
+
+        Returns: {ok, operation} or {ok: false, error, error_class}
+        """
+        return _run_console_tool(
+            "hyperv_console_button", vm_name, "console_input",
+            console.mouse_button, _cfg(), vm_name, button, is_down,
+        )
+
+    @mcp.tool()
+    def hyperv_console_scroll(vm_name: str, delta: int) -> dict:
+        """Scroll the console wheel by delta (positive = down).
+        Policy: console_input.
+
+        Returns: {ok, operation} or {ok: false, error, error_class}
+        """
+        return _run_console_tool(
+            "hyperv_console_scroll", vm_name, "console_input",
+            console.scroll, _cfg(), vm_name, delta,
+        )
+
+    @mcp.tool()
+    def hyperv_console_wait_frame_change(
+        vm_name: str, baseline_hash: str = "", width: int = 640, height: int = 480,
+        timeout_s: int = 60, interval_s: int = 2,
+    ) -> Any:
+        """Poll the console until the frame changes (or the deadline passes).
+        Bounded: polls = ceil(timeout_s/interval_s), deadline enforced
+        host-side. Returns [ImageContent(image/png), TextContent(json)] when
+        changed — {stop_reason: changed|deadline, polls, elapsed_ms,
+        frame_hash, width, height} in the text block — or a deadline dict
+        with no image. Never invents text for what is on screen: interpret
+        the returned image visually.
+
+        Args:
+            baseline_hash: frame_hash from a previous capture ("" compares
+                           against nothing — first poll's frame is baseline)
+        """
+        try:
+            with _audit("hyperv_console_wait_frame_change", vm_name, "read"):
+                out = console.wait_frame_change(
+                    _cfg(), vm_name, baseline_hash, width, height, timeout_s, interval_s
+                )
+                meta = {k: v for k, v in out.items() if k != "image"}
+                if "image" in out:
+                    buf = io.BytesIO()
+                    out["image"].save(buf, format="PNG")
+                    return [Image(data=buf.getvalue(), format="png").to_image_content(), meta]
+                return meta
+        except policy.PolicyDenied as exc:
+            return {"ok": False, "error": str(exc), "error_class": "policy"}
+
+    @mcp.tool()
+    def hyperv_console_capture_sequence(
+        vm_name: str, count: int = 3, interval_s: int = 2,
+        width: int = 640, height: int = 480,
+    ) -> Any:
+        """Capture a bounded sequence of console frames with per-frame hashes
+        and changed-byte counts vs the previous frame (transition evidence,
+        not progress inference). Returns [first Image, last Image, meta_text]
+        (a single Image when count==1) where meta carries frames[] (index,
+        frame_hash, changed_bytes_vs_previous, captured_at), elapsed_ms, dimensions.
+        """
+        try:
+            with _audit("hyperv_console_capture_sequence", vm_name, "read"):
+                out = console.capture_sequence(
+                    _cfg(), vm_name, count, interval_s, width, height
+                )
+                meta = {k: v for k, v in out.items() if k != "images"}
+                parts: list = []
+                imgs = list(out["images"])
+                for img in imgs:
+                    buf = io.BytesIO()
+                    img.save(buf, format="PNG")
+                    parts.append(Image(data=buf.getvalue(), format="png").to_image_content())
+                parts.append(meta)
+                return parts
+        except policy.PolicyDenied as exc:
+            return {"ok": False, "error": str(exc), "error_class": "policy"}
+
+    @mcp.tool()
+    def hyperv_wait_vm_state(
+        vm_name: str, states: list[str], timeout_s: int = 300,
+    ) -> dict:
+        """Wait (bounded) until the VM reaches one of the requested states.
+        states must be from: Off, Running, Saved, Paused, Starting, Stopping,
+        Resuming, Pausing. Reports guest-channel readiness for handoff:
+        console input works in firmware/WinPE, PowerShell Direct only after
+        Windows boots — verify hyperv_console_get_display_info before
+        switching channels.
+
+        Returns: {ok, final_state, guest_channel} — raises RuntimeError with
+        the last observed state if the deadline expires first.
+        """
+        for s in states:
+            if s not in lifecycle.VALID_STATES:
+                raise ValueError(
+                    f"invalid state {s!r}; must be one of {lifecycle.VALID_STATES} "
+                    "(strict validation: no shell metacharacters possible)"
+                )
+        with _audit("hyperv_wait_vm_state", vm_name, "read"):
+            final = lifecycle.wait_for_vm_state(_cfg(), vm_name, list(states), timeout_s)
+            return {"ok": True, "final_state": final, "guest_channel": "ps_direct_unverified"}
+
+    # ---- VM / media preparation (deployment testing) ---------------------
+
+    @mcp.tool()
+    def hyperv_vm_create(
+        name: str, vhd_path: str, memory_mb: int = 2048, cpu_count: int = 1,
+        generation: int = 2, vhd_size_gb: int = 64, switch_name: str = "",
+        confirm: bool = False,
+    ) -> dict:
+        """Create a disposable VM with a fresh VHDX (New-VHD + New-VM). The
+        new name must match allowed_vm_patterns so it stays policy-scoped.
+        Policy: vm_provision category + confirm=true.
+
+        Returns: {ok, id, name, state, generation} or raises.
+        """
+        with _audit("hyperv_vm_create", name, "vm_provision"):
+            return media.vm_create(
+                _cfg(), name, memory_mb, cpu_count, generation,
+                vhd_path, vhd_size_gb, switch_name, confirm,
+            )
+
+    @mcp.tool()
+    def hyperv_vm_disk_add(
+        vm_name: str, path: str, size_gb: int, controller_type: str = "SCSI",
+        confirm: bool = False,
+    ) -> dict:
+        """Create and attach an additional VHDX (for multi-disk deployment
+        tests). Policy: vm_provision + confirm=true.
+
+        Returns: {ok, vhd_path, disk_count} or raises.
+        """
+        with _audit("hyperv_vm_disk_add", vm_name, "vm_provision"):
+            return media.vm_disk_add(
+                _cfg(), vm_name, path, size_gb, controller_type, confirm,
+            )
+
+    @mcp.tool()
+    def hyperv_vm_disk_list(vm_name: str) -> dict:
+        """List the VM's hard disks (controller type/number, LUN, path) —
+        use to verify disk topology before deployment runs.
+
+        Returns: {ok, disks: [...]}
+        """
+        with _audit("hyperv_vm_disk_list", vm_name, "read"):
+            return media.vm_disk_list(_cfg(), vm_name)
+
+    @mcp.tool()
+    def hyperv_vm_media_attach(vm_name: str, iso_path: str) -> dict:
+        """Attach an ISO to a virtual DVD drive (Add-VMDvdDrive). Verify the
+        ISO is the intended, freshly built media before claiming a deployment
+        tests new fixes. Policy: media category (reversible, no confirm).
+        iso_path requires host_read policy.
+
+        Returns: {ok, iso_path} or raises.
+        """
+        with _audit("hyperv_vm_media_attach", vm_name, "media"):
+            return media.vm_media_attach(_cfg(), vm_name, iso_path)
+
+    @mcp.tool()
+    def hyperv_vm_media_detach(vm_name: str) -> dict:
+        """Detach all virtual DVD drives; returns the removed ISO paths.
+        Policy: media category (reversible, no confirm).
+
+        Returns: {ok, removed: [...]} or raises.
+        """
+        with _audit("hyperv_vm_media_detach", vm_name, "media"):
+            return media.vm_media_detach(_cfg(), vm_name)
+
+    @mcp.tool()
+    def hyperv_vm_media_list(vm_name: str) -> dict:
+        """List virtual DVD drives and attached ISO paths.
+
+        Returns: {ok, media: [...]}
+        """
+        with _audit("hyperv_vm_media_list", vm_name, "read"):
+            return media.vm_media_list(_cfg(), vm_name)
+
+    @mcp.tool()
+    def hyperv_vm_firmware_get(vm_name: str) -> dict:
+        """Firmware state for Gen2 VMs: SecureBoot, template, boot order,
+        TPM enabled. Generation 1 returns an explicit error.
+
+        Returns: {ok, secure_boot, secure_boot_template, boot_order, tpm_enabled}
+        """
+        with _audit("hyperv_vm_firmware_get", vm_name, "read"):
+            return media.vm_firmware_get(_cfg(), vm_name)
+
+    @mcp.tool()
+    def hyperv_vm_firmware_set_boot_order(
+        vm_name: str, boot_type: str = "Drive", confirm: bool = False,
+    ) -> dict:
+        """Set the first boot device by type (Drive | Network | File) — e.g.
+        boot from attached DVD media. Policy: vm_provision + confirm=true.
+        Generation 1 returns an explicit error.
+
+        Returns: {ok, first_boot} or raises.
+        """
+        with _audit("hyperv_vm_firmware_set_boot_order", vm_name, "vm_provision"):
+            return media.vm_firmware_set_boot_order(_cfg(), vm_name, boot_type, confirm)
+
+    @mcp.tool()
+    def hyperv_vm_tpm_set(vm_name: str, enabled: bool, confirm: bool = False) -> dict:
+        """Enable or disable the virtual TPM (Gen2 only).
+        Policy: vm_provision + confirm=true.
+
+        Returns: {ok, tpm_enabled} or raises.
+        """
+        with _audit("hyperv_vm_tpm_set", vm_name, "vm_provision"):
+            return media.vm_tpm_set(_cfg(), vm_name, enabled, confirm)
+
+    @mcp.tool()
+    def hyperv_vm_secureboot_set(
+        vm_name: str, enabled: bool, template: str = "", confirm: bool = False,
+    ) -> dict:
+        """Enable or disable Secure Boot (Gen2 only), optionally setting the
+        template (e.g. MicrosoftWindows, MicrosoftUEFICertificateAuthority).
+        Policy: vm_provision + confirm=true.
+
+        Returns: {ok, secure_boot, secure_boot_template} or raises.
+        """
+        with _audit("hyperv_vm_secureboot_set", vm_name, "vm_provision"):
+            return media.vm_secureboot_set(_cfg(), vm_name, enabled, template, confirm)
+
+    @mcp.tool()
+    def hyperv_vm_network_set(vm_name: str, switch_name: str) -> dict:
+        """Connect the VM's network adapter to a virtual switch.
+        Policy: media category (reversible, no confirm).
+
+        Returns: {ok, switch_name} or raises.
+        """
+        with _audit("hyperv_vm_network_set", vm_name, "media"):
+            return media.vm_network_set(_cfg(), vm_name, switch_name)
 
 
 # ---------------------------------------------------------------------------
