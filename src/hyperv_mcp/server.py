@@ -767,7 +767,10 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 img, meta = console.screenshot(_cfg(), vm_name, width, height, save_path)
                 buf = io.BytesIO()
                 img.save(buf, format="PNG")
-                return [Image(data=buf.getvalue(), format="png"), meta]
+                # ImageContent is a pydantic model; the raw FastMCP Image
+                # wrapper is not and breaks serialization across the mcp
+                # versions in the CI matrix.
+                return [Image(data=buf.getvalue(), format="png").to_image_content(), meta]
         except policy.PolicyDenied as exc:
             return {"ok": False, "error": str(exc), "error_class": "policy"}
 
@@ -927,7 +930,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 if "image" in out:
                     buf = io.BytesIO()
                     out["image"].save(buf, format="PNG")
-                    return [Image(data=buf.getvalue(), format="png"), meta]
+                    return [Image(data=buf.getvalue(), format="png").to_image_content(), meta]
                 return meta
         except policy.PolicyDenied as exc:
             return {"ok": False, "error": str(exc), "error_class": "policy"}
@@ -954,7 +957,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 for img in imgs:
                     buf = io.BytesIO()
                     img.save(buf, format="PNG")
-                    parts.append(Image(data=buf.getvalue(), format="png"))
+                    parts.append(Image(data=buf.getvalue(), format="png").to_image_content())
                 parts.append(meta)
                 return parts
         except policy.PolicyDenied as exc:

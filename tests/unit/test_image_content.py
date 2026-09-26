@@ -135,3 +135,49 @@ def test_deadline_wait_returns_no_image_block(monkeypatch, fresh_server):
     ))
     content = result[0] if isinstance(result, tuple) else result
     assert not [c for c in content if getattr(c, "type", "") == "image"]
+
+
+def test_tools_never_return_raw_image_objects(monkeypatch, fresh_server):
+    """Tool functions must return mcp.types ImageContent, never the FastMCP
+    Image wrapper. On Python 3.10, `-> Any` builds a wrapped output model and
+    convert_result model_dumps the raw return — a raw Image raises
+    PydanticSerializationError there. Python 3.11+ skips that path, so CI's
+    failure was invisible on a 3.11 dev box: assert on the raw return instead.
+    """
+    import asyncio
+
+    from mcp.server.fastmcp.utilities.types import Image as FastMCPImage
+
+    _mock_capture(monkeypatch, 320, 240)
+    mcp = fresh_server.get_mcp()
+    raw = asyncio.run(mcp._tool_manager.call_tool(
+        "hyperv_console_screenshot",
+        {"vm_name": "test-vm-1", "width": 320, "height": 240},
+        context=None,
+    ))
+    assert isinstance(raw, list)
+    assert not [v for v in raw if isinstance(v, FastMCPImage)]
+    assert [v for v in raw if isinstance(v, ImageContent)]
+
+
+def test_wrapped_any_output_model_dumps_image_content():
+    """Pin the exact Python 3.10 mechanism: `-> Any` builds snapOutput(result: Any)
+    with wrap_output=True, and convert_result model_dumps the raw return. That
+    path must serialize our [ImageContent, meta] returns without error.
+    """
+    from typing import Any
+
+    from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase, FuncMetadata
+    from pydantic import create_model
+
+    wrapped = create_model("toolOutput", result=(Any, ...))
+    md = FuncMetadata(
+        arg_model=create_model("toolArguments", __base__=ArgModelBase),
+        output_schema=wrapped.model_json_schema(),
+        output_model=wrapped,
+        wrap_output=True,
+    )
+    block = ImageContent(type="image", data="eA==", mimeType="image/png")
+    unstructured, structured = md.convert_result([block, {"frame_hash": "abc"}])
+    assert [c.type for c in unstructured] == ["image", "text"]
+    assert structured["result"][1]["frame_hash"] == "abc"
