@@ -130,6 +130,24 @@ def _wait_for_state(cfg: Config, vm_name: str, wanted: list[str], timeout_s: int
     return final
 
 
+_VALID_STATES = ("Off", "Running", "Saved", "Paused", "Starting", "Stopping", "Resuming", "Pausing")
+
+
+def wait_for_vm_state(cfg: Config, vm_name: str, states: list[str], timeout_s: int = 300) -> str:
+    """Public bounded wait used by hyperv_wait_vm_state. States are validated
+    STRICTLY against the Hyper-V state enum (caller strings must never reach
+    the generated script unvalidated)."""
+    for state in states:
+        if state not in _VALID_STATES:
+            raise ValueError(f"invalid state {state!r}; must be one of {_VALID_STATES}")
+    if not states:
+        raise ValueError("states list is required")
+    if timeout_s < 1:
+        raise ValueError("timeout_s must be >= 1")
+    _checked_vm(cfg, vm_name)
+    return _wait_for_state(cfg, vm_name, list(states), timeout_s)
+
+
 # ---------------------------------------------------------------------------
 # VM lifecycle
 # ---------------------------------------------------------------------------

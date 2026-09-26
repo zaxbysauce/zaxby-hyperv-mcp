@@ -1,7 +1,7 @@
 # hyperv-mcp (hardened fork)
 
 An MCP (Model Context Protocol) server for Hyper-V VM management and guest
-execution. Exposes 19 tools for VM lifecycle, checkpoint management, kernel
+execution. Exposes 43 tools for VM lifecycle, checkpoint management, kernel
 debug setup (KDNET/KDCOM), and guest file transfer/command execution via
 PowerShell Direct (no WinRM required).
 
@@ -138,6 +138,9 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
     "stop": true, "reset": false, "checkpoint_restore": true,
     "checkpoint_remove": true, "kd_reboot": true, "elevated_exec": true,
     "guest_write": true,
+    "console_input": true,        // virtual keyboard + mouse input
+    "media": true,                // ISO attach/detach, network connect
+    "vm_provision": true,         // VM create, disk add, firmware, TPM, SecureBoot
     "require_confirm": true       // tools additionally need confirm=true
   },
   "allow_inline_credentials": false,   // expose username/password tool params
@@ -200,6 +203,9 @@ These tools refuse to run unless their category is enabled **and** (when
 | `hyperv_configure_kdnet` / `hyperv_configure_kdcom` | `kd_reboot` |
 | `hyperv_guest_run(_ps)` with `elevated=true` | `elevated_exec` |
 | `hyperv_guest_put` (guest write) | `guest_write` |
+| `hyperv_console_type_text` / `press_key` / `key_combo` / `type_scancodes` / `mouse_move` / `click` / `button` / `scroll` | `console_input` (no confirm — non-destructive interactive input) |
+| `hyperv_vm_media_attach` / `media_detach` / `network_set` | `media` (reversible, no confirm) |
+| `hyperv_vm_create` / `disk_add` / `firmware_set_boot_order` / `tpm_set` / `secureboot_set` | `vm_provision` + `confirm` |
 
 Denials return a structured `policy` error (no secrets, no speculative paths).
 Concurrency is also guarded: one operation per VM at a time (`busy` error
@@ -232,7 +238,7 @@ claude mcp add hyperv -- hyperv-mcp
 
 ---
 
-## Available Tools (19 total)
+## Available Tools (43 total)
 
 ### VM Lifecycle
 
@@ -316,6 +322,61 @@ cases and requires the VM Off/Saved for the `Set-VMComPort` step.
 Environment-only victim credentials; never elevated.
 
 ---
+
+### VM Console (WMI — works from firmware through WinPE)
+
+| Tool | Parameters | Returns |
+|------|-----------|---------|
+| `hyperv_console_screenshot` | `vm_name`, `width=1024`, `height=768`, `save_path?` | MCP ImageContent(image/png) + metadata text (vm_id, frame_hash, head res, scale note, fallback_used, captured_at) |
+| `hyperv_console_get_display_info` | `vm_name` | `{ok, enabled_state, head_horizontal, head_vertical, keyboard_present, keyboard_enabled, mouse_present, mouse_enabled, guest_channel, guest_channel_note, vm_id}` |
+| `hyperv_console_type_text` | `vm_name`, `text` (ASCII) | `{ok, chunks, chars}` |
+| `hyperv_console_press_key` | `vm_name`, `key`, `modifiers[]` | `{ok, scancodes_sent, chunks}` |
+| `hyperv_console_key_combo` | `vm_name`, `keys[]` | `{ok, scancodes_sent, chunks}` |
+| `hyperv_console_type_scancodes` | `vm_name`, `scancodes[]` (0..255) | `{ok, scancodes_sent, chunks}` |
+| `hyperv_console_mouse_move` | `vm_name`, `x`, `y`, `frame_width?`, `frame_height?` | `{ok, operation, head_x, head_y}` |
+| `hyperv_console_click` | `vm_name`, `x?=0`, `y?=0`, `frame_width?=0`, `frame_height?=0`, `button=1` | `{ok, operation, head_x?, head_y?}` |
+| `hyperv_console_button` | `vm_name`, `button`, `is_down` | `{ok, operation}` |
+| `hyperv_console_scroll` | `vm_name`, `delta` | `{ok, operation}` |
+| `hyperv_console_wait_frame_change` | `vm_name`, `baseline_hash=""`, `width=640`, `height=480`, `timeout_s=60`, `interval_s=2` | list[ImageContent(image/png), TextContent({stop_reason: changed\|deadline, polls, elapsed_ms, frame_hash})] or deadline dict |
+| `hyperv_console_capture_sequence` | `vm_name`, `count=3`, `interval_s=2`, `width=640`, `height=480` | [first Image, last Image, meta_text(frames[] with per-frame hash + changed_bytes)] |
+
+Console notes: text rides the stdin channel (never in argv/script/errors); non-ASCII input must use type_scancodes; mouse coordinates are in the space of the observed image — pass `frame_width`/`frame_height` matching your screenshot dimensions to scale to head space, or omit them to use head coordinates directly; `wait_frame_change` with `baseline_hash=""` treats the first polled frame as the baseline; WinPE errors and wizard screens are returned as images for visual interpretation (no OCR is performed).
+
+### VM & Media Preparation (deployment testing)
+
+| Tool | Parameters | Returns |
+|------|-----------|---------|
+| `hyperv_vm_create` | `name`, `vhd_path`, `memory_mb=2048`, `cpu_count=1`, `generation=2`, `vhd_size_gb=64`, `switch_name?`, `confirm` | `{ok, id, name, state, generation}` |
+| `hyperv_vm_disk_add` | `vm_name`, `path`, `size_gb`, `controller_type=SCSI`, `confirm` | `{ok, vhd_path, disk_count}` |
+| `hyperv_vm_disk_list` | `vm_name` | `{ok, disks[]}` |
+| `hyperv_vm_media_attach` | `vm_name`, `iso_path` | `{ok, iso_path}` |
+| `hyperv_vm_media_detach` | `vm_name` | `{ok, removed[]}` |
+| `hyperv_vm_media_list` | `vm_name` | `{ok, media[]}` |
+| `hyperv_vm_firmware_get` | `vm_name` | `{ok, secure_boot, secure_boot_template, boot_order, tpm_enabled}` |
+| `hyperv_vm_firmware_set_boot_order` | `vm_name`, `boot_type (Drive\|Network\|File)`, `confirm` | `{ok, first_boot}` |
+| `hyperv_vm_tpm_set` | `vm_name`, `enabled`, `confirm` | `{ok, tpm_enabled}` |
+| `hyperv_vm_secureboot_set` | `vm_name`, `enabled`, `template?`, `confirm` | `{ok, secure_boot, secure_boot_template}` |
+| `hyperv_vm_network_set` | `vm_name`, `switch_name` | `{ok, connected}` |
+
+### Orchestration
+
+| Tool | Parameters | Returns |
+|------|-----------|---------|
+| `hyperv_wait_vm_state` | `vm_name`, `states[]` (Off/Running/Saved/Paused/...), `timeout_s=300` | `{ok, final_state, guest_channel: "ps_direct_unverified"}` |
+
+### MDT Deployment Playbook (agent-driven)
+
+1. **Identify** — `hyperv_list_vms`; pick a disposable VM matching allowed_vm_patterns.
+2. **Verify media** — `hyperv_vm_media_list` on the VM or known-good ISO path; confirm freshness.
+3. **Checkpoint/recreate** — `hyperv_checkpoint_create` (restore later) or `hyperv_vm_create` + `hyperv_vm_disk_add` (multi-disk: separate OS and data disks).
+4. **Attach media** — `hyperv_vm_media_attach` with the LiteTouch ISO.
+5. **Boot** — `hyperv_vm_firmware_set_boot_order` (Drive for blank-disk fallthrough, or Network for PXE) then `hyperv_start_vm`.
+6. **Observe** — `hyperv_console_screenshot` then `hyperv_console_wait_frame_change` (chain via `frame_hash`). WinPE errors appear as images — interpret visually, never answer blindly.
+7. **Answer wizard** — `hyperv_console_click` (coordinates from the screenshot) then `hyperv_console_type_text` for harmless fields. For the disk-selection step: verify which disk you are targeting against `hyperv_vm_disk_list` — an early cleanup prompt and the later "Select OS Disk" step are DIFFERENT stages; never target the deployment-media disk.
+8. **Monitor** — repeated `wait_frame_change` (static frame = no progress, not success).
+9. **Switch channels** — once Windows is up and an admin account exists, switch to `hyperv_guest_run_ps` / `filetransfer` tools. PS Direct failures during WinPE are expected, not evidence the VM is down. Report the switch explicitly.
+10. **Collect** — guest logs: `C:\Windows\Temp\DeploymentLogs\SMSTS.log`, `...\BDD.log`. Results.xml lives on the deployment share (host-side) — inspect via host_read_roots, not guest_get. RetVal=0 does not mean zero errors.
+11. **Classify & restore** — success/prompt/error from the final image; `hyperv_checkpoint_restore` or recreate the VM.
 
 ## Typical Workflow — Kernel Debugging a Hyper-V VM
 

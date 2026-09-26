@@ -22,6 +22,29 @@ TOOL_NAMES = {
     "hyperv_guest_run", "hyperv_guest_run_ps", "hyperv_guest_put",
     "hyperv_guest_get", "hyperv_guest_read_file", "hyperv_guest_list_dir",
     "hyperv_victim_run", "hyperv_victim_run_ps",
+    # console (WMI screenshot / keyboard / mouse)
+    "hyperv_console_screenshot", "hyperv_console_get_display_info",
+    "hyperv_console_type_text", "hyperv_console_press_key",
+    "hyperv_console_key_combo", "hyperv_console_type_scancodes",
+    "hyperv_console_mouse_move", "hyperv_console_click",
+    "hyperv_console_button", "hyperv_console_scroll",
+    "hyperv_console_wait_frame_change", "hyperv_console_capture_sequence",
+    # VM / media preparation
+    "hyperv_vm_create", "hyperv_vm_disk_add", "hyperv_vm_disk_list",
+    "hyperv_vm_media_attach", "hyperv_vm_media_detach", "hyperv_vm_media_list",
+    "hyperv_vm_firmware_get", "hyperv_vm_firmware_set_boot_order",
+    "hyperv_vm_tpm_set", "hyperv_vm_secureboot_set", "hyperv_vm_network_set",
+    # orchestration
+    "hyperv_wait_vm_state",
+}
+CONFIRM_TOOLS = {
+    "hyperv_stop_vm", "hyperv_reset_vm", "hyperv_checkpoint_restore",
+    "hyperv_checkpoint_remove", "hyperv_configure_kdnet",
+    "hyperv_configure_kdcom", "hyperv_guest_run_ps", "hyperv_guest_run",
+    "hyperv_guest_put",
+    "hyperv_vm_create", "hyperv_vm_disk_add",
+    "hyperv_vm_firmware_set_boot_order", "hyperv_vm_tpm_set",
+    "hyperv_vm_secureboot_set",
 }
 
 
@@ -41,11 +64,11 @@ def _schemas(mod):
     return {t.name: t.inputSchema for t in tools}
 
 
-def test_19_tools_registered(fresh_server):
+def test_43_tools_registered(fresh_server):
     mod = fresh_server({})
     schemas = _schemas(mod)
     assert set(schemas) == TOOL_NAMES
-    assert len(schemas) == 19
+    assert len(schemas) == 43
 
 
 def test_no_password_params_by_default(fresh_server):
@@ -74,11 +97,62 @@ def test_inline_credential_mode_exposes_params(tmp_path, fresh_server):
 
 def test_destructive_tools_have_confirm_param(fresh_server):
     mod = fresh_server({})
-    for name in ("hyperv_stop_vm", "hyperv_reset_vm", "hyperv_checkpoint_restore",
-                 "hyperv_checkpoint_remove", "hyperv_configure_kdnet",
-                 "hyperv_configure_kdcom", "hyperv_guest_run_ps"):
+    schemas = _schemas(mod)
+    confirmed = {n for n, sch in schemas.items() if "confirm" in sch.get("properties", {})}
+    assert confirmed == CONFIRM_TOOLS, (
+        f"confirm-param set drifted: extra={confirmed - CONFIRM_TOOLS}, missing={CONFIRM_TOOLS - confirmed}"
+    )
+
+
+def test_interactive_tools_have_no_confirm_param(fresh_server):
+    """Console input + reversible media ops must NOT force a human prompt."""
+    mod = fresh_server({})
+    for name in ("hyperv_console_type_text", "hyperv_console_press_key",
+                 "hyperv_console_mouse_move", "hyperv_console_click",
+                 "hyperv_vm_media_attach", "hyperv_vm_media_detach",
+                 "hyperv_vm_network_set"):
         props = _schemas(mod)[name].get("properties", {})
-        assert "confirm" in props, name
+        assert "confirm" not in props, name
+
+
+def test_mdt_config_still_loads(tmp_path, fresh_server):
+    """The user's existing 7-category config (schema_version 1) must keep
+    loading unchanged after the additive category extension."""
+    doc = {
+        "schema_version": 1,
+        "allowed_vm_patterns": ["Deployment Test", "Deployment Test 2"],
+        "guest_read_roots": ["C:\\", "D:\\"],
+        "destructive": {
+            "stop": True, "reset": True, "checkpoint_restore": True,
+            "checkpoint_remove": True, "kd_reboot": True,
+            "elevated_exec": True, "guest_write": True,
+            "require_confirm": True,
+        },
+        "allow_inline_credentials": False,
+    }
+    p = tmp_path / "hyperv-mcp-mdt.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mod = fresh_server({"HYPERV_MCP_CONFIG": str(p)})
+    cfg = mod.CFG
+    assert cfg.destructive.stop is True
+    assert cfg.destructive.console_input is False  # new fields default safely
+    assert cfg.destructive.media is False
+    assert cfg.destructive.vm_provision is False
+
+
+def test_mdt_config_with_new_categories(tmp_path, fresh_server):
+    doc = {
+        "schema_version": 1,
+        "allowed_vm_patterns": ["Deployment Test", "Deployment Test 2", "ZAC"],
+        "destructive": {
+            "console_input": True, "media": True, "vm_provision": True,
+            "require_confirm": True,
+        },
+    }
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mod = fresh_server({"HYPERV_MCP_CONFIG": str(p)})
+    assert mod.CFG.destructive.console_input is True
 
 
 def test_check_env_exit_zero(fresh_server, capsys):
