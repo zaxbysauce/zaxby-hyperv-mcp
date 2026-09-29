@@ -159,14 +159,33 @@ class _RelayHandler(BaseHTTPRequestHandler):
         with self.context["counter_lock"]:
             self.context["counters"][key] += amount
 
-    def _reply(self, status: int, payload: bytes, content_type: str) -> None:
+    def _reply(
+        self, status: int, payload: bytes, content_type: str, *, close: bool = False,
+    ) -> None:
+        if close:
+            # Error paths may leave an unread request body buffered; keeping
+            # the connection alive would let those bytes be parsed as the
+            # NEXT request (desync / request smuggling past the guards —
+            # review round 2, N1). Close instead of draining untrusted input.
+            self.close_connection = True
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("X-Hyperv-Relay", self.context["relay_id"])
+        if close:
+            self.send_header("Connection", "close")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(payload)
+
+    def _reply_error(self, status: int, message: str) -> None:
+        self._bump("errors")
+        self._reply(
+            status,
+            json.dumps({"ok": False, "error": message}).encode("utf-8"),
+            "application/json",
+            close=True,
+        )
 
     def _forward(self) -> None:
         ctx = self.context
@@ -178,28 +197,18 @@ class _RelayHandler(BaseHTTPRequestHandler):
             # request to an attacker-chosen host via userinfo tricks
             # (review round 1, critical): reject before building anything.
             if not self.path.startswith("/"):
-                self._bump("errors")
-                self._reply(
-                    400,
-                    b'{"ok":false,"error":"only path-absolute targets are forwarded"}',
-                    "application/json",
-                )
+                self._reply_error(400, "only path-absolute targets are forwarded")
                 return
             if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
-                self._bump("errors")
-                self._reply(
-                    411,
-                    b'{"ok":false,"error":"chunked bodies are not supported; send Content-Length"}',
-                    "application/json",
+                self._reply_error(
+                    411, "chunked bodies are not supported; send Content-Length",
                 )
                 return
             body = b""
             length = int(self.headers.get("Content-Length") or 0)
             if length:
                 if length > _MAX_BODY_BYTES:
-                    self._bump("errors")
-                    self._reply(413, b'{"ok":false,"error":"body exceeds relay limit"}',
-                                "application/json")
+                    self._reply_error(413, "body exceeds relay limit")
                     return
                 body = self.rfile.read(length)
             headers = {
@@ -213,20 +222,21 @@ class _RelayHandler(BaseHTTPRequestHandler):
             self._bump("bytes_in", len(body))
             outcome = _run_forward(script, ctx["cred"])
         except Exception as exc:
-            self._bump("errors")
-            self._reply(502, json.dumps({"ok": False, "error": str(exc)}).encode(),
-                        "application/json")
+            self._reply_error(502, str(exc))
             return
         if "error" in outcome:
-            self._bump("errors")
             err = outcome.get("error", "")
             guest_status = int(outcome.get("status") or 0)
             detail = json.dumps({"ok": False, "error": err, "guest_status": guest_status})
             # A guest-side HTTP error passes its real status through (a
             # DevTools-style 404 reaches the caller as 404); transport
-            # failures surface as 502.
-            self._reply(guest_status if guest_status > 0 else 502,
-                        detail.encode(), "application/json")
+            # failures surface as 502. Both close: the envelope path does
+            # not mirror the caller's framing guarantees.
+            self._bump("errors")
+            self._reply(
+                guest_status if guest_status > 0 else 502,
+                detail.encode("utf-8"), "application/json", close=True,
+            )
             return
         self._bump("ok")
         payload = base64.b64decode(outcome.get("body_b64") or "")

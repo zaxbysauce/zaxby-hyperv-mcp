@@ -15,8 +15,10 @@ uses only the registry lock. Credential lifetime disclosure: the stored
 credential set outlives the starting call until a SUCCESSFUL stop, cap
 eviction, or process exit; successful stop and eviction null the field (a
 failed stop keeps the entry stoppable, so its credential is retained for
-the retry). The registry is capped: new starts are rejected once
-_MAX_JOBS entries are active (oldest stopped entries are evicted first).
+the retry). The registry is capped with an atomic reservation: a slot is
+reserved before the guest start leg (oldest stopped entries are evicted
+first) and released if the start fails, so concurrent starts can never
+collectively exceed _MAX_JOBS.
 Elevated start is not offered: -Verb RunAs cannot redirect streams, so an
 elevated job could not capture output.
 """
@@ -52,26 +54,41 @@ def clear_registry_for_tests() -> None:
         _jobs.clear()
 
 
-def _ensure_capacity() -> None:
-    """Pre-flight capacity check: evict oldest stopped entries; if the
-    registry is still full of ACTIVE jobs, reject the new start (never
-    silently exceed the cap — review round 1, finding 13). Called BEFORE
-    the guest start leg so a rejection leaks no guest process."""
+def _reserve_slot(job_id: str) -> None:
+    """Atomically reserve a registry slot BEFORE the guest start leg.
+
+    Evicts oldest stopped entries when at capacity; rejects when the
+    registry is still full of active jobs. The reservation (an in-flight
+    placeholder) counts against the cap from the moment it is taken, so
+    concurrent starts on different VMs cannot collectively exceed
+    _MAX_JOBS (review round 2, N2); on a failed start the caller must
+    _release_slot it.
+    """
     with _jobs_lock:
-        if len(_jobs) < _MAX_JOBS:
-            return
-        stopped = sorted(
-            (k for k, v in _jobs.items() if v.get("stopped")),
-            key=lambda k: _jobs[k]["started_at"],
-        )
-        for key in stopped[: max(1, len(_jobs) - _MAX_JOBS + 1)]:
-            _jobs[key]["cred"] = None
-            del _jobs[key]
+        if len(_jobs) >= _MAX_JOBS:
+            stopped = sorted(
+                (k for k, v in _jobs.items() if v.get("stopped")),
+                key=lambda k: _jobs[k]["started_at"],
+            )
+            for key in stopped[: max(1, len(_jobs) - _MAX_JOBS + 1)]:
+                _jobs[key]["cred"] = None
+                del _jobs[key]
         if len(_jobs) >= _MAX_JOBS:
             raise RuntimeError(
                 f"guest job registry is full ({_MAX_JOBS} active jobs); "
                 "stop jobs before starting more"
             )
+        _jobs[job_id] = {
+            "job_id": job_id, "vm_name": "", "pid": 0, "in_flight": True,
+            "started_at": _utc_now_iso(), "cred": None, "stopped": False,
+        }
+
+
+def _release_slot(job_id: str) -> None:
+    with _jobs_lock:
+        entry = _jobs.get(job_id)
+        if entry is not None and entry.get("in_flight"):
+            del _jobs[job_id]
 
 
 def _register(job: dict[str, Any]) -> None:
@@ -86,6 +103,8 @@ def _lookup(job_id: str) -> dict[str, Any]:
         entry = _jobs.get(job_id)
     if entry is None:
         raise ValueError(f"unknown job_id {job_id!r}")
+    if entry.get("in_flight"):
+        raise ValueError(f"job {job_id!r} is still starting")
     return entry
 
 
@@ -219,15 +238,20 @@ def job_start(
     if cred is None:
         raise ValueError("guest credentials are required")
     policy.vm_allowed(cfg, vm_name)
-    _ensure_capacity()
 
     job_id = uuid.uuid4().hex[:12]
+    _reserve_slot(job_id)
     wrapper = _wrapper_script(command, args, cwd)
-    outcome = run_guest_inner(
-        cfg, vm_name, _start_script(job_id, wrapper), cred, timeout_ms=timeout_ms,
-    )
+    try:
+        outcome = run_guest_inner(
+            cfg, vm_name, _start_script(job_id, wrapper), cred, timeout_ms=timeout_ms,
+        )
+    except BaseException:
+        _release_slot(job_id)
+        raise
     pid = int(outcome.get("pid") or 0)
     if pid <= 0:
+        _release_slot(job_id)
         raise RuntimeError("guest job start returned no pid")
     job_dir = str(outcome.get("job_dir") or "")
     entry: dict[str, Any] = {

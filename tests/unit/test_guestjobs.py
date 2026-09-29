@@ -214,17 +214,13 @@ def test_registry_cap_evicts_stopped_and_nulls_cred(monkeypatch):
     }
     guestjobs._MAX_JOBS = 1
     try:
-        entry = {
-            "job_id": "new", "vm_name": "vm", "pid": 2, "job_dir": "d2",
-            "out_path": "o2", "err_path": "e2", "exit_path": "x2",
-            "started_at": "2026-01-02T00:00:00Z", "cred": CRED, "stopped": False,
-        }
-        # Pre-flight capacity check evicts the stopped entry, then admits.
-        guestjobs._ensure_capacity()
-        guestjobs._register(entry)
+        # Reservation evicts the stopped entry, then admits.
+        guestjobs._reserve_slot("new")
         assert "new" in guestjobs._jobs
         assert "old" not in guestjobs._jobs
-        assert entry["cred"] is CRED
+        assert guestjobs._jobs["new"]["in_flight"] is True
+        guestjobs._release_slot("new")
+        assert "new" not in guestjobs._jobs
     finally:
         guestjobs._MAX_JOBS = 128
 
@@ -241,7 +237,7 @@ def test_registry_cap_rejects_when_full_of_active_jobs(monkeypatch):
     }
     try:
         with pytest.raises(RuntimeError, match="registry is full"):
-            guestjobs._ensure_capacity()
+            guestjobs._reserve_slot("next")
         assert len(guestjobs._jobs) == 1
         # And job_start surfaces the same rejection BEFORE any guest leg.
         with pytest.raises(RuntimeError, match="registry is full"):
@@ -249,6 +245,62 @@ def test_registry_cap_rejects_when_full_of_active_jobs(monkeypatch):
         assert fake.scripts == []
     finally:
         guestjobs._MAX_JOBS = 128
+
+
+def test_registry_cap_atomic_across_concurrent_starts(monkeypatch):
+    """Review r2 N2: the reservation must bound CONCURRENT starts on
+    different VMs (vm_lock does not serialize them)."""
+    import threading
+
+    cfg = Config(unrestricted=True)
+    guestjobs._MAX_JOBS = 3
+    barrier = threading.Barrier(3, timeout=15)
+    calls = []
+
+    def fake_run(script, **kwargs):
+        calls.append(script)
+        barrier.wait()  # all admitted starts overlap before any registers
+        return pswindows.PSResult(
+            stdout=json.dumps({"pid": 100 + len(calls), "job_dir": "d"}), returncode=0,
+        )
+
+    monkeypatch.setattr(pswindows, "run_ps", fake_run)
+    results: list = []
+    lock = threading.Lock()
+
+    def worker(i: int):
+        try:
+            out = guestjobs.job_start(cfg, f"test-vm-{i}", "x.exe", cred=CRED)
+            with lock:
+                results.append(("ok", out["job_id"]))
+        except RuntimeError as exc:
+            with lock:
+                results.append(("rejected", str(exc)))
+        except threading.BrokenBarrierError:
+            with lock:
+                results.append(("barrier", ""))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    ok = [r for r in results if r[0] == "ok"]
+    rejected = [r for r in results if r[0] == "rejected"]
+    assert len(ok) == 3, results
+    assert len(rejected) == 3, results
+    assert all("registry is full" in r[1] for r in rejected)
+    assert len(guestjobs._jobs) == 3
+    assert len(calls) == 3
+
+
+def test_start_failure_releases_reserved_slot(monkeypatch):
+    cfg = Config(unrestricted=True)
+    fake = FakePS([pswindows.PSResult(stdout="", returncode=1, stderr="boom")])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(RuntimeError, match="boom"):
+        guestjobs.job_start(cfg, "test-vm", "x.exe", cred=CRED)
+    assert guestjobs._jobs == {}
 
 
 def test_stop_failure_keeps_entry_stoppable(monkeypatch):

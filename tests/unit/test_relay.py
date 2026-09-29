@@ -163,16 +163,42 @@ def test_authority_form_target_rejected_400(monkeypatch):
     assert fake.scripts == []
 
 
-def test_forward_script_host_is_always_loopback():
-    # The handler rejects authority/absolute-form targets before
-    # _forward_script ever runs (see the 400 test); this pins the builder's
-    # URL shape for a sane path so the guest-side host is always loopback.
-    script = relay._forward_script(9222, "GET", "/json/version", {}, b"")
-    assert "'http://127.0.0.1:9222/json/version'" in script
+def test_rejected_request_body_cannot_smuggle_followup(monkeypatch):
+    """Review r2 N1: a rejected request carrying a body must close the
+    connection — its buffered body was previously parsed as the NEXT
+    request and executed as a guest forward."""
+    cfg = _relay_cfg()
+    fake = FakePS([])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = relay.relay_start(cfg, "test-vm", 9222, cred=CRED)
+    import socket
+
+    smuggled = b"GET /smuggled-by-reject HTTP/1.1\r\nHost: x\r\n\r\n"
+    with socket.create_connection(("127.0.0.1", out["host_port"]), timeout=10) as sock:
+        sock.sendall(
+            b"POST @evil.example:8080/x HTTP/1.1\r\nHost: x\r\n"
+            + b"Content-Length: " + str(len(smuggled)).encode() + b"\r\n\r\n"
+            + smuggled
+        )
+        data = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    # Exactly ONE response (the 400), the connection closes, and the
+    # buffered body never executes as a guest forward.
+    assert data.count(b"HTTP/1.1") == 1
+    assert b" 400 " in data.split(b"\r\n")[0]
+    assert b"Connection: close" in data
+    assert b" 200 " not in data
+    assert fake.scripts == []
 
 
 def test_chunked_transfer_encoding_rejected_411(monkeypatch):
-    """Review r1 finding 14: chunked bodies were silently dropped."""
+    """Review r1 finding 14: chunked bodies were silently dropped; review
+    r2 N1: the rejection must close the connection (chunked framing bytes
+    were previously parsed as a follow-up request line)."""
     cfg = _relay_cfg()
     fake = FakePS([])
     monkeypatch.setattr(pswindows, "run_ps", fake)
@@ -186,7 +212,16 @@ def test_chunked_transfer_encoding_rejected_411(monkeypatch):
         )
         data = sock.recv(4096)
     assert b" 411 " in data.split(b"\r\n")[0]
+    assert b"Connection: close" in data
     assert fake.scripts == []
+
+
+def test_forward_script_host_is_always_loopback():
+    # The handler rejects authority/absolute-form targets before
+    # _forward_script ever runs (see the 400 test); this pins the builder's
+    # URL shape for a sane path so the guest-side host is always loopback.
+    script = relay._forward_script(9222, "GET", "/json/version", {}, b"")
+    assert "'http://127.0.0.1:9222/json/version'" in script
 
 
 def test_stop_marks_stopped_and_nulls_cred(monkeypatch):
