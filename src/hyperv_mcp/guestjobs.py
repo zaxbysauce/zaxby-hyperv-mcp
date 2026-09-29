@@ -241,15 +241,18 @@ def job_start(
 
     job_id = uuid.uuid4().hex[:12]
     _reserve_slot(job_id)
-    wrapper = _wrapper_script(command, args, cwd)
     try:
+        # Wrapper building and pid parsing stay inside the release window so
+        # no exception between reservation and registration can strand an
+        # in-flight placeholder (review round 3 question, adopted).
+        wrapper = _wrapper_script(command, args, cwd)
         outcome = run_guest_inner(
             cfg, vm_name, _start_script(job_id, wrapper), cred, timeout_ms=timeout_ms,
         )
+        pid = int(outcome.get("pid") or 0)
     except BaseException:
         _release_slot(job_id)
         raise
-    pid = int(outcome.get("pid") or 0)
     if pid <= 0:
         _release_slot(job_id)
         raise RuntimeError("guest job start returned no pid")

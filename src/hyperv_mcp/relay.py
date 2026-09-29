@@ -206,6 +206,11 @@ class _RelayHandler(BaseHTTPRequestHandler):
                 return
             body = b""
             length = int(self.headers.get("Content-Length") or 0)
+            if length < 0:
+                # A negative Content-Length would make rfile.read() block
+                # until EOF (review round 3 question, adopted).
+                self._reply_error(400, "invalid Content-Length")
+                return
             if length:
                 if length > _MAX_BODY_BYTES:
                     self._reply_error(413, "body exceeds relay limit")

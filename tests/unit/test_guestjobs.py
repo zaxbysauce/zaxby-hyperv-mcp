@@ -252,46 +252,49 @@ def test_registry_cap_atomic_across_concurrent_starts(monkeypatch):
     different VMs (vm_lock does not serialize them)."""
     import threading
 
-    cfg = Config(unrestricted=True)
     guestjobs._MAX_JOBS = 3
-    barrier = threading.Barrier(3, timeout=15)
-    calls = []
+    try:
+        cfg = Config(unrestricted=True)
+        barrier = threading.Barrier(3, timeout=15)
+        calls = []
 
-    def fake_run(script, **kwargs):
-        calls.append(script)
-        barrier.wait()  # all admitted starts overlap before any registers
-        return pswindows.PSResult(
-            stdout=json.dumps({"pid": 100 + len(calls), "job_dir": "d"}), returncode=0,
-        )
+        def fake_run(script, **kwargs):
+            calls.append(script)
+            barrier.wait()  # all admitted starts overlap before any registers
+            return pswindows.PSResult(
+                stdout=json.dumps({"pid": 100 + len(calls), "job_dir": "d"}), returncode=0,
+            )
 
-    monkeypatch.setattr(pswindows, "run_ps", fake_run)
-    results: list = []
-    lock = threading.Lock()
+        monkeypatch.setattr(pswindows, "run_ps", fake_run)
+        results: list = []
+        lock = threading.Lock()
 
-    def worker(i: int):
-        try:
-            out = guestjobs.job_start(cfg, f"test-vm-{i}", "x.exe", cred=CRED)
-            with lock:
-                results.append(("ok", out["job_id"]))
-        except RuntimeError as exc:
-            with lock:
-                results.append(("rejected", str(exc)))
-        except threading.BrokenBarrierError:
-            with lock:
-                results.append(("barrier", ""))
+        def worker(i: int):
+            try:
+                out = guestjobs.job_start(cfg, f"test-vm-{i}", "x.exe", cred=CRED)
+                with lock:
+                    results.append(("ok", out["job_id"]))
+            except RuntimeError as exc:
+                with lock:
+                    results.append(("rejected", str(exc)))
+            except threading.BrokenBarrierError:
+                with lock:
+                    results.append(("barrier", ""))
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=30)
-    ok = [r for r in results if r[0] == "ok"]
-    rejected = [r for r in results if r[0] == "rejected"]
-    assert len(ok) == 3, results
-    assert len(rejected) == 3, results
-    assert all("registry is full" in r[1] for r in rejected)
-    assert len(guestjobs._jobs) == 3
-    assert len(calls) == 3
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        ok = [r for r in results if r[0] == "ok"]
+        rejected = [r for r in results if r[0] == "rejected"]
+        assert len(ok) == 3, results
+        assert len(rejected) == 3, results
+        assert all("registry is full" in r[1] for r in rejected)
+        assert len(guestjobs._jobs) == 3
+        assert len(calls) == 3
+    finally:
+        guestjobs._MAX_JOBS = 128
 
 
 def test_start_failure_releases_reserved_slot(monkeypatch):
