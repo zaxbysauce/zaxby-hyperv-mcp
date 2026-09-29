@@ -131,6 +131,64 @@ def test_duplicate_target_rejected(monkeypatch):
     assert second["host_port"] != first["host_port"]
 
 
+def test_relay_ids_unique_same_port_different_vms(monkeypatch):
+    """Review r1 finding 11: thread-id ids collided and silently dropped a
+    live listener from the registry."""
+    cfg = _relay_cfg()
+    fake = FakePS([])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    a = relay.relay_start(cfg, "test-vm-a", 9222, cred=CRED)
+    b = relay.relay_start(cfg, "test-vm-b", 9222, cred=CRED)
+    assert a["relay_id"] != b["relay_id"]
+    assert set(relay._relays) == {a["relay_id"], b["relay_id"]}
+    status = relay.relay_status(cfg)
+    assert len(status["relays"]) == 2
+
+
+def test_authority_form_target_rejected_400(monkeypatch):
+    """Review r1 finding 10 (critical SSRF): an authority-form target
+    ("@evil.example/") must never reach the guest URL builder."""
+    cfg = _relay_cfg()
+    fake = FakePS([])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = relay.relay_start(cfg, "test-vm", 9222, cred=CRED)
+    # Python's HTTP server accepts authority-form; the handler must reject.
+    import socket
+
+    with socket.create_connection(("127.0.0.1", out["host_port"]), timeout=10) as sock:
+        sock.sendall(b"GET @evil.example:8080/json HTTP/1.1\r\nHost: x\r\n\r\n")
+        data = sock.recv(4096)
+    assert b" 400 " in data.split(b"\r\n")[0]
+    # No guest leg ran.
+    assert fake.scripts == []
+
+
+def test_forward_script_host_is_always_loopback():
+    # The handler rejects authority/absolute-form targets before
+    # _forward_script ever runs (see the 400 test); this pins the builder's
+    # URL shape for a sane path so the guest-side host is always loopback.
+    script = relay._forward_script(9222, "GET", "/json/version", {}, b"")
+    assert "'http://127.0.0.1:9222/json/version'" in script
+
+
+def test_chunked_transfer_encoding_rejected_411(monkeypatch):
+    """Review r1 finding 14: chunked bodies were silently dropped."""
+    cfg = _relay_cfg()
+    fake = FakePS([])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = relay.relay_start(cfg, "test-vm", 9222, cred=CRED)
+    import socket
+
+    with socket.create_connection(("127.0.0.1", out["host_port"]), timeout=10) as sock:
+        sock.sendall(
+            b"POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"5\r\nhello\r\n0\r\n\r\n"
+        )
+        data = sock.recv(4096)
+    assert b" 411 " in data.split(b"\r\n")[0]
+    assert fake.scripts == []
+
+
 def test_stop_marks_stopped_and_nulls_cred(monkeypatch):
     cfg = _relay_cfg()
     fake = FakePS([])

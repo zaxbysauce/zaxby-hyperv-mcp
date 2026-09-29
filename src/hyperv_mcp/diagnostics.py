@@ -25,8 +25,6 @@ from .config import Config
 from .credentials import CredentialSet
 from .vmlocks import vm_lock
 
-_SSHD_CONFIG_PATH = "C:\\ProgramData\\ssh\\sshd_config"  # mirrored in _GUEST_PROBE_SCRIPT
-
 # Addresses that are valid ListenAddress/target values regardless of the
 # guest's current unicast IPs (wildcards and loopback).
 _UNIVERSAL_ADDRESSES = {"0.0.0.0", "::", "[::]", "*", "0.0.0.0:0"}
@@ -211,7 +209,7 @@ def _addr_host(value: str) -> str:
     return v
 
 
-def _findings(vm: dict, guest: dict) -> list[dict]:
+def _findings(_vm: dict, guest: dict) -> list[dict]:
     out: list[dict] = []
     if guest.get("identity", {}).get("error"):
         pass  # section error already surfaces in the report

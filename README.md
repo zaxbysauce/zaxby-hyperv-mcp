@@ -395,9 +395,14 @@ forwarding each HTTP request through PowerShell Direct to
 web endpoints and DevTools HTTP APIs (`/json/version`, ...) with zero
 dependence on the guest's external addresses and no guest-side component.
 Gated by the `relay` category. Limits: HTTP only (no WebSocket/CDP socket
-proxying); request bodies ≤ 1 MiB, responses ≤ 4 MiB; per-request PS Direct
-legs deliberately do not serialize behind the per-VM lock. The relay holds
-the start-time credentials until `hyperv_relay_stop`.
+proxying); request bodies ≤ 1 MiB with Content-Length (chunked bodies are
+rejected with 411), responses ≤ 4 MiB; only path-absolute request targets
+are forwarded (authority/absolute-form targets are rejected with 400, so a
+caller can never steer the guest-side request to another host); per-request
+PS Direct legs deliberately do not serialize behind the per-VM lock. The
+relay holds the start-time credentials until `hyperv_relay_stop`. Guest-side
+HTTP error statuses pass through to the caller (a guest 404 arrives as 404
+with the relay error envelope).
 
 ### Evidence Capture (0.3.0)
 

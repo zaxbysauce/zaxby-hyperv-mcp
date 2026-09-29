@@ -130,6 +130,9 @@ def test_status_exiting_when_exit_file_missing(monkeypatch):
     start = guestjobs.job_start(cfg, "test-vm", "x.exe", cred=CRED)
     out = guestjobs.job_status(cfg, start["job_id"])
     assert out["status"] == "exiting"
+    # Load-bearing (review r1 finding 15): the guest-side 'exiting' branch
+    # must actually be generated, not just echoed from a canned payload.
+    assert "'exiting'" in _inner(fake.scripts[1])
 
 
 def test_output_tail_and_encodings(monkeypatch):
@@ -216,8 +219,58 @@ def test_registry_cap_evicts_stopped_and_nulls_cred(monkeypatch):
             "out_path": "o2", "err_path": "e2", "exit_path": "x2",
             "started_at": "2026-01-02T00:00:00Z", "cred": CRED, "stopped": False,
         }
+        # Pre-flight capacity check evicts the stopped entry, then admits.
+        guestjobs._ensure_capacity()
         guestjobs._register(entry)
         assert "new" in guestjobs._jobs
         assert "old" not in guestjobs._jobs
+        assert entry["cred"] is CRED
     finally:
         guestjobs._MAX_JOBS = 128
+
+
+def test_registry_cap_rejects_when_full_of_active_jobs(monkeypatch):
+    """Review r1 finding 13: no silent growth when nothing is evictable."""
+    fake = FakePS([])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    guestjobs._MAX_JOBS = 1
+    guestjobs._jobs["active"] = {
+        "job_id": "active", "vm_name": "vm", "pid": 1, "job_dir": "d",
+        "out_path": "o", "err_path": "e", "exit_path": "x",
+        "started_at": "2026-01-01T00:00:00Z", "cred": CRED, "stopped": False,
+    }
+    try:
+        with pytest.raises(RuntimeError, match="registry is full"):
+            guestjobs._ensure_capacity()
+        assert len(guestjobs._jobs) == 1
+        # And job_start surfaces the same rejection BEFORE any guest leg.
+        with pytest.raises(RuntimeError, match="registry is full"):
+            guestjobs.job_start(Config(unrestricted=True), "test-vm", "x.exe", cred=CRED)
+        assert fake.scripts == []
+    finally:
+        guestjobs._MAX_JOBS = 128
+
+
+def test_stop_failure_keeps_entry_stoppable(monkeypatch):
+    """Review r1 finding 12: a failed kill leg must not claim stopped."""
+    cfg = Config(unrestricted=True)
+    fake = FakePS([
+        _start_ok(),
+        pswindows.PSResult(stdout="", returncode=1, stderr="transport down"),
+        _ok({"stopped": True}),  # retry succeeds
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    start = guestjobs.job_start(cfg, "test-vm", "x.exe", cred=CRED)
+    first = guestjobs.job_stop(cfg, start["job_id"])
+    assert first["ok"] is False
+    assert first["stopped"] is False
+    assert "transport down" in first["error"]
+    # Entry remains stoppable: cred retained, retry reaches the guest.
+    entry = guestjobs._jobs[start["job_id"]]
+    assert entry["stopped"] is False
+    assert entry["cred"] is not None
+    second = guestjobs.job_stop(cfg, start["job_id"])
+    assert second["ok"] is True
+    assert second["stopped"] is True
+    assert guestjobs._jobs[start["job_id"]]["cred"] is None
+    assert len(fake.scripts) == 3

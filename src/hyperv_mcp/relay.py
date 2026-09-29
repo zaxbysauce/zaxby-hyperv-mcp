@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import json
 import threading
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -113,8 +114,8 @@ try {{
     $resp = Invoke-WebRequest @sp
     $ct = ''
     if ($resp.Headers -and $resp.Headers['Content-Type']) {{ $ct = [string]$resp.Headers['Content-Type'] }}
+    if ($resp.RawContentStream.Length -gt {int(_MAX_RESPONSE_BYTES)}) {{ throw 'guest response exceeds relay limit' }}
     $bytes = $resp.RawContentStream.ToArray()
-    if ($bytes.Length -gt {int(_MAX_RESPONSE_BYTES)}) {{ throw 'guest response exceeds relay limit' }}
     [PSCustomObject]@{{
         status      = [int]$resp.StatusCode
         content_type = $ct
@@ -171,6 +172,27 @@ class _RelayHandler(BaseHTTPRequestHandler):
         ctx = self.context
         self._bump("requests")
         try:
+            # The relay forwards ONLY path-absolute targets. An
+            # authority-form target ("GET @evil.example/ HTTP/1.1") or an
+            # absolute-form URL would let a caller steer the guest-side
+            # request to an attacker-chosen host via userinfo tricks
+            # (review round 1, critical): reject before building anything.
+            if not self.path.startswith("/"):
+                self._bump("errors")
+                self._reply(
+                    400,
+                    b'{"ok":false,"error":"only path-absolute targets are forwarded"}',
+                    "application/json",
+                )
+                return
+            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                self._bump("errors")
+                self._reply(
+                    411,
+                    b'{"ok":false,"error":"chunked bodies are not supported; send Content-Length"}',
+                    "application/json",
+                )
+                return
             body = b""
             length = int(self.headers.get("Content-Length") or 0)
             if length:
@@ -198,11 +220,13 @@ class _RelayHandler(BaseHTTPRequestHandler):
         if "error" in outcome:
             self._bump("errors")
             err = outcome.get("error", "")
-            detail = json.dumps({"ok": False, "error": err, "guest_status": outcome.get("status", 0)})
-            status = 502
-            if outcome.get("status"):
-                status = 502  # guest-side HTTP error surfaced via relay envelope
-            self._reply(status, detail.encode(), "application/json")
+            guest_status = int(outcome.get("status") or 0)
+            detail = json.dumps({"ok": False, "error": err, "guest_status": guest_status})
+            # A guest-side HTTP error passes its real status through (a
+            # DevTools-style 404 reaches the caller as 404); transport
+            # failures surface as 502.
+            self._reply(guest_status if guest_status > 0 else 502,
+                        detail.encode(), "application/json")
             return
         self._bump("ok")
         payload = base64.b64decode(outcome.get("body_b64") or "")
@@ -287,7 +311,7 @@ def relay_start(
         server = _RelayServer((bind, int(host_port)), handler)
     except OSError as exc:
         raise RuntimeError(f"could not bind {bind}:{host_port or 0}: {exc}") from None
-    relay_id = f"relay-{guest_port}-{threading.get_ident()}"
+    relay_id = f"relay-{guest_port}-{uuid.uuid4().hex[:8]}"
     context["relay_id"] = relay_id
     thread = threading.Thread(
         target=server.serve_forever, name=f"hyperv-relay-{relay_id}", daemon=True,

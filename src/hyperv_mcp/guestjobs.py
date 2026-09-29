@@ -12,8 +12,11 @@ stop later address exactly that process.
 Lock policy: every guest leg (start/status/output/stop) runs under vm_lock
 acquired per leg inside diagnostics.run_guest_inner; registry bookkeeping
 uses only the registry lock. Credential lifetime disclosure: the stored
-credential set outlives the starting call until stop, cap eviction, or
-process exit; stop and eviction null the stored field.
+credential set outlives the starting call until a SUCCESSFUL stop, cap
+eviction, or process exit; successful stop and eviction null the field (a
+failed stop keeps the entry stoppable, so its credential is retained for
+the retry). The registry is capped: new starts are rejected once
+_MAX_JOBS entries are active (oldest stopped entries are evicted first).
 Elevated start is not offered: -Verb RunAs cannot redirect streams, so an
 elevated job could not capture output.
 """
@@ -49,16 +52,30 @@ def clear_registry_for_tests() -> None:
         _jobs.clear()
 
 
+def _ensure_capacity() -> None:
+    """Pre-flight capacity check: evict oldest stopped entries; if the
+    registry is still full of ACTIVE jobs, reject the new start (never
+    silently exceed the cap — review round 1, finding 13). Called BEFORE
+    the guest start leg so a rejection leaks no guest process."""
+    with _jobs_lock:
+        if len(_jobs) < _MAX_JOBS:
+            return
+        stopped = sorted(
+            (k for k, v in _jobs.items() if v.get("stopped")),
+            key=lambda k: _jobs[k]["started_at"],
+        )
+        for key in stopped[: max(1, len(_jobs) - _MAX_JOBS + 1)]:
+            _jobs[key]["cred"] = None
+            del _jobs[key]
+        if len(_jobs) >= _MAX_JOBS:
+            raise RuntimeError(
+                f"guest job registry is full ({_MAX_JOBS} active jobs); "
+                "stop jobs before starting more"
+            )
+
+
 def _register(job: dict[str, Any]) -> None:
     with _jobs_lock:
-        if len(_jobs) >= _MAX_JOBS:
-            stopped = sorted(
-                (k for k, v in _jobs.items() if v.get("stopped")),
-                key=lambda k: _jobs[k]["started_at"],
-            )
-            for key in stopped[: max(1, len(_jobs) - _MAX_JOBS + 1)]:
-                _jobs[key]["cred"] = None
-                del _jobs[key]
         _jobs[job["job_id"]] = job
 
 
@@ -202,6 +219,7 @@ def job_start(
     if cred is None:
         raise ValueError("guest credentials are required")
     policy.vm_allowed(cfg, vm_name)
+    _ensure_capacity()
 
     job_id = uuid.uuid4().hex[:12]
     wrapper = _wrapper_script(command, args, cwd)
@@ -287,16 +305,36 @@ def job_output(cfg: Config, job_id: str, *, tail_bytes: int = 65536) -> dict:
 
 
 def job_stop(cfg: Config, job_id: str) -> dict:
+    """Stop exactly this job's guest PID and release its credentials.
+
+    The registry entry flips to stopped (and the stored credential is
+    nulled) ONLY when the guest kill leg succeeds — a failed stop keeps the
+    entry stoppable so a retry can reach the guest again (review round 1,
+    finding 12); the tool never reports stopped for a process it could not
+    kill.
+    """
     entry = _lookup(job_id)
+    if entry.get("stopped"):
+        return {
+            "ok": True, "job_id": job_id, "pid": entry["pid"],
+            "stopped": True, "note": "was already stopped",
+        }
     cred = entry["cred"]
-    error = ""
-    if entry["pid"] > 0 and cred is not None:
-        try:
-            run_guest_inner(
-                cfg, entry["vm_name"], _stop_script(entry["pid"], entry["job_dir"]), cred,
-            )
-        except Exception as exc:
-            error = pswindows.redact(str(exc))
+    if cred is None:
+        raise RuntimeError(f"job {job_id} has no stored credentials (evicted)")
+    try:
+        run_guest_inner(
+            cfg, entry["vm_name"], _stop_script(entry["pid"], entry["job_dir"]), cred,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "job_id": job_id,
+            "pid": entry["pid"],
+            "stopped": False,
+            "error": pswindows.redact(str(exc)),
+            "error_class": "transport",
+        }
     # Registry bookkeeping (registry lock only, outside any vm_lock).
     with _jobs_lock:
         current = _jobs.get(job_id)
@@ -304,9 +342,8 @@ def job_stop(cfg: Config, job_id: str) -> dict:
             current["stopped"] = True
             current["cred"] = None
     return {
-        "ok": not error,
+        "ok": True,
         "job_id": job_id,
         "pid": entry["pid"],
         "stopped": True,
-        **({"error": error, "error_class": "transport"} if error else {}),
     }
