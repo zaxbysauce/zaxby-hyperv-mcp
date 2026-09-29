@@ -240,6 +240,31 @@ def test_require_category_denies_default():
         require_category(Config(), "media", "attach iso")
     with pytest.raises(PolicyDenied, match="category:vm_provision"):
         require_category(Config(), "vm_provision", "create vm")
+    with pytest.raises(PolicyDenied, match="category:relay"):
+        require_category(Config(), "relay", "relay requests into guest")
+
+
+def test_guest_repair_category_matrix():
+    """guest_repair is a confirm-leg destructive category (AC9)."""
+    from hyperv_mcp.policy import require_destructive
+
+    with pytest.raises(PolicyDenied, match="confirm"):
+        require_destructive(Config(), "guest_repair", confirm=False, detail="apply repairs")
+    cfg = Config()
+    cfg.destructive.guest_repair = True
+    with pytest.raises(PolicyDenied, match="confirm"):
+        require_destructive(cfg, "guest_repair", confirm=False, detail="apply repairs")
+    require_destructive(cfg, "guest_repair", confirm=True, detail="apply repairs")
+    with pytest.raises(PolicyDenied, match="guest_repair"):
+        require_destructive(Config(), "guest_repair", confirm=True, detail="apply repairs")
+
+
+def test_relay_category_allows_enabled():
+    from hyperv_mcp.policy import require_category
+
+    cfg = Config()
+    cfg.destructive.relay = True
+    require_category(cfg, "relay", "relay requests into guest")
 
 
 def test_require_category_unrestricted_bypasses():

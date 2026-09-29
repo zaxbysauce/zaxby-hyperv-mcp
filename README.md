@@ -1,7 +1,7 @@
 # hyperv-mcp (hardened fork)
 
 An MCP (Model Context Protocol) server for Hyper-V VM management and guest
-execution. Exposes 43 tools for VM lifecycle, checkpoint management, kernel
+execution. Exposes 54 tools for VM lifecycle, checkpoint management, kernel
 debug setup (KDNET/KDCOM), and guest file transfer/command execution via
 PowerShell Direct (no WinRM required).
 
@@ -141,6 +141,8 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
     "console_input": true,        // virtual keyboard + mouse input
     "media": true,                // ISO attach/detach, network connect
     "vm_provision": true,         // VM create, disk add, firmware, TPM, SecureBoot
+    "guest_repair": true,         // APPLY guest access repairs (dry run needs no switch)
+    "relay": true,                // host->guest HTTP relay listener
     "require_confirm": true       // tools additionally need confirm=true
   },
   "allow_inline_credentials": false,   // expose username/password tool params
@@ -206,6 +208,8 @@ These tools refuse to run unless their category is enabled **and** (when
 | `hyperv_console_type_text` / `press_key` / `key_combo` / `type_scancodes` / `mouse_move` / `click` / `button` / `scroll` | `console_input` (no confirm — non-destructive interactive input) |
 | `hyperv_vm_media_attach` / `media_detach` / `network_set` | `media` (reversible, no confirm) |
 | `hyperv_vm_create` / `disk_add` / `firmware_set_boot_order` / `tpm_set` / `secureboot_set` | `vm_provision` + `confirm` |
+| `hyperv_repair_guest_access` with `apply=true` | `guest_repair` + `confirm` (dry run is read-only) |
+| `hyperv_relay_start` / `relay_status` / `relay_stop` | `relay` (standing loopback listener, no confirm) |
 
 Denials return a structured `policy` error (no secrets, no speculative paths).
 Concurrency is also guarded: one operation per VM at a time (`busy` error
@@ -238,7 +242,7 @@ claude mcp add hyperv -- hyperv-mcp
 
 ---
 
-## Available Tools (43 total)
+## Available Tools (54 total)
 
 ### VM Lifecycle
 
@@ -320,6 +324,94 @@ cases and requires the VM Off/Saved for the `Set-VMComPort` step.
 | `hyperv_victim_run_ps` | `vm_name`, `script`, `timeout_ms` | standard guest envelope |
 
 Environment-only victim credentials; never elevated.
+
+### Guest Access Diagnostics & Repair (0.3.0)
+
+| Tool | Parameters | Returns |
+|------|-----------|---------|
+| `hyperv_diagnose_vm_access` | `vm_name`, `timeout_ms=90000` | `{ok, vm, ps_direct, guest, findings[], checked_at}` |
+| `hyperv_repair_guest_access` | `vm_name`, `apply=false`, `confirm=false` | `{ok, applied, plan[], changes[], backup_path?}` |
+
+`hyperv_diagnose_vm_access` is ONE read-only call that reports host VM state,
+guest identity (hostname/OS), current guest IPv4/IPv6 addresses, PowerShell
+Direct availability (a transport failure is a RESULT with `ps_direct.available:
+false`, not an error), sshd and WinRM service state, SSH/WinRM listeners, and
+a `findings` list naming the exact failure — including `ssh_stale_binding`
+when SSH is bound to an address that is no longer a guest IP (the
+post-subnet-change incident class). Probe sections are individually
+fault-isolated; one failing probe never aborts the report.
+
+`hyperv_repair_guest_access` dry-runs by default (propose only, read-only).
+With `apply=true` it performs the narrow fixes — stale `ListenAddress` lines
+rewritten to `0.0.0.0` (sshd_config backed up first), stopped sshd/WinRM
+started, EXISTING disabled firewall allow rules enabled (never creates broad
+new rules) — and re-verifies every action, returning per-change
+`applied`/`verified` results. Apply requires `guest_repair: true` AND
+`confirm=true`.
+
+### Managed Guest Jobs (0.3.0)
+
+| Tool | Parameters | Returns |
+|------|-----------|---------|
+| `hyperv_guest_job_start` | `vm_name`, `command`, `args[]?`, `cwd?`, `timeout_ms=60000` | `{ok, job_id, pid, job_dir, out_path, err_path, exit_path}` |
+| `hyperv_guest_job_status` | `job_id` | `{ok, job_id, pid, status: running\|exited\|exiting\|stopped, exit_code?}` |
+| `hyperv_guest_job_output` | `job_id`, `tail_bytes=65536` | `{ok, stdout, stderr, *_truncated, *_encoding}` |
+| `hyperv_guest_job_stop` | `job_id` | `{ok, job_id, pid, stopped}` |
+
+Start returns immediately with a job id bound to the exact guest PID (the
+wrapper records `$LASTEXITCODE` to a file, streams go to per-job logs under
+guest `%TEMP%\hyperv-mcp-job-<id>`), replacing scheduled-task and SSH-tunnel
+ babysitting for long probes. Output reads are byte-tail bounded and
+BOM-sniffed against the stream HEAD (PowerShell 5.1 `1>`/`2>` may write
+UTF-16LE; the reported `*_encoding` says which was used). Stop kills exactly
+that PID, removes the job dir, and drops the stored credentials. Non-elevated
+only (RunAs cannot redirect streams). The in-process job registry holds the
+start-time credentials until stop/eviction/process exit — plan accordingly on
+shared hosts.
+
+### Reboot Recovery (0.3.0)
+
+| Tool | Parameters | Returns |
+|------|-----------|---------|
+| `hyperv_wait_guest_recovery` | `vm_name`, `services[]?`, `processes[]?`, `timeout_s=300`, `interval_s=3` | `{ok, ps_direct, services[], processes[], failures[]}` |
+
+Waits a bounded time for PowerShell Direct to answer (the first thing that
+comes back after a reboot), then verifies each named service is Running and
+each named process exists. `failures` lists exactly what did not return
+(`ps_direct`, `service:<name>`, `process:<name>`). Empty lists = wait for PS
+Direct only.
+
+### Host-to-Guest HTTP Relay (0.3.0)
+
+| Tool | Parameters | Returns |
+|------|-----------|---------|
+| `hyperv_relay_start` | `vm_name`, `guest_port`, `host_port=0` (ephemeral) | `{ok, relay_id, url, host_port, ...}` |
+| `hyperv_relay_status` | `relay_id?` | `{ok, relays[{relay_id, url, counters, stopped, ...}]}` |
+| `hyperv_relay_stop` | `relay_id` | `{ok, relay_id, host_port, stopped}` |
+
+A loopback-only host listener (127.0.0.1; non-loopback binds are refused)
+forwarding each HTTP request through PowerShell Direct to
+`http://127.0.0.1:<guest_port><path>` INSIDE the guest — reach guest-local
+web endpoints and DevTools HTTP APIs (`/json/version`, ...) with zero
+dependence on the guest's external addresses and no guest-side component.
+Gated by the `relay` category. Limits: HTTP only (no WebSocket/CDP socket
+proxying); request bodies ≤ 1 MiB, responses ≤ 4 MiB; per-request PS Direct
+legs deliberately do not serialize behind the per-VM lock. The relay holds
+the start-time credentials until `hyperv_relay_stop`.
+
+### Evidence Capture (0.3.0)
+
+| Tool | Parameters | Returns |
+|------|-----------|---------|
+| `hyperv_capture_evidence` | `vm_name`, `width=1024`, `height=768`, `save_path?`, `ui_tree=false`, `ui_tree_depth=3`, `ui_tree_max_elements=200` | `[ImageContent, TextContent(meta)]` |
+
+One call pairing the console screenshot with `captured_at` (UTC ISO-8601),
+`vm_id`, capture dimensions, `frame_hash`, and — when `ui_tree=true` — a
+bounded UIAutomation element tree from the guest (depth/element caps;
+requires guest credentials, which the screenshot alone does not). The UI
+tree is best-effort: a PowerShell Direct session may not see an interactive
+desktop, in which case `ui_tree.ok=false` carries the reason while the
+screenshot still ships.
 
 ---
 

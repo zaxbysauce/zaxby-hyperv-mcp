@@ -13,6 +13,9 @@ CRED_TOOLS = {
     "hyperv_guest_run", "hyperv_guest_run_ps",
     "hyperv_guest_put", "hyperv_guest_get",
     "hyperv_guest_read_file", "hyperv_guest_list_dir",
+    "hyperv_diagnose_vm_access", "hyperv_repair_guest_access",
+    "hyperv_guest_job_start", "hyperv_wait_guest_recovery",
+    "hyperv_relay_start", "hyperv_capture_evidence",
 }
 TOOL_NAMES = {
     "hyperv_list_vms", "hyperv_get_vm_info", "hyperv_start_vm", "hyperv_stop_vm",
@@ -36,6 +39,13 @@ TOOL_NAMES = {
     "hyperv_vm_tpm_set", "hyperv_vm_secureboot_set", "hyperv_vm_network_set",
     # orchestration
     "hyperv_wait_vm_state",
+    # guest access diagnostics / repair / jobs / recovery / relay / evidence
+    "hyperv_diagnose_vm_access", "hyperv_repair_guest_access",
+    "hyperv_guest_job_start", "hyperv_guest_job_status",
+    "hyperv_guest_job_output", "hyperv_guest_job_stop",
+    "hyperv_wait_guest_recovery",
+    "hyperv_relay_start", "hyperv_relay_status", "hyperv_relay_stop",
+    "hyperv_capture_evidence",
 }
 CONFIRM_TOOLS = {
     "hyperv_stop_vm", "hyperv_reset_vm", "hyperv_checkpoint_restore",
@@ -45,6 +55,7 @@ CONFIRM_TOOLS = {
     "hyperv_vm_create", "hyperv_vm_disk_add",
     "hyperv_vm_firmware_set_boot_order", "hyperv_vm_tpm_set",
     "hyperv_vm_secureboot_set",
+    "hyperv_repair_guest_access",
 }
 
 
@@ -64,11 +75,11 @@ def _schemas(mod):
     return {t.name: t.inputSchema for t in tools}
 
 
-def test_43_tools_registered(fresh_server):
+def test_tool_inventory_registered(fresh_server):
     mod = fresh_server({})
     schemas = _schemas(mod)
     assert set(schemas) == TOOL_NAMES
-    assert len(schemas) == 43
+    assert len(schemas) == 54
 
 
 def test_no_password_params_by_default(fresh_server):
@@ -160,7 +171,7 @@ def test_check_env_exit_zero(fresh_server, capsys):
     rc = mod.main(["--check-env"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "hyperv-mcp 0.2.0" in out
+    assert "hyperv-mcp 0.3.0" in out
     assert "DENY ALL" in out
 
 
@@ -180,7 +191,7 @@ def test_version_flag(fresh_server, capsys):
     with pytest.raises(SystemExit) as exc:
         mod.main(["--version"])
     assert exc.value.code == 0
-    assert "0.2.0" in capsys.readouterr().out
+    assert "0.3.0" in capsys.readouterr().out
 
 
 def test_mcp_compat_import_bootstraps(fresh_server):
