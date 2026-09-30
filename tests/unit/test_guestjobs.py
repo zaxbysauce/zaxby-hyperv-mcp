@@ -329,3 +329,30 @@ def test_stop_failure_keeps_entry_stoppable(monkeypatch):
     assert second["stopped"] is True
     assert guestjobs._jobs[start["job_id"]]["cred"] is None
     assert len(fake.scripts) == 3
+
+
+def test_output_rejects_nonpositive_tail():
+    """PRR-016b: tail_bytes < 1 must ValueError (guard precedes lookup)."""
+    cfg = Config(unrestricted=True)
+    with pytest.raises(ValueError, match="tail_bytes"):
+        guestjobs.job_output(cfg, "whatever", tail_bytes=0)
+
+
+def test_output_full_read_utf16_has_no_bom_leak(monkeypatch):
+    """COP-2: when the output fits tail_bytes the tail slice INCLUDES the
+    UTF-16LE BOM; decoding must strip it, not leak U+FEFF."""
+    cfg = Config(unrestricted=True)
+    text = "small output"
+    data = b"\xff\xfe" + text.encode("utf-16-le")
+    fake = FakePS([
+        _start_ok(),
+        _ok({"head_hex": data[:4].hex(), "tail_b64": base64.b64encode(data).decode(),
+             "size": len(data), "truncated": False}),
+        _ok({"head_hex": "", "tail_b64": "", "size": 0, "truncated": False}),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    start = guestjobs.job_start(cfg, "test-vm", "x.exe", cred=CRED)
+    out = guestjobs.job_output(cfg, start["job_id"], tail_bytes=4096)
+    assert out["stdout"] == text
+    assert out["stdout_encoding"] == "utf-16"
+    assert not out["stdout"].startswith("\ufeff")

@@ -9,8 +9,11 @@ diagnostic probes.
 
 The fixes are deliberately narrow: rewrite stale sshd ListenAddress lines to
 0.0.0.0 (with a timestamped backup of sshd_config), start stopped sshd /
-WinRM services, and enable EXISTING disabled allow rules covering SSH/WinRM
-ports — never create broad new firewall rules.
+WinRM services, and enable EXISTING disabled allow rules whose port filter
+matches the SSH/WinRM port exactly or is port-Any — new firewall rules are
+never created, but widening a disabled Any-port rule is possible and is
+stated verbatim in the dry-run plan text so the operator approves it
+informed.
 """
 
 from __future__ import annotations
@@ -140,7 +143,7 @@ def _plan_items(report: dict) -> list[dict[str, Any]]:
                 "action": "enable_existing_firewall_rules",
                 "target": "TCP 22 inbound allow rules",
                 "before": {"port": 22},
-                "change": "enable existing disabled allow rules covering TCP 22 (no new rules created)",
+                "change": "enable existing disabled inbound allow rules whose port filter matches TCP 22 exactly or is port-Any (may widen an existing Any-port rule; no new rules created)",
                 "finding": fid,
                 "apply_script": _apply_firewall_enable_script(22),
                 "verify_finding": "ssh_firewall_no_allow",
@@ -150,7 +153,7 @@ def _plan_items(report: dict) -> list[dict[str, Any]]:
                 "action": "enable_existing_firewall_rules",
                 "target": "TCP 5985 inbound allow rules",
                 "before": {"port": 5985},
-                "change": "enable existing disabled allow rules covering TCP 5985 (no new rules created)",
+                "change": "enable existing disabled inbound allow rules whose port filter matches TCP 5985 exactly or is port-Any (may widen an existing Any-port rule; no new rules created)",
                 "finding": fid,
                 "apply_script": _apply_firewall_enable_script(5985),
                 "verify_finding": "winrm_firewall_no_allow",

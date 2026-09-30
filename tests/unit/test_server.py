@@ -219,3 +219,32 @@ def test_state_enum_single_source():
     )
     assert lifecycle._VALID_STATES is lifecycle.VALID_STATES
     assert not hasattr(console, "_STATE_ENUM")
+
+
+def test_credential_error_envelope_at_tool_layer(fresh_server, tmp_path):
+    """PRR-018: a CredentialError raised inside a registered guest tool must
+    surface as {ok: false, error_class: "credential"} — CredentialError
+    subclasses RuntimeError, so without this envelope mapping a handler
+    removal silently relabels credential failures as transport. Drives the
+    REAL registered tool (env-only mode: no guest credentials configured)
+    through mcp.call_tool."""
+    import json as _json
+
+    doc = {"allowed_vm_patterns": ["test-*"], "unrestricted": True}
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mod = fresh_server({"HYPERV_MCP_CONFIG": str(p)})
+    mcp = mod.get_mcp()
+
+    import asyncio
+
+    result = asyncio.run(mcp.call_tool(
+        "hyperv_capture_evidence",
+        {"vm_name": "test-vm", "ui_tree": True},
+    ))
+    content = result[0] if isinstance(result, tuple) else result
+    text_blocks = [c for c in content if getattr(c, "type", "") == "text"]
+    assert text_blocks, "expected a text envelope for the credential failure"
+    envelope = _json.loads(text_blocks[0].text)
+    assert envelope["ok"] is False
+    assert envelope["error_class"] == "credential"

@@ -114,3 +114,19 @@ def test_recovery_timeout_envelope(monkeypatch):
     out = diagnostics.wait_guest_recovery(cfg, "test-vm", timeout_s=5, interval_s=1, cred=CRED)
     assert out["ok"] is False
     assert out["error_class"] == "timeout"
+
+
+def test_recovery_service_failure_listed(monkeypatch):
+    """PRR-C1: a service with ok:False must reach the failures list (the
+    service-failure append was mutation-unpinned)."""
+    cfg = Config(unrestricted=True)
+    payload = {
+        "ps_direct": {"available": True, "attempts": 1, "error": ""},
+        "services": [{"name": "sshd", "present": True, "status": "Stopped", "ok": False}],
+        "processes": [],
+    }
+    fake = FakePS([_ok(payload)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = diagnostics.wait_guest_recovery(cfg, "test-vm", services=["sshd"], cred=CRED)
+    assert out["ok"] is False
+    assert out["failures"] == ["service:sshd"]

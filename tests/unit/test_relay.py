@@ -269,3 +269,74 @@ def test_status_lists_all(monkeypatch):
     status = relay.relay_status(cfg)
     assert len(status["relays"]) == 2
     assert {r["guest_port"] for r in status["relays"]} == {9222, 8080}
+
+
+def test_negative_content_length_rejected_400(monkeypatch):
+    """PRR-021: Content-Length < 0 must 400 (rfile.read(-1) would block the
+    handler until EOF)."""
+    cfg = _relay_cfg()
+    fake = FakePS([])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = relay.relay_start(cfg, "test-vm", 9222, cred=CRED)
+    import socket
+
+    with socket.create_connection(("127.0.0.1", out["host_port"]), timeout=10) as sock:
+        sock.sendall(b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n")
+        data = sock.recv(4096)
+    assert b" 400 " in data.split(b"\r\n")[0]
+    assert b"Connection: close" in data
+    assert fake.scripts == []
+
+
+def test_start_requires_credentials():
+    """PRR-016a: cred=None must ValueError before any registry insert."""
+    cfg = _relay_cfg()
+    with pytest.raises(ValueError, match="guest credentials are required"):
+        relay.relay_start(cfg, "test-vm", 9222, cred=None)
+    assert relay._relays == {}
+
+
+def test_request_with_nulled_cred_gets_clean_503(monkeypatch):
+    """PRR-003: a request racing relay_stop (cred already nulled, listener
+    still draining) gets a clean stopped signal, not an internal
+    AttributeError 502."""
+    cfg = _relay_cfg()
+    fake = FakePS([])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = relay.relay_start(cfg, "test-vm", 9222, cred=CRED)
+    relay._relays[out["relay_id"]]["context"]["cred"] = None
+    try:
+        urllib.request.urlopen(out["url"] + "/x", timeout=10)
+        raised = False
+    except urllib.error.HTTPError as exc:
+        raised = exc.code == 503
+    assert raised
+    assert fake.scripts == []
+
+
+def test_concurrent_stop_single_shutdown(monkeypatch):
+    """PRR-027b: two racing stops on one relay — both succeed, exactly one
+    observes already-stopped, cred ends nulled."""
+    import threading
+
+    cfg = _relay_cfg()
+    fake = FakePS([])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = relay.relay_start(cfg, "test-vm", 9222, cred=CRED)
+    results = []
+    lock = threading.Lock()
+
+    def stopper():
+        r = relay.relay_stop(cfg, out["relay_id"])
+        with lock:
+            results.append(r)
+
+    threads = [threading.Thread(target=stopper) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert len(results) == 2
+    assert all(r["stopped"] is True for r in results)
+    assert sum(1 for r in results if "note" in r) == 1
+    assert relay._relays[out["relay_id"]]["context"]["cred"] is None

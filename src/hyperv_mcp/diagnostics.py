@@ -209,21 +209,34 @@ def _addr_host(value: str) -> str:
     return v
 
 
-def _findings(_vm: dict, guest: dict) -> list[dict]:
+def _findings(_vm: dict, guest: dict | None) -> list[dict]:
     out: list[dict] = []
+    if guest is None:
+        # The guest leg never ran (PS Direct unavailable): no guest-derived
+        # finding is supportable — the report already carries
+        # ps_direct_unavailable (Copilot review, COP-1).
+        return out
     if guest.get("identity", {}).get("error"):
         pass  # section error already surfaces in the report
 
+    ip_section = guest.get("ip_addresses") or {}
+    ip_ok = not ip_section.get("error")
     ipv4: set[str] = set()
-    for entry in (guest.get("ip_addresses") or {}).get("ipv4") or []:
+    for entry in ip_section.get("ipv4") or []:
         addr = entry.get("address")
         if addr:
             ipv4.add(addr.strip())
-    if not ipv4:
+    if ip_ok and not ipv4:
         out.append({
             "id": "guest_no_ipv4", "severity": "high", "route": "guest",
             "summary": "guest reports no non-loopback IPv4 addresses",
             "detail": "Get-NetIPAddress returned no usable IPv4; networking may be down or unset",
+        })
+    elif not ip_ok:
+        out.append({
+            "id": "guest_ip_probe_failed", "severity": "medium", "route": "guest",
+            "summary": "the guest IP probe failed; binding checks skipped",
+            "detail": ip_section.get("error", ""),
         })
 
     ssh = guest.get("ssh") or {}
@@ -259,7 +272,10 @@ def _findings(_vm: dict, guest: dict) -> list[dict]:
                 continue
             if raw not in stale:
                 stale.append(raw)
-        if stale:
+        # Stale-binding validation needs a trustworthy current-IP list; with
+        # the IP probe errored, every non-wildcard binding would falsely
+        # read as stale (Copilot review, COP-1).
+        if stale and ip_ok:
             out.append({
                 "id": "ssh_stale_binding", "severity": "high", "route": "ssh",
                 "summary": "SSH is bound to addresses that are not current guest IPs",
@@ -374,7 +390,7 @@ def diagnose_vm_access(
         except Exception as exc:
             ps_direct = {"available": False, "error": str(exc), "error_class": "transport"}
 
-    findings = _findings(host_info, guest or {})
+    findings = _findings(host_info, guest)
     if not ps_direct.get("available"):
         findings.append({
             "id": "ps_direct_unavailable", "severity": "high", "route": "ps_direct",

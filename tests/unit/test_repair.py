@@ -171,3 +171,24 @@ def test_plan_items_do_not_leak_apply_scripts(monkeypatch):
     out = repair.repair_guest_access(cfg, "test-vm", cred=CRED)
     for item in out["plan"]:
         assert "apply_script" not in item
+
+
+def test_apply_reports_still_present_when_verify_fails(monkeypatch):
+    """PRR-020: when the post-apply re-diagnose still reports the finding,
+    the change must carry verified=False with the still-present detail (the
+    branch a user needs when a repair did not take)."""
+    cfg = Config(unrestricted=True)
+    broken = _guest(status="Stopped")
+    still_broken = _guest(status="Stopped")
+    fake = FakePS([
+        _ok(_host()), _ok(broken),
+        _ok({"service": "sshd", "status": "Running"}),  # apply leg claims success
+        _ok(_host()), _ok(still_broken),                # verify: finding remains
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = repair.repair_guest_access(cfg, "test-vm", apply=True, confirm=True, cred=CRED)
+    assert len(out["changes"]) == 1
+    change = out["changes"][0]
+    assert change["applied"] is True
+    assert change["verified"] is False
+    assert "still present" in change["verify_detail"]

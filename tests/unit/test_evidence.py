@@ -125,9 +125,12 @@ def test_bounds_and_depth_clamped(fake_screenshot, monkeypatch):
         return {"elements": 1, "truncated": True, "tree": {}}
 
     monkeypatch.setattr(evidence, "run_guest_inner", fake_run)
-    evidence.capture_evidence(
+    out = evidence.capture_evidence(
         cfg, "test-vm", ui_tree=True, ui_tree_depth=99, ui_tree_max_elements=99999, cred=CRED,
     )
     # Depth clamped to 6, element cap to 500.
     assert "$script:cap = 500" in captured["script"]
     assert "Walk $root 6" in captured["script"]
+    # PRR-C2: the truncated pass-through is pinned in BOTH directions — a
+    # capped tree must not be reported as complete.
+    assert out["meta"]["ui_tree"]["truncated"] is True

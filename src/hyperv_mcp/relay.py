@@ -98,7 +98,8 @@ $url = {pswindows.ps_quote(url)}
 $contentType = {pswindows.ps_quote(content_type)}
 try {{
     $h = @{{}}
-    ($headersB64 | ConvertFrom-Json).PSObject.Properties | ForEach-Object {{ $h[$_.Name] = [string]$_.Value }}
+    $headersJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($headersB64))
+    ($headersJson | ConvertFrom-Json).PSObject.Properties | ForEach-Object {{ $h[$_.Name] = [string]$_.Value }}
     $body = $null
     if ($bodyB64 -ne '') {{ $body = [Convert]::FromBase64String($bodyB64) }}
     $sp = @{{
@@ -151,6 +152,10 @@ class _RelayHandler(BaseHTTPRequestHandler):
 
     context: dict[str, Any]
     protocol_version = "HTTP/1.1"
+    # Socket-level timeout (StreamRequestHandler.setup applies it): a client
+    # that stalls mid-request cannot park a handler thread forever (review
+    # round: slowloris / threads surviving relay_stop).
+    timeout = _REQUEST_TIMEOUT_S
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         pass  # keep stderr quiet; counters replace logs
@@ -223,9 +228,16 @@ class _RelayHandler(BaseHTTPRequestHandler):
             inner = _forward_script(
                 ctx["guest_port"], self.command, self.path, headers, body,
             )
-            script = build_guest_script(ctx["vm_name"], inner, ctx["cred"])
+            cred = ctx["cred"]
+            if cred is None:
+                # relay_stop nulled the credential while this request was in
+                # flight; answer with a clean signal instead of leaking the
+                # internal AttributeError from psdirect_prefix.
+                self._reply_error(503, "relay is stopped")
+                return
+            script = build_guest_script(ctx["vm_name"], inner, cred)
             self._bump("bytes_in", len(body))
-            outcome = _run_forward(script, ctx["cred"])
+            outcome = _run_forward(script, cred)
         except Exception as exc:
             self._reply_error(502, str(exc))
             return

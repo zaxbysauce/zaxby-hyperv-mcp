@@ -1174,7 +1174,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             naming the exact failure (e.g. SSH bound to obsolete guest IPs).
             Read-only (vm policy only).
 
-            Returns: {ok, vm, ps_direct, guest, findings, checked_at}.
+            Returns: {ok, vm_name, vm, ps_direct, guest, findings, checked_at}.
             """
             return _run_guest_tool(
                 "hyperv_diagnose_vm_access", vm_name, "read",
@@ -1194,7 +1194,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             allow rules. Apply requires guest_repair=true AND confirm=true;
             every applied change is re-verified and reported.
 
-            Returns: {ok, applied, plan, changes[, backup_path]}.
+            Returns: {ok, vm_name, applied, plan, changes,
+            verification_findings[, backup_path]}.
             """
             return _run_guest_tool(
                 "hyperv_repair_guest_access", vm_name, "guest_repair",
@@ -1215,7 +1216,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             stop exactly that PID with hyperv_guest_job_stop. Non-elevated
             (elevated start cannot capture output).
 
-            Returns: {ok, job_id, pid, job_dir, out_path, err_path, exit_path}.
+            Returns: {ok, job_id, vm_name, pid, job_dir, out_path, err_path, exit_path, started_at}.
             """
             return _run_guest_tool(
                 "hyperv_guest_job_start", vm_name, "exec",
@@ -1234,7 +1235,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             answer, then verify each named service is Running and each named
             process exists; reports per-item results and what failed.
 
-            Returns: {ok, ps_direct, services, processes, failures}.
+            Returns: {ok, vm_name, ps_direct, services, processes, failures, checked_at}.
             """
             return _run_guest_tool(
                 "hyperv_wait_guest_recovery", vm_name, "read",
@@ -1309,7 +1310,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             naming the exact failure (e.g. SSH bound to obsolete guest IPs).
             Read-only (vm policy only). Credentials from environment only.
 
-            Returns: {ok, vm, ps_direct, guest, findings, checked_at}.
+            Returns: {ok, vm_name, vm, ps_direct, guest, findings, checked_at}.
             """
             return _run_guest_tool(
                 "hyperv_diagnose_vm_access", vm_name, "read",
@@ -1328,7 +1329,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             every applied change is re-verified and reported. Credentials
             from environment only.
 
-            Returns: {ok, applied, plan, changes[, backup_path]}.
+            Returns: {ok, vm_name, applied, plan, changes, verification_findings[, backup_path]}.
             """
             return _run_guest_tool(
                 "hyperv_repair_guest_access", vm_name, "guest_repair",
@@ -1348,7 +1349,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             (elevated start cannot capture output). Credentials from
             environment only.
 
-            Returns: {ok, job_id, pid, job_dir, out_path, err_path, exit_path}.
+            Returns: {ok, job_id, vm_name, pid, job_dir, out_path, err_path, exit_path, started_at}.
             """
             return _run_guest_tool(
                 "hyperv_guest_job_start", vm_name, "exec",
@@ -1367,7 +1368,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             process exists; reports per-item results and what failed.
             Credentials from environment only.
 
-            Returns: {ok, ps_direct, services, processes, failures}.
+            Returns: {ok, vm_name, ps_direct, services, processes, failures, checked_at}.
             """
             return _run_guest_tool(
                 "hyperv_wait_guest_recovery", vm_name, "read",
@@ -1449,7 +1450,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         the last tail_bytes per stream. Encoding is BOM-sniffed from the
         stream head (PS 5.1 redirection may write UTF-16LE) and reported.
 
-        Returns: {ok, job_id, stdout, stderr, *_truncated, *_encoding}.
+        Returns: {ok, job_id, pid, tail_bytes, stdout, stderr, *_truncated, *_encoding, *_size}.
         """
         return _run_guest_tool(
             "hyperv_guest_job_output", "", "exec",

@@ -206,11 +206,11 @@ def _decode_stream(head_hex: str, tail_b64: str) -> tuple[str, str]:
     """BOM-sniff via the stream head (the tail slice may lack the BOM)."""
     head = bytes.fromhex(head_hex or "")
     raw = base64.b64decode(tail_b64) if tail_b64 else b""
-    if raw[:2] == b"\xff\xfe" or (len(raw) < 2 and head[:2] == b"\xff\xfe"):
-        if raw[:2] != b"\xff\xfe":
-            if len(raw) % 2 == 1:
-                raw = raw[1:]
-        return raw.decode("utf-16-le", "replace"), "utf-16"
+    if raw[:2] == b"\xff\xfe":
+        # Full read (or a tail that starts at the BOM): strip the BOM so it
+        # does not leak as U+FEFF into the decoded text (Copilot review,
+        # COP-2).
+        return raw[2:].decode("utf-16-le", "replace"), "utf-16"
     if head[:2] == b"\xff\xfe":
         # Truncated UTF-16 tail: align to a codeunit boundary before decode.
         if len(raw) % 2 == 1:

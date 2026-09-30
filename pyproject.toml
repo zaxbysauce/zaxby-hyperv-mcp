@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "hyperv-mcp"
 version = "0.3.0"
-description = "MCP server for Hyper-V VM management, checkpoints, kernel debug setup, and guest execution over PowerShell Direct."
+description = "MCP server for Hyper-V VM management, checkpoints, kernel debug setup, guest execution, guest access diagnostics/repair, managed guest jobs, HTTP relay, and console evidence capture over PowerShell Direct."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"

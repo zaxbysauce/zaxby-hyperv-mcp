@@ -271,3 +271,60 @@ def test_parse_relay_forward_script(parsed_ps):
 def test_parse_evidence_uia_script(parsed_ps):
     assert _parse_errors(evidence._uia_script(3, 200)) == []
     assert _parse_errors(evidence._uia_script(6, 500)) == []
+
+
+# -- execution lane (relay forward) ---------------------------------------------
+# The parse lane above proves SYNTAX; the mocked run_ps suites prove PYTHON
+# logic. Neither can catch runtime-semantic errors in the generated script
+# itself (the shipped header-b64 bug 502'd every relay request while both
+# lanes stayed green). This lane EXECUTES the generated inner script on real
+# PowerShell against a live local HTTP endpoint.
+
+
+def test_forward_script_executes_on_real_ps(parsed_ps, tmp_path):
+    import base64 as _b64
+    import json as _json
+    import subprocess
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Stub(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'{"Browser": "Chrome/126"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Stub)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        inner = relay._forward_script(
+            port, "GET", "/json/version", {"Accept": "application/json"}, b"",
+        )
+        script_path = tmp_path / "forward_inner.ps1"
+        script_path.write_text(inner, encoding="ascii")
+        proc = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
+            capture_output=True, text=True, timeout=120,
+        )
+        assert proc.returncode == 0, f"stderr: {proc.stderr}"
+        payload = _json.loads(proc.stdout.strip())
+        assert payload["status"] == 200, payload
+        assert payload["content_type"] == "application/json"
+        assert _json.loads(
+            _b64.b64decode(payload["body_b64"]).decode("utf-8")
+        )["Browser"] == "Chrome/126"
+        # A decode bug would take the script's catch path and emit an error
+        # payload instead of a response payload.
+        assert "error" not in payload
+    finally:
+        server.shutdown()
+        server.server_close()
