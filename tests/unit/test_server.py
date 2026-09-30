@@ -13,6 +13,9 @@ CRED_TOOLS = {
     "hyperv_guest_run", "hyperv_guest_run_ps",
     "hyperv_guest_put", "hyperv_guest_get",
     "hyperv_guest_read_file", "hyperv_guest_list_dir",
+    "hyperv_diagnose_vm_access", "hyperv_repair_guest_access",
+    "hyperv_guest_job_start", "hyperv_wait_guest_recovery",
+    "hyperv_relay_start", "hyperv_capture_evidence",
 }
 TOOL_NAMES = {
     "hyperv_list_vms", "hyperv_get_vm_info", "hyperv_start_vm", "hyperv_stop_vm",
@@ -36,6 +39,13 @@ TOOL_NAMES = {
     "hyperv_vm_tpm_set", "hyperv_vm_secureboot_set", "hyperv_vm_network_set",
     # orchestration
     "hyperv_wait_vm_state",
+    # guest access diagnostics / repair / jobs / recovery / relay / evidence
+    "hyperv_diagnose_vm_access", "hyperv_repair_guest_access",
+    "hyperv_guest_job_start", "hyperv_guest_job_status",
+    "hyperv_guest_job_output", "hyperv_guest_job_stop",
+    "hyperv_wait_guest_recovery",
+    "hyperv_relay_start", "hyperv_relay_status", "hyperv_relay_stop",
+    "hyperv_capture_evidence",
 }
 CONFIRM_TOOLS = {
     "hyperv_stop_vm", "hyperv_reset_vm", "hyperv_checkpoint_restore",
@@ -45,6 +55,7 @@ CONFIRM_TOOLS = {
     "hyperv_vm_create", "hyperv_vm_disk_add",
     "hyperv_vm_firmware_set_boot_order", "hyperv_vm_tpm_set",
     "hyperv_vm_secureboot_set",
+    "hyperv_repair_guest_access",
 }
 
 
@@ -64,11 +75,11 @@ def _schemas(mod):
     return {t.name: t.inputSchema for t in tools}
 
 
-def test_43_tools_registered(fresh_server):
+def test_tool_inventory_registered(fresh_server):
     mod = fresh_server({})
     schemas = _schemas(mod)
     assert set(schemas) == TOOL_NAMES
-    assert len(schemas) == 43
+    assert len(schemas) == 54
 
 
 def test_no_password_params_by_default(fresh_server):
@@ -160,7 +171,7 @@ def test_check_env_exit_zero(fresh_server, capsys):
     rc = mod.main(["--check-env"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "hyperv-mcp 0.2.0" in out
+    assert "hyperv-mcp 0.3.0" in out
     assert "DENY ALL" in out
 
 
@@ -180,7 +191,7 @@ def test_version_flag(fresh_server, capsys):
     with pytest.raises(SystemExit) as exc:
         mod.main(["--version"])
     assert exc.value.code == 0
-    assert "0.2.0" in capsys.readouterr().out
+    assert "0.3.0" in capsys.readouterr().out
 
 
 def test_mcp_compat_import_bootstraps(fresh_server):
@@ -208,3 +219,32 @@ def test_state_enum_single_source():
     )
     assert lifecycle._VALID_STATES is lifecycle.VALID_STATES
     assert not hasattr(console, "_STATE_ENUM")
+
+
+def test_credential_error_envelope_at_tool_layer(fresh_server, tmp_path):
+    """PRR-018: a CredentialError raised inside a registered guest tool must
+    surface as {ok: false, error_class: "credential"} — CredentialError
+    subclasses RuntimeError, so without this envelope mapping a handler
+    removal silently relabels credential failures as transport. Drives the
+    REAL registered tool (env-only mode: no guest credentials configured)
+    through mcp.call_tool."""
+    import json as _json
+
+    doc = {"allowed_vm_patterns": ["test-*"], "unrestricted": True}
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mod = fresh_server({"HYPERV_MCP_CONFIG": str(p)})
+    mcp = mod.get_mcp()
+
+    import asyncio
+
+    result = asyncio.run(mcp.call_tool(
+        "hyperv_capture_evidence",
+        {"vm_name": "test-vm", "ui_tree": True},
+    ))
+    content = result[0] if isinstance(result, tuple) else result
+    text_blocks = [c for c in content if getattr(c, "type", "") == "text"]
+    assert text_blocks, "expected a text envelope for the credential failure"
+    envelope = _json.loads(text_blocks[0].text)
+    assert envelope["ok"] is False
+    assert envelope["error_class"] == "credential"

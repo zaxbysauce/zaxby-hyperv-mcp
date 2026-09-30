@@ -22,6 +22,8 @@ def test_defaults_deny_every_axis():
     assert not cfg.destructive.console_input
     assert not cfg.destructive.media
     assert not cfg.destructive.vm_provision
+    assert not cfg.destructive.guest_repair
+    assert not cfg.destructive.relay
     assert cfg.destructive.require_confirm
     assert not cfg.allow_inline_credentials
 

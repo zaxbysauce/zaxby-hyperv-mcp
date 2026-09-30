@@ -1,9 +1,11 @@
 """
 hyperv_mcp.server -- MCP server for Hyper-V VM management (hardened fork).
 
-Exposes 43 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
-guest execution and file transfer via PowerShell Direct, console observation
-and input (WMI), VM/media provisioning, and orchestration waits. Security model:
+Exposes 54 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
+guest execution and file transfer via PowerShell Direct, guest access
+diagnostics/repair and managed guest jobs, reboot recovery verification,
+host-to-guest HTTP relay, console observation and input (WMI), evidence
+capture, VM/media provisioning, and orchestration waits. Security model:
 
   - Credentials resolve from env vars / credential files; username/password
     tool parameters exist only when config allow_inline_credentials=true.
@@ -29,22 +31,39 @@ from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP, Image
 from pydantic import AnyHttpUrl
 
-from . import auditlog, console, credentials, filetransfer, guestexec, lifecycle, media, policy, pswindows
+from . import (
+    auditlog,
+    console,
+    credentials,
+    diagnostics,
+    evidence,
+    filetransfer,
+    guestexec,
+    guestjobs,
+    lifecycle,
+    media,
+    policy,
+    pswindows,
+    relay,
+    repair,
+)
 from .config import Config, ConfigError
 from .credentials import CredentialError
 from .vmlocks import VMBusy
 
 __all__ = ["mcp", "main", "bootstrap", "configure_http_auth"]  # noqa: F822 (mcp: module __getattr__)
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 _INSTRUCTIONS = (
     "Hyper-V VM management MCP (hardened). VM lifecycle, checkpoints, "
     "KDNET/KDCOM setup, PowerShell Direct guest execution and file "
-    "transfer. Policy defaults are DENY-BY-DEFAULT: configure "
-    "HYPERV_MCP_CONFIG (allowed VM patterns and path roots) or set "
-    "HYPERV_MCP_UNRESTRICTED=1 for disposable labs. Destructive "
-    "operations additionally need confirm=true. "
+    "transfer, guest access diagnostics and narrow repair, managed guest "
+    "jobs, reboot recovery checks, a loopback host-to-guest HTTP relay, "
+    "console observation/input, and evidence capture. Policy defaults are "
+    "DENY-BY-DEFAULT: configure HYPERV_MCP_CONFIG (allowed VM patterns and "
+    "path roots) or set HYPERV_MCP_UNRESTRICTED=1 for disposable labs. "
+    "Destructive operations additionally need confirm=true. "
     "Run `hyperv-mcp --check-env` to print the effective policy."
 )
 
@@ -188,6 +207,19 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
     def _audit(tool: str, vm: str, category: str):
         return auditlog.operation(tool=tool, vm_name=vm, category=category)
 
+    def _image_meta_content(result: dict) -> list:
+        """evidence.capture_evidence result -> [ImageContent, TextContent].
+
+        Mirrors the console screenshot idiom: the PIL image is encoded to
+        PNG here and the metadata dict ships as the text sidecar.
+        """
+        buf = io.BytesIO()
+        result["image"].save(buf, format="PNG")
+        return [
+            Image(data=buf.getvalue(), format="png").to_image_content(),
+            result["meta"],
+        ]
+
     def _run_guest_tool(tool: str, vm: str, category: str, fn, *args, cred_factory=None, **kwargs) -> dict:
         """Run a guest/transfer tool, mapping policy/cred errors to ok:false.
 
@@ -223,6 +255,10 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             op.ok = False
             op.error_class = "invalid"
             return {"ok": False, "error": str(exc), "error_class": "invalid"}
+        except TimeoutError as exc:
+            op.ok = False
+            op.error_class = "timeout"
+            return {"ok": False, "error": str(exc), "error_class": "timeout"}
         except RuntimeError as exc:
             op.ok = False
             op.error_class = "transport"
@@ -1119,6 +1155,349 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         """
         with _audit("hyperv_vm_network_set", vm_name, "media"):
             return media.vm_network_set(_cfg(), vm_name, switch_name)
+
+    # ---- guest access diagnostics, repair, jobs, recovery, relay,
+    # evidence (0.3.0). Cred tools come in dual variants like the guest
+    # family above; job/relay follow-ups address the host-side registries
+    # (credentials were resolved and stored at start time).
+
+    if creds_allowed:
+
+        @mcp.tool()
+        def hyperv_diagnose_vm_access(
+            vm_name: str, timeout_ms: int = 90000,
+            username: str = "", password: str = "",
+        ) -> dict:
+            """One-call guest access diagnostic: host VM state, guest
+            identity, current guest IPs, PowerShell Direct availability,
+            sshd/WinRM service state, SSH/WinRM listeners, and findings
+            naming the exact failure (e.g. SSH bound to obsolete guest IPs).
+            Read-only (vm policy only).
+
+            Returns: {ok, vm_name, vm, ps_direct, guest, findings, checked_at}.
+            """
+            return _run_guest_tool(
+                "hyperv_diagnose_vm_access", vm_name, "read",
+                diagnostics.diagnose_vm_access, _cfg(), vm_name,
+                timeout_ms=timeout_ms,
+                cred_factory=lambda: _cred_args(username, password),
+            )
+
+        @mcp.tool()
+        def hyperv_repair_guest_access(
+            vm_name: str, apply: bool = False, confirm: bool = False,
+            username: str = "", password: str = "",
+        ) -> dict:
+            """Propose (dry run, default) or apply narrow guest access fixes:
+            stale SSH ListenAddress bindings (config backed up first;
+            firewall repair may widen an existing disabled Any-port rule,
+            disclosed in the plan text), starting stopped sshd/WinRM,
+            enabling EXISTING disabled firewall allow rules. Apply requires
+            guest_repair=true AND confirm=true;
+            every applied change is re-verified and reported.
+
+            Returns: {ok, vm_name, applied, plan, changes,
+            verification_findings[, backup_path]}.
+            """
+            return _run_guest_tool(
+                "hyperv_repair_guest_access", vm_name, "guest_repair",
+                repair.repair_guest_access, _cfg(), vm_name,
+                apply=apply, confirm=confirm,
+                cred_factory=lambda: _cred_args(username, password),
+            )
+
+        @mcp.tool()
+        def hyperv_guest_job_start(
+            vm_name: str, command: str, args: list[str] | None = None,
+            cwd: str = "", timeout_ms: int = 60000,
+            username: str = "", password: str = "",
+        ) -> dict:
+            """Start a guest command as a managed job WITHOUT waiting.
+            Returns a job_id plus the guest PID and output-file paths; poll
+            with hyperv_guest_job_status, read with hyperv_guest_job_output,
+            stop exactly that PID with hyperv_guest_job_stop. Non-elevated
+            (elevated start cannot capture output).
+
+            Returns: {ok, job_id, vm_name, pid, job_dir, out_path, err_path, exit_path, started_at}.
+            """
+            return _run_guest_tool(
+                "hyperv_guest_job_start", vm_name, "exec",
+                guestjobs.job_start, _cfg(), vm_name, command, args, cwd,
+                timeout_ms=timeout_ms,
+                cred_factory=lambda: _cred_args(username, password),
+            )
+
+        @mcp.tool()
+        def hyperv_wait_guest_recovery(
+            vm_name: str, services: list[str] | None = None,
+            processes: list[str] | None = None, timeout_s: int = 300,
+            interval_s: int = 3, username: str = "", password: str = "",
+        ) -> dict:
+            """After a restart, wait (bounded) for PowerShell Direct to
+            answer, then verify each named service is Running and each named
+            process exists; reports per-item results and what failed.
+
+            Returns: {ok, vm_name, ps_direct, services, processes, failures, checked_at}.
+            """
+            return _run_guest_tool(
+                "hyperv_wait_guest_recovery", vm_name, "read",
+                diagnostics.wait_guest_recovery, _cfg(), vm_name,
+                services, processes, timeout_s=timeout_s, interval_s=interval_s,
+                cred_factory=lambda: _cred_args(username, password),
+            )
+
+        @mcp.tool()
+        def hyperv_relay_start(
+            vm_name: str, guest_port: int, host_port: int = 0,
+            username: str = "", password: str = "",
+        ) -> dict:
+            """Start a loopback-only host HTTP listener forwarding requests
+            through PowerShell Direct to the guest's 127.0.0.1:guest_port —
+            reach guest-local web endpoints and DevTools HTTP APIs with no
+            dependence on guest network addresses. Policy: relay category.
+            HTTP only (no WebSocket proxying).
+
+            Returns: {ok, relay_id, url, host_port, ...}.
+            """
+            return _run_guest_tool(
+                "hyperv_relay_start", vm_name, "relay",
+                relay.relay_start, _cfg(), vm_name, guest_port,
+                host_port=host_port,
+                cred_factory=lambda: _cred_args(username, password),
+            )
+
+        @mcp.tool()
+        def hyperv_capture_evidence(
+            vm_name: str, width: int = 1024, height: int = 768,
+            save_path: str = "", ui_tree: bool = False,
+            ui_tree_depth: int = 3, ui_tree_max_elements: int = 200,
+            username: str = "", password: str = "",
+        ) -> list | dict:
+            """Capture console evidence in one call: screenshot paired with
+            captured_at, vm_id, dimensions and frame hash, plus an optional
+            bounded guest UI element tree (requires guest credentials; the
+            screenshot alone does not).
+
+            Returns: [ImageContent, TextContent(metadata)] on success.
+            """
+            try:
+                with _audit("hyperv_capture_evidence", vm_name, "read"):
+                    cred = _cred_args(username, password) if ui_tree else None
+                    result = evidence.capture_evidence(
+                        _cfg(), vm_name, width, height, save_path,
+                        ui_tree=ui_tree, ui_tree_depth=ui_tree_depth,
+                        ui_tree_max_elements=ui_tree_max_elements, cred=cred,
+                    )
+                    return _image_meta_content(result)
+            except policy.PolicyDenied as exc:
+                return {"ok": False, "error": str(exc), "error_class": "policy"}
+            except CredentialError as exc:
+                return {"ok": False, "error": str(exc), "error_class": "credential"}
+            except VMBusy as exc:
+                return {"ok": False, "error": str(exc), "error_class": "busy"}
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc), "error_class": "invalid"}
+            except console.ConsoleError as exc:
+                return {"ok": False, "error": str(exc), "error_class": "transport"}
+            except RuntimeError as exc:
+                return {"ok": False, "error": str(exc), "error_class": "transport"}
+
+    else:
+
+        @mcp.tool()
+        def hyperv_diagnose_vm_access(vm_name: str, timeout_ms: int = 90000) -> dict:
+            """One-call guest access diagnostic: host VM state, guest
+            identity, current guest IPs, PowerShell Direct availability,
+            sshd/WinRM service state, SSH/WinRM listeners, and findings
+            naming the exact failure (e.g. SSH bound to obsolete guest IPs).
+            Read-only (vm policy only). Credentials from environment only.
+
+            Returns: {ok, vm_name, vm, ps_direct, guest, findings, checked_at}.
+            """
+            return _run_guest_tool(
+                "hyperv_diagnose_vm_access", vm_name, "read",
+                diagnostics.diagnose_vm_access, _cfg(), vm_name,
+                timeout_ms=timeout_ms, cred_factory=credentials.resolve_guest,
+            )
+
+        @mcp.tool()
+        def hyperv_repair_guest_access(
+            vm_name: str, apply: bool = False, confirm: bool = False,
+        ) -> dict:
+            """Propose (dry run, default) or apply narrow guest access fixes:
+            stale SSH ListenAddress bindings (config backed up first;
+            firewall repair may widen an existing disabled Any-port rule,
+            disclosed in the plan text), starting stopped sshd/WinRM,
+            enabling EXISTING disabled firewall allow rules. Apply requires
+            guest_repair=true AND confirm=true;
+            every applied change is re-verified and reported. Credentials
+            from environment only.
+
+            Returns: {ok, vm_name, applied, plan, changes, verification_findings[, backup_path]}.
+            """
+            return _run_guest_tool(
+                "hyperv_repair_guest_access", vm_name, "guest_repair",
+                repair.repair_guest_access, _cfg(), vm_name,
+                apply=apply, confirm=confirm, cred_factory=credentials.resolve_guest,
+            )
+
+        @mcp.tool()
+        def hyperv_guest_job_start(
+            vm_name: str, command: str, args: list[str] | None = None,
+            cwd: str = "", timeout_ms: int = 60000,
+        ) -> dict:
+            """Start a guest command as a managed job WITHOUT waiting.
+            Returns a job_id plus the guest PID and output-file paths; poll
+            with hyperv_guest_job_status, read with hyperv_guest_job_output,
+            stop exactly that PID with hyperv_guest_job_stop. Non-elevated
+            (elevated start cannot capture output). Credentials from
+            environment only.
+
+            Returns: {ok, job_id, vm_name, pid, job_dir, out_path, err_path, exit_path, started_at}.
+            """
+            return _run_guest_tool(
+                "hyperv_guest_job_start", vm_name, "exec",
+                guestjobs.job_start, _cfg(), vm_name, command, args, cwd,
+                timeout_ms=timeout_ms, cred_factory=credentials.resolve_guest,
+            )
+
+        @mcp.tool()
+        def hyperv_wait_guest_recovery(
+            vm_name: str, services: list[str] | None = None,
+            processes: list[str] | None = None, timeout_s: int = 300,
+            interval_s: int = 3,
+        ) -> dict:
+            """After a restart, wait (bounded) for PowerShell Direct to
+            answer, then verify each named service is Running and each named
+            process exists; reports per-item results and what failed.
+            Credentials from environment only.
+
+            Returns: {ok, vm_name, ps_direct, services, processes, failures, checked_at}.
+            """
+            return _run_guest_tool(
+                "hyperv_wait_guest_recovery", vm_name, "read",
+                diagnostics.wait_guest_recovery, _cfg(), vm_name,
+                services, processes, timeout_s=timeout_s, interval_s=interval_s,
+                cred_factory=credentials.resolve_guest,
+            )
+
+        @mcp.tool()
+        def hyperv_relay_start(
+            vm_name: str, guest_port: int, host_port: int = 0,
+        ) -> dict:
+            """Start a loopback-only host HTTP listener forwarding requests
+            through PowerShell Direct to the guest's 127.0.0.1:guest_port —
+            reach guest-local web endpoints and DevTools HTTP APIs with no
+            dependence on guest network addresses. Policy: relay category.
+            HTTP only (no WebSocket proxying). Credentials from environment
+            only.
+
+            Returns: {ok, relay_id, url, host_port, ...}.
+            """
+            return _run_guest_tool(
+                "hyperv_relay_start", vm_name, "relay",
+                relay.relay_start, _cfg(), vm_name, guest_port,
+                host_port=host_port, cred_factory=credentials.resolve_guest,
+            )
+
+        @mcp.tool()
+        def hyperv_capture_evidence(
+            vm_name: str, width: int = 1024, height: int = 768,
+            save_path: str = "", ui_tree: bool = False,
+            ui_tree_depth: int = 3, ui_tree_max_elements: int = 200,
+        ) -> list | dict:
+            """Capture console evidence in one call: screenshot paired with
+            captured_at, vm_id, dimensions and frame hash, plus an optional
+            bounded guest UI element tree (requires guest credentials; the
+            screenshot alone does not). Credentials from environment only.
+
+            Returns: [ImageContent, TextContent(metadata)] on success.
+            """
+            try:
+                with _audit("hyperv_capture_evidence", vm_name, "read"):
+                    cred = credentials.resolve_guest() if ui_tree else None
+                    result = evidence.capture_evidence(
+                        _cfg(), vm_name, width, height, save_path,
+                        ui_tree=ui_tree, ui_tree_depth=ui_tree_depth,
+                        ui_tree_max_elements=ui_tree_max_elements, cred=cred,
+                    )
+                    return _image_meta_content(result)
+            except policy.PolicyDenied as exc:
+                return {"ok": False, "error": str(exc), "error_class": "policy"}
+            except CredentialError as exc:
+                return {"ok": False, "error": str(exc), "error_class": "credential"}
+            except VMBusy as exc:
+                return {"ok": False, "error": str(exc), "error_class": "busy"}
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc), "error_class": "invalid"}
+            except console.ConsoleError as exc:
+                return {"ok": False, "error": str(exc), "error_class": "transport"}
+            except RuntimeError as exc:
+                return {"ok": False, "error": str(exc), "error_class": "transport"}
+
+    @mcp.tool()
+    def hyperv_guest_job_status(job_id: str) -> dict:
+        """Report a managed guest job: running / exited (with exit code) /
+        exiting / stopped (`exiting` is not terminal: if the guest wrapper
+        died before writing its exit-code file, status stays `exiting`
+        until hyperv_guest_job_stop is called). Addresses the host-side
+        job registry (credentials
+        were stored at start time).
+
+        Returns: {ok, job_id, pid, status[, exit_code, process_name]}.
+        """
+        return _run_guest_tool(
+            "hyperv_guest_job_status", "", "exec",
+            guestjobs.job_status, _cfg(), job_id,
+        )
+
+    @mcp.tool()
+    def hyperv_guest_job_output(job_id: str, tail_bytes: int = 65536) -> dict:
+        """Read the captured stdout/stderr of a managed guest job, bounded to
+        the last tail_bytes per stream. Encoding is BOM-sniffed from the
+        stream head (PS 5.1 redirection may write UTF-16LE) and reported.
+
+        Returns: {ok, job_id, pid, tail_bytes, stdout, stderr, *_truncated, *_encoding, *_size}.
+        """
+        return _run_guest_tool(
+            "hyperv_guest_job_output", "", "exec",
+            guestjobs.job_output, _cfg(), job_id, tail_bytes=tail_bytes,
+        )
+
+    @mcp.tool()
+    def hyperv_guest_job_stop(job_id: str) -> dict:
+        """Stop exactly the guest PID of a managed job, remove its guest
+        temp directory, and release the stored credentials.
+
+        Returns: {ok, job_id, pid, stopped}.
+        """
+        return _run_guest_tool(
+            "hyperv_guest_job_stop", "", "exec",
+            guestjobs.job_stop, _cfg(), job_id,
+        )
+
+    @mcp.tool()
+    def hyperv_relay_status(relay_id: str = "") -> dict:
+        """List relays (or one) with liveness and request counters.
+
+        Returns: {ok, relays: [{relay_id, url, counters, stopped, ...}]}.
+        """
+        return _run_guest_tool(
+            "hyperv_relay_status", "", "relay",
+            relay.relay_status, _cfg(), relay_id,
+        )
+
+    @mcp.tool()
+    def hyperv_relay_stop(relay_id: str) -> dict:
+        """Stop a relay: close the loopback listener and release the stored
+        credentials.
+
+        Returns: {ok, relay_id, host_port, stopped}.
+        """
+        return _run_guest_tool(
+            "hyperv_relay_stop", "", "relay",
+            relay.relay_stop, _cfg(), relay_id,
+        )
 
 
 # ---------------------------------------------------------------------------
