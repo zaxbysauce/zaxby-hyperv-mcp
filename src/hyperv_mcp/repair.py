@@ -13,7 +13,10 @@ WinRM services, and enable EXISTING disabled allow rules whose port filter
 matches the SSH/WinRM port exactly or is port-Any — new firewall rules are
 never created, but widening a disabled Any-port rule is possible and is
 stated verbatim in the dry-run plan text so the operator approves it
-informed.
+informed. A stale address seen only on the runtime listener (e.g. a
+hostname ListenAddress line) matches no config line: the backup and sshd
+restart still run with 0 replacements while verification reports the
+binding still present.
 """
 
 from __future__ import annotations

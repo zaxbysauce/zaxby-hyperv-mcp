@@ -345,7 +345,10 @@ fault-isolated; one failing probe never aborts the report.
 `hyperv_repair_guest_access` dry-runs by default (propose only, read-only).
 With `apply=true` it performs the narrow fixes — stale `ListenAddress` lines
 rewritten to `0.0.0.0` (sshd_config backed up first), stopped sshd/WinRM
-started, EXISTING disabled firewall allow rules enabled — a rule whose port filter matches the target port exactly or is port-Any may be widened (disclosed verbatim in the dry-run plan; no new rules are created) — and re-verifies every action, returning per-change
+started, EXISTING disabled firewall allow rules enabled — a rule whose port filter matches the target port exactly or is port-Any may be widened (disclosed verbatim in the dry-run plan; no new rules are created). A
+stale address seen only on the runtime listener matches no config line:
+the backup and restart still run with 0 replacements while verification
+reports the binding still present — and re-verifies every action, returning per-change
 `applied`/`verified` results. Apply requires `guest_repair: true` AND
 `confirm=true`.
 
@@ -372,8 +375,9 @@ a successful stop, cap eviction, or process exit — plan accordingly on
 shared hosts. `exiting` is not a terminal state: if the guest wrapper dies
 before writing its exit-code file, status stays `exiting` until you call
 `hyperv_guest_job_stop`. Registry follow-ups (status/output/stop) write
-audit rows with an empty vm_name (they address the host-side registry, not
-a VM operation).
+audit rows with an empty vm_name and no job/relay id (they address the
+host-side registry, not a VM operation) — a follow-up row cannot be
+correlated to the specific job or relay that started it.
 
 ### Reboot Recovery (0.3.0)
 

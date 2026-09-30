@@ -1189,9 +1189,11 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             username: str = "", password: str = "",
         ) -> dict:
             """Propose (dry run, default) or apply narrow guest access fixes:
-            stale SSH ListenAddress bindings (config backed up first),
-            starting stopped sshd/WinRM, enabling EXISTING disabled firewall
-            allow rules. Apply requires guest_repair=true AND confirm=true;
+            stale SSH ListenAddress bindings (config backed up first;
+            firewall repair may widen an existing disabled Any-port rule,
+            disclosed in the plan text), starting stopped sshd/WinRM,
+            enabling EXISTING disabled firewall allow rules. Apply requires
+            guest_repair=true AND confirm=true;
             every applied change is re-verified and reported.
 
             Returns: {ok, vm_name, applied, plan, changes,
@@ -1323,9 +1325,11 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_name: str, apply: bool = False, confirm: bool = False,
         ) -> dict:
             """Propose (dry run, default) or apply narrow guest access fixes:
-            stale SSH ListenAddress bindings (config backed up first),
-            starting stopped sshd/WinRM, enabling EXISTING disabled firewall
-            allow rules. Apply requires guest_repair=true AND confirm=true;
+            stale SSH ListenAddress bindings (config backed up first;
+            firewall repair may widen an existing disabled Any-port rule,
+            disclosed in the plan text), starting stopped sshd/WinRM,
+            enabling EXISTING disabled firewall allow rules. Apply requires
+            guest_repair=true AND confirm=true;
             every applied change is re-verified and reported. Credentials
             from environment only.
 
@@ -1434,7 +1438,10 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
     @mcp.tool()
     def hyperv_guest_job_status(job_id: str) -> dict:
         """Report a managed guest job: running / exited (with exit code) /
-        exiting / stopped. Addresses the host-side job registry (credentials
+        exiting / stopped (`exiting` is not terminal: if the guest wrapper
+        died before writing its exit-code file, status stays `exiting`
+        until hyperv_guest_job_stop is called). Addresses the host-side
+        job registry (credentials
         were stored at start time).
 
         Returns: {ok, job_id, pid, status[, exit_code, process_name]}.
