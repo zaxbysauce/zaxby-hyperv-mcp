@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 
 from PIL import Image as PILImage
 
-from . import policy, pswindows, vmlocks
+from . import guestexec, policy, pswindows, vmlocks
 from .config import Config
 
 _WMI_NS = "root\\virtualization\\v2"
@@ -247,13 +247,19 @@ while ($polls -lt %MAX_POLLS%) {
 # ---------------------------------------------------------------------------
 
 def _vm_guid(cfg: Config, vm_name: str) -> str:
-    """Authorize the VM name and resolve its stable Hyper-V GUID."""
+    """Authorize the VM name and resolve its stable Hyper-V GUID.
+
+    Resolved straight from the virtualization CIM namespace (Msvm_ComputerSystem.Name
+    IS the GUID) with a bounded retry: Get-VM -Name intermittently fails with
+    'Call cancelled' under vmms WMI stress, and the console path must not depend on it.
+    """
     if not vm_name or not vm_name.strip():
         raise ValueError("vm_name is required")
     policy.vm_allowed(cfg, vm_name)
+    # psdirect_vm_target only ASSIGNS $vmTarget; append the bare emit line so
+    # run_ps captures the GUID itself on stdout.
     result = pswindows.run_ps(
-        "(Get-VM -Name " + pswindows.ps_name(vm_name) + " -ErrorAction Stop).Id.ToString()",
-        timeout_s=60,
+        guestexec.psdirect_vm_target(vm_name) + "\n$vmTarget\n", timeout_s=60
     )
     pswindows.check_result(result, f"resolve VM '{vm_name}'")
     guid = result.stdout.strip()

@@ -18,7 +18,7 @@ from datetime import datetime
 from . import policy, pswindows, vmlocks
 from .config import Config
 from .credentials import CredentialSet
-from .guestexec import psdirect_prefix  # re-exported for kd tools
+from .guestexec import psdirect_prefix, psdirect_vm_target  # re-exported prefix for kd tools
 
 _MAX_NAME_LEN = 260
 
@@ -95,14 +95,14 @@ _SNAPSHOT_KEY_ALIASES = {
 # ---------------------------------------------------------------------------
 
 def _wait_state_script(cfg: Config, vm_name: str, wanted: list[str], timeout_s: int) -> str:
-    n = pswindows.ps_name(vm_name)
     wanted_ps = ", ".join(f"'{w}'" for w in wanted)
     return f"""
-$vm = Get-VM -Name {n} -ErrorAction Stop
+{psdirect_vm_target(vm_name)}
+$vm = Get-VM -Id $vmTarget -ErrorAction Stop
 $deadline = (Get-Date).AddSeconds({int(timeout_s)})
 while ([string]$vm.State -notin ({wanted_ps}) -and (Get-Date) -lt $deadline) {{
     Start-Sleep -Seconds 2
-    $vm = Get-VM -Name {n} -ErrorAction SilentlyContinue
+    $vm = Get-VM -Id $vmTarget -ErrorAction SilentlyContinue
     if (-not $vm) {{
         # -f inserts the name as DATA (no expansion of $/sub-expressions).
         throw ('VM {{0}} disappeared while waiting for state' -f {pswindows.ps_name(vm_name)})
@@ -156,13 +156,28 @@ def wait_for_vm_state(cfg: Config, vm_name: str, states: list[str], timeout_s: i
 # ---------------------------------------------------------------------------
 
 _LIST_VM_SCRIPT = """
-Get-VM | Select-Object @{N='name';E={$_.Name}},
-  @{N='state';E={[string]$_.State}},
-  @{N='status';E={$_.Status}},
-  @{N='memory_mb';E={[math]::Round($_.MemoryAssigned/1MB,1)}},
-  @{N='cpu_count';E={$_.ProcessorCount}},
-  @{N='uptime_seconds';E={$_.Uptime.TotalSeconds}} |
-  ConvertTo-Json -Compress -Depth 3
+# Get-VM enumeration intermittently fails with 'Call cancelled' under vmms
+# WMI stress; retry instead of surfacing a transient transport error. The
+# success flag distinguishes 'zero VMs' ($vms stays $null) from 'enumeration
+# failed', so an empty host still lists as [] instead of erroring forever.
+$vms = $null
+$done = $false
+foreach ($i in 1..3) {
+  try {
+    $vms = Get-VM | Select-Object @{N='name';E={$_.Name}},
+      @{N='state';E={[string]$_.State}},
+      @{N='status';E={$_.Status}},
+      @{N='memory_mb';E={[math]::Round($_.MemoryAssigned/1MB,1)}},
+      @{N='cpu_count';E={$_.ProcessorCount}},
+      @{N='uptime_seconds';E={$_.Uptime.TotalSeconds}}
+    $done = $true
+    break
+  } catch {
+    if ($i -lt 3) { Start-Sleep -Seconds 2 }
+  }
+}
+if (-not $done) { throw 'Get-VM enumeration failed after retries' }
+$vms | ConvertTo-Json -Compress -Depth 3
 """
 
 
@@ -192,13 +207,13 @@ def list_vms(cfg: Config) -> list[dict]:
 
 def get_vm_info(cfg: Config, vm_name: str) -> dict:
     _checked_vm(cfg, vm_name)
-    n = pswindows.ps_name(vm_name)
     script = f"""
-$vm  = Get-VM          -Name {n} -ErrorAction Stop
-$com = Get-VMComPort   -VMName {n} | Select-Object Name, Path
-$net = Get-VMNetworkAdapter -VMName {n} | Select-Object Name, SwitchName, MacAddress, IPAddresses
-$hdd = Get-VMHardDiskDrive  -VMName {n} | Select-Object ControllerType, Path
-$snaps = (Get-VMSnapshot -VMName {n} | Measure-Object).Count
+{psdirect_vm_target(vm_name)}
+$vm  = Get-VM -Id $vmTarget -ErrorAction Stop
+$com = Get-VMComPort   -VM $vm | Select-Object Name, Path
+$net = Get-VMNetworkAdapter -VM $vm | Select-Object Name, SwitchName, MacAddress, IPAddresses
+$hdd = Get-VMHardDiskDrive  -VM $vm | Select-Object ControllerType, Path
+$snaps = (Get-VMSnapshot -VM $vm | Measure-Object).Count
 [PSCustomObject]@{{
     name             = $vm.Name
     state            = [string]$vm.State
@@ -224,9 +239,9 @@ $snaps = (Get-VMSnapshot -VMName {n} | Measure-Object).Count
 
 def start_vm(cfg: Config, vm_name: str) -> dict:
     _checked_vm(cfg, vm_name)
-    n = pswindows.ps_name(vm_name)
     script = f"""
-$vm = Get-VM -Name {n} -ErrorAction Stop
+{psdirect_vm_target(vm_name)}
+$vm = Get-VM -Id $vmTarget -ErrorAction Stop
 $initial = [string]$vm.State
 if ($initial -ne 'Running') {{ Start-VM -VM $vm -ErrorAction Stop }}
 [PSCustomObject]@{{ initial_state=$initial }} | ConvertTo-Json -Compress
@@ -260,9 +275,9 @@ def stop_vm(cfg: Config, vm_name: str, method: str = "shutdown", confirm: bool =
         raise ValueError("method must be one of: shutdown, shutdown-force, save, turnoff")
     _require_destructive(cfg, "stop", confirm, f"stop VM '{vm_name}' ({method})")
     flags, wanted, _ = _STOP_SPECS[method]
-    n = pswindows.ps_name(vm_name)
     script = f"""
-$vm = Get-VM -Name {n} -ErrorAction Stop
+{psdirect_vm_target(vm_name)}
+$vm = Get-VM -Id $vmTarget -ErrorAction Stop
 $initial = [string]$vm.State
 if ($initial -notin ({", ".join(f"'{w}'" for w in wanted)})) {{
     Stop-VM -VM $vm {flags} -ErrorAction Stop
@@ -286,10 +301,11 @@ if ($initial -notin ({", ".join(f"'{w}'" for w in wanted)})) {{
 def reset_vm(cfg: Config, vm_name: str, confirm: bool = False) -> dict:
     _checked_vm(cfg, vm_name)
     _require_destructive(cfg, "reset", confirm, f"hard reset VM '{vm_name}'")
-    n = pswindows.ps_name(vm_name)
     script = f"""
-Stop-VM -Name {n} -TurnOff -ErrorAction Stop
-Start-VM -Name {n} -ErrorAction Stop
+{psdirect_vm_target(vm_name)}
+$vm = Get-VM -Id $vmTarget -ErrorAction Stop
+Stop-VM -VM $vm -TurnOff -ErrorAction Stop
+Start-VM -VM $vm -ErrorAction Stop
 """
     with vmlocks.vm_lock(vm_name):
         result = pswindows.run_ps(script, timeout_s=60)
@@ -307,26 +323,29 @@ def checkpoint_create(cfg: Config, vm_name: str, checkpoint_name: str = "") -> d
     if not checkpoint_name:
         checkpoint_name = f"MCP-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     _checked_label(checkpoint_name, "checkpoint_name")
-    n = pswindows.ps_name(vm_name)
     cn = pswindows.ps_name(checkpoint_name)
     with vmlocks.vm_lock(vm_name):
-        result = pswindows.run_ps(
-            f"Checkpoint-VM -Name {n} -SnapshotName {cn} -ErrorAction Stop", timeout_s=300
-        )
+        script = f"""
+{psdirect_vm_target(vm_name)}
+$vm = Get-VM -Id $vmTarget -ErrorAction Stop
+Checkpoint-VM -VM $vm -SnapshotName {cn} -ErrorAction Stop
+"""
+        result = pswindows.run_ps(script, timeout_s=300)
         pswindows.check_result(result, f"hyperv_checkpoint_create({vm_name})")
         return {"status": "created", "vm_name": vm_name, "checkpoint_name": checkpoint_name}
 
 
 def checkpoint_list(cfg: Config, vm_name: str) -> list[dict]:
     _checked_vm(cfg, vm_name)
-    script = """
-Get-VMSnapshot -VMName %VM% |
+    script = psdirect_vm_target(vm_name) + """
+$vm = Get-VM -Id $vmTarget -ErrorAction Stop
+Get-VMSnapshot -VM $vm |
   Select-Object @{N='name';E={$_.Name}},
                 @{N='type';E={[string]$_.SnapshotType}},
                 @{N='created';E={$_.CreationTime.ToString('o')}},
                 @{N='parent_name';E={$_.ParentSnapshotName}} |
   ConvertTo-Json -Compress -Depth 2
-""".replace("%VM%", pswindows.ps_name(vm_name))
+"""
     result = pswindows.run_ps(script, timeout_s=60)
     pswindows.check_result(result, f"hyperv_checkpoint_list({vm_name})")
     return [_add_legacy_aliases(row, _SNAPSHOT_KEY_ALIASES) for row in _parse_json_objects(result, "checkpoint_list")]
@@ -336,13 +355,13 @@ def checkpoint_restore(cfg: Config, vm_name: str, checkpoint_name: str, confirm:
     _checked_vm(cfg, vm_name)
     _checked_label(checkpoint_name, "checkpoint_name")
     _require_destructive(cfg, "checkpoint_restore", confirm, f"restore VM '{vm_name}' to '{checkpoint_name}'")
-    n = pswindows.ps_name(vm_name)
     cn = pswindows.ps_name(checkpoint_name)
     with vmlocks.vm_lock(vm_name):
-        result = pswindows.run_ps(
-            f"Restore-VMSnapshot -Name {cn} -VMName {n} -Confirm:$false -ErrorAction Stop",
-            timeout_s=300,
-        )
+        script = f"""
+{psdirect_vm_target(vm_name)}
+Restore-VMSnapshot -Name {cn} -VM (Get-VM -Id $vmTarget -ErrorAction Stop) -Confirm:$false -ErrorAction Stop
+"""
+        result = pswindows.run_ps(script, timeout_s=300)
         pswindows.check_result(result, f"hyperv_checkpoint_restore({vm_name}, {checkpoint_name})")
         # Restoring a checkpoint whose subtree has descendants merges their
         # differencing disks; the VM can stay in transitional states for many
@@ -364,14 +383,14 @@ def checkpoint_remove(
     _checked_label(checkpoint_name, "checkpoint_name")
     detail = f"remove checkpoint '{checkpoint_name}' on '{vm_name}'" + (" (subtree)" if include_subtree else "")
     _require_destructive(cfg, "checkpoint_remove", confirm, detail)
-    n = pswindows.ps_name(vm_name)
     cn = pswindows.ps_name(checkpoint_name)
     subtree = "-IncludeAllChildSnapshots" if include_subtree else ""
     with vmlocks.vm_lock(vm_name):
-        result = pswindows.run_ps(
-            f"Remove-VMSnapshot -Name {cn} -VMName {n} {subtree} -Confirm:$false -ErrorAction Stop",
-            timeout_s=300,
-        )
+        script = f"""
+{psdirect_vm_target(vm_name)}
+Remove-VMSnapshot -Name {cn} -VM (Get-VM -Id $vmTarget -ErrorAction Stop) {subtree} -Confirm:$false -ErrorAction Stop
+"""
+        result = pswindows.run_ps(script, timeout_s=300)
         pswindows.check_result(result, f"hyperv_checkpoint_remove({vm_name})")
         return {"status": "removed", "vm_name": vm_name, "checkpoint_name": checkpoint_name}
 
@@ -434,13 +453,14 @@ def configure_kdnet(
         cfg, "kd_reboot", confirm,
         f"configure KDNET on '{vm_name}'" + (" and reboot it" if reboot else ""),
     )
-    n = pswindows.ps_name(vm_name)
     eip = pswindows.ps_quote(host_ip)
     ekey = pswindows.ps_quote(key)
     cred_prefix = psdirect_prefix(cred)
+    vm_target = psdirect_vm_target(vm_name)
     script = f"""
 {cred_prefix}
-$out = Invoke-Command -VMName {n} -Credential $cred -ErrorAction Stop -ScriptBlock {{
+{vm_target}
+$out = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{
     param($ip, $p, $k)
     $r1 = & 'bcdedit.exe' '/dbgsettings' 'net' "hostip:$ip" "port:$p" "key:$k" 2>&1
     $r2 = & 'bcdedit.exe' '/debug' 'on' 2>&1
@@ -461,7 +481,8 @@ $out | ConvertTo-Json -Compress
         if reboot:
             reboot_script = f"""
 {cred_prefix}
-Invoke-Command -VMName {n} -Credential $cred -ScriptBlock {{ & 'shutdown.exe' '/r' '/t' '3' }} -ErrorAction Stop
+{vm_target}
+Invoke-Command -VMId $vmTarget -Credential $cred -ScriptBlock {{ & 'shutdown.exe' '/r' '/t' '3' }} -ErrorAction Stop
 """
             rr = pswindows.run_ps(
                 reboot_script.strip(), timeout_s=30, stdin_b64=pswindows.utf8_b64(cred.password)
@@ -501,14 +522,18 @@ def configure_kdcom(
         raise ValueError("guest credentials are required")
     _require_destructive(cfg, "kd_reboot", confirm, f"configure KDCOM on '{vm_name}'" + (" and reboot it" if reboot else ""))
 
-    n = pswindows.ps_name(vm_name)
     pn = pswindows.ps_name(pipe_name)
     cred_prefix = psdirect_prefix(cred)
+    vm_target = psdirect_vm_target(vm_name)
 
-    step1 = f"Set-VMComPort -VMName {n} -Number {com_port} -Path {pn} -ErrorAction Stop"
+    step1 = f"""
+{psdirect_vm_target(vm_name)}
+Set-VMComPort -VM (Get-VM -Id $vmTarget -ErrorAction Stop) -Number {com_port} -Path {pn} -ErrorAction Stop
+"""
     step2 = f"""
 {cred_prefix}
-$out = Invoke-Command -VMName {n} -Credential $cred -ErrorAction Stop -ScriptBlock {{
+{vm_target}
+$out = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{
     param($port)
     $r1 = & 'bcdedit.exe' '/dbgsettings' 'serial' "debugport:$port" 'baudrate:115200' 2>&1
     $r2 = & 'bcdedit.exe' '/debug' 'on' 2>&1
@@ -531,7 +556,8 @@ $out | ConvertTo-Json -Compress
         if reboot:
             reboot_script = f"""
 {cred_prefix}
-Invoke-Command -VMName {n} -Credential $cred -ScriptBlock {{ & 'shutdown.exe' '/r' '/t' '3' }} -ErrorAction Stop
+{vm_target}
+Invoke-Command -VMId $vmTarget -Credential $cred -ScriptBlock {{ & 'shutdown.exe' '/r' '/t' '3' }} -ErrorAction Stop
 """
             rr = pswindows.run_ps(
                 reboot_script.strip(), timeout_s=30, stdin_b64=pswindows.utf8_b64(cred.password)

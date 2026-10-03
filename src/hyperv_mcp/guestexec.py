@@ -47,6 +47,55 @@ def psdirect_prefix(cred: CredentialSet) -> str:
     ])
 
 
+def psdirect_vm_target(vm_name: str) -> str:
+    """PowerShell lines resolving the VM GUID into $vmTarget (caller emits it).
+
+    Invoke-Command -VMName and Get-VM -Name intermittently fail with 'does not
+    resolve to a single virtual machine' or 'Call cancelled' when the vmms WMI
+    provider is under stress, even with a unique name. Resolving the GUID once
+    via the virtualization CIM namespace and binding by -VMId/-Id everywhere is
+    deterministic; the bounded retry rides out transient WMI cancellations.
+    The filter is a literal -eq (ps_quote, no wildcard escaping — wildcard
+    chars are inert by construction) restricted to GUID-shaped Msvm_ComputerSystem
+    instances, because the namespace also contains the HOST computer system
+    (observed live: ElementName='VSAN', Name='VSAN' — not a GUID), which would
+    otherwise hijack resolution when the VM name equals the host name. A
+    duplicate VM name is ambiguous exactly like the old -VMName binding, so it
+    throws instead of silently picking one. NOTE: the emitted script only
+    ASSIGNS $vmTarget — append a bare '$vmTarget' line (or consume it in a
+    larger script) when the value itself must be captured.
+    """
+    return "\n".join([
+        "$vmTarget = $null",
+        "$vmResolveError = ''",
+        "foreach ($vmAttempt in 1..3) {",
+        "    try {",
+        "        $vmCandidates = @(",
+        "            Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem"
+        " -ErrorAction Stop |",
+        f"            Where-Object {{ ($_.ElementName -eq {pswindows.ps_quote(vm_name)})"
+        " -and ($_.Name -match '^[0-9a-fA-F]{8}-') }",
+        "        )",
+        "        if ($vmCandidates.Count -gt 1) {",
+        "            $vmResolveError = 'target VM name is not unique'",
+        "            break",
+        "        }",
+        "        if ($vmCandidates.Count -eq 1) {",
+        "            $vmTarget = $vmCandidates[0].Name",
+        "            break",
+        "        }",
+        "    } catch {",
+        "        $vmResolveError = $_.Exception.Message",
+        "    }",
+        "    if ($vmAttempt -lt 3) { Start-Sleep -Seconds 2 }",
+        "}",
+        "if (-not $vmTarget) {",
+        "    if (-not $vmResolveError) { $vmResolveError = 'target VM not found by name' }",
+        "    throw ('target VM resolution failed after retries: {0}' -f $vmResolveError)",
+        "}",
+    ])
+
+
 def _truncate(value: str, limit_bytes: int) -> tuple[str, bool]:
     raw = value.encode("utf-8", "replace")
     if len(raw) <= limit_bytes:
@@ -124,7 +173,6 @@ try {
 
 
 def _host_script(vm_name: str, inner_script: str, cred: CredentialSet, elevated: bool) -> str:
-    n = pswindows.ps_name(vm_name)
     body = _elevated_body() if elevated else _normal_body()
     # $enc MUST be passed via -ArgumentList (the comment at the Invoke-Command
     # says so — regression F-A round 2 caught it missing) and the temp .ps1 is
@@ -133,8 +181,9 @@ def _host_script(vm_name: str, inner_script: str, cred: CredentialSet, elevated:
     # residue (a fresh unique name, no side-effect file to clean up).
     return f"""
 {psdirect_prefix(cred)}
+{psdirect_vm_target(vm_name)}
 $enc = '{pswindows.utf8_b64(inner_script)}'
-$r = Invoke-Command -VMName {n} -Credential $cred -ErrorAction Stop -ScriptBlock {{
+$r = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{
     param($enc)
     $text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($enc))
     $tmp  = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName() + '.ps1')

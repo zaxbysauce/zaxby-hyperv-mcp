@@ -215,3 +215,21 @@ def test_vm_policy_denied_raises():
 def test_missing_creds_rejected():
     with pytest.raises(ValueError, match="credentials"):
         guestexec.guest_run_ps(Config(unrestricted=True), "vm1", "x", cred=None)
+
+
+def test_psdirect_vm_target_script_contract():
+    """Resolver emits GUID-shaped CIM filter, duplicate guard, gated sleep,
+    and only ASSIGNS $vmTarget (no emit — callers own output capture)."""
+    script = guestexec.psdirect_vm_target("test[1]*vm")
+    # literal -eq match (wildcard chars inert) AND GUID-shaped Name filter
+    assert "$_.ElementName -eq 'test[1]*vm'" in script
+    assert "$_.Name -match '^[0-9a-fA-F]{8}-'" in script
+    # duplicate VM names are ambiguous -> error, never a silent [0] pick
+    assert "$vmCandidates.Count -gt 1" in script
+    assert "'target VM name is not unique'" in script
+    # bounded retry with terminal-attempt sleep gated
+    assert "foreach ($vmAttempt in 1..3)" in script
+    assert "if ($vmAttempt -lt 3) { Start-Sleep -Seconds 2 }" in script
+    # assignment-only: no bare emit, so stdout stays empty for embedders
+    assert script.rstrip().endswith("}")
+    assert "\n$vmTarget\n" not in script

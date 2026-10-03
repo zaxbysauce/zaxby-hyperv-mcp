@@ -30,7 +30,10 @@ class FakePS:
         self.kwargs.append(kwargs)
         if self.responses:
             item = self.responses.pop(0)
-        elif ".Id.ToString()" in script:
+        elif "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget"):
+            # Discriminating on the bare $vmTarget EMIT (not just resolver
+            # presence): resolver-only scripts assign silently and must NOT
+            # yield the GUID, matching the real stdout contract.
             item = pswindows.PSResult(
                 stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0)
         elif "GetVirtualSystemThumbnailImage" in script:

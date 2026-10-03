@@ -1,8 +1,9 @@
 """Guest access diagnostics: one-call VM access health report and reboot
 recovery verification.
 
-Both tools ride PowerShell Direct (Invoke-Command -VMName), so they work
-regardless of guest network configuration — the diagnostic answers "why
+Both tools ride PowerShell Direct (Invoke-Command -VMId after CIM GUID
+resolution), so they work regardless of guest network configuration — the
+diagnostic answers "why
 can't I reach this VM" from INSIDE the guest, including the reporter's
 incident class where SSH stayed bound to obsolete guest IPs after a subnet
 change.
@@ -43,9 +44,9 @@ def _err(cfg: Config, error: str, error_class: str) -> dict:
 
 
 def _host_leg_script(vm_name: str) -> str:
-    n = pswindows.ps_name(vm_name)
     return f"""
-$vm = Get-VM -Name {n} -ErrorAction Stop
+{guestexec.psdirect_vm_target(vm_name)}
+$vm = Get-VM -Id $vmTarget -ErrorAction Stop
 $up = if ($vm.Uptime) {{ [int][math]::Floor($vm.Uptime.TotalSeconds) }} else {{ 0 }}
 [PSCustomObject]@{{
     state      = [string]$vm.State
@@ -165,11 +166,11 @@ $r | ConvertTo-Json -Compress -Depth 6
 
 
 def _guest_leg_script(vm_name: str, inner_script: str, cred: CredentialSet) -> str:
-    n = pswindows.ps_name(vm_name)
     return f"""
 {guestexec.psdirect_prefix(cred)}
+{guestexec.psdirect_vm_target(vm_name)}
 $enc = '{pswindows.utf8_b64(inner_script)}'
-$out = Invoke-Command -VMName {n} -Credential $cred -ErrorAction Stop -ScriptBlock {{
+$out = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{
     param($enc)
     $text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($enc))
     $tmp  = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName() + '.ps1')
@@ -443,12 +444,12 @@ def _recovery_script(
     vm_name: str, cred: CredentialSet, services: list[str], processes: list[str],
     timeout_s: int, interval_s: int,
 ) -> str:
-    n = pswindows.ps_name(vm_name)
     items_b64 = pswindows.utf8_b64(json.dumps({"services": services, "processes": processes}))
     verify_b64 = pswindows.utf8_b64(_VERIFY_SCRIPT)
     max_attempts = max(1, math.ceil(timeout_s / max(1, interval_s)))
     return f"""
 {guestexec.psdirect_prefix(cred)}
+{guestexec.psdirect_vm_target(vm_name)}
 $deadline = (Get-Date).AddSeconds({timeout_s})
 $interval = {interval_s}
 $maxAttempts = {max_attempts}
@@ -458,7 +459,7 @@ $err = ''
 while ((Get-Date) -lt $deadline -and $attempts -lt $maxAttempts) {{
     $attempts++
     try {{
-        $null = Invoke-Command -VMName {n} -Credential $cred -ErrorAction Stop -ScriptBlock {{ param($probe) $probe }} -ArgumentList 'ok'
+        $null = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{ param($probe) $probe }} -ArgumentList 'ok'
         $ok = $true
         break
     }} catch {{
@@ -478,7 +479,7 @@ if (-not $ok) {{
 }} else {{
     $enc2 = '{verify_b64}'
     $itemsB64 = '{items_b64}'
-    $verify = Invoke-Command -VMName {n} -Credential $cred -ErrorAction Stop -ScriptBlock {{
+    $verify = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{
         param($enc2, $itemsB64)
         $text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($enc2))
         $tmp  = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName() + '.ps1')

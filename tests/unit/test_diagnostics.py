@@ -97,7 +97,11 @@ def test_diagnose_report_shape(monkeypatch):
     # Two legs: host Get-VM + one guest PS Direct probe.
     assert len(fake.scripts) == 2
     assert "Get-VM" in fake.scripts[0]
-    assert "Invoke-Command -VMName" in fake.scripts[1]
+    assert "Invoke-Command -VMId $vmTarget" in fake.scripts[1]
+    # GUID resolution precedes the remoting call so vmms name flakiness cannot
+    # produce 'does not resolve to a single virtual machine'.
+    assert "Msvm_ComputerSystem" in fake.scripts[1]
+    assert fake.scripts[1].index("Msvm_ComputerSystem") < fake.scripts[1].index("Invoke-Command -VMId")
 
 
 def test_diagnose_section_isolation_one_failing_probe(monkeypatch):
@@ -183,7 +187,10 @@ def test_diagnose_vm_name_wildcard_escaped(monkeypatch):
     fake = FakePS([_ok_result(_host_payload()), _ok_result(_guest_payload())])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     diagnostics.diagnose_vm_access(cfg, "test[1]", cred=CRED)
-    assert "'test`[1`]'" in fake.scripts[0]
+    # CIM resolution matches the name LITERALLY (-eq), so wildcard chars are
+    # inert by construction; the VM binds by resolved GUID (-Id).
+    assert "$_.ElementName -eq 'test[1]'" in fake.scripts[0]
+    assert "Get-VM -Id $vmTarget" in fake.scripts[0]
 
 
 def test_diagnose_guest_script_contains_probes(monkeypatch):

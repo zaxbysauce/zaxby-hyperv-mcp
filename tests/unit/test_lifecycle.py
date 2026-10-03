@@ -126,14 +126,15 @@ def test_vm_policy_denied_before_ps(monkeypatch):
 
 
 def test_start_vm_wildcard_escaped_in_script(monkeypatch, unrestricted):
-    """F2 regression: wildcard chars must arrive backtick-escaped."""
+    """Wildcard chars must match literally (CIM -eq) and bind by resolved GUID."""
     fake = FakePS([
         pswindows.PSResult(stdout=json.dumps({"initial_state": "Off"}), returncode=0),
         pswindows.PSResult(stdout=json.dumps({"final_state": "Running"}), returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     lifecycle.start_vm(unrestricted, "weird*[1]")
-    assert "'weird`*`[1`]'" in fake.scripts[0]
+    assert "$_.ElementName -eq 'weird*[1]'" in fake.scripts[0]
+    assert "Get-VM -Id $vmTarget" in fake.scripts[0]
 
 
 def test_start_vm_already_running_idempotent(monkeypatch, unrestricted):
