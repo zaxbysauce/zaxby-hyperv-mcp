@@ -467,9 +467,9 @@ Console notes: text rides the stdin channel (never in argv/script/errors); non-A
 | Tool | Parameters | Returns |
 |------|-----------|---------|
 | `hyperv_vm_create` | `name`, `vhd_path`, `memory_mb=2048`, `cpu_count=1`, `generation=2`, `vhd_size_gb=64`, `switch_name?`, `confirm` | `{ok, id, name, state, generation}` |
-| `hyperv_vm_disk_add` | `vm_name`, `path`, `size_gb`, `controller_type=SCSI`, `confirm` | `{ok, vhd_path, disk_count}` |
+| `hyperv_vm_disk_add` | `vm_name`, `path`, `size_gb`, `controller_type=SCSI`, `confirm` | `{ok, vhd_path, disk_count}` (`disk_count` is `null` if the post-add read failed) |
 | `hyperv_vm_disk_list` | `vm_name` | `{ok, disks[]}` |
-| `hyperv_vm_media_attach` | `vm_name`, `iso_path` | `{ok, iso_path}` |
+| `hyperv_vm_media_attach` | `vm_name`, `iso_path` | `{ok, iso_path, attached}` (`attached` is `null` if the post-attach read failed) |
 | `hyperv_vm_media_detach` | `vm_name` | `{ok, removed[]}` |
 | `hyperv_vm_media_list` | `vm_name` | `{ok, media[]}` |
 | `hyperv_vm_firmware_get` | `vm_name` | `{ok, secure_boot, secure_boot_template, boot_order, tpm_enabled}` |

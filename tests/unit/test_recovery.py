@@ -56,7 +56,8 @@ def test_recovery_wait_loop_and_verification(monkeypatch):
     script = fake.scripts[0]
     assert "AddSeconds(30)" in script
     assert "Start-Sleep" in script
-    assert "Invoke-Command -VMName" in script
+    assert "Invoke-Command -VMId $vmTarget" in script
+    assert "Msvm_ComputerSystem" in script
 
 
 def test_recovery_ps_direct_never_available(monkeypatch):

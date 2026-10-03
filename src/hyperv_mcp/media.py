@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import os
 
-from . import policy, pswindows, vmlocks
+from . import guestexec, policy, pswindows, vmlocks
 from .config import Config
 
 _BOOT_TYPES = ("Drive", "Network", "File")
@@ -83,10 +83,11 @@ def _json_out(result: pswindows.PSResult, ctx: str) -> dict | list:
 
 def _generation_guard(cfg: Config, vm_name: str) -> None:
     """Explicit error for Gen1 VMs (Get-VMFirmware/TPM are Gen2-only)."""
-    result = pswindows.run_ps(
-        "(Get-VM -Name " + pswindows.ps_name(vm_name) + " -ErrorAction Stop).Generation.ToString()",
-        timeout_s=60,
+    script = (
+        guestexec.psdirect_vm_target(vm_name)
+        + "\n(Get-VM -Id $vmTarget -ErrorAction Stop).Generation.ToString()\n"
     )
+    result = pswindows.run_ps(script, timeout_s=60)
     try:
         pswindows.check_result(result, f"resolve generation of '{vm_name}'")
     except RuntimeError as exc:
@@ -95,6 +96,17 @@ def _generation_guard(cfg: Config, vm_name: str) -> None:
         raise MediaError(
             f"VM '{vm_name}' is Generation {result.stdout.strip()}; this operation requires Generation 2"
         )
+
+
+def _resolve_vm_prefix(vm_name: str) -> str:
+    """CIM GUID resolver + Get-VM -Id fetch; scripts below bind cmdlets with -VM $vm.
+
+    Hyper-V cmdlets accept -VM (object) but not -VMId, and name-based binding
+    intermittently fails under vmms WMI stress ('Call cancelled' / 'does not
+    resolve to a single virtual machine'). psdirect_vm_target only ASSIGNS
+    $vmTarget; this prefix also fetches the VM object.
+    """
+    return guestexec.psdirect_vm_target(vm_name) + "\n$vm = Get-VM -Id $vmTarget -ErrorAction Stop\n"
 
 
 # ---------------------------------------------------------------------------
@@ -175,27 +187,31 @@ def vm_disk_add(
         # Same orphan hazard as vm_create: a failed attach must not leave the
         # staged VHDX behind to wedge retries.
         "try {\n"
-        f"  Add-VMHardDiskDrive -VMName {pswindows.ps_name(vm_name)} -Path $vhd.Path "
+        f"  Add-VMHardDiskDrive -VM $vm -Path $vhd.Path "
         f"-ControllerType {controller_type} -ErrorAction Stop\n"
         "} catch {\n"
         f"  Remove-Item -LiteralPath {pswindows.ps_quote(vhd)} -Force -ErrorAction SilentlyContinue\n"
         "  throw\n"
         "}",
-        f"(Get-VMHardDiskDrive -VMName {pswindows.ps_name(vm_name)} | Measure-Object).Count | "
-        "ForEach-Object { [PSCustomObject]@{ disk_count = $_ } } | ConvertTo-Json -Compress",
+        # Informational count AFTER a completed, non-idempotent mutation: a
+        # transient read failure must not fail the call (a retry would hit the
+        # existing-VHD guard); report an unknown count instead.
+        "$diskCount = $null\n"
+        "try { $diskCount = (Get-VMHardDiskDrive -VM $vm -ErrorAction Stop | Measure-Object).Count } catch { }\n"
+        "[PSCustomObject]@{ disk_count = $diskCount } | ConvertTo-Json -Compress",
     ]
     with vmlocks.vm_lock(vm_name):
         if os.path.isfile(vhd):
             raise MediaError(f"VHD already exists: {vhd} (refusing to overwrite)")
-        result = _run(cfg, "\n".join(lines), f"vm_disk_add({vm_name})")
+        result = _run(cfg, _resolve_vm_prefix(vm_name) + "\n".join(lines), f"vm_disk_add({vm_name})")
     out = _json_out(result, "vm_disk_add")
     return {"ok": True, "vhd_path": vhd, **out} if isinstance(out, dict) else {"ok": True, "vhd_path": vhd}
 
 
 def vm_disk_list(cfg: Config, vm_name: str) -> dict:
     _checked_vm(cfg, vm_name)
-    script = (
-        "Get-VMHardDiskDrive -VMName " + pswindows.ps_name(vm_name) + " | ForEach-Object {\n"
+    script = _resolve_vm_prefix(vm_name) + (
+        "Get-VMHardDiskDrive -VM $vm -ErrorAction Stop | ForEach-Object {\n"
         "  [PSCustomObject]@{ controller_type = [string]$_.ControllerType; controller_number = $_.ControllerNumber;\n"
         "    lun = $_.LunNumber; path = $_.Path }\n"
         "} | ConvertTo-Json -Compress\n"
@@ -216,23 +232,29 @@ def vm_media_attach(cfg: Config, vm_name: str, iso_path: str) -> dict:
     _checked_vm(cfg, vm_name)
     policy.require_category(cfg, "media", f"attach ISO to '{vm_name}'")
     iso = _checked_file_path(cfg, iso_path, write=False, must_exist=True, extensions=(".iso",))
-    script = (
-        "Add-VMDvdDrive -VMName " + pswindows.ps_name(vm_name) + " -Path "
+    script = _resolve_vm_prefix(vm_name) + (
+        "Add-VMDvdDrive -VM $vm -Path "
         + pswindows.ps_quote(iso) + " -ErrorAction Stop\n"
-        "(Get-VMDvdDrive -VMName " + pswindows.ps_name(vm_name) + " | "
-        "Where-Object { $_.Path -eq " + pswindows.ps_quote(iso) + " } | Measure-Object).Count | "
-        "ForEach-Object { [PSCustomObject]@{ attached = ($_ -gt 0) } } | ConvertTo-Json -Compress"
+        # Informational check AFTER a completed, non-idempotent attach: a
+        # transient read failure must not fail the call (a retry would add a
+        # duplicate drive); report an unknown result instead.
+        "$attached = $null\n"
+        "try { $attached = (Get-VMDvdDrive -VM $vm -ErrorAction Stop | "
+        "Where-Object { $_.Path -eq " + pswindows.ps_quote(iso) + " } | Measure-Object).Count -gt 0 } catch { }\n"
+        "[PSCustomObject]@{ attached = $attached } | ConvertTo-Json -Compress"
     )
     with vmlocks.vm_lock(vm_name):
-        _run(cfg, script, f"vm_media_attach({vm_name})")
-    return {"ok": True, "iso_path": iso}
+        result = _run(cfg, script, f"vm_media_attach({vm_name})")
+    out = _json_out(result, "vm_media_attach")
+    attached = out.get("attached") if isinstance(out, dict) else None
+    return {"ok": True, "iso_path": iso, "attached": attached}
 
 
 def vm_media_detach(cfg: Config, vm_name: str) -> dict:
     _checked_vm(cfg, vm_name)
     policy.require_category(cfg, "media", f"detach media from '{vm_name}'")
-    script = (
-        "$drives = Get-VMDvdDrive -VMName " + pswindows.ps_name(vm_name) + " -ErrorAction Stop\n"
+    script = _resolve_vm_prefix(vm_name) + (
+        "$drives = Get-VMDvdDrive -VM $vm -ErrorAction Stop\n"
         "$paths = @($drives | ForEach-Object { $_.Path })\n"
         "$drives | Remove-VMDvdDrive -ErrorAction Stop\n"
         "[PSCustomObject]@{ removed = $paths } | ConvertTo-Json -Compress"
@@ -246,8 +268,8 @@ def vm_media_detach(cfg: Config, vm_name: str) -> dict:
 
 def vm_media_list(cfg: Config, vm_name: str) -> dict:
     _checked_vm(cfg, vm_name)
-    script = (
-        "Get-VMDvdDrive -VMName " + pswindows.ps_name(vm_name) + " | ForEach-Object {\n"
+    script = _resolve_vm_prefix(vm_name) + (
+        "Get-VMDvdDrive -VM $vm -ErrorAction Stop | ForEach-Object {\n"
         "  [PSCustomObject]@{ controller_number = $_.ControllerNumber; lun = $_.LunNumber; path = $_.Path }\n"
         "} | ConvertTo-Json -Compress\n"
     )
@@ -264,15 +286,23 @@ def vm_network_set(cfg: Config, vm_name: str, switch_name: str) -> dict:
     policy.require_category(cfg, "media", f"connect '{vm_name}' to switch '{switch_name}'")
     if not switch_name or not switch_name.strip():
         raise ValueError("switch_name is required")
-    script = (
-        "Connect-VMNetworkAdapter -VMName " + pswindows.ps_name(vm_name)
-        + " -SwitchName " + pswindows.ps_quote(switch_name) + " -ErrorAction Stop\n"
-        "(Get-VMNetworkAdapter -VMName " + pswindows.ps_name(vm_name) + " | "
-        "Where-Object { $_.SwitchName -eq " + pswindows.ps_quote(switch_name) + " } | Measure-Object).Count | "
-        "ForEach-Object { [PSCustomObject]@{ connected = ($_ -gt 0) } } | ConvertTo-Json -Compress"
+    # Connect-VMNetworkAdapter has no -VM parameter; bind the adapter objects
+    # instead. ALL adapters are connected, matching the former -VMName binding
+    # (no -Name defaults to every adapter of the VM).
+    script = _resolve_vm_prefix(vm_name) + (
+        "$adapters = @(Get-VMNetworkAdapter -VM $vm -ErrorAction Stop)\n"
+        "if ($adapters.Count -eq 0) { throw 'VM has no network adapter' }\n"
+        "$adapters | Connect-VMNetworkAdapter -SwitchName " + pswindows.ps_quote(switch_name)
+        + " -ErrorAction Stop\n"
+        "$off = @(Get-VMNetworkAdapter -VM $vm -ErrorAction Stop | "
+        "Where-Object { $_.SwitchName -ne " + pswindows.ps_quote(switch_name) + " }).Count\n"
+        "[PSCustomObject]@{ connected = ($off -eq 0) } | ConvertTo-Json -Compress"
     )
     with vmlocks.vm_lock(vm_name):
-        _run(cfg, script, f"vm_network_set({vm_name})")
+        result = _run(cfg, script, f"vm_network_set({vm_name})")
+    out = _json_out(result, "vm_network_set")
+    if isinstance(out, dict) and out.get("connected") is False:
+        raise MediaError(f"vm_network_set({vm_name}): not every adapter is on switch '{switch_name}' after connect")
     return {"ok": True, "switch_name": switch_name}
 
 
@@ -283,9 +313,9 @@ def vm_network_set(cfg: Config, vm_name: str, switch_name: str) -> dict:
 def vm_firmware_get(cfg: Config, vm_name: str) -> dict:
     _checked_vm(cfg, vm_name)
     _generation_guard(cfg, vm_name)
-    script = (
-        "$f = Get-VMFirmware -VMName " + pswindows.ps_name(vm_name) + " -ErrorAction Stop\n"
-        "$sec = Get-VMSecurity -VMName " + pswindows.ps_name(vm_name) + " -ErrorAction SilentlyContinue\n"
+    script = _resolve_vm_prefix(vm_name) + (
+        "$f = Get-VMFirmware -VM $vm -ErrorAction Stop\n"
+        "$sec = Get-VMSecurity -VM $vm -ErrorAction SilentlyContinue\n"
         "[PSCustomObject]@{ secure_boot = [string]$f.SecureBoot; secure_boot_template = $f.SecureBootTemplate; "
         "boot_order = @($f.BootOrder | ForEach-Object { [string]$_.BootType }); "
         "tpm_enabled = if ($sec) { [bool]$sec.TpmEnabled } else { $null } } | ConvertTo-Json -Compress"
@@ -301,12 +331,12 @@ def vm_firmware_set_boot_order(cfg: Config, vm_name: str, boot_type: str = "Driv
     if boot_type not in _BOOT_TYPES:
         raise ValueError(f"boot_type must be one of {_BOOT_TYPES}")
     _generation_guard(cfg, vm_name)
-    script = (
-        "$f = Get-VMFirmware -VMName " + pswindows.ps_name(vm_name) + " -ErrorAction Stop\n"
+    script = _resolve_vm_prefix(vm_name) + (
+        "$f = Get-VMFirmware -VM $vm -ErrorAction Stop\n"
         "$device = $f.BootOrder | Where-Object { [string]$_.BootType -eq '" + boot_type + "' } | Select-Object -First 1\n"
         "if (-not $device) { throw ('no boot device of type " + boot_type + " present') }\n"
-        "Set-VMFirmware -VMName " + pswindows.ps_name(vm_name) + " -FirstBootDevice $device -ErrorAction Stop\n"
-        "$f2 = Get-VMFirmware -VMName " + pswindows.ps_name(vm_name) + "\n"
+        "Set-VMFirmware -VM $vm -FirstBootDevice $device -ErrorAction Stop\n"
+        "$f2 = Get-VMFirmware -VM $vm -ErrorAction Stop\n"
         "[PSCustomObject]@{ first_boot = [string]$f2.BootOrder[0].BootType } | ConvertTo-Json -Compress"
     )
     with vmlocks.vm_lock(vm_name):
@@ -320,9 +350,9 @@ def vm_tpm_set(cfg: Config, vm_name: str, enabled: bool, confirm: bool = False) 
     policy.require_destructive(cfg, "vm_provision", confirm, f"{'enable' if enabled else 'disable'} TPM on '{vm_name}'")
     _generation_guard(cfg, vm_name)
     cmdlet = "Enable-VMTPM" if enabled else "Disable-VMTPM"
-    script = (
-        cmdlet + " -VMName " + pswindows.ps_name(vm_name) + " -ErrorAction Stop\n"
-        "$sec = Get-VMSecurity -VMName " + pswindows.ps_name(vm_name) + "\n"
+    script = _resolve_vm_prefix(vm_name) + (
+        cmdlet + " -VM $vm -ErrorAction Stop\n"
+        "$sec = Get-VMSecurity -VM $vm -ErrorAction Stop\n"
         "[PSCustomObject]@{ tpm_enabled = [bool]$sec.TpmEnabled } | ConvertTo-Json -Compress"
     )
     with vmlocks.vm_lock(vm_name):
@@ -341,10 +371,10 @@ def vm_secureboot_set(cfg: Config, vm_name: str, enabled: bool, template: str = 
         if not template.strip():
             raise ValueError("template must be a non-empty name when given")
         template_part = " -SecureBootTemplate " + pswindows.ps_quote(template)
-    script = (
-        "Set-VMFirmware -VMName " + pswindows.ps_name(vm_name)
+    script = _resolve_vm_prefix(vm_name) + (
+        "Set-VMFirmware -VM $vm"
         + " -EnableSecureBoot " + onoff + template_part + " -ErrorAction Stop\n"
-        "$f = Get-VMFirmware -VMName " + pswindows.ps_name(vm_name) + "\n"
+        "$f = Get-VMFirmware -VM $vm -ErrorAction Stop\n"
         "[PSCustomObject]@{ secure_boot = [string]$f.SecureBoot; secure_boot_template = $f.SecureBootTemplate } "
         "| ConvertTo-Json -Compress"
     )

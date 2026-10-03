@@ -44,6 +44,34 @@ def test_list_vms_denied_without_patterns(monkeypatch):
     assert called.scripts == []
 
 
+def test_list_vms_script_retries_non_terminating_errors():
+    """Get-VM must use -ErrorAction Stop, otherwise a non-terminating WMI error
+    skips the catch/retry and lists as a false-empty []."""
+    script = lifecycle._LIST_VM_SCRIPT
+    assert "Get-VM -ErrorAction Stop |" in script
+    assert "foreach ($i in 1..3)" in script
+    assert "throw 'Get-VM enumeration failed after retries'" in script
+
+
+def test_vm_info_and_checkpoint_list_reads_use_error_action_stop(monkeypatch, unrestricted):
+    """Reads that feed a success result must raise on non-terminating WMI
+    errors; otherwise a transient failure reads as an empty snapshot list or
+    empty device inventory."""
+    fake = FakePS([
+        pswindows.PSResult(stdout="[]", returncode=0),
+        pswindows.PSResult(stdout='{"name": "vm"}', returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    lifecycle.checkpoint_list(unrestricted, "vm")
+    lifecycle.get_vm_info(unrestricted, "vm")
+    snap_script = " ".join(fake.scripts[0].split())
+    info_script = " ".join(fake.scripts[1].split())  # ignore cosmetic column alignment
+    assert "Get-VMSnapshot -VM $vm -ErrorAction Stop |" in snap_script
+    for cmdlet in ("Get-VMComPort -VM $vm", "Get-VMNetworkAdapter -VM $vm",
+                   "Get-VMHardDiskDrive -VM $vm", "Get-VMSnapshot -VM $vm"):
+        assert cmdlet + " -ErrorAction Stop" in info_script, cmdlet
+
+
 def test_list_vms_filtered_to_patterns(monkeypatch):
     cfg = Config(allowed_vm_patterns=["test-*"])
     payload = [
@@ -126,14 +154,15 @@ def test_vm_policy_denied_before_ps(monkeypatch):
 
 
 def test_start_vm_wildcard_escaped_in_script(monkeypatch, unrestricted):
-    """F2 regression: wildcard chars must arrive backtick-escaped."""
+    """Wildcard chars must match literally (CIM -eq) and bind by resolved GUID."""
     fake = FakePS([
         pswindows.PSResult(stdout=json.dumps({"initial_state": "Off"}), returncode=0),
         pswindows.PSResult(stdout=json.dumps({"final_state": "Running"}), returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     lifecycle.start_vm(unrestricted, "weird*[1]")
-    assert "'weird`*`[1`]'" in fake.scripts[0]
+    assert "$_.ElementName -eq 'weird*[1]'" in fake.scripts[0]
+    assert "Get-VM -Id $vmTarget" in fake.scripts[0]
 
 
 def test_start_vm_already_running_idempotent(monkeypatch, unrestricted):

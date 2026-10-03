@@ -1,5 +1,7 @@
 """Media/provisioning tests: script shapes, path policy, gate matrix, errors."""
 
+import os
+
 import pytest
 
 from hyperv_mcp import media, pswindows
@@ -215,6 +217,120 @@ def test_network_set(monkeypatch, unrestricted):
     assert out["ok"] and out["switch_name"] == "LabSwitch"
     assert "Connect-VMNetworkAdapter" in fake.scripts[0]
     assert "'LabSwitch'" in fake.scripts[0]
+
+
+def test_network_set_connects_all_adapters_and_guards_empty(monkeypatch, unrestricted):
+    """Base 'Connect-VMNetworkAdapter -VMName X' connected EVERY adapter; the
+    converted script must not truncate to the first NIC."""
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    media.vm_network_set(unrestricted, "vm", "LabSwitch")
+    script = fake.scripts[0]
+    assert "Select-Object -First 1" not in script
+    assert "$adapters = @(Get-VMNetworkAdapter -VM $vm -ErrorAction Stop)" in script
+    assert "if ($adapters.Count -eq 0) { throw 'VM has no network adapter' }" in script
+    assert "$adapters | Connect-VMNetworkAdapter -SwitchName 'LabSwitch' -ErrorAction Stop" in script
+    # verification requires EVERY adapter on the target switch
+    assert "$_.SwitchName -ne 'LabSwitch'" in script
+    assert "connected = ($off -eq 0)" in script
+
+
+def test_network_set_raises_when_not_all_adapters_connected(monkeypatch, unrestricted):
+    fake = FakePS([pswindows.PSResult(stdout='{"connected": false}', returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(MediaError, match="not every adapter"):
+        media.vm_network_set(unrestricted, "vm", "LabSwitch")
+
+
+def test_media_builders_bind_by_vm_object_and_read_with_stop(monkeypatch, unrestricted, tmp_path):
+    """Every converted builder resolves via the CIM prefix and binds -VM $vm
+    (never -VMName); reads use -ErrorAction Stop so a non-terminating WMI
+    error cannot masquerade as an empty result."""
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    media.vm_disk_list(unrestricted, "vm")
+    media.vm_media_list(unrestricted, "vm")
+    media.vm_media_detach(unrestricted, "vm")
+    media.vm_network_set(unrestricted, "vm", "LabSwitch")
+    for script in fake.scripts:
+        assert "$vmTarget" in script and "$vm = Get-VM -Id $vmTarget -ErrorAction Stop" in script
+        assert "-VMName" not in script
+    assert "Get-VMHardDiskDrive -VM $vm -ErrorAction Stop" in fake.scripts[0]
+    assert "Get-VMDvdDrive -VM $vm -ErrorAction Stop" in fake.scripts[1]
+
+
+def test_verify_and_write_path_reads_use_error_action_stop(monkeypatch, unrestricted, tmp_path):
+    """Pin -ErrorAction Stop on the reads behind post-write verification so a
+    non-terminating WMI error cannot read as an empty/false result. Idempotent
+    verification reads raise; the two non-idempotent mutations (disk_add,
+    media_attach) instead wrap their trailing read in try/catch and report
+    null (see test_post_mutation_info_reads_cannot_fail_non_idempotent_calls)."""
+    cfg = Config(allowed_vm_patterns=["test-*"], host_read_roots=[str(tmp_path)])
+    cfg.destructive.media = True
+    iso = tmp_path / "media.iso"
+    iso.write_bytes(b"x")
+    cases = [
+        (lambda: media.vm_disk_add(unrestricted, "vm", str(tmp_path / "d.vhdx"), 10, "SCSI", confirm=True),
+         0, '{"disk_count": 1}',
+         "try { $diskCount = (Get-VMHardDiskDrive -VM $vm -ErrorAction Stop | Measure-Object).Count } catch { }"),
+        (lambda: media.vm_media_attach(cfg, "test-vm", str(iso)),
+         0, "{}", "try { $attached = (Get-VMDvdDrive -VM $vm -ErrorAction Stop | "),
+        (lambda: media.vm_network_set(unrestricted, "vm", "LabSwitch"),
+         0, "{}", "$off = @(Get-VMNetworkAdapter -VM $vm -ErrorAction Stop | "),
+        (lambda: media.vm_firmware_set_boot_order(unrestricted, "vm", "Drive", confirm=True),
+         1, '{"first_boot": "Drive"}', "$f2 = Get-VMFirmware -VM $vm -ErrorAction Stop"),
+        (lambda: media.vm_tpm_set(unrestricted, "vm", True, confirm=True),
+         1, '{"tpm_enabled": true}', "$sec = Get-VMSecurity -VM $vm -ErrorAction Stop"),
+        (lambda: media.vm_secureboot_set(unrestricted, "vm", True, confirm=True),
+         1, '{"secure_boot": "On"}', "$f = Get-VMFirmware -VM $vm -ErrorAction Stop\n[PSCustomObject]@{ secure_boot"),
+    ]
+    for call, idx, out, pin in cases:
+        # Gen2-only builders run the generation guard first ("2"), then the op.
+        responses = ([pswindows.PSResult(stdout="2", returncode=0)] if idx == 1 else []) + [
+            pswindows.PSResult(stdout=out, returncode=0)]
+        fake = FakePS(responses)
+        monkeypatch.setattr(pswindows, "run_ps", fake)
+        call()
+        assert pin in fake.scripts[idx], (pin, fake.scripts[idx])
+
+
+def test_media_attach_surfaces_attached_flag(monkeypatch, tmp_path):
+    cfg = Config(allowed_vm_patterns=["test-*"], host_read_roots=[str(tmp_path)])
+    cfg.destructive.media = True
+    iso = tmp_path / "media.iso"
+    iso.write_bytes(b"x")
+    fake = FakePS([pswindows.PSResult(stdout='{"attached": true}', returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = media.vm_media_attach(cfg, "test-vm", str(iso))
+    # expected path derived independently of the value under test
+    assert out == {"ok": True, "iso_path": os.path.normpath(os.path.abspath(str(iso))), "attached": True}
+
+
+def test_post_mutation_info_reads_cannot_fail_non_idempotent_calls(monkeypatch, unrestricted, tmp_path):
+    """vm_disk_add / vm_media_attach are not idempotent (a retry would hit the
+    existing-VHD guard or add a duplicate drive), so their trailing informational
+    reads must be guarded: a transient read failure reports an unknown value
+    instead of failing a mutation that already succeeded."""
+    cfg = Config(allowed_vm_patterns=["test-*"], host_read_roots=[str(tmp_path)])
+    cfg.destructive.media = True
+    iso = tmp_path / "media.iso"
+    iso.write_bytes(b"x")
+    fake = FakePS([
+        pswindows.PSResult(stdout='{"disk_count": null}', returncode=0),
+        pswindows.PSResult(stdout='{"attached": null}', returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = media.vm_disk_add(unrestricted, "vm", str(tmp_path / "d.vhdx"), 10, "SCSI", confirm=True)
+    assert out["disk_count"] is None
+    attach = media.vm_media_attach(cfg, "test-vm", str(iso))
+    assert attach["ok"] and attach["attached"] is None  # surfaced as unknown, never raised
+    disk_script, attach_script = fake.scripts
+    assert disk_script.rindex("catch { }") > disk_script.index("$diskCount = $null")
+    assert "$diskCount = $null\ntry {" in disk_script
+    assert "$attached = $null\ntry {" in attach_script and attach_script.rstrip().endswith("ConvertTo-Json -Compress")
+    assert attach_script.rindex("catch { }") > attach_script.index("$attached = $null")  # catch present too
+    # the guarded reads are the LAST statements: nothing after them can throw
+    assert disk_script.rstrip().endswith("[PSCustomObject]@{ disk_count = $diskCount } | ConvertTo-Json -Compress")
 
 
 # ---------------------------------------------------------------------------

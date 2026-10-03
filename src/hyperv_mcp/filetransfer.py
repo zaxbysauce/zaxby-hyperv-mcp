@@ -26,7 +26,7 @@ import os
 from . import policy, pswindows, vmlocks
 from .config import Config
 from .credentials import CredentialSet
-from .guestexec import psdirect_prefix
+from .guestexec import psdirect_prefix, psdirect_vm_target
 
 _STAGING_SUFFIX = ".mcptmp"
 
@@ -68,10 +68,10 @@ for ($pi = 1; $pi -lt $policyParts.Count; $pi++) {{
 
 
 def _session_body(cred: CredentialSet, vm_name: str, script_body: str) -> str:
-    n = pswindows.ps_name(vm_name)
     return f"""
 {psdirect_prefix(cred)}
-$s = New-PSSession -VMName {n} -Credential $cred -ErrorAction Stop
+{psdirect_vm_target(vm_name)}
+$s = New-PSSession -VMId $vmTarget -Credential $cred -ErrorAction Stop
 try {{
 {script_body}
 }} finally {{
@@ -261,10 +261,10 @@ def guest_read_file(
         raise ValueError("guest credentials are required")
     policy.vm_allowed(cfg, vm_name)
     policy.check_guest_read(cfg, remote_path)
-    n = pswindows.ps_name(vm_name)
     body = f"""
 {psdirect_prefix(cred)}
-$r = Invoke-Command -VMName {n} -Credential $cred -ErrorAction Stop -ScriptBlock {{
+{psdirect_vm_target(vm_name)}
+$r = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{
     param($path, $maxb)
     {_guest_root_assertion(remote_path, cfg.guest_read_roots, 'read').strip()}
     $stream = [System.IO.File]::Open($path, 'Open', 'Read', 'Read')
@@ -323,10 +323,10 @@ def guest_list_dir(
         raise ValueError("guest credentials are required")
     policy.vm_allowed(cfg, vm_name)
     policy.check_guest_read(cfg, remote_path)
-    n = pswindows.ps_name(vm_name)
     body = f"""
 {psdirect_prefix(cred)}
-$items = Invoke-Command -VMName {n} -Credential $cred -ErrorAction Stop -ScriptBlock {{
+{psdirect_vm_target(vm_name)}
+$items = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{
     param($path)
     {_guest_root_assertion(remote_path, cfg.guest_read_roots, 'read').strip()}
     Get-ChildItem -LiteralPath $path -ErrorAction Stop | ForEach-Object {{

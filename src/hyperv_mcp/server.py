@@ -1052,7 +1052,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         """Create and attach an additional VHDX (for multi-disk deployment
         tests). Policy: vm_provision + confirm=true.
 
-        Returns: {ok, vhd_path, disk_count} or raises.
+        Returns: {ok, vhd_path, disk_count} or raises. disk_count is null if
+        the post-add read failed (the disk is attached either way).
         """
         with _audit("hyperv_vm_disk_add", vm_name, "vm_provision"):
             return media.vm_disk_add(
@@ -1076,7 +1077,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         tests new fixes. Policy: media category (reversible, no confirm).
         iso_path requires host_read policy.
 
-        Returns: {ok, iso_path} or raises.
+        Returns: {ok, iso_path, attached} or raises. attached is null if the
+        post-attach read failed (the ISO is attached either way).
         """
         with _audit("hyperv_vm_media_attach", vm_name, "media"):
             return media.vm_media_attach(_cfg(), vm_name, iso_path)
