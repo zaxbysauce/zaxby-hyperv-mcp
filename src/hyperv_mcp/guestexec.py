@@ -57,7 +57,7 @@ def psdirect_vm_target(vm_name: str) -> str:
     deterministic; the bounded retry rides out transient WMI cancellations.
     The filter is a literal -eq (ps_quote, no wildcard escaping — wildcard
     chars are inert by construction) restricted to GUID-shaped Msvm_ComputerSystem
-    instances, because the namespace also contains the HOST computer system
+    instances (full 8-4-4-4-12 shape, anchored), because the namespace also contains the HOST computer system
     (observed live: ElementName='VSAN', Name='VSAN' — not a GUID), which would
     otherwise hijack resolution when the VM name equals the host name. A
     duplicate VM name is ambiguous exactly like the old -VMName binding, so it
@@ -74,8 +74,9 @@ def psdirect_vm_target(vm_name: str) -> str:
         "            Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem"
         " -ErrorAction Stop |",
         f"            Where-Object {{ ($_.ElementName -eq {pswindows.ps_quote(vm_name)})"
-        " -and ($_.Name -match '^[0-9a-fA-F]{8}-') }",
+        " -and ($_.Name -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') }",
         "        )",
+        "        $vmResolveError = ''",
         "        if ($vmCandidates.Count -gt 1) {",
         "            $vmResolveError = 'target VM name is not unique'",
         "            break",
@@ -84,6 +85,9 @@ def psdirect_vm_target(vm_name: str) -> str:
         "            $vmTarget = $vmCandidates[0].Name",
         "            break",
         "        }",
+        "        # A clean enumeration with no match is authoritative: do not retry.",
+        "        $vmResolveError = 'target VM not found by name'",
+        "        break",
         "    } catch {",
         "        $vmResolveError = $_.Exception.Message",
         "    }",

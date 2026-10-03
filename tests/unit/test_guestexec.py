@@ -217,13 +217,44 @@ def test_missing_creds_rejected():
         guestexec.guest_run_ps(Config(unrestricted=True), "vm1", "x", cred=None)
 
 
+_GUID_RE = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+
+
+def test_psdirect_vm_target_guid_filter_is_fully_anchored():
+    """The Name filter must accept real VM GUIDs and reject the host system
+    (Name='VSAN') and hostnames that merely start with 8 hex chars + '-'."""
+    import re
+
+    script = guestexec.psdirect_vm_target("vm1")
+    match = re.search(r"\$_\.Name -match '([^']+)'", script)
+    assert match, script
+    pattern = re.compile(match.group(1))
+    assert pattern.search("A45778CC-1F2E-4B9A-9C3D-0123456789AB")
+    assert pattern.search("a45778cc-1f2e-4b9a-9c3d-0123456789ab")
+    for bad in ("VSAN", "deadbeef-host", "12345678-", "A45778CC-1F2E-4B9A-9C3D-0123456789ABCD",
+                "xA45778CC-1F2E-4B9A-9C3D-0123456789AB"):
+        assert not pattern.search(bad), bad
+
+
+def test_psdirect_vm_target_clean_empty_enumeration_is_not_retried():
+    """A successful enumeration with zero matches is authoritative: it breaks
+    out of the retry loop (no 4s of sleeps) and clears any stale transient error."""
+    script = guestexec.psdirect_vm_target("vm1")
+    # the clear inside the loop (indented), not just the top-level initializer
+    assert "\n        $vmResolveError = ''\n" in script
+    not_found = script.index("$vmResolveError = 'target VM not found by name'")
+    catch_at = script.index("} catch {")
+    assert not_found < catch_at
+    assert script[not_found:catch_at].count("break") == 1
+
+
 def test_psdirect_vm_target_script_contract():
     """Resolver emits GUID-shaped CIM filter, duplicate guard, gated sleep,
     and only ASSIGNS $vmTarget (no emit — callers own output capture)."""
     script = guestexec.psdirect_vm_target("test[1]*vm")
     # literal -eq match (wildcard chars inert) AND GUID-shaped Name filter
     assert "$_.ElementName -eq 'test[1]*vm'" in script
-    assert "$_.Name -match '^[0-9a-fA-F]{8}-'" in script
+    assert f"$_.Name -match '{_GUID_RE}'" in script
     # duplicate VM names are ambiguous -> error, never a silent [0] pick
     assert "$vmCandidates.Count -gt 1" in script
     assert "'target VM name is not unique'" in script

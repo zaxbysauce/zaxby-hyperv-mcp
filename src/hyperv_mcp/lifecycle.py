@@ -160,11 +160,12 @@ _LIST_VM_SCRIPT = """
 # WMI stress; retry instead of surfacing a transient transport error. The
 # success flag distinguishes 'zero VMs' ($vms stays $null) from 'enumeration
 # failed', so an empty host still lists as [] instead of erroring forever.
+# -ErrorAction Stop makes non-terminating WMI errors reach the catch/retry.
 $vms = $null
 $done = $false
 foreach ($i in 1..3) {
   try {
-    $vms = Get-VM | Select-Object @{N='name';E={$_.Name}},
+    $vms = Get-VM -ErrorAction Stop | Select-Object @{N='name';E={$_.Name}},
       @{N='state';E={[string]$_.State}},
       @{N='status';E={$_.Status}},
       @{N='memory_mb';E={[math]::Round($_.MemoryAssigned/1MB,1)}},
@@ -210,10 +211,10 @@ def get_vm_info(cfg: Config, vm_name: str) -> dict:
     script = f"""
 {psdirect_vm_target(vm_name)}
 $vm  = Get-VM -Id $vmTarget -ErrorAction Stop
-$com = Get-VMComPort   -VM $vm | Select-Object Name, Path
-$net = Get-VMNetworkAdapter -VM $vm | Select-Object Name, SwitchName, MacAddress, IPAddresses
-$hdd = Get-VMHardDiskDrive  -VM $vm | Select-Object ControllerType, Path
-$snaps = (Get-VMSnapshot -VM $vm | Measure-Object).Count
+$com = Get-VMComPort   -VM $vm -ErrorAction Stop | Select-Object Name, Path
+$net = Get-VMNetworkAdapter -VM $vm -ErrorAction Stop | Select-Object Name, SwitchName, MacAddress, IPAddresses
+$hdd = Get-VMHardDiskDrive  -VM $vm -ErrorAction Stop | Select-Object ControllerType, Path
+$snaps = (Get-VMSnapshot -VM $vm -ErrorAction Stop | Measure-Object).Count
 [PSCustomObject]@{{
     name             = $vm.Name
     state            = [string]$vm.State
@@ -339,7 +340,7 @@ def checkpoint_list(cfg: Config, vm_name: str) -> list[dict]:
     _checked_vm(cfg, vm_name)
     script = psdirect_vm_target(vm_name) + """
 $vm = Get-VM -Id $vmTarget -ErrorAction Stop
-Get-VMSnapshot -VM $vm |
+Get-VMSnapshot -VM $vm -ErrorAction Stop |
   Select-Object @{N='name';E={$_.Name}},
                 @{N='type';E={[string]$_.SnapshotType}},
                 @{N='created';E={$_.CreationTime.ToString('o')}},
