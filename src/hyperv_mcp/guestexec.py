@@ -68,6 +68,7 @@ def psdirect_vm_target(vm_name: str) -> str:
     return "\n".join([
         "$vmTarget = $null",
         "$vmResolveError = ''",
+        "$vmFinal = $false",
         "foreach ($vmAttempt in 1..3) {",
         "    try {",
         "        $vmCandidates = @(",
@@ -79,6 +80,7 @@ def psdirect_vm_target(vm_name: str) -> str:
         "        $vmResolveError = ''",
         "        if ($vmCandidates.Count -gt 1) {",
         "            $vmResolveError = 'target VM name is not unique'",
+        "            $vmFinal = $true",
         "            break",
         "        }",
         "        if ($vmCandidates.Count -eq 1) {",
@@ -87,6 +89,7 @@ def psdirect_vm_target(vm_name: str) -> str:
         "        }",
         "        # A clean enumeration with no match is authoritative: do not retry.",
         "        $vmResolveError = 'target VM not found by name'",
+        "        $vmFinal = $true",
         "        break",
         "    } catch {",
         "        $vmResolveError = $_.Exception.Message",
@@ -95,6 +98,7 @@ def psdirect_vm_target(vm_name: str) -> str:
         "}",
         "if (-not $vmTarget) {",
         "    if (-not $vmResolveError) { $vmResolveError = 'target VM not found by name' }",
+        "    if ($vmFinal) { throw ('target VM resolution failed: {0}' -f $vmResolveError) }",
         "    throw ('target VM resolution failed after retries: {0}' -f $vmResolveError)",
         "}",
     ])

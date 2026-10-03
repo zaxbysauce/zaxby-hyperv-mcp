@@ -193,8 +193,12 @@ def vm_disk_add(
         f"  Remove-Item -LiteralPath {pswindows.ps_quote(vhd)} -Force -ErrorAction SilentlyContinue\n"
         "  throw\n"
         "}",
-        "(Get-VMHardDiskDrive -VM $vm -ErrorAction Stop | Measure-Object).Count | "
-        "ForEach-Object { [PSCustomObject]@{ disk_count = $_ } } | ConvertTo-Json -Compress",
+        # Informational count AFTER a completed, non-idempotent mutation: a
+        # transient read failure must not fail the call (a retry would hit the
+        # existing-VHD guard); report an unknown count instead.
+        "$diskCount = $null\n"
+        "try { $diskCount = (Get-VMHardDiskDrive -VM $vm -ErrorAction Stop | Measure-Object).Count } catch { }\n"
+        "[PSCustomObject]@{ disk_count = $diskCount } | ConvertTo-Json -Compress",
     ]
     with vmlocks.vm_lock(vm_name):
         if os.path.isfile(vhd):
@@ -231,9 +235,13 @@ def vm_media_attach(cfg: Config, vm_name: str, iso_path: str) -> dict:
     script = _resolve_vm_prefix(vm_name) + (
         "Add-VMDvdDrive -VM $vm -Path "
         + pswindows.ps_quote(iso) + " -ErrorAction Stop\n"
-        "(Get-VMDvdDrive -VM $vm -ErrorAction Stop | "
-        "Where-Object { $_.Path -eq " + pswindows.ps_quote(iso) + " } | Measure-Object).Count | "
-        "ForEach-Object { [PSCustomObject]@{ attached = ($_ -gt 0) } } | ConvertTo-Json -Compress"
+        # Informational check AFTER a completed, non-idempotent attach: a
+        # transient read failure must not fail the call (a retry would add a
+        # duplicate drive); report an unknown result instead.
+        "$attached = $null\n"
+        "try { $attached = (Get-VMDvdDrive -VM $vm -ErrorAction Stop | "
+        "Where-Object { $_.Path -eq " + pswindows.ps_quote(iso) + " } | Measure-Object).Count -gt 0 } catch { }\n"
+        "[PSCustomObject]@{ attached = $attached } | ConvertTo-Json -Compress"
     )
     with vmlocks.vm_lock(vm_name):
         _run(cfg, script, f"vm_media_attach({vm_name})")

@@ -266,9 +266,10 @@ def test_verify_and_write_path_reads_use_error_action_stop(monkeypatch, unrestri
     iso.write_bytes(b"x")
     cases = [
         (lambda: media.vm_disk_add(unrestricted, "vm", str(tmp_path / "d.vhdx"), 10, "SCSI", confirm=True),
-         0, '{"disk_count": 1}', "(Get-VMHardDiskDrive -VM $vm -ErrorAction Stop | Measure-Object).Count"),
+         0, '{"disk_count": 1}',
+         "try { $diskCount = (Get-VMHardDiskDrive -VM $vm -ErrorAction Stop | Measure-Object).Count } catch { }"),
         (lambda: media.vm_media_attach(cfg, "test-vm", str(iso)),
-         0, "{}", "(Get-VMDvdDrive -VM $vm -ErrorAction Stop | "),
+         0, "{}", "try { $attached = (Get-VMDvdDrive -VM $vm -ErrorAction Stop | "),
         (lambda: media.vm_network_set(unrestricted, "vm", "LabSwitch"),
          0, "{}", "$off = @(Get-VMNetworkAdapter -VM $vm -ErrorAction Stop | "),
         (lambda: media.vm_firmware_set_boot_order(unrestricted, "vm", "Drive", confirm=True),
@@ -286,6 +287,28 @@ def test_verify_and_write_path_reads_use_error_action_stop(monkeypatch, unrestri
         monkeypatch.setattr(pswindows, "run_ps", fake)
         call()
         assert pin in fake.scripts[idx], (pin, fake.scripts[idx])
+
+
+def test_post_mutation_info_reads_cannot_fail_non_idempotent_calls(monkeypatch, unrestricted, tmp_path):
+    """vm_disk_add / vm_media_attach are not idempotent (a retry would hit the
+    existing-VHD guard or add a duplicate drive), so their trailing informational
+    reads must be guarded: a transient read failure reports an unknown value
+    instead of failing a mutation that already succeeded."""
+    cfg = Config(allowed_vm_patterns=["test-*"], host_read_roots=[str(tmp_path)])
+    cfg.destructive.media = True
+    iso = tmp_path / "media.iso"
+    iso.write_bytes(b"x")
+    fake = FakePS([pswindows.PSResult(stdout='{"disk_count": null}', returncode=0)] * 2)
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = media.vm_disk_add(unrestricted, "vm", str(tmp_path / "d.vhdx"), 10, "SCSI", confirm=True)
+    assert out["disk_count"] is None
+    media.vm_media_attach(cfg, "test-vm", str(iso))
+    disk_script, attach_script = fake.scripts
+    assert disk_script.rindex("catch { }") > disk_script.index("$diskCount = $null")
+    assert "$diskCount = $null\ntry {" in disk_script
+    assert "$attached = $null\ntry {" in attach_script and attach_script.rstrip().endswith("ConvertTo-Json -Compress")
+    # the guarded reads are the LAST statements: nothing after them can throw
+    assert disk_script.rstrip().endswith("[PSCustomObject]@{ disk_count = $diskCount } | ConvertTo-Json -Compress")
 
 
 # ---------------------------------------------------------------------------

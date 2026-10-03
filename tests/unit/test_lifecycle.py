@@ -57,17 +57,18 @@ def test_vm_info_and_checkpoint_list_reads_use_error_action_stop(monkeypatch, un
     """Reads that feed a success result must raise on non-terminating WMI
     errors; otherwise a transient failure reads as an empty snapshot list or
     empty device inventory."""
-    fake = FakePS([pswindows.PSResult(stdout="[]", returncode=0)] * 2)
+    fake = FakePS([
+        pswindows.PSResult(stdout="[]", returncode=0),
+        pswindows.PSResult(stdout='{"name": "vm"}', returncode=0),
+    ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     lifecycle.checkpoint_list(unrestricted, "vm")
-    try:
-        lifecycle.get_vm_info(unrestricted, "vm")
-    except Exception:  # noqa: BLE001 - output shape is irrelevant; only the script matters
-        pass
-    snap_script, info_script = fake.scripts[0], fake.scripts[1]
+    lifecycle.get_vm_info(unrestricted, "vm")
+    snap_script = " ".join(fake.scripts[0].split())
+    info_script = " ".join(fake.scripts[1].split())  # ignore cosmetic column alignment
     assert "Get-VMSnapshot -VM $vm -ErrorAction Stop |" in snap_script
-    for cmdlet in ("Get-VMComPort   -VM $vm", "Get-VMNetworkAdapter -VM $vm",
-                   "Get-VMHardDiskDrive  -VM $vm", "Get-VMSnapshot -VM $vm"):
+    for cmdlet in ("Get-VMComPort -VM $vm", "Get-VMNetworkAdapter -VM $vm",
+                   "Get-VMHardDiskDrive -VM $vm", "Get-VMSnapshot -VM $vm"):
         assert cmdlet + " -ErrorAction Stop" in info_script, cmdlet
 
 
