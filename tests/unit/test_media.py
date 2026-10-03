@@ -1,5 +1,7 @@
 """Media/provisioning tests: script shapes, path policy, gate matrix, errors."""
 
+import os
+
 import pytest
 
 from hyperv_mcp import media, pswindows
@@ -300,7 +302,8 @@ def test_media_attach_surfaces_attached_flag(monkeypatch, tmp_path):
     fake = FakePS([pswindows.PSResult(stdout='{"attached": true}', returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = media.vm_media_attach(cfg, "test-vm", str(iso))
-    assert out == {"ok": True, "iso_path": out["iso_path"], "attached": True}
+    # expected path derived independently of the value under test
+    assert out == {"ok": True, "iso_path": os.path.normpath(os.path.abspath(str(iso))), "attached": True}
 
 
 def test_post_mutation_info_reads_cannot_fail_non_idempotent_calls(monkeypatch, unrestricted, tmp_path):
@@ -312,9 +315,11 @@ def test_post_mutation_info_reads_cannot_fail_non_idempotent_calls(monkeypatch, 
     cfg.destructive.media = True
     iso = tmp_path / "media.iso"
     iso.write_bytes(b"x")
-    fake = FakePS([pswindows.PSResult(stdout='{"disk_count": null}', returncode=0)] * 2)
+    fake = FakePS([
+        pswindows.PSResult(stdout='{"disk_count": null}', returncode=0),
+        pswindows.PSResult(stdout='{"attached": null}', returncode=0),
+    ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
-    fake.responses[1] = pswindows.PSResult(stdout='{"attached": null}', returncode=0)
     out = media.vm_disk_add(unrestricted, "vm", str(tmp_path / "d.vhdx"), 10, "SCSI", confirm=True)
     assert out["disk_count"] is None
     attach = media.vm_media_attach(cfg, "test-vm", str(iso))
