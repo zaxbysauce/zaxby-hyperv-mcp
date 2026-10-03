@@ -244,8 +244,10 @@ def vm_media_attach(cfg: Config, vm_name: str, iso_path: str) -> dict:
         "[PSCustomObject]@{ attached = $attached } | ConvertTo-Json -Compress"
     )
     with vmlocks.vm_lock(vm_name):
-        _run(cfg, script, f"vm_media_attach({vm_name})")
-    return {"ok": True, "iso_path": iso}
+        result = _run(cfg, script, f"vm_media_attach({vm_name})")
+    out = _json_out(result, "vm_media_attach")
+    attached = out.get("attached") if isinstance(out, dict) else None
+    return {"ok": True, "iso_path": iso, "attached": attached}
 
 
 def vm_media_detach(cfg: Config, vm_name: str) -> dict:

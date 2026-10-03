@@ -258,8 +258,11 @@ def test_media_builders_bind_by_vm_object_and_read_with_stop(monkeypatch, unrest
 
 
 def test_verify_and_write_path_reads_use_error_action_stop(monkeypatch, unrestricted, tmp_path):
-    """Reads that feed a success result (post-write verification) must raise on
-    non-terminating WMI errors instead of reading as an empty/false result."""
+    """Pin -ErrorAction Stop on the reads behind post-write verification so a
+    non-terminating WMI error cannot read as an empty/false result. Idempotent
+    verification reads raise; the two non-idempotent mutations (disk_add,
+    media_attach) instead wrap their trailing read in try/catch and report
+    null (see test_post_mutation_info_reads_cannot_fail_non_idempotent_calls)."""
     cfg = Config(allowed_vm_patterns=["test-*"], host_read_roots=[str(tmp_path)])
     cfg.destructive.media = True
     iso = tmp_path / "media.iso"
@@ -289,6 +292,17 @@ def test_verify_and_write_path_reads_use_error_action_stop(monkeypatch, unrestri
         assert pin in fake.scripts[idx], (pin, fake.scripts[idx])
 
 
+def test_media_attach_surfaces_attached_flag(monkeypatch, tmp_path):
+    cfg = Config(allowed_vm_patterns=["test-*"], host_read_roots=[str(tmp_path)])
+    cfg.destructive.media = True
+    iso = tmp_path / "media.iso"
+    iso.write_bytes(b"x")
+    fake = FakePS([pswindows.PSResult(stdout='{"attached": true}', returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = media.vm_media_attach(cfg, "test-vm", str(iso))
+    assert out == {"ok": True, "iso_path": out["iso_path"], "attached": True}
+
+
 def test_post_mutation_info_reads_cannot_fail_non_idempotent_calls(monkeypatch, unrestricted, tmp_path):
     """vm_disk_add / vm_media_attach are not idempotent (a retry would hit the
     existing-VHD guard or add a duplicate drive), so their trailing informational
@@ -300,13 +314,16 @@ def test_post_mutation_info_reads_cannot_fail_non_idempotent_calls(monkeypatch, 
     iso.write_bytes(b"x")
     fake = FakePS([pswindows.PSResult(stdout='{"disk_count": null}', returncode=0)] * 2)
     monkeypatch.setattr(pswindows, "run_ps", fake)
+    fake.responses[1] = pswindows.PSResult(stdout='{"attached": null}', returncode=0)
     out = media.vm_disk_add(unrestricted, "vm", str(tmp_path / "d.vhdx"), 10, "SCSI", confirm=True)
     assert out["disk_count"] is None
-    media.vm_media_attach(cfg, "test-vm", str(iso))
+    attach = media.vm_media_attach(cfg, "test-vm", str(iso))
+    assert attach["ok"] and attach["attached"] is None  # surfaced as unknown, never raised
     disk_script, attach_script = fake.scripts
     assert disk_script.rindex("catch { }") > disk_script.index("$diskCount = $null")
     assert "$diskCount = $null\ntry {" in disk_script
     assert "$attached = $null\ntry {" in attach_script and attach_script.rstrip().endswith("ConvertTo-Json -Compress")
+    assert attach_script.rindex("catch { }") > attach_script.index("$attached = $null")  # catch present too
     # the guarded reads are the LAST statements: nothing after them can throw
     assert disk_script.rstrip().endswith("[PSCustomObject]@{ disk_count = $diskCount } | ConvertTo-Json -Compress")
 

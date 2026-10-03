@@ -248,6 +248,9 @@ def test_psdirect_vm_target_clean_empty_enumeration_is_not_retried():
     assert script[not_found:catch_at].count("break") == 1
     # a terminal (clean) result must not claim a retry history
     assert "$vmFinal = $true" in script[not_found:catch_at]
+    # the duplicate-name path is terminal too (flag set before its break)
+    dup = script.index("$vmResolveError = 'target VM name is not unique'")
+    assert script[dup:script.index("break", dup)].count("$vmFinal = $true") == 1
     assert "if ($vmFinal) { throw ('target VM resolution failed: {0}' -f $vmResolveError) }" in script
     assert "target VM resolution failed after retries: {0}" in script  # exhausted transient retries only
 
