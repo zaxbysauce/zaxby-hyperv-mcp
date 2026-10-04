@@ -381,3 +381,49 @@ def test_put_get_scripts_parse_clean(monkeypatch, rooted_cfg, tmp_path):
             errors="replace",
         )
         assert proc.returncode == 0, f"{label} script failed PS parse: {proc.stdout}{proc.stderr}"
+
+
+def test_put_get_assert_wrappers_pin_terminating_erroraction(monkeypatch, rooted_cfg, tmp_path):
+    """Implementation-review round 1 (mutation M1): the in-guest assertion
+    wrapper must carry `-ErrorAction Stop` — plan 07 marks it REQUIRED, not
+    cosmetic: without the flag a remote `throw` surfaces as a non-terminating
+    error record, so a denial could fall through to dir-creation/copy.
+    Static pin on the rendered wrapper (the parse test proves syntax only,
+    and AC8's real-VM leg stays host-gated), matching the repo's existing
+    `-ErrorAction Stop` script-pin convention (test_media)."""
+    src = tmp_path / "host-src" / "a.bin"
+    src.write_bytes(b"x")
+    dest = tmp_path / "host-dst" / "a.bin"
+    put_payload = {"ok": True, "bytes_copied": 1, "bytes_local": 1, "bytes_remote": 1,
+                   "sha256_local": None, "sha256_remote": None}
+    get_payload = {"ok": True, "bytes_copied": 1, "bytes_remote": 1,
+                   "sha256_local": "S", "sha256_remote": "S"}
+    fake = FakePS([
+        pswindows.PSResult(stdout=json.dumps(put_payload), returncode=0),
+        pswindows.PSResult(stdout=json.dumps(get_payload), returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    filetransfer.guest_put(
+        rooted_cfg, "test-vm", str(src), r"C:\g-write\a.bin",
+        confirm=True, verify=False, cred=CRED,
+    )
+    filetransfer.guest_get(
+        rooted_cfg, "test-vm", r"C:\g-read\a.bin", str(dest),
+        verify=True, cred=CRED,
+    )
+    for label, script, path, roots, category in (
+        ("put", fake.scripts[0], r"C:\g-write\a.bin",
+         rooted_cfg.guest_write_roots, "write"),
+        ("get", fake.scripts[1], r"C:\g-read\a.bin",
+         rooted_cfg.guest_read_roots, "read"),
+    ):
+        fragment = filetransfer._guest_root_assertion(path, roots, category)
+        assert fragment, f"{label}: roots configured, fragment must be non-empty"
+        wrapper = (
+            "Invoke-Command -Session $s -ScriptBlock {\n"
+            + fragment
+            + "\n} -ErrorAction Stop\n"
+        )
+        assert wrapper in script, (
+            f"{label} assertion wrapper lost its terminating -ErrorAction Stop"
+        )
