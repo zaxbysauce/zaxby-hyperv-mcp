@@ -9,9 +9,9 @@ Safety and integrity properties:
   - All file cmdlets use -LiteralPath (wildcards inert) except the guest
     parent-dir creation, where New-Item has no -LiteralPath and -Path was
     probed to treat brackets literally on PS 5.1.
-  - put/get stage to a sibling temp file and Move-Item -Force into place; the
-    try/finally region covers the COPY as well as the move, so any failed
-    stage (copy or move) cleans up the staging file.
+  - put/get stage to a sibling temp file unique per transfer and Move-Item
+    -Force into place; the try/finally region covers the COPY as well as the
+    move, so any failed stage (copy or move) cleans up the staging file.
   - When verification is on, staged content is hashed BEFORE the move — a
     mismatch aborts with error_class "integrity" and never replaces the
     destination.
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+from uuid import uuid4
 
 from . import policy, pswindows, vmlocks
 from .config import Config
@@ -29,6 +30,24 @@ from .credentials import CredentialSet
 from .guestexec import psdirect_prefix, psdirect_vm_target
 
 _STAGING_SUFFIX = ".mcptmp"
+
+
+def _staging_path(dest: str) -> str:
+    """Sibling temp path, unique per transfer (see module docstring)."""
+    return f"{dest}.{uuid4().hex}{_STAGING_SUFFIX}"
+
+
+def _failure_class(detail: str) -> str:
+    """Classify a PowerShell failure text for the transfer envelope.
+
+    Integrity text first (preserves the pre-existing SHA-256 mapping), then
+    in-guest/host policy denials; everything else is transport.
+    """
+    if "SHA-256 mismatch" in detail:
+        return "integrity"
+    if "policy:" in detail:
+        return "policy"
+    return "transport"
 
 
 def _guest_root_assertion(path_literal: str, roots: list[str], category: str) -> str:
@@ -90,8 +109,7 @@ def _run_transfer(cfg: Config, vm_name: str, body: str, cred: CredentialSet, tim
         return {"ok": False, "error": f"host timeout after {timeout_s}s; transfer aborted", "error_class": "timeout"}
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "unknown PowerShell error"
-        error_class = "integrity" if "SHA-256 mismatch" in detail else "transport"
-        return {"ok": False, "error": detail, "error_class": error_class}
+        return {"ok": False, "error": detail, "error_class": _failure_class(detail)}
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError as exc:
@@ -122,7 +140,7 @@ def guest_put(
     do_verify = cfg.verify_sha256 if verify is None else verify
     lp = pswindows.ps_quote(os.path.abspath(local_path))
     rp = pswindows.ps_quote(remote_path)
-    staged = pswindows.ps_quote(remote_path + _STAGING_SUFFIX)
+    staged = pswindows.ps_quote(_staging_path(remote_path))
     # Copy AND move both sit inside the try/catch that cleans the staging
     # file, and (when verifying) the STAGED copy is hashed BEFORE the move —
     # a mismatch aborts without ever replacing the destination.
@@ -157,9 +175,16 @@ def guest_put(
         throw
     }}
 """
+    fragment = _guest_root_assertion(remote_path, cfg.guest_write_roots, "write")
+    assert_block = (
+        "Invoke-Command -Session $s -ScriptBlock {\n"
+        + fragment
+        + "\n} -ErrorAction Stop\n"
+        if fragment
+        else ""
+    )
     body = f"""
-    {_guest_root_assertion(remote_path, cfg.guest_write_roots, 'write')}
-    $dir = Split-Path -Path {rp} -Parent
+{assert_block}    $dir = Split-Path -Path {rp} -Parent
     Invoke-Command -Session $s -ScriptBlock {{
         param($d) if ($d -and -not (Test-Path -LiteralPath $d)) {{ New-Item -ItemType Directory -Path $d -Force -ErrorAction Stop | Out-Null }}
     }} -ArgumentList $dir -ErrorAction Stop
@@ -201,7 +226,7 @@ def guest_get(
     do_verify = cfg.verify_sha256 if verify is None else verify
     rp = pswindows.ps_quote(remote_path)
     lp = pswindows.ps_quote(local_abs)
-    staged = pswindows.ps_quote(local_abs + _STAGING_SUFFIX)
+    staged = pswindows.ps_quote(_staging_path(local_abs))
     # Copy AND move both sit inside the try/catch that cleans the staging
     # file, and (when verifying) the STAGED copy is hashed BEFORE the move.
     pre_hash = f"""
@@ -228,9 +253,16 @@ def guest_get(
         throw
     }}
 """
+    fragment = _guest_root_assertion(remote_path, cfg.guest_read_roots, "read")
+    assert_block = (
+        "Invoke-Command -Session $s -ScriptBlock {\n"
+        + fragment
+        + "\n} -ErrorAction Stop\n"
+        if fragment
+        else ""
+    )
     body = f"""
-    {_guest_root_assertion(remote_path, cfg.guest_read_roots, 'read')}
-{pre_hash}
+{assert_block}{pre_hash}
     $bytesRemote = Invoke-Command -Session $s -ScriptBlock {{ param($p) (Get-Item -LiteralPath $p).Length }} -ArgumentList {rp} -ErrorAction Stop
     $bytesLocal  = (Get-Item -LiteralPath {lp}).Length
     [PSCustomObject]@{{
@@ -295,7 +327,7 @@ $r | ConvertTo-Json -Compress
         return {"ok": False, "error": "host timeout reading guest file", "error_class": "timeout"}
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "unknown PowerShell error"
-        return {"ok": False, "error": detail, "error_class": "transport"}
+        return {"ok": False, "error": detail, "error_class": _failure_class(detail)}
     try:
         data = json.loads(result.stdout)
         # Explicit keys only: remoting metadata (PSComputerName, RunspaceId)
@@ -348,7 +380,7 @@ if ($items) {{ @($items) | ConvertTo-Json -Compress }} else {{ '[]' }}
         return {"ok": False, "error": "host timeout listing guest directory", "error_class": "timeout"}
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "unknown PowerShell error"
-        return {"ok": False, "error": detail, "error_class": "transport"}
+        return {"ok": False, "error": detail, "error_class": _failure_class(detail)}
     try:
         raw = result.stdout.strip()
         if not raw or raw == "null":

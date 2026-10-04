@@ -7,10 +7,13 @@ Semantics (see plan.md "Policy defaults"):
 
 Host path checks are syntactic-but-strong: \\?\ prefix handling, normpath,
 drive-relative rejection, per-component realpath resolution of the existing
-prefix (junctions/symlinks), case-insensitive root comparison. Guest paths get
-the same host-side check PLUS an authoritative in-guest GetFullPath assertion
-(done in the generated PowerShell), because guest reparse points are only
-visible to the guest filesystem.
+prefix (junctions/symlinks), case-insensitive root comparison. Guest paths
+are checked PURELY LEXICALLY against the path spelling — the host filesystem
+is never consulted for guest decisions (host junctions/case normalization
+must not decide guest policy); the authoritative in-guest GetFullPath
+assertion plus reparse-point walk (filetransfer._guest_root_assertion)
+enforces guest-boundary truth inside the guest, because guest reparse points
+are only visible to the guest filesystem.
 """
 
 from __future__ import annotations
@@ -47,18 +50,21 @@ class CanonicalPath:
 
     original: str
     normalized: str  # normpath'd (case preserved; comparisons casefold later), no \\?\ prefix
-    exists_prefix_resolved: str  # realpath-resolved (junctions/symlinks) form
+    exists_prefix_resolved: str  # realpath-resolved (junctions/symlinks) form; equals normalized when resolve=False
 
 
-def canonicalize_windows_path(path: str) -> CanonicalPath:
+def canonicalize_windows_path(path: str, *, resolve: bool = True) -> CanonicalPath:
     r"""Canonicalize a Windows path for policy comparison.
 
     - Rejects empty and drive-relative paths ("C:foo") — the latter is
       ambiguous (per-drive cwd) and therefore always policy-invalid.
     - Strips the \\?\ long-path prefix (preserving UNC form).
     - normpath + case folding for comparison.
-    - realpath resolves junctions/symlinks for the part of the path that
-      exists; nonexistent tail stays lexical.
+    - resolve=True (host axes): realpath resolves junctions/symlinks for the
+      part of the path that exists; nonexistent tail stays lexical.
+    - resolve=False (guest axes): NO host filesystem lookup at all — the
+      resolved form is the lexical normalization, keeping guest decisions
+      provably free of host realpath (see module docstring).
     """
     if not path or not path.strip():
         raise PolicyDenied("path", "empty path")
@@ -70,12 +76,15 @@ def canonicalize_windows_path(path: str) -> CanonicalPath:
     if _DRIVE_RELATIVE.match(p):
         raise PolicyDenied("path", f"drive-relative path is ambiguous: {path!r}")
     normalized = ntpath.normpath(p)
-    # realpath: resolves the existing prefix (junctions/symlinks), leaves the
-    # nonexistent tail lexical. On Windows this also normalizes case of the
-    # existing components.
-    try:
-        resolved = os.path.realpath(normalized)
-    except OSError:
+    if resolve:
+        # realpath: resolves the existing prefix (junctions/symlinks), leaves
+        # the nonexistent tail lexical. On Windows this also normalizes case
+        # of the existing components.
+        try:
+            resolved = os.path.realpath(normalized)
+        except OSError:
+            resolved = normalized
+    else:
         resolved = normalized
     return CanonicalPath(
         original=path,
@@ -107,9 +116,9 @@ def _cmp_form(cp: CanonicalPath) -> str:
     return cp.exists_prefix_resolved.replace("/", "\\").casefold()
 
 
-def _root_cmp_form(root: str) -> str | None:
+def _root_cmp_form(root: str, *, resolve: bool = True) -> str | None:
     try:
-        cp = canonicalize_windows_path(root)
+        cp = canonicalize_windows_path(root, resolve=resolve)
     except PolicyDenied:
         # An invalid root (e.g. bare drive-relative "C:") can never match —
         # returning None skips it instead of degrading to a loose prefix.
@@ -117,8 +126,8 @@ def _root_cmp_form(root: str) -> str | None:
     return _cmp_form(cp)
 
 
-def _check_roots(cfg: Config, key: str, category: str, path: str) -> CanonicalPath:
-    cp = canonicalize_windows_path(path)
+def _check_roots(cfg: Config, key: str, category: str, path: str, *, resolve: bool = True) -> CanonicalPath:
+    cp = canonicalize_windows_path(path, resolve=resolve)
     if cfg.unrestricted:
         return cp
     roots = getattr(cfg, key)
@@ -126,7 +135,7 @@ def _check_roots(cfg: Config, key: str, category: str, path: str) -> CanonicalPa
         raise PolicyDenied(category, f"no {key} configured")
     path_cmp = _cmp_form(cp)
     for root in roots:
-        root_cmp = _root_cmp_form(root)
+        root_cmp = _root_cmp_form(root, resolve=resolve)
         if root_cmp is not None and _is_within(path_cmp, root_cmp):
             return cp
     raise PolicyDenied(category, f"path outside configured {key}")
@@ -141,11 +150,11 @@ def check_host_write(cfg: Config, path: str) -> CanonicalPath:
 
 
 def check_guest_read(cfg: Config, path: str) -> CanonicalPath:
-    return _check_roots(cfg, "guest_read_roots", "guest read", path)
+    return _check_roots(cfg, "guest_read_roots", "guest read", path, resolve=False)
 
 
 def check_guest_write(cfg: Config, path: str) -> CanonicalPath:
-    return _check_roots(cfg, "guest_write_roots", "guest write", path)
+    return _check_roots(cfg, "guest_write_roots", "guest write", path, resolve=False)
 
 
 def vm_allowed(cfg: Config, vm_name: str) -> None:

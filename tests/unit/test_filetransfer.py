@@ -1,6 +1,8 @@
 """File transfer tests with mocked PowerShell: integrity, policy, validation."""
 
 import json
+import shutil
+import subprocess
 
 import pytest
 
@@ -264,3 +266,118 @@ def test_timeout_mapping(monkeypatch, rooted_cfg, tmp_path):
         confirm=True, verify=False, cred=CRED,
     )
     assert out["error_class"] == "timeout" and out["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# issue #6: failure-class mappers, ordering pins, parse validity
+# ---------------------------------------------------------------------------
+
+def test_read_file_policy_denial_maps_to_policy_class(monkeypatch, rooted_cfg):
+    """AC5 leg: guest_read_file's mapper must classify policy text, not transport."""
+    fake = FakePS([pswindows.PSResult(
+        returncode=1, stderr="policy: guest read denied (path outside configured roots)")])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = filetransfer.guest_read_file(rooted_cfg, "test-vm", r"C:\g-read\f", cred=CRED)
+    assert out["ok"] is False and out["error_class"] == "policy"
+
+
+def test_list_dir_policy_denial_maps_to_policy_class(monkeypatch, rooted_cfg):
+    """AC5 leg: guest_list_dir's mapper must classify policy text, not transport."""
+    fake = FakePS([pswindows.PSResult(
+        returncode=1, stderr="policy: guest read denied (path outside configured roots)")])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = filetransfer.guest_list_dir(rooted_cfg, "test-vm", r"C:\g-read", cred=CRED)
+    assert out["ok"] is False and out["error_class"] == "policy"
+
+
+def test_failure_class_branches():
+    """Single classifier: integrity first, policy second, transport default."""
+    assert filetransfer._failure_class(
+        "SHA-256 mismatch (staged copy differs from source)") == "integrity"
+    assert filetransfer._failure_class(
+        "policy: guest write denied (reparse point in path inside root)") == "policy"
+    assert filetransfer._failure_class("Access is denied") == "transport"
+    # precedence: integrity text wins even if a policy fragment co-occurs
+    assert filetransfer._failure_class(
+        "SHA-256 mismatch ... policy: ...") == "integrity"
+
+
+def test_put_assertion_precedes_dir_creation(monkeypatch, rooted_cfg, tmp_path):
+    """AC1 ordering: the guest assertion block is the FIRST statement of the
+    body — C1's placement tuple (0, 1) alone would also pass if the block
+    were moved after dir creation, so pin the order explicitly."""
+    from test_a02_guest_transfer import MARKER
+
+    src = tmp_path / "host-src" / "a.bin"
+    src.write_bytes(b"x")
+    payload = {"ok": True, "bytes_copied": 1, "bytes_local": 1, "bytes_remote": 1,
+               "sha256_local": None, "sha256_remote": None}
+    fake = FakePS([pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    filetransfer.guest_put(
+        rooted_cfg, "test-vm", str(src), r"C:\g-write\a.bin",
+        confirm=True, verify=False, cred=CRED,
+    )
+    script = fake.scripts[0]
+    assert script.index(MARKER) < script.index("New-Item")
+
+
+def test_get_assertion_precedes_copy_from_session(monkeypatch, rooted_cfg, tmp_path):
+    """AC2 ordering: assertion before Copy-Item -FromSession (placement tuple
+    alone does not capture body order — see the plan's ordering pins)."""
+    from test_a02_guest_transfer import MARKER
+
+    dest = tmp_path / "host-dst" / "a.bin"
+    payload = {"ok": True, "bytes_copied": 1, "bytes_remote": 1,
+               "sha256_local": "S", "sha256_remote": "S"}
+    fake = FakePS([pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    filetransfer.guest_get(
+        rooted_cfg, "test-vm", r"C:\g-read\a.bin", str(dest),
+        verify=True, cred=CRED,
+    )
+    script = fake.scripts[0]
+    assert script.index(MARKER) < script.index("Copy-Item -FromSession")
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None,
+                    reason="parse validity needs real PowerShell")
+def test_put_get_scripts_parse_clean(monkeypatch, rooted_cfg, tmp_path):
+    """Generated put/get scripts must parse under real PS 5.1's parser —
+    mocked-subprocess unit tests happily accept scripts real PowerShell
+    would reject (zmem 334b6cdc)."""
+    src = tmp_path / "host-src" / "a.bin"
+    src.write_bytes(b"x")
+    dest = tmp_path / "host-dst" / "a.bin"
+    put_payload = {"ok": True, "bytes_copied": 1, "bytes_local": 1, "bytes_remote": 1,
+                   "sha256_local": None, "sha256_remote": None}
+    get_payload = {"ok": True, "bytes_copied": 1, "bytes_remote": 1,
+                   "sha256_local": "S", "sha256_remote": "S"}
+    fake = FakePS([
+        pswindows.PSResult(stdout=json.dumps(put_payload), returncode=0),
+        pswindows.PSResult(stdout=json.dumps(get_payload), returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    filetransfer.guest_put(
+        rooted_cfg, "test-vm", str(src), r"C:\g-write\a.bin",
+        confirm=True, verify=False, cred=CRED,
+    )
+    filetransfer.guest_get(
+        rooted_cfg, "test-vm", r"C:\g-read\a.bin", str(dest),
+        verify=True, cred=CRED,
+    )
+    parser = (
+        "$src = [Console]::In.ReadToEnd(); "
+        "$toks = $null; $errs = $null; "
+        "[void][System.Management.Automation.Language.Parser]::ParseInput("
+        "$src, [ref]$toks, [ref]$errs); "
+        "if ($errs -and $errs.Count) { "
+        "$errs | ForEach-Object { $_.ToString() }; exit 1 }"
+    )
+    for label, script in (("put", fake.scripts[0]), ("get", fake.scripts[1])):
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", parser],
+            input=script, capture_output=True, text=True, timeout=60,
+            errors="replace",
+        )
+        assert proc.returncode == 0, f"{label} script failed PS parse: {proc.stdout}{proc.stderr}"
