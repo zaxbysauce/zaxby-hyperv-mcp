@@ -19,7 +19,8 @@ provenance. Security model:
   - Structured audit log per operation (secret-safe).
 
 Configuration: HYPERV_MCP_CONFIG (JSON file) — see README for the schema and
-worked examples. Run `hyperv-mcp --check-env` to print the effective policy.
+worked examples. Run `hyperv-mcp --check-env` to print the effective policy
+and runtime provenance (PowerShell probe, config digest, git revision).
 """
 
 import argparse
@@ -71,7 +72,8 @@ _INSTRUCTIONS = (
     "DENY-BY-DEFAULT: configure HYPERV_MCP_CONFIG (allowed VM patterns and "
     "path roots) or set HYPERV_MCP_UNRESTRICTED=1 for disposable labs. "
     "Destructive operations additionally need confirm=true. "
-    "Run `hyperv-mcp --check-env` to print the effective policy."
+    "Run `hyperv-mcp --check-env` to print the effective policy and runtime "
+    "provenance (PowerShell, config digest, git revision)."
 )
 
 _mcp: FastMCP | None = None
@@ -220,10 +222,15 @@ _PROVENANCE_SCRIPT = (
 def _git_revision() -> str:
     """Git revision of the source tree; 'unknown' on any failure (never raises).
 
-    Runs with the sanitized child environment, so the git process cannot see
-    server secrets either.
+    Probes only when the derived root itself contains a ``.git`` entry, so a
+    pip-installed package sitting inside an unrelated repository cannot have
+    its reported revision hijacked by that enclosing repository. Runs with the
+    sanitized child environment: the git process cannot see server secrets or
+    inherit GIT_DIR/GIT_WORK_TREE redirections (child_env strips both).
     """
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if not os.path.exists(os.path.join(repo_root, ".git")):
+        return "unknown"
     try:
         proc = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -237,7 +244,7 @@ def _git_revision() -> str:
     except (OSError, subprocess.SubprocessError):
         return "unknown"
     revision = proc.stdout.strip()
-    if proc.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", revision):
+    if proc.returncode != 0 or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", revision):
         return "unknown"
     return revision
 
@@ -275,6 +282,16 @@ def _powershell_provenance(cfg: Config) -> dict[str, str]:
     return answers
 
 
+def _mcp_sdk_version() -> str:
+    """Installed 'mcp' distribution version; 'unknown' if the distribution
+    metadata is unavailable (failure-soft, matching the other provenance
+    legs — never raises)."""
+    try:
+        return importlib.metadata.version("mcp")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
 def _server_info_payload(cfg: Config) -> dict[str, Any]:
     """Read-only runtime provenance payload for the hyperv_server_info tool."""
     return {
@@ -283,7 +300,7 @@ def _server_info_payload(cfg: Config) -> dict[str, Any]:
         "powershell": _powershell_provenance(cfg),
         "config_path": cfg.config_path,
         "config_sha256": cfg.config_sha256,
-        "mcp_sdk_version": importlib.metadata.version("mcp"),
+        "mcp_sdk_version": _mcp_sdk_version(),
         "protocol_version": LATEST_PROTOCOL_VERSION,
         "feature_flags": {
             "unrestricted": cfg.unrestricted,
@@ -1627,7 +1644,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument(
         "--check-env", action="store_true",
-        help="print the effective policy and credential configuration, then exit",
+        help="print the effective policy and credential configuration, plus "
+             "runtime provenance (PowerShell probe, config digest, git "
+             "revision), then exit",
     )
     ns = parser.parse_args(argv)
 

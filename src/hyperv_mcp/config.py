@@ -142,6 +142,19 @@ class Config:
             raise ConfigError("max_output_bytes must be >= 1024")
         if self.ps_timeout_s < 5:
             raise ConfigError("ps_timeout_s must be >= 5")
+        # child_env() strips the token_env-named variable from every spawned
+        # child; naming a functional variable would break that child (bare-name
+        # resolution, PowerShell internals), so reject it at load time.
+        reserved_functional_env = {
+            "PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP",
+            "PATHEXT", "PSMODULEPATH", "PROGRAMFILES",
+        }
+        token_env = self.http.token_env.strip().upper()
+        if token_env in reserved_functional_env:
+            raise ConfigError(
+                f"http.token_env must not shadow the functional environment "
+                f"variable {token_env}"
+            )
         for key in ("host_read_roots", "host_write_roots", "guest_read_roots", "guest_write_roots"):
             for root in getattr(self, key):
                 if not isinstance(root, str) or not root.strip():
@@ -241,7 +254,10 @@ class Config:
                     raise ConfigError("http.port must be an integer in 1..65535")
                 http.port = val
             elif isinstance(val, str) and val.strip():
-                setattr(http, key, val)
+                # token_env is matched by exact (case-insensitive) name
+                # downstream; store it trimmed so padding cannot defeat the
+                # match and the secret variable survives into children.
+                setattr(http, key, val.strip() if key == "token_env" else val)
             else:
                 raise ConfigError(f"http.{key} must be a non-empty string")
         object.__setattr__(self, "http", http)

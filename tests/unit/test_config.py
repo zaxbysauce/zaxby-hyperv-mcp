@@ -1,5 +1,6 @@
 """Config schema tests: secure defaults, strict parsing, failure modes."""
 
+import hashlib
 import json
 
 import pytest
@@ -127,3 +128,72 @@ def test_ps_bounds_validated():
         Config.from_dict({"max_output_bytes": 10})
     with pytest.raises(ConfigError):
         Config.from_dict({"ps_timeout_s": 1})
+
+
+# ---------------------------------------------------------------------------
+# provenance fields (config_path / config_sha256) — ENH-16
+# ---------------------------------------------------------------------------
+
+def test_bom_prefixed_config_loads_with_real_digest(tmp_path):
+    """F-008: a UTF-8 BOM is tolerated and config_sha256 covers the raw
+    stored bytes (BOM included)."""
+    p = tmp_path / "bom.json"
+    p.write_text(json.dumps({"allowed_vm_patterns": ["bom-vm"]}), encoding="utf-8-sig")
+    cfg = Config.load(environ={"HYPERV_MCP_CONFIG": str(p)})
+    assert cfg.allowed_vm_patterns == ["bom-vm"]
+    assert cfg.config_sha256 == hashlib.sha256(p.read_bytes()).hexdigest()
+    assert cfg.config_path == str(p)
+
+
+def test_load_digest_is_real_file_hash(tmp_path):
+    """F-008/F-037: config_sha256 is the digest of the actual file bytes, so
+    a mutation returning a constant default digest fails here."""
+    p = tmp_path / "cfg.json"
+    payload = b'{"verify_sha256": true}'
+    p.write_bytes(payload)
+    cfg = Config.load(environ={"HYPERV_MCP_CONFIG": str(p)})
+    assert cfg.config_sha256 == hashlib.sha256(payload).hexdigest()
+    assert cfg.config_path == str(p)
+
+
+def test_missing_config_records_path_and_empty_digest():
+    """F-026/F-029: the missing-file branch records the requested path and
+    the documented sha256(b"") sentinel (config_path disambiguates)."""
+    cfg = Config.load(environ={"HYPERV_MCP_CONFIG": r"Z:\definitely\missing.json"})
+    assert cfg.config_path == r"Z:\definitely\missing.json"
+    assert cfg.config_sha256 == hashlib.sha256(b"").hexdigest()
+
+
+def test_no_config_records_empty_path_and_empty_digest():
+    """F-029: the no-config bootstrap branch is pinned too."""
+    cfg = Config.load(environ={})
+    assert cfg.config_path == ""
+    assert cfg.config_sha256 == hashlib.sha256(b"").hexdigest()
+
+
+def test_json_cannot_set_provenance_fields():
+    """F-043: config_path/config_sha256 stay out of _FIELD_MAP — JSON
+    attempts are rejected as unknown keys so a config file cannot dictate the
+    reported provenance."""
+    with pytest.raises(ConfigError, match="unknown config key"):
+        Config.from_dict({"config_sha256": "deadbeef"})
+    with pytest.raises(ConfigError, match="unknown config key"):
+        Config.from_dict({"config_path": r"C:\x.json"})
+
+
+def test_padded_token_env_stored_trimmed():
+    """F-017: padding around http.token_env must not defeat exact-name
+    matching downstream (child_env strips by exact case-insensitive name)."""
+    cfg = Config.from_dict({"http": {"token_env": "  HYPERV_MCP_HTTP_TOKEN  "}})
+    assert cfg.http.token_env == "HYPERV_MCP_HTTP_TOKEN"
+
+
+def test_token_env_reserved_names_rejected():
+    """F-035: naming a functional variable as token_env would make child_env
+    strip that variable from every spawned child — reject at load time."""
+    with pytest.raises(ConfigError, match="token_env"):
+        Config.from_dict({"http": {"token_env": "PATH"}})
+    with pytest.raises(ConfigError, match="token_env"):
+        Config.from_dict({"http": {"token_env": "SystemRoot"}})
+    with pytest.raises(ConfigError, match="token_env"):
+        Config.from_dict({"http": {"token_env": "PSModulePath"}})

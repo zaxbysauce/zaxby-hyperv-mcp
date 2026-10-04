@@ -162,6 +162,14 @@ Unknown keys are rejected at startup (typos must not disable a control).
 `"unrestricted": true` for disposable labs; unrestricted mode also forces a
 visible audit line per operation.
 
+`host_powershell_path` limitation: the child environment handed to every
+spawn always carries a PowerShell 5.1-shaped `PSModulePath` (pwsh7 module
+directories stripped, the 5.1 system module directory appended). Pointing
+`host_powershell_path` at a `pwsh.exe` (PowerShell 7) executable is therefore
+not recommended: the pwsh7 child would lose its pwsh7 module directories on
+every spawn. The knob exists for exotic 5.1 layouts; leave it `null` for
+PowerShell 7 hosts.
+
 **Path checks** canonicalize before comparing: `..` collapse, mixed
 separators, drive-relative rejection, `\\?\`/UNC prefixes, case-insensitive
 root comparison (drive roots like `C:\` are valid), and junction/symlink
