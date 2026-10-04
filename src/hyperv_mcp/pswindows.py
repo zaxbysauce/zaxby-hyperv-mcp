@@ -28,7 +28,7 @@ import time
 from ctypes import wintypes
 from dataclasses import dataclass
 
-from .config import Config
+from .config import Config, HttpPolicy
 
 _CREATE_SUSPENDED = 0x00000004
 _TH32CS_SNAPTHREAD = 0x00000004
@@ -42,6 +42,23 @@ _PS_PIN = (
     "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);\n"
 )
 _DEFAULT_PS = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+PS51_SYSTEM_MODULES = r"C:\Windows\system32\WindowsPowerShell\v1.0\Modules"
+_PWSH7_SHARED_MODULES = r"C:\Program Files\PowerShell\Modules"
+# Server-side secrets that must never reach a spawned child process. Compared
+# case-insensitively (Windows env names); the configured http.token_env name is
+# unioned in at call time by child_env(), together with the literal default
+# HYPERV_MCP_HTTP_TOKEN name (so customizing token_env never re-enables the
+# default variable).
+_SECRET_ENV_NAMES = frozenset({
+    "HYPERV_GUEST_PASSWORD",
+    "HYPERV_GUEST_PASSWORD_FILE",
+    "HYPERV_GUEST_VICTIM_PASSWORD",
+    "HYPERV_GUEST_VICTIM_PASSWORD_FILE",
+})
+# Inheriting these would redirect the git provenance probe (server.py
+# _git_revision spawns under child_env()); they are not secrets but must not
+# ride the child environment either.
+_GIT_ENV_NAMES = frozenset({"GIT_DIR", "GIT_WORK_TREE"})
 
 
 class PowerShellTransportError(RuntimeError):
@@ -113,6 +130,80 @@ def find_powershell(config_path: str | None) -> str:
     if os.path.isfile(_DEFAULT_PS):
         return _DEFAULT_PS
     return "powershell"
+
+
+# ---------------------------------------------------------------------------
+# child environment sanitization (FND-03: never leak server env into children)
+# ---------------------------------------------------------------------------
+
+def _norm_path(value: str) -> str:
+    """Canonical form for module-directory comparison.
+
+    Order matters: convert forward slashes to backslashes BEFORE stripping
+    trailing separators, otherwise a ``C:/.../Modules/`` spelling keeps its
+    trailing separator and no longer compares equal to the canonical dir.
+    """
+    return value.strip().replace("/", "\\").rstrip("\\").lower()
+
+
+def _is_pwsh7_module_entry(entry: str) -> bool:
+    """A PSModulePath entry is a PowerShell 7 (pwsh7) entry when it lies
+    under a PowerShell 7 install directory — segment-aware, so the GA ``7``
+    root, preview/daily roots (``7-preview``, ``7-daily``) and versioned
+    side-by-side roots (``7.x``) all match — equals the pwsh7 program-files
+    shared module directory, or is a pwsh7 user Documents module directory.
+    Windows PowerShell 5.1 directories (WindowsPowerShell) never match."""
+    norm = _norm_path(entry)
+    wrapped = "\\" + norm + "\\"
+    # Check every "\powershell\" segment occurrence, not just the first, so
+    # nested install parents (...\PowerShell\PowerShell\7\Modules) still match.
+    idx = wrapped.find("\\powershell\\")
+    while idx != -1:
+        segment = wrapped[idx + len("\\powershell\\"):].split("\\", 1)[0]
+        if segment == "7" or segment.startswith(("7-", "7.")):
+            return True
+        idx = wrapped.find("\\powershell\\", idx + 1)
+    if norm == _norm_path(_PWSH7_SHARED_MODULES):
+        return True
+    return norm.endswith("\\documents\\powershell\\modules")
+
+
+def child_env() -> dict[str, str]:
+    """Environment for every process spawned from this module.
+
+    Inherit the server environment minus credential and HTTP-token variable
+    names (case-insensitive): the configured http.token_env name (trimmed, so
+    a whitespace-padded config value still matches), the literal default
+    HYPERV_MCP_HTTP_TOKEN name even when token_env is customized, and
+    GIT_DIR/GIT_WORK_TREE (they would redirect the git provenance probe).
+
+    The child always receives a PowerShell 5.1-only PSModulePath: pwsh7 module
+    directories and empty entries are dropped, the 5.1 system module directory
+    is appended when missing, and a PSModulePath with no surviving entries is
+    removed entirely. An absent PSModulePath stays absent.
+
+    Edition note (limitation): the 5.1 shape is unconditional. If
+    host_powershell_path is pointed at a pwsh7 executable, the child loses the
+    pwsh7 module directories on every spawn — see the host_powershell_path
+    documentation in README.md.
+    """
+    env = dict(os.environ)
+    token_name = _config.http.token_env if _config is not None else HttpPolicy().token_env
+    secret_names = _SECRET_ENV_NAMES | {"HYPERV_MCP_HTTP_TOKEN", token_name.strip().upper()}
+    strip_names = secret_names | _GIT_ENV_NAMES
+    for key in [k for k in env if k.upper() in strip_names]:
+        del env[key]
+    psmk = next((k for k in env if k.upper() == "PSMODULEPATH"), None)
+    if psmk is not None:
+        entries = [e for e in env[psmk].split(";") if e.strip()]
+        kept = [e for e in entries if not _is_pwsh7_module_entry(e)]
+        if kept:
+            if _norm_path(PS51_SYSTEM_MODULES) not in {_norm_path(e) for e in kept}:
+                kept.append(PS51_SYSTEM_MODULES)
+            env[psmk] = ";".join(kept)
+        else:
+            del env[psmk]
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +302,7 @@ def _taskkill_tree(pid: int) -> None:
     subprocess.run(
         ["taskkill", "/T", "/F", "/PID", str(pid)],
         capture_output=True, timeout=15, check=False,
+        env=child_env(),
     )
 
 
@@ -268,6 +360,7 @@ def run_ps(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             creationflags=creationflags,
+            env=child_env(),
         )
     except OSError as exc:
         if job:

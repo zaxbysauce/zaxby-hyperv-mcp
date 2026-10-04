@@ -1,11 +1,12 @@
 """
 hyperv_mcp.server -- MCP server for Hyper-V VM management (hardened fork).
 
-Exposes 54 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
+Exposes 55 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
 guest execution and file transfer via PowerShell Direct, guest access
 diagnostics/repair and managed guest jobs, reboot recovery verification,
 host-to-guest HTTP relay, console observation and input (WMI), evidence
-capture, VM/media provisioning, and orchestration waits. Security model:
+capture, VM/media provisioning, orchestration waits, and server runtime
+provenance. Security model:
 
   - Credentials resolve from env vars / credential files; username/password
     tool parameters exist only when config allow_inline_credentials=true.
@@ -18,17 +19,24 @@ capture, VM/media provisioning, and orchestration waits. Security model:
   - Structured audit log per operation (secret-safe).
 
 Configuration: HYPERV_MCP_CONFIG (JSON file) — see README for the schema and
-worked examples. Run `hyperv-mcp --check-env` to print the effective policy.
+worked examples. Run `hyperv-mcp --check-env` to print the effective policy
+and runtime provenance (PowerShell probe, config digest, git revision).
 """
 
 import argparse
+import dataclasses
+import importlib.metadata
 import io
+import json
 import os
+import re
+import subprocess
 import sys
 from typing import Any
 
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP, Image
+from mcp.types import LATEST_PROTOCOL_VERSION
 from pydantic import AnyHttpUrl
 
 from . import (
@@ -64,7 +72,8 @@ _INSTRUCTIONS = (
     "DENY-BY-DEFAULT: configure HYPERV_MCP_CONFIG (allowed VM patterns and "
     "path roots) or set HYPERV_MCP_UNRESTRICTED=1 for disposable labs. "
     "Destructive operations additionally need confirm=true. "
-    "Run `hyperv-mcp --check-env` to print the effective policy."
+    "Run `hyperv-mcp --check-env` to print the effective policy and runtime "
+    "provenance (PowerShell, config digest, git revision)."
 )
 
 _mcp: FastMCP | None = None
@@ -192,6 +201,115 @@ def _cfg() -> Config:
     assert CFG is not None
     return CFG
 
+
+# ---------------------------------------------------------------------------
+# server provenance (ENH-16)
+# ---------------------------------------------------------------------------
+
+# Probe script for the PowerShell child pswindows would spawn. Mentions three
+# of the four probe markers plus ConvertTo-Json, so the compact JSON contract
+# holds for both a real run and a stubbed run_ps.
+_PROVENANCE_SCRIPT = (
+    "[pscustomobject]@{ "
+    "path = [System.Diagnostics.Process]::GetCurrentProcess().Path; "
+    "edition = [string]$PSEdition; "
+    "version = [string]$PSVersionTable.PSVersion.ToString(); "
+    "psmodulepath = [string]$env:PSModulePath "
+    "} | ConvertTo-Json -Compress"
+)
+
+
+def _git_revision() -> str:
+    """Git revision of the source tree; 'unknown' on any failure (never raises).
+
+    Probes only when the derived root itself contains a ``.git`` entry, so a
+    pip-installed package sitting inside an unrelated repository cannot have
+    its reported revision hijacked by that enclosing repository. Runs with the
+    sanitized child environment: the git process cannot see server secrets or
+    inherit GIT_DIR/GIT_WORK_TREE redirections (child_env strips both).
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if not os.path.exists(os.path.join(repo_root, ".git")):
+        return "unknown"
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            env=pswindows.child_env(),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    revision = proc.stdout.strip()
+    if proc.returncode != 0 or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", revision):
+        return "unknown"
+    return revision
+
+
+def _powershell_provenance(cfg: Config) -> dict[str, str]:
+    """PowerShell path/edition/version/psmodulepath for the child process.
+
+    Best effort: any probe failure falls back per field (path -> the
+    executable pswindows would spawn, edition/version -> 'unknown',
+    psmodulepath -> the 5.1 system module directory), so the result is always
+    four non-empty strings and never raises.
+    """
+    answers = {"path": "", "edition": "", "version": "", "psmodulepath": ""}
+    try:
+        result = pswindows.run_ps(_PROVENANCE_SCRIPT, timeout_s=10)
+    except Exception:
+        result = None
+    if result is not None and result.ok():
+        try:
+            payload = json.loads(result.stdout)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                if key in answers and isinstance(value, str):
+                    answers[key] = value
+    if not answers["path"].strip():
+        answers["path"] = pswindows.find_powershell(cfg.host_powershell_path)
+    if not answers["edition"].strip():
+        answers["edition"] = "unknown"
+    if not answers["version"].strip():
+        answers["version"] = "unknown"
+    if not answers["psmodulepath"].strip():
+        answers["psmodulepath"] = pswindows.PS51_SYSTEM_MODULES
+    return answers
+
+
+def _mcp_sdk_version() -> str:
+    """Installed 'mcp' distribution version; 'unknown' if the distribution
+    metadata is unavailable (failure-soft, matching the other provenance
+    legs — never raises)."""
+    try:
+        return importlib.metadata.version("mcp")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _server_info_payload(cfg: Config) -> dict[str, Any]:
+    """Read-only runtime provenance payload for the hyperv_server_info tool."""
+    return {
+        "version": VERSION,
+        "git_revision": _git_revision(),
+        "powershell": _powershell_provenance(cfg),
+        "config_path": cfg.config_path,
+        "config_sha256": cfg.config_sha256,
+        "mcp_sdk_version": _mcp_sdk_version(),
+        "protocol_version": LATEST_PROTOCOL_VERSION,
+        "feature_flags": {
+            "unrestricted": cfg.unrestricted,
+            "allow_inline_credentials": cfg.allow_inline_credentials,
+            "verify_sha256": cfg.verify_sha256,
+            "destructive": dataclasses.asdict(cfg.destructive),
+        },
+    }
+
 # ---------------------------------------------------------------------------
 # tool registration
 # ---------------------------------------------------------------------------
@@ -263,6 +381,19 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             op.ok = False
             op.error_class = "transport"
             return {"ok": False, "error": str(exc), "error_class": "transport"}
+
+    # ---- server provenance ----------------------------------------------
+
+    @mcp.tool()
+    def hyperv_server_info() -> dict:
+        """Read-only runtime provenance for this hyperv-mcp server process.
+
+        Returns: {version, git_revision, powershell:{path, edition, version,
+        psmodulepath}, config_path, config_sha256, mcp_sdk_version,
+        protocol_version, feature_flags}. Never contains secrets.
+        """
+        with _audit("hyperv_server_info", "", "read"):
+            return _server_info_payload(cfg)
 
     # ---- VM lifecycle --------------------------------------------------
 
@@ -1513,7 +1644,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument(
         "--check-env", action="store_true",
-        help="print the effective policy and credential configuration, then exit",
+        help="print the effective policy and credential configuration, plus "
+             "runtime provenance (PowerShell probe, config digest, git "
+             "revision), then exit",
     )
     ns = parser.parse_args(argv)
 
@@ -1532,6 +1665,14 @@ def main(argv: list[str] | None = None) -> int:
             "HYPERV_MCP_UNRESTRICTED", "HYPERV_MCP_HTTP_TOKEN",
         ):
             print(f"{name:36}{'set' if name in os.environ else 'not set'}")
+        ps_info = _powershell_provenance(cfg)
+        print(f"powershell.path {ps_info['path']}")
+        print(f"powershell.edition {ps_info['edition']}")
+        print(f"powershell.version {ps_info['version']}")
+        print(f"powershell.psmodulepath {ps_info['psmodulepath']}")
+        print(f"config.path {cfg.config_path or '(none)'}")
+        print(f"config.sha256 {cfg.config_sha256}")
+        print(f"git.revision {_git_revision()}")
         return 0
 
     try:

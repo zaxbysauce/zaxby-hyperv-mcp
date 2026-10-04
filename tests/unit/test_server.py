@@ -1,8 +1,13 @@
 """Server-level tests: tool schemas per credential mode, entry points."""
 
 import asyncio
+import dataclasses
+import hashlib
 import importlib
 import json
+import re
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -39,6 +44,8 @@ TOOL_NAMES = {
     "hyperv_vm_tpm_set", "hyperv_vm_secureboot_set", "hyperv_vm_network_set",
     # orchestration
     "hyperv_wait_vm_state",
+    # server provenance (read-only)
+    "hyperv_server_info",
     # guest access diagnostics / repair / jobs / recovery / relay / evidence
     "hyperv_diagnose_vm_access", "hyperv_repair_guest_access",
     "hyperv_guest_job_start", "hyperv_guest_job_status",
@@ -79,7 +86,7 @@ def test_tool_inventory_registered(fresh_server):
     mod = fresh_server({})
     schemas = _schemas(mod)
     assert set(schemas) == TOOL_NAMES
-    assert len(schemas) == 54
+    assert len(schemas) == 55
 
 
 def test_no_password_params_by_default(fresh_server):
@@ -173,6 +180,163 @@ def test_check_env_exit_zero(fresh_server, capsys):
     out = capsys.readouterr().out
     assert "hyperv-mcp 0.3.0" in out
     assert "DENY ALL" in out
+
+
+def _ps_available() -> bool:
+    try:
+        subprocess.run(
+            [r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+             "-NonInteractive", "-NoProfile", "-Command", "$null"],
+            capture_output=True, timeout=60, check=False,
+        )
+        return True
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(not _ps_available(), reason="Windows PowerShell not available")
+def test_check_env_prints_provenance(fresh_server, capsys, monkeypatch):
+    """ENH-16: --check-env prints runtime provenance (PowerShell
+    path/edition/version/psmodulepath, config path + sha256, git revision)
+    and still exits 0.
+
+    F-044: sentinel secret values seeded into the server environment must
+    never appear in the CLI output.
+    """
+    guest_sentinel = "DUMMY-SENTINEL-checkenv-guest-password"
+    token_sentinel = "DUMMY-SENTINEL-checkenv-http-token"
+    monkeypatch.setenv("HYPERV_GUEST_PASSWORD", guest_sentinel)
+    monkeypatch.setenv("HYPERV_MCP_HTTP_TOKEN", token_sentinel)
+
+    mod = fresh_server({})
+    rc = mod.main(["--check-env"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    for prefix in (
+        "powershell.path ", "powershell.edition ", "powershell.version ",
+        "powershell.psmodulepath ", "config.path ", "config.sha256 ",
+        "git.revision ",
+    ):
+        assert prefix in out, f"--check-env output is missing the {prefix.strip()!r} line"
+    assert guest_sentinel not in out, "--check-env printed the guest-password sentinel"
+    assert token_sentinel not in out, "--check-env printed the http-token sentinel"
+
+    ps_path = re.search(r"^powershell\.path (.+)$", out, re.M)
+    assert ps_path and ps_path.group(1).strip(), "powershell.path line has no value"
+    path_value = ps_path.group(1).strip()
+    assert path_value.lower().endswith("powershell.exe") or path_value.lower() == "powershell", (
+        f"powershell.path does not name a PowerShell executable: {path_value!r}"
+    )
+    edition = re.search(r"^powershell\.edition (\S+)$", out, re.M)
+    assert edition and edition.group(1) in ("Desktop", "Core"), (
+        f"powershell.edition is not Desktop/Core: {out!r}"
+    )
+    version = re.search(r"^powershell\.version (\S+)$", out, re.M)
+    assert version and re.fullmatch(r"(\d[0-9A-Za-z.\-+]*|unknown)", version.group(1)), (
+        f"powershell.version is neither a version string nor 'unknown': "
+        f"{version.group(1) if version else None!r}"
+    )
+    psm = re.search(r"^powershell\.psmodulepath (.+)$", out, re.M)
+    assert psm and "windowspowershell\\v1.0\\modules" in psm.group(1).lower(), (
+        f"powershell.psmodulepath lost the 5.1 system module directory: "
+        f"{psm.group(1) if psm else None!r}"
+    )
+    sha = re.search(r"^config\.sha256 (\S+)$", out, re.M)
+    assert sha and re.fullmatch(r"[0-9a-f]{64}", sha.group(1)), (
+        f"config.sha256 is not a 64-hex digest: {sha.group(1) if sha else None!r}"
+    )
+
+    # F-015: probe git FIRST and, whenever the probe succeeds, require the
+    # printed revision to equal the probed HEAD and be a full object id, so an
+    # always-"unknown" implementation can no longer pass this test. A missing
+    # git binary counts as a failed probe (git-less hosts must not error).
+    rev = re.search(r"^git\.revision (\S+)$", out, re.M)
+    assert rev, "git.revision line missing from --check-env output"
+    revision = rev.group(1)
+    try:
+        probe = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            capture_output=True, text=True, timeout=10,
+        )
+    except OSError:
+        probe = None
+    if probe is not None and probe.returncode == 0:
+        head = probe.stdout.strip()
+        assert re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head), (
+            f"test probe returned an unexpected HEAD shape: {head!r}"
+        )
+        assert revision == head, (
+            f"--check-env git.revision {revision!r} does not match the "
+            f"checkout HEAD {head!r}"
+        )
+    else:
+        assert revision == "unknown", (
+            f"git probe failed yet git.revision is {revision!r}, expected 'unknown'"
+        )
+
+
+def test_check_env_config_sha256_matches_file_bytes(tmp_path, monkeypatch, capsys):
+    """F-013 (test_a01_ps_environment.py is frozen; CLI-surface sibling): the
+    printed config.sha256 must equal the real SHA-256 of the config file
+    bytes, not merely be 64-hex shaped."""
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps({"allowed_vm_patterns": ["probe-vm"]}), encoding="utf-8")
+    monkeypatch.setenv("HYPERV_MCP_CONFIG", str(p))
+    mod = importlib.reload(server_module)
+    try:
+        rc = mod.main(["--check-env"])
+        assert rc == 0
+        out = capsys.readouterr().out
+    finally:
+        importlib.reload(server_module)
+    sha = re.search(r"^config\.sha256 ([0-9a-f]{64})$", out, re.M)
+    assert sha, f"config.sha256 line missing or malformed: {out!r}"
+    assert sha.group(1) == hashlib.sha256(p.read_bytes()).hexdigest(), (
+        "config.sha256 does not equal the digest of the config file bytes"
+    )
+
+
+def test_server_info_feature_flags_match_config(fresh_server):
+    """F-040 (test_a01_ps_environment.py is frozen; sibling): the
+    feature_flags payload values must mirror the live config, not merely be
+    present."""
+    mod = fresh_server({})
+    payload = mod._server_info_payload(mod.CFG)
+    flags = payload["feature_flags"]
+    assert flags["unrestricted"] == mod.CFG.unrestricted
+    assert flags["allow_inline_credentials"] == mod.CFG.allow_inline_credentials
+    assert flags["verify_sha256"] == mod.CFG.verify_sha256
+    assert flags["destructive"] == dataclasses.asdict(mod.CFG.destructive)
+
+
+def test_git_revision_spawns_with_sanitized_env(monkeypatch, fresh_server):
+    """F-042: the git provenance probe is a spawn site; capture its env=
+    kwarg and prove secrets and GIT_DIR redirections never ride along."""
+    mod = fresh_server({})
+    captured = {}
+    real_run = mod.subprocess.run
+
+    def fake_run(argv, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    monkeypatch.setenv("HYPERV_GUEST_PASSWORD", "DUMMY-SENTINEL-git-env")
+    monkeypatch.setenv("GIT_DIR", r"Z:\unrelated\.git")
+
+    revision = mod._git_revision()
+
+    env = captured.get("env")
+    assert env is not None, "_git_revision spawned without env="
+    assert not any(k.upper() == "HYPERV_GUEST_PASSWORD" for k in env), (
+        "git probe child env carries HYPERV_GUEST_PASSWORD"
+    )
+    assert not any(k.upper() == "GIT_DIR" for k in env), (
+        "git probe child env carries GIT_DIR redirection"
+    )
+    if revision != "unknown":
+        assert re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", revision)
 
 
 def test_check_env_config_error_exit_two(tmp_path, monkeypatch, capsys):
