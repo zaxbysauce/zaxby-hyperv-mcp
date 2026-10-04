@@ -3,6 +3,9 @@
 import asyncio
 import importlib
 import json
+import re
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -39,6 +42,8 @@ TOOL_NAMES = {
     "hyperv_vm_tpm_set", "hyperv_vm_secureboot_set", "hyperv_vm_network_set",
     # orchestration
     "hyperv_wait_vm_state",
+    # server provenance (read-only)
+    "hyperv_server_info",
     # guest access diagnostics / repair / jobs / recovery / relay / evidence
     "hyperv_diagnose_vm_access", "hyperv_repair_guest_access",
     "hyperv_guest_job_start", "hyperv_guest_job_status",
@@ -79,7 +84,7 @@ def test_tool_inventory_registered(fresh_server):
     mod = fresh_server({})
     schemas = _schemas(mod)
     assert set(schemas) == TOOL_NAMES
-    assert len(schemas) == 54
+    assert len(schemas) == 55
 
 
 def test_no_password_params_by_default(fresh_server):
@@ -173,6 +178,51 @@ def test_check_env_exit_zero(fresh_server, capsys):
     out = capsys.readouterr().out
     assert "hyperv-mcp 0.3.0" in out
     assert "DENY ALL" in out
+
+
+def test_check_env_prints_provenance(fresh_server, capsys):
+    """ENH-16: --check-env prints runtime provenance (PowerShell
+    path/edition/version/psmodulepath, config path + sha256, git revision)
+    and still exits 0."""
+    mod = fresh_server({})
+    rc = mod.main(["--check-env"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    for prefix in (
+        "powershell.path ", "powershell.edition ", "powershell.version ",
+        "powershell.psmodulepath ", "config.path ", "config.sha256 ",
+        "git.revision ",
+    ):
+        assert prefix in out, f"--check-env output is missing the {prefix.strip()!r} line"
+
+    ps_path = re.search(r"^powershell\.path (.+)$", out, re.M)
+    assert ps_path and ps_path.group(1).strip(), "powershell.path line has no value"
+    edition = re.search(r"^powershell\.edition (\S+)$", out, re.M)
+    assert edition and edition.group(1) in ("Desktop", "Core"), (
+        f"powershell.edition is not Desktop/Core: {out!r}"
+    )
+    sha = re.search(r"^config\.sha256 (\S+)$", out, re.M)
+    assert sha and re.fullmatch(r"[0-9a-f]{64}", sha.group(1)), (
+        f"config.sha256 is not a 64-hex digest: {sha.group(1) if sha else None!r}"
+    )
+
+    rev = re.search(r"^git\.revision (\S+)$", out, re.M)
+    assert rev, "git.revision line missing from --check-env output"
+    revision = rev.group(1)
+    if revision != "unknown":
+        assert re.fullmatch(r"[0-9a-f]{40}", revision), (
+            f"git.revision is neither 'unknown' nor a 40-hex sha: {revision!r}"
+        )
+        probe = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            capture_output=True, text=True, timeout=10,
+        )
+        if probe.returncode == 0:
+            assert revision == probe.stdout.strip(), (
+                f"--check-env git.revision {revision!r} does not match the "
+                f"checkout HEAD {probe.stdout.strip()!r}"
+            )
 
 
 def test_check_env_config_error_exit_two(tmp_path, monkeypatch, capsys):

@@ -14,6 +14,7 @@ a control.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field, replace
@@ -68,6 +69,13 @@ class Config:
     verify_sha256: bool = False
     ps_timeout_s: int = 120
     http: HttpPolicy = field(default_factory=HttpPolicy)
+    # Provenance set by load() only (deliberately NOT in _FIELD_MAP, so a JSON
+    # config can never set them and unknown-key rejection stays intact):
+    # config_path is the effective HYPERV_MCP_CONFIG path, config_sha256 is
+    # SHA-256 over the raw stored bytes (BOM included; sha256(b"") when no
+    # file was read).
+    config_path: str = ""
+    config_sha256: str = hashlib.sha256(b"").hexdigest()
 
     # -- loading ---------------------------------------------------------
 
@@ -76,27 +84,36 @@ class Config:
         env = dict(os.environ if environ is None else environ)
         data: dict[str, Any] = {}
         config_path = env.get("HYPERV_MCP_CONFIG", "").strip()
+        raw: bytes | None = None
         if config_path:
             try:
-                with open(config_path, encoding="utf-8-sig") as fh:
-                    data = json.load(fh)
+                with open(config_path, "rb") as fh:
+                    raw = fh.read()
             except FileNotFoundError:
                 # Missing file = run on deny-all defaults (banner explains it).
-                data = {}
+                raw = None
             except OSError as exc:
                 raise ConfigError(
                     f"HYPERV_MCP_CONFIG points to an unreadable file ({config_path}): {exc}"
                 ) from None
-            except json.JSONDecodeError as exc:
-                raise ConfigError(
-                    f"HYPERV_MCP_CONFIG file is not valid JSON ({config_path}): {exc}"
-                ) from None
+            if raw is not None:
+                try:
+                    data = json.loads(raw.decode("utf-8-sig"))
+                except json.JSONDecodeError as exc:
+                    raise ConfigError(
+                        f"HYPERV_MCP_CONFIG file is not valid JSON ({config_path}): {exc}"
+                    ) from None
             if not isinstance(data, dict):
                 raise ConfigError("HYPERV_MCP_CONFIG must contain a JSON object")
 
         cfg = cls.from_dict(data)
         if env.get("HYPERV_MCP_UNRESTRICTED", "") in ("1", "true", "yes"):
             cfg = replace(cfg, unrestricted=True)
+        cfg = replace(
+            cfg,
+            config_path=config_path,
+            config_sha256=hashlib.sha256(raw if raw is not None else b"").hexdigest(),
+        )
         cfg.validate()
         return cfg
 

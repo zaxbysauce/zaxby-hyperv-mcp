@@ -1,7 +1,7 @@
 # hyperv-mcp (hardened fork)
 
 An MCP (Model Context Protocol) server for Hyper-V VM management and guest
-execution. Exposes 54 tools for VM lifecycle, checkpoint management, kernel
+execution. Exposes 55 tools for VM lifecycle, checkpoint management, kernel
 debug setup (KDNET/KDCOM), and guest file transfer/command execution via
 PowerShell Direct (no WinRM required).
 
@@ -120,7 +120,8 @@ Hardening properties:
 
 No configuration file = **deny everything** (safe default; the server prints
 its effective policy to stderr at startup and on every denied call).
-`hyperv-mcp --check-env` prints the effective policy.
+`hyperv-mcp --check-env` prints the effective policy plus runtime provenance
+(PowerShell path/edition/version, config path and SHA-256, git revision).
 
 Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
 
@@ -243,7 +244,7 @@ claude mcp add hyperv -- hyperv-mcp
 
 ---
 
-## Available Tools (54 total)
+## Available Tools (55 total)
 
 ### VM Lifecycle
 
@@ -483,6 +484,12 @@ Console notes: text rides the stdin channel (never in argv/script/errors); non-A
 | Tool | Parameters | Returns |
 |------|-----------|---------|
 | `hyperv_wait_vm_state` | `vm_name`, `states[]` (Off/Running/Saved/Paused/...), `timeout_s=300` | `{ok, final_state, guest_channel: "ps_direct_unverified"}` |
+
+### Server Provenance (0.3.0)
+
+| Tool | Parameters | Returns |
+|------|-----------|---------|
+| `hyperv_server_info` | — | `{version, git_revision, powershell: {path, edition, version, psmodulepath}, config_path, config_sha256, mcp_sdk_version, protocol_version, feature_flags}` — read-only; never contains secrets |
 
 ### MDT Deployment Playbook (agent-driven)
 
