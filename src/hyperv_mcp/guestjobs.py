@@ -431,9 +431,13 @@ def job_stop(cfg: Config, job_id: str) -> dict:
     """
     entry = _lookup(job_id)
     if entry.get("stopped"):
+        # Same key set as a real stop, so a client written to the documented
+        # contract never hits a missing key on a repeat call. The observation
+        # fields are honest unknowns: this call observed nothing.
         return {
             "ok": True, "job_id": job_id, "pid": entry["pid"],
-            "stopped": True, "note": "was already stopped",
+            "stopped": True, "alive_pids": [], "job_dir_removed": None,
+            "pid_reused": False, "note": "was already stopped",
         }
     cred = entry["cred"]
     if cred is None:

@@ -1481,13 +1481,14 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             cwd: str = "", timeout_ms: int = 60000,
         ) -> dict:
             """Start a guest command as a managed job WITHOUT waiting.
-            Returns a job_id plus the guest PID and output-file paths; poll
-            with hyperv_guest_job_status, read with hyperv_guest_job_output,
-            stop exactly that PID with hyperv_guest_job_stop. Non-elevated
-            (elevated start cannot capture output). Credentials from
+            Returns a job_id plus the guest PID, the process start time used
+            to identify it, and the output-file paths; poll with
+            hyperv_guest_job_status, read with hyperv_guest_job_output, stop
+            that process and its descendants with hyperv_guest_job_stop.
+            Non-elevated (elevated start cannot capture output). Credentials from
             environment only.
 
-            Returns: {ok, job_id, vm_name, pid, job_dir, out_path, err_path, exit_path, started_at}.
+            Returns: {ok, job_id, vm_name, pid, start_time_ticks, job_dir, out_path, err_path, exit_path, started_at}.
             """
             return _run_guest_tool(
                 "hyperv_guest_job_start", vm_name, "exec",
