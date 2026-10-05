@@ -123,6 +123,31 @@ def test_empty_string_root_rejected():
         Config.from_dict({"host_read_roots": ["  "]})
 
 
+def test_guest_roots_must_be_absolute():
+    """Guest policy is purely lexical (the host never resolves guest fs
+    state), so a relative or drive-relative guest root would anchor the
+    boundary to a guest cwd the host cannot see — reject at load time."""
+    for bad in ("\\g-write", "g-write\\sub", "C:sub", "sub"):
+        with pytest.raises(ConfigError, match="absolute"):
+            Config.from_dict({"guest_write_roots": [bad]})
+        with pytest.raises(ConfigError, match="absolute"):
+            Config.from_dict({"guest_read_roots": [bad]})
+
+
+def test_absolute_guest_roots_accepted():
+    """Drive roots, drive-rooted paths, and UNC roots are all valid."""
+    for good in ("C:\\", "C:\\Windows\\Temp", "\\\\server\\share", "\\\\server\\share\\a"):
+        cfg = Config.from_dict({"guest_write_roots": [good]})
+        assert cfg.guest_write_roots == [good]
+
+
+def test_host_roots_may_stay_relative():
+    """Host axes resolve against host state, so the absolute-path rule is
+    guest-only — a relative host root must keep loading."""
+    cfg = Config.from_dict({"host_write_roots": ["relative\\dir"]})
+    assert cfg.host_write_roots == ["relative\\dir"]
+
+
 def test_ps_bounds_validated():
     with pytest.raises(ConfigError):
         Config.from_dict({"max_output_bytes": 10})
