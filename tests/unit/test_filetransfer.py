@@ -1,8 +1,8 @@
 """File transfer tests with mocked PowerShell: integrity, policy, validation."""
 
 import json
-import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -21,7 +21,13 @@ class FakePS:
 
     def __call__(self, script, **kwargs):
         self.scripts.append(script)
-        item = self.responses.pop(0) if self.responses else pswindows.PSResult(returncode=0)
+        # Exhaustion = failure: a silent ok here would mask a tool issuing
+        # more PowerShell runs than the test scripted responses for.
+        item = (
+            self.responses.pop(0)
+            if self.responses
+            else pswindows.PSResult(returncode=1, stderr="FakePS: fixture exhausted (no scripted response)")
+        )
         if isinstance(item, Exception):
             raise item
         return item
@@ -257,15 +263,20 @@ def test_guest_root_assertion_embedded_when_roots_set(monkeypatch, rooted_cfg):
 
 
 def test_timeout_mapping(monkeypatch, rooted_cfg, tmp_path):
+    """Timeout maps to the timeout class AND triggers the best-effort guest
+    staged-file cleanup the script's own catch could not run (PRR-008)."""
     src = tmp_path / "host-src" / "big.bin"
     src.write_bytes(b"x")
-    fake = FakePS([pswindows.PSResult(timed_out=True)])
+    fake = FakePS([pswindows.PSResult(timed_out=True), pswindows.PSResult(returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = filetransfer.guest_put(
         rooted_cfg, "test-vm", str(src), r"C:\g-write\big.bin",
         confirm=True, verify=False, cred=CRED,
     )
     assert out["error_class"] == "timeout" and out["ok"] is False
+    assert len(fake.scripts) == 2, "timeout must issue exactly one cleanup run"
+    cleanup = fake.scripts[1]
+    assert "Remove-Item" in cleanup and ".mcptmp" in cleanup
 
 
 # ---------------------------------------------------------------------------
@@ -291,15 +302,21 @@ def test_list_dir_policy_denial_maps_to_policy_class(monkeypatch, rooted_cfg):
 
 
 def test_failure_class_branches():
-    """Single classifier: integrity first, policy second, transport default."""
+    """Single classifier: integrity first, policy second, invalid destination,
+    transport default."""
     assert filetransfer._failure_class(
         "SHA-256 mismatch (staged copy differs from source)") == "integrity"
     assert filetransfer._failure_class(
         "policy: guest write denied (reparse point in path inside root)") == "policy"
+    assert filetransfer._failure_class(
+        "invalid destination: C:\\g-write\\dir is an existing directory") == "invalid"
     assert filetransfer._failure_class("Access is denied") == "transport"
     # precedence: integrity text wins even if a policy fragment co-occurs
     assert filetransfer._failure_class(
         "SHA-256 mismatch ... policy: ...") == "integrity"
+    # policy wins over invalid destination text
+    assert filetransfer._failure_class(
+        "policy: guest write denied (... invalid destination ...)") == "policy"
 
 
 def test_put_assertion_precedes_dir_creation(monkeypatch, rooted_cfg, tmp_path):
@@ -340,8 +357,7 @@ def test_get_assertion_precedes_copy_from_session(monkeypatch, rooted_cfg, tmp_p
     assert script.index(MARKER) < script.index("Copy-Item -FromSession")
 
 
-@pytest.mark.skipif(shutil.which("powershell") is None,
-                    reason="parse validity needs real PowerShell")
+@pytest.mark.skipif(sys.platform != "win32", reason="parse validity needs real Windows PowerShell")
 def test_put_get_scripts_parse_clean(monkeypatch, rooted_cfg, tmp_path):
     """Generated put/get scripts must parse under real PS 5.1's parser —
     mocked-subprocess unit tests happily accept scripts real PowerShell
@@ -427,3 +443,101 @@ def test_put_get_assert_wrappers_pin_terminating_erroraction(monkeypatch, rooted
         assert wrapper in script, (
             f"{label} assertion wrapper lost its terminating -ErrorAction Stop"
         )
+
+
+# ---------------------------------------------------------------------------
+# issue #6 feedback round: invalid-destination input, prune, timeout cleanup,
+# transport classification for read_file/list_dir, dest==root refusal
+# ---------------------------------------------------------------------------
+
+def test_get_local_directory_destination_rejected(monkeypatch, rooted_cfg, tmp_path):
+    """A directory destination is invalid input, rejected host-side before
+    any PowerShell runs — a staged file inside the directory would be a
+    silent orphan."""
+    d = tmp_path / "host-dst" / "somedir"
+    d.mkdir()
+    fake = FakePS([])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = filetransfer.guest_get(
+        rooted_cfg, "test-vm", r"C:\g-read\a.bin", str(d), cred=CRED,
+    )
+    assert out["ok"] is False and out["error_class"] == "invalid"
+    assert fake.scripts == []
+
+
+def test_put_container_check_classified_invalid_and_precedes_copy(monkeypatch, rooted_cfg, tmp_path):
+    """The in-guest container check runs BEFORE the copy (no staged file is
+    created inside the container) and its throw maps to error_class
+    "invalid", not transport."""
+    src = tmp_path / "host-src" / "a.bin"
+    src.write_bytes(b"x")
+    fake = FakePS([pswindows.PSResult(
+        returncode=1,
+        stderr="invalid destination: C:\\g-write\\dir is an existing directory")])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = filetransfer.guest_put(
+        rooted_cfg, "test-vm", str(src), r"C:\g-write\dir\a.bin",
+        confirm=True, verify=False, cred=CRED,
+    )
+    assert out["ok"] is False and out["error_class"] == "invalid"
+    script = fake.scripts[0]
+    assert "PathType Container" in script
+    assert script.index("PathType Container") < script.index("Copy-Item -ToSession")
+
+
+def test_get_denied_leaves_no_created_dirs(monkeypatch, rooted_cfg, tmp_path):
+    """Directories THIS call created are pruned when the transfer fails; a
+    pre-existing directory is never touched."""
+    dest = tmp_path / "host-dst" / "newdir" / "out.bin"
+    fake = FakePS([pswindows.PSResult(
+        returncode=1, stderr="policy: guest read denied (path outside configured roots)")])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = filetransfer.guest_get(
+        rooted_cfg, "test-vm", r"C:\g-read\a.bin", str(dest), cred=CRED,
+    )
+    assert out["error_class"] == "policy"
+    assert not (tmp_path / "host-dst" / "newdir").exists()
+    assert (tmp_path / "host-dst").exists()
+
+
+def test_get_timeout_removes_host_staged_file(monkeypatch, rooted_cfg, tmp_path):
+    """A host timeout kills the script before its own catch runs; the
+    Python side must still remove the host staged file."""
+    dest = tmp_path / "host-dst" / "out.bin"
+    staged = tmp_path / "host-dst" / "fixed.mcptmp"
+    monkeypatch.setattr(filetransfer, "_staging_path", lambda d: str(staged))
+    staged.write_bytes(b"partial")
+    fake = FakePS([pswindows.PSResult(timed_out=True)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = filetransfer.guest_get(
+        rooted_cfg, "test-vm", r"C:\g-read\a.bin", str(dest), verify=False, cred=CRED,
+    )
+    assert out["error_class"] == "timeout"
+    assert not staged.exists()
+
+
+def test_read_file_failure_defaults_to_transport(monkeypatch, rooted_cfg):
+    fake = FakePS([pswindows.PSResult(returncode=1, stderr="Access is denied")])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = filetransfer.guest_read_file(rooted_cfg, "test-vm", r"C:\g-read\f", cred=CRED)
+    assert out["ok"] is False and out["error_class"] == "transport"
+
+
+def test_list_dir_failure_defaults_to_transport(monkeypatch, rooted_cfg):
+    fake = FakePS([pswindows.PSResult(returncode=1, stderr="Access is denied")])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = filetransfer.guest_list_dir(rooted_cfg, "test-vm", r"C:\g-read", cred=CRED)
+    assert out["ok"] is False and out["error_class"] == "transport"
+
+
+def test_get_destination_equal_to_host_root_denied(monkeypatch, rooted_cfg, tmp_path):
+    """A host destination spelled exactly like a configured root is refused:
+    the staged sibling would land outside host_write_roots."""
+    fake = FakePS([])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(PolicyDenied, match="root"):
+        filetransfer.guest_get(
+            rooted_cfg, "test-vm", r"C:\g-read\a.bin",
+            str(tmp_path / "host-dst"), cred=CRED,
+        )
+    assert fake.scripts == []

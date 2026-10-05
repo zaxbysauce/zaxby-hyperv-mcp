@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ntpath
 import os
 from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar
@@ -159,9 +160,28 @@ class Config:
             for root in getattr(self, key):
                 if not isinstance(root, str) or not root.strip():
                     raise ConfigError(f"{key} entries must be non-empty strings")
+                if key.startswith("guest_"):
+                    self._require_absolute_guest_root(key, root)
         for pattern in self.allowed_vm_patterns:
             if not isinstance(pattern, str) or not pattern.strip():
                 raise ConfigError("allowed_vm_patterns entries must be non-empty strings")
+
+    @staticmethod
+    def _require_absolute_guest_root(key: str, root: str) -> None:
+        """Guest roots must be absolute Windows paths: drive+root or UNC.
+
+        Guest policy is purely lexical — the host never resolves guest
+        filesystem state — so a relative or drive-relative spelling
+        ("\\g-write", "C:sub") would anchor the boundary to a guest cwd the
+        host cannot see. Reject it loudly at load time instead.
+        """
+        drive, rest = ntpath.splitdrive(root)
+        if not drive:
+            raise ConfigError(f"{key} entries must be absolute Windows paths: {root!r}")
+        if drive.startswith("\\\\"):  # UNC: \\server\share
+            return
+        if rest[:1] not in ("\\", "/"):
+            raise ConfigError(f"{key} entries must be absolute Windows paths: {root!r}")
 
     # -- introspection ---------------------------------------------------
 

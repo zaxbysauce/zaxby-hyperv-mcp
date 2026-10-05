@@ -1,6 +1,6 @@
 r"""Path and VM-name policy enforcement for hyperv-mcp.
 
-Semantics (see plan.md "Policy defaults"):
+Semantics:
   - unrestricted=True          -> every check passes (research mode, loud warnings).
   - non-empty list configured  -> allowlist; deny by default.
   - empty list                 -> deny (nothing is configured = nothing allowed).

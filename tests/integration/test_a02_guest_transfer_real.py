@@ -10,9 +10,9 @@ guest-held junctions `C:\mcp-w\esc -> C:\Windows\Temp` and
 write junction and `guest_get` through the read junction must BOTH return
 `ok: false, error_class: "policy"`, leave no `a03.txt` (or staging file)
 under `C:\Windows\Temp`, and write no local file. This is the real-guest
-proof that in-guest assertion placement (before any side effect), `-ErrorAction
-Stop` termination, and policy classification compose end to end — mocked
-unit tests cannot exercise the `-Session` remoting leg.
+proof that in-guest assertion placement (before any in-guest side effect),
+`-ErrorAction Stop` termination, and policy classification compose end to
+end — mocked unit tests cannot exercise the `-Session` remoting leg.
 """
 
 import itertools
@@ -44,6 +44,10 @@ def _rooted_cfg(vm_name, it_tmp):
         verify_sha256=True,
     )
     cfg.destructive.guest_write = True
+    # The finally block restores a checkpoint; without the category switch
+    # that restore is denied and swallowed into the cleanup report, so the
+    # VM would keep test-created roots/junctions between runs.
+    cfg.destructive.checkpoint_restore = True
     cfg.destructive.require_confirm = False
     return cfg
 
@@ -60,9 +64,15 @@ def test_guest_junction_inside_root_is_denied(it, it_tmp):
         setup = guestexec.guest_run_ps(
             cfg,
             vm,
+            # Check each mklink's exit code: without it a first-junction
+            # failure would be masked by the second command's success.
+            # (No check after New-Item: $LASTEXITCODE there is stale/null
+            # and would exit the script prematurely.)
             "New-Item -ItemType Directory -Path 'C:\\mcp-w', 'C:\\mcp-r' -Force | Out-Null; "
             "cmd /c mklink /J C:\\mcp-w\\esc C:\\Windows\\Temp; "
-            "cmd /c mklink /J C:\\mcp-r\\esc C:\\Windows\\System32\\drivers\\etc",
+            "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; "
+            "cmd /c mklink /J C:\\mcp-r\\esc C:\\Windows\\System32\\drivers\\etc; "
+            "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
             cred=it.creds,
         )
         assert setup["ok"] and setup["exit_code"] == 0, setup
@@ -81,9 +91,11 @@ def test_guest_junction_inside_root_is_denied(it, it_tmp):
             cfg,
             vm,
             "$file = Test-Path -LiteralPath 'C:\\Windows\\Temp\\a03.txt'; "
+            # Staging names are uuid siblings (no destination-name prefix),
+            # so the orphan probe matches any *.mcptmp, not a03.txt*.
             "$staging = @(Get-ChildItem -LiteralPath 'C:\\Windows\\Temp' -File "
             "-ErrorAction SilentlyContinue | Where-Object { "
-            "$_.Name -like 'a03.txt*.mcptmp' }).Count; "
+            "$_.Name -like '*.mcptmp' }).Count; "
             "'{0}|{1}' -f $file, $staging",
             cred=it.creds,
         )
@@ -111,6 +123,57 @@ def test_guest_junction_inside_root_is_denied(it, it_tmp):
             )
         except Exception:  # noqa: BLE001 - restore below is the real cleanup
             pass
+        try:
+            lifecycle.checkpoint_restore(cfg, vm, checkpoint, confirm=True)
+        except Exception as exc:  # noqa: BLE001 - report, don't hide
+            with open("hyperv-it-cleanup-report.json", "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"unrestored_vm": vm, "checkpoint": checkpoint, "error": str(exc)},
+                    fh,
+                )
+
+
+def test_put_to_existing_directory_is_invalid(it, it_tmp):
+    """A directory destination must come back as error_class "invalid" —
+    classified by the in-guest container check BEFORE the copy, so no
+    staging file is ever created inside the container."""
+    from hyperv_mcp import filetransfer, guestexec, lifecycle
+
+    vm = it.vm
+    cfg = _rooted_cfg(vm, it_tmp)
+    checkpoint = f"{CHECKPOINT}-{next(_CHECKPOINT_SEQ)}"
+    lifecycle.checkpoint_create(cfg, vm, checkpoint)
+    try:
+        lifecycle.start_vm(cfg, vm)
+        setup = guestexec.guest_run_ps(
+            cfg,
+            vm,
+            "New-Item -ItemType Directory -Path 'C:\\mcp-w\\dir' -Force | Out-Null",
+            cred=it.creds,
+        )
+        assert setup["ok"] and setup["exit_code"] == 0, setup
+
+        src = it_tmp / "host-src" / "a04.txt"
+        src.write_text("into a directory destination")
+        put = filetransfer.guest_put(
+            cfg, vm, str(src), r"C:\mcp-w\dir",
+            confirm=True, verify=True, cred=it.creds,
+        )
+        assert put["ok"] is False and put["error_class"] == "invalid", put
+        assert "invalid destination" in put["error"], put
+
+        probe = guestexec.guest_run_ps(
+            cfg,
+            vm,
+            "$staging = @(Get-ChildItem -LiteralPath 'C:\\mcp-w\\dir' -File "
+            "-Recurse -ErrorAction SilentlyContinue | Where-Object { "
+            "$_.Name -like '*.mcptmp' }).Count; "
+            "'{0}' -f $staging",
+            cred=it.creds,
+        )
+        assert probe["ok"] and probe["exit_code"] == 0, probe
+        assert probe["stdout"].strip() == "0", probe
+    finally:
         try:
             lifecycle.checkpoint_restore(cfg, vm, checkpoint, confirm=True)
         except Exception as exc:  # noqa: BLE001 - report, don't hide

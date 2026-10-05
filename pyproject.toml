@@ -62,7 +62,7 @@ include = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests/unit"]
-addopts = "-q"
+addopts = "-q --import-mode=prepend"
 timeout = 120
 timeout_method = "thread"
 pythonpath = ["src"]

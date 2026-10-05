@@ -25,7 +25,13 @@ from hyperv_mcp.config import Config
 
 
 def test_realpath_authority_census(monkeypatch):
-    """Predicate 1: guest axes must never consult host realpath (host axis must)."""
+    """Predicate 1: guest axes must never consult host realpath (host axes must).
+
+    The check_* census is discovered from policy.py source, so a NEW policy
+    check added later fails here until it is classified below — an
+    unclassified axis must not silently inherit the wrong filesystem
+    authority.
+    """
     seam_calls = []
     real_realpath = os.path.realpath
 
@@ -35,50 +41,86 @@ def test_realpath_authority_census(monkeypatch):
 
     monkeypatch.setattr(policy.os.path, "realpath", spy)
 
+    host_root = os.path.abspath(os.getcwd())
     guest_cfg = Config(guest_read_roots=["C:\\g-read"], guest_write_roots=["C:\\g-write"])
+    host_cfg = Config(host_read_roots=[host_root], host_write_roots=[host_root])
+    probe = os.path.join(host_root, "guardrail-probe.bin")
+
+    guest_axes = {
+        "check_guest_read": (policy.check_guest_read, guest_cfg, r"C:\g-read\x.bin"),
+        "check_guest_write": (policy.check_guest_write, guest_cfg, r"C:\g-write\x.bin"),
+    }
+    host_axes = {
+        "check_host_read": (policy.check_host_read, host_cfg, probe),
+        "check_host_write": (policy.check_host_write, host_cfg, probe),
+    }
+
+    tree = ast.parse(Path(policy.__file__).read_text(encoding="utf-8"))
+    discovered = {
+        n.name
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("check_")
+    }
+    classified = set(guest_axes) | set(host_axes)
+    unclassified = discovered - classified
+    stale = classified - discovered
+    assert not unclassified, f"new policy check(s) not classified: {sorted(unclassified)}"
+    assert not stale, f"classified check(s) no longer exist: {sorted(stale)}"
+
     hit_axes = []
-    for name, check, path in (
-        ("check_guest_read", policy.check_guest_read, r"C:\g-read\x.bin"),
-        ("check_guest_write", policy.check_guest_write, r"C:\g-write\x.bin"),
-    ):
+    for name, (check, cfg, path) in guest_axes.items():
         seam_calls.clear()
         try:
-            check(guest_cfg, path)
+            check(cfg, path)
         except policy.PolicyDenied:
             pass
         if seam_calls:
             hit_axes.append(name)
     assert not hit_axes, f"guest axes consulting host realpath: {hit_axes}"
 
-    # Positive control: the host axis still resolves through realpath, so
+    # Positive control per host axis: realpath must still be consulted, so
     # "remove realpath everywhere" cannot satisfy this predicate.
-    host_root = os.path.abspath(os.getcwd())
-    host_cfg = Config(host_write_roots=[host_root])
-    seam_calls.clear()
-    policy.check_host_write(host_cfg, os.path.join(host_root, "guardrail-probe.bin"))
-    assert seam_calls, "host axis no longer consults realpath (positive control broken)"
+    for name, (check, cfg, path) in host_axes.items():
+        seam_calls.clear()
+        check(cfg, path)
+        assert seam_calls, f"host axis {name} no longer consults realpath (positive control broken)"
 
 
 def test_transport_literal_single_source():
-    """Predicate 2: the "transport" literal lives only inside _failure_class."""
+    """Predicate 2: exactly one "transport" string constant, inside _failure_class.
+
+    AST-based: a docstring that merely mentions transport cannot count, and
+    an implicit concatenation ("trans" "port"), which folds to the same
+    string at runtime, cannot slip past a raw text count.
+    """
     text = Path(filetransfer.__file__).read_text(encoding="utf-8")
-    count = text.count('"transport"') + text.count("'transport'")
-    assert count == 1, f'"transport" literal occurs {count} times; must be single-sourced'
     tree = ast.parse(text)
+    hits = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value == "transport"
+    ]
+    assert len(hits) == 1, f'"transport" string constant occurs {len(hits)} times; must be single-sourced'
     helper = next(
         (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_failure_class"),
         None,
     )
     assert helper is not None, "_failure_class helper missing"
-    pos = text.find('"transport"')
-    if pos < 0:
-        pos = text.find("'transport'")
-    line = text.count("\n", 0, pos) + 1
-    assert helper.lineno <= line <= helper.end_lineno, f'"transport" literal at line {line} outside _failure_class'
+    hit = hits[0]
+    assert helper.lineno <= hit.lineno <= helper.end_lineno, (
+        f'"transport" constant at line {hit.lineno} outside _failure_class'
+    )
 
 
 def test_staging_suffix_single_constructor():
-    """Predicate 3: every Load of _STAGING_SUFFIX occurs inside _staging_path only."""
+    """Predicate 3: staging names are built only inside _staging_path.
+
+    Pins the suffix VALUE (so a "harmless" rename cannot change the probe
+    glob contract), every Load of _STAGING_SUFFIX, and every string
+    constant containing the suffix marker — AST-based so implicit
+    concatenation counts too.
+    """
+    assert filetransfer._STAGING_SUFFIX == ".mcptmp"
     text = Path(filetransfer.__file__).read_text(encoding="utf-8")
     tree = ast.parse(text)
     loads = sorted(
@@ -95,6 +137,21 @@ def test_staging_suffix_single_constructor():
     outside = [ln for ln in loads if not (helper.lineno <= ln <= helper.end_lineno)]
     assert loads, "expected at least one Load of _STAGING_SUFFIX"
     assert not outside, f"_STAGING_SUFFIX loaded outside _staging_path at lines {outside}"
+
+    # Every string constant carrying the suffix marker must be the suffix
+    # definition itself or live inside _staging_path.
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str) and "mcptmp" in node.value):
+            continue
+        scope = node
+        while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.Assign)):
+            scope = parents.get(scope)
+        ok = scope is helper or (
+            isinstance(scope, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "_STAGING_SUFFIX" for t in scope.targets)
+        )
+        assert ok, f'staging-suffix constant {node.value!r} at line {node.lineno} outside _staging_path'
     # Plain-text cross-check: no destination + suffix construction outside the helper.
     helper_src = ast.get_source_segment(text, helper) or ""
     residual = text.replace(helper_src, "", 1)
@@ -103,8 +160,24 @@ def test_staging_suffix_single_constructor():
     )
 
 
+# Expected (outside, inside) assertion-marker counts per tool. put = (0, 2)
+# is load-bearing: initial assertion + re-walk immediately before Move-Item.
+EXPECTED_INSIDE = {
+    "guest_put": (0, 2),
+    "guest_get": (0, 1),
+    "guest_read_file": (0, 1),
+    "guest_list_dir": (0, 1),
+}
+
+
 def test_placement_census_all_four_tools(monkeypatch, tmp_path, rooted_cfg):  # noqa: F811
-    """Predicate 4: the root-assertion fragment sits inside a guest -ScriptBlock in all four tools."""
+    """Predicate 4: the root-assertion fragment sits inside a guest -ScriptBlock in every tool.
+
+    The census is expectation-driven (per-tool counts) and cross-checked
+    against the AST call sites of _guest_root_assertion: a fifth tool (or a
+    helper) that starts embedding the fragment fails here until it is
+    added to EXPECTED_INSIDE deliberately.
+    """
     cfg = rooted_cfg
     vm = "test-vm-a"
     placements = {}
@@ -148,5 +221,26 @@ def test_placement_census_all_four_tools(monkeypatch, tmp_path, rooted_cfg):  # 
     filetransfer.guest_list_dir(cfg, vm, r"C:\g-read", cred=CRED)
     placements["guest_list_dir"] = assertion_placement(fake.scripts[0])
 
-    bad = {name: plc for name, plc in placements.items() if plc != (0, 1)}
-    assert not bad, f"assertion placement violations (outside, inside): {bad}"
+    bad = {name: plc for name, plc in placements.items() if EXPECTED_INSIDE.get(name) != plc}
+    assert not bad, f"assertion placement violations (expected, got): {bad}"
+    assert set(placements) == set(EXPECTED_INSIDE), (
+        f"census tools drifted: missing {sorted(set(EXPECTED_INSIDE) - set(placements))}, "
+        f"unexpected {sorted(set(placements) - set(EXPECTED_INSIDE))}"
+    )
+
+    # AST cross-check: every _guest_root_assertion call site must live in a
+    # census tool — a new embedder cannot hide behind an unchanged census.
+    tree = ast.parse(Path(filetransfer.__file__).read_text(encoding="utf-8"))
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+    callers = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_guest_root_assertion":
+            scope = node
+            while scope is not None and not isinstance(scope, ast.FunctionDef):
+                scope = parents.get(scope)
+            assert scope is not None, "_guest_root_assertion call outside any function"
+            callers.add(scope.name)
+    assert callers == set(EXPECTED_INSIDE), (
+        f"_guest_root_assertion callers drifted: "
+        f"{sorted(callers ^ set(EXPECTED_INSIDE))}"
+    )

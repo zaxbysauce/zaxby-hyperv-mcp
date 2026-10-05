@@ -10,8 +10,8 @@ adapted from the issue trace's reproduction probe.
 import json
 import os
 import re
-import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -30,7 +30,13 @@ class FakePS:
 
     def __call__(self, script, **kwargs):
         self.scripts.append(script)
-        item = self.responses.pop(0) if self.responses else pswindows.PSResult(returncode=0)
+        # Exhaustion = failure: a silent ok here would mask a tool issuing
+        # more PowerShell runs than the test scripted responses for.
+        item = (
+            self.responses.pop(0)
+            if self.responses
+            else pswindows.PSResult(returncode=1, stderr="FakePS: fixture exhausted (no scripted response)")
+        )
         if isinstance(item, Exception):
             raise item
         return item
@@ -149,7 +155,15 @@ def test_put_root_assertion_runs_inside_guest(monkeypatch, rooted_cfg, tmp_path)
         verify=False,
         cred=CRED,
     )
-    assert assertion_placement(fake.scripts[0]) == (0, 1)
+    # put runs the assertion TWICE, both inside guest -ScriptBlocks: before
+    # dir creation/copy, and again immediately before the final Move-Item so
+    # the move re-checks the boundary after the staging window.
+    assert assertion_placement(fake.scripts[0]) == (0, 2)
+    script = fake.scripts[0]
+    markers = [m.start() for m in re.finditer(re.escape(MARKER), script)]
+    assert len(markers) == 2
+    move_at = script.index("Move-Item -LiteralPath")
+    assert markers[1] < move_at, "re-walk must precede the final Move-Item"
 
 
 def test_get_root_assertion_runs_inside_guest(monkeypatch, rooted_cfg, tmp_path):
@@ -236,6 +250,7 @@ def test_in_guest_policy_denial_maps_to_policy_class(monkeypatch, rooted_cfg, tm
         verify=False,
         cred=CRED,
     )
+    assert out["ok"] is False
     assert out["error_class"] == "policy"
 
 
@@ -252,7 +267,96 @@ def test_guest_axes_do_not_use_host_realpath(monkeypatch):
     assert _outcome(policy.check_guest_write, cfg, r"C:\elsewhere\x.bin") == "denied"
 
 
-@pytest.mark.skipif(shutil.which("cmd") is None, reason="junctions need cmd /c mklink /J")
+def test_put_destination_equal_to_root_denied(monkeypatch, rooted_cfg, tmp_path):
+    """A destination spelled exactly like a configured root is refused.
+
+    The staging sibling would land in dirname(dest) — at the root that is
+    OUTSIDE the boundary — so the transfer must fail before staging.
+    """
+    src = tmp_path / "host-src" / "a.bin"
+    src.write_bytes(b"x")
+    fake = FakePS([])  # denial must happen before any PowerShell runs
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(policy.PolicyDenied, match="root"):
+        filetransfer.guest_put(
+            rooted_cfg,
+            "test-vm-a",
+            str(src),
+            r"C:\g-write",
+            confirm=True,
+            verify=False,
+            cred=CRED,
+        )
+    assert fake.scripts == []
+
+
+def test_unrestricted_mode_skips_in_guest_assertion(monkeypatch, rooted_cfg, tmp_path):
+    """unrestricted=True disables host checks, so the guest assertion must
+    not contradict it by still denying host-allowed paths (policy.py:
+    'unrestricted=True -> every check passes')."""
+    cfg = rooted_cfg
+    cfg.unrestricted = True
+    src = tmp_path / "host-src" / "a.bin"
+    src.write_bytes(b"x")
+    payload = {
+        "ok": True,
+        "bytes_copied": 1,
+        "bytes_local": 1,
+        "bytes_remote": 1,
+        "sha256_local": None,
+        "sha256_remote": None,
+    }
+    fake = FakePS([pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    filetransfer.guest_put(
+        cfg,
+        "test-vm-a",
+        str(src),
+        r"C:\g-write\a.bin",
+        confirm=True,
+        verify=False,
+        cred=CRED,
+    )
+    assert MARKER not in fake.scripts[0]
+
+
+def test_put_staging_is_sibling_with_bounded_component(monkeypatch, rooted_cfg, tmp_path):
+    """Staging is a fixed-size uuid sibling of the destination directory.
+
+    Deriving the staging name from the full destination name would push a
+    legal 216-char component past NTFS's 255-char limit; the sibling name
+    must stay 39 chars (uuid4 hex 32 + suffix 7) no matter how long dest is.
+    """
+    src = tmp_path / "host-src" / "a.bin"
+    src.write_bytes(b"x")
+    dest = "C:\\g-write\\" + "d" * 216  # legal at base, overflows if suffixed
+    payload = {
+        "ok": True,
+        "bytes_copied": 1,
+        "bytes_local": 1,
+        "bytes_remote": 1,
+        "sha256_local": None,
+        "sha256_remote": None,
+    }
+    fake = FakePS([pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    filetransfer.guest_put(
+        rooted_cfg,
+        "test-vm-a",
+        str(src),
+        dest,
+        confirm=True,
+        verify=False,
+        cred=CRED,
+    )
+    staged = staged_destination(fake.scripts[0], "ToSession")
+    parent, name = os.path.split(staged)
+    assert parent == "C:\\g-write"
+    assert name.endswith(".mcptmp")
+    assert len(name) == 39, f"staging component must be uuid+suffix (39 chars), got {len(name)}"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="junction probes need Windows cmd mklink")
 def test_guest_axes_ignore_real_host_junction_windows(tmp_path):
     g_write = tmp_path / "g-write"
     g_write.mkdir()

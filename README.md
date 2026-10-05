@@ -171,11 +171,17 @@ every spawn. The knob exists for exotic 5.1 layouts; leave it `null` for
 PowerShell 7 hosts.
 
 **Path checks** canonicalize before comparing: `..` collapse, mixed
-separators, drive-relative rejection, `\\?\`/UNC prefixes, case-insensitive
-root comparison (drive roots like `C:\` are valid), and junction/symlink
-resolution of the existing path prefix (the guest re-checks authoritatively
-inside the VM). Guest roots are enforced host-side *and* re-asserted inside
-the guest (`[IO.Path]::GetFullPath`), failing closed.
+separators, drive-relative rejection, `\\?\`/UNC prefixes, and
+case-insensitive root comparison (drive roots like `C:\` are valid). Host
+axes additionally resolve junctions/symlinks of the existing path prefix.
+Guest axes are checked *purely lexically* against the path spelling — the
+host never consults guest filesystem state — so guest roots must be
+spelled exactly as they appear in the guest (8.3 short names, trailing
+dots/spaces, and other aliases are not normalized host-side). Guest paths
+are re-asserted inside the VM (`[IO.Path]::GetFullPath`, configured-root
+containment, and a reparse-point walk of every existing component strictly
+*below* the matched root — a reparse at or above the root is the
+operator's own spelling of the boundary), failing closed.
 
 **VM inventory is policy-filtered too**: `hyperv_list_vms` returns only VMs
 matching `allowed_vm_patterns` (and errors under the unconfigured deny-all
