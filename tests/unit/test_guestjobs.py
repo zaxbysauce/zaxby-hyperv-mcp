@@ -331,6 +331,34 @@ def test_stop_failure_keeps_entry_stoppable(monkeypatch):
     assert len(fake.scripts) == 3
 
 
+def test_repeat_stop_returns_full_result_contract(monkeypatch):
+    """Round-1 review follow-up: a repeat stop must carry every key a real
+    stop returns (observation fields as honest unknowns — this call observed
+    nothing), so a client written to the documented contract never hits a
+    missing key on the idempotent second call."""
+    cfg = Config(unrestricted=True)
+    fake = FakePS([
+        _start_ok(),
+        _ok({"stopped": True, "alive_pids": [], "job_dir_removed": True,
+             "pid_reused": False}),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    start = guestjobs.job_start(cfg, "test-vm", "x.exe", cred=CRED)
+    first = guestjobs.job_stop(cfg, start["job_id"])
+    assert first["ok"] is True
+    assert first["stopped"] is True
+    second = guestjobs.job_stop(cfg, start["job_id"])
+    assert second == {
+        "ok": True, "job_id": start["job_id"], "pid": 4242,
+        "stopped": True, "alive_pids": [], "job_dir_removed": None,
+        "pid_reused": False, "note": "was already stopped",
+    }
+    # The documented key set of a real stop is a subset of the repeat's.
+    assert set(first).issubset(set(second))
+    # The short-circuit must not reach the guest again.
+    assert len(fake.scripts) == 2
+
+
 def test_output_rejects_nonpositive_tail():
     """PRR-016b: tail_bytes < 1 must ValueError (guard precedes lookup)."""
     cfg = Config(unrestricted=True)
