@@ -187,3 +187,24 @@ def test_walk_anchored_at_matched_root_not_drive_root():
     )
     assert "$policyWalk" in fragment
     assert "$policyParts" not in fragment
+
+
+def test_failure_class_on_real_ps_stderr():
+    """PRR-038: classification must run on genuine PS 5.1 failure output,
+    not hand-written strings. The fragment runs UNWRAPPED (no try/catch),
+    so the terminating error travels the same rc/stderr path a real
+    transfer failure takes: a policy denial classifies as "policy" and an
+    unrelated throw as "transport" straight from stderr."""
+    pswindows.init(Config())
+    denied = filetransfer._guest_root_assertion(
+        "C:\\nope-elsewhere\\f.bin", ["C:\\g-read"], "read"
+    )
+    result = pswindows.run_ps(denied, timeout_s=60)
+    assert result.returncode != 0, f"denied fragment unexpectedly succeeded: {result.stdout!r}"
+    stderr = result.stderr or ""
+    assert stderr, "terminating policy error produced no stderr"
+    assert filetransfer._failure_class(stderr) == "policy"
+
+    failed = pswindows.run_ps("throw 'kaboom transport probe'", timeout_s=60)
+    assert failed.returncode != 0, f"throw unexpectedly succeeded: {failed.stdout!r}"
+    assert filetransfer._failure_class(failed.stderr or "") == "transport"
