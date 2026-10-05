@@ -371,18 +371,26 @@ reports the binding still present — and re-verifies every action, returning pe
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_guest_job_start` | `vm_name`, `command`, `args[]?`, `cwd?`, `timeout_ms=60000` | `{ok, job_id, vm_name, pid, job_dir, out_path, err_path, exit_path, started_at}` |
+| `hyperv_guest_job_start` | `vm_name`, `command`, `args[]?`, `cwd?`, `timeout_ms=60000` | `{ok, job_id, vm_name, pid, start_time_ticks, job_dir, out_path, err_path, exit_path, started_at}` |
 | `hyperv_guest_job_status` | `job_id` | `{ok, job_id, pid, status: running\|exited\|exiting\|stopped, process_name?, exit_code?}` |
 | `hyperv_guest_job_output` | `job_id`, `tail_bytes=65536` | `{ok, job_id, pid, tail_bytes, stdout, stderr, *_truncated, *_encoding, *_size}` |
-| `hyperv_guest_job_stop` | `job_id` | `{ok, job_id, pid, stopped}` |
+| `hyperv_guest_job_stop` | `job_id` | `{ok, job_id, pid, stopped, alive_pids, job_dir_removed, pid_reused}` |
 
-Start returns immediately with a job id bound to the exact guest PID (the
-wrapper records `$LASTEXITCODE` to a file, streams go to per-job logs under
+Start returns immediately with a job id bound to the exact guest PID and its
+start time (`start_time_ticks`; the wrapper records the command's observed
+outcome to a file — a native exit code, or 1 for a failed cmdlet or a
+command-not-found — and streams go to per-job logs under
 guest `%TEMP%\hyperv-mcp-job-<id>`), replacing scheduled-task and SSH-tunnel
- babysitting for long probes. Output reads are byte-tail bounded and
+babysitting for long probes. Output reads are byte-tail bounded and
 BOM-sniffed against the stream HEAD (PowerShell 5.1 `1>`/`2>` may write
-UTF-16LE; the reported `*_encoding` says which was used). Stop kills exactly
-that PID, removes the job dir, and drops the stored credentials. Non-elevated
+UTF-16LE; the reported `*_encoding` says which was used). Stop kills the
+recorded process AND its descendants, then reports what it observed: the job
+dir is removed and the stored credentials dropped only when nothing
+survived — a survivor comes back as `ok: false, stopped: false` with
+`alive_pids` and the job stays stoppable for a retry. The PID is
+re-validated against `start_time_ticks` first, so a reused PID belonging to
+an unrelated process is never killed (that returns `pid_reused: true`, and
+the already-gone job reports stopped). Non-elevated
 only (RunAs cannot redirect streams). The in-process registry is capped at
 128 active jobs (oldest stopped entries are evicted first; new starts are
 rejected once the cap is reached) and holds the start-time credentials until

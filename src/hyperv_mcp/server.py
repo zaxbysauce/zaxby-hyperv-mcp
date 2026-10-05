@@ -1346,12 +1346,13 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             username: str = "", password: str = "",
         ) -> dict:
             """Start a guest command as a managed job WITHOUT waiting.
-            Returns a job_id plus the guest PID and output-file paths; poll
-            with hyperv_guest_job_status, read with hyperv_guest_job_output,
-            stop exactly that PID with hyperv_guest_job_stop. Non-elevated
-            (elevated start cannot capture output).
+            Returns a job_id plus the guest PID, the process start time used
+            to identify it, and the output-file paths; poll with
+            hyperv_guest_job_status, read with hyperv_guest_job_output, stop
+            that process and its descendants with hyperv_guest_job_stop.
+            Non-elevated (elevated start cannot capture output).
 
-            Returns: {ok, job_id, vm_name, pid, job_dir, out_path, err_path, exit_path, started_at}.
+            Returns: {ok, job_id, vm_name, pid, start_time_ticks, job_dir, out_path, err_path, exit_path, started_at}.
             """
             return _run_guest_tool(
                 "hyperv_guest_job_start", vm_name, "exec",
@@ -1573,8 +1574,10 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         """Report a managed guest job: running / exited (with exit code) /
         exiting / stopped (`exiting` is not terminal: if the guest wrapper
         died before writing its exit-code file, status stays `exiting`
-        until hyperv_guest_job_stop is called). Addresses the host-side
-        job registry (credentials
+        until hyperv_guest_job_stop is called). A live process is only
+        reported `running` when its start time still matches the one
+        recorded at start (PID reuse falls through to exited/exiting).
+        Addresses the host-side job registry (credentials
         were stored at start time).
 
         Returns: {ok, job_id, pid, status[, exit_code, process_name]}.
@@ -1599,10 +1602,15 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
     @mcp.tool()
     def hyperv_guest_job_stop(job_id: str) -> dict:
-        """Stop exactly the guest PID of a managed job, remove its guest
-        temp directory, and release the stored credentials.
+        """Stop the guest process of a managed job and all of its descendants,
+        then report what was observed. The guest temp directory is removed
+        and the stored credentials released only when nothing survived;
+        otherwise the job stays stoppable for a retry (ok: false,
+        stopped: false, alive_pids lists the survivors). `pid_reused: true`
+        means the recorded process was already gone and the PID now belongs
+        to an unrelated process, which is never killed.
 
-        Returns: {ok, job_id, pid, stopped}.
+        Returns: {ok, job_id, pid, stopped, alive_pids, job_dir_removed, pid_reused}.
         """
         return _run_guest_tool(
             "hyperv_guest_job_stop", "", "exec",

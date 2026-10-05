@@ -32,7 +32,9 @@ from .credentials import CredentialSet
 _GRACE_S = 10
 
 _EXIT_PROPAGATION = (
-    "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 0 }"
+    "$ok = $?"
+    "\nif ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } "
+    "elseif ($ok) { exit 0 } else { exit 1 }"
 )
 
 
@@ -313,8 +315,14 @@ def guest_run(
         lines.append(f"try {{ Set-Location -LiteralPath {pswindows.ps_quote(cwd)} -ErrorAction Stop")
     lines.append(invoke)
     if cwd:
+        # The tail must sit INSIDE the try: outside it, `$ok = $?` would
+        # capture Pop-Location's success (always $true) and a failing command
+        # would still exit 0. `exit` inside a try still runs the finally
+        # block and preserves the code (verified on PS 5.1).
+        lines.append(_EXIT_PROPAGATION)
         lines.append("} finally { Pop-Location }")
-    lines.append(_EXIT_PROPAGATION)
+    else:
+        lines.append(_EXIT_PROPAGATION)
     with vmlocks.vm_lock(vm_name):
         return _run_inner(cfg, vm_name, "\n".join(lines), cred, timeout_ms, elevated)
 

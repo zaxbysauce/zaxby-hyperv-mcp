@@ -124,8 +124,10 @@ def _wrapper_script(command: str, args: list[str] | None, cwd: str) -> str:
         lines.append(f"Set-Location -LiteralPath {pswindows.ps_quote(cwd)} -ErrorAction SilentlyContinue")
     lines.append(f"& {cmd}{' ' + argv if argv else ''} 1> $outf 2> $errf")
     lines.append(
-        "if ($null -ne $LASTEXITCODE) { $LASTEXITCODE | Set-Content -LiteralPath $exitf } "
-        "else { 0 | Set-Content -LiteralPath $exitf }"
+        "$ok = $?\n"
+        "if ($null -ne $LASTEXITCODE) { $LASTEXITCODE | Set-Content -LiteralPath $exitf }\n"
+        "elseif ($ok) { 0 | Set-Content -LiteralPath $exitf }\n"
+        "else { 1 | Set-Content -LiteralPath $exitf }"
     )
     return "\n".join(lines)
 
@@ -148,13 +150,27 @@ $sp = @{{
     PassThru     = $true
 }}
 $p = Start-Process @sp
-[PSCustomObject]@{{ pid = $p.Id; job_dir = $dir }} | ConvertTo-Json -Compress
+$st = $null
+try {{ $st = $p.StartTime.ToUniversalTime().Ticks }} catch {{ $st = $null }}
+[PSCustomObject]@{{ pid = $p.Id; job_dir = $dir; start_time_ticks = $st }} | ConvertTo-Json -Compress
 """.strip()
 
 
-def _status_script(pid: int, exit_path: str) -> str:
+def _status_script(pid: int, exit_path: str, start_time_ticks: int | None = None) -> str:
+    """Observe the job process, pinned by start time when it was recorded.
+
+    A live PID whose start time differs from the recorded one belongs to a
+    different process (PID reuse), so it is treated as NOT this job and the
+    exit-file branch answers instead of reporting 'running'.
+    """
+    want = f"$want = {int(start_time_ticks)}" if start_time_ticks is not None else "$want = $null"
     return f"""
 $proc = Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue
+{want}
+if ($null -ne $proc -and $null -ne $want) {{
+    try {{ if ([long]$proc.StartTime.ToUniversalTime().Ticks -ne $want) {{ $proc = $null }} }}
+    catch {{ $proc = $null }}
+}}
 if ($null -ne $proc) {{
     [PSCustomObject]@{{ status = 'running'; process_name = $proc.ProcessName }} | ConvertTo-Json -Compress
 }} else {{
@@ -193,12 +209,70 @@ $r | ConvertTo-Json -Compress
 """.strip()
 
 
-def _stop_script(pid: int, job_dir: str) -> str:
+def _stop_script(pid: int, job_dir: str, start_time_ticks: int | None = None) -> str:
+    """Kill the job's recorded process AND its descendants, and report what
+    was actually observed.
+
+    Identity comes first: when a start time was recorded, a live PID whose
+    start time differs is a stranger's process, so nothing is killed and the
+    payload says `pid_reused` (StartTime is immutable for a PID's lifetime,
+    so a mismatch proves the recorded process is already gone). `stopped` is
+    true only when no member of the recorded tree survives, and the job
+    directory is removed only in that case (otherwise it stays for a retry).
+    """
+    want = f"$want = {int(start_time_ticks)}" if start_time_ticks is not None else "$want = $null"
+    pid_i = int(pid)
     return f"""
-Stop-Process -Id {int(pid)} -Force -ErrorAction SilentlyContinue
-$dir = {pswindows.ps_quote(job_dir)}
-if (Test-Path -LiteralPath $dir) {{ Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }}
-[PSCustomObject]@{{ stopped = $true }} | ConvertTo-Json -Compress
+$jobDir = {pswindows.ps_quote(job_dir)}
+{want}
+$ours = $true
+$p = Get-Process -Id {pid_i} -ErrorAction SilentlyContinue
+if ($null -ne $p) {{
+    if ($null -ne $want) {{
+        try {{ $ours = ([long]$p.StartTime.ToUniversalTime().Ticks -eq $want) }}
+        catch {{ $ours = $false }}
+    }}
+}}
+$stopped = $false
+$alive = @()
+$reused = $false
+if ($null -eq $p) {{
+    $stopped = $true
+}} elseif (-not $ours) {{
+    $stopped = $true
+    $reused = $true
+}} else {{
+    $all = @(Get-CimInstance -ClassName Win32_Process | Select-Object ProcessId, ParentProcessId)
+    $tree = New-Object 'System.Collections.Generic.List[int]'
+    $tree.Add({pid_i}) | Out-Null
+    $frontier = @({pid_i})
+    while ($frontier.Count -gt 0) {{
+        $next = @()
+        foreach ($pp in $frontier) {{
+            foreach ($proc in $all) {{
+                if ($proc.ParentProcessId -eq $pp -and -not $tree.Contains([int]$proc.ProcessId)) {{
+                    $tree.Add([int]$proc.ProcessId) | Out-Null
+                    $next += [int]$proc.ProcessId
+                }}
+            }}
+        }}
+        $frontier = $next
+    }}
+    & taskkill /PID {pid_i} /T /F 2>$null | Out-Null
+    Stop-Process -Id {pid_i} -Force -ErrorAction SilentlyContinue
+    foreach ($t in $tree) {{
+        if ($null -ne (Get-Process -Id $t -ErrorAction SilentlyContinue)) {{ $alive += $t }}
+    }}
+    if ($alive.Count -eq 0) {{ $stopped = $true }}
+}}
+$removed = $false
+if ($stopped) {{
+    if (Test-Path -LiteralPath $jobDir) {{
+        Remove-Item -LiteralPath $jobDir -Recurse -Force -ErrorAction SilentlyContinue
+    }}
+    $removed = -not (Test-Path -LiteralPath $jobDir)
+}}
+[pscustomobject]@{{ stopped = $stopped; alive_pids = @($alive); job_dir_removed = $removed; pid_reused = $reused }} | ConvertTo-Json -Compress
 """.strip()
 
 
@@ -257,10 +331,19 @@ def job_start(
         _release_slot(job_id)
         raise RuntimeError("guest job start returned no pid")
     job_dir = str(outcome.get("job_dir") or "")
+    # Start time identifies the process behind the PID: without it a later
+    # stop could kill an unrelated process that reused the PID. A missing or
+    # non-numeric value degrades to the legacy PID-only path (no false pin).
+    raw_ticks = outcome.get("start_time_ticks")
+    try:
+        start_time_ticks: int | None = int(raw_ticks) if raw_ticks is not None else None
+    except (TypeError, ValueError):
+        start_time_ticks = None
     entry: dict[str, Any] = {
         "job_id": job_id,
         "vm_name": vm_name,
         "pid": pid,
+        "start_time_ticks": start_time_ticks,
         "command": command,
         "args": list(args or []),
         "job_dir": job_dir,
@@ -282,6 +365,7 @@ def job_start(
         "err_path": entry["err_path"],
         "exit_path": entry["exit_path"],
         "started_at": entry["started_at"],
+        "start_time_ticks": entry["start_time_ticks"],
     }
 
 
@@ -293,7 +377,9 @@ def job_status(cfg: Config, job_id: str) -> dict:
     if cred is None:
         raise RuntimeError(f"job {job_id} has no stored credentials (stopped or evicted)")
     outcome = run_guest_inner(
-        cfg, entry["vm_name"], _status_script(entry["pid"], entry["exit_path"]), cred,
+        cfg, entry["vm_name"],
+        _status_script(entry["pid"], entry["exit_path"], entry.get("start_time_ticks")),
+        cred,
     )
     return {
         "ok": True,
@@ -332,13 +418,16 @@ def job_output(cfg: Config, job_id: str, *, tail_bytes: int = 65536) -> dict:
 
 
 def job_stop(cfg: Config, job_id: str) -> dict:
-    """Stop exactly this job's guest PID and release its credentials.
+    """Stop this job's guest process and its descendants, reporting what
+    actually happened.
 
-    The registry entry flips to stopped (and the stored credential is
-    nulled) ONLY when the guest kill leg succeeds — a failed stop keeps the
-    entry stoppable so a retry can reach the guest again (review round 1,
-    finding 12); the tool never reports stopped for a process it could not
-    kill.
+    The guest leg observes the kill instead of asserting it: the result is
+    honored verbatim, so a survivor (or an unreadable process) is reported
+    as `stopped: false` with `ok: false` and the entry stays stoppable with
+    its credential retained for a retry (review round 1, finding 12). The
+    registry entry flips to stopped and the credential is nulled only when
+    the guest reported the tree gone; the tool never reports stopped for a
+    process it could not kill.
     """
     entry = _lookup(job_id)
     if entry.get("stopped"):
@@ -350,8 +439,10 @@ def job_stop(cfg: Config, job_id: str) -> dict:
     if cred is None:
         raise RuntimeError(f"job {job_id} has no stored credentials (evicted)")
     try:
-        run_guest_inner(
-            cfg, entry["vm_name"], _stop_script(entry["pid"], entry["job_dir"]), cred,
+        outcome = run_guest_inner(
+            cfg, entry["vm_name"],
+            _stop_script(entry["pid"], entry["job_dir"], entry.get("start_time_ticks")),
+            cred,
         )
     except Exception as exc:
         return {
@@ -362,15 +453,26 @@ def job_stop(cfg: Config, job_id: str) -> dict:
             "error": pswindows.redact(str(exc)),
             "error_class": "transport",
         }
-    # Registry bookkeeping (registry lock only, outside any vm_lock).
-    with _jobs_lock:
-        current = _jobs.get(job_id)
-        if current is not None:
-            current["stopped"] = True
-            current["cred"] = None
+    # The guest payload is the truth. A legacy single-key response
+    # ({"stopped": true}) leaves the observation fields as honest unknowns.
+    raw_alive = outcome.get("alive_pids")
+    alive_pids = [int(p) for p in raw_alive] if isinstance(raw_alive, list) else []
+    # Survivors win over a contradictory `stopped: true`.
+    stopped = bool(outcome.get("stopped")) and not alive_pids
+    job_dir_removed = outcome.get("job_dir_removed")
+    if stopped:
+        # Registry bookkeeping (registry lock only, outside any vm_lock).
+        with _jobs_lock:
+            current = _jobs.get(job_id)
+            if current is not None:
+                current["stopped"] = True
+                current["cred"] = None
     return {
-        "ok": True,
+        "ok": stopped,
         "job_id": job_id,
         "pid": entry["pid"],
-        "stopped": True,
+        "stopped": stopped,
+        "alive_pids": alive_pids,
+        "job_dir_removed": job_dir_removed,
+        "pid_reused": bool(outcome.get("pid_reused")),
     }
