@@ -1346,12 +1346,20 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             username: str = "", password: str = "",
         ) -> dict:
             """Start a guest command as a managed job WITHOUT waiting.
-            Returns a job_id plus the guest PID and output-file paths; poll
-            with hyperv_guest_job_status, read with hyperv_guest_job_output,
-            stop exactly that PID with hyperv_guest_job_stop. Non-elevated
-            (elevated start cannot capture output).
+            Returns a job_id plus the guest PID, the process start time used
+            to identify it, and the output-file paths; poll with
+            hyperv_guest_job_status, read with hyperv_guest_job_output, stop
+            that process and its descendants with hyperv_guest_job_stop
+            (descendants are killed even when the wrapper already exited).
+            The wrapper records the observed outcome — a native exit code,
+            or 1 for a failed cmdlet / command-not-found; caveat: a .ps1
+            target whose final statement is a failed cmdlet without an
+            explicit exit records the last code the script set (0 when it
+            never set one), because PS 5.1 does not propagate a failed
+            callee across the script boundary.
+            Non-elevated (elevated start cannot capture output).
 
-            Returns: {ok, job_id, vm_name, pid, job_dir, out_path, err_path, exit_path, started_at}.
+            Returns: {ok, job_id, vm_name, pid, start_time_ticks, job_dir, out_path, err_path, exit_path, started_at}.
             """
             return _run_guest_tool(
                 "hyperv_guest_job_start", vm_name, "exec",
@@ -1480,13 +1488,21 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             cwd: str = "", timeout_ms: int = 60000,
         ) -> dict:
             """Start a guest command as a managed job WITHOUT waiting.
-            Returns a job_id plus the guest PID and output-file paths; poll
-            with hyperv_guest_job_status, read with hyperv_guest_job_output,
-            stop exactly that PID with hyperv_guest_job_stop. Non-elevated
-            (elevated start cannot capture output). Credentials from
+            Returns a job_id plus the guest PID, the process start time used
+            to identify it, and the output-file paths; poll with
+            hyperv_guest_job_status, read with hyperv_guest_job_output, stop
+            that process and its descendants with hyperv_guest_job_stop
+            (descendants are killed even when the wrapper already exited).
+            The wrapper records the observed outcome — a native exit code,
+            or 1 for a failed cmdlet / command-not-found; caveat: a .ps1
+            target whose final statement is a failed cmdlet without an
+            explicit exit records the last code the script set (0 when it
+            never set one), because PS 5.1 does not propagate a failed
+            callee across the script boundary.
+            Non-elevated (elevated start cannot capture output). Credentials from
             environment only.
 
-            Returns: {ok, job_id, vm_name, pid, job_dir, out_path, err_path, exit_path, started_at}.
+            Returns: {ok, job_id, vm_name, pid, start_time_ticks, job_dir, out_path, err_path, exit_path, started_at}.
             """
             return _run_guest_tool(
                 "hyperv_guest_job_start", vm_name, "exec",
@@ -1573,8 +1589,10 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         """Report a managed guest job: running / exited (with exit code) /
         exiting / stopped (`exiting` is not terminal: if the guest wrapper
         died before writing its exit-code file, status stays `exiting`
-        until hyperv_guest_job_stop is called). Addresses the host-side
-        job registry (credentials
+        until hyperv_guest_job_stop is called). A live process is only
+        reported `running` when its start time still matches the one
+        recorded at start (PID reuse falls through to exited/exiting).
+        Addresses the host-side job registry (credentials
         were stored at start time).
 
         Returns: {ok, job_id, pid, status[, exit_code, process_name]}.
@@ -1599,10 +1617,24 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
     @mcp.tool()
     def hyperv_guest_job_stop(job_id: str) -> dict:
-        """Stop exactly the guest PID of a managed job, remove its guest
-        temp directory, and release the stored credentials.
+        """Stop the guest process of a managed job and all of its descendants,
+        then report what was observed. Descendants are enumerated and killed
+        EVEN when the wrapper has already exited (an orphaned child keeps
+        the dead recorded PID as its Win32_Process parent, so the walk still
+        finds it); `stopped` is true only when no member of the recorded
+        tree was observed alive afterward. The guest temp directory is
+        removed and the stored credentials released only when nothing
+        survived; otherwise the job stays stoppable for a retry
+        (ok: false, stopped: false, alive_pids lists the survivors, and the
+        retry re-walks and re-kills whatever survived). The result carries
+        the same key set on every path; a transport failure adds
+        error/error_class with stopped: false. `pid_reused: true`
+        means the recorded process was already gone and the PID now belongs
+        to an unrelated process, which is never killed (an unreadable
+        start time is an unknown, not a mismatch — nothing is killed and
+        pid_reused stays false).
 
-        Returns: {ok, job_id, pid, stopped}.
+        Returns: {ok, job_id, pid, stopped, alive_pids, job_dir_removed, pid_reused}.
         """
         return _run_guest_tool(
             "hyperv_guest_job_stop", "", "exec",

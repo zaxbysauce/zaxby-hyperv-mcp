@@ -31,8 +31,18 @@ from .credentials import CredentialSet
 
 _GRACE_S = 10
 
+# Emitted immediately BEFORE the user's command/script invoke in every sync
+# builder (PRR-003 / CUB-7): $LASTEXITCODE survives later cmdlets, so a stale
+# code set before the invoke could mask the invoke's own failure in the
+# LE-first tail below. With the reset, any code the tail sees was set by the
+# invoked command itself. The tail keeps LE-first precedence: a native exit
+# N still propagates N; a failing cmdlet with no code exits 1.
+_LE_RESET = "$global:LASTEXITCODE = $null"
+
 _EXIT_PROPAGATION = (
-    "if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 0 }"
+    "$ok = $?"
+    "\nif ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } "
+    "elseif ($ok) { exit 0 } else { exit 1 }"
 )
 
 
@@ -281,7 +291,7 @@ def guest_run_ps(
     if elevated:
         policy.require_destructive(cfg, "elevated_exec", confirm, f"run an elevated script on '{vm_name}'")
     with vmlocks.vm_lock(vm_name):
-        inner = f"{script}\n{_EXIT_PROPAGATION}"
+        inner = f"{_LE_RESET}\n{script}\n{_EXIT_PROPAGATION}"
         return _run_inner(cfg, vm_name, inner, cred, timeout_ms, elevated)
 
 
@@ -311,10 +321,19 @@ def guest_run(
     if cwd:
         lines.append("Push-Location")
         lines.append(f"try {{ Set-Location -LiteralPath {pswindows.ps_quote(cwd)} -ErrorAction Stop")
+    # Reset stale $LASTEXITCODE AFTER the optional Set-Location and
+    # immediately BEFORE the invoke (see _LE_RESET).
+    lines.append(_LE_RESET)
     lines.append(invoke)
     if cwd:
+        # The tail must sit INSIDE the try: outside it, `$ok = $?` would
+        # capture Pop-Location's success (always $true) and a failing command
+        # would still exit 0. `exit` inside a try still runs the finally
+        # block and preserves the code (verified on PS 5.1).
+        lines.append(_EXIT_PROPAGATION)
         lines.append("} finally { Pop-Location }")
-    lines.append(_EXIT_PROPAGATION)
+    else:
+        lines.append(_EXIT_PROPAGATION)
     with vmlocks.vm_lock(vm_name):
         return _run_inner(cfg, vm_name, "\n".join(lines), cred, timeout_ms, elevated)
 
@@ -333,7 +352,7 @@ def victim_run_ps(
         raise ValueError("vm_name and script are required")
     policy.vm_allowed(cfg, vm_name)
     with vmlocks.vm_lock(vm_name):
-        inner = f"{script}\n{_EXIT_PROPAGATION}"
+        inner = f"{_LE_RESET}\n{script}\n{_EXIT_PROPAGATION}"
         return _run_inner(cfg, vm_name, inner, cred, timeout_ms, elevated=False)
 
 
