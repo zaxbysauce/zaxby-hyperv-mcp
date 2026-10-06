@@ -122,6 +122,10 @@ def _wrapper_script(command: str, args: list[str] | None, cwd: str) -> str:
     ]
     if cwd:
         lines.append(f"Set-Location -LiteralPath {pswindows.ps_quote(cwd)} -ErrorAction SilentlyContinue")
+    # Reset any stale $LASTEXITCODE from the preamble so the tail can never
+    # mistake an earlier code for this command's outcome (PRR-003/CUB-7):
+    # placed immediately BEFORE the invoke, after the optional Set-Location.
+    lines.append("$global:LASTEXITCODE = $null")
     lines.append(f"& {cmd}{' ' + argv if argv else ''} 1> $outf 2> $errf")
     lines.append(
         "$ok = $?\n"
@@ -215,10 +219,16 @@ def _stop_script(pid: int, job_dir: str, start_time_ticks: int | None = None) ->
 
     Identity comes first: when a start time was recorded, a live PID whose
     start time differs is a stranger's process, so nothing is killed and the
-    payload says `pid_reused` (StartTime is immutable for a PID's lifetime,
-    so a mismatch proves the recorded process is already gone). `stopped` is
-    true only when no member of the recorded tree survives, and the job
-    directory is removed only in that case (otherwise it stays for a retry).
+    payload says `pid_reused` (a mismatch is strong evidence the recorded
+    process is already gone — StartTime is immutable for a live PID's
+    lifetime; an UNREADABLE start time is an unknown, not a mismatch, and
+    never reports `pid_reused`). `stopped` is true only when no member of
+    the recorded tree (wrapper or descendants) is observed alive afterward,
+    and the job directory is removed only in that case (otherwise it stays
+    for a retry). Descendants are enumerated and killed EVEN WHEN the
+    wrapper has already exited: an orphaned child keeps the dead recorded
+    PID as its Win32_Process ParentProcessId, so the parent-chain walk from
+    the recorded PID still finds it.
     """
     want = f"$want = {int(start_time_ticks)}" if start_time_ticks is not None else "$want = $null"
     pid_i = int(pid)
@@ -226,21 +236,20 @@ def _stop_script(pid: int, job_dir: str, start_time_ticks: int | None = None) ->
 $jobDir = {pswindows.ps_quote(job_dir)}
 {want}
 $ours = $true
+$readFailed = $false
 $p = Get-Process -Id {pid_i} -ErrorAction SilentlyContinue
 if ($null -ne $p) {{
     if ($null -ne $want) {{
         try {{ $ours = ([long]$p.StartTime.ToUniversalTime().Ticks -eq $want) }}
-        catch {{ $ours = $false }}
+        catch {{ $ours = $false; $readFailed = $true }}
     }}
 }}
 $stopped = $false
 $alive = @()
 $reused = $false
-if ($null -eq $p) {{
+if ($null -ne $p -and -not $ours) {{
+    if (-not $readFailed) {{ $reused = $true }}
     $stopped = $true
-}} elseif (-not $ours) {{
-    $stopped = $true
-    $reused = $true
 }} else {{
     $all = @(Get-CimInstance -ClassName Win32_Process | Select-Object ProcessId, ParentProcessId)
     $tree = New-Object 'System.Collections.Generic.List[int]'
@@ -260,6 +269,10 @@ if ($null -eq $p) {{
     }}
     & taskkill /PID {pid_i} /T /F 2>$null | Out-Null
     Stop-Process -Id {pid_i} -Force -ErrorAction SilentlyContinue
+    foreach ($t in $tree) {{
+        & taskkill /PID $t /T /F 2>$null | Out-Null
+        Stop-Process -Id $t -Force -ErrorAction SilentlyContinue
+    }}
     foreach ($t in $tree) {{
         if ($null -ne (Get-Process -Id $t -ErrorAction SilentlyContinue)) {{ $alive += $t }}
     }}
@@ -332,12 +345,14 @@ def job_start(
         raise RuntimeError("guest job start returned no pid")
     job_dir = str(outcome.get("job_dir") or "")
     # Start time identifies the process behind the PID: without it a later
-    # stop could kill an unrelated process that reused the PID. A missing or
-    # non-numeric value degrades to the legacy PID-only path (no false pin).
+    # stop could kill an unrelated process that reused the PID. A missing,
+    # non-numeric, or overflowing value (e.g. a JSON inf) degrades to the
+    # legacy PID-only path (no false pin) instead of stranding the reserved
+    # slot (PRR-015).
     raw_ticks = outcome.get("start_time_ticks")
     try:
         start_time_ticks: int | None = int(raw_ticks) if raw_ticks is not None else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         start_time_ticks = None
     entry: dict[str, Any] = {
         "job_id": job_id,
@@ -424,16 +439,24 @@ def job_stop(cfg: Config, job_id: str) -> dict:
     The guest leg observes the kill instead of asserting it: the result is
     honored verbatim, so a survivor (or an unreadable process) is reported
     as `stopped: false` with `ok: false` and the entry stays stoppable with
-    its credential retained for a retry (review round 1, finding 12). The
-    registry entry flips to stopped and the credential is nulled only when
-    the guest reported the tree gone; the tool never reports stopped for a
-    process it could not kill.
+    its credential retained for a retry (review round 1, finding 12).
+    Descendants are enumerated and killed even when the wrapper has already
+    exited (an orphaned child keeps the dead recorded PID as its
+    ParentProcessId, so the walk still finds it); `stopped` is true only
+    when no member of the recorded tree was observed alive afterward, which
+    is strong evidence the tree is gone (StartTime-based identity aside).
+    The registry entry flips to stopped and the credential is nulled only
+    when the guest reported the tree gone; the tool never reports stopped
+    for a process it could not kill. The documented key set holds on every
+    path — success, survivor, repeat, and transport-error alike (an error
+    adds `error`/`error_class` with `stopped: false`).
     """
     entry = _lookup(job_id)
     if entry.get("stopped"):
         # Same key set as a real stop, so a client written to the documented
-        # contract never hits a missing key on a repeat call. The observation
-        # fields are honest unknowns: this call observed nothing.
+        # contract never hits a missing key on a repeat call. These are the
+        # documented repeat-contract constants (this call observed nothing
+        # new), not fresh observations.
         return {
             "ok": True, "job_id": job_id, "pid": entry["pid"],
             "stopped": True, "alive_pids": [], "job_dir_removed": None,
@@ -449,18 +472,31 @@ def job_stop(cfg: Config, job_id: str) -> dict:
             cred,
         )
     except Exception as exc:
+        # Same documented key set as a successful stop plus the error pair,
+        # so the 7-key contract holds on the error path too (PRR-004); the
+        # entry stays stoppable and the credential retained for a retry.
         return {
-            "ok": False,
-            "job_id": job_id,
-            "pid": entry["pid"],
-            "stopped": False,
-            "error": pswindows.redact(str(exc)),
-            "error_class": "transport",
+            "ok": False, "job_id": job_id, "pid": entry["pid"],
+            "stopped": False, "alive_pids": [], "job_dir_removed": None,
+            "pid_reused": False,
+            "error": pswindows.redact(str(exc)), "error_class": "transport",
         }
     # The guest payload is the truth. A legacy single-key response
     # ({"stopped": true}) leaves the observation fields as honest unknowns.
     raw_alive = outcome.get("alive_pids")
-    alive_pids = [int(p) for p in raw_alive] if isinstance(raw_alive, list) else []
+    try:
+        alive_pids = [int(p) for p in raw_alive] if isinstance(raw_alive, list) else []
+    except (TypeError, ValueError):
+        # A malformed survivor list must not raise out of the kill leg's
+        # aftermath (PRR-016): report the same full-key error envelope with
+        # error_class "invalid"; the entry stays stoppable for a retry.
+        return {
+            "ok": False, "job_id": job_id, "pid": entry["pid"],
+            "stopped": False, "alive_pids": [], "job_dir_removed": None,
+            "pid_reused": False,
+            "error": "guest stop payload carried a non-numeric alive_pids member",
+            "error_class": "invalid",
+        }
     # Survivors win over a contradictory `stopped: true`.
     stopped = bool(outcome.get("stopped")) and not alive_pids
     job_dir_removed = outcome.get("job_dir_removed")

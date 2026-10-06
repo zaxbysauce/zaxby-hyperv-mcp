@@ -374,23 +374,41 @@ reports the binding still present — and re-verifies every action, returning pe
 | `hyperv_guest_job_start` | `vm_name`, `command`, `args[]?`, `cwd?`, `timeout_ms=60000` | `{ok, job_id, vm_name, pid, start_time_ticks, job_dir, out_path, err_path, exit_path, started_at}` |
 | `hyperv_guest_job_status` | `job_id` | `{ok, job_id, pid, status: running\|exited\|exiting\|stopped, process_name?, exit_code?}` |
 | `hyperv_guest_job_output` | `job_id`, `tail_bytes=65536` | `{ok, job_id, pid, tail_bytes, stdout, stderr, *_truncated, *_encoding, *_size}` |
-| `hyperv_guest_job_stop` | `job_id` | `{ok, job_id, pid, stopped, alive_pids, job_dir_removed, pid_reused}` |
+| `hyperv_guest_job_stop` | `job_id` | `{ok, job_id, pid, stopped, alive_pids, job_dir_removed, pid_reused}` (same key set on every path; a failure adds `error`/`error_class` with `stopped: false`; a repeat stop adds `note: "was already stopped"`) |
 
 Start returns immediately with a job id bound to the exact guest PID and its
-start time (`start_time_ticks`; the wrapper records the command's observed
-outcome to a file — a native exit code, or 1 for a failed cmdlet or a
-command-not-found — and streams go to per-job logs under
-guest `%TEMP%\hyperv-mcp-job-<id>`), replacing scheduled-task and SSH-tunnel
-babysitting for long probes. Output reads are byte-tail bounded and
+start time (`start_time_ticks`; the wrapper resets `$LASTEXITCODE` to null
+immediately before invoking the command so a stale code can never mask the
+command's own outcome, then records the observed result to a file — a native
+exit code, or 1 for a failed cmdlet or a command-not-found — and streams go
+to per-job logs under guest `%TEMP%\hyperv-mcp-job-<id>`), replacing
+scheduled-task and SSH-tunnel babysitting for long probes. Known
+PowerShell-5.1 limit, stated precisely: when the target is a `.ps1` script
+the wrapper invokes it as a script callee, so a FAILED FINAL CMDLET inside
+it does not propagate `$? = false` across the callee boundary — the wrapper
+records the last exit code the script set (0 when it never set one), not 1;
+a `.ps1` that wants a truthful code must end with an explicit `exit`.
+Output reads are byte-tail bounded and
 BOM-sniffed against the stream HEAD (PowerShell 5.1 `1>`/`2>` may write
 UTF-16LE; the reported `*_encoding` says which was used). Stop kills the
-recorded process AND its descendants, then reports what it observed: the job
-dir is removed and the stored credentials dropped only when nothing
-survived — a survivor comes back as `ok: false, stopped: false` with
-`alive_pids` and the job stays stoppable for a retry. The PID is
+recorded process AND its descendants, then reports what it observed:
+descendants are enumerated and killed EVEN WHEN the wrapper has already
+exited (an orphaned child keeps the dead recorded PID as its
+`Win32_Process` parent, so the parent-chain walk from the recorded PID
+still finds it), and `stopped` is true only when no member of the recorded
+tree was observed alive afterward — the job dir is removed and the stored
+credentials dropped only in that case; otherwise a survivor comes back as
+`ok: false, stopped: false` with `alive_pids` and the job stays stoppable
+for a retry (the retry re-walks and re-kills whatever survived). The stop
+result carries the same key set on every path — success, survivor, repeat
+stop (`note: "was already stopped"`, observation fields as honest
+unknowns), and transport failure (which adds `error`/`error_class` with
+`stopped: false`). The PID is
 re-validated against `start_time_ticks` first, so a reused PID belonging to
-an unrelated process is never killed (that returns `pid_reused: true`, and
-the already-gone job reports stopped). Non-elevated
+an unrelated process is never killed (a confirmed start-time mismatch
+returns `pid_reused: true`, and the already-gone job reports stopped; an
+UNREADABLE start time is an unknown, not a mismatch — nothing is killed
+and `pid_reused` stays false). Non-elevated
 only (RunAs cannot redirect streams). The in-process registry is capped at
 128 active jobs (oldest stopped entries are evicted first; new starts are
 rejected once the cap is reached) and holds the start-time credentials until

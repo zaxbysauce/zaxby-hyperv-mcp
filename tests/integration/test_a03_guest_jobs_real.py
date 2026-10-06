@@ -8,9 +8,13 @@ with the conftest reason, and AC8/AC9 are recorded as not-run in
 02-reproduction.md (the issue sanctions that).
 
 AC8 (tree kill): start a job whose target is a long-lived native child
-(`ping.exe -n 600 127.0.0.1`), prove the child is really alive, then stop the
-job and require that no ping.exe descendant survives, the job directory is
-gone, and the stop reports `stopped: true, job_dir_removed: true`.
+(`ping.exe -n 600 127.0.0.1`), prove the job's own descendant is really
+alive (a Win32_Process parent-chain walk from the recorded wrapper pid —
+NOT a guest-wide ping census, which both false-fails on unrelated
+processes and could pass without this job's tree being killed), then stop
+the job and require that no descendant of this job survives, the job
+directory is gone, and the stop reports `stopped: true, job_dir_removed:
+true`.
 
 AC9 (exit-code truthfulness): run the three jobs the pre-fix wrapper
 mislabelled, and require the recorded codes to be truthful — a failing
@@ -54,17 +58,42 @@ def _wait_for_status(cfg, it, job_id: str, wanted: set[str], timeout_s: int = 60
     return last
 
 
-def _guest_ping_pids(cfg, it) -> list[int]:
-    """PIDs of every live ping.exe in the guest, via a PS Direct leg."""
+def _guest_job_tree(cfg, it, root_pid: int) -> tuple[bool, list[int]]:
+    """Observe the JOB'S OWN tree in the guest, not every process of that
+    name: (root alive?, descendant pids) via a Win32_Process parent-chain
+    walk from the recorded wrapper pid (PRR-011 / CUB-4 — a guest-wide
+    census both false-fails on unrelated processes and can pass without
+    this job's tree being killed)."""
     result = guestexec.guest_run_ps(
         cfg, it.vm,
-        "$p = @(Get-Process -Name ping -ErrorAction SilentlyContinue | "
-        "Select-Object -ExpandProperty Id)\n"
-        "[PSCustomObject]@{ pids = $p } | ConvertTo-Json -Compress",
+        f"$root = {int(root_pid)}\n"
+        "$all = @(Get-CimInstance -ClassName Win32_Process | "
+        "Select-Object ProcessId, ParentProcessId)\n"
+        "$kids = New-Object 'System.Collections.Generic.List[int]'\n"
+        "$frontier = @($root)\n"
+        "while ($frontier.Count -gt 0) {\n"
+        "    $next = @()\n"
+        "    foreach ($pp in $frontier) {\n"
+        "        foreach ($proc in $all) {\n"
+        "            if ($proc.ParentProcessId -eq $pp -and -not $kids.Contains([int]$proc.ProcessId)) {\n"
+        "                $kids.Add([int]$proc.ProcessId) | Out-Null\n"
+        "                $next += [int]$proc.ProcessId\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "    $frontier = $next\n"
+        "}\n"
+        "$rootAlive = [bool](Get-Process -Id $root -ErrorAction SilentlyContinue)\n"
+        "[PSCustomObject]@{ root_alive = $rootAlive; descendants = @($kids) } "
+        "| ConvertTo-Json -Compress",
         cred=it.creds,
     )
-    assert result.get("ok") is True, f"ping probe leg failed: {result}"
-    return [int(p) for p in json.loads(str(result.get("stdout") or "{}")).get("pids") or []]
+    assert result.get("ok") is True, f"tree probe leg failed: {result}"
+    payload = json.loads(str(result.get("stdout") or "{}"))
+    return (
+        bool(payload.get("root_alive")),
+        [int(p) for p in payload.get("descendants") or []],
+    )
 
 
 def _stop_quietly(cfg, job_id: str) -> None:
@@ -76,7 +105,7 @@ def _stop_quietly(cfg, job_id: str) -> None:
 
 
 def test_ac8_stop_kills_the_descendant_tree(it):
-    """AC8: stopping the job leaves no ping.exe descendant alive."""
+    """AC8: stopping the job leaves no descendant of THIS job alive."""
     cfg = it.cfg
     started = guestjobs.job_start(cfg, it.vm, "ping.exe", _PING_ARGS, cred=it.creds)
     job_id = started["job_id"]
@@ -87,15 +116,17 @@ def test_ac8_stop_kills_the_descendant_tree(it):
             f"job_start did not record a start time: {started}"
         )
 
-        # The child must be observably alive before the stop, otherwise the
-        # check would pass trivially.
+        # The job's own descendant (the ping child) must be observably alive
+        # before the stop, otherwise the check would pass trivially.
         deadline = time.monotonic() + 60
-        alive_before: list[int] = []
-        while time.monotonic() < deadline and not alive_before:
-            alive_before = _guest_ping_pids(cfg, it)
-            if not alive_before:
-                time.sleep(1.0)
-        assert alive_before, "the job's ping.exe child never became visible in the guest"
+        root_alive, descendants = _guest_job_tree(cfg, it, started["pid"])
+        while time.monotonic() < deadline and not descendants:
+            time.sleep(1.0)
+            root_alive, descendants = _guest_job_tree(cfg, it, started["pid"])
+        assert root_alive and descendants, (
+            "the job's wrapper/descendant tree never became visible in the guest "
+            f"(root_alive={root_alive}, descendants={descendants})"
+        )
 
         stop = guestjobs.job_stop(cfg, job_id)
         assert stop.get("stopped") is True, f"stop must report the tree killed: {stop}"
@@ -106,14 +137,24 @@ def test_ac8_stop_kills_the_descendant_tree(it):
         )
         assert stop.get("pid_reused") is False, f"the recorded process was not reused: {stop}"
 
-        # Independent of the stop payload: no ping.exe may remain.
+        # Independent of the stop payload: this job's descendants (observed
+        # alive before the stop) must be gone, and so must the wrapper.
+        seen_descendants = set(descendants)
         deadline = time.monotonic() + 30
-        after: list[int] = list(alive_before)
-        while time.monotonic() < deadline and after:
-            after = _guest_ping_pids(cfg, it)
-            if after:
-                time.sleep(1.0)
-        assert after == [], f"ping.exe descendants survived the stop: {after}"
+        root_alive, after = _guest_job_tree(cfg, it, started["pid"])
+        while time.monotonic() < deadline and (after or root_alive):
+            if seen_descendants & set(after):
+                break  # a specific descendant survived: fail now, no retry
+            time.sleep(1.0)
+            root_alive, after = _guest_job_tree(cfg, it, started["pid"])
+        assert not (seen_descendants & set(after)), (
+            f"this job's descendants {sorted(seen_descendants & set(after))} "
+            f"survived the stop: {after}"
+        )
+        assert not root_alive and after == [], (
+            f"the job tree (wrapper or descendants) survived the stop: "
+            f"root_alive={root_alive}, descendants={after}"
+        )
     finally:
         _stop_quietly(cfg, job_id)
 

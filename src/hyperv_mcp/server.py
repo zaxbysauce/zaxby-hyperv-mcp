@@ -1349,7 +1349,14 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             Returns a job_id plus the guest PID, the process start time used
             to identify it, and the output-file paths; poll with
             hyperv_guest_job_status, read with hyperv_guest_job_output, stop
-            that process and its descendants with hyperv_guest_job_stop.
+            that process and its descendants with hyperv_guest_job_stop
+            (descendants are killed even when the wrapper already exited).
+            The wrapper records the observed outcome — a native exit code,
+            or 1 for a failed cmdlet / command-not-found; caveat: a .ps1
+            target whose final statement is a failed cmdlet without an
+            explicit exit records the last code the script set (0 when it
+            never set one), because PS 5.1 does not propagate a failed
+            callee across the script boundary.
             Non-elevated (elevated start cannot capture output).
 
             Returns: {ok, job_id, vm_name, pid, start_time_ticks, job_dir, out_path, err_path, exit_path, started_at}.
@@ -1484,7 +1491,14 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             Returns a job_id plus the guest PID, the process start time used
             to identify it, and the output-file paths; poll with
             hyperv_guest_job_status, read with hyperv_guest_job_output, stop
-            that process and its descendants with hyperv_guest_job_stop.
+            that process and its descendants with hyperv_guest_job_stop
+            (descendants are killed even when the wrapper already exited).
+            The wrapper records the observed outcome — a native exit code,
+            or 1 for a failed cmdlet / command-not-found; caveat: a .ps1
+            target whose final statement is a failed cmdlet without an
+            explicit exit records the last code the script set (0 when it
+            never set one), because PS 5.1 does not propagate a failed
+            callee across the script boundary.
             Non-elevated (elevated start cannot capture output). Credentials from
             environment only.
 
@@ -1604,12 +1618,21 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
     @mcp.tool()
     def hyperv_guest_job_stop(job_id: str) -> dict:
         """Stop the guest process of a managed job and all of its descendants,
-        then report what was observed. The guest temp directory is removed
-        and the stored credentials released only when nothing survived;
-        otherwise the job stays stoppable for a retry (ok: false,
-        stopped: false, alive_pids lists the survivors). `pid_reused: true`
+        then report what was observed. Descendants are enumerated and killed
+        EVEN when the wrapper has already exited (an orphaned child keeps
+        the dead recorded PID as its Win32_Process parent, so the walk still
+        finds it); `stopped` is true only when no member of the recorded
+        tree was observed alive afterward. The guest temp directory is
+        removed and the stored credentials released only when nothing
+        survived; otherwise the job stays stoppable for a retry
+        (ok: false, stopped: false, alive_pids lists the survivors, and the
+        retry re-walks and re-kills whatever survived). The result carries
+        the same key set on every path; a transport failure adds
+        error/error_class with stopped: false. `pid_reused: true`
         means the recorded process was already gone and the PID now belongs
-        to an unrelated process, which is never killed.
+        to an unrelated process, which is never killed (an unreadable
+        start time is an unknown, not a mismatch — nothing is killed and
+        pid_reused stays false).
 
         Returns: {ok, job_id, pid, stopped, alive_pids, job_dir_removed, pid_reused}.
         """
