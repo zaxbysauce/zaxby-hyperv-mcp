@@ -40,10 +40,10 @@ import json
 import os
 from uuid import uuid4
 
-from . import policy, pswindows, vmlocks
+from . import policy, pswindows, vmident, vmlocks
 from .config import Config
 from .credentials import CredentialSet
-from .guestexec import psdirect_prefix, psdirect_vm_target
+from .guestexec import psdirect_prefix, vm_target_preamble
 
 _STAGING_SUFFIX = ".mcptmp"
 
@@ -200,10 +200,11 @@ def _deny_root_destination(cfg: Config, cp: policy.CanonicalPath, key: str, cate
             raise policy.PolicyDenied(category, "destination equals a configured root")
 
 
-def _session_body(cred: CredentialSet, vm_name: str, script_body: str) -> str:
+def _session_body(cred: CredentialSet, vm_id: str, script_body: str) -> str:
+    """GUID-native session wrapper: $vmTarget preamble, no name resolution."""
     return f"""
 {psdirect_prefix(cred)}
-{psdirect_vm_target(vm_name)}
+{vm_target_preamble(vm_id)}
 $s = New-PSSession -VMId $vmTarget -Credential $cred -ErrorAction Stop
 try {{
 {script_body}
@@ -213,19 +214,19 @@ try {{
 """
 
 
-def _cleanup_guest_staged(vm_name: str, staged_raw: str, cred: CredentialSet) -> None:
+def _cleanup_guest_staged(vm_id: str, staged_raw: str, cred: CredentialSet) -> None:
     """Best-effort removal of a guest staged file after a host timeout.
 
     The timeout kill terminates the transfer script before its own catch
     cleanup runs; this follow-up gets a short timeout and its result is
     ignored — a guest that stays unreachable keeps the staged file (see
-    the module docstring).
+    the module docstring). Addressed by the pre-resolved GUID.
     """
     try:
         pswindows.run_ps(
             _session_body(
                 cred,
-                vm_name,
+                vm_id,
                 "Remove-Item -LiteralPath "
                 + pswindows.ps_quote(staged_raw)
                 + " -Force -ErrorAction SilentlyContinue",
@@ -267,9 +268,9 @@ def _cleanup_failed_get(staged_raw: str, created_dirs: list[str]) -> None:
             pass
 
 
-def _run_transfer(cfg: Config, vm_name: str, body: str, cred: CredentialSet, timeout_s: int = 300) -> dict:
+def _run_transfer(cfg: Config, vm_id: str, body: str, cred: CredentialSet, timeout_s: int = 300) -> dict:
     result = pswindows.run_ps(
-        _session_body(cred, vm_name, body).strip(),
+        _session_body(cred, vm_id, body).strip(),
         timeout_s=timeout_s,
         stdin_b64=pswindows.utf8_b64(cred.password),
     )
@@ -286,25 +287,29 @@ def _run_transfer(cfg: Config, vm_name: str, body: str, cred: CredentialSet, tim
 
 def guest_put(
     cfg: Config,
-    vm_name: str,
-    local_path: str,
-    remote_path: str,
+    vm_name: str = "",
+    local_path: str = "",
+    remote_path: str = "",
     *,
     confirm: bool = False,
     verify: bool | None = None,
     cred: CredentialSet | None = None,
+    vm_id: str = "",
 ) -> dict:
-    if not vm_name or not local_path or not remote_path:
-        raise ValueError("vm_name, local_path, and remote_path are required")
+    if (not vm_name and not vm_id) or not local_path or not remote_path:
+        raise ValueError("vm_name (or vm_id), local_path, and remote_path are required")
     if cred is None:
         raise ValueError("guest credentials are required")
-    policy.vm_allowed(cfg, vm_name)
     policy.check_host_read(cfg, local_path)
     cpw = policy.check_guest_write(cfg, remote_path)
     _deny_root_destination(cfg, cpw, "guest_write_roots", "guest write")
-    policy.require_destructive(cfg, "guest_write", confirm, f"write '{remote_path}' on '{vm_name}'")
+    policy.require_destructive(cfg, "guest_write", confirm, f"write '{remote_path}' on '{vm_name or vm_id}'")
     if not os.path.isfile(local_path):
         return {"ok": False, "error": f"local source not found: {local_path}", "error_class": "not_found"}
+    # Resolve AFTER the cheap host-side input/policy checks (no PowerShell
+    # spawns on bad input) and BEFORE the lock: the lock key and the acted-on
+    # VM are then the same identity even mid-rename.
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
 
     do_verify = cfg.verify_sha256 if verify is None else verify
     # One canonical spelling drives the copy destination AND the assertion:
@@ -383,27 +388,27 @@ def guest_put(
         sha256_remote = $shaRemote
     }} | ConvertTo-Json -Compress
 """
-    with vmlocks.vm_lock(vm_name):
-        result = _run_transfer(cfg, vm_name, body, cred)
+    with vmlocks.vm_lock(ref.id):
+        result = _run_transfer(cfg, ref.id, body, cred)
         if result.get("error_class") == "timeout":
-            _cleanup_guest_staged(vm_name, staged_raw, cred)
+            _cleanup_guest_staged(ref.id, staged_raw, cred)
     return result
 
 
 def guest_get(
     cfg: Config,
-    vm_name: str,
-    remote_path: str,
-    local_path: str,
+    vm_name: str = "",
+    remote_path: str = "",
+    local_path: str = "",
     *,
     verify: bool | None = None,
     cred: CredentialSet | None = None,
+    vm_id: str = "",
 ) -> dict:
-    if not vm_name or not remote_path or not local_path:
-        raise ValueError("vm_name, remote_path, and local_path are required")
+    if (not vm_name and not vm_id) or not remote_path or not local_path:
+        raise ValueError("vm_name (or vm_id), remote_path, and local_path are required")
     if cred is None:
         raise ValueError("guest credentials are required")
-    policy.vm_allowed(cfg, vm_name)
     cpr = policy.check_guest_read(cfg, remote_path)
     local_abs = os.path.abspath(local_path)
     hcp = policy.check_host_write(cfg, local_abs)
@@ -472,9 +477,10 @@ def guest_get(
         sha256_remote = $shaRemote
     }} | ConvertTo-Json -Compress
 """
-    with vmlocks.vm_lock(vm_name):
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    with vmlocks.vm_lock(ref.id):
         try:
-            result = _run_transfer(cfg, vm_name, body, cred)
+            result = _run_transfer(cfg, ref.id, body, cred)
         except Exception:
             _cleanup_failed_get(staged_raw, created_dirs)
             raise
@@ -485,24 +491,25 @@ def guest_get(
 
 def guest_read_file(
     cfg: Config,
-    vm_name: str,
-    remote_path: str,
+    vm_name: str = "",
+    remote_path: str = "",
     max_bytes: int = 256 * 1024,
     *,
     cred: CredentialSet | None = None,
+    vm_id: str = "",
 ) -> dict:
-    if not vm_name or not remote_path:
-        raise ValueError("vm_name and remote_path are required")
+    if (not vm_name and not vm_id) or not remote_path:
+        raise ValueError("vm_name (or vm_id) and remote_path are required")
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1:
         raise ValueError("max_bytes must be an integer >= 1")
     if cred is None:
         raise ValueError("guest credentials are required")
-    policy.vm_allowed(cfg, vm_name)
     cpr = policy.check_guest_read(cfg, remote_path)
     remote = cpr.normalized
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     body = f"""
 {psdirect_prefix(cred)}
-{psdirect_vm_target(vm_name)}
+{vm_target_preamble(ref.id)}
 $r = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{
     param($path, $maxb)
     {_guest_root_assertion(remote, _effective_guest_roots(cfg, 'guest_read_roots'), 'read').strip()}
@@ -526,7 +533,7 @@ $r = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptB
 }} -ArgumentList {pswindows.ps_quote(remote)}, {int(max_bytes)}
 $r | ConvertTo-Json -Compress
 """
-    with vmlocks.vm_lock(vm_name):
+    with vmlocks.vm_lock(ref.id):
         result = pswindows.run_ps(
             body.strip(), timeout_s=120, stdin_b64=pswindows.utf8_b64(cred.password)
         )
@@ -551,21 +558,22 @@ $r | ConvertTo-Json -Compress
 
 def guest_list_dir(
     cfg: Config,
-    vm_name: str,
-    remote_path: str,
+    vm_name: str = "",
+    remote_path: str = "",
     *,
     cred: CredentialSet | None = None,
+    vm_id: str = "",
 ) -> dict:
-    if not vm_name or not remote_path:
-        raise ValueError("vm_name and remote_path are required")
+    if (not vm_name and not vm_id) or not remote_path:
+        raise ValueError("vm_name (or vm_id) and remote_path are required")
     if cred is None:
         raise ValueError("guest credentials are required")
-    policy.vm_allowed(cfg, vm_name)
     cpr = policy.check_guest_read(cfg, remote_path)
     remote = cpr.normalized
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     body = f"""
 {psdirect_prefix(cred)}
-{psdirect_vm_target(vm_name)}
+{vm_target_preamble(ref.id)}
 $items = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{
     param($path)
     {_guest_root_assertion(remote, _effective_guest_roots(cfg, 'guest_read_roots'), 'read').strip()}
@@ -580,7 +588,7 @@ $items = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -Scr
 }} -ArgumentList {pswindows.ps_quote(remote)}
 if ($items) {{ @($items) | ConvertTo-Json -Compress }} else {{ '[]' }}
 """
-    with vmlocks.vm_lock(vm_name):
+    with vmlocks.vm_lock(ref.id):
         result = pswindows.run_ps(
             body.strip(), timeout_s=60, stdin_b64=pswindows.utf8_b64(cred.password)
         )

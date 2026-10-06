@@ -41,12 +41,26 @@ def _base_meta():
     }
 
 
+VM_GUID = "e953c649-1234-5678-9abc-def012345678"
+
+
 @pytest.fixture()
 def fake_screenshot(monkeypatch):
-    def _capture(cfg, vm_name, width=1024, height=768, save_path=""):
+    captured = {}
+
+    def _capture(cfg, vm_name, width=1024, height=768, save_path="", vm_id=""):
+        captured["vm_name"] = vm_name
+        captured["vm_id"] = vm_id
         return FakeImage(), _base_meta()
 
     monkeypatch.setattr(evidence.console, "screenshot", _capture)
+    # capture_evidence resolves the target first (vmident by-name leg) —
+    # serve it so no real PowerShell spawns in tests.
+    monkeypatch.setattr(
+        pswindows, "run_ps",
+        lambda script, **kw: pswindows.PSResult(stdout=VM_GUID, returncode=0),
+    )
+    _capture.captured = captured
     return _capture
 
 
@@ -69,6 +83,10 @@ def test_screenshot_only_path_needs_no_credentials(fake_screenshot):
     assert meta["width"] == 1024 and meta["height"] == 768
     assert len(meta["frame_hash"]) == 64
     assert meta["ui_tree"] == {"requested": False}
+    # issue #8: the screenshot leg receives the SAME resolved GUID the UIA
+    # leg would use — one identity for the whole bundle.
+    assert fake_screenshot.captured["vm_id"] == VM_GUID
+    assert fake_screenshot.captured["vm_name"] == "test-vm"
 
 
 def test_ui_tree_without_credentials_raises(fake_screenshot):

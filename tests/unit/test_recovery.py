@@ -34,6 +34,14 @@ def _ok(payload):
     return pswindows.PSResult(stdout=json.dumps(payload), returncode=0)
 
 
+VM_GUID = "e953c649-1234-5678-9abc-def012345678"
+
+
+def _guid_result():
+    """Canned by-name resolution leg response (stdout = the VM GUID)."""
+    return pswindows.PSResult(stdout=VM_GUID, returncode=0)
+
+
 # -- recovery (wait_guest_recovery) ----------------------------------------
 
 
@@ -44,7 +52,7 @@ def test_recovery_wait_loop_and_verification(monkeypatch):
         "services": [{"name": "sshd", "present": True, "status": "Running", "ok": True}],
         "processes": [{"name": "cdpclient", "present": False, "ok": False}],
     }
-    fake = FakePS([_ok(payload)])
+    fake = FakePS([_guid_result(), _ok(payload)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = diagnostics.wait_guest_recovery(
         cfg, "test-vm", services=["sshd"], processes=["cdpclient"],
@@ -53,17 +61,21 @@ def test_recovery_wait_loop_and_verification(monkeypatch):
     assert out["ok"] is False
     assert out["failures"] == ["process:cdpclient"]
     assert out["ps_direct"]["attempts"] == 2
-    script = fake.scripts[0]
+    script = fake.scripts[1]
     assert "AddSeconds(30)" in script
     assert "Start-Sleep" in script
     assert "Invoke-Command -VMId $vmTarget" in script
-    assert "Msvm_ComputerSystem" in script
+    # issue #8: the wait script addresses the pre-resolved GUID (preamble),
+    # while the name resolver lives only in the standalone first leg.
+    assert f"$vmTarget = '{VM_GUID}'" in script
+    assert "Msvm_ComputerSystem" in fake.scripts[0]
+    assert "Msvm_ComputerSystem" not in script
 
 
 def test_recovery_ps_direct_never_available(monkeypatch):
     cfg = Config(unrestricted=True)
     payload = {"ps_direct": {"available": False, "attempts": 10, "error": "no"}}
-    fake = FakePS([_ok(payload)])
+    fake = FakePS([_guid_result(), _ok(payload)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = diagnostics.wait_guest_recovery(cfg, "test-vm", timeout_s=5, interval_s=1, cred=CRED)
     assert out["ok"] is False
@@ -74,7 +86,7 @@ def test_recovery_ps_direct_never_available(monkeypatch):
 def test_recovery_wait_only_mode(monkeypatch):
     cfg = Config(unrestricted=True)
     payload = {"ps_direct": {"available": True, "attempts": 1, "error": ""}}
-    fake = FakePS([_ok(payload)])
+    fake = FakePS([_guid_result(), _ok(payload)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = diagnostics.wait_guest_recovery(cfg, "test-vm", timeout_s=5, interval_s=1, cred=CRED)
     assert out["ok"] is True
@@ -89,7 +101,7 @@ def test_recovery_single_service_object_is_normalized(monkeypatch):
         "services": {"name": "sshd", "present": True, "status": "Running", "ok": True},
         "processes": {"name": "x", "present": True, "ok": True},
     }
-    fake = FakePS([_ok(payload)])
+    fake = FakePS([_guid_result(), _ok(payload)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = diagnostics.wait_guest_recovery(
         cfg, "test-vm", services=["sshd"], processes=["x"], cred=CRED,
@@ -110,7 +122,7 @@ def test_recovery_policy_denied_before_ps(monkeypatch):
 
 def test_recovery_timeout_envelope(monkeypatch):
     cfg = Config(unrestricted=True)
-    fake = FakePS([pswindows.PSResult(stdout="", returncode=None, timed_out=True)])
+    fake = FakePS([_guid_result(), pswindows.PSResult(stdout="", returncode=None, timed_out=True)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = diagnostics.wait_guest_recovery(cfg, "test-vm", timeout_s=5, interval_s=1, cred=CRED)
     assert out["ok"] is False
@@ -126,7 +138,7 @@ def test_recovery_service_failure_listed(monkeypatch):
         "services": [{"name": "sshd", "present": True, "status": "Stopped", "ok": False}],
         "processes": [],
     }
-    fake = FakePS([_ok(payload)])
+    fake = FakePS([_guid_result(), _ok(payload)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = diagnostics.wait_guest_recovery(cfg, "test-vm", services=["sshd"], cred=CRED)
     assert out["ok"] is False

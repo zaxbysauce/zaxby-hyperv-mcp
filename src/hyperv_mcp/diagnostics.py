@@ -19,9 +19,8 @@ from __future__ import annotations
 import json
 import math
 from datetime import datetime, timezone
-from typing import Any
 
-from . import guestexec, policy, pswindows
+from . import guestexec, pswindows, vmident
 from .config import Config
 from .credentials import CredentialSet
 from .vmlocks import vm_lock
@@ -43,9 +42,11 @@ def _err(cfg: Config, error: str, error_class: str) -> dict:
 # -- host leg (no credentials) -------------------------------------------
 
 
-def _host_leg_script(vm_name: str) -> str:
+def _host_leg_script(vm_id: str) -> str:
+    """GUID-native: opens with the validated $vmTarget preamble (the caller
+    resolved the identity via vmident; no name resolution inside)."""
     return f"""
-{guestexec.psdirect_vm_target(vm_name)}
+{guestexec.vm_target_preamble(vm_id)}
 $vm = Get-VM -Id $vmTarget -ErrorAction Stop
 $up = if ($vm.Uptime) {{ [int][math]::Floor($vm.Uptime.TotalSeconds) }} else {{ 0 }}
 [PSCustomObject]@{{
@@ -58,10 +59,10 @@ $up = if ($vm.Uptime) {{ [int][math]::Floor($vm.Uptime.TotalSeconds) }} else {{ 
 """.strip()
 
 
-def _run_host_leg(cfg: Config, vm_name: str) -> dict:
-    result = pswindows.run_ps(_host_leg_script(vm_name), timeout_s=90)
+def _run_host_leg(cfg: Config, vm_id: str) -> dict:
+    result = pswindows.run_ps(_host_leg_script(vm_id), timeout_s=90)
     if result.timed_out:
-        raise RuntimeError(f"host leg timed out for '{vm_name}'")
+        raise RuntimeError(f"host leg timed out for '{vm_id}'")
     pswindows.check_result(result)
     payload = json.loads(result.stdout.strip() or "{}")
     if not isinstance(payload, dict) or "state" not in payload:
@@ -165,10 +166,11 @@ $r | ConvertTo-Json -Compress -Depth 6
 """
 
 
-def _guest_leg_script(vm_name: str, inner_script: str, cred: CredentialSet) -> str:
+def _guest_leg_script(vm_id: str, inner_script: str, cred: CredentialSet) -> str:
+    """GUID-native PS Direct wrapper: $vmTarget preamble + Invoke-Command -VMId."""
     return f"""
 {guestexec.psdirect_prefix(cred)}
-{guestexec.psdirect_vm_target(vm_name)}
+{guestexec.vm_target_preamble(vm_id)}
 $enc = '{pswindows.utf8_b64(inner_script)}'
 $out = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{
     param($enc)
@@ -181,13 +183,13 @@ $out
 """.strip()
 
 
-def _run_guest_probe(cfg: Config, vm_name: str, cred: CredentialSet, timeout_ms: int) -> dict:
+def _run_guest_probe(cfg: Config, vm_id: str, cred: CredentialSet, timeout_ms: int) -> dict:
     """One PS Direct probe leg. Returns the parsed section dict or raises."""
     timeout_s = max(30, timeout_ms // 1000 + guestexec._GRACE_S)
-    script = _guest_leg_script(vm_name, _GUEST_PROBE_SCRIPT, cred)
+    script = _guest_leg_script(vm_id, _GUEST_PROBE_SCRIPT, cred)
     result = pswindows.run_ps(script, timeout_s=timeout_s, stdin_b64=pswindows.utf8_b64(cred.password))
     if result.timed_out:
-        raise TimeoutError(f"guest probe timed out for '{vm_name}'")
+        raise TimeoutError(f"guest probe timed out for '{vm_id}'")
     pswindows.check_result(result)
     payload = json.loads(result.stdout.strip() or "{}")
     if not isinstance(payload, dict):
@@ -315,35 +317,43 @@ def _findings(_vm: dict, guest: dict | None) -> list[dict]:
     return out
 
 
-def build_guest_script(vm_name: str, inner_script: str, cred: CredentialSet) -> str:
+def build_guest_script(vm_id: str, inner_script: str, cred: CredentialSet) -> str:
     """Host PS wrapper (PS Direct) around an inner guest script, no lock.
+
+    GUID-native: the target arrives pre-resolved (vmident); the script opens
+    with the validated $vmTarget preamble and never resolves a name inside.
 
     The relay's per-request legs call this directly: they deliberately skip
     vm_lock (a proxied HTTP request must not fail because an unrelated tool
     call holds the VM) while every tool-call leg goes through
     run_guest_inner, which acquires the lock.
     """
-    return _guest_leg_script(vm_name, inner_script, cred)
+    return _guest_leg_script(vm_id, inner_script, cred)
 
 
 def run_guest_inner(
-    cfg: Config, vm_name: str, inner_script: str, cred: CredentialSet,
+    cfg: Config, vm_id: str, inner_script: str, cred: CredentialSet,
     timeout_ms: int = 60000,
 ) -> dict:
-    """Run one PS Direct inner script under vm_lock and return its parsed JSON.
+    """Run one PS Direct inner script on the VM identified by a pre-resolved
+    GUID, under vm_lock keyed on that GUID, and return its parsed JSON.
 
-    Shared leg runner for the guest-access tool family (diagnostics, repair).
+    GUID-native shared leg runner for the guest-access tool family
+    (diagnostics, repair, evidence) and the guest-job follow-up legs
+    (guestjobs passes the GUID stored at job_start). Contract: the caller
+    addresses the guest by pre-resolved GUID — no name resolution happens
+    inside, so a renamed VM's stored entry can never silently re-target.
     Raises on transport failure/timeout; callers own error envelopes.
     """
     timeout_s = max(30, timeout_ms // 1000 + guestexec._GRACE_S)
-    script = _guest_leg_script(vm_name, inner_script, cred)
-    with vm_lock(vm_name):
+    script = _guest_leg_script(vm_id, inner_script, cred)
+    with vm_lock(vm_id):
         result = pswindows.run_ps(
             script, timeout_s=timeout_s,
             stdin_b64=pswindows.utf8_b64(cred.password),
         )
     if result.timed_out:
-        raise TimeoutError(f"guest leg timed out for '{vm_name}'")
+        raise TimeoutError(f"guest leg timed out for '{vm_id}'")
     pswindows.check_result(result)
     return json.loads(result.stdout.strip() or "{}")
 
@@ -351,40 +361,31 @@ def run_guest_inner(
 # -- public API ------------------------------------------------------------
 
 
-def diagnose_vm_access(
-    cfg: Config,
-    vm_name: str,
-    *,
-    cred: CredentialSet | None = None,
-    timeout_ms: int = 90000,
+def _diagnose_report(
+    cfg: Config, vm_id: str, display_name: str,
+    cred: CredentialSet, timeout_ms: int,
 ) -> dict:
-    """One-call guest access diagnostic for a VM (AC8).
+    """GUID-native report builder: host leg + guest probe + findings.
 
-    Read-only: vm_allowed policy gate only (matches non-elevated guest_run_ps
-    semantics). PS Direct failure is a RESULT, not an error: the report
-    carries ps_direct={available: false, ...} and host-side findings only.
+    No name resolution inside — diagnose_vm_access resolves and hands the
+    GUID in; repair reuses this for its initial and verification passes so a
+    composite repair resolves exactly once per public call.
     """
-    if not vm_name:
-        raise ValueError("vm_name is required")
-    if cred is None:
-        raise ValueError("guest credentials are required")
-    policy.vm_allowed(cfg, vm_name)
-
     checked_at = _utc_now_iso()
 
     host_info: dict = {}
     host_error = ""
-    with vm_lock(vm_name):
+    with vm_lock(vm_id):
         try:
-            host_info = _run_host_leg(cfg, vm_name)
+            host_info = _run_host_leg(cfg, vm_id)
         except Exception as exc:  # host WMI leg failure is a result, not fatal
             host_error = str(exc)
 
     guest: dict | None = None
     ps_direct: dict = {"available": False}
-    with vm_lock(vm_name):
+    with vm_lock(vm_id):
         try:
-            guest = _run_guest_probe(cfg, vm_name, cred, timeout_ms)
+            guest = _run_guest_probe(cfg, vm_id, cred, timeout_ms)
             ps_direct = {"available": True}
         except TimeoutError as exc:
             ps_direct = {"available": False, "error": str(exc), "error_class": "timeout"}
@@ -405,16 +406,37 @@ def diagnose_vm_access(
             "detail": host_error,
         })
 
-    report: dict[str, Any] = {
+    return {
         "ok": True,
-        "vm_name": vm_name,
+        "vm_name": display_name,
         "checked_at": checked_at,
         "vm": host_info,
         "ps_direct": ps_direct,
         "guest": guest,
         "findings": findings,
     }
-    return report
+
+
+def diagnose_vm_access(
+    cfg: Config,
+    vm_name: str = "",
+    *,
+    cred: CredentialSet | None = None,
+    timeout_ms: int = 90000,
+    vm_id: str = "",
+) -> dict:
+    """One-call guest access diagnostic for a VM (AC8).
+
+    Read-only: vm_allowed policy gate only (matches non-elevated guest_run_ps
+    semantics), run by vmident.resolve on the governing name (caller-supplied
+    or the name the GUID resolves to). PS Direct failure is a RESULT, not an
+    error: the report carries ps_direct={available: false, ...} and host-side
+    findings only.
+    """
+    if cred is None:
+        raise ValueError("guest credentials are required")
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    return _diagnose_report(cfg, ref.id, ref.name, cred, timeout_ms)
 
 
 # -- reboot recovery (F4) ---------------------------------------------------
@@ -441,7 +463,7 @@ foreach ($name in @($items.processes)) {
 
 
 def _recovery_script(
-    vm_name: str, cred: CredentialSet, services: list[str], processes: list[str],
+    vm_id: str, cred: CredentialSet, services: list[str], processes: list[str],
     timeout_s: int, interval_s: int,
 ) -> str:
     items_b64 = pswindows.utf8_b64(json.dumps({"services": services, "processes": processes}))
@@ -449,7 +471,7 @@ def _recovery_script(
     max_attempts = max(1, math.ceil(timeout_s / max(1, interval_s)))
     return f"""
 {guestexec.psdirect_prefix(cred)}
-{guestexec.psdirect_vm_target(vm_name)}
+{guestexec.vm_target_preamble(vm_id)}
 $deadline = (Get-Date).AddSeconds({timeout_s})
 $interval = {interval_s}
 $maxAttempts = {max_attempts}
@@ -494,27 +516,26 @@ if (-not $ok) {{
 
 def wait_guest_recovery(
     cfg: Config,
-    vm_name: str,
+    vm_name: str = "",
     services: list[str] | None = None,
     processes: list[str] | None = None,
     *,
     timeout_s: int = 300,
     interval_s: int = 3,
     cred: CredentialSet | None = None,
+    vm_id: str = "",
 ) -> dict:
     """Wait for PowerShell Direct, then verify services/processes (AC11)."""
-    if not vm_name:
-        raise ValueError("vm_name is required")
     if cred is None:
         raise ValueError("guest credentials are required")
     if timeout_s < 1 or interval_s < 1:
         raise ValueError("timeout_s and interval_s must be >= 1")
     services = [s.strip() for s in (services or []) if s and s.strip()]
     processes = [p.strip() for p in (processes or []) if p and p.strip()]
-    policy.vm_allowed(cfg, vm_name)
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
 
-    script = _recovery_script(vm_name, cred, services, processes, timeout_s, interval_s)
-    with vm_lock(vm_name):
+    script = _recovery_script(ref.id, cred, services, processes, timeout_s, interval_s)
+    with vm_lock(ref.id):
         result = pswindows.run_ps(
             script,
             timeout_s=timeout_s + 15,
@@ -522,7 +543,7 @@ def wait_guest_recovery(
         )
     if result.timed_out:
         return {
-            "ok": False, "vm_name": vm_name,
+            "ok": False, "vm_name": ref.name,
             "error": f"recovery wait timed out after {timeout_s}s",
             "error_class": "timeout",
         }
@@ -551,7 +572,7 @@ def wait_guest_recovery(
             failures.append(f"process:{row.get('name')}")
     return {
         "ok": not failures,
-        "vm_name": vm_name,
+        "vm_name": ref.name,
         "ps_direct": ps,
         "services": svc_rows,
         "processes": proc_rows,

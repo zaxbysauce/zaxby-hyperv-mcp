@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import console, policy
+from . import console, vmident
 from .config import Config
 from .credentials import CredentialError, CredentialSet
 from .diagnostics import run_guest_inner
@@ -74,7 +74,7 @@ $tree = Walk $root {depth}
 
 def capture_evidence(
     cfg: Config,
-    vm_name: str,
+    vm_name: str = "",
     width: int = 1024,
     height: int = 768,
     save_path: str = "",
@@ -83,16 +83,19 @@ def capture_evidence(
     ui_tree_depth: int = 3,
     ui_tree_max_elements: int = 200,
     cred: CredentialSet | None = None,
+    vm_id: str = "",
 ) -> dict:
     """Screenshot + evidence metadata, optionally with a guest UIA tree.
+
+    Resolves the target once (name or GUID); the UIA leg addresses the guest
+    by the resolved GUID via run_guest_inner, and console.screenshot receives
+    the same GUID so the whole bundle acts on one identity.
 
     Returns {ok, image: <PIL.Image>, meta: <screenshot meta extended with
     ui_tree>} mirroring console.screenshot's (image, meta) tuple contract;
     the server layer converts to [ImageContent, TextContent].
     """
-    if not vm_name:
-        raise ValueError("vm_name is required")
-    policy.vm_allowed(cfg, vm_name)
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     tree_cred: CredentialSet | None = None
     if ui_tree:
         if cred is None:
@@ -102,12 +105,12 @@ def capture_evidence(
             )
         tree_cred = cred
 
-    image, meta = console.screenshot(cfg, vm_name, width, height, save_path)
+    image, meta = console.screenshot(cfg, ref.name, width, height, save_path, vm_id=ref.id)
     ui: dict[str, Any] = {"requested": ui_tree}
     if tree_cred is not None:
         try:
             outcome = run_guest_inner(
-                cfg, vm_name,
+                cfg, ref.id,
                 _uia_script(ui_tree_depth, ui_tree_max_elements), tree_cred,
                 timeout_ms=60000,
             )

@@ -9,8 +9,15 @@ inversion of guestexec._normal_body — one statement, PS 5.1-safe). The
 host-side registry maps job_id -> {pid, paths, cred, ...} so status/output/
 stop later address exactly that process.
 
+Identity (issue #8): job_start resolves the target ONCE via vmident.resolve
+and the registry entry stores the resolved GUID (`vm_id`) alongside the
+display name; every follow-up leg (status/output/stop) addresses the guest
+by that stored GUID, so a VM rename between legs can never retarget a leg
+at a different VM.
+
 Lock policy: every guest leg (start/status/output/stop) runs under vm_lock
-acquired per leg inside diagnostics.run_guest_inner; registry bookkeeping
+acquired per leg inside diagnostics.run_guest_inner (keyed on the GUID);
+registry bookkeeping
 uses only the registry lock. Credential lifetime disclosure: the stored
 credential set outlives the starting call until a SUCCESSFUL stop, cap
 eviction, or process exit; successful stop and eviction null the field (a
@@ -31,7 +38,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import policy, pswindows
+from . import pswindows, vmident
 from .config import Config
 from .credentials import CredentialSet
 from .diagnostics import run_guest_inner
@@ -79,7 +86,8 @@ def _reserve_slot(job_id: str) -> None:
                 "stop jobs before starting more"
             )
         _jobs[job_id] = {
-            "job_id": job_id, "vm_name": "", "pid": 0, "in_flight": True,
+            "job_id": job_id, "vm_name": "", "vm_id": "", "pid": 0,
+            "in_flight": True,
             "started_at": _utc_now_iso(), "cred": None, "stopped": False,
         }
 
@@ -311,30 +319,38 @@ def _decode_stream(head_hex: str, tail_b64: str) -> tuple[str, str]:
 
 def job_start(
     cfg: Config,
-    vm_name: str,
-    command: str,
+    vm_name: str = "",
+    command: str = "",
     args: list[str] | None = None,
     cwd: str = "",
+    vm_id: str = "",
     *,
     cred: CredentialSet | None = None,
     timeout_ms: int = 60000,
 ) -> dict:
-    """Start a guest command as a tracked job; returns without waiting."""
-    if not vm_name or not command:
-        raise ValueError("vm_name and command are required")
+    """Start a guest command as a tracked job; returns without waiting.
+
+    The VM may be addressed by `vm_name` or `vm_id` (exactly one required;
+    vmident.resolve enforces identity and policy). The start leg runs against
+    the RESOLVED GUID, and the registry entry stores it, so every follow-up
+    leg below addresses the same VM even if it is renamed mid-job.
+    """
+    if not command:
+        raise ValueError("command is required")
     if cred is None:
         raise ValueError("guest credentials are required")
-    policy.vm_allowed(cfg, vm_name)
 
     job_id = uuid.uuid4().hex[:12]
     _reserve_slot(job_id)
     try:
         # Wrapper building and pid parsing stay inside the release window so
         # no exception between reservation and registration can strand an
-        # in-flight placeholder (review round 3 question, adopted).
+        # in-flight placeholder (review round 3 question, adopted); the
+        # identity resolution rides the same window for the same reason.
+        ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
         wrapper = _wrapper_script(command, args, cwd)
         outcome = run_guest_inner(
-            cfg, vm_name, _start_script(job_id, wrapper), cred, timeout_ms=timeout_ms,
+            cfg, ref.id, _start_script(job_id, wrapper), cred, timeout_ms=timeout_ms,
         )
         pid = int(outcome.get("pid") or 0)
     except BaseException:
@@ -356,7 +372,8 @@ def job_start(
         start_time_ticks = None
     entry: dict[str, Any] = {
         "job_id": job_id,
-        "vm_name": vm_name,
+        "vm_name": ref.name,
+        "vm_id": ref.id,
         "pid": pid,
         "start_time_ticks": start_time_ticks,
         "command": command,
@@ -373,7 +390,7 @@ def job_start(
     return {
         "ok": True,
         "job_id": job_id,
-        "vm_name": vm_name,
+        "vm_name": ref.name,
         "pid": pid,
         "job_dir": job_dir,
         "out_path": entry["out_path"],
@@ -392,7 +409,7 @@ def job_status(cfg: Config, job_id: str) -> dict:
     if cred is None:
         raise RuntimeError(f"job {job_id} has no stored credentials (stopped or evicted)")
     outcome = run_guest_inner(
-        cfg, entry["vm_name"],
+        cfg, entry["vm_id"],
         _status_script(entry["pid"], entry["exit_path"], entry.get("start_time_ticks")),
         cred,
     )
@@ -421,7 +438,7 @@ def job_output(cfg: Config, job_id: str, *, tail_bytes: int = 65536) -> dict:
             result[f"{key}_truncated"] = False
             result[f"{key}_encoding"] = "utf-8"
             continue
-        outcome = run_guest_inner(cfg, entry["vm_name"], _output_script(path, tail_bytes), cred)
+        outcome = run_guest_inner(cfg, entry["vm_id"], _output_script(path, tail_bytes), cred)
         text, encoding = _decode_stream(
             str(outcome.get("head_hex") or ""), str(outcome.get("tail_b64") or ""),
         )
@@ -467,7 +484,7 @@ def job_stop(cfg: Config, job_id: str) -> dict:
         raise RuntimeError(f"job {job_id} has no stored credentials (evicted)")
     try:
         outcome = run_guest_inner(
-            cfg, entry["vm_name"],
+            cfg, entry["vm_id"],
             _stop_script(entry["pid"], entry["job_dir"], entry.get("start_time_ticks")),
             cred,
         )

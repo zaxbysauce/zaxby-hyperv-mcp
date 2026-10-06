@@ -7,9 +7,10 @@ Gate matrix (see README):
   - vm_provision category + confirm: vm create, disk add, firmware boot
     order, TPM set, SecureBoot set
 
-Every mutating op takes the per-VM lock and resolves the VM name through the
-allowlist first. Host file paths (VHD/ISO) pass the canonicalization policy
-before touching PowerShell. Deployment media is never created here.
+Every mutating op takes the per-VM lock keyed on the resolved VM GUID
+(vmident.resolve, by name or by id) and gates on policy first. Host file
+paths (VHD/ISO) pass the canonicalization policy before touching
+PowerShell. Deployment media is never created here.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 
-from . import guestexec, policy, pswindows, vmlocks
+from . import guestexec, policy, pswindows, vmident, vmlocks
 from .config import Config
 
 _BOOT_TYPES = ("Drive", "Network", "File")
@@ -27,13 +28,6 @@ _SECUREBOOT_ONOFF = {True: "On", False: "Off"}
 
 class MediaError(RuntimeError):
     """Structured media/provisioning failure."""
-
-
-def _checked_vm(cfg: Config, vm_name: str) -> str:
-    if not vm_name or not vm_name.strip():
-        raise ValueError("vm_name is required")
-    policy.vm_allowed(cfg, vm_name)
-    return vm_name
 
 
 def _checked_new_name(cfg: Config, name: str) -> str:
@@ -81,32 +75,37 @@ def _json_out(result: pswindows.PSResult, ctx: str) -> dict | list:
         raise MediaError(f"{ctx}: output parse failed: {exc} | raw: {raw[:200]!r}") from None
 
 
-def _generation_guard(cfg: Config, vm_name: str) -> None:
+def _generation_guard(cfg: Config, ref: vmident.VMRef) -> None:
     """Explicit error for Gen1 VMs (Get-VMFirmware/TPM are Gen2-only)."""
     script = (
-        guestexec.psdirect_vm_target(vm_name)
+        guestexec.vm_target_preamble(ref.id)
         + "\n(Get-VM -Id $vmTarget -ErrorAction Stop).Generation.ToString()\n"
     )
     result = pswindows.run_ps(script, timeout_s=60)
     try:
-        pswindows.check_result(result, f"resolve generation of '{vm_name}'")
+        pswindows.check_result(result, f"resolve generation of '{ref.name}'")
     except RuntimeError as exc:
         raise MediaError(str(exc)) from None
     if result.stdout.strip() != "2":
         raise MediaError(
-            f"VM '{vm_name}' is Generation {result.stdout.strip()}; this operation requires Generation 2"
+            f"VM '{ref.name}' is Generation {result.stdout.strip()}; this operation requires Generation 2"
         )
 
 
-def _resolve_vm_prefix(vm_name: str) -> str:
-    """CIM GUID resolver + Get-VM -Id fetch; scripts below bind cmdlets with -VM $vm.
+def _resolve_vm_prefix(ref: vmident.VMRef) -> str:
+    """Validated GUID preamble + Get-VM -Id fetch; scripts below bind cmdlets
+    with -VM $vm.
 
     Hyper-V cmdlets accept -VM (object) but not -VMId, and name-based binding
     intermittently fails under vmms WMI stress ('Call cancelled' / 'does not
-    resolve to a single virtual machine'). psdirect_vm_target only ASSIGNS
-    $vmTarget; this prefix also fetches the VM object.
+    resolve to a single virtual machine'). The caller has already resolved the
+    identity host-side (vmident.resolve); the preamble only binds $vmTarget,
+    and this prefix also fetches the VM object.
     """
-    return guestexec.psdirect_vm_target(vm_name) + "\n$vm = Get-VM -Id $vmTarget -ErrorAction Stop\n"
+    return (
+        guestexec.vm_target_preamble(ref.id)
+        + "\n$vm = Get-VM -Id $vmTarget -ErrorAction Stop\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +142,17 @@ def vm_create(
         )
     lines = [pre] if pre else []
     lines += [
+        # Refuse to shadow an existing VM of the same name BEFORE creating
+        # anything. The predicate mirrors guestexec.psdirect_vm_target exactly
+        # (literal ElementName -eq via ps_quote AND a GUID-shaped Name), so a
+        # host or non-VM computer system sharing the name is not falsely
+        # refused and "same name" is the resolver's notion.
+        "if (@(Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem"
+        " -ErrorAction Stop | Where-Object { ($_.ElementName -eq "
+        + pswindows.ps_quote(name)
+        + ") -and ($_.Name -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+        "-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') }).Count)"
+        " { throw 'VM name already exists' }",
         f"$vhd = New-VHD -Path {pswindows.ps_quote(vhd)} -SizeBytes ({int(vhd_size_gb)}GB) -Fixed:$false -ErrorAction Stop",
         # If New-VM fails the fresh VHDX would orphan on the host and wedge
         # every retry against the exists-refusal below — clean it up first.
@@ -172,16 +182,16 @@ def vm_create(
 
 
 def vm_disk_add(
-    cfg: Config, vm_name: str, path: str, size_gb: int,
-    controller_type: str = "SCSI", confirm: bool = False,
+    cfg: Config, vm_name: str = "", path: str = "", size_gb: int = 0,
+    controller_type: str = "SCSI", confirm: bool = False, vm_id: str = "",
 ) -> dict:
-    _checked_vm(cfg, vm_name)
     policy.require_destructive(cfg, "vm_provision", confirm, f"add {size_gb}GB disk '{path}' to '{vm_name}'")
     if controller_type not in ("SCSI", "IDE"):
         raise ValueError("controller_type must be SCSI or IDE")
     vhd = _checked_file_path(cfg, path, write=True, must_exist=False, extensions=(".vhdx", ".vhd"))
     if not (1 <= size_gb <= 2048):
         raise ValueError("size_gb must be within 1..2048")
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     lines = [
         f"$vhd = New-VHD -Path {pswindows.ps_quote(vhd)} -SizeBytes ({int(size_gb)}GB) -Fixed:$false -ErrorAction Stop",
         # Same orphan hazard as vm_create: a failed attach must not leave the
@@ -200,23 +210,23 @@ def vm_disk_add(
         "try { $diskCount = (Get-VMHardDiskDrive -VM $vm -ErrorAction Stop | Measure-Object).Count } catch { }\n"
         "[PSCustomObject]@{ disk_count = $diskCount } | ConvertTo-Json -Compress",
     ]
-    with vmlocks.vm_lock(vm_name):
+    with vmlocks.vm_lock(ref.id):
         if os.path.isfile(vhd):
             raise MediaError(f"VHD already exists: {vhd} (refusing to overwrite)")
-        result = _run(cfg, _resolve_vm_prefix(vm_name) + "\n".join(lines), f"vm_disk_add({vm_name})")
+        result = _run(cfg, _resolve_vm_prefix(ref) + "\n".join(lines), f"vm_disk_add({ref.name})")
     out = _json_out(result, "vm_disk_add")
     return {"ok": True, "vhd_path": vhd, **out} if isinstance(out, dict) else {"ok": True, "vhd_path": vhd}
 
 
-def vm_disk_list(cfg: Config, vm_name: str) -> dict:
-    _checked_vm(cfg, vm_name)
-    script = _resolve_vm_prefix(vm_name) + (
+def vm_disk_list(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    script = _resolve_vm_prefix(ref) + (
         "Get-VMHardDiskDrive -VM $vm -ErrorAction Stop | ForEach-Object {\n"
         "  [PSCustomObject]@{ controller_type = [string]$_.ControllerType; controller_number = $_.ControllerNumber;\n"
         "    lun = $_.LunNumber; path = $_.Path }\n"
         "} | ConvertTo-Json -Compress\n"
     )
-    result = _run(cfg, script, f"vm_disk_list({vm_name})")
+    result = _run(cfg, script, f"vm_disk_list({ref.name})")
     raw = result.stdout.strip()
     drives = [] if not raw or raw == "null" else json.loads(raw)
     if isinstance(drives, dict):
@@ -228,11 +238,11 @@ def vm_disk_list(cfg: Config, vm_name: str) -> dict:
 # media (media category, no confirm — reversible)
 # ---------------------------------------------------------------------------
 
-def vm_media_attach(cfg: Config, vm_name: str, iso_path: str) -> dict:
-    _checked_vm(cfg, vm_name)
+def vm_media_attach(cfg: Config, vm_name: str = "", iso_path: str = "", vm_id: str = "") -> dict:
     policy.require_category(cfg, "media", f"attach ISO to '{vm_name}'")
     iso = _checked_file_path(cfg, iso_path, write=False, must_exist=True, extensions=(".iso",))
-    script = _resolve_vm_prefix(vm_name) + (
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    script = _resolve_vm_prefix(ref) + (
         "Add-VMDvdDrive -VM $vm -Path "
         + pswindows.ps_quote(iso) + " -ErrorAction Stop\n"
         # Informational check AFTER a completed, non-idempotent attach: a
@@ -243,37 +253,37 @@ def vm_media_attach(cfg: Config, vm_name: str, iso_path: str) -> dict:
         "Where-Object { $_.Path -eq " + pswindows.ps_quote(iso) + " } | Measure-Object).Count -gt 0 } catch { }\n"
         "[PSCustomObject]@{ attached = $attached } | ConvertTo-Json -Compress"
     )
-    with vmlocks.vm_lock(vm_name):
-        result = _run(cfg, script, f"vm_media_attach({vm_name})")
+    with vmlocks.vm_lock(ref.id):
+        result = _run(cfg, script, f"vm_media_attach({ref.name})")
     out = _json_out(result, "vm_media_attach")
     attached = out.get("attached") if isinstance(out, dict) else None
     return {"ok": True, "iso_path": iso, "attached": attached}
 
 
-def vm_media_detach(cfg: Config, vm_name: str) -> dict:
-    _checked_vm(cfg, vm_name)
+def vm_media_detach(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
     policy.require_category(cfg, "media", f"detach media from '{vm_name}'")
-    script = _resolve_vm_prefix(vm_name) + (
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    script = _resolve_vm_prefix(ref) + (
         "$drives = Get-VMDvdDrive -VM $vm -ErrorAction Stop\n"
         "$paths = @($drives | ForEach-Object { $_.Path })\n"
         "$drives | Remove-VMDvdDrive -ErrorAction Stop\n"
         "[PSCustomObject]@{ removed = $paths } | ConvertTo-Json -Compress"
     )
-    with vmlocks.vm_lock(vm_name):
-        result = _run(cfg, script, f"vm_media_detach({vm_name})")
+    with vmlocks.vm_lock(ref.id):
+        result = _run(cfg, script, f"vm_media_detach({ref.name})")
     out = _json_out(result, "vm_media_detach")
     removed = out.get("removed", []) if isinstance(out, dict) else []
     return {"ok": True, "removed": removed}
 
 
-def vm_media_list(cfg: Config, vm_name: str) -> dict:
-    _checked_vm(cfg, vm_name)
-    script = _resolve_vm_prefix(vm_name) + (
+def vm_media_list(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    script = _resolve_vm_prefix(ref) + (
         "Get-VMDvdDrive -VM $vm -ErrorAction Stop | ForEach-Object {\n"
         "  [PSCustomObject]@{ controller_number = $_.ControllerNumber; lun = $_.LunNumber; path = $_.Path }\n"
         "} | ConvertTo-Json -Compress\n"
     )
-    result = _run(cfg, script, f"vm_media_list({vm_name})")
+    result = _run(cfg, script, f"vm_media_list({ref.name})")
     raw = result.stdout.strip()
     drives = [] if not raw or raw == "null" else json.loads(raw)
     if isinstance(drives, dict):
@@ -281,15 +291,15 @@ def vm_media_list(cfg: Config, vm_name: str) -> dict:
     return {"ok": True, "media": drives}
 
 
-def vm_network_set(cfg: Config, vm_name: str, switch_name: str) -> dict:
-    _checked_vm(cfg, vm_name)
+def vm_network_set(cfg: Config, vm_name: str = "", switch_name: str = "", vm_id: str = "") -> dict:
     policy.require_category(cfg, "media", f"connect '{vm_name}' to switch '{switch_name}'")
     if not switch_name or not switch_name.strip():
         raise ValueError("switch_name is required")
     # Connect-VMNetworkAdapter has no -VM parameter; bind the adapter objects
     # instead. ALL adapters are connected, matching the former -VMName binding
     # (no -Name defaults to every adapter of the VM).
-    script = _resolve_vm_prefix(vm_name) + (
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    script = _resolve_vm_prefix(ref) + (
         "$adapters = @(Get-VMNetworkAdapter -VM $vm -ErrorAction Stop)\n"
         "if ($adapters.Count -eq 0) { throw 'VM has no network adapter' }\n"
         "$adapters | Connect-VMNetworkAdapter -SwitchName " + pswindows.ps_quote(switch_name)
@@ -298,11 +308,11 @@ def vm_network_set(cfg: Config, vm_name: str, switch_name: str) -> dict:
         "Where-Object { $_.SwitchName -ne " + pswindows.ps_quote(switch_name) + " }).Count\n"
         "[PSCustomObject]@{ connected = ($off -eq 0) } | ConvertTo-Json -Compress"
     )
-    with vmlocks.vm_lock(vm_name):
-        result = _run(cfg, script, f"vm_network_set({vm_name})")
+    with vmlocks.vm_lock(ref.id):
+        result = _run(cfg, script, f"vm_network_set({ref.name})")
     out = _json_out(result, "vm_network_set")
     if isinstance(out, dict) and out.get("connected") is False:
-        raise MediaError(f"vm_network_set({vm_name}): not every adapter is on switch '{switch_name}' after connect")
+        raise MediaError(f"vm_network_set({ref.name}): not every adapter is on switch '{switch_name}' after connect")
     return {"ok": True, "switch_name": switch_name}
 
 
@@ -310,28 +320,30 @@ def vm_network_set(cfg: Config, vm_name: str, switch_name: str) -> dict:
 # firmware / security (read: open; write: vm_provision + confirm; Gen2-only)
 # ---------------------------------------------------------------------------
 
-def vm_firmware_get(cfg: Config, vm_name: str) -> dict:
-    _checked_vm(cfg, vm_name)
-    _generation_guard(cfg, vm_name)
-    script = _resolve_vm_prefix(vm_name) + (
+def vm_firmware_get(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    _generation_guard(cfg, ref)
+    script = _resolve_vm_prefix(ref) + (
         "$f = Get-VMFirmware -VM $vm -ErrorAction Stop\n"
         "$sec = Get-VMSecurity -VM $vm -ErrorAction SilentlyContinue\n"
         "[PSCustomObject]@{ secure_boot = [string]$f.SecureBoot; secure_boot_template = $f.SecureBootTemplate; "
         "boot_order = @($f.BootOrder | ForEach-Object { [string]$_.BootType }); "
         "tpm_enabled = if ($sec) { [bool]$sec.TpmEnabled } else { $null } } | ConvertTo-Json -Compress"
     )
-    result = _run(cfg, script, f"vm_firmware_get({vm_name})")
+    result = _run(cfg, script, f"vm_firmware_get({ref.name})")
     out = _json_out(result, "vm_firmware_get")
     return {"ok": True, **out} if isinstance(out, dict) else {"ok": True}
 
 
-def vm_firmware_set_boot_order(cfg: Config, vm_name: str, boot_type: str = "Drive", confirm: bool = False) -> dict:
-    _checked_vm(cfg, vm_name)
+def vm_firmware_set_boot_order(
+    cfg: Config, vm_name: str = "", boot_type: str = "Drive", confirm: bool = False, vm_id: str = "",
+) -> dict:
     policy.require_destructive(cfg, "vm_provision", confirm, f"set '{vm_name}' first boot device to {boot_type}")
     if boot_type not in _BOOT_TYPES:
         raise ValueError(f"boot_type must be one of {_BOOT_TYPES}")
-    _generation_guard(cfg, vm_name)
-    script = _resolve_vm_prefix(vm_name) + (
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    _generation_guard(cfg, ref)
+    script = _resolve_vm_prefix(ref) + (
         "$f = Get-VMFirmware -VM $vm -ErrorAction Stop\n"
         "$device = $f.BootOrder | Where-Object { [string]$_.BootType -eq '" + boot_type + "' } | Select-Object -First 1\n"
         "if (-not $device) { throw ('no boot device of type " + boot_type + " present') }\n"
@@ -339,46 +351,51 @@ def vm_firmware_set_boot_order(cfg: Config, vm_name: str, boot_type: str = "Driv
         "$f2 = Get-VMFirmware -VM $vm -ErrorAction Stop\n"
         "[PSCustomObject]@{ first_boot = [string]$f2.BootOrder[0].BootType } | ConvertTo-Json -Compress"
     )
-    with vmlocks.vm_lock(vm_name):
-        result = _run(cfg, script, f"vm_firmware_set_boot_order({vm_name})")
+    with vmlocks.vm_lock(ref.id):
+        result = _run(cfg, script, f"vm_firmware_set_boot_order({ref.name})")
     out = _json_out(result, "vm_firmware_set_boot_order")
     return {"ok": True, **out} if isinstance(out, dict) else {"ok": True}
 
 
-def vm_tpm_set(cfg: Config, vm_name: str, enabled: bool, confirm: bool = False) -> dict:
-    _checked_vm(cfg, vm_name)
+def vm_tpm_set(
+    cfg: Config, vm_name: str = "", enabled: bool = False, confirm: bool = False, vm_id: str = "",
+) -> dict:
     policy.require_destructive(cfg, "vm_provision", confirm, f"{'enable' if enabled else 'disable'} TPM on '{vm_name}'")
-    _generation_guard(cfg, vm_name)
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    _generation_guard(cfg, ref)
     cmdlet = "Enable-VMTPM" if enabled else "Disable-VMTPM"
-    script = _resolve_vm_prefix(vm_name) + (
+    script = _resolve_vm_prefix(ref) + (
         cmdlet + " -VM $vm -ErrorAction Stop\n"
         "$sec = Get-VMSecurity -VM $vm -ErrorAction Stop\n"
         "[PSCustomObject]@{ tpm_enabled = [bool]$sec.TpmEnabled } | ConvertTo-Json -Compress"
     )
-    with vmlocks.vm_lock(vm_name):
-        result = _run(cfg, script, f"vm_tpm_set({vm_name})")
+    with vmlocks.vm_lock(ref.id):
+        result = _run(cfg, script, f"vm_tpm_set({ref.name})")
     out = _json_out(result, "vm_tpm_set")
     return {"ok": True, **out} if isinstance(out, dict) else {"ok": True}
 
 
-def vm_secureboot_set(cfg: Config, vm_name: str, enabled: bool, template: str = "", confirm: bool = False) -> dict:
-    _checked_vm(cfg, vm_name)
+def vm_secureboot_set(
+    cfg: Config, vm_name: str = "", enabled: bool = False, template: str = "",
+    confirm: bool = False, vm_id: str = "",
+) -> dict:
     policy.require_destructive(cfg, "vm_provision", confirm, f"{'enable' if enabled else 'disable'} SecureBoot on '{vm_name}'")
-    _generation_guard(cfg, vm_name)
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    _generation_guard(cfg, ref)
     onoff = _SECUREBOOT_ONOFF[bool(enabled)]
     template_part = ""
     if template:
         if not template.strip():
             raise ValueError("template must be a non-empty name when given")
         template_part = " -SecureBootTemplate " + pswindows.ps_quote(template)
-    script = _resolve_vm_prefix(vm_name) + (
+    script = _resolve_vm_prefix(ref) + (
         "Set-VMFirmware -VM $vm"
         + " -EnableSecureBoot " + onoff + template_part + " -ErrorAction Stop\n"
         "$f = Get-VMFirmware -VM $vm -ErrorAction Stop\n"
         "[PSCustomObject]@{ secure_boot = [string]$f.SecureBoot; secure_boot_template = $f.SecureBootTemplate } "
         "| ConvertTo-Json -Compress"
     )
-    with vmlocks.vm_lock(vm_name):
-        result = _run(cfg, script, f"vm_secureboot_set({vm_name})")
+    with vmlocks.vm_lock(ref.id):
+        result = _run(cfg, script, f"vm_secureboot_set({ref.name})")
     out = _json_out(result, "vm_secureboot_set")
     return {"ok": True, **out} if isinstance(out, dict) else {"ok": True}

@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 
 from PIL import Image as PILImage
 
-from . import guestexec, policy, pswindows, vmlocks
+from . import policy, pswindows, vmident, vmlocks
 from .config import Config
 
 _WMI_NS = "root\\virtualization\\v2"
@@ -246,28 +246,6 @@ while ($polls -lt %MAX_POLLS%) {
 # internals
 # ---------------------------------------------------------------------------
 
-def _vm_guid(cfg: Config, vm_name: str) -> str:
-    """Authorize the VM name and resolve its stable Hyper-V GUID.
-
-    Resolved straight from the virtualization CIM namespace (Msvm_ComputerSystem.Name
-    IS the GUID) with a bounded retry: Get-VM -Name intermittently fails with
-    'Call cancelled' under vmms WMI stress, and the console path must not depend on it.
-    """
-    if not vm_name or not vm_name.strip():
-        raise ValueError("vm_name is required")
-    policy.vm_allowed(cfg, vm_name)
-    # psdirect_vm_target only ASSIGNS $vmTarget; append the bare emit line so
-    # run_ps captures the GUID itself on stdout.
-    result = pswindows.run_ps(
-        guestexec.psdirect_vm_target(vm_name) + "\n$vmTarget\n", timeout_s=60
-    )
-    pswindows.check_result(result, f"resolve VM '{vm_name}'")
-    guid = result.stdout.strip()
-    if not guid:
-        raise ConsoleError(f"VM '{vm_name}' resolved to an empty Id")
-    return guid
-
-
 def _check_rc(result: pswindows.PSResult, ctx: str) -> pswindows.PSResult:
     try:
         return pswindows.check_result(result, ctx)
@@ -425,16 +403,18 @@ def _scancodes_for_combo(keys: list[str]) -> list[int]:
 
 def screenshot(
     cfg: Config,
-    vm_name: str,
+    vm_name: str = "",
     width: int = 1024,
     height: int = 768,
     save_path: str = "",
+    vm_id: str = "",
 ) -> tuple[PILImage.Image, dict]:
     """Capture the console; returns (PIL image, metadata). Caller wraps in
     MCP image content. Raises on failure (uniform list-form success shape)."""
     if not (160 <= width <= 4096 and 160 <= height <= 4096):
         raise ValueError("width/height must be within 160..4096")
-    guid = _vm_guid(cfg, vm_name)
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    guid = ref.id
     head = _head_resolution(cfg, guid)
     fallback_used = ""
     raw: bytes | None = None
@@ -459,7 +439,7 @@ def screenshot(
     png = _decode_rgb565(raw, actual_w, actual_h)
     img = PILImage.open(io.BytesIO(png))
     meta = {
-        "vm_name": vm_name,
+        "vm_name": ref.name,
         "vm_id": guid,
         "width": actual_w,
         "height": actual_h,
@@ -486,16 +466,16 @@ def screenshot(
     return img, meta
 
 
-def get_display_info(cfg: Config, vm_name: str) -> dict:
-    guid = _vm_guid(cfg, vm_name)
-    script = _DISPLAY_INFO_SCRIPT.replace("%NS%", _WMI_NS).replace("%GUID%", guid.lower())
+def get_display_info(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    script = _DISPLAY_INFO_SCRIPT.replace("%NS%", _WMI_NS).replace("%GUID%", ref.id)
     result = pswindows.run_ps(script.strip(), timeout_s=60)
     _check_rc(result, "console display info")
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise ConsoleError(f"display info parse failed: {exc}") from None
-    data["vm_id"] = guid
+    data["vm_id"] = ref.id
     data["guest_channel"] = "ps_direct_unverified"
     data["guest_channel_note"] = (
         "console input works from firmware/WinPE; PowerShell Direct requires a "
@@ -504,16 +484,17 @@ def get_display_info(cfg: Config, vm_name: str) -> dict:
     return {"ok": True, **data}
 
 
-def type_text(cfg: Config, vm_name: str, text: str) -> dict:
+def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -> dict:
     policy.require_category(cfg, "console_input", f"type text into '{vm_name}' console")
     if not text:
         raise ValueError("text is required")
     if any(ord(c) > 127 for c in text):
         raise ValueError("text must be ASCII; use hyperv_console_type_scancodes for other input")
-    guid = _vm_guid(cfg, vm_name)
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    guid = ref.id
     chunks = [text[i:i + 512] for i in range(0, len(text), 512)]
     calls = 0
-    with vmlocks.vm_lock(vm_name):
+    with vmlocks.vm_lock(ref.id):
         for i, chunk in enumerate(chunks):
             # Text rides stdin as UTF-8 base64 — never in the script, argv, or
             # error records (CLIXML errors quote script lines).
@@ -538,37 +519,39 @@ def type_text(cfg: Config, vm_name: str, text: str) -> dict:
     return {"ok": True, "chunks": calls, "chars": len(text)}
 
 
-def press_key(cfg: Config, vm_name: str, key: str, modifiers: list[str] | None = None) -> dict:
+def press_key(
+    cfg: Config, vm_name: str = "", key: str = "", modifiers: list[str] | None = None, vm_id: str = "",
+) -> dict:
     policy.require_category(cfg, "console_input", f"press {key} on '{vm_name}' console")
-    guid = _vm_guid(cfg, vm_name)
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     codes = _scancodes_for_combo([key] + list(modifiers or []))
-    return _send_scancodes_locked(cfg, vm_name, guid, codes)
+    return _send_scancodes_locked(cfg, ref, codes)
 
 
-def key_combo(cfg: Config, vm_name: str, keys: list[str]) -> dict:
+def key_combo(cfg: Config, vm_name: str = "", keys: list[str] | None = None, vm_id: str = "") -> dict:
     policy.require_category(cfg, "console_input", f"send combo {keys!r} on '{vm_name}' console")
     if not keys:
         raise ValueError("keys list is required")
-    guid = _vm_guid(cfg, vm_name)
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     codes = _scancodes_for_combo(keys)
-    return _send_scancodes_locked(cfg, vm_name, guid, codes)
+    return _send_scancodes_locked(cfg, ref, codes)
 
 
-def type_scancodes(cfg: Config, vm_name: str, scancodes: list[int]) -> dict:
-    policy.require_category(cfg, "console_input", f"send {len(scancodes)} scancodes to '{vm_name}' console")
+def type_scancodes(cfg: Config, vm_name: str = "", scancodes: list[int] | None = None, vm_id: str = "") -> dict:
+    policy.require_category(cfg, "console_input", f"send {len(scancodes or [])} scancodes to '{vm_name}' console")
     if not scancodes:
         raise ValueError("scancodes list is required")
     for code in scancodes:
         if type(code) is not int or not (0 <= code <= 255):
             raise ValueError(f"scancodes must be integers 0..255 (bools rejected); got {code!r}")
-    guid = _vm_guid(cfg, vm_name)
-    return _send_scancodes_locked(cfg, vm_name, guid, list(scancodes))
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    return _send_scancodes_locked(cfg, ref, list(scancodes))
 
 
-def _send_scancodes_locked(cfg: Config, vm_name: str, guid: str, codes: list[int]) -> dict:
+def _send_scancodes_locked(cfg: Config, ref: vmident.VMRef, codes: list[int]) -> dict:
     chunks = [codes[i:i + 64] for i in range(0, len(codes), 64)]
     sent = 0
-    with vmlocks.vm_lock(vm_name):
+    with vmlocks.vm_lock(ref.id):
         for i, chunk in enumerate(chunks):
             arr = ",".join(str(c) for c in chunk)
             call = (
@@ -578,7 +561,7 @@ def _send_scancodes_locked(cfg: Config, vm_name: str, guid: str, codes: list[int
                 "Write-Output ('RC=' + $r.ReturnValue + ' CHUNK=' + %I + '/' + %N)\n"
             ).replace("%I", str(i + 1)).replace("%N", str(len(chunks)))
             script = _KEYBOARD_SCRIPT_TMPL.replace("%NS%", _WMI_NS).replace(
-                "%GUID%", guid.lower()
+                "%GUID%", ref.id
             ).replace("%CALL%", call)
             result = pswindows.run_ps(script.strip(), timeout_s=90)
             _check_rc(result, f"console scancodes chunk {i + 1}/{len(chunks)}")
@@ -589,27 +572,28 @@ def _send_scancodes_locked(cfg: Config, vm_name: str, guid: str, codes: list[int
 
 
 def mouse_move(
-    cfg: Config, vm_name: str, x: int, y: int, frame_width: int = 0, frame_height: int = 0
+    cfg: Config, vm_name: str = "", x: int = 0, y: int = 0,
+    frame_width: int = 0, frame_height: int = 0, vm_id: str = "",
 ) -> dict:
     policy.require_category(cfg, "console_input", f"move mouse on '{vm_name}' console")
-    guid = _vm_guid(cfg, vm_name)
-    head = _head_resolution(cfg, guid)
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    head = _head_resolution(cfg, ref.id)
     hx, hy = _scale_to_head(x, y, frame_width, frame_height, head)
-    return _mouse_op(cfg, vm_name, guid, f"move to ({hx},{hy})",
+    return _mouse_op(cfg, ref, f"move to ({hx},{hy})",
                      "SetAbsolutePosition",
                      f"@{{ HorizontalPosition = {hx}; VerticalPosition = {hy} }}",
                      extra={"head_x": hx, "head_y": hy})
 
 
 def click(
-    cfg: Config, vm_name: str, x: int, y: int, frame_width: int = 0,
-    frame_height: int = 0, button: int = 1,
+    cfg: Config, vm_name: str = "", x: int = 0, y: int = 0, frame_width: int = 0,
+    frame_height: int = 0, button: int = 1, vm_id: str = "",
 ) -> dict:
     policy.require_category(cfg, "console_input", f"click on '{vm_name}' console")
     if button not in (1, 2):
         raise ValueError("button must be 1 (left) or 2 (right)")
-    guid = _vm_guid(cfg, vm_name)
-    head = _head_resolution(cfg, guid)
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    head = _head_resolution(cfg, ref.id)
     if x or y:
         hx, hy = _scale_to_head(x, y, frame_width, frame_height, head)
         move_call = (
@@ -630,33 +614,34 @@ def click(
         + "    if ($r.ReturnValue -ne 0) { throw ('ClickButton failed with ReturnValue=' + $r.ReturnValue) }\n"
         + "    Write-Output ('RC=' + $r.ReturnValue)\n"
     )
-    out = _mouse_op(cfg, vm_name, guid, f"click button {button}", call=call, extra=extra)
+    out = _mouse_op(cfg, ref, f"click button {button}", call=call, extra=extra)
     return out
 
 
-def mouse_button(cfg: Config, vm_name: str, button: int, is_down: bool) -> dict:
+def mouse_button(
+    cfg: Config, vm_name: str = "", button: int = 1, is_down: bool = False, vm_id: str = "",
+) -> dict:
     policy.require_category(cfg, "console_input", f"button {'down' if is_down else 'up'} on '{vm_name}' console")
     if button not in (1, 2):
         raise ValueError("button must be 1 (left) or 2 (right)")
-    guid = _vm_guid(cfg, vm_name)
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     return _mouse_op(
-        cfg, vm_name, guid, f"button {button} {'down' if is_down else 'up'}",
+        cfg, ref, f"button {button} {'down' if is_down else 'up'}",
         "SetButtonState",
         f"@{{ ButtonIndex = {button}; IsDown = ${'true' if is_down else 'false'} }}",
     )
 
 
-def scroll(cfg: Config, vm_name: str, delta: int) -> dict:
+def scroll(cfg: Config, vm_name: str = "", delta: int = 0, vm_id: str = "") -> dict:
     policy.require_category(cfg, "console_input", f"scroll on '{vm_name}' console")
-    guid = _vm_guid(cfg, vm_name)
-    return _mouse_op(cfg, vm_name, guid, f"scroll {delta}",
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    return _mouse_op(cfg, ref, f"scroll {delta}",
                      "SetScrollPosition", f"@{{ ScrollPositionDelta = {int(delta)} }}")
 
 
 def _mouse_op(
     cfg: Config,
-    vm_name: str,
-    guid: str,
+    ref: vmident.VMRef,
     detail: str,
     method: str | None = None,
     args_literal: str = "",
@@ -673,10 +658,10 @@ def _mouse_op(
         )
     script = (
         _MOUSE_FOR_VM_SCRIPT.replace("%NS%", _WMI_NS)
-        .replace("%GUID%", guid.lower())
+        .replace("%GUID%", ref.id)
         .replace("%CALL%", call)
     )
-    with vmlocks.vm_lock(vm_name):
+    with vmlocks.vm_lock(ref.id):
         result = pswindows.run_ps(script.strip(), timeout_s=90)
     _check_rc(result, f"console mouse {detail}")
     out = {"ok": True, "operation": detail}
@@ -687,12 +672,13 @@ def _mouse_op(
 
 def wait_frame_change(
     cfg: Config,
-    vm_name: str,
+    vm_name: str = "",
     baseline_hash: str = "",
     width: int = 640,
     height: int = 480,
     timeout_s: int = 60,
     interval_s: int = 2,
+    vm_id: str = "",
 ) -> dict:
     if interval_s < 1:
         raise ValueError("interval_s must be >= 1")
@@ -702,11 +688,11 @@ def wait_frame_change(
         raise ValueError("width/height must be within 160..4096")
     if baseline_hash and not re.fullmatch(r"[0-9a-f]{64}", baseline_hash):
         raise ValueError("baseline_hash must be an empty string or a 64-char hex sha256")
-    guid = _vm_guid(cfg, vm_name)
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     max_polls = math.ceil(timeout_s / interval_s)
     script = (
         _WAIT_FRAME_SCRIPT_TMPL.replace("%NS%", _WMI_NS)
-        .replace("%GUID%", guid.lower())
+        .replace("%GUID%", ref.id)
         .replace("%TIMEOUT_S%", str(int(timeout_s)))
         .replace("%MAX_POLLS%", str(max_polls))
         .replace("%W%", str(width))
@@ -753,8 +739,8 @@ def wait_frame_change(
 
 
 def capture_sequence(
-    cfg: Config, vm_name: str, count: int = 3, interval_s: int = 2,
-    width: int = 640, height: int = 480,
+    cfg: Config, vm_name: str = "", count: int = 3, interval_s: int = 2,
+    width: int = 640, height: int = 480, vm_id: str = "",
 ) -> dict:
     if not (1 <= count <= 10):
         raise ValueError("count must be 1..10")
@@ -762,7 +748,8 @@ def capture_sequence(
         raise ValueError("interval_s must be >= 1")
     if not (160 <= width <= 4096 and 160 <= height <= 4096):
         raise ValueError("width/height must be within 160..4096")
-    guid = _vm_guid(cfg, vm_name)
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    guid = ref.id
     frames: list[dict] = []
     images: list = []
     prev_raw: bytes | None = None

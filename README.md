@@ -260,12 +260,26 @@ claude mcp add hyperv -- hyperv-mcp
 
 ## Available Tools (55 total)
 
+### VM identity: `vm_name` and `vm_id` (0.4.0)
+
+Every tool that takes `vm_name` also takes an optional `vm_id` (the VM's CIM
+GUID); exactly one of the two is required. VMs are resolved by GUID end to
+end: operations lock on the resolved GUID (stable across renames),
+`hyperv_list_vms` and `hyperv_get_vm_info` report each VM's `id`, and a name
+that matches more than one VM fails closed with an error listing every
+candidate as `name=guid` so the call can be retried with `vm_id`. When both
+`vm_name` and `vm_id` are given they must resolve to the same VM, otherwise
+the call is rejected as `invalid`. Policy (`allowed_vm_patterns`) applies to
+the caller-supplied name first, and to the name resolved from a `vm_id`
+before anything runs. `hyperv_vm_create` refuses a name that already exists
+(the in-script guard matches the resolver's notion of same-name).
+
 ### VM Lifecycle
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_list_vms` | — | `[{name, state, status, memory_mb, cpu_count, uptime_seconds}]` |
-| `hyperv_get_vm_info` | `vm_name` | `{name, state, generation, memory_mb, cpu_count, checkpoint_count, com_ports, network_adapters, hard_drives, ...}` |
+| `hyperv_list_vms` | — | `[{id, name, state, status, memory_mb, cpu_count, uptime_seconds}]` |
+| `hyperv_get_vm_info` | `vm_name` or `vm_id` | `{id, name, state, generation, memory_mb, cpu_count, checkpoint_count, com_ports, network_adapters, hard_drives, ...}` |
 | `hyperv_start_vm` | `vm_name` | `{status: started\|already_running, vm_name, state}` — waits for Running |
 | `hyperv_stop_vm` | `vm_name`, `method`, `confirm` | `{status, vm_name, method, state}` — waits for final state |
 | `hyperv_reset_vm` | `vm_name`, `confirm` | `{status, vm_name, state}` — waits for Running |

@@ -89,6 +89,34 @@ def test_tool_inventory_registered(fresh_server):
     assert len(schemas) == 55
 
 
+def test_every_vm_tool_schema_has_vm_id(fresh_server):
+    """Issue #8 (server layer): every tool that addresses a VM by name must
+    also accept vm_id as an equally-optional alternative (exactly one of the
+    two identifies the VM; the module layer raises ValueError when neither
+    is given). hyperv_vm_create addresses nothing — it CREATES a VM from a
+    fresh `name` — so it stays name-only."""
+    mod = fresh_server({})
+    schemas = _schemas(mod)
+    vm_tools = {
+        name for name, schema in schemas.items()
+        if "vm_name" in schema.get("properties", {})
+    }
+    missing = sorted(
+        name for name in vm_tools
+        if "vm_id" not in schemas[name].get("properties", {})
+    )
+    assert missing == []
+    for name in vm_tools:
+        assert "vm_name" not in schemas[name].get("required", []), (
+            f"{name}: vm_name must be optional so vm_id-only calls validate"
+        )
+    create_props = schemas["hyperv_vm_create"].get("properties", {})
+    assert "vm_id" not in create_props, (
+        "hyperv_vm_create creates a VM; it must not pretend to address one by GUID"
+    )
+    assert "name" in schemas["hyperv_vm_create"].get("required", [])
+
+
 def test_no_password_params_by_default(fresh_server):
     """F4 regression: username/password must be absent from tool schemas."""
     mod = fresh_server({})

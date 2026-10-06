@@ -11,6 +11,11 @@ from hyperv_mcp.policy import PolicyDenied
 
 CRED = CredentialSet("Administrator", "placeholder-pass")
 
+GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
+# Every vm-taking op resolves name -> GUID in one extra run_ps leg before
+# the action script (vmident.resolve), so queue fakes prepend this response.
+RESOLUTION = pswindows.PSResult(stdout=GUID, returncode=0)
+
 
 class FakePS:
     """Records scripts, returns canned results."""
@@ -58,14 +63,16 @@ def test_vm_info_and_checkpoint_list_reads_use_error_action_stop(monkeypatch, un
     errors; otherwise a transient failure reads as an empty snapshot list or
     empty device inventory."""
     fake = FakePS([
+        RESOLUTION,
         pswindows.PSResult(stdout="[]", returncode=0),
+        RESOLUTION,
         pswindows.PSResult(stdout='{"name": "vm"}', returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     lifecycle.checkpoint_list(unrestricted, "vm")
     lifecycle.get_vm_info(unrestricted, "vm")
-    snap_script = " ".join(fake.scripts[0].split())
-    info_script = " ".join(fake.scripts[1].split())  # ignore cosmetic column alignment
+    snap_script = " ".join(fake.scripts[1].split())
+    info_script = " ".join(fake.scripts[3].split())  # ignore cosmetic column alignment
     assert "Get-VMSnapshot -VM $vm -ErrorAction Stop |" in snap_script
     for cmdlet in ("Get-VMComPort -VM $vm", "Get-VMNetworkAdapter -VM $vm",
                    "Get-VMHardDiskDrive -VM $vm", "Get-VMSnapshot -VM $vm"):
@@ -101,23 +108,25 @@ def test_list_vms_maps_snake_and_pascal(monkeypatch, unrestricted):
 def test_stop_vm_shutdown_has_no_force_flag(monkeypatch, unrestricted):
     """F7 regression: graceful shutdown must not pass -Force."""
     fake = FakePS([
+        RESOLUTION,
         pswindows.PSResult(stdout=json.dumps({"initial_state": "Running"}), returncode=0),
         pswindows.PSResult(stdout=json.dumps({"final_state": "Off"}), returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = lifecycle.stop_vm(unrestricted, "test-vm-1", "shutdown", confirm=True)
     assert out["status"] == "stopped" and out["state"] == "Off"
-    assert "-Force" not in fake.scripts[0]
+    assert "-Force" not in fake.scripts[1]
 
 
 def test_stop_vm_shutdown_force_uses_force(monkeypatch, unrestricted):
     fake = FakePS([
+        RESOLUTION,
         pswindows.PSResult(stdout=json.dumps({"initial_state": "Running"}), returncode=0),
         pswindows.PSResult(stdout=json.dumps({"final_state": "Off"}), returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     lifecycle.stop_vm(unrestricted, "test-vm-1", "shutdown-force", confirm=True)
-    assert "-Force" in fake.scripts[0]
+    assert "-Force" in fake.scripts[1]
 
 
 def test_stop_vm_methods_validated(unrestricted):
@@ -127,6 +136,7 @@ def test_stop_vm_methods_validated(unrestricted):
 
 def test_stop_vm_waits_for_saved_state(monkeypatch, unrestricted):
     fake = FakePS([
+        RESOLUTION,
         pswindows.PSResult(stdout=json.dumps({"initial_state": "Running"}), returncode=0),
         pswindows.PSResult(stdout=json.dumps({"final_state": "Saved"}), returncode=0),
     ])
@@ -156,17 +166,23 @@ def test_vm_policy_denied_before_ps(monkeypatch):
 def test_start_vm_wildcard_escaped_in_script(monkeypatch, unrestricted):
     """Wildcard chars must match literally (CIM -eq) and bind by resolved GUID."""
     fake = FakePS([
+        RESOLUTION,
         pswindows.PSResult(stdout=json.dumps({"initial_state": "Off"}), returncode=0),
         pswindows.PSResult(stdout=json.dumps({"final_state": "Running"}), returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     lifecycle.start_vm(unrestricted, "weird*[1]")
+    # The name reaches PowerShell only inside the resolution leg, as a
+    # literal CIM -eq (wildcard-inert).
     assert "$_.ElementName -eq 'weird*[1]'" in fake.scripts[0]
-    assert "Get-VM -Id $vmTarget" in fake.scripts[0]
+    # The action script addresses the pre-resolved GUID, never the name.
+    assert f"$vmTarget = '{GUID}'" in fake.scripts[1]
+    assert "Get-VM -Id $vmTarget" in fake.scripts[1]
 
 
 def test_start_vm_already_running_idempotent(monkeypatch, unrestricted):
     fake = FakePS([
+        RESOLUTION,
         pswindows.PSResult(stdout=json.dumps({"initial_state": "Running"}), returncode=0),
         pswindows.PSResult(stdout=json.dumps({"final_state": "Running"}), returncode=0),
     ])
@@ -174,11 +190,12 @@ def test_start_vm_already_running_idempotent(monkeypatch, unrestricted):
     out = lifecycle.start_vm(unrestricted, "vm1")
     assert out["status"] == "already_running"
     # Start-VM only runs inside the state guard, never for an already-running VM
-    assert "if ($initial -ne 'Running') { Start-VM -VM $vm" in fake.scripts[0]
+    assert "if ($initial -ne 'Running') { Start-VM -VM $vm" in fake.scripts[1]
 
 
 def test_state_wait_timeout_error(monkeypatch, unrestricted):
     fake = FakePS([
+        RESOLUTION,
         pswindows.PSResult(stdout=json.dumps({"initial_state": "Running"}), returncode=0),
         pswindows.PSResult(stdout=json.dumps({"final_state": "Stopping"}), returncode=3),
     ])
@@ -188,17 +205,18 @@ def test_state_wait_timeout_error(monkeypatch, unrestricted):
 
 
 def test_checkpoint_name_autogenerated(monkeypatch, unrestricted):
-    fake = FakePS([pswindows.PSResult(stdout="", returncode=0)])
+    fake = FakePS([RESOLUTION, pswindows.PSResult(stdout="", returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = lifecycle.checkpoint_create(unrestricted, "vm1")
     assert out["checkpoint_name"].startswith("MCP-")
-    assert "MCP-" in fake.scripts[0]
+    assert "MCP-" in fake.scripts[1]
 
 
 def test_checkpoint_restore_gated_and_reports_state(monkeypatch):
     cfg = Config(allowed_vm_patterns=["test-*"], unrestricted=False)
     cfg.destructive.checkpoint_restore = True
     fake = FakePS([
+        RESOLUTION,
         pswindows.PSResult(stdout="", returncode=0),
         pswindows.PSResult(stdout=json.dumps({"final_state": "Off"}), returncode=0),
     ])
@@ -211,11 +229,11 @@ def test_checkpoint_restore_gated_and_reports_state(monkeypatch):
 
 
 def test_checkpoint_remove_subtree_flag(monkeypatch, unrestricted):
-    fake = FakePS([pswindows.PSResult(stdout="", returncode=0)])
+    fake = FakePS([RESOLUTION, pswindows.PSResult(stdout="", returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     lifecycle.checkpoint_remove(unrestricted, "vm1", "snap", include_subtree=True, confirm=True)
-    assert "-IncludeAllChildSnapshots" in fake.scripts[0]
-    assert "-Confirm:$false" in fake.scripts[0]
+    assert "-IncludeAllChildSnapshots" in fake.scripts[1]
+    assert "-Confirm:$false" in fake.scripts[1]
 
 
 def test_checkpoint_remove_unrestricted_still_needs_confirm(monkeypatch):
@@ -261,6 +279,7 @@ def test_kdnet_bcdedit_uses_direct_arg_form(monkeypatch, unrestricted):
     one 'a b' argument — verified empirically), so the direct form is required.
     """
     fake = FakePS([
+        RESOLUTION,
         pswindows.PSResult(stdout=json.dumps({"DbgSettings": "ok"}), returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
@@ -268,12 +287,13 @@ def test_kdnet_bcdedit_uses_direct_arg_form(monkeypatch, unrestricted):
         unrestricted, "vm1", "192.0.2.1", 50000, "a1b2c.d3e4f.5a6b7.c8d9e",
         reboot=False, confirm=True, cred=CRED,
     )
-    assert "& 'bcdedit.exe' '/dbgsettings' 'net'" in fake.scripts[0]
-    assert "@('/dbgsettings'" not in fake.scripts[0]
+    assert "& 'bcdedit.exe' '/dbgsettings' 'net'" in fake.scripts[1]
+    assert "@('/dbgsettings'" not in fake.scripts[1]
 
 
 def test_kdnet_generated_key_returned(monkeypatch, unrestricted):
     fake = FakePS([
+        RESOLUTION,
         pswindows.PSResult(stdout=json.dumps({"DbgSettings": "ok"}), returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
@@ -293,6 +313,7 @@ def test_kdcom_pipe_name_validated(unrestricted):
 
 def test_kdcom_requires_off_state_note_and_gates(monkeypatch, unrestricted):
     fake = FakePS([
+        RESOLUTION,
         pswindows.PSResult(stdout="", returncode=0),   # Set-VMComPort
         pswindows.PSResult(stdout=json.dumps({"DbgSettings": "ok"}), returncode=0),
     ])
@@ -301,7 +322,7 @@ def test_kdcom_requires_off_state_note_and_gates(monkeypatch, unrestricted):
         unrestricted, "vm1", "\\\\.\\pipe\\kd_vm1", 1, reboot=False, confirm=True, cred=CRED
     )
     assert out["kernel_attach_string"].startswith("com:pipe,port=")
-    assert "Set-VMComPort" in fake.scripts[0]
+    assert "Set-VMComPort" in fake.scripts[1]
 
 
 def test_label_validation():

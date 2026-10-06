@@ -356,6 +356,16 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                         op.exit_code = result["exit_code"]
                     op.ok = bool(result.get("ok", True))
                     op.error_class = str(result.get("error_class") or "")
+                    # Issue #8 audit clause: a by-id call audited under an
+                    # empty caller name adopts the RESOLVED display name
+                    # (never fabricated — modules return ref.name; where a
+                    # result carries none, the empty caller input stands).
+                    # get_vm_info and vm_create results key the VM display
+                    # name as `name`; every other wrapped result with a
+                    # bare `name` key is also a VM name (audited grep).
+                    display = result.get("vm_name") or result.get("name")
+                    if not vm and display:
+                        op.vm_name = str(display)
                 return result
         except policy.PolicyDenied as exc:
             op.ok = False
@@ -401,7 +411,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
     def hyperv_list_vms() -> list:
         """List all Hyper-V virtual machines and their current state.
 
-        Returns: [{name, state, status, memory_mb, cpu_count, uptime_seconds}]
+        Returns: [{id, name, state, status, memory_mb, cpu_count, uptime_seconds}]
         (Deprecated PascalCase aliases Name/State/... are also included
         through the 0.2.x series.)
         """
@@ -409,32 +419,39 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return lifecycle.list_vms(_cfg())
 
     @mcp.tool()
-    def hyperv_get_vm_info(vm_name: str) -> dict:
+    def hyperv_get_vm_info(vm_name: str = "", vm_id: str = "") -> dict:
         """Get detailed info about a Hyper-V VM: state, generation, COM ports,
         network adapters, hard drives, checkpoint count.
 
         Args:
             vm_name: Name of the VM (must match allowed_vm_patterns)
+            vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {name, state, generation, memory_mb, cpu_count,
+        Returns: {id, name, state, generation, memory_mb, cpu_count,
                   checkpoint_count, com_ports, network_adapters, hard_drives, ...}
         """
-        with _audit("hyperv_get_vm_info", vm_name, "read"):
-            return lifecycle.get_vm_info(_cfg(), vm_name)
+        return _run_guest_tool(
+            "hyperv_get_vm_info", vm_name, "read",
+            lifecycle.get_vm_info, _cfg(), vm_name, vm_id=vm_id,
+        )
 
     @mcp.tool()
-    def hyperv_start_vm(vm_name: str) -> dict:
+    def hyperv_start_vm(vm_name: str = "", vm_id: str = "") -> dict:
         """Start a Hyper-V VM and wait until it reports Running.
 
         Idempotent: an already-running VM returns status "already_running".
 
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
         Returns: {status, vm_name, state}
         """
-        with _audit("hyperv_start_vm", vm_name, "lifecycle"):
-            return lifecycle.start_vm(_cfg(), vm_name)
+        return _run_guest_tool(
+            "hyperv_start_vm", vm_name, "lifecycle",
+            lifecycle.start_vm, _cfg(), vm_name, vm_id=vm_id,
+        )
 
     @mcp.tool()
-    def hyperv_stop_vm(vm_name: str, method: str = "shutdown", confirm: bool = False) -> dict:
+    def hyperv_stop_vm(vm_name: str = "", method: str = "shutdown", confirm: bool = False, vm_id: str = "") -> dict:
         """Stop a Hyper-V VM and wait until it reaches the final state.
 
         Args:
@@ -445,82 +462,111 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                      "save" — suspend to disk (final state Saved)
                      "turnoff" — hard power-off
             confirm: Must be true (destructive.require_confirm)
+            vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {status, vm_name, method, state}
         """
-        with _audit("hyperv_stop_vm", vm_name, "destructive"):
-            return lifecycle.stop_vm(_cfg(), vm_name, method, confirm)
+        return _run_guest_tool(
+            "hyperv_stop_vm", vm_name, "destructive",
+            lifecycle.stop_vm, _cfg(), vm_name,
+            method=method, confirm=confirm, vm_id=vm_id,
+        )
 
     @mcp.tool()
-    def hyperv_reset_vm(vm_name: str, confirm: bool = False) -> dict:
+    def hyperv_reset_vm(vm_name: str = "", confirm: bool = False, vm_id: str = "") -> dict:
         """Hard-reset a Hyper-V VM (power off immediately, start again) and
         wait until it reports Running. Equivalent to the physical reset button.
 
         Args:
+            vm_name: Name of the VM
             confirm: Must be true (destructive.require_confirm)
+            vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {status, vm_name, state}
         """
-        with _audit("hyperv_reset_vm", vm_name, "destructive"):
-            return lifecycle.reset_vm(_cfg(), vm_name, confirm)
+        return _run_guest_tool(
+            "hyperv_reset_vm", vm_name, "destructive",
+            lifecycle.reset_vm, _cfg(), vm_name, confirm=confirm, vm_id=vm_id,
+        )
 
     # ---- checkpoints ----------------------------------------------------
 
     @mcp.tool()
-    def hyperv_checkpoint_create(vm_name: str, checkpoint_name: str = "") -> dict:
+    def hyperv_checkpoint_create(vm_name: str = "", checkpoint_name: str = "", vm_id: str = "") -> dict:
         """Create a checkpoint (snapshot) of a Hyper-V VM.
 
         Args:
             vm_name:         Name of the VM
             checkpoint_name: Label (auto timestamp if omitted)
+            vm_id:           Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {status, vm_name, checkpoint_name}
         """
-        with _audit("hyperv_checkpoint_create", vm_name, "checkpoint"):
-            return lifecycle.checkpoint_create(_cfg(), vm_name, checkpoint_name)
+        return _run_guest_tool(
+            "hyperv_checkpoint_create", vm_name, "checkpoint",
+            lifecycle.checkpoint_create, _cfg(), vm_name,
+            checkpoint_name=checkpoint_name, vm_id=vm_id,
+        )
 
     @mcp.tool()
-    def hyperv_checkpoint_list(vm_name: str) -> list:
+    def hyperv_checkpoint_list(vm_name: str = "", vm_id: str = "") -> list:
         """List checkpoints of a Hyper-V VM.
+
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: [{name, type, created, parent_name}]
         """
-        with _audit("hyperv_checkpoint_list", vm_name, "read"):
-            return lifecycle.checkpoint_list(_cfg(), vm_name)
+        # list on success, {"ok": False, ...} envelope on failure (the one
+        # list-returning tool routed through the envelope mapping).
+        return _run_guest_tool(  # type: ignore[return-value]
+            "hyperv_checkpoint_list", vm_name, "read",
+            lifecycle.checkpoint_list, _cfg(), vm_name, vm_id=vm_id,
+        )
 
     @mcp.tool()
     def hyperv_checkpoint_restore(
-        vm_name: str, checkpoint_name: str, confirm: bool = False
+        vm_name: str = "", checkpoint_name: str = "", confirm: bool = False, vm_id: str = ""
     ) -> dict:
         """Restore a VM to a checkpoint. ALL STATE SINCE THE CHECKPOINT IS
         DISCARDED. The VM ends powered off; call hyperv_start_vm afterwards.
 
         Args:
+            vm_name:         Name of the VM
             checkpoint_name: Name of the checkpoint to restore
             confirm:         Must be true (destructive.require_confirm)
+            vm_id:           Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {status, vm_name, checkpoint_name, state, note}
         """
-        with _audit("hyperv_checkpoint_restore", vm_name, "destructive"):
-            return lifecycle.checkpoint_restore(_cfg(), vm_name, checkpoint_name, confirm)
+        return _run_guest_tool(
+            "hyperv_checkpoint_restore", vm_name, "destructive",
+            lifecycle.checkpoint_restore, _cfg(), vm_name,
+            checkpoint_name=checkpoint_name, confirm=confirm, vm_id=vm_id,
+        )
 
     @mcp.tool()
     def hyperv_checkpoint_remove(
-        vm_name: str, checkpoint_name: str, include_subtree: bool = False, confirm: bool = False
+        vm_name: str = "", checkpoint_name: str = "", include_subtree: bool = False,
+        confirm: bool = False, vm_id: str = "",
     ) -> dict:
         """Remove a checkpoint, optionally with its whole child subtree.
         Merged disks cannot be undone afterwards.
 
         Args:
+            vm_name:         Name of the VM
+            checkpoint_name: Name of the checkpoint to remove
             include_subtree: Also remove all child checkpoints
             confirm:         Must be true (destructive.require_confirm)
+            vm_id:           Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {status, vm_name, checkpoint_name}
         """
-        with _audit("hyperv_checkpoint_remove", vm_name, "destructive"):
-            return lifecycle.checkpoint_remove(
-                _cfg(), vm_name, checkpoint_name, include_subtree, confirm
-            )
+        return _run_guest_tool(
+            "hyperv_checkpoint_remove", vm_name, "destructive",
+            lifecycle.checkpoint_remove, _cfg(), vm_name,
+            checkpoint_name=checkpoint_name, include_subtree=include_subtree,
+            confirm=confirm, vm_id=vm_id,
+        )
 
     # ---- KD setup ---------------------------------------------------------
 
@@ -528,9 +574,10 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         @mcp.tool()
         def hyperv_configure_kdnet(
-            vm_name: str, host_ip: str, port: int = 50000, key: str = "",
+            vm_name: str = "", host_ip: str = "", port: int = 50000, key: str = "",
             reboot: bool = False, confirm: bool = False,
             username: str = "", password: str = "",
+            vm_id: str = "",
         ) -> dict:
             """Configure KDNET (network kernel debugging) in a guest via
             PowerShell Direct + bcdedit. Returns kernel_attach_string for
@@ -538,51 +585,60 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             username/password (inline requires allow_inline_credentials=true).
 
             Args:
+                vm_name:  Name of the VM
                 host_ip:  Debugger host IP on the VM's vSwitch (IPv4/IPv6)
                 port:     UDP port (1024-65535)
                 key:      kdnet key a.b.c.d hex — auto-generated if omitted
                 reboot:   Reboot the guest after configuring
                 confirm:  Must be true (destructive.require_confirm)
+                vm_id:    Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {status, vm_name, host_ip, port, key,
                       kernel_attach_string, bcdedit_output, rebooting}
             """
-            with _audit("hyperv_configure_kdnet", vm_name, "destructive"):
-                return lifecycle.configure_kdnet(
-                    _cfg(), vm_name, host_ip, port, key, reboot, confirm,
-                    cred=_cred_args(username, password),
-                )
+            return _run_guest_tool(
+                "hyperv_configure_kdnet", vm_name, "destructive",
+                lifecycle.configure_kdnet, _cfg(), vm_name,
+                host_ip=host_ip, port=port, key=key, reboot=reboot,
+                confirm=confirm, vm_id=vm_id,
+                cred_factory=lambda: _cred_args(username, password),
+            )
 
         @mcp.tool()
         def hyperv_configure_kdcom(
-            vm_name: str, pipe_name: str = "", com_port: int = 1,
+            vm_name: str = "", pipe_name: str = "", com_port: int = 1,
             reboot: bool = False, confirm: bool = False,
             username: str = "", password: str = "",
+            vm_id: str = "",
         ) -> dict:
             """Configure COM-port/named-pipe kernel debugging. Maps the VM COM
             port to a host named pipe (VM must be Off/Saved) and runs bcdedit
             in the guest. Use only when KDNET is unavailable.
 
             Args:
+                vm_name:   Name of the VM
                 pipe_name: Named pipe path — auto-generated if omitted
                 com_port:  1 or 2 (default 1)
                 confirm:   Must be true (destructive.require_confirm)
+                vm_id:     Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {status, vm_name, com_port, pipe_path,
                       kernel_attach_string, bcdedit_output, rebooting}
             """
-            with _audit("hyperv_configure_kdcom", vm_name, "destructive"):
-                return lifecycle.configure_kdcom(
-                    _cfg(), vm_name, pipe_name, com_port, reboot, confirm,
-                    cred=_cred_args(username, password),
-                )
+            return _run_guest_tool(
+                "hyperv_configure_kdcom", vm_name, "destructive",
+                lifecycle.configure_kdcom, _cfg(), vm_name,
+                pipe_name=pipe_name, com_port=com_port, reboot=reboot,
+                confirm=confirm, vm_id=vm_id,
+                cred_factory=lambda: _cred_args(username, password),
+            )
 
     else:
 
         @mcp.tool()
         def hyperv_configure_kdnet(
-            vm_name: str, host_ip: str, port: int = 50000, key: str = "",
-            reboot: bool = False, confirm: bool = False,
+            vm_name: str = "", host_ip: str = "", port: int = 50000, key: str = "",
+            reboot: bool = False, confirm: bool = False, vm_id: str = "",
         ) -> dict:
             """Configure KDNET (network kernel debugging) in a guest via
             PowerShell Direct + bcdedit. Returns kernel_attach_string for
@@ -590,25 +646,29 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             HYPERV_GUEST_PASSWORD (or HYPERV_GUEST_PASSWORD_FILE).
 
             Args:
+                vm_name:  Name of the VM
                 host_ip:  Debugger host IP on the VM's vSwitch (IPv4/IPv6)
                 port:     UDP port (1024-65535)
                 key:      kdnet key a.b.c.d hex — auto-generated if omitted
                 reboot:   Reboot the guest after configuring
                 confirm:  Must be true (destructive.require_confirm)
+                vm_id:    Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {status, vm_name, host_ip, port, key,
                       kernel_attach_string, bcdedit_output, rebooting}
             """
-            with _audit("hyperv_configure_kdnet", vm_name, "destructive"):
-                return lifecycle.configure_kdnet(
-                    _cfg(), vm_name, host_ip, port, key, reboot, confirm,
-                    cred=credentials.resolve_guest(),
-                )
+            return _run_guest_tool(
+                "hyperv_configure_kdnet", vm_name, "destructive",
+                lifecycle.configure_kdnet, _cfg(), vm_name,
+                host_ip=host_ip, port=port, key=key, reboot=reboot,
+                confirm=confirm, vm_id=vm_id,
+                cred_factory=credentials.resolve_guest,
+            )
 
         @mcp.tool()
         def hyperv_configure_kdcom(
-            vm_name: str, pipe_name: str = "", com_port: int = 1,
-            reboot: bool = False, confirm: bool = False,
+            vm_name: str = "", pipe_name: str = "", com_port: int = 1,
+            reboot: bool = False, confirm: bool = False, vm_id: str = "",
         ) -> dict:
             """Configure COM-port/named-pipe kernel debugging. Maps the VM COM
             port to a host named pipe (VM must be Off/Saved) and runs bcdedit
@@ -616,18 +676,22 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             HYPERV_GUEST_PASSWORD (or HYPERV_GUEST_PASSWORD_FILE).
 
             Args:
+                vm_name:   Name of the VM
                 pipe_name: Named pipe path — auto-generated if omitted
                 com_port:  1 or 2 (default 1)
                 confirm:   Must be true (destructive.require_confirm)
+                vm_id:     Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {status, vm_name, com_port, pipe_path,
                       kernel_attach_string, bcdedit_output, rebooting}
             """
-            with _audit("hyperv_configure_kdcom", vm_name, "destructive"):
-                return lifecycle.configure_kdcom(
-                    _cfg(), vm_name, pipe_name, com_port, reboot, confirm,
-                    cred=credentials.resolve_guest(),
-                )
+            return _run_guest_tool(
+                "hyperv_configure_kdcom", vm_name, "destructive",
+                lifecycle.configure_kdcom, _cfg(), vm_name,
+                pipe_name=pipe_name, com_port=com_port, reboot=reboot,
+                confirm=confirm, vm_id=vm_id,
+                cred_factory=credentials.resolve_guest,
+            )
 
     # ---- guest execution ------------------------------------------------
 
@@ -635,14 +699,19 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         @mcp.tool()
         def hyperv_guest_run_ps(
-            vm_name: str, script: str, timeout_ms: int = 60000,
+            vm_name: str = "", script: str = "", timeout_ms: int = 60000,
             elevated: bool = False, confirm: bool = False,
             username: str = "", password: str = "",
+            vm_id: str = "",
         ) -> dict:
             """Run a PowerShell script inside a guest via PowerShell Direct.
             stdout/stderr are SEPARATE (0.2.0 change); exit codes are real.
             elevated=true runs at High IL via UAC RunAs (merged streams; needs
             destructive.elevated_exec + confirm).
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
             or {ok: false, error, error_class}
@@ -651,19 +720,24 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 "hyperv_guest_run_ps", vm_name, "exec",
                 guestexec.guest_run_ps, _cfg(), vm_name, script,
                 timeout_ms=timeout_ms, elevated=elevated, confirm=confirm,
-                cred_factory=lambda: _cred_args(username, password),
+                vm_id=vm_id, cred_factory=lambda: _cred_args(username, password),
             )
 
         @mcp.tool()
         def hyperv_guest_run(
-            vm_name: str, command: str, args: list[str] | None = None,
+            vm_name: str = "", command: str = "", args: list[str] | None = None,
             cwd: str | None = None, timeout_ms: int = 60000,
             elevated: bool = False, confirm: bool = False,
             username: str = "", password: str = "",
+            vm_id: str = "",
         ) -> dict:
             """Run an executable inside a guest via PowerShell Direct.
             Separate stdout/stderr, real exit codes. elevated=true needs
             destructive.elevated_exec + confirm.
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
             or {ok: false, error, error_class}
@@ -672,18 +746,23 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 "hyperv_guest_run", vm_name, "exec",
                 guestexec.guest_run, _cfg(), vm_name, command, args, cwd,
                 timeout_ms=timeout_ms, elevated=elevated, confirm=confirm,
-                cred_factory=lambda: _cred_args(username, password),
+                vm_id=vm_id, cred_factory=lambda: _cred_args(username, password),
             )
 
         @mcp.tool()
         def hyperv_guest_put(
-            vm_name: str, local_path: str, remote_path: str,
+            vm_name: str = "", local_path: str = "", remote_path: str = "",
             confirm: bool = False, verify: bool | None = None,
             username: str = "", password: str = "",
+            vm_id: str = "",
         ) -> dict:
             """Copy a host file into a guest via PowerShell Direct. Staged
             rename, parent dirs created, optional SHA-256 verification
             (verify=True, or config verify_sha256). Needs guest_write policy.
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, bytes_copied, sha256_local?, sha256_remote?}
             or {ok: false, error, error_class}
@@ -691,17 +770,23 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return _run_guest_tool(
                 "hyperv_guest_put", vm_name, "transfer",
                 filetransfer.guest_put, _cfg(), vm_name, local_path, remote_path,
-                confirm=confirm, verify=verify, cred_factory=lambda: _cred_args(username, password),
+                confirm=confirm, verify=verify, vm_id=vm_id,
+                cred_factory=lambda: _cred_args(username, password),
             )
 
         @mcp.tool()
         def hyperv_guest_get(
-            vm_name: str, remote_path: str, local_path: str,
+            vm_name: str = "", remote_path: str = "", local_path: str = "",
             verify: bool | None = None,
             username: str = "", password: str = "",
+            vm_id: str = "",
         ) -> dict:
             """Copy a guest file to the host via PowerShell Direct. Staged
             rename, local parent dirs created, optional SHA-256 verification.
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, bytes_copied, sha256_local?, sha256_remote?}
             or {ok: false, error, error_class}
@@ -709,16 +794,22 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return _run_guest_tool(
                 "hyperv_guest_get", vm_name, "transfer",
                 filetransfer.guest_get, _cfg(), vm_name, remote_path, local_path,
-                verify=verify, cred_factory=lambda: _cred_args(username, password),
+                verify=verify, vm_id=vm_id,
+                cred_factory=lambda: _cred_args(username, password),
             )
 
         @mcp.tool()
         def hyperv_guest_read_file(
-            vm_name: str, remote_path: str, max_bytes: int = 262144,
+            vm_name: str = "", remote_path: str = "", max_bytes: int = 262144,
             username: str = "", password: str = "",
+            vm_id: str = "",
         ) -> dict:
             """Read up to max_bytes of a guest file (base64). Bounded stream
             read; max_bytes must be >= 1.
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, content_b64, bytes_read, truncated}
             or {ok: false, error, error_class}
@@ -726,15 +817,20 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return _run_guest_tool(
                 "hyperv_guest_read_file", vm_name, "transfer",
                 filetransfer.guest_read_file, _cfg(), vm_name, remote_path, max_bytes,
-                cred_factory=lambda: _cred_args(username, password),
+                vm_id=vm_id, cred_factory=lambda: _cred_args(username, password),
             )
 
         @mcp.tool()
         def hyperv_guest_list_dir(
-            vm_name: str, remote_path: str,
+            vm_name: str = "", remote_path: str = "",
             username: str = "", password: str = "",
+            vm_id: str = "",
         ) -> dict:
             """List a directory in the guest.
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, entries: [{name, is_dir, size_bytes, modified}]}
             or {ok: false, error, error_class}
@@ -742,15 +838,15 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return _run_guest_tool(
                 "hyperv_guest_list_dir", vm_name, "transfer",
                 filetransfer.guest_list_dir, _cfg(), vm_name, remote_path,
-                cred_factory=lambda: _cred_args(username, password),
+                vm_id=vm_id, cred_factory=lambda: _cred_args(username, password),
             )
 
     else:
 
         @mcp.tool()
         def hyperv_guest_run_ps(
-            vm_name: str, script: str, timeout_ms: int = 60000,
-            elevated: bool = False, confirm: bool = False,
+            vm_name: str = "", script: str = "", timeout_ms: int = 60000,
+            elevated: bool = False, confirm: bool = False, vm_id: str = "",
         ) -> dict:
             """Run a PowerShell script inside a guest via PowerShell Direct.
             stdout/stderr are SEPARATE (0.2.0 change); exit codes are real.
@@ -758,6 +854,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             HYPERV_GUEST_PASSWORD_FILE. elevated=true needs
             destructive.elevated_exec + confirm.
 
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
             Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
             or {ok: false, error, error_class}
             """
@@ -765,20 +863,22 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 "hyperv_guest_run_ps", vm_name, "exec",
                 guestexec.guest_run_ps, _cfg(), vm_name, script,
                 timeout_ms=timeout_ms, elevated=elevated, confirm=confirm,
-                cred_factory=credentials.resolve_guest,
+                vm_id=vm_id, cred_factory=credentials.resolve_guest,
             )
 
         @mcp.tool()
         def hyperv_guest_run(
-            vm_name: str, command: str, args: list[str] | None = None,
+            vm_name: str = "", command: str = "", args: list[str] | None = None,
             cwd: str | None = None, timeout_ms: int = 60000,
-            elevated: bool = False, confirm: bool = False,
+            elevated: bool = False, confirm: bool = False, vm_id: str = "",
         ) -> dict:
             """Run an executable inside a guest via PowerShell Direct.
             Separate stdout/stderr, real exit codes. Credentials:
             HYPERV_GUEST_USERNAME / HYPERV_GUEST_PASSWORD /
             HYPERV_GUEST_PASSWORD_FILE. elevated=true needs
             destructive.elevated_exec + confirm.
+
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
             or {ok: false, error, error_class}
@@ -787,17 +887,19 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 "hyperv_guest_run", vm_name, "exec",
                 guestexec.guest_run, _cfg(), vm_name, command, args, cwd,
                 timeout_ms=timeout_ms, elevated=elevated, confirm=confirm,
-                cred_factory=credentials.resolve_guest,
+                vm_id=vm_id, cred_factory=credentials.resolve_guest,
             )
 
         @mcp.tool()
         def hyperv_guest_put(
-            vm_name: str, local_path: str, remote_path: str,
-            confirm: bool = False, verify: bool | None = None,
+            vm_name: str = "", local_path: str = "", remote_path: str = "",
+            confirm: bool = False, verify: bool | None = None, vm_id: str = "",
         ) -> dict:
             """Copy a host file into a guest via PowerShell Direct. Staged
             rename, parent dirs created, optional SHA-256 verification.
             Needs guest_write policy + confirm.
+
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, bytes_copied, sha256_local?, sha256_remote?}
             or {ok: false, error, error_class}
@@ -805,16 +907,19 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return _run_guest_tool(
                 "hyperv_guest_put", vm_name, "transfer",
                 filetransfer.guest_put, _cfg(), vm_name, local_path, remote_path,
-                confirm=confirm, verify=verify, cred_factory=credentials.resolve_guest,
+                confirm=confirm, verify=verify, vm_id=vm_id,
+                cred_factory=credentials.resolve_guest,
             )
 
         @mcp.tool()
         def hyperv_guest_get(
-            vm_name: str, remote_path: str, local_path: str,
-            verify: bool | None = None,
+            vm_name: str = "", remote_path: str = "", local_path: str = "",
+            verify: bool | None = None, vm_id: str = "",
         ) -> dict:
             """Copy a guest file to the host via PowerShell Direct. Staged
             rename, local parent dirs created, optional SHA-256 verification.
+
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, bytes_copied, sha256_local?, sha256_remote?}
             or {ok: false, error, error_class}
@@ -822,15 +927,18 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return _run_guest_tool(
                 "hyperv_guest_get", vm_name, "transfer",
                 filetransfer.guest_get, _cfg(), vm_name, remote_path, local_path,
-                verify=verify, cred_factory=credentials.resolve_guest,
+                verify=verify, vm_id=vm_id, cred_factory=credentials.resolve_guest,
             )
 
         @mcp.tool()
         def hyperv_guest_read_file(
-            vm_name: str, remote_path: str, max_bytes: int = 262144,
+            vm_name: str = "", remote_path: str = "", max_bytes: int = 262144,
+            vm_id: str = "",
         ) -> dict:
             """Read up to max_bytes of a guest file (base64). Bounded stream
             read; max_bytes must be >= 1.
+
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, content_b64, bytes_read, truncated}
             or {ok: false, error, error_class}
@@ -838,12 +946,14 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return _run_guest_tool(
                 "hyperv_guest_read_file", vm_name, "transfer",
                 filetransfer.guest_read_file, _cfg(), vm_name, remote_path, max_bytes,
-                cred_factory=credentials.resolve_guest,
+                vm_id=vm_id, cred_factory=credentials.resolve_guest,
             )
 
         @mcp.tool()
-        def hyperv_guest_list_dir(vm_name: str, remote_path: str) -> dict:
+        def hyperv_guest_list_dir(vm_name: str = "", remote_path: str = "", vm_id: str = "") -> dict:
             """List a directory in the guest.
+
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, entries: [{name, is_dir, size_bytes, modified}]}
             or {ok: false, error, error_class}
@@ -851,19 +961,21 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             return _run_guest_tool(
                 "hyperv_guest_list_dir", vm_name, "transfer",
                 filetransfer.guest_list_dir, _cfg(), vm_name, remote_path,
-                cred_factory=credentials.resolve_guest,
+                vm_id=vm_id, cred_factory=credentials.resolve_guest,
             )
 
     # ---- victim execution (env-only credentials, never elevated) --------
 
     @mcp.tool()
     def hyperv_victim_run(
-        vm_name: str, command: str, args: list[str] | None = None,
-        cwd: str | None = None, timeout_ms: int = 60000,
+        vm_name: str = "", command: str = "", args: list[str] | None = None,
+        cwd: str | None = None, timeout_ms: int = 60000, vm_id: str = "",
     ) -> dict:
         """Run an executable in the guest as the unprivileged victim account
         (Medium IL). Credentials: HYPERV_GUEST_VICTIM_USERNAME /
         HYPERV_GUEST_VICTIM_PASSWORD / HYPERV_GUEST_VICTIM_PASSWORD_FILE.
+
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
         or {ok: false, error, error_class}
@@ -871,13 +983,18 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         return _run_guest_tool(
             "hyperv_victim_run", vm_name, "victim",
             guestexec.victim_run, _cfg(), vm_name, command, args, cwd,
-            timeout_ms=timeout_ms, cred_factory=credentials.resolve_victim,
+            timeout_ms=timeout_ms, vm_id=vm_id,
+            cred_factory=credentials.resolve_victim,
         )
 
     @mcp.tool()
-    def hyperv_victim_run_ps(vm_name: str, script: str, timeout_ms: int = 60000) -> dict:
+    def hyperv_victim_run_ps(
+        vm_name: str = "", script: str = "", timeout_ms: int = 60000, vm_id: str = ""
+    ) -> dict:
         """Run a PowerShell script in the guest as the unprivileged victim
         account (Medium IL). Victim credentials from environment only.
+
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
         or {ok: false, error, error_class}
@@ -885,7 +1002,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         return _run_guest_tool(
             "hyperv_victim_run_ps", vm_name, "victim",
             guestexec.victim_run_ps, _cfg(), vm_name, script,
-            timeout_ms=timeout_ms, cred_factory=credentials.resolve_victim,
+            timeout_ms=timeout_ms, vm_id=vm_id,
+            cred_factory=credentials.resolve_victim,
         )
 
     # ---- console (WMI screenshot / keyboard / mouse) --------------------
@@ -912,7 +1030,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
     @mcp.tool()
     def hyperv_console_screenshot(
-        vm_name: str, width: int = 1024, height: int = 768, save_path: str = ""
+        vm_name: str = "", width: int = 1024, height: int = 768, save_path: str = "",
+        vm_id: str = "",
     ) -> Any:
         """Capture the VM console via Hyper-V WMI (works from firmware through
         WinPE; independent of VMConnect, host foreground, guest login/network).
@@ -924,6 +1043,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         Args:
             vm_name:  VM name (must match allowed_vm_patterns)
+            vm_id:    Optional VM GUID; exactly one of vm_name/vm_id must be given
             width:    requested snapshot width (160..4096)
             height:   requested snapshot height (160..4096)
             save_path: optional host path to also save the PNG (host_write policy)
@@ -932,7 +1052,9 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         """
         try:
             with _audit("hyperv_console_screenshot", vm_name, "read"):
-                img, meta = console.screenshot(_cfg(), vm_name, width, height, save_path)
+                img, meta = console.screenshot(
+                    _cfg(), vm_name, width, height, save_path, vm_id=vm_id
+                )
                 buf = io.BytesIO()
                 img.save(buf, format="PNG")
                 # ImageContent is a pydantic model; the raw FastMCP Image
@@ -941,12 +1063,26 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 return [Image(data=buf.getvalue(), format="png").to_image_content(), meta]
         except policy.PolicyDenied as exc:
             return {"ok": False, "error": str(exc), "error_class": "policy"}
+        except CredentialError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "credential"}
+        except VMBusy as exc:
+            return {"ok": False, "error": str(exc), "error_class": "busy"}
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "invalid"}
+        except TimeoutError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "timeout"}
+        except console.ConsoleError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "transport"}
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "transport"}
 
     @mcp.tool()
-    def hyperv_console_get_display_info(vm_name: str) -> dict:
+    def hyperv_console_get_display_info(vm_name: str = "", vm_id: str = "") -> dict:
         """Display head resolution, keyboard/mouse device presence and state,
         and guest-channel readiness (console works in firmware/WinPE;
         PowerShell Direct needs a running supported guest OS).
+
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {ok, enabled_state, head_horizontal, head_vertical,
                   keyboard_present, keyboard_enabled, mouse_present,
@@ -954,69 +1090,83 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         """
         return _run_console_tool(
             "hyperv_console_get_display_info", vm_name, "read",
-            console.get_display_info, _cfg(), vm_name,
+            console.get_display_info, _cfg(), vm_name, vm_id=vm_id,
         )
 
     @mcp.tool()
-    def hyperv_console_type_text(vm_name: str, text: str) -> dict:
+    def hyperv_console_type_text(vm_name: str = "", text: str = "", vm_id: str = "") -> dict:
         """Type ASCII text into the VM console via Msvm_Keyboard.TypeText
         (works pre-login, in WinPE). Text rides the stdin channel — it never
         appears in process argv, the PowerShell script, or error records.
         Chunks over 512 chars with pacing. For non-ASCII input use
         hyperv_console_type_scancodes. Policy: console_input category.
 
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
         Returns: {ok, chunks, chars} or {ok: false, error, error_class}
         """
         return _run_console_tool(
             "hyperv_console_type_text", vm_name, "console_input",
-            console.type_text, _cfg(), vm_name, text,
+            console.type_text, _cfg(), vm_name, text, vm_id=vm_id,
         )
 
     @mcp.tool()
     def hyperv_console_press_key(
-        vm_name: str, key: str, modifiers: list[str] | None = None,
+        vm_name: str = "", key: str = "", modifiers: list[str] | None = None,
+        vm_id: str = "",
     ) -> dict:
         """Press a named key (scan-code make/break pair) with optional
         modifiers (ctrl/alt/shift). Supported keys: enter, escape, tab,
         backspace, space, up/down/left/right, delete, home, end, pageup,
         pagedown, insert, f1-f12, a-z, 0-9. Policy: console_input.
 
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
         Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class}
         """
         return _run_console_tool(
             "hyperv_console_press_key", vm_name, "console_input",
-            console.press_key, _cfg(), vm_name, key, modifiers,
+            console.press_key, _cfg(), vm_name, key, modifiers, vm_id=vm_id,
         )
 
     @mcp.tool()
-    def hyperv_console_key_combo(vm_name: str, keys: list[str]) -> dict:
+    def hyperv_console_key_combo(
+        vm_name: str = "", keys: list[str] | None = None, vm_id: str = ""
+    ) -> dict:
         """Send a key combination: modifier makes first, keys in order,
         modifier breaks last (e.g. ["ctrl", "alt", "delete"]).
         Policy: console_input.
+
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class}
         """
         return _run_console_tool(
             "hyperv_console_key_combo", vm_name, "console_input",
-            console.key_combo, _cfg(), vm_name, keys,
+            console.key_combo, _cfg(), vm_name, keys, vm_id=vm_id,
         )
 
     @mcp.tool()
-    def hyperv_console_type_scancodes(vm_name: str, scancodes: list[int]) -> dict:
+    def hyperv_console_type_scancodes(
+        vm_name: str = "", scancodes: list[int] | None = None, vm_id: str = ""
+    ) -> dict:
         """Send raw PS/2 scan codes (0..255 ints, make/break pairs included)
         via Msvm_Keyboard.TypeScancodes; chunked at 64 codes with pacing.
         Policy: console_input.
+
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class}
         """
         return _run_console_tool(
             "hyperv_console_type_scancodes", vm_name, "console_input",
-            console.type_scancodes, _cfg(), vm_name, scancodes,
+            console.type_scancodes, _cfg(), vm_name, scancodes, vm_id=vm_id,
         )
 
     @mcp.tool()
     def hyperv_console_mouse_move(
-        vm_name: str, x: int, y: int, frame_width: int = 0, frame_height: int = 0,
+        vm_name: str = "", x: int = 0, y: int = 0, frame_width: int = 0,
+        frame_height: int = 0, vm_id: str = "",
     ) -> dict:
         """Position the synthetic mouse. Coordinates are in the space of the
         image you observed; give frame_width/frame_height (the snapshot
@@ -1024,58 +1174,70 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         the head resolution must be available, else the tool errors rather
         than clicking blind. Policy: console_input.
 
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
         Returns: {ok, operation, head_x, head_y} or {ok: false, error, error_class}
         """
         return _run_console_tool(
             "hyperv_console_mouse_move", vm_name, "console_input",
             console.mouse_move, _cfg(), vm_name, x, y, frame_width, frame_height,
+            vm_id=vm_id,
         )
 
     @mcp.tool()
     def hyperv_console_click(
-        vm_name: str, x: int = 0, y: int = 0, frame_width: int = 0,
-        frame_height: int = 0, button: int = 1,
+        vm_name: str = "", x: int = 0, y: int = 0, frame_width: int = 0,
+        frame_height: int = 0, button: int = 1, vm_id: str = "",
     ) -> dict:
         """Click at frame-space coordinates (optional; positions first when
         x/y are given, else clicks at the current position). button: 1=left,
         2=right. Verify placement with a screenshot between steps — never
         assume focus from a prior frame. Policy: console_input.
 
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
         Returns: {ok, operation, head_x?, head_y?} or {ok: false, error, error_class}
         """
         return _run_console_tool(
             "hyperv_console_click", vm_name, "console_input",
             console.click, _cfg(), vm_name, x, y, frame_width, frame_height, button,
+            vm_id=vm_id,
         )
 
     @mcp.tool()
-    def hyperv_console_button(vm_name: str, button: int, is_down: bool) -> dict:
+    def hyperv_console_button(
+        vm_name: str = "", button: int = 1, is_down: bool = False, vm_id: str = ""
+    ) -> dict:
         """Hold or release a mouse button (raw SetButtonState; for drag
         gestures). Policy: console_input.
+
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {ok, operation} or {ok: false, error, error_class}
         """
         return _run_console_tool(
             "hyperv_console_button", vm_name, "console_input",
-            console.mouse_button, _cfg(), vm_name, button, is_down,
+            console.mouse_button, _cfg(), vm_name, button, is_down, vm_id=vm_id,
         )
 
     @mcp.tool()
-    def hyperv_console_scroll(vm_name: str, delta: int) -> dict:
+    def hyperv_console_scroll(vm_name: str = "", delta: int = 0, vm_id: str = "") -> dict:
         """Scroll the console wheel by delta (positive = down).
         Policy: console_input.
+
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {ok, operation} or {ok: false, error, error_class}
         """
         return _run_console_tool(
             "hyperv_console_scroll", vm_name, "console_input",
-            console.scroll, _cfg(), vm_name, delta,
+            console.scroll, _cfg(), vm_name, delta, vm_id=vm_id,
         )
 
     @mcp.tool()
     def hyperv_console_wait_frame_change(
-        vm_name: str, baseline_hash: str = "", width: int = 640, height: int = 480,
-        timeout_s: int = 60, interval_s: int = 2,
+        vm_name: str = "", baseline_hash: str = "", width: int = 640, height: int = 480,
+        timeout_s: int = 60, interval_s: int = 2, vm_id: str = "",
     ) -> Any:
         """Poll the console until the frame changes (or the deadline passes).
         Bounded: polls = ceil(timeout_s/interval_s), deadline enforced
@@ -1086,13 +1248,16 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         the returned image visually.
 
         Args:
-            baseline_hash: frame_hash from a previous capture ("" compares
-                           against nothing — first poll's frame is baseline)
+            vm_name:        VM name (must match allowed_vm_patterns)
+            vm_id:          Optional VM GUID; exactly one of vm_name/vm_id must be given
+            baseline_hash:  frame_hash from a previous capture ("" compares
+                            against nothing — first poll's frame is baseline)
         """
         try:
             with _audit("hyperv_console_wait_frame_change", vm_name, "read"):
                 out = console.wait_frame_change(
-                    _cfg(), vm_name, baseline_hash, width, height, timeout_s, interval_s
+                    _cfg(), vm_name, baseline_hash, width, height, timeout_s,
+                    interval_s, vm_id=vm_id
                 )
                 meta = {k: v for k, v in out.items() if k != "image"}
                 if "image" in out:
@@ -1102,22 +1267,36 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 return meta
         except policy.PolicyDenied as exc:
             return {"ok": False, "error": str(exc), "error_class": "policy"}
+        except CredentialError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "credential"}
+        except VMBusy as exc:
+            return {"ok": False, "error": str(exc), "error_class": "busy"}
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "invalid"}
+        except TimeoutError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "timeout"}
+        except console.ConsoleError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "transport"}
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "transport"}
 
     @mcp.tool()
     def hyperv_console_capture_sequence(
-        vm_name: str, count: int = 3, interval_s: int = 2,
-        width: int = 640, height: int = 480,
+        vm_name: str = "", count: int = 3, interval_s: int = 2,
+        width: int = 640, height: int = 480, vm_id: str = "",
     ) -> Any:
         """Capture a bounded sequence of console frames with per-frame hashes
         and changed-byte counts vs the previous frame (transition evidence,
         not progress inference). Returns [first Image, last Image, meta_text]
         (a single Image when count==1) where meta carries frames[] (index,
         frame_hash, changed_bytes_vs_previous, captured_at), elapsed_ms, dimensions.
+
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
         """
         try:
             with _audit("hyperv_console_capture_sequence", vm_name, "read"):
                 out = console.capture_sequence(
-                    _cfg(), vm_name, count, interval_s, width, height
+                    _cfg(), vm_name, count, interval_s, width, height, vm_id=vm_id
                 )
                 meta = {k: v for k, v in out.items() if k != "images"}
                 parts: list = []
@@ -1130,10 +1309,23 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 return parts
         except policy.PolicyDenied as exc:
             return {"ok": False, "error": str(exc), "error_class": "policy"}
+        except CredentialError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "credential"}
+        except VMBusy as exc:
+            return {"ok": False, "error": str(exc), "error_class": "busy"}
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "invalid"}
+        except TimeoutError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "timeout"}
+        except console.ConsoleError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "transport"}
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "transport"}
 
     @mcp.tool()
     def hyperv_wait_vm_state(
-        vm_name: str, states: list[str], timeout_s: int = 300,
+        vm_name: str = "", states: list[str] | None = None, timeout_s: int = 300,
+        vm_id: str = "",
     ) -> dict:
         """Wait (bounded) until the VM reaches one of the requested states.
         states must be from: Off, Running, Saved, Paused, Starting, Stopping,
@@ -1142,18 +1334,28 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         Windows boots — verify hyperv_console_get_display_info before
         switching channels.
 
-        Returns: {ok, final_state, guest_channel} — raises RuntimeError with
-        the last observed state if the deadline expires first.
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
+        Returns: {ok, final_state, guest_channel} — {ok: false, error_class:
+        "transport"} carrying the last observed state if the deadline
+        expires first.
         """
-        for s in states:
-            if s not in lifecycle.VALID_STATES:
-                raise ValueError(
-                    f"invalid state {s!r}; must be one of {lifecycle.VALID_STATES} "
-                    "(strict validation: no shell metacharacters possible)"
-                )
-        with _audit("hyperv_wait_vm_state", vm_name, "read"):
-            final = lifecycle.wait_for_vm_state(_cfg(), vm_name, list(states), timeout_s)
+
+        def _wait() -> dict:
+            if not states:
+                raise ValueError("states list is required")
+            for s in states:
+                if s not in lifecycle.VALID_STATES:
+                    raise ValueError(
+                        f"invalid state {s!r}; must be one of {lifecycle.VALID_STATES} "
+                        "(strict validation: no shell metacharacters possible)"
+                    )
+            final = lifecycle.wait_for_vm_state(
+                _cfg(), vm_name, list(states), timeout_s, vm_id=vm_id
+            )
             return {"ok": True, "final_state": final, "guest_channel": "ps_direct_unverified"}
+
+        return _run_guest_tool("hyperv_wait_vm_state", vm_name, "read", _wait)
 
     # ---- VM / media preparation (deployment testing) ---------------------
 
@@ -1167,127 +1369,193 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         new name must match allowed_vm_patterns so it stays policy-scoped.
         Policy: vm_provision category + confirm=true.
 
-        Returns: {ok, id, name, state, generation} or raises.
+        Returns: {ok, id, name, state, generation} or {ok: false,
+        error, error_class}.
         """
-        with _audit("hyperv_vm_create", name, "vm_provision"):
-            return media.vm_create(
-                _cfg(), name, memory_mb, cpu_count, generation,
-                vhd_path, vhd_size_gb, switch_name, confirm,
-            )
+        return _run_guest_tool(
+            "hyperv_vm_create", name, "vm_provision",
+            media.vm_create, _cfg(), name,
+            memory_mb=memory_mb, cpu_count=cpu_count, generation=generation,
+            vhd_path=vhd_path, vhd_size_gb=vhd_size_gb, switch_name=switch_name,
+            confirm=confirm,
+        )
 
     @mcp.tool()
     def hyperv_vm_disk_add(
-        vm_name: str, path: str, size_gb: int, controller_type: str = "SCSI",
-        confirm: bool = False,
+        vm_name: str = "", path: str = "", size_gb: int = 0,
+        controller_type: str = "SCSI", confirm: bool = False, vm_id: str = "",
     ) -> dict:
         """Create and attach an additional VHDX (for multi-disk deployment
         tests). Policy: vm_provision + confirm=true.
 
-        Returns: {ok, vhd_path, disk_count} or raises. disk_count is null if
-        the post-add read failed (the disk is attached either way).
+        Args:
+            vm_name: Name of the VM
+            vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+
+        Returns: {ok, vhd_path, disk_count} or {ok: false, error, error_class}.
+        disk_count is null if the post-add read failed (the disk is attached
+        either way).
         """
-        with _audit("hyperv_vm_disk_add", vm_name, "vm_provision"):
-            return media.vm_disk_add(
-                _cfg(), vm_name, path, size_gb, controller_type, confirm,
-            )
+        return _run_guest_tool(
+            "hyperv_vm_disk_add", vm_name, "vm_provision",
+            media.vm_disk_add, _cfg(), vm_name,
+            path=path, size_gb=size_gb, controller_type=controller_type,
+            confirm=confirm, vm_id=vm_id,
+        )
 
     @mcp.tool()
-    def hyperv_vm_disk_list(vm_name: str) -> dict:
+    def hyperv_vm_disk_list(vm_name: str = "", vm_id: str = "") -> dict:
         """List the VM's hard disks (controller type/number, LUN, path) —
         use to verify disk topology before deployment runs.
 
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
         Returns: {ok, disks: [...]}
         """
-        with _audit("hyperv_vm_disk_list", vm_name, "read"):
-            return media.vm_disk_list(_cfg(), vm_name)
+        return _run_guest_tool(
+            "hyperv_vm_disk_list", vm_name, "read",
+            media.vm_disk_list, _cfg(), vm_name, vm_id=vm_id,
+        )
 
     @mcp.tool()
-    def hyperv_vm_media_attach(vm_name: str, iso_path: str) -> dict:
+    def hyperv_vm_media_attach(vm_name: str = "", iso_path: str = "", vm_id: str = "") -> dict:
         """Attach an ISO to a virtual DVD drive (Add-VMDvdDrive). Verify the
         ISO is the intended, freshly built media before claiming a deployment
         tests new fixes. Policy: media category (reversible, no confirm).
         iso_path requires host_read policy.
 
-        Returns: {ok, iso_path, attached} or raises. attached is null if the
-        post-attach read failed (the ISO is attached either way).
+        Args:
+            vm_name: Name of the VM
+            vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+
+        Returns: {ok, iso_path, attached} or {ok: false, error, error_class}.
+        attached is null if the post-attach read failed (the ISO is attached
+        either way).
         """
-        with _audit("hyperv_vm_media_attach", vm_name, "media"):
-            return media.vm_media_attach(_cfg(), vm_name, iso_path)
+        return _run_guest_tool(
+            "hyperv_vm_media_attach", vm_name, "media",
+            media.vm_media_attach, _cfg(), vm_name, iso_path=iso_path, vm_id=vm_id,
+        )
 
     @mcp.tool()
-    def hyperv_vm_media_detach(vm_name: str) -> dict:
+    def hyperv_vm_media_detach(vm_name: str = "", vm_id: str = "") -> dict:
         """Detach all virtual DVD drives; returns the removed ISO paths.
         Policy: media category (reversible, no confirm).
 
-        Returns: {ok, removed: [...]} or raises.
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
+        Returns: {ok, removed: [...]} or {ok: false, error, error_class}.
         """
-        with _audit("hyperv_vm_media_detach", vm_name, "media"):
-            return media.vm_media_detach(_cfg(), vm_name)
+        return _run_guest_tool(
+            "hyperv_vm_media_detach", vm_name, "media",
+            media.vm_media_detach, _cfg(), vm_name, vm_id=vm_id,
+        )
 
     @mcp.tool()
-    def hyperv_vm_media_list(vm_name: str) -> dict:
+    def hyperv_vm_media_list(vm_name: str = "", vm_id: str = "") -> dict:
         """List virtual DVD drives and attached ISO paths.
+
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {ok, media: [...]}
         """
-        with _audit("hyperv_vm_media_list", vm_name, "read"):
-            return media.vm_media_list(_cfg(), vm_name)
+        return _run_guest_tool(
+            "hyperv_vm_media_list", vm_name, "read",
+            media.vm_media_list, _cfg(), vm_name, vm_id=vm_id,
+        )
 
     @mcp.tool()
-    def hyperv_vm_firmware_get(vm_name: str) -> dict:
+    def hyperv_vm_firmware_get(vm_name: str = "", vm_id: str = "") -> dict:
         """Firmware state for Gen2 VMs: SecureBoot, template, boot order,
         TPM enabled. Generation 1 returns an explicit error.
 
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
         Returns: {ok, secure_boot, secure_boot_template, boot_order, tpm_enabled}
         """
-        with _audit("hyperv_vm_firmware_get", vm_name, "read"):
-            return media.vm_firmware_get(_cfg(), vm_name)
+        return _run_guest_tool(
+            "hyperv_vm_firmware_get", vm_name, "read",
+            media.vm_firmware_get, _cfg(), vm_name, vm_id=vm_id,
+        )
 
     @mcp.tool()
     def hyperv_vm_firmware_set_boot_order(
-        vm_name: str, boot_type: str = "Drive", confirm: bool = False,
+        vm_name: str = "", boot_type: str = "Drive", confirm: bool = False,
+        vm_id: str = "",
     ) -> dict:
         """Set the first boot device by type (Drive | Network | File) — e.g.
         boot from attached DVD media. Policy: vm_provision + confirm=true.
         Generation 1 returns an explicit error.
 
-        Returns: {ok, first_boot} or raises.
+        Args:
+            vm_name: Name of the VM
+            vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+
+        Returns: {ok, first_boot} or {ok: false, error, error_class}.
         """
-        with _audit("hyperv_vm_firmware_set_boot_order", vm_name, "vm_provision"):
-            return media.vm_firmware_set_boot_order(_cfg(), vm_name, boot_type, confirm)
+        return _run_guest_tool(
+            "hyperv_vm_firmware_set_boot_order", vm_name, "vm_provision",
+            media.vm_firmware_set_boot_order, _cfg(), vm_name,
+            boot_type=boot_type, confirm=confirm, vm_id=vm_id,
+        )
 
     @mcp.tool()
-    def hyperv_vm_tpm_set(vm_name: str, enabled: bool, confirm: bool = False) -> dict:
+    def hyperv_vm_tpm_set(
+        vm_name: str = "", enabled: bool = False, confirm: bool = False, vm_id: str = ""
+    ) -> dict:
         """Enable or disable the virtual TPM (Gen2 only).
         Policy: vm_provision + confirm=true.
 
-        Returns: {ok, tpm_enabled} or raises.
+        Args:
+            vm_name: Name of the VM
+            vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+
+        Returns: {ok, tpm_enabled} or {ok: false, error, error_class}.
         """
-        with _audit("hyperv_vm_tpm_set", vm_name, "vm_provision"):
-            return media.vm_tpm_set(_cfg(), vm_name, enabled, confirm)
+        return _run_guest_tool(
+            "hyperv_vm_tpm_set", vm_name, "vm_provision",
+            media.vm_tpm_set, _cfg(), vm_name,
+            enabled=enabled, confirm=confirm, vm_id=vm_id,
+        )
 
     @mcp.tool()
     def hyperv_vm_secureboot_set(
-        vm_name: str, enabled: bool, template: str = "", confirm: bool = False,
+        vm_name: str = "", enabled: bool = False, template: str = "",
+        confirm: bool = False, vm_id: str = "",
     ) -> dict:
         """Enable or disable Secure Boot (Gen2 only), optionally setting the
         template (e.g. MicrosoftWindows, MicrosoftUEFICertificateAuthority).
         Policy: vm_provision + confirm=true.
 
-        Returns: {ok, secure_boot, secure_boot_template} or raises.
+        Args:
+            vm_name: Name of the VM
+            vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+
+        Returns: {ok, secure_boot, secure_boot_template} or {ok: false,
+        error, error_class}.
         """
-        with _audit("hyperv_vm_secureboot_set", vm_name, "vm_provision"):
-            return media.vm_secureboot_set(_cfg(), vm_name, enabled, template, confirm)
+        return _run_guest_tool(
+            "hyperv_vm_secureboot_set", vm_name, "vm_provision",
+            media.vm_secureboot_set, _cfg(), vm_name,
+            enabled=enabled, template=template, confirm=confirm, vm_id=vm_id,
+        )
 
     @mcp.tool()
-    def hyperv_vm_network_set(vm_name: str, switch_name: str) -> dict:
+    def hyperv_vm_network_set(vm_name: str = "", switch_name: str = "", vm_id: str = "") -> dict:
         """Connect the VM's network adapter to a virtual switch.
         Policy: media category (reversible, no confirm).
 
-        Returns: {ok, switch_name} or raises.
+        Args:
+            vm_name: Name of the VM
+            vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+
+        Returns: {ok, switch_name} or {ok: false, error, error_class}.
         """
-        with _audit("hyperv_vm_network_set", vm_name, "media"):
-            return media.vm_network_set(_cfg(), vm_name, switch_name)
+        return _run_guest_tool(
+            "hyperv_vm_network_set", vm_name, "media",
+            media.vm_network_set, _cfg(), vm_name,
+            switch_name=switch_name, vm_id=vm_id,
+        )
 
     # ---- guest access diagnostics, repair, jobs, recovery, relay,
     # evidence (0.3.0). Cred tools come in dual variants like the guest
@@ -1298,8 +1566,9 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         @mcp.tool()
         def hyperv_diagnose_vm_access(
-            vm_name: str, timeout_ms: int = 90000,
+            vm_name: str = "", timeout_ms: int = 90000,
             username: str = "", password: str = "",
+            vm_id: str = "",
         ) -> dict:
             """One-call guest access diagnostic: host VM state, guest
             identity, current guest IPs, PowerShell Direct availability,
@@ -1307,19 +1576,24 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             naming the exact failure (e.g. SSH bound to obsolete guest IPs).
             Read-only (vm policy only).
 
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+
             Returns: {ok, vm_name, vm, ps_direct, guest, findings, checked_at}.
             """
             return _run_guest_tool(
                 "hyperv_diagnose_vm_access", vm_name, "read",
                 diagnostics.diagnose_vm_access, _cfg(), vm_name,
-                timeout_ms=timeout_ms,
+                timeout_ms=timeout_ms, vm_id=vm_id,
                 cred_factory=lambda: _cred_args(username, password),
             )
 
         @mcp.tool()
         def hyperv_repair_guest_access(
-            vm_name: str, apply: bool = False, confirm: bool = False,
+            vm_name: str = "", apply: bool = False, confirm: bool = False,
             username: str = "", password: str = "",
+            vm_id: str = "",
         ) -> dict:
             """Propose (dry run, default) or apply narrow guest access fixes:
             stale SSH ListenAddress bindings (config backed up first;
@@ -1329,21 +1603,26 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             guest_repair=true AND confirm=true;
             every applied change is re-verified and reported.
 
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+
             Returns: {ok, vm_name, applied, plan, changes,
             verification_findings[, backup_path]}.
             """
             return _run_guest_tool(
                 "hyperv_repair_guest_access", vm_name, "guest_repair",
                 repair.repair_guest_access, _cfg(), vm_name,
-                apply=apply, confirm=confirm,
+                apply=apply, confirm=confirm, vm_id=vm_id,
                 cred_factory=lambda: _cred_args(username, password),
             )
 
         @mcp.tool()
         def hyperv_guest_job_start(
-            vm_name: str, command: str, args: list[str] | None = None,
+            vm_name: str = "", command: str = "", args: list[str] | None = None,
             cwd: str = "", timeout_ms: int = 60000,
             username: str = "", password: str = "",
+            vm_id: str = "",
         ) -> dict:
             """Start a guest command as a managed job WITHOUT waiting.
             Returns a job_id plus the guest PID, the process start time used
@@ -1359,24 +1638,33 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             callee across the script boundary.
             Non-elevated (elevated start cannot capture output).
 
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+
             Returns: {ok, job_id, vm_name, pid, start_time_ticks, job_dir, out_path, err_path, exit_path, started_at}.
             """
             return _run_guest_tool(
                 "hyperv_guest_job_start", vm_name, "exec",
                 guestjobs.job_start, _cfg(), vm_name, command, args, cwd,
-                timeout_ms=timeout_ms,
+                timeout_ms=timeout_ms, vm_id=vm_id,
                 cred_factory=lambda: _cred_args(username, password),
             )
 
         @mcp.tool()
         def hyperv_wait_guest_recovery(
-            vm_name: str, services: list[str] | None = None,
+            vm_name: str = "", services: list[str] | None = None,
             processes: list[str] | None = None, timeout_s: int = 300,
             interval_s: int = 3, username: str = "", password: str = "",
+            vm_id: str = "",
         ) -> dict:
             """After a restart, wait (bounded) for PowerShell Direct to
             answer, then verify each named service is Running and each named
             process exists; reports per-item results and what failed.
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, vm_name, ps_direct, services, processes, failures, checked_at}.
             """
@@ -1384,13 +1672,14 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 "hyperv_wait_guest_recovery", vm_name, "read",
                 diagnostics.wait_guest_recovery, _cfg(), vm_name,
                 services, processes, timeout_s=timeout_s, interval_s=interval_s,
-                cred_factory=lambda: _cred_args(username, password),
+                vm_id=vm_id, cred_factory=lambda: _cred_args(username, password),
             )
 
         @mcp.tool()
         def hyperv_relay_start(
-            vm_name: str, guest_port: int, host_port: int = 0,
+            vm_name: str = "", guest_port: int = 0, host_port: int = 0,
             username: str = "", password: str = "",
+            vm_id: str = "",
         ) -> dict:
             """Start a loopback-only host HTTP listener forwarding requests
             through PowerShell Direct to the guest's 127.0.0.1:guest_port —
@@ -1398,26 +1687,35 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             dependence on guest network addresses. Policy: relay category.
             HTTP only (no WebSocket proxying).
 
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+
             Returns: {ok, relay_id, url, host_port, ...}.
             """
             return _run_guest_tool(
                 "hyperv_relay_start", vm_name, "relay",
                 relay.relay_start, _cfg(), vm_name, guest_port,
-                host_port=host_port,
+                host_port=host_port, vm_id=vm_id,
                 cred_factory=lambda: _cred_args(username, password),
             )
 
         @mcp.tool()
         def hyperv_capture_evidence(
-            vm_name: str, width: int = 1024, height: int = 768,
+            vm_name: str = "", width: int = 1024, height: int = 768,
             save_path: str = "", ui_tree: bool = False,
             ui_tree_depth: int = 3, ui_tree_max_elements: int = 200,
             username: str = "", password: str = "",
+            vm_id: str = "",
         ) -> list | dict:
             """Capture console evidence in one call: screenshot paired with
             captured_at, vm_id, dimensions and frame hash, plus an optional
             bounded guest UI element tree (requires guest credentials; the
             screenshot alone does not).
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: [ImageContent, TextContent(metadata)] on success.
             """
@@ -1428,6 +1726,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                         _cfg(), vm_name, width, height, save_path,
                         ui_tree=ui_tree, ui_tree_depth=ui_tree_depth,
                         ui_tree_max_elements=ui_tree_max_elements, cred=cred,
+                        vm_id=vm_id,
                     )
                     return _image_meta_content(result)
             except policy.PolicyDenied as exc:
@@ -1446,24 +1745,30 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
     else:
 
         @mcp.tool()
-        def hyperv_diagnose_vm_access(vm_name: str, timeout_ms: int = 90000) -> dict:
+        def hyperv_diagnose_vm_access(
+            vm_name: str = "", timeout_ms: int = 90000, vm_id: str = ""
+        ) -> dict:
             """One-call guest access diagnostic: host VM state, guest
             identity, current guest IPs, PowerShell Direct availability,
             sshd/WinRM service state, SSH/WinRM listeners, and findings
             naming the exact failure (e.g. SSH bound to obsolete guest IPs).
             Read-only (vm policy only). Credentials from environment only.
 
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
             Returns: {ok, vm_name, vm, ps_direct, guest, findings, checked_at}.
             """
             return _run_guest_tool(
                 "hyperv_diagnose_vm_access", vm_name, "read",
                 diagnostics.diagnose_vm_access, _cfg(), vm_name,
-                timeout_ms=timeout_ms, cred_factory=credentials.resolve_guest,
+                timeout_ms=timeout_ms, vm_id=vm_id,
+                cred_factory=credentials.resolve_guest,
             )
 
         @mcp.tool()
         def hyperv_repair_guest_access(
-            vm_name: str, apply: bool = False, confirm: bool = False,
+            vm_name: str = "", apply: bool = False, confirm: bool = False,
+            vm_id: str = "",
         ) -> dict:
             """Propose (dry run, default) or apply narrow guest access fixes:
             stale SSH ListenAddress bindings (config backed up first;
@@ -1474,18 +1779,21 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             every applied change is re-verified and reported. Credentials
             from environment only.
 
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
             Returns: {ok, vm_name, applied, plan, changes, verification_findings[, backup_path]}.
             """
             return _run_guest_tool(
                 "hyperv_repair_guest_access", vm_name, "guest_repair",
                 repair.repair_guest_access, _cfg(), vm_name,
-                apply=apply, confirm=confirm, cred_factory=credentials.resolve_guest,
+                apply=apply, confirm=confirm, vm_id=vm_id,
+                cred_factory=credentials.resolve_guest,
             )
 
         @mcp.tool()
         def hyperv_guest_job_start(
-            vm_name: str, command: str, args: list[str] | None = None,
-            cwd: str = "", timeout_ms: int = 60000,
+            vm_name: str = "", command: str = "", args: list[str] | None = None,
+            cwd: str = "", timeout_ms: int = 60000, vm_id: str = "",
         ) -> dict:
             """Start a guest command as a managed job WITHOUT waiting.
             Returns a job_id plus the guest PID, the process start time used
@@ -1502,24 +1810,29 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             Non-elevated (elevated start cannot capture output). Credentials from
             environment only.
 
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
             Returns: {ok, job_id, vm_name, pid, start_time_ticks, job_dir, out_path, err_path, exit_path, started_at}.
             """
             return _run_guest_tool(
                 "hyperv_guest_job_start", vm_name, "exec",
                 guestjobs.job_start, _cfg(), vm_name, command, args, cwd,
-                timeout_ms=timeout_ms, cred_factory=credentials.resolve_guest,
+                timeout_ms=timeout_ms, vm_id=vm_id,
+                cred_factory=credentials.resolve_guest,
             )
 
         @mcp.tool()
         def hyperv_wait_guest_recovery(
-            vm_name: str, services: list[str] | None = None,
+            vm_name: str = "", services: list[str] | None = None,
             processes: list[str] | None = None, timeout_s: int = 300,
-            interval_s: int = 3,
+            interval_s: int = 3, vm_id: str = "",
         ) -> dict:
             """After a restart, wait (bounded) for PowerShell Direct to
             answer, then verify each named service is Running and each named
             process exists; reports per-item results and what failed.
             Credentials from environment only.
+
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, vm_name, ps_direct, services, processes, failures, checked_at}.
             """
@@ -1527,12 +1840,13 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 "hyperv_wait_guest_recovery", vm_name, "read",
                 diagnostics.wait_guest_recovery, _cfg(), vm_name,
                 services, processes, timeout_s=timeout_s, interval_s=interval_s,
-                cred_factory=credentials.resolve_guest,
+                vm_id=vm_id, cred_factory=credentials.resolve_guest,
             )
 
         @mcp.tool()
         def hyperv_relay_start(
-            vm_name: str, guest_port: int, host_port: int = 0,
+            vm_name: str = "", guest_port: int = 0, host_port: int = 0,
+            vm_id: str = "",
         ) -> dict:
             """Start a loopback-only host HTTP listener forwarding requests
             through PowerShell Direct to the guest's 127.0.0.1:guest_port —
@@ -1541,24 +1855,30 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             HTTP only (no WebSocket proxying). Credentials from environment
             only.
 
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
             Returns: {ok, relay_id, url, host_port, ...}.
             """
             return _run_guest_tool(
                 "hyperv_relay_start", vm_name, "relay",
                 relay.relay_start, _cfg(), vm_name, guest_port,
-                host_port=host_port, cred_factory=credentials.resolve_guest,
+                host_port=host_port, vm_id=vm_id,
+                cred_factory=credentials.resolve_guest,
             )
 
         @mcp.tool()
         def hyperv_capture_evidence(
-            vm_name: str, width: int = 1024, height: int = 768,
+            vm_name: str = "", width: int = 1024, height: int = 768,
             save_path: str = "", ui_tree: bool = False,
             ui_tree_depth: int = 3, ui_tree_max_elements: int = 200,
+            vm_id: str = "",
         ) -> list | dict:
             """Capture console evidence in one call: screenshot paired with
             captured_at, vm_id, dimensions and frame hash, plus an optional
             bounded guest UI element tree (requires guest credentials; the
             screenshot alone does not). Credentials from environment only.
+
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: [ImageContent, TextContent(metadata)] on success.
             """
@@ -1569,6 +1889,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                         _cfg(), vm_name, width, height, save_path,
                         ui_tree=ui_tree, ui_tree_depth=ui_tree_depth,
                         ui_tree_max_elements=ui_tree_max_elements, cred=cred,
+                        vm_id=vm_id,
                     )
                     return _image_meta_content(result)
             except policy.PolicyDenied as exc:

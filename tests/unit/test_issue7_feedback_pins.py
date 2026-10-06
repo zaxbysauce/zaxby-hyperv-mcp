@@ -39,6 +39,15 @@ from hyperv_mcp.credentials import CredentialSet
 CRED = CredentialSet("Administrator", "placeholder-pass")
 TICKS = 12345
 
+# Well-formed GUID served for the by-name identity-resolution leg vmident
+# resolve runs before job_start/guestexec calls (issue #8; test_a04 pattern).
+VM_GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
+
+
+def _is_resolution_leg(script: str) -> bool:
+    """A standalone by-name resolution leg emits $vmTarget as its last line."""
+    return "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget")
+
 
 class FakePS:
     def __init__(self, responses):
@@ -47,6 +56,8 @@ class FakePS:
 
     def __call__(self, script, **kwargs):
         self.scripts.append(script)
+        if _is_resolution_leg(script):
+            return pswindows.PSResult(stdout=VM_GUID, returncode=0)
         if not self.responses:
             raise AssertionError("unexpected extra run_ps call")
         item = self.responses.pop(0)
@@ -114,7 +125,7 @@ def test_stop_script_pins_tree_kill_target_and_wrapper_gone_walk(monkeypatch):
     fake.responses.append(_ok({"stopped": True, "alive_pids": [],
                                "job_dir_removed": True, "pid_reused": False}))
     guestjobs.job_stop(cfg, start["job_id"])
-    script = _inner(fake.scripts[1])
+    script = _inner(fake.scripts[2])
     # (b) target-proof: the literal recorded pid rides a taskkill /T /F.
     assert "taskkill" in script.lower()
     for flag in ("/pid", "/t", "/f"):
@@ -175,8 +186,8 @@ def test_recorded_ticks_reach_status_and_stop_legs(monkeypatch):
                                "job_dir_removed": True, "pid_reused": False}))
     guestjobs.job_status(cfg, start["job_id"])
     guestjobs.job_stop(cfg, start["job_id"])
-    status_inner = _inner(fake.scripts[1])
-    stop_inner = _inner(fake.scripts[2])
+    status_inner = _inner(fake.scripts[2])
+    stop_inner = _inner(fake.scripts[3])
     assert f"$want = {TICKS}" in status_inner
     assert f"$want = {TICKS}" in stop_inner
 
@@ -246,7 +257,8 @@ def test_stop_nonnumeric_alive_pids_returns_invalid_envelope(monkeypatch):
 
 def test_wrapper_resets_lastexitcode_before_the_invoke(monkeypatch):
     cfg, fake, start = _start_job(monkeypatch)
-    wrapper = _inner(_inner(fake.scripts[0]))
+    # scripts[0] is the identity-resolution leg; scripts[1] the start action.
+    wrapper = _inner(_inner(fake.scripts[1]))
     reset_at = wrapper.find("$global:LASTEXITCODE = $null")
     invoke_at = wrapper.find("& 'x.exe'")
     assert reset_at != -1 and invoke_at != -1 and reset_at < invoke_at, (
@@ -272,7 +284,9 @@ def test_sync_builders_reset_lastexitcode_before_the_invoke(monkeypatch):
     guestexec.victim_run(cfg, "vm1", "cmd.exe", ["/c", "exit", "0"],
                          cred=CredentialSet("victim", "p2"))
     names = ("guest_run_ps", "guest_run(cwd)", "victim_run_ps", "victim_run")
-    for name, host in zip(names, fake.scripts, strict=True):
+    # Each call resolves the VM identity first (issue #8): action legs are
+    # the odd indexes after each interleaved resolution leg.
+    for name, host in zip(names, fake.scripts[1::2], strict=True):
         inner = _inner(host)
         reset_at = inner.find("$global:LASTEXITCODE = $null")
         tail_at = inner.find("$ok = $?")

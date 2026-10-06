@@ -3,7 +3,9 @@ thread safety, status transitions, bounded tail decode, exact-PID stop."""
 
 import base64
 import json
+import re
 import threading
+import uuid
 
 import pytest
 
@@ -14,6 +16,23 @@ from hyperv_mcp.policy import PolicyDenied
 
 CRED = CredentialSet("Administrator", "placeholder-pass")
 
+# Identity resolution (issue #8): vmident.resolve runs a by-name leg before
+# job_start. Distinct VM names must resolve to DISTINCT GUIDs — the lock and
+# the registry now key on the GUID, so a shared fake GUID would falsely make
+# different VMs collide (test_a04_vm_identity FakePS pattern, per-name guid).
+_NAME_RE = re.compile(r"ElementName -eq '([^']*)'")
+
+
+def _is_resolution_leg(script: str) -> bool:
+    """A standalone by-name resolution leg emits $vmTarget as its last line."""
+    return "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget")
+
+
+def _resolved_guid(script: str) -> str:
+    """Stable per-name GUID: distinct names are distinct VMs."""
+    m = _NAME_RE.search(script)
+    return str(uuid.uuid5(uuid.NAMESPACE_OID, m.group(1) if m else ""))
+
 
 class FakePS:
     def __init__(self, responses):
@@ -22,6 +41,8 @@ class FakePS:
 
     def __call__(self, script, **kwargs):
         self.scripts.append(script)
+        if _is_resolution_leg(script):
+            return pswindows.PSResult(stdout=_resolved_guid(script), returncode=0)
         if not self.responses:
             raise AssertionError("unexpected extra run_ps call")
         item = self.responses.pop(0)
@@ -64,7 +85,8 @@ def test_start_returns_job_handle_without_wait(monkeypatch):
     assert out["out_path"].endswith("stdout.log")
     assert out["exit_path"].endswith("exitcode.txt")
     # Async by construction: splat Start-Process, NO Wait member.
-    inner = _inner(fake.scripts[0])
+    # scripts[0] is the identity-resolution leg; scripts[1] the start action.
+    inner = _inner(fake.scripts[1])
     assert "Start-Process @sp" in inner
     assert "-Wait" not in inner
     assert "Wait" not in inner.replace("WindowStyle", "")
@@ -119,8 +141,8 @@ def test_status_running_then_exited(monkeypatch):
     exited = guestjobs.job_status(cfg, start["job_id"])
     assert exited["status"] == "exited"
     assert exited["exit_code"] == "0"
-    # Status probes the exact pid.
-    assert "Get-Process -Id 4242" in _inner(fake.scripts[1])
+    # Status probes the exact pid (leg index +1: resolution leg precedes start).
+    assert "Get-Process -Id 4242" in _inner(fake.scripts[2])
 
 
 def test_status_exiting_when_exit_file_missing(monkeypatch):
@@ -132,7 +154,7 @@ def test_status_exiting_when_exit_file_missing(monkeypatch):
     assert out["status"] == "exiting"
     # Load-bearing (review r1 finding 15): the guest-side 'exiting' branch
     # must actually be generated, not just echoed from a canned payload.
-    assert "'exiting'" in _inner(fake.scripts[1])
+    assert "'exiting'" in _inner(fake.scripts[2])
 
 
 def test_output_tail_and_encodings(monkeypatch):
@@ -185,7 +207,7 @@ def test_stop_targets_exact_pid_and_nulls_cred(monkeypatch):
     out = guestjobs.job_stop(cfg, start["job_id"])
     assert out["ok"] is True
     assert out["stopped"] is True
-    inner = _inner(fake.scripts[1])
+    inner = _inner(fake.scripts[2])
     assert "Stop-Process -Id 4242 -Force" in inner
     assert "Remove-Item" in inner
     # Registry: stopped + cred nulled.
@@ -195,7 +217,8 @@ def test_stop_targets_exact_pid_and_nulls_cred(monkeypatch):
     # A later status short-circuits without another guest leg.
     status = guestjobs.job_status(cfg, start["job_id"])
     assert status["status"] == "stopped"
-    assert len(fake.scripts) == 2
+    # resolve + start + stop legs only.
+    assert len(fake.scripts) == 3
 
 
 def test_unknown_job_id_rejected():
@@ -260,6 +283,11 @@ def test_registry_cap_atomic_across_concurrent_starts(monkeypatch):
 
         def fake_run(script, **kwargs):
             calls.append(script)
+            if _is_resolution_leg(script):
+                # Identity leg answers before the barrier: only admitted
+                # starts reach it (rejected starts never resolve). Per-name
+                # GUIDs keep the 3 VMs distinct under the GUID-keyed lock.
+                return pswindows.PSResult(stdout=_resolved_guid(script), returncode=0)
             barrier.wait()  # all admitted starts overlap before any registers
             return pswindows.PSResult(
                 stdout=json.dumps({"pid": 100 + len(calls), "job_dir": "d"}), returncode=0,
@@ -292,7 +320,7 @@ def test_registry_cap_atomic_across_concurrent_starts(monkeypatch):
         assert len(rejected) == 3, results
         assert all("registry is full" in r[1] for r in rejected)
         assert len(guestjobs._jobs) == 3
-        assert len(calls) == 3
+        assert len(calls) == 6  # per admitted start: resolution leg + start leg
     finally:
         guestjobs._MAX_JOBS = 128
 
@@ -328,7 +356,7 @@ def test_stop_failure_keeps_entry_stoppable(monkeypatch):
     assert second["ok"] is True
     assert second["stopped"] is True
     assert guestjobs._jobs[start["job_id"]]["cred"] is None
-    assert len(fake.scripts) == 3
+    assert len(fake.scripts) == 4  # resolve + start + failed stop + retry
 
 
 def test_repeat_stop_returns_full_result_contract(monkeypatch):
@@ -356,7 +384,7 @@ def test_repeat_stop_returns_full_result_contract(monkeypatch):
     # The documented key set of a real stop is a subset of the repeat's.
     assert set(first).issubset(set(second))
     # The short-circuit must not reach the guest again.
-    assert len(fake.scripts) == 2
+    assert len(fake.scripts) == 3  # resolve + start + first stop only
 
 
 def test_output_rejects_nonpositive_tail():
