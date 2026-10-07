@@ -29,14 +29,28 @@ ROOTED = Config(
 _REAL_RUN_PS = pswindows.run_ps  # saved before any monkeypatching
 
 
+VM_GUID = "e953c649-1234-5678-9abc-def012345678"
+
+
+def _is_resolution_leg(script: str) -> bool:
+    """A standalone by-name resolution leg emits $vmTarget as its last line."""
+    return "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget")
+
+
 class Recorder:
-    """Captures generated scripts; returns benign canned results."""
+    """Captures generated scripts; returns benign canned results.
+
+    The by-name resolution leg (vmident, issue #8) is content-served so
+    flows that resolve before acting still reach their action scripts.
+    """
 
     def __init__(self):
         self.scripts = []
 
     def __call__(self, script, **kwargs):
         self.scripts.append(script)
+        if _is_resolution_leg(script):
+            return pswindows.PSResult(stdout=VM_GUID, returncode=0)
         return pswindows.PSResult(stdout="", returncode=0)
 
 
@@ -85,7 +99,9 @@ def _collect(monkeypatch, fn, *args, **kwargs) -> str:
         # don't matter — the generated script was already captured.
         pass
     assert rec.scripts, f"{fn.__name__} produced no script"
-    return rec.scripts[0]
+    actions = [s for s in rec.scripts if not _is_resolution_leg(s)]
+    assert actions, f"{fn.__name__} produced no action script"
+    return actions[0]
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +181,8 @@ def test_parse_kdnet_reboot(monkeypatch, parsed_ps):
 
     def rec(script, **kwargs):
         captured.append(script)
+        if _is_resolution_leg(script):
+            return pswindows.PSResult(stdout=VM_GUID, returncode=0)
         return pswindows.PSResult(
             stdout=json.dumps({"DbgSettings": "ok"}), returncode=0
         )
@@ -182,6 +200,8 @@ def test_parse_kdcom(monkeypatch, parsed_ps):
 
     def rec(script, **kwargs):
         captured.append(script)
+        if _is_resolution_leg(script):
+            return pswindows.PSResult(stdout=VM_GUID, returncode=0)
         if "Set-VMComPort" in script:
             return pswindows.PSResult(stdout="", returncode=0)
         return pswindows.PSResult(stdout=json.dumps({"DbgSettings": "ok"}), returncode=0)
@@ -372,7 +392,6 @@ def test_wait_script_hash_is_full_hex_sha256(monkeypatch, parsed_ps):
     returned frame_hash round-trips through baseline_hash validation
     (64-hex) and matches PS-side comparisons. The old base64 Substring(0,32)
     form broke the documented chaining contract."""
-    monkeypatch.setattr(console, "_vm_guid", lambda cfg, vm: "guid-1")
     rec = Recorder()
     monkeypatch.setattr(pswindows, "run_ps", rec)
     try:
@@ -459,11 +478,11 @@ def test_parse_media_firmware_and_security(monkeypatch, parsed_ps):
         lambda: media.vm_firmware_get(UNRESTRICTED, "vm1"),
         lambda: media.vm_firmware_set_boot_order(UNRESTRICTED, "vm1", "Drive", True),
         lambda: media.vm_firmware_set_boot_order(UNRESTRICTED, "vm1", "Network", True),
-        lambda: media.vm_tpm_set(UNRESTRICTED, "vm1", True, True),
-        lambda: media.vm_tpm_set(UNRESTRICTED, "vm1", False, True),
-        lambda: media.vm_secureboot_set(UNRESTRICTED, "vm1", True, "", True),
-        lambda: media.vm_secureboot_set(UNRESTRICTED, "vm1", False, "", True),
-        lambda: media.vm_secureboot_set(UNRESTRICTED, "vm1", True, "MicrosoftWindows", True),
+        lambda: media.vm_tpm_set(UNRESTRICTED, "vm1", enabled=True, confirm=True),
+        lambda: media.vm_tpm_set(UNRESTRICTED, "vm1", enabled=False, confirm=True),
+        lambda: media.vm_secureboot_set(UNRESTRICTED, "vm1", enabled=True, template="", confirm=True),
+        lambda: media.vm_secureboot_set(UNRESTRICTED, "vm1", enabled=False, template="", confirm=True),
+        lambda: media.vm_secureboot_set(UNRESTRICTED, "vm1", enabled=True, template="MicrosoftWindows", confirm=True),
     ):
         rec = Recorder()
         monkeypatch.setattr(pswindows, "run_ps", rec)

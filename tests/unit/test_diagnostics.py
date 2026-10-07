@@ -65,6 +65,14 @@ def _ok_result(payload):
     return pswindows.PSResult(stdout=json.dumps(payload), returncode=0)
 
 
+VM_GUID = "e953c649-1234-5678-9abc-def012345678"
+
+
+def _guid_result():
+    """Canned by-name resolution leg response (stdout = the VM GUID)."""
+    return pswindows.PSResult(stdout=VM_GUID, returncode=0)
+
+
 def test_diagnose_denied_without_patterns(monkeypatch):
     cfg = Config()
     called = FakePS([])
@@ -82,7 +90,7 @@ def test_diagnose_requires_credentials():
 
 def test_diagnose_report_shape(monkeypatch):
     cfg = Config(unrestricted=True)
-    fake = FakePS([_ok_result(_host_payload()), _ok_result(_guest_payload())])
+    fake = FakePS([_guid_result(), _ok_result(_host_payload()), _ok_result(_guest_payload())])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     report = diagnostics.diagnose_vm_access(cfg, "test-vm", cred=CRED)
     assert report["ok"] is True
@@ -94,14 +102,20 @@ def test_diagnose_report_shape(monkeypatch):
     assert guest["ssh"]["service"]["status"] == "Running"
     assert guest["winrm"]["listeners"][0]["port"] == 5985
     assert isinstance(report["checked_at"], str) and report["checked_at"]
-    # Two legs: host Get-VM + one guest PS Direct probe.
-    assert len(fake.scripts) == 2
-    assert "Get-VM" in fake.scripts[0]
-    assert "Invoke-Command -VMId $vmTarget" in fake.scripts[1]
-    # GUID resolution precedes the remoting call so vmms name flakiness cannot
-    # produce 'does not resolve to a single virtual machine'.
-    assert "Msvm_ComputerSystem" in fake.scripts[1]
-    assert fake.scripts[1].index("Msvm_ComputerSystem") < fake.scripts[1].index("Invoke-Command -VMId")
+    # Three legs: by-name resolution (standalone), host Get-VM, one guest
+    # PS Direct probe.
+    assert len(fake.scripts) == 3
+    assert fake.scripts[0].rstrip().endswith("$vmTarget")
+    assert "Get-VM" in fake.scripts[1]
+    assert "Invoke-Command -VMId $vmTarget" in fake.scripts[2]
+    # The action scripts open with the validated GUID preamble (issue #8):
+    # binding by -VMId is deterministic, no vmms name flakiness, and the lock
+    # keys on the same resolved GUID.
+    assert f"$vmTarget = '{VM_GUID}'" in fake.scripts[1]
+    assert f"$vmTarget = '{VM_GUID}'" in fake.scripts[2]
+    assert "Msvm_ComputerSystem" not in fake.scripts[1]
+    assert "Msvm_ComputerSystem" not in fake.scripts[2]
+    assert fake.scripts[2].index("$vmTarget = ") < fake.scripts[2].index("Invoke-Command -VMId")
 
 
 def test_diagnose_section_isolation_one_failing_probe(monkeypatch):
@@ -110,7 +124,7 @@ def test_diagnose_section_isolation_one_failing_probe(monkeypatch):
     guest = _guest_payload()
     guest["ssh"] = {"error": "probe failed: service subsystem unavailable"}
     guest["ip_addresses"] = {"error": "probe failed: nettc backlog"}
-    fake = FakePS([_ok_result(_host_payload()), _ok_result(guest)])
+    fake = FakePS([_guid_result(), _ok_result(_host_payload()), _ok_result(guest)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     report = diagnostics.diagnose_vm_access(cfg, "test-vm", cred=CRED)
     assert report["ok"] is True
@@ -126,7 +140,7 @@ def test_diagnose_stale_binding_finding(monkeypatch):
     guest = _guest_payload()
     guest["ssh"]["config_listen"] = ["192.168.50.20"]
     guest["ssh"]["listeners"] = [{"address": "192.168.50.20", "port": 22}]
-    fake = FakePS([_ok_result(_host_payload()), _ok_result(guest)])
+    fake = FakePS([_guid_result(), _ok_result(_host_payload()), _ok_result(guest)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     report = diagnostics.diagnose_vm_access(cfg, "test-vm", cred=CRED)
     stale = [f for f in report["findings"] if f["id"] == "ssh_stale_binding"]
@@ -144,7 +158,7 @@ def test_diagnose_no_stale_finding_for_wildcard_or_current_ip(monkeypatch):
         {"address": "0.0.0.0", "port": 22},
         {"address": "10.0.0.5", "port": 22},
     ]
-    fake = FakePS([_ok_result(_host_payload()), _ok_result(guest)])
+    fake = FakePS([_guid_result(), _ok_result(_host_payload()), _ok_result(guest)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     report = diagnostics.diagnose_vm_access(cfg, "test-vm", cred=CRED)
     assert not [f for f in report["findings"] if f["id"] == "ssh_stale_binding"]
@@ -155,6 +169,7 @@ def test_diagnose_ps_direct_unavailable_is_a_result(monkeypatch):
     finding, not an exception."""
     cfg = Config(unrestricted=True)
     fake = FakePS([
+        _guid_result(),
         _ok_result(_host_payload()),
         pswindows.PSResult(stdout="", returncode=1, stderr="connection failed"),
     ])
@@ -173,7 +188,7 @@ def test_diagnose_stopped_services_findings(monkeypatch):
     guest["ssh"]["service"]["status"] = "Stopped"
     guest["winrm"]["service"]["status"] = "Stopped"
     guest["firewall"]["ssh22_allowed"] = False
-    fake = FakePS([_ok_result(_host_payload()), _ok_result(guest)])
+    fake = FakePS([_guid_result(), _ok_result(_host_payload()), _ok_result(guest)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     report = diagnostics.diagnose_vm_access(cfg, "test-vm", cred=CRED)
     ids = {f["id"] for f in report["findings"]}
@@ -184,25 +199,27 @@ def test_diagnose_stopped_services_findings(monkeypatch):
 
 def test_diagnose_vm_name_wildcard_escaped(monkeypatch):
     cfg = Config(unrestricted=True)
-    fake = FakePS([_ok_result(_host_payload()), _ok_result(_guest_payload())])
+    fake = FakePS([_guid_result(), _ok_result(_host_payload()), _ok_result(_guest_payload())])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     diagnostics.diagnose_vm_access(cfg, "test[1]", cred=CRED)
     # CIM resolution matches the name LITERALLY (-eq), so wildcard chars are
-    # inert by construction; the VM binds by resolved GUID (-Id).
+    # inert by construction; the VM binds by resolved GUID (-Id) — the name
+    # resolver lives only in the standalone first leg (vmident).
     assert "$_.ElementName -eq 'test[1]'" in fake.scripts[0]
-    assert "Get-VM -Id $vmTarget" in fake.scripts[0]
+    assert f"$vmTarget = '{VM_GUID}'" in fake.scripts[1]
+    assert "Get-VM -Id $vmTarget" in fake.scripts[1]
 
 
 def test_diagnose_guest_script_contains_probes(monkeypatch):
     cfg = Config(unrestricted=True)
-    fake = FakePS([_ok_result(_host_payload()), _ok_result(_guest_payload())])
+    fake = FakePS([_guid_result(), _ok_result(_host_payload()), _ok_result(_guest_payload())])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     diagnostics.diagnose_vm_access(cfg, "test-vm", cred=CRED)
     # The probe body rides the host script base64-encoded; decode it.
     import base64
     import re as _re
 
-    m = _re.search(r"\$enc = '([A-Za-z0-9+/=]+)'", fake.scripts[1])
+    m = _re.search(r"\$enc = '([A-Za-z0-9+/=]+)'", fake.scripts[2])
     assert m, "host script must embed the b64 probe payload"
     probe = base64.b64decode(m.group(1)).decode("utf-8")
     for marker in (

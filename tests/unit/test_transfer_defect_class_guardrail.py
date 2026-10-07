@@ -18,10 +18,21 @@ import pytest
 
 # rooted_cfg is re-exported so pytest can discover it as a fixture of THIS
 # module; the placement test requests it by parameter name.
-from test_a02_guest_transfer import CRED, FakePS, assertion_placement, rooted_cfg  # noqa: F401
+from test_a02_guest_transfer import (  # noqa: F401
+    CRED,
+    FakePS,
+    _is_resolution_leg,
+    assertion_placement,
+    rooted_cfg,
+)
 
 from hyperv_mcp import filetransfer, policy, pswindows
 from hyperv_mcp.config import Config
+
+
+def _action_scripts(fake):
+    """Legs after the content-served vmident resolution leg (issue #8)."""
+    return [sc for sc in fake.scripts if not _is_resolution_leg(sc)]
 
 
 def test_realpath_authority_census(monkeypatch):
@@ -199,7 +210,7 @@ def test_placement_census_all_four_tools(monkeypatch, tmp_path, rooted_cfg):  # 
     filetransfer.guest_put(
         cfg, vm, str(src), r"C:\g-write\census.bin", confirm=True, verify=False, cred=CRED
     )
-    placements["guest_put"] = assertion_placement(fake.scripts[0])
+    placements["guest_put"] = assertion_placement(_action_scripts(fake)[0])
 
     dest = tmp_path / "host-dst" / "census-back.bin"
     get_payload = json.dumps(
@@ -208,18 +219,18 @@ def test_placement_census_all_four_tools(monkeypatch, tmp_path, rooted_cfg):  # 
     fake = FakePS([pswindows.PSResult(stdout=get_payload, returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     filetransfer.guest_get(cfg, vm, r"C:\g-read\census.bin", str(dest), verify=True, cred=CRED)
-    placements["guest_get"] = assertion_placement(fake.scripts[0])
+    placements["guest_get"] = assertion_placement(_action_scripts(fake)[0])
 
     read_payload = json.dumps({"content_b64": "eA==", "bytes_read": 1, "truncated": False})
     fake = FakePS([pswindows.PSResult(stdout=read_payload, returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     filetransfer.guest_read_file(cfg, vm, r"C:\g-read\census.bin", cred=CRED)
-    placements["guest_read_file"] = assertion_placement(fake.scripts[0])
+    placements["guest_read_file"] = assertion_placement(_action_scripts(fake)[0])
 
     fake = FakePS([pswindows.PSResult(stdout="[]", returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     filetransfer.guest_list_dir(cfg, vm, r"C:\g-read", cred=CRED)
-    placements["guest_list_dir"] = assertion_placement(fake.scripts[0])
+    placements["guest_list_dir"] = assertion_placement(_action_scripts(fake)[0])
 
     bad = {name: plc for name, plc in placements.items() if EXPECTED_INSIDE.get(name) != plc}
     assert not bad, f"assertion placement violations (expected, got): {bad}"

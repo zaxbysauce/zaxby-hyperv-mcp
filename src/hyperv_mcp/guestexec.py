@@ -24,10 +24,30 @@ removed in finally blocks; a host timeout can leak them in the guest %TEMP%
 from __future__ import annotations
 
 import json
+import re
 
-from . import policy, pswindows, vmlocks
+from . import policy, pswindows, vmident, vmlocks
 from .config import Config
 from .credentials import CredentialSet
+
+GUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def validate_vm_guid(guid: str) -> str:
+    """Raise ValueError unless guid is a well-formed VM GUID.
+
+    Gate for every PYTHON-side binding of a caller-supplied id:
+    vmident.resolve, vm_target_preamble and psdirect_vm_target_id all call
+    this before the GUID reaches a generated script. (Console's %GUID%
+    templating substitutes the already-validated ref.id returned by
+    vmident.resolve; the resolver's own PS-side anchored match remains the
+    authoritative shape filter.)
+    """
+    # fullmatch: a `$`-anchored match would accept a trailing newline, which
+    # survives into VMRef.id and splits the vm_lock key space (review PRR-012).
+    if not isinstance(guid, str) or not GUID_RE.fullmatch(guid):
+        raise ValueError(f"vm_id is not a valid VM GUID: {guid!r}")
+    return guid
 
 _GRACE_S = 10
 
@@ -89,7 +109,7 @@ def psdirect_vm_target(vm_name: str) -> str:
         "        )",
         "        $vmResolveError = ''",
         "        if ($vmCandidates.Count -gt 1) {",
-        "            $vmResolveError = 'target VM name is not unique'",
+        "            $vmResolveError = 'target VM name is not unique; candidates: ' + (($vmCandidates | ForEach-Object { $_.ElementName + '=' + $_.Name }) -join ', ')",
         "            $vmFinal = $true",
         "            break",
         "        }",
@@ -114,6 +134,33 @@ def psdirect_vm_target(vm_name: str) -> str:
     ])
 
 
+def psdirect_vm_target_id(guid: str) -> str:
+    """PowerShell lines addressing a VM by its validated GUID and emitting the
+    VM's NAME as the bare final stdout line (the by-id counterpart of the
+    by-name resolver's bare `$vmTarget` emit; vmident.resolve consumes the
+    name for the policy check). The GUID is regex-validated here and in
+    vm_target_preamble, so only a well-formed literal can reach the script.
+    """
+    validate_vm_guid(guid)
+    return "\n".join([
+        f"$vmTarget = {pswindows.ps_quote(guid)}",
+        "$vm = Get-VM -Id $vmTarget -ErrorAction Stop",
+        "$vm.Name",
+    ])
+
+
+def vm_target_preamble(guid: str) -> str:
+    """The action-script opener: bind $vmTarget to a validated GUID.
+
+    Replaces the inline name-resolver embed in scripts whose caller has
+    already resolved the identity host-side (vmident.resolve), so the lock
+    key and the acted-on VM can never differ. Scripts that need a VM object
+    keep their own `$vm = Get-VM -Id $vmTarget` fetch line after this.
+    """
+    validate_vm_guid(guid)
+    return f"$vmTarget = {pswindows.ps_quote(guid)}"
+
+
 def _truncate(value: str, limit_bytes: int) -> tuple[str, bool]:
     raw = value.encode("utf-8", "replace")
     if len(raw) <= limit_bytes:
@@ -121,7 +168,7 @@ def _truncate(value: str, limit_bytes: int) -> tuple[str, bool]:
     return raw[:limit_bytes].decode("utf-8", "ignore"), True
 
 
-def _result_ok(cfg: Config, exit_code, stdout: str, stderr: str) -> dict:
+def _result_ok(cfg: Config, exit_code, stdout: str, stderr: str, vm_name: str = "") -> dict:
     stdout, t_out = _truncate(stdout, cfg.max_output_bytes)
     stderr, t_err = _truncate(stderr, cfg.max_output_bytes)
     return {
@@ -131,6 +178,9 @@ def _result_ok(cfg: Config, exit_code, stdout: str, stderr: str) -> dict:
         "stderr": stderr,
         "timed_out": False,
         "truncated": t_out or t_err,
+        # Resolved display name (never the raw caller input) so the server's
+        # audit adoption can attribute by-id calls (PRR-005).
+        "vm_name": vm_name,
     }
 
 
@@ -190,16 +240,17 @@ try {
 """
 
 
-def _host_script(vm_name: str, inner_script: str, cred: CredentialSet, elevated: bool) -> str:
+def _host_script(vm_id: str, inner_script: str, cred: CredentialSet, elevated: bool) -> str:
     body = _elevated_body() if elevated else _normal_body()
     # $enc MUST be passed via -ArgumentList (the comment at the Invoke-Command
     # says so — regression F-A round 2 caught it missing) and the temp .ps1 is
     # created INSIDE the guest scriptblock: caller scope does not cross the
     # remoting boundary. GetRandomFileName avoids GetTempFileName's base .tmp
-    # residue (a fresh unique name, no side-effect file to clean up).
+    # residue (a fresh unique name, no side-effect file to clean up). The VM
+    # is addressed by the pre-resolved GUID ($vmTarget preamble, vmident).
     return f"""
 {psdirect_prefix(cred)}
-{psdirect_vm_target(vm_name)}
+{vm_target_preamble(vm_id)}
 $enc = '{pswindows.utf8_b64(inner_script)}'
 $r = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{
     param($enc)
@@ -215,17 +266,22 @@ $r | ConvertTo-Json -Compress -Depth 2
 
 def _run_inner(
     cfg: Config,
-    vm_name: str,
+    vm_id: str,
     inner_script: str,
     cred: CredentialSet,
     timeout_ms: int,
     elevated: bool,
+    vm_name: str = "",
 ) -> dict:
-    policy.vm_allowed(cfg, vm_name)
+    """Run one inner script on the VM identified by the pre-resolved GUID.
+
+    GUID-native: the caller resolved the identity (vmident.resolve, which
+    also ran the VM policy) and holds the per-VM lock on the same GUID.
+    """
     timeout_s = max(30, timeout_ms // 1000 + _GRACE_S)
     try:
         result = pswindows.run_ps(
-            _host_script(vm_name, inner_script, cred, elevated).strip(),
+            _host_script(vm_id, inner_script, cred, elevated).strip(),
             timeout_s=timeout_s,
             stdin_b64=pswindows.utf8_b64(cred.password),
         )
@@ -260,7 +316,7 @@ def _run_inner(
     if exit_code is None:
         return _result_err(cfg, "guest child process produced no exit code", "guest")
 
-    out = _result_ok(cfg, exit_code, data.get("stdout") or "", data.get("stderr") or "")
+    out = _result_ok(cfg, exit_code, data.get("stdout") or "", data.get("stderr") or "", vm_name=vm_name)
     if elevated:
         out["note"] = (
             "elevated run: guest stdout/stderr are merged (RunAs cannot redirect streams); "
@@ -275,30 +331,31 @@ def _run_inner(
 
 def guest_run_ps(
     cfg: Config,
-    vm_name: str,
-    script: str,
+    vm_name: str = "",
+    script: str = "",
     *,
     timeout_ms: int = 60000,
     elevated: bool = False,
     confirm: bool = False,
     cred: CredentialSet | None = None,
+    vm_id: str = "",
 ) -> dict:
-    if not vm_name or not script:
-        raise ValueError("vm_name and script are required")
+    if (not vm_name and not vm_id) or not script:
+        raise ValueError("vm_name (or vm_id) and script are required")
     if cred is None:
         raise ValueError("guest credentials are required")
-    policy.vm_allowed(cfg, vm_name)
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     if elevated:
-        policy.require_destructive(cfg, "elevated_exec", confirm, f"run an elevated script on '{vm_name}'")
-    with vmlocks.vm_lock(vm_name):
+        policy.require_destructive(cfg, "elevated_exec", confirm, f"run an elevated script on '{ref.name}'")
+    with vmlocks.vm_lock(ref.id):
         inner = f"{_LE_RESET}\n{script}\n{_EXIT_PROPAGATION}"
-        return _run_inner(cfg, vm_name, inner, cred, timeout_ms, elevated)
+        return _run_inner(cfg, ref.id, inner, cred, timeout_ms, elevated, vm_name=ref.name)
 
 
 def guest_run(
     cfg: Config,
-    vm_name: str,
-    command: str,
+    vm_name: str = "",
+    command: str = "",
     args: list[str] | None = None,
     cwd: str | None = None,
     *,
@@ -306,14 +363,15 @@ def guest_run(
     elevated: bool = False,
     confirm: bool = False,
     cred: CredentialSet | None = None,
+    vm_id: str = "",
 ) -> dict:
-    if not vm_name or not command:
-        raise ValueError("vm_name and command are required")
+    if (not vm_name and not vm_id) or not command:
+        raise ValueError("vm_name (or vm_id) and command are required")
     if cred is None:
         raise ValueError("guest credentials are required")
-    policy.vm_allowed(cfg, vm_name)
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     if elevated:
-        policy.require_destructive(cfg, "elevated_exec", confirm, f"run '{command}' elevated on '{vm_name}'")
+        policy.require_destructive(cfg, "elevated_exec", confirm, f"run '{command}' elevated on '{ref.name}'")
 
     arg_array = pswindows.ps_native_args(list(args or []))
     invoke = f"& {pswindows.ps_quote(command)} {arg_array}".strip()
@@ -334,42 +392,46 @@ def guest_run(
         lines.append("} finally { Pop-Location }")
     else:
         lines.append(_EXIT_PROPAGATION)
-    with vmlocks.vm_lock(vm_name):
-        return _run_inner(cfg, vm_name, "\n".join(lines), cred, timeout_ms, elevated)
+    with vmlocks.vm_lock(ref.id):
+        return _run_inner(cfg, ref.id, "\n".join(lines), cred, timeout_ms, elevated, vm_name=ref.name)
 
 
 def victim_run_ps(
     cfg: Config,
-    vm_name: str,
-    script: str,
+    vm_name: str = "",
+    script: str = "",
     *,
     timeout_ms: int = 60000,
     cred: CredentialSet | None = None,
+    vm_id: str = "",
 ) -> dict:
     if cred is None:
         raise ValueError("victim credentials are required")
-    if not vm_name or not script:
-        raise ValueError("vm_name and script are required")
-    policy.vm_allowed(cfg, vm_name)
-    with vmlocks.vm_lock(vm_name):
+    if (not vm_name and not vm_id) or not script:
+        raise ValueError("vm_name (or vm_id) and script are required")
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    with vmlocks.vm_lock(ref.id):
         inner = f"{_LE_RESET}\n{script}\n{_EXIT_PROPAGATION}"
-        return _run_inner(cfg, vm_name, inner, cred, timeout_ms, elevated=False)
+        return _run_inner(cfg, ref.id, inner, cred, timeout_ms, elevated=False, vm_name=ref.name)
 
 
 def victim_run(
     cfg: Config,
-    vm_name: str,
-    command: str,
+    vm_name: str = "",
+    command: str = "",
     args: list[str] | None = None,
     cwd: str | None = None,
     *,
     timeout_ms: int = 60000,
     cred: CredentialSet | None = None,
+    vm_id: str = "",
 ) -> dict:
     if cred is None:
         raise ValueError("victim credentials are required")
-    policy.vm_allowed(cfg, vm_name)
+    if (not vm_name and not vm_id) or not command:
+        raise ValueError("vm_name (or vm_id) and command are required")
+    # guest_run resolves once (VM policy included) — no double resolution.
     return guest_run(
         cfg, vm_name, command, args, cwd,
-        timeout_ms=timeout_ms, elevated=False, confirm=False, cred=cred,
+        timeout_ms=timeout_ms, elevated=False, confirm=False, cred=cred, vm_id=vm_id,
     )

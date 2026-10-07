@@ -35,8 +35,20 @@ _REAL_RUN_PS = pswindows.run_ps  # saved before any monkeypatching
 _ENC_RE = re.compile(r"\$enc\d? = '([A-Za-z0-9+/=]+)'")
 
 
+VM_GUID = "e953c649-1234-5678-9abc-def012345678"
+
+
+def _is_resolution_leg(script: str) -> bool:
+    """A standalone by-name resolution leg emits $vmTarget as its last line."""
+    return "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget")
+
+
 class Recorder:
-    """Captures generated scripts; returns canned/empty results."""
+    """Captures generated scripts; returns canned/empty results.
+
+    The by-name resolution leg (vmident, issue #8) is content-served so the
+    queued responses stay attached to the flow's real legs.
+    """
 
     def __init__(self, responses=None):
         self.responses = list(responses or [])
@@ -44,6 +56,8 @@ class Recorder:
 
     def __call__(self, script, **kwargs):
         self.scripts.append(script)
+        if _is_resolution_leg(script):
+            return pswindows.PSResult(stdout=VM_GUID, returncode=0)
         item = self.responses.pop(0) if self.responses else None
         if isinstance(item, Exception):
             raise item
@@ -123,7 +137,7 @@ def test_parse_diagnose_flows(parsed_ps, monkeypatch):
         monkeypatch, diagnostics.diagnose_vm_access, UNRESTRICTED, "test-vm",
         cred=CRED, responses=[host, guest],
     )
-    assert len(scripts) == 2
+    assert len(scripts) == 3  # resolve + host leg + guest probe
     for script in scripts:
         assert _parse_script_and_payloads(script) == []
 
@@ -153,9 +167,9 @@ def test_parse_repair_flows(parsed_ps, monkeypatch):
         responses=[host, broken, '{"service":"sshd"}', '{"backup":"b","replaced":1}',
                    '{"port":"22","enabled_rules":[]}', host, healthy],
     )
-    # 2 diagnose legs + 5 apply legs (sshd stopped, stale binding, WinRM
-    # stopped, ssh firewall, winrm firewall) + 2 verify legs.
-    assert len(scripts) == 9
+    # 1 resolution leg + 2 diagnose legs + 5 apply legs (sshd stopped, stale
+    # binding, WinRM stopped, ssh firewall, winrm firewall) + 2 verify legs.
+    assert len(scripts) == 10
     for script in scripts:
         assert _parse_script_and_payloads(script) == []
 
@@ -183,13 +197,15 @@ def test_parse_job_start_and_wrapper(parsed_ps, monkeypatch):
             "sqlprobe.exe", ["--long"], "C:\\work", cred=CRED,
             responses=[json.dumps({"pid": 100, "job_dir": "C:\\t\\j"})],
         )
-        # scripts[0] host wrapper; payload level 1 = start script; level 2 = wrapper .ps1.
-        payloads = _inner_payloads(scripts[0])
+        # host wrapper (after any resolution leg); payload level 1 = start
+        # script; level 2 = wrapper .ps1.
+        wrapper_host = next(s for s in scripts if "$enc = '" in s)
+        payloads = _inner_payloads(wrapper_host)
         assert payloads, "start script payload must decode"
         wrapper = payloads[-1]
         assert "Split-Path" in wrapper  # sanity: the innermost is the wrapper
         assert _parse_errors(wrapper) == []
-        assert _parse_script_and_payloads(scripts[0]) == []
+        assert _parse_script_and_payloads(wrapper_host) == []
     finally:
         guestjobs.clear_registry_for_tests()
 
@@ -198,7 +214,7 @@ def test_parse_job_start_and_wrapper(parsed_ps, monkeypatch):
 def _job():
     guestjobs.clear_registry_for_tests()
     guestjobs._register({
-        "job_id": "abc123def456", "vm_name": "test-vm", "pid": 4242,
+        "job_id": "abc123def456", "vm_name": "test-vm", "vm_id": VM_GUID, "pid": 4242,
         "command": "x.exe", "args": [], "job_dir": "C:\\t\\hyperv-mcp-job-abc123def456",
         "out_path": "C:\\t\\hyperv-mcp-job-abc123def456\\stdout.log",
         "err_path": "C:\\t\\hyperv-mcp-job-abc123def456\\stderr.log",

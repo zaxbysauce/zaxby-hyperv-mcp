@@ -23,6 +23,14 @@ CRED = CredentialSet("Administrator", "placeholder-pass")
 MARKER = "$policyPath = [System.IO.Path]::GetFullPath("
 
 
+VM_GUID = "e953c649-1234-5678-9abc-def012345678"
+
+
+def _is_resolution_leg(script: str) -> bool:
+    """A standalone by-name resolution leg emits $vmTarget as its last line."""
+    return "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget")
+
+
 class FakePS:
     def __init__(self, responses=()):
         self.responses = list(responses)
@@ -30,6 +38,10 @@ class FakePS:
 
     def __call__(self, script, **kwargs):
         self.scripts.append(script)
+        # The by-name resolution leg (vmident) is content-served: it precedes
+        # every transfer op now (issue #8) and carries no test payload.
+        if _is_resolution_leg(script):
+            return pswindows.PSResult(stdout=VM_GUID, returncode=0)
         # Exhaustion = failure: a silent ok here would mask a tool issuing
         # more PowerShell runs than the test scripted responses for.
         item = (
@@ -158,8 +170,8 @@ def test_put_root_assertion_runs_inside_guest(monkeypatch, rooted_cfg, tmp_path)
     # put runs the assertion TWICE, both inside guest -ScriptBlocks: before
     # dir creation/copy, and again immediately before the final Move-Item so
     # the move re-checks the boundary after the staging window.
-    assert assertion_placement(fake.scripts[0]) == (0, 2)
-    script = fake.scripts[0]
+    assert assertion_placement(fake.scripts[1]) == (0, 2)
+    script = fake.scripts[1]
     markers = [m.start() for m in re.finditer(re.escape(MARKER), script)]
     assert len(markers) == 2
     move_at = script.index("Move-Item -LiteralPath")
@@ -179,7 +191,7 @@ def test_get_root_assertion_runs_inside_guest(monkeypatch, rooted_cfg, tmp_path)
         verify=True,
         cred=CRED,
     )
-    assert assertion_placement(fake.scripts[0]) == (0, 1)
+    assert assertion_placement(fake.scripts[1]) == (0, 1)
 
 
 def test_put_staging_name_unique_per_transfer(monkeypatch, rooted_cfg, tmp_path):
@@ -205,8 +217,8 @@ def test_put_staging_name_unique_per_transfer(monkeypatch, rooted_cfg, tmp_path)
             verify=False,
             cred=CRED,
         )
-    first = staged_destination(fake.scripts[0], "ToSession")
-    second = staged_destination(fake.scripts[1], "ToSession")
+    first = staged_destination(fake.scripts[1], "ToSession")
+    second = staged_destination(fake.scripts[3], "ToSession")
     assert first != second
 
 
@@ -224,8 +236,8 @@ def test_get_staging_name_unique_per_transfer(monkeypatch, rooted_cfg, tmp_path)
             verify=True,
             cred=CRED,
         )
-    first = staged_destination(fake.scripts[0], "FromSession")
-    second = staged_destination(fake.scripts[1], "FromSession")
+    first = staged_destination(fake.scripts[1], "FromSession")
+    second = staged_destination(fake.scripts[3], "FromSession")
     assert first != second
 
 
@@ -317,7 +329,7 @@ def test_unrestricted_mode_skips_in_guest_assertion(monkeypatch, rooted_cfg, tmp
         verify=False,
         cred=CRED,
     )
-    assert MARKER not in fake.scripts[0]
+    assert MARKER not in fake.scripts[1]
 
 
 def test_put_staging_is_sibling_with_bounded_component(monkeypatch, rooted_cfg, tmp_path):
@@ -349,7 +361,7 @@ def test_put_staging_is_sibling_with_bounded_component(monkeypatch, rooted_cfg, 
         verify=False,
         cred=CRED,
     )
-    staged = staged_destination(fake.scripts[0], "ToSession")
+    staged = staged_destination(fake.scripts[1], "ToSession")
     parent, name = os.path.split(staged)
     assert parent == "C:\\g-write"
     assert name.endswith(".mcptmp")

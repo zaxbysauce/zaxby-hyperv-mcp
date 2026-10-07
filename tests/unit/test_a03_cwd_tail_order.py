@@ -26,6 +26,15 @@ from hyperv_mcp.credentials import CredentialSet
 CRED = CredentialSet("Administrator", "placeholder-pass")
 CWD = r"C:\work dir"
 
+# Well-formed GUID served for the by-name identity-resolution leg vmident
+# resolve runs before guest_run (issue #8; test_a04_vm_identity pattern).
+VM_GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
+
+
+def _is_resolution_leg(script: str) -> bool:
+    """A standalone by-name resolution leg emits $vmTarget as its last line."""
+    return "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget")
+
 
 def _inner_script(host_script: str) -> str:
     """The guest-visible inner script rides in the host script as b64."""
@@ -42,6 +51,8 @@ class FakePS:
 
     def __call__(self, script, **kwargs):
         self.scripts.append(script)
+        if _is_resolution_leg(script):
+            return pswindows.PSResult(stdout=VM_GUID, returncode=0)
         item = self.responses.pop(0) if self.responses else pswindows.PSResult(returncode=0)
         if isinstance(item, Exception):
             raise item
@@ -61,7 +72,8 @@ def _emit_inner(monkeypatch, unrestricted, cwd):
     guestexec.guest_run(
         unrestricted, "vm1", r"C:\tool.exe", ["arg"], cwd=cwd, cred=CRED,
     )
-    return _inner_script(fake.scripts[0])
+    # scripts[0] is the identity-resolution leg; scripts[1] the exec action.
+    return _inner_script(fake.scripts[1])
 
 
 def test_cwd_exit_tail_is_emitted_inside_the_try(monkeypatch, unrestricted):

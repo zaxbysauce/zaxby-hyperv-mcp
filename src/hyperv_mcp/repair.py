@@ -1,6 +1,9 @@
 """Narrow guest-access repair with a dry run by default (AC9).
 
-Step 1 reuses diagnostics.diagnose_vm_access (no copy). Step 2 maps findings
+Step 1 reuses diagnostics' GUID-native report builder (diagnose_report —
+the no-re-resolve entry point that diagnose_vm_access wraps after its own
+resolve, no copy and no
+second name resolution). Step 2 maps findings
 to narrow fix proposals. Only explicit apply=True with the destructive
 confirm leg satisfied (category guest_repair) performs any guest mutation;
 each mutation leg runs under its own vm_lock (never an outer lock across the
@@ -23,10 +26,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import diagnostics, policy, pswindows
+from . import diagnostics, policy, pswindows, vmident
 from .config import Config
 from .credentials import CredentialSet
-from .diagnostics import diagnose_vm_access, run_guest_inner
+from .diagnostics import run_guest_inner
 
 _SSHD_CFG = "C:\\ProgramData\\ssh\\sshd_config"
 
@@ -182,30 +185,36 @@ def _is_stale_address(raw: str, report: dict) -> bool:
 
 def repair_guest_access(
     cfg: Config,
-    vm_name: str,
+    vm_name: str = "",
     *,
     apply: bool = False,
     confirm: bool = False,
     cred: CredentialSet | None = None,
+    vm_id: str = "",
 ) -> dict:
-    """Dry-run-first narrow repair for guest access routes (AC9)."""
-    if not vm_name:
-        raise ValueError("vm_name is required")
+    """Dry-run-first narrow repair for guest access routes (AC9).
+
+    Resolves the target ONCE (name or GUID) and threads the resolved GUID
+    through every diagnostic/apply/verify leg — no follow-up leg re-resolves
+    the (possibly renamed) name.
+    """
+    if not vm_name and not vm_id:
+        raise ValueError("vm_name or vm_id is required")
     if cred is None:
         raise ValueError("guest credentials are required")
-    policy.vm_allowed(cfg, vm_name)
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     if apply:
         policy.require_destructive(
             cfg, "guest_repair", confirm,
-            f"apply guest access repairs on '{vm_name}'",
+            f"apply guest access repairs on '{ref.name}'",
         )
 
-    report = diagnose_vm_access(cfg, vm_name, cred=cred)
+    report = diagnostics.diagnose_report(cfg, ref.id, ref.name, cred, 90000)
     items = _plan_items(report)
 
     result: dict[str, Any] = {
         "ok": True,
-        "vm_name": vm_name,
+        "vm_name": ref.name,
         "applied": apply,
         "plan": [
             {k: v for k, v in item.items() if k != "apply_script"}
@@ -230,7 +239,7 @@ def repair_guest_access(
         if item.get("apply_script"):
             try:
                 outcome = run_guest_inner(
-                    cfg, vm_name, item["apply_script"], cred, timeout_ms=90000,
+                    cfg, ref.id, item["apply_script"], cred, timeout_ms=90000,
                 )
                 change["applied"] = True
                 change["outcome"] = outcome
@@ -240,7 +249,7 @@ def repair_guest_access(
                 change["error"] = pswindows.redact(str(exc))
         changes.append(change)
 
-    verify_report = diagnose_vm_access(cfg, vm_name, cred=cred)
+    verify_report = diagnostics.diagnose_report(cfg, ref.id, ref.name, cred, 90000)
     remaining = {f.get("id") for f in verify_report.get("findings") or []}
     for item, change in zip(items, changes, strict=True):
         if item["verify_finding"] in remaining:

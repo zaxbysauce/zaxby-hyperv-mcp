@@ -14,6 +14,14 @@ from hyperv_mcp.policy import PolicyDenied
 CRED = CredentialSet("Administrator", "placeholder-pass")
 
 
+VM_GUID = "e953c649-1234-5678-9abc-def012345678"
+
+
+def _is_resolution_leg(script: str) -> bool:
+    """A standalone by-name resolution leg emits $vmTarget as its last line."""
+    return "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget")
+
+
 class FakePS:
     def __init__(self, responses=()):
         self.responses = list(responses)
@@ -21,6 +29,10 @@ class FakePS:
 
     def __call__(self, script, **kwargs):
         self.scripts.append(script)
+        # The by-name resolution leg (vmident) is content-served: it precedes
+        # every transfer op now (issue #8) and carries no test payload.
+        if _is_resolution_leg(script):
+            return pswindows.PSResult(stdout=VM_GUID, returncode=0)
         # Exhaustion = failure: a silent ok here would mask a tool issuing
         # more PowerShell runs than the test scripted responses for.
         item = (
@@ -63,7 +75,8 @@ def test_put_success_byte_counts_and_staging(monkeypatch, rooted_cfg, tmp_path):
         confirm=True, verify=False, cred=CRED,
     )
     assert out["ok"] and out["bytes_copied"] == 2
-    script = fake.scripts[0]
+    assert out["vm_name"] == "test-vm"  # resolved display name (PRR-005)
+    script = fake.scripts[1]
     assert "-LiteralPath" in script
     assert ".mcptmp" in script
     assert "Move-Item" in script
@@ -140,7 +153,7 @@ def test_put_verify_branch_emits_real_boolean_guard(monkeypatch, rooted_cfg, tmp
         rooted_cfg, "test-vm", str(src), r"C:\g-write\a.bin",
         confirm=True, verify=True, cred=CRED,
     )
-    script = fake.scripts[0]
+    script = fake.scripts[1]
     assert "$doVerify" not in script  # no bareword boolean variable at all
     assert "if ($shaLocal -ne $shaStaged)" in script
     # Copy-Item must sit INSIDE the staging-cleanup try (leak-on-copy regression).
@@ -185,7 +198,7 @@ def test_get_creates_local_parents_and_verifies(monkeypatch, rooted_cfg, tmp_pat
     )
     assert out["ok"]
     assert dest.parent.is_dir()
-    assert "-FromSession" in fake.scripts[0]
+    assert "-FromSession" in fake.scripts[1]
 
 
 def test_get_guest_read_outside_roots_denied(monkeypatch, rooted_cfg, tmp_path):
@@ -222,7 +235,7 @@ def test_read_file_slice_script_bounded(monkeypatch, rooted_cfg):
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = filetransfer.guest_read_file(rooted_cfg, "test-vm", r"C:\g-read\f", 3, cred=CRED)
     assert out["ok"] and out["bytes_read"] == 3
-    script = fake.scripts[0]
+    script = fake.scripts[1]
     assert "[System.IO.File]::Open(" in script
     assert "ReadAllBytes" not in script
     assert "0..($maxb - 1)" not in script
@@ -250,7 +263,7 @@ def test_list_dir_empty(monkeypatch, rooted_cfg):
     fake = FakePS([pswindows.PSResult(stdout="[]", returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = filetransfer.guest_list_dir(rooted_cfg, "test-vm", r"C:\g-read\empty", cred=CRED)
-    assert out == {"ok": True, "entries": []}
+    assert out == {"ok": True, "vm_name": "test-vm", "entries": []}
 
 
 def test_guest_root_assertion_embedded_when_roots_set(monkeypatch, rooted_cfg):
@@ -258,8 +271,8 @@ def test_guest_root_assertion_embedded_when_roots_set(monkeypatch, rooted_cfg):
     fake = FakePS([pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     filetransfer.guest_read_file(rooted_cfg, "test-vm", r"C:\g-read\f", cred=CRED)
-    assert "policy: guest read denied" in fake.scripts[0]
-    assert "GetFullPath" in fake.scripts[0]
+    assert "policy: guest read denied" in fake.scripts[1]
+    assert "GetFullPath" in fake.scripts[1]
 
 
 def test_timeout_mapping(monkeypatch, rooted_cfg, tmp_path):
@@ -274,8 +287,8 @@ def test_timeout_mapping(monkeypatch, rooted_cfg, tmp_path):
         confirm=True, verify=False, cred=CRED,
     )
     assert out["error_class"] == "timeout" and out["ok"] is False
-    assert len(fake.scripts) == 2, "timeout must issue exactly one cleanup run"
-    cleanup = fake.scripts[1]
+    assert len(fake.scripts) == 3, "resolve + transfer + exactly one cleanup run"
+    cleanup = fake.scripts[2]
     assert "Remove-Item" in cleanup and ".mcptmp" in cleanup
 
 
@@ -335,7 +348,7 @@ def test_put_assertion_precedes_dir_creation(monkeypatch, rooted_cfg, tmp_path):
         rooted_cfg, "test-vm", str(src), r"C:\g-write\a.bin",
         confirm=True, verify=False, cred=CRED,
     )
-    script = fake.scripts[0]
+    script = fake.scripts[1]
     assert script.index(MARKER) < script.index("New-Item")
 
 
@@ -353,7 +366,7 @@ def test_get_assertion_precedes_copy_from_session(monkeypatch, rooted_cfg, tmp_p
         rooted_cfg, "test-vm", r"C:\g-read\a.bin", str(dest),
         verify=True, cred=CRED,
     )
-    script = fake.scripts[0]
+    script = fake.scripts[1]
     assert script.index(MARKER) < script.index("Copy-Item -FromSession")
 
 
@@ -390,7 +403,7 @@ def test_put_get_scripts_parse_clean(monkeypatch, rooted_cfg, tmp_path):
         "if ($errs -and $errs.Count) { "
         "$errs | ForEach-Object { $_.ToString() }; exit 1 }"
     )
-    for label, script in (("put", fake.scripts[0]), ("get", fake.scripts[1])):
+    for label, script in (("put", fake.scripts[1]), ("get", fake.scripts[3])):
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", parser],
             input=script, capture_output=True, text=True, timeout=60,
@@ -428,9 +441,9 @@ def test_put_get_assert_wrappers_pin_terminating_erroraction(monkeypatch, rooted
         verify=True, cred=CRED,
     )
     for label, script, path, roots, category in (
-        ("put", fake.scripts[0], r"C:\g-write\a.bin",
+        ("put", fake.scripts[1], r"C:\g-write\a.bin",
          rooted_cfg.guest_write_roots, "write"),
-        ("get", fake.scripts[1], r"C:\g-read\a.bin",
+        ("get", fake.scripts[3], r"C:\g-read\a.bin",
          rooted_cfg.guest_read_roots, "read"),
     ):
         fragment = filetransfer._guest_root_assertion(path, roots, category)
@@ -480,9 +493,24 @@ def test_put_container_check_classified_invalid_and_precedes_copy(monkeypatch, r
         confirm=True, verify=False, cred=CRED,
     )
     assert out["ok"] is False and out["error_class"] == "invalid"
-    script = fake.scripts[0]
+    script = fake.scripts[1]
     assert "PathType Container" in script
     assert script.index("PathType Container") < script.index("Copy-Item -ToSession")
+
+
+def test_get_denied_vm_name_creates_no_directories(monkeypatch, rooted_cfg, tmp_path):
+    """PRR-010: guest_get resolves identity BEFORE creating the local
+    destination dirs — a call rejected at resolve (denied VM name) must not
+    orphan host directories (the failure cleanup only runs post-resolve)."""
+    dest = tmp_path / "host-dst" / "newdir" / "out.bin"
+    fake = FakePS([])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(PolicyDenied, match="vm"):
+        filetransfer.guest_get(
+            rooted_cfg, "prod-db", r"C:\g-read\a.bin", str(dest), cred=CRED,
+        )
+    assert fake.scripts == []       # denied name spawns no PowerShell
+    assert not dest.parent.exists()  # and no directory was created at all
 
 
 def test_get_denied_leaves_no_created_dirs(monkeypatch, rooted_cfg, tmp_path):

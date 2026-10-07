@@ -12,6 +12,13 @@ per-request PS Direct legs deliberately SKIP vm_lock (pinned in the plan) —
 a proxied request must not fail because an unrelated tool call holds the
 VM. Credential lifetime: the stored credential set lives until
 relay_stop/eviction/process exit; stop nulls the field.
+
+Identity (issue #8): relay_start resolves the target ONCE via
+vmident.resolve and stores the resolved GUID (`vm_id`) alongside the
+display name; every per-request leg builds its guest script from that
+stored GUID, so a VM rename after start can never retarget the relay, and
+the duplicate-relay check compares the resolved GUID (plus guest_port),
+not the mutable name.
 """
 
 from __future__ import annotations
@@ -24,7 +31,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from . import policy, pswindows
+from . import policy, pswindows, vmident
 from .config import Config
 from .credentials import CredentialSet
 from .diagnostics import build_guest_script
@@ -235,7 +242,7 @@ class _RelayHandler(BaseHTTPRequestHandler):
                 # internal AttributeError from psdirect_prefix.
                 self._reply_error(503, "relay is stopped")
                 return
-            script = build_guest_script(ctx["vm_name"], inner, cred)
+            script = build_guest_script(ctx["vm_id"], inner, cred)
             self._bump("bytes_in", len(body))
             outcome = _run_forward(script, cred)
         except Exception as exc:
@@ -296,16 +303,21 @@ class _RelayServer(ThreadingHTTPServer):
 
 def relay_start(
     cfg: Config,
-    vm_name: str,
-    guest_port: int,
+    vm_name: str = "",
+    guest_port: int = 0,
+    vm_id: str = "",
     *,
     host_port: int = 0,
     bind: str = "127.0.0.1",
     cred: CredentialSet | None = None,
 ) -> dict:
-    """Start a loopback HTTP relay to the guest's 127.0.0.1:guest_port."""
-    if not vm_name:
-        raise ValueError("vm_name is required")
+    """Start a loopback HTTP relay to the guest's 127.0.0.1:guest_port.
+
+    The VM may be addressed by `vm_name` or `vm_id` (exactly one required;
+    vmident.resolve enforces identity and policy). The stored GUID addresses
+    every per-request leg, and the duplicate check compares it, so renames
+    never fork or retarget a relay.
+    """
     if cred is None:
         raise ValueError("guest credentials are required")
     if not 1 <= int(guest_port) <= 65535:
@@ -314,20 +326,23 @@ def relay_start(
         raise ValueError("host_port must be 0..65535 (0 = ephemeral)")
     if bind.lower() not in _LOOPBACK_BINDS:
         raise ValueError(f"refusing non-loopback bind {bind!r}: the relay is loopback-only")
-    policy.vm_allowed(cfg, vm_name)
-    policy.require_category(cfg, "relay", f"relay HTTP requests into guest '{vm_name}'")
+    policy.require_category(cfg, "relay", f"relay HTTP requests into guest '{vm_name or vm_id}'")
+    # Resolve once (VM policy runs inside vmident.resolve on the governing
+    # name — caller-supplied or resolved from the GUID).
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
 
     with _relays_lock:
         for entry in _relays.values():
-            if not entry.get("stopped") and entry["vm_name"].casefold() == vm_name.casefold() \
+            if not entry.get("stopped") and entry["vm_id"] == ref.id \
                     and entry["guest_port"] == guest_port:
                 raise ValueError(
-                    f"a relay to {vm_name}:{guest_port} already exists ({entry['relay_id']})"
+                    f"a relay to {ref.name}:{guest_port} already exists ({entry['relay_id']})"
                 )
 
     context: dict[str, Any] = {
         "cfg": cfg,
-        "vm_name": vm_name,
+        "vm_name": ref.name,
+        "vm_id": ref.id,
         "guest_port": int(guest_port),
         "cred": cred,
         "counters": _new_counters(),
@@ -346,7 +361,8 @@ def relay_start(
     thread.start()
     entry = {
         "relay_id": relay_id,
-        "vm_name": vm_name,
+        "vm_name": ref.name,
+        "vm_id": ref.id,
         "guest_port": int(guest_port),
         "bind": bind,
         "host_port": server.server_address[1],
@@ -361,7 +377,7 @@ def relay_start(
     return {
         "ok": True,
         "relay_id": relay_id,
-        "vm_name": vm_name,
+        "vm_name": ref.name,
         "guest_port": int(guest_port),
         "bind": bind,
         "host_port": entry["host_port"],

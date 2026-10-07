@@ -13,6 +13,13 @@ from hyperv_mcp.policy import PolicyDenied
 CRED = CredentialSet("Administrator", "placeholder-pass")
 VICTIM = CredentialSet("victim", "placeholder-pass-2")
 
+VM_GUID = "e953c649-1234-5678-9abc-def012345678"
+
+
+def _guid_result():
+    """Canned by-name resolution leg response (stdout = the VM GUID)."""
+    return pswindows.PSResult(stdout=VM_GUID, returncode=0)
+
 
 def _inner_script(host_script: str) -> str:
     """The guest-visible inner script rides in the host script as b64."""
@@ -44,18 +51,19 @@ def unrestricted():
 
 def test_run_ps_success_envelope(monkeypatch, unrestricted):
     payload = {"exit_code": 0, "stdout": "out-text", "stderr": ""}
-    fake = FakePS([pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
+    fake = FakePS([_guid_result(), pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = guestexec.guest_run_ps(unrestricted, "vm1", "Get-Date", cred=CRED)
     assert out == {
         "ok": True, "exit_code": 0, "stdout": "out-text", "stderr": "",
         "timed_out": False, "truncated": False,
+        "vm_name": "vm1",  # resolved display name for by-id audit attribution
     }
 
 
 def test_run_ps_real_exit_code_preserved(monkeypatch, unrestricted):
     payload = {"exit_code": 3, "stdout": "", "stderr": ""}
-    fake = FakePS([pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
+    fake = FakePS([_guid_result(), pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = guestexec.guest_run_ps(unrestricted, "vm1", "exit 3", cred=CRED)
     assert out["ok"] and out["exit_code"] == 3
@@ -63,14 +71,14 @@ def test_run_ps_real_exit_code_preserved(monkeypatch, unrestricted):
 
 def test_separate_streams(monkeypatch, unrestricted):
     payload = {"exit_code": 0, "stdout": "to-out", "stderr": "to-err"}
-    fake = FakePS([pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
+    fake = FakePS([_guid_result(), pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = guestexec.guest_run_ps(unrestricted, "vm1", "x", cred=CRED)
     assert out["stdout"] == "to-out" and out["stderr"] == "to-err"
 
 
 def test_timeout_reports_guest_may_continue(monkeypatch, unrestricted):
-    fake = FakePS([pswindows.PSResult(timed_out=True)])
+    fake = FakePS([_guid_result(), pswindows.PSResult(timed_out=True)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = guestexec.guest_run_ps(unrestricted, "vm1", "x", timeout_ms=1000, cred=CRED)
     assert out["ok"] is False
@@ -80,14 +88,14 @@ def test_timeout_reports_guest_may_continue(monkeypatch, unrestricted):
 
 
 def test_transport_error_mapping(monkeypatch, unrestricted):
-    fake = FakePS([pswindows.PSResult(returncode=1, stderr="Cannot find VM")])
+    fake = FakePS([_guid_result(), pswindows.PSResult(returncode=1, stderr="Cannot find VM")])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = guestexec.guest_run_ps(unrestricted, "vm1", "x", cred=CRED)
     assert out["error_class"] == "transport" and "Cannot find VM" in out["error"]
 
 
 def test_parse_error_mapping(monkeypatch, unrestricted):
-    fake = FakePS([pswindows.PSResult(stdout="not json at all", returncode=0)])
+    fake = FakePS([_guid_result(), pswindows.PSResult(stdout="not json at all", returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = guestexec.guest_run_ps(unrestricted, "vm1", "x", cred=CRED)
     assert out["error_class"] == "parse"
@@ -96,15 +104,19 @@ def test_parse_error_mapping(monkeypatch, unrestricted):
 def test_output_truncation_flag(monkeypatch):
     cfg = Config(unrestricted=True, max_output_bytes=1024)
     payload = {"exit_code": 0, "stdout": "A" * 5000, "stderr": ""}
-    fake = FakePS([pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
+    fake = FakePS([_guid_result(), pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = guestexec.guest_run_ps(cfg, "vm1", "x", cred=CRED)
     assert out["truncated"] is True
     assert len(out["stdout"].encode("utf-8")) <= 1024
 
 
-def test_elevated_gated_by_policy():
+def test_elevated_gated_by_policy(monkeypatch):
     cfg = Config(allowed_vm_patterns=["test-*"])
+    # vm_allowed runs inside vmident.resolve (before any elevated gate), so
+    # the resolution leg is served even for the denied elevated calls.
+    fake = FakePS([_guid_result(), _guid_result()])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
     with pytest.raises(PolicyDenied, match="elevated_exec"):
         guestexec.guest_run_ps(
             cfg, "test-vm", "x", elevated=True, confirm=True, cred=CRED
@@ -118,46 +130,46 @@ def test_elevated_gated_by_policy():
 
 def test_elevated_uses_runas_merged_note(monkeypatch, unrestricted):
     payload = {"exit_code": 0, "stdout": "merged", "stderr": ""}
-    fake = FakePS([pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
+    fake = FakePS([_guid_result(), pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = guestexec.guest_run_ps(
         unrestricted, "vm1", "x", elevated=True, confirm=True, cred=CRED
     )
-    assert "Verb" in fake.scripts[0] and "'RunAs'" in fake.scripts[0]
+    assert "Verb" in fake.scripts[1] and "'RunAs'" in fake.scripts[1]
     assert "merged" in out["note"]
 
 
 def test_normal_path_uses_separate_redirects(monkeypatch, unrestricted):
     payload = {"exit_code": 0, "stdout": "o", "stderr": "e"}
-    fake = FakePS([pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
+    fake = FakePS([_guid_result(), pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     guestexec.guest_run_ps(unrestricted, "vm1", "x", cred=CRED)
-    assert "RedirectStandardOutput" in fake.scripts[0]
-    assert "RedirectStandardError" in fake.scripts[0]
-    assert "'RunAs'" not in fake.scripts[0]
+    assert "RedirectStandardOutput" in fake.scripts[1]
+    assert "RedirectStandardError" in fake.scripts[1]
+    assert "'RunAs'" not in fake.scripts[1]
 
 
 def test_password_via_stdin_not_script(monkeypatch, unrestricted):
     """F1/F4 regression: password must arrive via stdin_b64, never embedded."""
-    fake = FakePS([pswindows.PSResult(
+    fake = FakePS([_guid_result(), pswindows.PSResult(
         stdout=json.dumps({"exit_code": 0, "stdout": "", "stderr": ""}), returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     guestexec.guest_run_ps(unrestricted, "vm1", "x", cred=CRED)
-    script = fake.scripts[0]
+    script = fake.scripts[1]
     assert CRED.password not in script
-    assert fake.kwargs[0].get("stdin_b64") == pswindows.utf8_b64(CRED.password)
+    assert fake.kwargs[1].get("stdin_b64") == pswindows.utf8_b64(CRED.password)
     assert "$cred = [System.Management.Automation.PSCredential]::new('Administrator', $sec)" in script
 
 
 def test_guest_run_command_quoting_and_empty_args(monkeypatch, unrestricted):
-    fake = FakePS([pswindows.PSResult(
+    fake = FakePS([_guid_result(), pswindows.PSResult(
         stdout=json.dumps({"exit_code": 0, "stdout": "", "stderr": ""}), returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     guestexec.guest_run(
         unrestricted, "vm1", r"C:\path with space\tool.exe",
         ["", "arg with 'quote'", "plain"], cwd=r"C:\work dir", cred=CRED,
     )
-    inner = _inner_script(fake.scripts[0])
+    inner = _inner_script(fake.scripts[1])
     assert "'C:\\path with space\\tool.exe'" in inner
     assert "''" in inner
     assert "'arg with ''quote'''" in inner
@@ -166,42 +178,58 @@ def test_guest_run_command_quoting_and_empty_args(monkeypatch, unrestricted):
 
 
 def test_guest_run_exit_propagation(monkeypatch, unrestricted):
-    fake = FakePS([pswindows.PSResult(
+    fake = FakePS([_guid_result(), pswindows.PSResult(
         stdout=json.dumps({"exit_code": 7, "stdout": "", "stderr": ""}), returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     guestexec.guest_run(unrestricted, "vm1", "cmd.exe", ["/c", "exit 7"], cred=CRED)
-    assert guestexec._EXIT_PROPAGATION in _inner_script(fake.scripts[0])
+    assert guestexec._EXIT_PROPAGATION in _inner_script(fake.scripts[1])
 
 
 def test_guest_run_ps_exit_propagation(monkeypatch, unrestricted):
-    fake = FakePS([pswindows.PSResult(
+    fake = FakePS([_guid_result(), pswindows.PSResult(
         stdout=json.dumps({"exit_code": 0, "stdout": "", "stderr": ""}), returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     guestexec.guest_run_ps(unrestricted, "vm1", "Write-Output hi", cred=CRED)
-    assert guestexec._EXIT_PROPAGATION in _inner_script(fake.scripts[0])
+    assert guestexec._EXIT_PROPAGATION in _inner_script(fake.scripts[1])
 
 
 def test_host_script_passes_enc_via_argument_list(monkeypatch, unrestricted):
     """Round-2 regression: without -ArgumentList $enc the guest scriptblock
     binds $enc=$null, silently executes an EMPTY script, and returns
     {ok:true, exit_code:0, stdout:''} — a worse failure than an error."""
-    fake = FakePS([pswindows.PSResult(
+    fake = FakePS([_guid_result(), pswindows.PSResult(
         stdout=json.dumps({"exit_code": 0, "stdout": "x", "stderr": ""}), returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     guestexec.guest_run_ps(unrestricted, "vm1", "Get-Date", cred=CRED)
     # Rendered f-string turns }} into }: the Invoke-Command closes with a
     # single brace followed by the ArgumentList carrying $enc across the
     # remoting boundary.
-    assert "} -ArgumentList $enc" in fake.scripts[0]
+    assert "} -ArgumentList $enc" in fake.scripts[1]
 
 
 def test_victim_never_elevated(monkeypatch, unrestricted):
-    fake = FakePS([pswindows.PSResult(
+    fake = FakePS([_guid_result(), pswindows.PSResult(
         stdout=json.dumps({"exit_code": 0, "stdout": "", "stderr": ""}), returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     guestexec.victim_run_ps(unrestricted, "vm1", "whoami", cred=VICTIM)
-    assert "'RunAs'" not in fake.scripts[0]
-    assert VICTIM.username in fake.scripts[0]
+    assert "'RunAs'" not in fake.scripts[1]
+    assert VICTIM.username in fake.scripts[1]
+
+
+def test_action_script_addresses_resolved_guid(monkeypatch, unrestricted):
+    """Issue #8: after the by-name resolution leg, the action script binds
+    $vmTarget to the resolved GUID via the preamble — no inline name resolver,
+    no VM name anywhere in the action script."""
+    payload = {"exit_code": 0, "stdout": "", "stderr": ""}
+    fake = FakePS([_guid_result(), pswindows.PSResult(stdout=json.dumps(payload), returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    guestexec.guest_run_ps(unrestricted, "vm1", "Get-Date", cred=CRED)
+    resolve_leg, action = fake.scripts[0], fake.scripts[1]
+    # the standalone by-name leg emits the GUID as its last line
+    assert "Msvm_ComputerSystem" in resolve_leg and resolve_leg.rstrip().endswith("$vmTarget")
+    assert f"$vmTarget = '{VM_GUID}'" in action
+    assert "Msvm_ComputerSystem" not in action
+    assert "vm1" not in action
 
 
 def test_vm_policy_denied_raises():
@@ -249,7 +277,7 @@ def test_psdirect_vm_target_clean_empty_enumeration_is_not_retried():
     # a terminal (clean) result must not claim a retry history
     assert "$vmFinal = $true" in script[not_found:catch_at]
     # the duplicate-name path is terminal too (flag set before its break)
-    dup = script.index("$vmResolveError = 'target VM name is not unique'")
+    dup = script.index("'target VM name is not unique; candidates: '")
     assert script[dup:script.index("break", dup)].count("$vmFinal = $true") == 1
     assert "if ($vmFinal) { throw ('target VM resolution failed: {0}' -f $vmResolveError) }" in script
     assert "target VM resolution failed after retries: {0}" in script  # exhausted transient retries only
@@ -262,9 +290,11 @@ def test_psdirect_vm_target_script_contract():
     # literal -eq match (wildcard chars inert) AND GUID-shaped Name filter
     assert "$_.ElementName -eq 'test[1]*vm'" in script
     assert f"$_.Name -match '{_GUID_RE}'" in script
-    # duplicate VM names are ambiguous -> error, never a silent [0] pick
+    # duplicate VM names are ambiguous -> error naming the candidate GUIDs
+    # (issue #8 C4), never a silent [0] pick
     assert "$vmCandidates.Count -gt 1" in script
-    assert "'target VM name is not unique'" in script
+    assert "'target VM name is not unique; candidates: '" in script
+    assert "$vmCandidates | ForEach-Object { $_.ElementName + '=' + $_.Name }" in script
     # bounded retry with terminal-attempt sleep gated
     assert "foreach ($vmAttempt in 1..3)" in script
     assert "if ($vmAttempt -lt 3) { Start-Sleep -Seconds 2 }" in script

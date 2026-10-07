@@ -32,6 +32,14 @@ def _ok(payload):
     return pswindows.PSResult(stdout=json.dumps(payload), returncode=0)
 
 
+VM_GUID = "e953c649-1234-5678-9abc-def012345678"
+
+
+def _guid_result():
+    """Canned by-name resolution leg response (stdout = the VM GUID)."""
+    return pswindows.PSResult(stdout=VM_GUID, returncode=0)
+
+
 def _host():
     return {"state": "Running", "vm_id": "e953c649-1", "uptime_s": 1, "memory_mb": 1, "cpu_usage": 1}
 
@@ -57,34 +65,34 @@ def test_dry_run_is_default_and_mutates_nothing(monkeypatch):
     cfg = Config(unrestricted=True)
     guest = _guest(listen="192.168.50.20")
     guest["ssh"]["listeners"] = [{"address": "192.168.50.20", "port": 22}]
-    fake = FakePS([_ok(_host()), _ok(guest)])
+    fake = FakePS([_guid_result(), _ok(_host()), _ok(guest)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = repair.repair_guest_access(cfg, "test-vm", cred=CRED)
     assert out["applied"] is False
     ids = [p["finding"] for p in out["plan"]]
     assert "ssh_stale_binding" in ids
     assert out["changes"] == []
-    # Only the two diagnose legs ran — no mutation script.
-    assert len(fake.scripts) == 2
-    assert "Restart-Service" not in fake.scripts[1]
+    # Resolve + the two diagnose legs ran — no mutation script.
+    assert len(fake.scripts) == 3
+    assert "Restart-Service" not in fake.scripts[2]
 
 
 def test_apply_without_confirm_denied_before_mutation(monkeypatch):
     cfg = Config(unrestricted=True)
-    fake = FakePS([])
+    fake = FakePS([_guid_result()])  # resolve runs before the destructive gate
     monkeypatch.setattr(pswindows, "run_ps", fake)
     with pytest.raises(PolicyDenied, match="confirm"):
         repair.repair_guest_access(cfg, "test-vm", apply=True, confirm=False, cred=CRED)
-    assert fake.scripts == []
+    assert len(fake.scripts) == 1
 
 
 def test_apply_denied_when_category_disabled(monkeypatch):
     cfg = Config(allowed_vm_patterns=["test-*"], destructive=DestructivePolicy(guest_repair=False))
-    fake = FakePS([])
+    fake = FakePS([_guid_result()])  # resolve runs before the destructive gate
     monkeypatch.setattr(pswindows, "run_ps", fake)
     with pytest.raises(PolicyDenied, match="guest_repair"):
         repair.repair_guest_access(cfg, "test-vm", apply=True, confirm=True, cred=CRED)
-    assert fake.scripts == []
+    assert len(fake.scripts) == 1
 
 
 def test_apply_executes_and_verifies_each_action(monkeypatch):
@@ -93,6 +101,7 @@ def test_apply_executes_and_verifies_each_action(monkeypatch):
     broken["ssh"]["listeners"] = [{"address": "192.168.50.20", "port": 22}]
     healthy = _guest(status="Running", listen="0.0.0.0", fw=True)
     fake = FakePS([
+        _guid_result(),                            # resolve once (issue #8)
         _ok(_host()), _ok(broken),                 # diagnose 1
         _ok({"service": "sshd", "status": "Running"}),  # apply start sshd
         _ok({"backup": "C:/ProgramData/ssh/sshd_config.bak-20260929", "replaced": 1}),  # apply stale
@@ -111,8 +120,9 @@ def test_apply_executes_and_verifies_each_action(monkeypatch):
         assert change["verified"] is True
         assert change["verify_detail"].endswith("cleared")
     assert out["backup_path"].endswith(".bak-20260929")
-    # One apply script per item, then a full re-diagnose (2 legs).
-    assert len(fake.scripts) == 7
+    # One resolution leg, one apply script per item, then a full re-diagnose
+    # (2 legs) — the verify pass reuses the resolved GUID, no re-resolve.
+    assert len(fake.scripts) == 8
 
     def inner(script):
         import base64
@@ -122,9 +132,9 @@ def test_apply_executes_and_verifies_each_action(monkeypatch):
         assert m
         return base64.b64decode(m.group(1)).decode("utf-8")
 
-    assert "Start-Service -Name 'sshd'" in inner(fake.scripts[2])
-    assert "Copy-Item" in inner(fake.scripts[3])
-    assert "Set-NetFirewallRule" in inner(fake.scripts[4])
+    assert "Start-Service -Name 'sshd'" in inner(fake.scripts[3])
+    assert "Copy-Item" in inner(fake.scripts[4])
+    assert "Set-NetFirewallRule" in inner(fake.scripts[5])
 
 
 def test_apply_sibling_continues_after_item_error(monkeypatch):
@@ -133,6 +143,7 @@ def test_apply_sibling_continues_after_item_error(monkeypatch):
     broken["ssh"]["listeners"] = [{"address": "192.168.50.20", "port": 22}]
     healthy = _guest(status="Running", listen="0.0.0.0")
     fake = FakePS([
+        _guid_result(),
         _ok(_host()), _ok(broken),
         pswindows.PSResult(stdout="", returncode=1, stderr="rewrite failed"),  # stale apply fails
         _ok({"service": "sshd", "status": "Running"}),  # start-service sibling succeeds
@@ -148,7 +159,7 @@ def test_apply_sibling_continues_after_item_error(monkeypatch):
 
 def test_healthy_vm_empty_plan(monkeypatch):
     cfg = Config(unrestricted=True)
-    fake = FakePS([_ok(_host()), _ok(_guest())])
+    fake = FakePS([_guid_result(), _ok(_host()), _ok(_guest())])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = repair.repair_guest_access(cfg, "test-vm", cred=CRED)
     assert out["plan"] == []
@@ -157,16 +168,16 @@ def test_healthy_vm_empty_plan(monkeypatch):
 
 def test_apply_nothing_to_do_when_clean(monkeypatch):
     cfg = Config(unrestricted=True)
-    fake = FakePS([_ok(_host()), _ok(_guest())])
+    fake = FakePS([_guid_result(), _ok(_host()), _ok(_guest())])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = repair.repair_guest_access(cfg, "test-vm", apply=True, confirm=True, cred=CRED)
     assert out["changes"] == []
-    assert len(fake.scripts) == 2
+    assert len(fake.scripts) == 3
 
 
 def test_plan_items_do_not_leak_apply_scripts(monkeypatch):
     cfg = Config(unrestricted=True)
-    fake = FakePS([_ok(_host()), _ok(_guest(status="Stopped"))])
+    fake = FakePS([_guid_result(), _ok(_host()), _ok(_guest(status="Stopped"))])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = repair.repair_guest_access(cfg, "test-vm", cred=CRED)
     for item in out["plan"]:
@@ -181,6 +192,7 @@ def test_apply_reports_still_present_when_verify_fails(monkeypatch):
     broken = _guest(status="Stopped")
     still_broken = _guest(status="Stopped")
     fake = FakePS([
+        _guid_result(),
         _ok(_host()), _ok(broken),
         _ok({"service": "sshd", "status": "Running"}),  # apply leg claims success
         _ok(_host()), _ok(still_broken),                # verify: finding remains
