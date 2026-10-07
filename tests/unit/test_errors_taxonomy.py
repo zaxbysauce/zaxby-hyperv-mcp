@@ -153,3 +153,19 @@ def test_every_tool_has_no_output_model(registered_tools):
         if md.output_schema is not None:
             bad.append(name)
     assert bad == [], f"tools with output models (envelope-hostile): {bad}"
+
+
+def test_success_result_serializer_matches_convert_to_content():
+    """Pin the wire-identity claim (review round 1 mutation M4 survived:
+    changing success_result's to_json indent left the suite green). The
+    metadata sidecar text must be byte-identical to what
+    func_metadata._convert_to_content produces for the same dict."""
+    from mcp.server.fastmcp.utilities.func_metadata import _convert_to_content
+
+    meta = {"vm_id": "e953c649", "frame_hash": "abc", "width": 640,
+            "unicode": "café", "nested": {"a": 1}}
+    block = errors.success_result([meta]).content[0]
+    assert block.type == "text"
+    assert block.text == _convert_to_content(meta)[0].text, (
+        "success_result must serialize dicts exactly as _convert_to_content"
+    )
