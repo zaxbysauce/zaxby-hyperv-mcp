@@ -237,3 +237,67 @@ def test_module_dict_without_error_class_audits_envelope_class(monkeypatch, tmp_
     assert match and match[-1]["error_class"] == env["error_class"], (
         f"audit {match[-1:] if match else 'none'} must equal envelope {env['error_class']!r}"
     )
+
+
+def test_guard_survives_broken_audit_sink(monkeypatch, tmp_path, capsys):
+    """PRR-014 fix: a failed audit write must not turn a rejection into a
+    raw exception — the envelope still ships, the failure warns on stderr."""
+    import asyncio
+
+    doc = {"allowed_vm_patterns": ["test-*"], "unrestricted": True}
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mod = importlib.reload(server_module)
+    mod.bootstrap({"HYPERV_MCP_CONFIG": str(p)})
+    mcp = mod.get_mcp()
+
+    def broken_sink(*args, **kwargs):
+        raise PermissionError("disk full")
+
+    monkeypatch.setattr(mod.auditlog, "log_operation", broken_sink)
+    result = asyncio.run(mcp.call_tool("hyperv_list_vms", {"bogus": True}))
+    env = result.structuredContent
+    assert env["ok"] is False and env["error_class"] == "invalid"
+    assert "bogus" in env["error"]
+    captured = capsys.readouterr().err
+    assert "audit write failed" in captured
+
+
+def test_harden_tools_warns_loudly_on_empty_registry(capsys):
+    """PRR-015 fix: if the SDK's private tool registry shape changes, the
+    hardening pass must say so on stderr instead of failing open silently."""
+    from mcp.server.fastmcp import FastMCP
+
+    server_module._harden_tools(FastMCP("probe-empty"))
+    captured = capsys.readouterr().err
+    assert "found no registered tools" in captured
+
+
+def test_registered_secret_redacted_in_validation_envelope(monkeypatch, tmp_path):
+    """PRR-002 residual pin: a mistyped value that IS a registered secret
+    must reach the envelope redacted (the registry scrub runs inside
+    errors.envelope). Unregistered values are documented residual — the
+    SDK's validation message format embeds them before redaction can see
+    a registration."""
+    import asyncio
+
+    from hyperv_mcp import credentials
+
+    doc = {"allowed_vm_patterns": ["test-*"], "unrestricted": True,
+           "allow_inline_credentials": True}
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mod = importlib.reload(server_module)
+    mod.bootstrap({"HYPERV_MCP_CONFIG": str(p)})
+    secret = "S3CR3T-REGISTERED-VALUE"
+    credentials._validated_password(secret, "test registration")
+    mcp = mod.get_mcp()
+
+    result = asyncio.run(mcp.call_tool(
+        "hyperv_guest_run_ps",
+        {"vm_name": "test-vm", "script": {"k": secret}},
+    ))
+    env = result.structuredContent
+    assert env["ok"] is False and env["error_class"] == "invalid"
+    assert secret not in env["error"], "registered secret leaked into the envelope"
+    assert "***REDACTED***" in env["error"]

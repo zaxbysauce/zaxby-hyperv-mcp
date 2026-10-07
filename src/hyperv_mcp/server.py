@@ -1042,7 +1042,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                     display = result.get("vm_name") or result.get("name")
                     if not vm and display:
                         op.vm_name = str(display)
-                    if not bool(result.get("ok", True)):
+                    op.ok = bool(result.get("ok", True))
+                    if not op.ok:
                         # Same contract as _run_guest_tool: module-built
                         # ok:false dicts leave as enriched failure envelopes
                         # with the audit class derived from them.
@@ -1200,8 +1201,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, operation, vm_name, head_x, head_y} or {ok: false,
-        error, error_class}.
+        Returns: {ok, operation, vm_name, head_x, head_y} or the failure
+        envelope {ok: false, error, error_class, retryable, retry_after_ms}.
         """
         return _run_console_tool(
             "hyperv_console_mouse_move", vm_name, "console_input",
@@ -1385,8 +1386,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         new name must match allowed_vm_patterns so it stays policy-scoped.
         Policy: vm_provision category + confirm=true.
 
-        Returns: {ok, id, name, state, generation} or {ok: false,
-        error, error_class}.
+        Returns: {ok, id, name, state, generation} or the failure envelope
+        {ok: false, error, error_class, retryable, retry_after_ms}.
         """
         return _run_guest_tool(
             "hyperv_vm_create", name, "vm_provision",
@@ -1551,8 +1552,9 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                      a schema error; it never silently defaults to disable)
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, secure_boot, secure_boot_template, vm_name} or {ok:
-        false, error, error_class}.
+        Returns: {ok, secure_boot, secure_boot_template, vm_name} or the
+        failure envelope {ok: false, error, error_class, retryable,
+        retry_after_ms}.
         """
         return _run_guest_tool(
             "hyperv_vm_secureboot_set", vm_name, "vm_provision",
