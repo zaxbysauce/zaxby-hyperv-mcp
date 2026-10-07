@@ -539,7 +539,7 @@ def job_stop(cfg: Config, job_id: str) -> dict:
             if current is not None:
                 current["stopped"] = True
                 current["cred"] = None
-    return {
+    result = {
         "ok": stopped,
         "job_id": job_id,
         "vm_name": entry["vm_name"],
@@ -549,3 +549,13 @@ def job_stop(cfg: Config, job_id: str) -> dict:
         "job_dir_removed": job_dir_removed,
         "pid_reused": bool(outcome.get("pid_reused")),
     }
+    if not stopped:
+        # Issue #9 review PRR-004: an ok:false result is a failure envelope
+        # and must carry the `error` key (the server wrapper enriches
+        # error_class/retryable/retry_after_ms on top of this).
+        result["error"] = (
+            f"job not fully stopped: {len(alive_pids)} guest process(es) "
+            "still alive" if alive_pids else
+            "guest reported the job as not stopped"
+        )
+    return result

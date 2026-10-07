@@ -228,8 +228,9 @@ def test_server_info_reports_provenance_without_secrets(monkeypatch, tmp_path):
                 f"{type(exc).__name__}: {exc}; is the tool registered?"
             )
 
-        content = raw[0] if isinstance(raw, tuple) else raw
-        text_blocks = [c for c in content if getattr(c, "type", "") == "text"]
+        from conftest import content_blocks as _blocks
+
+        text_blocks = [c for c in _blocks(raw) if getattr(c, "type", "") == "text"]
         assert text_blocks, "hyperv_server_info returned no text content"
         response_text = "".join(getattr(block, "text", "") for block in text_blocks)
         try:

@@ -25,3 +25,25 @@ def lab_cfg(tmp_path) -> Config:
         guest_read_roots=["C:\\guest-read"],
         guest_write_roots=["C:\\guest-write"],
     )
+
+
+def content_blocks(result):
+    """Content blocks from any mcp call_tool return shape.
+
+    Handles the historical tuple form, the converted list form, and the
+    CallToolResult object that in-process call_tool returns when a tool
+    returns one (issue #9 envelope delivery)."""
+    content = result[0] if isinstance(result, tuple) else result
+    if not isinstance(content, list) and hasattr(content, "content"):
+        content = content.content
+    return content if isinstance(content, list) else [content]
+
+
+def envelope_from_result(result, label: str) -> dict:
+    """Parse the first text block of a failure result into the envelope."""
+    import json
+
+    blocks = content_blocks(result)
+    texts = [c for c in blocks if getattr(c, "type", "") == "text"]
+    assert texts, f"expected a text envelope block for {label}"
+    return json.loads(texts[0].text)

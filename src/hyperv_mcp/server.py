@@ -36,7 +36,8 @@ from typing import Any
 
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP, Image
-from mcp.types import LATEST_PROTOCOL_VERSION
+from mcp.shared.exceptions import UrlElicitationRequiredError
+from mcp.types import LATEST_PROTOCOL_VERSION, CallToolResult
 from pydantic import AnyHttpUrl
 
 from . import (
@@ -44,20 +45,18 @@ from . import (
     console,
     credentials,
     diagnostics,
+    errors,
     evidence,
     filetransfer,
     guestexec,
     guestjobs,
     lifecycle,
     media,
-    policy,
     pswindows,
     relay,
     repair,
 )
 from .config import Config, ConfigError
-from .credentials import CredentialError
-from .vmlocks import VMBusy
 
 __all__ = ["mcp", "main", "bootstrap", "configure_http_auth"]  # noqa: F822 (mcp: module __getattr__)
 
@@ -338,12 +337,16 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             result["meta"],
         ]
 
-    def _run_guest_tool(tool: str, vm: str, category: str, fn, *args, cred_factory=None, **kwargs) -> dict:
-        """Run a guest/transfer tool, mapping policy/cred errors to ok:false.
+    def _run_guest_tool(tool: str, vm: str, category: str, fn, *args, cred_factory=None, **kwargs) -> Any:
+        """Run a guest/transfer tool; every failure leaves as one envelope.
 
         cred_factory resolves credentials INSIDE the audited region so a
-        CredentialError surfaces as {ok:false, error_class:"credential"} and
-        is audited, instead of escaping as a raw ToolError.
+        CredentialError surfaces as an audited {ok:false,...,"credential"}
+        envelope instead of escaping as a raw ToolError. Success shapes are
+        unchanged; ok:false result dicts from module-level builders gain the
+        retry fields and leave as isError CallToolResults (issue #9: one
+        envelope with error_class/retryable/retry_after_ms for every tool,
+        from the same errors.classify taxonomy the audit log uses).
         """
         op = auditlog.operation(tool=tool, vm_name=vm, category=category)
         try:
@@ -366,64 +369,56 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                     display = result.get("vm_name") or result.get("name")
                     if not vm and display:
                         op.vm_name = str(display)
+                    if not op.ok:
+                        # Enrich FIRST, then audit from the enriched dict so
+                        # the audit's error_class is the envelope's by
+                        # construction, never an independent default (issue
+                        # #9 review PRR-003/PRR-004).
+                        enriched = errors.enrich_failure(result)
+                        op.error_class = enriched["error_class"]
+                        return errors.failure_result(enriched)
+                    op.error_class = str(result.get("error_class") or "")
                 return result
-        except policy.PolicyDenied as exc:
-            op.ok = False
-            op.error_class = "policy"
-            return {"ok": False, "error": str(exc), "error_class": "policy"}
-        except CredentialError as exc:
-            op.ok = False
-            op.error_class = "credential"
-            return {"ok": False, "error": str(exc), "error_class": "credential"}
-        except VMBusy as exc:
-            op.ok = False
-            op.error_class = "busy"
-            return {"ok": False, "error": str(exc), "error_class": "busy"}
-        except ValueError as exc:
-            op.ok = False
-            op.error_class = "invalid"
-            return {"ok": False, "error": str(exc), "error_class": "invalid"}
-        except TimeoutError as exc:
-            op.ok = False
-            op.error_class = "timeout"
-            return {"ok": False, "error": str(exc), "error_class": "timeout"}
-        except media.MediaError as exc:
-            # MediaError subclasses RuntimeError but its faults are
-            # caller/vm-state faults (missing file, Gen1, verify mismatch) —
-            # the RuntimeError catch-all would mislabel them "transport".
-            op.ok = False
-            op.error_class = "invalid"
-            return {"ok": False, "error": str(exc), "error_class": "invalid"}
-        except RuntimeError as exc:
-            op.ok = False
-            op.error_class = "transport"
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
+        except UrlElicitationRequiredError:
+            raise
+        except Exception as exc:
+            return errors.failure_result(errors.envelope(exc))
 
     # ---- server provenance ----------------------------------------------
 
     @mcp.tool()
-    def hyperv_server_info() -> dict:
+    def hyperv_server_info() -> CallToolResult:
         """Read-only runtime provenance for this hyperv-mcp server process.
 
         Returns: {version, git_revision, powershell:{path, edition, version,
         psmodulepath}, config_path, config_sha256, mcp_sdk_version,
         protocol_version, feature_flags}. Never contains secrets.
         """
-        with _audit("hyperv_server_info", "", "read"):
-            return _server_info_payload(cfg)
+        try:
+            with _audit("hyperv_server_info", "", "read"):
+                return errors.success_result([_server_info_payload(cfg)])
+        except UrlElicitationRequiredError:
+            raise
+        except Exception as exc:
+            return errors.failure_result(errors.envelope(exc))
 
     # ---- VM lifecycle --------------------------------------------------
 
     @mcp.tool()
-    def hyperv_list_vms() -> list:
+    def hyperv_list_vms() -> CallToolResult:
         """List all Hyper-V virtual machines and their current state.
 
         Returns: [{id, name, state, status, memory_mb, cpu_count, uptime_seconds}]
         (Deprecated PascalCase aliases Name/State/... are also included
         through the 0.2.x series.)
         """
-        with _audit("hyperv_list_vms", "", "read"):
-            return lifecycle.list_vms(_cfg())
+        try:
+            with _audit("hyperv_list_vms", "", "read"):
+                return errors.success_result(list(lifecycle.list_vms(_cfg())))
+        except UrlElicitationRequiredError:
+            raise
+        except Exception as exc:
+            return errors.failure_result(errors.envelope(exc))
 
     @mcp.tool()
     def hyperv_get_vm_info(vm_name: str = "", vm_id: str = "") -> dict:
@@ -452,7 +447,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         Returns: {status, vm_name, state}
 
-        Failure: {ok: false, error, error_class}.        """
+        Failure: {ok: false, error, error_class, retryable, retry_after_ms}.        """
         return _run_guest_tool(
             "hyperv_start_vm", vm_name, "lifecycle",
             lifecycle.start_vm, _cfg(), vm_name, vm_id=vm_id,
@@ -474,7 +469,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         Returns: {status, vm_name, method, state}
 
-        Failure: {ok: false, error, error_class}.        """
+        Failure: {ok: false, error, error_class, retryable, retry_after_ms}.        """
         return _run_guest_tool(
             "hyperv_stop_vm", vm_name, "destructive",
             lifecycle.stop_vm, _cfg(), vm_name,
@@ -493,7 +488,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         Returns: {status, vm_name, state}
 
-        Failure: {ok: false, error, error_class}.        """
+        Failure: {ok: false, error, error_class, retryable, retry_after_ms}.        """
         return _run_guest_tool(
             "hyperv_reset_vm", vm_name, "destructive",
             lifecycle.reset_vm, _cfg(), vm_name, confirm=confirm, vm_id=vm_id,
@@ -512,7 +507,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         Returns: {status, vm_name, checkpoint_name}
 
-        Failure: {ok: false, error, error_class}.        """
+        Failure: {ok: false, error, error_class, retryable, retry_after_ms}.        """
         return _run_guest_tool(
             "hyperv_checkpoint_create", vm_name, "checkpoint",
             lifecycle.checkpoint_create, _cfg(), vm_name,
@@ -553,7 +548,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         Returns: {status, vm_name, checkpoint_name, state, note}
 
-        Failure: {ok: false, error, error_class}.        """
+        Failure: {ok: false, error, error_class, retryable, retry_after_ms}.        """
         return _run_guest_tool(
             "hyperv_checkpoint_restore", vm_name, "destructive",
             lifecycle.checkpoint_restore, _cfg(), vm_name,
@@ -577,7 +572,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         Returns: {status, vm_name, checkpoint_name}
 
-        Failure: {ok: false, error, error_class}.        """
+        Failure: {ok: false, error, error_class, retryable, retry_after_ms}.        """
         return _run_guest_tool(
             "hyperv_checkpoint_remove", vm_name, "destructive",
             lifecycle.checkpoint_remove, _cfg(), vm_name,
@@ -612,7 +607,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
             Returns: {status, vm_name, host_ip, port, key,
                       kernel_attach_string, bcdedit_output, rebooting}
-            Failure: {ok: false, error, error_class}.
+            Failure: {ok: false, error, error_class, retryable, retry_after_ms}.
             """
             return _run_guest_tool(
                 "hyperv_configure_kdnet", vm_name, "destructive",
@@ -642,7 +637,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
             Returns: {status, vm_name, com_port, pipe_path,
                       kernel_attach_string, bcdedit_output, rebooting}
-            Failure: {ok: false, error, error_class}.
+            Failure: {ok: false, error, error_class, retryable, retry_after_ms}.
             """
             return _run_guest_tool(
                 "hyperv_configure_kdcom", vm_name, "destructive",
@@ -675,7 +670,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
             Returns: {status, vm_name, host_ip, port, key,
                       kernel_attach_string, bcdedit_output, rebooting}
-            Failure: {ok: false, error, error_class}.
+            Failure: {ok: false, error, error_class, retryable, retry_after_ms}.
             """
             return _run_guest_tool(
                 "hyperv_configure_kdnet", vm_name, "destructive",
@@ -704,7 +699,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
             Returns: {status, vm_name, com_port, pipe_path,
                       kernel_attach_string, bcdedit_output, rebooting}
-            Failure: {ok: false, error, error_class}.
+            Failure: {ok: false, error, error_class, retryable, retry_after_ms}.
             """
             return _run_guest_tool(
                 "hyperv_configure_kdcom", vm_name, "destructive",
@@ -735,7 +730,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
-            or {ok: false, error, error_class}
+            or {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_guest_tool(
                 "hyperv_guest_run_ps", vm_name, "exec",
@@ -761,7 +756,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
-            or {ok: false, error, error_class}
+            or {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_guest_tool(
                 "hyperv_guest_run", vm_name, "exec",
@@ -786,7 +781,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, bytes_copied, sha256_local?, sha256_remote?}
-            or {ok: false, error, error_class}
+            or {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_guest_tool(
                 "hyperv_guest_put", vm_name, "transfer",
@@ -810,7 +805,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, bytes_copied, sha256_local?, sha256_remote?}
-            or {ok: false, error, error_class}
+            or {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_guest_tool(
                 "hyperv_guest_get", vm_name, "transfer",
@@ -833,7 +828,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, content_b64, bytes_read, truncated}
-            or {ok: false, error, error_class}
+            or {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_guest_tool(
                 "hyperv_guest_read_file", vm_name, "transfer",
@@ -854,7 +849,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, entries: [{name, is_dir, size_bytes, modified}]}
-            or {ok: false, error, error_class}
+            or {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_guest_tool(
                 "hyperv_guest_list_dir", vm_name, "transfer",
@@ -878,7 +873,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
-            or {ok: false, error, error_class}
+            or {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_guest_tool(
                 "hyperv_guest_run_ps", vm_name, "exec",
@@ -902,7 +897,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
-            or {ok: false, error, error_class}
+            or {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_guest_tool(
                 "hyperv_guest_run", vm_name, "exec",
@@ -923,7 +918,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, bytes_copied, sha256_local?, sha256_remote?}
-            or {ok: false, error, error_class}
+            or {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_guest_tool(
                 "hyperv_guest_put", vm_name, "transfer",
@@ -943,7 +938,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, bytes_copied, sha256_local?, sha256_remote?}
-            or {ok: false, error, error_class}
+            or {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_guest_tool(
                 "hyperv_guest_get", vm_name, "transfer",
@@ -962,7 +957,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, content_b64, bytes_read, truncated}
-            or {ok: false, error, error_class}
+            or {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_guest_tool(
                 "hyperv_guest_read_file", vm_name, "transfer",
@@ -977,7 +972,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, entries: [{name, is_dir, size_bytes, modified}]}
-            or {ok: false, error, error_class}
+            or {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_guest_tool(
                 "hyperv_guest_list_dir", vm_name, "transfer",
@@ -999,7 +994,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
-        or {ok: false, error, error_class}
+        or {ok: false, error, error_class, retryable, retry_after_ms}
         """
         return _run_guest_tool(
             "hyperv_victim_run", vm_name, "victim",
@@ -1018,7 +1013,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
-        or {ok: false, error, error_class}
+        or {ok: false, error, error_class, retryable, retry_after_ms}
         """
         return _run_guest_tool(
             "hyperv_victim_run_ps", vm_name, "victim",
@@ -1029,12 +1024,13 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
     # ---- console (WMI screenshot / keyboard / mouse) --------------------
     # Image-returning tools (screenshot/wait_frame_change/capture_sequence)
-    # return a LIST [Image, meta_dict] on success and RAISE on failure, so
-    # the success shape is uniformly image content + a metadata text block
-    # (FastMCP converts the list: ImageContent + TextContent). Input tools
-    # use the {ok,...}/{ok:false,error,error_class} envelope.
+    # return a LIST [Image, meta_dict] on success and the failure envelope
+    # (as a CallToolResult) on failure, so the success shape is uniformly
+    # image content + a metadata text block (FastMCP converts the list:
+    # ImageContent + TextContent). Input tools use the {ok,...} envelope on
+    # success; every failure leaves as the shared 5-key envelope.
 
-    def _run_console_tool(tool: str, vm: str, category: str, fn, *args, **kwargs):
+    def _run_console_tool(tool: str, vm: str, category: str, fn, *args, **kwargs) -> Any:
         op = _audit(tool, vm, category)
         try:
             with op:
@@ -1046,27 +1042,25 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                     display = result.get("vm_name") or result.get("name")
                     if not vm and display:
                         op.vm_name = str(display)
+                    op.ok = bool(result.get("ok", True))
+                    if not op.ok:
+                        # Same contract as _run_guest_tool: module-built
+                        # ok:false dicts leave as enriched failure envelopes
+                        # with the audit class derived from them.
+                        enriched = errors.enrich_failure(result)
+                        op.error_class = enriched["error_class"]
+                        return errors.failure_result(enriched)
                 return result
-        except policy.PolicyDenied as exc:
-            return {"ok": False, "error": str(exc), "error_class": "policy"}
-        except CredentialError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "credential"}
-        except VMBusy as exc:
-            return {"ok": False, "error": str(exc), "error_class": "busy"}
-        except ValueError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "invalid"}
-        except TimeoutError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "timeout"}
-        # ConsoleError subclasses RuntimeError and maps identically
-        # ("transport"), so the catch-all below covers it (PRR-020).
-        except RuntimeError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
+        except UrlElicitationRequiredError:
+            raise
+        except Exception as exc:
+            return errors.failure_result(errors.envelope(exc))
 
     @mcp.tool()
     def hyperv_console_screenshot(
         vm_name: str = "", width: int = 1024, height: int = 768, save_path: str = "",
         vm_id: str = "",
-    ) -> Any:
+    ) -> CallToolResult:
         """Capture the VM console via Hyper-V WMI (works from firmware through
         WinPE; independent of VMConnect, host foreground, guest login/network).
         Returns MCP image content (image/png) plus a metadata text block:
@@ -1097,21 +1091,13 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 # ImageContent is a pydantic model; the raw FastMCP Image
                 # wrapper is not and breaks serialization across the mcp
                 # versions in the CI matrix.
-                return [Image(data=buf.getvalue(), format="png").to_image_content(), meta]
-        except policy.PolicyDenied as exc:
-            return {"ok": False, "error": str(exc), "error_class": "policy"}
-        except CredentialError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "credential"}
-        except VMBusy as exc:
-            return {"ok": False, "error": str(exc), "error_class": "busy"}
-        except ValueError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "invalid"}
-        except TimeoutError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "timeout"}
-        except console.ConsoleError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
-        except RuntimeError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
+                return errors.success_result(
+                    [Image(data=buf.getvalue(), format="png").to_image_content(), meta]
+                )
+        except UrlElicitationRequiredError:
+            raise
+        except Exception as exc:
+            return errors.failure_result(errors.envelope(exc))
 
     @mcp.tool()
     def hyperv_console_get_display_info(vm_name: str = "", vm_id: str = "") -> dict:
@@ -1140,7 +1126,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, chunks, chars} or {ok: false, error, error_class}
+        Returns: {ok, chunks, chars} or {ok: false, error, error_class, retryable, retry_after_ms}
         """
         return _run_console_tool(
             "hyperv_console_type_text", vm_name, "console_input",
@@ -1159,7 +1145,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class}
+        Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class, retryable, retry_after_ms}
         """
         return _run_console_tool(
             "hyperv_console_press_key", vm_name, "console_input",
@@ -1176,7 +1162,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class}
+        Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class, retryable, retry_after_ms}
         """
         return _run_console_tool(
             "hyperv_console_key_combo", vm_name, "console_input",
@@ -1193,7 +1179,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class}
+        Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class, retryable, retry_after_ms}
         """
         return _run_console_tool(
             "hyperv_console_type_scancodes", vm_name, "console_input",
@@ -1215,8 +1201,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, operation, vm_name, head_x, head_y} or {ok: false,
-        error, error_class}.
+        Returns: {ok, operation, vm_name, head_x, head_y} or the failure
+        envelope {ok: false, error, error_class, retryable, retry_after_ms}.
         """
         return _run_console_tool(
             "hyperv_console_mouse_move", vm_name, "console_input",
@@ -1236,7 +1222,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, operation, head_x?, head_y?} or {ok: false, error, error_class}
+        Returns: {ok, operation, head_x?, head_y?} or {ok: false, error, error_class, retryable, retry_after_ms}
         """
         return _run_console_tool(
             "hyperv_console_click", vm_name, "console_input",
@@ -1253,7 +1239,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, operation} or {ok: false, error, error_class}
+        Returns: {ok, operation} or {ok: false, error, error_class, retryable, retry_after_ms}
         """
         return _run_console_tool(
             "hyperv_console_button", vm_name, "console_input",
@@ -1267,7 +1253,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, operation} or {ok: false, error, error_class}
+        Returns: {ok, operation} or {ok: false, error, error_class, retryable, retry_after_ms}
         """
         return _run_console_tool(
             "hyperv_console_scroll", vm_name, "console_input",
@@ -1278,7 +1264,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
     def hyperv_console_wait_frame_change(
         vm_name: str = "", baseline_hash: str = "", width: int = 640, height: int = 480,
         timeout_s: int = 60, interval_s: int = 2, vm_id: str = "",
-    ) -> Any:
+    ) -> CallToolResult:
         """Poll the console until the frame changes (or the deadline passes).
         Bounded: polls = ceil(timeout_s/interval_s), deadline enforced
         host-side. Returns [ImageContent(image/png), TextContent(json)] when
@@ -1306,28 +1292,20 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 if "image" in out:
                     buf = io.BytesIO()
                     out["image"].save(buf, format="PNG")
-                    return [Image(data=buf.getvalue(), format="png").to_image_content(), meta]
-                return meta
-        except policy.PolicyDenied as exc:
-            return {"ok": False, "error": str(exc), "error_class": "policy"}
-        except CredentialError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "credential"}
-        except VMBusy as exc:
-            return {"ok": False, "error": str(exc), "error_class": "busy"}
-        except ValueError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "invalid"}
-        except TimeoutError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "timeout"}
-        except console.ConsoleError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
-        except RuntimeError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
+                    return errors.success_result(
+                        [Image(data=buf.getvalue(), format="png").to_image_content(), meta]
+                    )
+                return errors.success_result([meta])
+        except UrlElicitationRequiredError:
+            raise
+        except Exception as exc:
+            return errors.failure_result(errors.envelope(exc))
 
     @mcp.tool()
     def hyperv_console_capture_sequence(
         vm_name: str = "", count: int = 3, interval_s: int = 2,
         width: int = 640, height: int = 480, vm_id: str = "",
-    ) -> Any:
+    ) -> CallToolResult:
         """Capture a bounded sequence of console frames with per-frame hashes
         and changed-byte counts vs the previous frame (transition evidence,
         not progress inference). Returns [first Image, last Image, meta_text]
@@ -1352,21 +1330,11 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                     img.save(buf, format="PNG")
                     parts.append(Image(data=buf.getvalue(), format="png").to_image_content())
                 parts.append(meta)
-                return parts
-        except policy.PolicyDenied as exc:
-            return {"ok": False, "error": str(exc), "error_class": "policy"}
-        except CredentialError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "credential"}
-        except VMBusy as exc:
-            return {"ok": False, "error": str(exc), "error_class": "busy"}
-        except ValueError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "invalid"}
-        except TimeoutError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "timeout"}
-        except console.ConsoleError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
-        except RuntimeError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
+                return errors.success_result(parts)
+        except UrlElicitationRequiredError:
+            raise
+        except Exception as exc:
+            return errors.failure_result(errors.envelope(exc))
 
     @mcp.tool()
     def hyperv_wait_vm_state(
@@ -1418,8 +1386,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         new name must match allowed_vm_patterns so it stays policy-scoped.
         Policy: vm_provision category + confirm=true.
 
-        Returns: {ok, id, name, state, generation} or {ok: false,
-        error, error_class}.
+        Returns: {ok, id, name, state, generation} or the failure envelope
+        {ok: false, error, error_class, retryable, retry_after_ms}.
         """
         return _run_guest_tool(
             "hyperv_vm_create", name, "vm_provision",
@@ -1441,7 +1409,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_name: Name of the VM
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, vhd_path, disk_count} or {ok: false, error, error_class}.
+        Returns: {ok, vhd_path, disk_count} or {ok: false, error, error_class, retryable, retry_after_ms}.
         disk_count is null if the post-add read failed (the disk is attached
         either way).
         """
@@ -1477,7 +1445,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_name: Name of the VM
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, iso_path, attached} or {ok: false, error, error_class}.
+        Returns: {ok, iso_path, attached} or {ok: false, error, error_class, retryable, retry_after_ms}.
         attached is null if the post-attach read failed (the ISO is attached
         either way).
         """
@@ -1493,7 +1461,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, removed: [...]} or {ok: false, error, error_class}.
+        Returns: {ok, removed: [...]} or {ok: false, error, error_class, retryable, retry_after_ms}.
         """
         return _run_guest_tool(
             "hyperv_vm_media_detach", vm_name, "media",
@@ -1540,7 +1508,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_name: Name of the VM
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, first_boot} or {ok: false, error, error_class}.
+        Returns: {ok, first_boot} or {ok: false, error, error_class, retryable, retry_after_ms}.
         """
         return _run_guest_tool(
             "hyperv_vm_firmware_set_boot_order", vm_name, "vm_provision",
@@ -1561,7 +1529,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                      a schema error; it never silently defaults to disable)
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, tpm_enabled, vm_name} or {ok: false, error, error_class}.
+        Returns: {ok, tpm_enabled, vm_name} or {ok: false, error, error_class, retryable, retry_after_ms}.
         """
         return _run_guest_tool(
             "hyperv_vm_tpm_set", vm_name, "vm_provision",
@@ -1584,8 +1552,9 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                      a schema error; it never silently defaults to disable)
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, secure_boot, secure_boot_template, vm_name} or {ok:
-        false, error, error_class}.
+        Returns: {ok, secure_boot, secure_boot_template, vm_name} or the
+        failure envelope {ok: false, error, error_class, retryable,
+        retry_after_ms}.
         """
         return _run_guest_tool(
             "hyperv_vm_secureboot_set", vm_name, "vm_provision",
@@ -1602,7 +1571,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_name: Name of the VM
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, switch_name} or {ok: false, error, error_class}.
+        Returns: {ok, switch_name} or {ok: false, error, error_class, retryable, retry_after_ms}.
         """
         return _run_guest_tool(
             "hyperv_vm_network_set", vm_name, "media",
@@ -1760,7 +1729,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             ui_tree_depth: int = 3, ui_tree_max_elements: int = 200,
             username: str = "", password: str = "",
             vm_id: str = "",
-        ) -> list | dict:
+        ) -> CallToolResult:
             """Capture console evidence in one call: screenshot paired with
             captured_at, vm_id, dimensions and frame hash, plus an optional
             bounded guest UI element tree (requires guest credentials; the
@@ -1781,19 +1750,11 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                         ui_tree_max_elements=ui_tree_max_elements, cred=cred,
                         vm_id=vm_id,
                     )
-                    return _image_meta_content(result)
-            except policy.PolicyDenied as exc:
-                return {"ok": False, "error": str(exc), "error_class": "policy"}
-            except CredentialError as exc:
-                return {"ok": False, "error": str(exc), "error_class": "credential"}
-            except VMBusy as exc:
-                return {"ok": False, "error": str(exc), "error_class": "busy"}
-            except ValueError as exc:
-                return {"ok": False, "error": str(exc), "error_class": "invalid"}
-            except console.ConsoleError as exc:
-                return {"ok": False, "error": str(exc), "error_class": "transport"}
-            except RuntimeError as exc:
-                return {"ok": False, "error": str(exc), "error_class": "transport"}
+                    return errors.success_result(_image_meta_content(result))
+            except UrlElicitationRequiredError:
+                raise
+            except Exception as exc:
+                return errors.failure_result(errors.envelope(exc))
 
     else:
 
@@ -1925,7 +1886,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             save_path: str = "", ui_tree: bool = False,
             ui_tree_depth: int = 3, ui_tree_max_elements: int = 200,
             vm_id: str = "",
-        ) -> list | dict:
+        ) -> CallToolResult:
             """Capture console evidence in one call: screenshot paired with
             captured_at, vm_id, dimensions and frame hash, plus an optional
             bounded guest UI element tree (requires guest credentials; the
@@ -1944,19 +1905,11 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                         ui_tree_max_elements=ui_tree_max_elements, cred=cred,
                         vm_id=vm_id,
                     )
-                    return _image_meta_content(result)
-            except policy.PolicyDenied as exc:
-                return {"ok": False, "error": str(exc), "error_class": "policy"}
-            except CredentialError as exc:
-                return {"ok": False, "error": str(exc), "error_class": "credential"}
-            except VMBusy as exc:
-                return {"ok": False, "error": str(exc), "error_class": "busy"}
-            except ValueError as exc:
-                return {"ok": False, "error": str(exc), "error_class": "invalid"}
-            except console.ConsoleError as exc:
-                return {"ok": False, "error": str(exc), "error_class": "transport"}
-            except RuntimeError as exc:
-                return {"ok": False, "error": str(exc), "error_class": "transport"}
+                    return errors.success_result(_image_meta_content(result))
+            except UrlElicitationRequiredError:
+                raise
+            except Exception as exc:
+                return errors.failure_result(errors.envelope(exc))
 
     @mcp.tool()
     def hyperv_guest_job_status(job_id: str) -> dict:
@@ -2037,6 +1990,106 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             "hyperv_relay_stop", "", "relay",
             relay.relay_stop, _cfg(), relay_id,
         )
+
+    _harden_tools(mcp)
+
+
+def _harden_tools(mcp: FastMCP) -> None:
+    """Stamp additionalProperties:false and reject bad calls at Tool.run.
+
+    FastMCP 1.x builds argument models with pydantic's default
+    extra="ignore", so an undeclared key is silently dropped before the
+    tool body runs — a misspelled confirm/verify/elevated flag would fail
+    open. The guard below sits at the Tool.run chokepoint (both
+    FastMCP.call_tool and direct _tool_manager.call_tool traverse it) and
+    handles, with one audited envelope each:
+
+    - UNDECLARED argument keys: rejected as "invalid", argument named,
+      tool body never runs.
+    - Wrong-TYPED declared arguments: FastMCP's Tool.run wraps the
+      pydantic ValidationError into ToolError before any tool body runs;
+      the guard classifies it via the cause ("invalid") and delivers the
+      same audited envelope instead of a raw protocol error (issue #9
+      review PRR-001/PRR-002).
+
+    Rejections are audited HERE (one record each) because they happen
+    before any tool body's audit region; the audit write is best-effort so
+    a broken sink cannot turn a rejection into a raw exception. Tool is a
+    pydantic BaseModel, so the wrap is installed with object.__setattr__;
+    the marker attribute keeps re-registration from stacking guards.
+    """
+    tm = getattr(mcp, "_tool_manager", None)
+    tools = list(getattr(tm, "_tools", {}).values()) if tm is not None else []
+    if not tools:
+        # PRR-015: a silent no-op would revert unknown-argument handling to
+        # pydantic's extra="ignore" fail-open. Make the SDK coupling loud.
+        print(
+            "[hyperv-mcp] WARNING: _harden_tools found no registered tools; "
+            "unknown-argument rejection and additionalProperties stamping "
+            "were NOT installed (mcp SDK shape changed?)",
+            file=sys.stderr,
+        )
+        return
+    for tool in tools:
+        params = getattr(tool, "parameters", None)
+        if isinstance(params, dict):
+            params["additionalProperties"] = False
+        if getattr(tool.run, "_unknown_arg_guard", False):
+            continue
+        original_run = tool.run
+
+        def _audited_rejection(name: str, arguments: dict, env: dict) -> CallToolResult:
+            try:
+                auditlog.log_operation(
+                    tool=name,
+                    vm_name=str((arguments or {}).get("vm_name") or ""),
+                    category="",
+                    ok=False,
+                    error_class=str(env.get("error_class") or ""),
+                )
+            except Exception as audit_exc:  # noqa: BLE001 - best-effort: a
+                # broken audit sink must not turn a rejection into a raw
+                # exception with no envelope (issue #9 review PRR-014).
+                print(
+                    f"[hyperv-mcp] WARNING: audit write failed for a "
+                    f"rejected call on {name}: {audit_exc}",
+                    file=sys.stderr,
+                )
+            return errors.failure_result(env)
+
+        async def guard(arguments, _tool=tool, _run=original_run, **kwargs):
+            declared = set((getattr(_tool, "parameters", None) or {}).get("properties", {}))
+            unknown = sorted(k for k in (arguments or {}) if k not in declared)
+            name = str(getattr(_tool, "name", "unknown-tool"))
+            if unknown:
+                shown = ", ".join(unknown[:8]) + (", ..." if len(unknown) > 8 else "")
+                message = (
+                    f"unknown argument(s) {shown} for {name}; "
+                    f"declared arguments: {sorted(declared)}"
+                )[:500]
+                retryable, retry_after_ms = errors.retry_fields("invalid")
+                return _audited_rejection(name, arguments, {
+                    "ok": False,
+                    "error": message,
+                    "error_class": "invalid",
+                    "retryable": retryable,
+                    "retry_after_ms": retry_after_ms,
+                })
+            try:
+                return await _run(arguments, **kwargs)
+            except UrlElicitationRequiredError:
+                raise
+            except Exception as exc:
+                # FastMCP's Tool.run wraps the pydantic ValidationError (a
+                # ValueError) for a declared-but-mistyped argument into
+                # ToolError before any tool body runs. Classify via the
+                # cause so the envelope says "invalid", not "transport".
+                classify_exc = exc.__cause__ if isinstance(exc.__cause__, ValueError) else exc
+                env = errors.envelope(classify_exc)
+                return _audited_rejection(name, arguments, env)
+
+        guard._unknown_arg_guard = True  # type: ignore[attr-defined]
+        object.__setattr__(tool, "run", guard)
 
 
 # ---------------------------------------------------------------------------

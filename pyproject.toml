@@ -27,7 +27,7 @@ classifiers = [
     "Topic :: System :: Emulators",
 ]
 dependencies = [
-    "mcp>=1.0.0,<2",
+    "mcp>=1.30.0,<2",
     "pillow>=10.0",
 ]
 

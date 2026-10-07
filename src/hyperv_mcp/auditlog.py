@@ -69,16 +69,11 @@ def log_operation(
     _emit(json.dumps(record, ensure_ascii=False))
 
 
-# Documented error_class taxonomy. Exception class names not listed here pass
-# through unchanged (they indicate a bug worth surfacing verbatim).
-_TAXONOMY = {
-    "PolicyDenied": "policy",
-    "CredentialError": "credential",
-    "VMBusy": "busy",
-    "ValueError": "invalid",
-    "TimeoutError": "timeout",
-    "RuntimeError": "transport",
-}
+# The error_class taxonomy lives in errors.classify (isinstance-based) and is
+# shared with the tool envelopes, so an audit record's error_class always
+# equals the envelope's (issue #9). The former exact-name _TAXONOMY table
+# audited subclasses under their verbatim names (e.g. ConsoleError), which
+# disagreed with the envelope's "transport".
 
 
 class operation:  # noqa: N801 - context manager reads like a decorator
@@ -109,9 +104,9 @@ class operation:  # noqa: N801 - context manager reads like a decorator
     def __exit__(self, exc_type, exc, tb) -> Literal[False]:
         duration_ms = int((time.monotonic() - self.start) * 1000)
         if exc is not None:
-            self.error_class = _TAXONOMY.get(
-                type(exc).__name__, type(exc).__name__
-            )
+            from . import errors  # late import: errors imports policy/media modules
+
+            self.error_class = errors.classify(exc)
         log_operation(
             tool=self.tool,
             vm_name=self.vm_name,

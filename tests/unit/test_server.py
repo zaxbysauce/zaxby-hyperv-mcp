@@ -448,8 +448,9 @@ def test_credential_error_envelope_at_tool_layer(fresh_server, tmp_path):
         "hyperv_capture_evidence",
         {"vm_name": "test-vm", "ui_tree": True},
     ))
-    content = result[0] if isinstance(result, tuple) else result
-    text_blocks = [c for c in content if getattr(c, "type", "") == "text"]
+    from conftest import content_blocks as _blocks
+
+    text_blocks = [c for c in _blocks(result) if getattr(c, "type", "") == "text"]
     assert text_blocks, "expected a text envelope for the credential failure"
     envelope = _json.loads(text_blocks[0].text)
     assert envelope["ok"] is False
@@ -458,8 +459,9 @@ def test_credential_error_envelope_at_tool_layer(fresh_server, tmp_path):
 
 def _envelope_from_call(mcp, tool: str, args: dict) -> dict:
     result = asyncio.run(mcp.call_tool(tool, args))
-    content = result[0] if isinstance(result, tuple) else result
-    text_blocks = [c for c in content if getattr(c, "type", "") == "text"]
+    from conftest import content_blocks as _blocks
+
+    text_blocks = [c for c in _blocks(result) if getattr(c, "type", "") == "text"]
     assert text_blocks, f"expected a text envelope for {tool}"
     return json.loads(text_blocks[0].text)
 
