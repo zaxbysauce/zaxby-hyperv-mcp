@@ -260,6 +260,12 @@ claude mcp add hyperv -- hyperv-mcp
 
 ## Available Tools (55 total)
 
+Every registered tool in the tables below returns failures the same way:
+the one-envelope contract (`ok/error/error_class/retryable/retry_after_ms`,
+delivered with `isError: true`) applies to ALL of them — lifecycle,
+checkpoints, guest, console, VM/media, and orchestration alike. The
+detailed contract is documented under "Behavior changes" below.
+
 ### VM identity: `vm_name` and `vm_id` (0.4.0)
 
 Every tool that takes `vm_name` also takes an optional `vm_id` (the VM's CIM
@@ -365,7 +371,10 @@ cases and requires the VM Off/Saved for the `Set-VMComPort` step.
 - (0.4.0) **Success results carry no `structuredContent`** (it is `null`);
   only failure envelopes populate it. Mistyped-declaration validation
   errors that used to surface as bare protocol errors now arrive as the
-  same audited envelope.
+  same audited envelope. Related: the image/evidence tools' advertised
+  `outputSchema` (and its `structuredContent` sidecar) is intentionally
+  gone on every Python version — a side effect of their new
+  `CallToolResult` return annotations, not a 3.10-only change.
 - **Timeout semantics:** the host kills its whole PowerShell process tree
   (Job Object) at the timeout and reports `timed_out: true` with an explicit
   warning — **the guest-side child may still be running**. Guest temp scripts
