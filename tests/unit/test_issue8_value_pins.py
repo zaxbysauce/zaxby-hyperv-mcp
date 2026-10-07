@@ -181,6 +181,8 @@ def unrestricted_server(tmp_path, fresh_server):
 def _envelope_from_call(mcp, tool: str, args: dict) -> dict:
     result = asyncio.run(mcp.call_tool(tool, args))
     content = result[0] if isinstance(result, tuple) else result
+    if not isinstance(content, list) and hasattr(content, "content"):
+        content = content.content  # in-process call_tool returns a CallToolResult
     text_blocks = [c for c in content if getattr(c, "type", "") == "text"]
     assert text_blocks, f"expected a text envelope for {tool}"
     return json.loads(text_blocks[0].text)

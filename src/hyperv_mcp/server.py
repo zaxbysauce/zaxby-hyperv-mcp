@@ -36,7 +36,7 @@ from typing import Any
 
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP, Image
-from mcp.types import LATEST_PROTOCOL_VERSION
+from mcp.types import LATEST_PROTOCOL_VERSION, CallToolResult
 from pydantic import AnyHttpUrl
 
 from . import (
@@ -44,20 +44,18 @@ from . import (
     console,
     credentials,
     diagnostics,
+    errors,
     evidence,
     filetransfer,
     guestexec,
     guestjobs,
     lifecycle,
     media,
-    policy,
     pswindows,
     relay,
     repair,
 )
 from .config import Config, ConfigError
-from .credentials import CredentialError
-from .vmlocks import VMBusy
 
 __all__ = ["mcp", "main", "bootstrap", "configure_http_auth"]  # noqa: F822 (mcp: module __getattr__)
 
@@ -338,12 +336,16 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             result["meta"],
         ]
 
-    def _run_guest_tool(tool: str, vm: str, category: str, fn, *args, cred_factory=None, **kwargs) -> dict:
-        """Run a guest/transfer tool, mapping policy/cred errors to ok:false.
+    def _run_guest_tool(tool: str, vm: str, category: str, fn, *args, cred_factory=None, **kwargs) -> Any:
+        """Run a guest/transfer tool; every failure leaves as one envelope.
 
         cred_factory resolves credentials INSIDE the audited region so a
-        CredentialError surfaces as {ok:false, error_class:"credential"} and
-        is audited, instead of escaping as a raw ToolError.
+        CredentialError surfaces as an audited {ok:false,...,"credential"}
+        envelope instead of escaping as a raw ToolError. Success shapes are
+        unchanged; ok:false result dicts from module-level builders gain the
+        retry fields and leave as isError CallToolResults (issue #9: one
+        envelope with error_class/retryable/retry_after_ms for every tool,
+        from the same errors.classify taxonomy the audit log uses).
         """
         op = auditlog.operation(tool=tool, vm_name=vm, category=category)
         try:
@@ -366,64 +368,46 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                     display = result.get("vm_name") or result.get("name")
                     if not vm and display:
                         op.vm_name = str(display)
+                    if not op.ok:
+                        return errors.failure_result(errors.enrich_failure(result))
                 return result
-        except policy.PolicyDenied as exc:
+        except Exception as exc:
+            env = errors.envelope(exc)
             op.ok = False
-            op.error_class = "policy"
-            return {"ok": False, "error": str(exc), "error_class": "policy"}
-        except CredentialError as exc:
-            op.ok = False
-            op.error_class = "credential"
-            return {"ok": False, "error": str(exc), "error_class": "credential"}
-        except VMBusy as exc:
-            op.ok = False
-            op.error_class = "busy"
-            return {"ok": False, "error": str(exc), "error_class": "busy"}
-        except ValueError as exc:
-            op.ok = False
-            op.error_class = "invalid"
-            return {"ok": False, "error": str(exc), "error_class": "invalid"}
-        except TimeoutError as exc:
-            op.ok = False
-            op.error_class = "timeout"
-            return {"ok": False, "error": str(exc), "error_class": "timeout"}
-        except media.MediaError as exc:
-            # MediaError subclasses RuntimeError but its faults are
-            # caller/vm-state faults (missing file, Gen1, verify mismatch) —
-            # the RuntimeError catch-all would mislabel them "transport".
-            op.ok = False
-            op.error_class = "invalid"
-            return {"ok": False, "error": str(exc), "error_class": "invalid"}
-        except RuntimeError as exc:
-            op.ok = False
-            op.error_class = "transport"
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
+            op.error_class = env["error_class"]
+            return errors.failure_result(env)
 
     # ---- server provenance ----------------------------------------------
 
     @mcp.tool()
-    def hyperv_server_info() -> dict:
+    def hyperv_server_info() -> CallToolResult:
         """Read-only runtime provenance for this hyperv-mcp server process.
 
         Returns: {version, git_revision, powershell:{path, edition, version,
         psmodulepath}, config_path, config_sha256, mcp_sdk_version,
         protocol_version, feature_flags}. Never contains secrets.
         """
-        with _audit("hyperv_server_info", "", "read"):
-            return _server_info_payload(cfg)
+        try:
+            with _audit("hyperv_server_info", "", "read"):
+                return errors.success_result([_server_info_payload(cfg)])
+        except Exception as exc:
+            return errors.failure_result(errors.envelope(exc))
 
     # ---- VM lifecycle --------------------------------------------------
 
     @mcp.tool()
-    def hyperv_list_vms() -> list:
+    def hyperv_list_vms() -> CallToolResult:
         """List all Hyper-V virtual machines and their current state.
 
         Returns: [{id, name, state, status, memory_mb, cpu_count, uptime_seconds}]
         (Deprecated PascalCase aliases Name/State/... are also included
         through the 0.2.x series.)
         """
-        with _audit("hyperv_list_vms", "", "read"):
-            return lifecycle.list_vms(_cfg())
+        try:
+            with _audit("hyperv_list_vms", "", "read"):
+                return errors.success_result(list(lifecycle.list_vms(_cfg())))
+        except Exception as exc:
+            return errors.failure_result(errors.envelope(exc))
 
     @mcp.tool()
     def hyperv_get_vm_info(vm_name: str = "", vm_id: str = "") -> dict:
@@ -1034,7 +1018,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
     # (FastMCP converts the list: ImageContent + TextContent). Input tools
     # use the {ok,...}/{ok:false,error,error_class} envelope.
 
-    def _run_console_tool(tool: str, vm: str, category: str, fn, *args, **kwargs):
+    def _run_console_tool(tool: str, vm: str, category: str, fn, *args, **kwargs) -> Any:
         op = _audit(tool, vm, category)
         try:
             with op:
@@ -1047,26 +1031,17 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                     if not vm and display:
                         op.vm_name = str(display)
                 return result
-        except policy.PolicyDenied as exc:
-            return {"ok": False, "error": str(exc), "error_class": "policy"}
-        except CredentialError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "credential"}
-        except VMBusy as exc:
-            return {"ok": False, "error": str(exc), "error_class": "busy"}
-        except ValueError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "invalid"}
-        except TimeoutError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "timeout"}
-        # ConsoleError subclasses RuntimeError and maps identically
-        # ("transport"), so the catch-all below covers it (PRR-020).
-        except RuntimeError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
+        except Exception as exc:
+            env = errors.envelope(exc)
+            op.ok = False
+            op.error_class = env["error_class"]
+            return errors.failure_result(env)
 
     @mcp.tool()
     def hyperv_console_screenshot(
         vm_name: str = "", width: int = 1024, height: int = 768, save_path: str = "",
         vm_id: str = "",
-    ) -> Any:
+    ) -> CallToolResult:
         """Capture the VM console via Hyper-V WMI (works from firmware through
         WinPE; independent of VMConnect, host foreground, guest login/network).
         Returns MCP image content (image/png) plus a metadata text block:
@@ -1097,21 +1072,11 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 # ImageContent is a pydantic model; the raw FastMCP Image
                 # wrapper is not and breaks serialization across the mcp
                 # versions in the CI matrix.
-                return [Image(data=buf.getvalue(), format="png").to_image_content(), meta]
-        except policy.PolicyDenied as exc:
-            return {"ok": False, "error": str(exc), "error_class": "policy"}
-        except CredentialError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "credential"}
-        except VMBusy as exc:
-            return {"ok": False, "error": str(exc), "error_class": "busy"}
-        except ValueError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "invalid"}
-        except TimeoutError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "timeout"}
-        except console.ConsoleError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
-        except RuntimeError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
+                return errors.success_result(
+                    [Image(data=buf.getvalue(), format="png").to_image_content(), meta]
+                )
+        except Exception as exc:
+            return errors.failure_result(errors.envelope(exc))
 
     @mcp.tool()
     def hyperv_console_get_display_info(vm_name: str = "", vm_id: str = "") -> dict:
@@ -1278,7 +1243,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
     def hyperv_console_wait_frame_change(
         vm_name: str = "", baseline_hash: str = "", width: int = 640, height: int = 480,
         timeout_s: int = 60, interval_s: int = 2, vm_id: str = "",
-    ) -> Any:
+    ) -> CallToolResult:
         """Poll the console until the frame changes (or the deadline passes).
         Bounded: polls = ceil(timeout_s/interval_s), deadline enforced
         host-side. Returns [ImageContent(image/png), TextContent(json)] when
@@ -1306,28 +1271,18 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 if "image" in out:
                     buf = io.BytesIO()
                     out["image"].save(buf, format="PNG")
-                    return [Image(data=buf.getvalue(), format="png").to_image_content(), meta]
-                return meta
-        except policy.PolicyDenied as exc:
-            return {"ok": False, "error": str(exc), "error_class": "policy"}
-        except CredentialError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "credential"}
-        except VMBusy as exc:
-            return {"ok": False, "error": str(exc), "error_class": "busy"}
-        except ValueError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "invalid"}
-        except TimeoutError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "timeout"}
-        except console.ConsoleError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
-        except RuntimeError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
+                    return errors.success_result(
+                        [Image(data=buf.getvalue(), format="png").to_image_content(), meta]
+                    )
+                return errors.success_result([meta])
+        except Exception as exc:
+            return errors.failure_result(errors.envelope(exc))
 
     @mcp.tool()
     def hyperv_console_capture_sequence(
         vm_name: str = "", count: int = 3, interval_s: int = 2,
         width: int = 640, height: int = 480, vm_id: str = "",
-    ) -> Any:
+    ) -> CallToolResult:
         """Capture a bounded sequence of console frames with per-frame hashes
         and changed-byte counts vs the previous frame (transition evidence,
         not progress inference). Returns [first Image, last Image, meta_text]
@@ -1352,21 +1307,9 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                     img.save(buf, format="PNG")
                     parts.append(Image(data=buf.getvalue(), format="png").to_image_content())
                 parts.append(meta)
-                return parts
-        except policy.PolicyDenied as exc:
-            return {"ok": False, "error": str(exc), "error_class": "policy"}
-        except CredentialError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "credential"}
-        except VMBusy as exc:
-            return {"ok": False, "error": str(exc), "error_class": "busy"}
-        except ValueError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "invalid"}
-        except TimeoutError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "timeout"}
-        except console.ConsoleError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
-        except RuntimeError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
+                return errors.success_result(parts)
+        except Exception as exc:
+            return errors.failure_result(errors.envelope(exc))
 
     @mcp.tool()
     def hyperv_wait_vm_state(
@@ -1760,7 +1703,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             ui_tree_depth: int = 3, ui_tree_max_elements: int = 200,
             username: str = "", password: str = "",
             vm_id: str = "",
-        ) -> list | dict:
+        ) -> CallToolResult:
             """Capture console evidence in one call: screenshot paired with
             captured_at, vm_id, dimensions and frame hash, plus an optional
             bounded guest UI element tree (requires guest credentials; the
@@ -1781,19 +1724,9 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                         ui_tree_max_elements=ui_tree_max_elements, cred=cred,
                         vm_id=vm_id,
                     )
-                    return _image_meta_content(result)
-            except policy.PolicyDenied as exc:
-                return {"ok": False, "error": str(exc), "error_class": "policy"}
-            except CredentialError as exc:
-                return {"ok": False, "error": str(exc), "error_class": "credential"}
-            except VMBusy as exc:
-                return {"ok": False, "error": str(exc), "error_class": "busy"}
-            except ValueError as exc:
-                return {"ok": False, "error": str(exc), "error_class": "invalid"}
-            except console.ConsoleError as exc:
-                return {"ok": False, "error": str(exc), "error_class": "transport"}
-            except RuntimeError as exc:
-                return {"ok": False, "error": str(exc), "error_class": "transport"}
+                    return errors.success_result(_image_meta_content(result))
+            except Exception as exc:
+                return errors.failure_result(errors.envelope(exc))
 
     else:
 
@@ -1925,7 +1858,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             save_path: str = "", ui_tree: bool = False,
             ui_tree_depth: int = 3, ui_tree_max_elements: int = 200,
             vm_id: str = "",
-        ) -> list | dict:
+        ) -> CallToolResult:
             """Capture console evidence in one call: screenshot paired with
             captured_at, vm_id, dimensions and frame hash, plus an optional
             bounded guest UI element tree (requires guest credentials; the
@@ -1944,19 +1877,9 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                         ui_tree_max_elements=ui_tree_max_elements, cred=cred,
                         vm_id=vm_id,
                     )
-                    return _image_meta_content(result)
-            except policy.PolicyDenied as exc:
-                return {"ok": False, "error": str(exc), "error_class": "policy"}
-            except CredentialError as exc:
-                return {"ok": False, "error": str(exc), "error_class": "credential"}
-            except VMBusy as exc:
-                return {"ok": False, "error": str(exc), "error_class": "busy"}
-            except ValueError as exc:
-                return {"ok": False, "error": str(exc), "error_class": "invalid"}
-            except console.ConsoleError as exc:
-                return {"ok": False, "error": str(exc), "error_class": "transport"}
-            except RuntimeError as exc:
-                return {"ok": False, "error": str(exc), "error_class": "transport"}
+                    return errors.success_result(_image_meta_content(result))
+            except Exception as exc:
+                return errors.failure_result(errors.envelope(exc))
 
     @mcp.tool()
     def hyperv_guest_job_status(job_id: str) -> dict:
@@ -2037,6 +1960,64 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             "hyperv_relay_stop", "", "relay",
             relay.relay_stop, _cfg(), relay_id,
         )
+
+    _harden_tools(mcp)
+
+
+def _harden_tools(mcp: FastMCP) -> None:
+    """Stamp additionalProperties:false and reject undeclared arguments.
+
+    FastMCP 1.x builds argument models with pydantic's default
+    extra="ignore", so an undeclared key is silently dropped before the
+    tool body runs — a misspelled confirm/verify/elevated flag would fail
+    open. The guard below sits at the Tool.run chokepoint (both
+    FastMCP.call_tool and direct _tool_manager.call_tool traverse it),
+    rejects unknown keys with an audited "invalid" envelope naming the
+    argument, and stamps the published schemas so schema-driven clients see
+    the contract. Rejections are audited HERE (one record each) because
+    they happen before any tool body's audit region (issue #9: every
+    failure audited once).
+
+    Tool is a pydantic BaseModel, so the wrap is installed with
+    object.__setattr__; the marker attribute keeps re-registration from
+    stacking guards.
+    """
+    tm = getattr(mcp, "_tool_manager", None)
+    tools = list(getattr(tm, "_tools", {}).values()) if tm is not None else []
+    for tool in tools:
+        params = getattr(tool, "parameters", None)
+        if isinstance(params, dict):
+            params["additionalProperties"] = False
+        if getattr(tool.run, "_unknown_arg_guard", False):
+            continue
+        original_run = tool.run
+
+        async def guard(arguments, _tool=tool, _run=original_run, **kwargs):
+            declared = set((getattr(_tool, "parameters", None) or {}).get("properties", {}))
+            unknown = sorted(k for k in (arguments or {}) if k not in declared)
+            if unknown:
+                name = str(getattr(_tool, "name", "unknown-tool"))
+                auditlog.log_operation(
+                    tool=name,
+                    vm_name=str((arguments or {}).get("vm_name") or ""),
+                    category="",
+                    ok=False,
+                    error_class="invalid",
+                )
+                return errors.failure_result({
+                    "ok": False,
+                    "error": (
+                        f"unknown argument(s) {unknown} for {name}; "
+                        f"declared arguments: {sorted(declared)}"
+                    ),
+                    "error_class": "invalid",
+                    "retryable": False,
+                    "retry_after_ms": None,
+                })
+            return await _run(arguments, **kwargs)
+
+        guard._unknown_arg_guard = True  # type: ignore[attr-defined]
+        object.__setattr__(tool, "run", guard)
 
 
 # ---------------------------------------------------------------------------

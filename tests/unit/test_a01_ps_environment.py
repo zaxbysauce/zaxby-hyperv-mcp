@@ -229,6 +229,8 @@ def test_server_info_reports_provenance_without_secrets(monkeypatch, tmp_path):
             )
 
         content = raw[0] if isinstance(raw, tuple) else raw
+        if not isinstance(content, list) and hasattr(content, "content"):
+            content = content.content  # in-process call_tool returns a CallToolResult
         text_blocks = [c for c in content if getattr(c, "type", "") == "text"]
         assert text_blocks, "hyperv_server_info returned no text content"
         response_text = "".join(getattr(block, "text", "") for block in text_blocks)

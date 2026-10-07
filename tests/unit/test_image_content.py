@@ -80,6 +80,8 @@ def test_screenshot_returns_image_content(monkeypatch, fresh_server):
         {"vm_name": "test-vm-1", "width": 320, "height": 240},
     ))
     content = result[0] if isinstance(result, tuple) else result
+    if not isinstance(content, list) and hasattr(content, "content"):
+        content = content.content  # in-process call_tool returns a CallToolResult
     image_blocks = [c for c in content if getattr(c, "type", "") == "image"]
     assert image_blocks, f"no image content in {[type(c).__name__ for c in content]}"
     block = image_blocks[0]
@@ -116,6 +118,8 @@ def test_wait_frame_change_changed_returns_image_content(monkeypatch, fresh_serv
         {"vm_name": "test-vm-1", "baseline_hash": "a" * 64, "width": w, "height": h},
     ))
     content = result[0] if isinstance(result, tuple) else result
+    if not isinstance(content, list) and hasattr(content, "content"):
+        content = content.content  # in-process call_tool returns a CallToolResult
     image_blocks = [c for c in content if getattr(c, "type", "") == "image"]
     assert image_blocks and image_blocks[0].mimeType == "image/png"
 
@@ -134,6 +138,8 @@ def test_deadline_wait_returns_no_image_block(monkeypatch, fresh_server):
         {"vm_name": "test-vm-1", "timeout_s": 5, "interval_s": 1},
     ))
     content = result[0] if isinstance(result, tuple) else result
+    if not isinstance(content, list) and hasattr(content, "content"):
+        content = content.content  # in-process call_tool returns a CallToolResult
     assert not [c for c in content if getattr(c, "type", "") == "image"]
 
 
@@ -155,6 +161,8 @@ def test_tools_never_return_raw_image_objects(monkeypatch, fresh_server):
         {"vm_name": "test-vm-1", "width": 320, "height": 240},
         context=None,
     ))
+    if not isinstance(raw, list) and hasattr(raw, "content"):
+        raw = raw.content  # issue #9: the tool returns a CallToolResult
     assert isinstance(raw, list)
     assert not [v for v in raw if isinstance(v, FastMCPImage)]
     assert [v for v in raw if isinstance(v, ImageContent)]

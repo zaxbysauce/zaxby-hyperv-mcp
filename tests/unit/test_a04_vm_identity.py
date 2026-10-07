@@ -196,7 +196,14 @@ def test_vm_id_policy_runs_on_resolved_name(tmp_path, monkeypatch, fresh_server)
     except Exception as exc:  # noqa: BLE001 - the outcome IS the assertion input
         outcome = "raised: " + str(exc)[:120]
     else:
-        outcome = result.get("error_class", "") if isinstance(result, dict) else repr(result)[:120]
+        if isinstance(result, dict):
+            outcome = result.get("error_class", "")
+        elif hasattr(result, "content"):  # issue #9: failures deliver as CallToolResult
+            import json as _json
+            texts = [c for c in result.content if getattr(c, "type", "") == "text"]
+            outcome = _json.loads(texts[0].text).get("error_class", "") if texts else ""
+        else:
+            outcome = repr(result)[:120]
     mutating = ("Start-VM", "Stop-VM", "Invoke-Command", "New-VM")
     mutating_scripts = [
         index for index, script in enumerate(scripts)

@@ -339,11 +339,25 @@ cases and requires the VM Off/Saved for the `Set-VMComPort` step.
   merged them via `2>&1` and reported `0` for guest PowerShell errors).
   Elevation caveat: `Start-Process -Verb RunAs` cannot redirect streams, so
   elevated runs merge both into `stdout` (the result carries a `note`).
-- Failures return `{ok: false, error, error_class}` where `error_class` is
-  one of `timeout | transport | policy | credential | busy | invalid | parse |
-  integrity | not_found | guest`. All VM, guest, and console tools return
-  these `{ok: false, error, error_class}` envelopes on failure — only
-  schema-level validation errors are rejected by the client transport.
+- Failures return ONE envelope `{ok: false, error, error_class, retryable,
+  retry_after_ms}` where `error_class` is one of `timeout | transport |
+  policy | credential | busy | invalid | parse | integrity | not_found |
+  guest`. Every registered tool returns this envelope on failure (0.4.0
+  documented breaking change: host-side tools no longer raise through the
+  protocol), delivered with `isError: true` so failures are visible at the
+  MCP protocol level — the envelope rides as the text content AND as
+  `structuredContent`. The five keys are the minimum set; module-level
+  diagnostics (`timed_out`, `stopped`, `alive_pids`, ...) ride alongside.
+  The envelope and the audit log share one isinstance-based taxonomy, so a
+  record's `error_class` always equals the envelope's.
+- **Retry guidance:** `busy` is retryable (`retry_after_ms` is a fixed ~2s
+  hint until per-holder waits land); `policy`, `invalid`, `credential` and
+  `timeout` are never retryable — a `timeout` is not safe to retry for
+  guest execution because the guest-side child may still be running.
+- **Unknown arguments are rejected:** a call carrying an argument the
+  tool's schema does not declare returns an `isError: true` envelope with
+  `error_class: "invalid"`, names the argument, and never runs the tool.
+  Every published inputSchema advertises `additionalProperties: false`.
 - **Timeout semantics:** the host kills its whole PowerShell process tree
   (Job Object) at the timeout and reports `timed_out: true` with an explicit
   warning — **the guest-side child may still be running**. Guest temp scripts
