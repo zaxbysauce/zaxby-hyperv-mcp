@@ -333,14 +333,14 @@ cases and requires the VM Off/Saved for the `Set-VMComPort` step.
 | `hyperv_guest_read_file` | `vm_name` or `vm_id`, `remote_path`, `max_bytes>=1` (default 262144) | `{ok, content_b64, bytes_read, truncated}` |
 | `hyperv_guest_list_dir` | `vm_name` or `vm_id`, `remote_path` | `{ok, entries[{name, is_dir, size_bytes, modified}]}` |
 
-**0.2.0 behavior changes (documented breaking):**
+**Behavior changes (documented breaking):**
 
-- **stdout and stderr are SEPARATE fields with real exit codes** (upstream
+- (0.2.0) **stdout and stderr are SEPARATE fields with real exit codes** (upstream
   merged them via `2>&1` and reported `0` for guest PowerShell errors).
   Elevation caveat: `Start-Process -Verb RunAs` cannot redirect streams, so
   elevated runs merge both into `stdout` (the result carries a `note`).
-- Failures return ONE envelope `{ok: false, error, error_class, retryable,
-  retry_after_ms}` where `error_class` is one of `timeout | transport |
+- (0.4.0) Failures return ONE envelope `{ok: false, error, error_class,
+  retryable, retry_after_ms}` where `error_class` is one of `timeout | transport |
   policy | credential | busy | invalid | parse | integrity | not_found |
   guest`. Every registered tool returns this envelope on failure (0.4.0
   documented breaking change: host-side tools no longer raise through the
@@ -350,14 +350,22 @@ cases and requires the VM Off/Saved for the `Set-VMComPort` step.
   diagnostics (`timed_out`, `stopped`, `alive_pids`, ...) ride alongside.
   The envelope and the audit log share one isinstance-based taxonomy, so a
   record's `error_class` always equals the envelope's.
-- **Retry guidance:** `busy` is retryable (`retry_after_ms` is a fixed ~2s
-  hint until per-holder waits land); `policy`, `invalid`, `credential` and
-  `timeout` are never retryable — a `timeout` is not safe to retry for
-  guest execution because the guest-side child may still be running.
-- **Unknown arguments are rejected:** a call carrying an argument the
-  tool's schema does not declare returns an `isError: true` envelope with
-  `error_class: "invalid"`, names the argument, and never runs the tool.
-  Every published inputSchema advertises `additionalProperties: false`.
+- (0.4.0) **Retry guidance:** `busy` is the only retryable class
+  (`retry_after_ms` is a fixed ~2s hint until per-holder waits land); every
+  other class — `policy`, `invalid`, `credential`, `timeout`, `transport`,
+  `parse`, `integrity`, `not_found`, `guest` — is never retryable. A
+  `timeout` is not safe to retry for guest execution because the
+  guest-side child may still be running.
+- (0.4.0) **Unknown arguments and mistyped arguments are rejected:** a
+  call carrying an argument the tool's schema does not declare — or a
+  declared argument whose value fails schema validation — returns an
+  `isError: true` envelope with `error_class: "invalid"` (the argument is
+  named), never runs the tool, and is audited. Every published inputSchema
+  advertises `additionalProperties: false`.
+- (0.4.0) **Success results carry no `structuredContent`** (it is `null`);
+  only failure envelopes populate it. Mistyped-declaration validation
+  errors that used to surface as bare protocol errors now arrive as the
+  same audited envelope.
 - **Timeout semantics:** the host kills its whole PowerShell process tree
   (Job Object) at the timeout and reports `timed_out: true` with an explicit
   warning — **the guest-side child may still be running**. Guest temp scripts
@@ -406,7 +414,7 @@ reports the binding still present — and re-verifies every action, returning pe
 | `hyperv_guest_job_start` | `vm_name` or `vm_id`, `command`, `args[]?`, `cwd?`, `timeout_ms=60000` | `{ok, job_id, vm_name, pid, start_time_ticks, job_dir, out_path, err_path, exit_path, started_at}` |
 | `hyperv_guest_job_status` | `job_id` | `{ok, job_id, pid, status: running\|exited\|exiting\|stopped, process_name?, exit_code?}` |
 | `hyperv_guest_job_output` | `job_id`, `tail_bytes=65536` | `{ok, job_id, pid, tail_bytes, stdout, stderr, *_truncated, *_encoding, *_size}` |
-| `hyperv_guest_job_stop` | `job_id` | `{ok, job_id, pid, stopped, alive_pids, job_dir_removed, pid_reused}` (same key set on every path; a failure adds `error`/`error_class` with `stopped: false`; a repeat stop adds `note: "was already stopped"`) |
+| `hyperv_guest_job_stop` | `job_id` | `{ok, job_id, pid, stopped, alive_pids, job_dir_removed, pid_reused}` (same key set on every path; every failure adds `error`/`error_class`/`retryable`/`retry_after_ms` with `stopped: false`; a repeat stop adds `note: "was already stopped"`) |
 
 Start returns immediately with a job id bound to the exact guest PID and its
 start time (`start_time_ticks`; the wrapper resets `$LASTEXITCODE` to null
@@ -430,12 +438,13 @@ exited (an orphaned child keeps the dead recorded PID as its
 still finds it), and `stopped` is true only when no member of the recorded
 tree was observed alive afterward — the job dir is removed and the stored
 credentials dropped only in that case; otherwise a survivor comes back as
-`ok: false, stopped: false` with `alive_pids` and the job stays stoppable
-for a retry (the retry re-walks and re-kills whatever survived). The stop
-result carries the same key set on every path — success, survivor, repeat
-stop (`note: "was already stopped"`, observation fields as honest
-unknowns), and transport failure (which adds `error`/`error_class` with
-`stopped: false`). The PID is
+`ok: false, stopped: false` with `alive_pids` and an `error` string, and
+the job stays stoppable for a retry (the retry re-walks and re-kills
+whatever survived). The stop result carries the same key set on every path
+— success, survivor (which adds `error` plus the standard
+`error_class`/`retryable`/`retry_after_ms`), repeat stop (`note: "was
+already stopped"`, observation fields as honest unknowns), and transport
+failure (which adds the same error fields with `stopped: false`). The PID is
 re-validated against `start_time_ticks` first, so a reused PID belonging to
 an unrelated process is never killed (a confirmed start-time mismatch
 returns `pid_reused: true`, and the already-gone job reports stopped; an
@@ -658,8 +667,9 @@ in its safe default state. Provide `HYPERV_MCP_CONFIG` (see
 **`MCP module not found`** — reinstall so `mcp` is pulled in:
 `pip install git+https://github.com/zaxbysauce/zaxby-hyperv-mcp.git`.
 
-**Dependency pin** — this fork pins `mcp>=1.0.0,<2`; the server uses the mcp
-v1 `FastMCP` API, which mcp 2.x renamed.
+**Dependency pin** — this fork pins `mcp>=1.30.0,<2`; the server uses the mcp
+v1 `FastMCP` API, which mcp 2.x renamed, and relies on CallToolResult
+passthrough behavior guaranteed from mcp 1.30.
 
 ---
 

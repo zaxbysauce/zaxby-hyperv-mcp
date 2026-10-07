@@ -54,7 +54,8 @@ def test_classify_most_specific_first():
 
 def test_retry_fields_busy_only():
     retryable, after = errors.retry_fields("busy")
-    assert retryable is True and isinstance(after, int) and after > 0
+    assert (retryable, after) == (True, errors.BUSY_RETRY_MS)
+    assert errors.BUSY_RETRY_MS == 2000  # pinned: the documented ~2s hint
     for cls in ("policy", "credential", "invalid", "timeout", "transport"):
         retryable, after = errors.retry_fields(cls)
         assert (retryable, after) == (False, None), cls
@@ -134,10 +135,12 @@ def test_unknown_argument_audited_once(monkeypatch, tmp_path):
 def registered_tools():
     mod = importlib.reload(server_module)
     mod.bootstrap({})  # deny-all: registration does not depend on policy
-    mcp = mod.get_mcp()
-    tm = mcp._tool_manager
-    fns = {name: tool.fn for name, tool in tm._tools.items()}
-    return fns
+    try:
+        mcp = mod.get_mcp()
+        tm = mcp._tool_manager
+        yield {name: tool.fn for name, tool in tm._tools.items()}
+    finally:
+        importlib.reload(server_module)
 
 
 def test_every_tool_has_no_output_model(registered_tools):
@@ -168,4 +171,69 @@ def test_success_result_serializer_matches_convert_to_content():
     assert block.type == "text"
     assert block.text == _convert_to_content(meta)[0].text, (
         "success_result must serialize dicts exactly as _convert_to_content"
+    )
+
+
+def test_wrong_typed_declared_arg_enveloped_and_audited(monkeypatch, tmp_path):
+    """PRR-001/PRR-002 fix: a declared argument with a wrong type used to
+    raise raw ToolError out of the guard (no envelope, no audit, message
+    embedding the raw input value). The guard now catches it, classifies
+    via the ValidationError cause ("invalid"), redacts, and audits once."""
+    import asyncio
+    import json as _json
+
+    audit = tmp_path / "audit.jsonl"
+    doc = {"allowed_vm_patterns": ["test-*"], "unrestricted": True,
+           "audit_log_path": str(audit)}
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mod = importlib.reload(server_module)
+    mod.bootstrap({"HYPERV_MCP_CONFIG": str(p)})
+    mcp = mod.get_mcp()
+
+    result = asyncio.run(mcp.call_tool(
+        "hyperv_wait_vm_state", {"vm_name": "test-vm", "states": "Exploded"}
+    ))
+    assert result.isError is True
+    env = result.structuredContent
+    assert env["ok"] is False and env["error_class"] == "invalid"
+    assert env["retryable"] is False and env["retry_after_ms"] is None
+    records = [_json.loads(ln) for ln in
+               audit.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    rejects = [r for r in records if r.get("tool") == "hyperv_wait_vm_state"
+               and r.get("ok") is False]
+    assert len(rejects) == 1, f"expected exactly one audited rejection: {records}"
+    assert rejects[0]["error_class"] == env["error_class"]
+
+
+def test_module_dict_without_error_class_audits_envelope_class(monkeypatch, tmp_path):
+    """PRR-003 fix: an ok:false module dict lacking error_class used to be
+    audited as "" while the envelope said "transport". The wrapper now
+    audits from the enriched dict, so audit == envelope by construction."""
+    import asyncio
+    import json as _json
+
+    audit = tmp_path / "audit.jsonl"
+    doc = {"allowed_vm_patterns": ["test-*"], "unrestricted": True,
+           "audit_log_path": str(audit)}
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mod = importlib.reload(server_module)
+    mod.bootstrap({"HYPERV_MCP_CONFIG": str(p)})
+    mcp = mod.get_mcp()
+
+    def classless_failure(*args, **kwargs):
+        return {"ok": False, "error": "module said no"}
+
+    monkeypatch.setattr("hyperv_mcp.lifecycle.get_vm_info", classless_failure)
+    result = asyncio.run(mcp.call_tool("hyperv_get_vm_info", {"vm_name": "test-vm"}))
+    env = result.structuredContent
+    assert env["ok"] is False and env["error"] == "module said no"
+    assert env["error_class"] == "transport"
+    assert env["retryable"] is False and env["retry_after_ms"] is None
+    records = [_json.loads(ln) for ln in
+               audit.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    match = [r for r in records if r.get("tool") == "hyperv_get_vm_info"]
+    assert match and match[-1]["error_class"] == env["error_class"], (
+        f"audit {match[-1:] if match else 'none'} must equal envelope {env['error_class']!r}"
     )
