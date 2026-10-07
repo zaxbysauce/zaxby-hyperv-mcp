@@ -392,6 +392,7 @@ def guest_put(
         result = _run_transfer(cfg, ref.id, body, cred)
         if result.get("error_class") == "timeout":
             _cleanup_guest_staged(ref.id, staged_raw, cred)
+    result["vm_name"] = ref.name
     return result
 
 
@@ -419,6 +420,12 @@ def guest_get(
             "error": f"invalid destination: {local_path} is a directory",
             "error_class": "invalid",
         }
+    # Resolve AFTER the cheap host-side input/policy checks (no PowerShell
+    # spawns on bad input) and BEFORE the local dir creation below — mirroring
+    # guest_put's ordering: a denied or invalid call must not orphan host
+    # directories, because the failure cleanup only runs post-resolve
+    # (PRR-010).
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     # Destination dirs must exist before the -FromSession copy, which runs
     # before the guest assertion result is known; directories THIS call
     # creates are pruned again if the transfer fails, so a denied get
@@ -477,7 +484,6 @@ def guest_get(
         sha256_remote = $shaRemote
     }} | ConvertTo-Json -Compress
 """
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     with vmlocks.vm_lock(ref.id):
         try:
             result = _run_transfer(cfg, ref.id, body, cred)
@@ -486,6 +492,7 @@ def guest_get(
             raise
     if result.get("ok") is False:
         _cleanup_failed_get(staged_raw, created_dirs)
+    result["vm_name"] = ref.name
     return result
 
 
@@ -538,22 +545,23 @@ $r | ConvertTo-Json -Compress
             body.strip(), timeout_s=120, stdin_b64=pswindows.utf8_b64(cred.password)
         )
     if result.timed_out:
-        return {"ok": False, "error": "host timeout reading guest file", "error_class": "timeout"}
+        return {"ok": False, "vm_name": ref.name, "error": "host timeout reading guest file", "error_class": "timeout"}
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "unknown PowerShell error"
-        return {"ok": False, "error": detail, "error_class": _failure_class(detail)}
+        return {"ok": False, "vm_name": ref.name, "error": detail, "error_class": _failure_class(detail)}
     try:
         data = json.loads(result.stdout)
         # Explicit keys only: remoting metadata (PSComputerName, RunspaceId)
         # must not leak into the tool result.
         return {
             "ok": True,
+            "vm_name": ref.name,
             "content_b64": data.get("content_b64"),
             "bytes_read": data.get("bytes_read"),
             "truncated": data.get("truncated"),
         }
     except json.JSONDecodeError as exc:
-        return {"ok": False, "error": f"result JSON parse failed: {exc}", "error_class": "parse"}
+        return {"ok": False, "vm_name": ref.name, "error": f"result JSON parse failed: {exc}", "error_class": "parse"}
 
 
 def guest_list_dir(
@@ -593,10 +601,10 @@ if ($items) {{ @($items) | ConvertTo-Json -Compress }} else {{ '[]' }}
             body.strip(), timeout_s=60, stdin_b64=pswindows.utf8_b64(cred.password)
         )
     if result.timed_out:
-        return {"ok": False, "error": "host timeout listing guest directory", "error_class": "timeout"}
+        return {"ok": False, "vm_name": ref.name, "error": "host timeout listing guest directory", "error_class": "timeout"}
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "unknown PowerShell error"
-        return {"ok": False, "error": detail, "error_class": _failure_class(detail)}
+        return {"ok": False, "vm_name": ref.name, "error": detail, "error_class": _failure_class(detail)}
     try:
         raw = result.stdout.strip()
         if not raw or raw == "null":
@@ -604,6 +612,6 @@ if ($items) {{ @($items) | ConvertTo-Json -Compress }} else {{ '[]' }}
         else:
             parsed = json.loads(raw)
             entries = [parsed] if isinstance(parsed, dict) else list(parsed)
-        return {"ok": True, "entries": entries}
+        return {"ok": True, "vm_name": ref.name, "entries": entries}
     except json.JSONDecodeError as exc:
-        return {"ok": False, "error": f"result JSON parse failed: {exc}", "error_class": "parse"}
+        return {"ok": False, "vm_name": ref.name, "error": f"result JSON parse failed: {exc}", "error_class": "parse"}

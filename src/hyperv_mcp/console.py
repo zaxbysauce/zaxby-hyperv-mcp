@@ -481,7 +481,7 @@ def get_display_info(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
         "console input works from firmware/WinPE; PowerShell Direct requires a "
         "running supported guest OS with credentials — verify before switching"
     )
-    return {"ok": True, **data}
+    return {"ok": True, **data, "vm_name": ref.name}
 
 
 def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -> dict:
@@ -516,7 +516,7 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
             calls += 1
             if i < len(chunks) - 1:
                 time.sleep(0.05)
-    return {"ok": True, "chunks": calls, "chars": len(text)}
+    return {"ok": True, "chunks": calls, "chars": len(text), "vm_name": ref.name}
 
 
 def press_key(
@@ -568,13 +568,18 @@ def _send_scancodes_locked(cfg: Config, ref: vmident.VMRef, codes: list[int]) ->
             sent += len(chunk)
             if i < len(chunks) - 1:
                 time.sleep(0.02)  # pacing: let the Hyper-V input buffer drain
-    return {"ok": True, "scancodes_sent": sent, "chunks": len(chunks)}
+    return {"ok": True, "scancodes_sent": sent, "chunks": len(chunks), "vm_name": ref.name}
 
 
 def mouse_move(
-    cfg: Config, vm_name: str = "", x: int = 0, y: int = 0,
+    cfg: Config, vm_name: str = "", x: int | None = None, y: int | None = None,
     frame_width: int = 0, frame_height: int = 0, vm_id: str = "",
 ) -> dict:
+    # x/y are semantically REQUIRED (PRR-014): omission must not silently
+    # mean (0,0) — a real SetAbsolutePosition(0,0). Checked before any
+    # policy/spawn so the invalid call costs nothing.
+    if x is None or y is None:
+        raise ValueError("x and y are required")
     policy.require_category(cfg, "console_input", f"move mouse on '{vm_name}' console")
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     head = _head_resolution(cfg, ref.id)
@@ -664,7 +669,7 @@ def _mouse_op(
     with vmlocks.vm_lock(ref.id):
         result = pswindows.run_ps(script.strip(), timeout_s=90)
     _check_rc(result, f"console mouse {detail}")
-    out = {"ok": True, "operation": detail}
+    out = {"ok": True, "operation": detail, "vm_name": ref.name}
     if extra:
         out.update(extra)
     return out
@@ -720,6 +725,7 @@ def wait_frame_change(
 
     out: dict = {
         "ok": True,
+        "vm_name": ref.name,
         "stop_reason": stop_reason,
         "changed": stop_reason == "changed",
         "polls": polls,
@@ -774,6 +780,7 @@ def capture_sequence(
             time.sleep(interval_s)
     return {
         "ok": True,
+        "vm_name": ref.name,
         "frames": frames,
         "images": images,
         "elapsed_ms": int((time.monotonic() - started) * 1000),

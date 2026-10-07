@@ -7,6 +7,12 @@ by vmident.resolve, stable across renames) and acquired non-blocking: a
 second conflicting call fails fast with VMBusy instead of queueing behind an
 unknown-duration operation. The key is an opaque string; vm_create locks on
 the not-yet-existing VM's name, which the duplicate-name guard keeps unique.
+Known residual: between `New-VM` committing inside vm_create's script and
+that script finishing, the new VM is GUID-resolvable while the create still
+holds only the name key, so a concurrent GUID-keyed operation can overlap
+the (sub-second, functionally complete) creation tail. Closing that window
+requires the creation script to hand back the GUID mid-lock, which a single
+script cannot do.
 """
 
 from __future__ import annotations

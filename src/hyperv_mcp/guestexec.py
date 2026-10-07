@@ -30,7 +30,7 @@ from . import policy, pswindows, vmident, vmlocks
 from .config import Config
 from .credentials import CredentialSet
 
-GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+GUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
 def validate_vm_guid(guid: str) -> str:
@@ -43,7 +43,9 @@ def validate_vm_guid(guid: str) -> str:
     vmident.resolve; the resolver's own PS-side anchored match remains the
     authoritative shape filter.)
     """
-    if not isinstance(guid, str) or not GUID_RE.match(guid):
+    # fullmatch: a `$`-anchored match would accept a trailing newline, which
+    # survives into VMRef.id and splits the vm_lock key space (review PRR-012).
+    if not isinstance(guid, str) or not GUID_RE.fullmatch(guid):
         raise ValueError(f"vm_id is not a valid VM GUID: {guid!r}")
     return guid
 
@@ -166,7 +168,7 @@ def _truncate(value: str, limit_bytes: int) -> tuple[str, bool]:
     return raw[:limit_bytes].decode("utf-8", "ignore"), True
 
 
-def _result_ok(cfg: Config, exit_code, stdout: str, stderr: str) -> dict:
+def _result_ok(cfg: Config, exit_code, stdout: str, stderr: str, vm_name: str = "") -> dict:
     stdout, t_out = _truncate(stdout, cfg.max_output_bytes)
     stderr, t_err = _truncate(stderr, cfg.max_output_bytes)
     return {
@@ -176,6 +178,9 @@ def _result_ok(cfg: Config, exit_code, stdout: str, stderr: str) -> dict:
         "stderr": stderr,
         "timed_out": False,
         "truncated": t_out or t_err,
+        # Resolved display name (never the raw caller input) so the server's
+        # audit adoption can attribute by-id calls (PRR-005).
+        "vm_name": vm_name,
     }
 
 
@@ -266,6 +271,7 @@ def _run_inner(
     cred: CredentialSet,
     timeout_ms: int,
     elevated: bool,
+    vm_name: str = "",
 ) -> dict:
     """Run one inner script on the VM identified by the pre-resolved GUID.
 
@@ -310,7 +316,7 @@ def _run_inner(
     if exit_code is None:
         return _result_err(cfg, "guest child process produced no exit code", "guest")
 
-    out = _result_ok(cfg, exit_code, data.get("stdout") or "", data.get("stderr") or "")
+    out = _result_ok(cfg, exit_code, data.get("stdout") or "", data.get("stderr") or "", vm_name=vm_name)
     if elevated:
         out["note"] = (
             "elevated run: guest stdout/stderr are merged (RunAs cannot redirect streams); "
@@ -343,7 +349,7 @@ def guest_run_ps(
         policy.require_destructive(cfg, "elevated_exec", confirm, f"run an elevated script on '{ref.name}'")
     with vmlocks.vm_lock(ref.id):
         inner = f"{_LE_RESET}\n{script}\n{_EXIT_PROPAGATION}"
-        return _run_inner(cfg, ref.id, inner, cred, timeout_ms, elevated)
+        return _run_inner(cfg, ref.id, inner, cred, timeout_ms, elevated, vm_name=ref.name)
 
 
 def guest_run(
@@ -387,7 +393,7 @@ def guest_run(
     else:
         lines.append(_EXIT_PROPAGATION)
     with vmlocks.vm_lock(ref.id):
-        return _run_inner(cfg, ref.id, "\n".join(lines), cred, timeout_ms, elevated)
+        return _run_inner(cfg, ref.id, "\n".join(lines), cred, timeout_ms, elevated, vm_name=ref.name)
 
 
 def victim_run_ps(
@@ -406,7 +412,7 @@ def victim_run_ps(
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     with vmlocks.vm_lock(ref.id):
         inner = f"{_LE_RESET}\n{script}\n{_EXIT_PROPAGATION}"
-        return _run_inner(cfg, ref.id, inner, cred, timeout_ms, elevated=False)
+        return _run_inner(cfg, ref.id, inner, cred, timeout_ms, elevated=False, vm_name=ref.name)
 
 
 def victim_run(

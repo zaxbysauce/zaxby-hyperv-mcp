@@ -61,7 +61,7 @@ from .vmlocks import VMBusy
 
 __all__ = ["mcp", "main", "bootstrap", "configure_http_auth"]  # noqa: F822 (mcp: module __getattr__)
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 _INSTRUCTIONS = (
     "Hyper-V VM management MCP (hardened). VM lifecycle, checkpoints, "
@@ -387,6 +387,13 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             op.ok = False
             op.error_class = "timeout"
             return {"ok": False, "error": str(exc), "error_class": "timeout"}
+        except media.MediaError as exc:
+            # MediaError subclasses RuntimeError but its faults are
+            # caller/vm-state faults (missing file, Gen1, verify mismatch) —
+            # the RuntimeError catch-all would mislabel them "transport".
+            op.ok = False
+            op.error_class = "invalid"
+            return {"ok": False, "error": str(exc), "error_class": "invalid"}
         except RuntimeError as exc:
             op.ok = False
             op.error_class = "transport"
@@ -444,7 +451,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {status, vm_name, state}
-        """
+
+        Failure: {ok: false, error, error_class}.        """
         return _run_guest_tool(
             "hyperv_start_vm", vm_name, "lifecycle",
             lifecycle.start_vm, _cfg(), vm_name, vm_id=vm_id,
@@ -465,7 +473,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {status, vm_name, method, state}
-        """
+
+        Failure: {ok: false, error, error_class}.        """
         return _run_guest_tool(
             "hyperv_stop_vm", vm_name, "destructive",
             lifecycle.stop_vm, _cfg(), vm_name,
@@ -483,7 +492,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {status, vm_name, state}
-        """
+
+        Failure: {ok: false, error, error_class}.        """
         return _run_guest_tool(
             "hyperv_reset_vm", vm_name, "destructive",
             lifecycle.reset_vm, _cfg(), vm_name, confirm=confirm, vm_id=vm_id,
@@ -501,7 +511,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id:           Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {status, vm_name, checkpoint_name}
-        """
+
+        Failure: {ok: false, error, error_class}.        """
         return _run_guest_tool(
             "hyperv_checkpoint_create", vm_name, "checkpoint",
             lifecycle.checkpoint_create, _cfg(), vm_name,
@@ -518,6 +529,10 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         """
         # list on success, {"ok": False, ...} envelope on failure (the one
         # list-returning tool routed through the envelope mapping).
+        # Audit-attribution exclusion (PRR-005): rows are per-checkpoint and
+        # carry no VM name, and the wrapper's adoption gate is dict-only, so
+        # by-id calls here audit under the empty caller name — documented
+        # permanent fallback, never a fabricated name.
         return _run_guest_tool(  # type: ignore[return-value]
             "hyperv_checkpoint_list", vm_name, "read",
             lifecycle.checkpoint_list, _cfg(), vm_name, vm_id=vm_id,
@@ -537,7 +552,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id:           Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {status, vm_name, checkpoint_name, state, note}
-        """
+
+        Failure: {ok: false, error, error_class}.        """
         return _run_guest_tool(
             "hyperv_checkpoint_restore", vm_name, "destructive",
             lifecycle.checkpoint_restore, _cfg(), vm_name,
@@ -560,7 +576,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id:           Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {status, vm_name, checkpoint_name}
-        """
+
+        Failure: {ok: false, error, error_class}.        """
         return _run_guest_tool(
             "hyperv_checkpoint_remove", vm_name, "destructive",
             lifecycle.checkpoint_remove, _cfg(), vm_name,
@@ -595,6 +612,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
             Returns: {status, vm_name, host_ip, port, key,
                       kernel_attach_string, bcdedit_output, rebooting}
+            Failure: {ok: false, error, error_class}.
             """
             return _run_guest_tool(
                 "hyperv_configure_kdnet", vm_name, "destructive",
@@ -624,6 +642,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
             Returns: {status, vm_name, com_port, pipe_path,
                       kernel_attach_string, bcdedit_output, rebooting}
+            Failure: {ok: false, error, error_class}.
             """
             return _run_guest_tool(
                 "hyperv_configure_kdcom", vm_name, "destructive",
@@ -656,6 +675,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
             Returns: {status, vm_name, host_ip, port, key,
                       kernel_attach_string, bcdedit_output, rebooting}
+            Failure: {ok: false, error, error_class}.
             """
             return _run_guest_tool(
                 "hyperv_configure_kdnet", vm_name, "destructive",
@@ -684,6 +704,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
             Returns: {status, vm_name, com_port, pipe_path,
                       kernel_attach_string, bcdedit_output, rebooting}
+            Failure: {ok: false, error, error_class}.
             """
             return _run_guest_tool(
                 "hyperv_configure_kdcom", vm_name, "destructive",
@@ -1014,17 +1035,30 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
     # use the {ok,...}/{ok:false,error,error_class} envelope.
 
     def _run_console_tool(tool: str, vm: str, category: str, fn, *args, **kwargs):
+        op = _audit(tool, vm, category)
         try:
-            with _audit(tool, vm, category):
-                return fn(*args, **kwargs)
+            with op:
+                result = fn(*args, **kwargs)
+                # Issue #8 audit clause (PRR-004): a by-id call audited under
+                # an empty caller name adopts the RESOLVED display name the
+                # console module returns; never fabricated.
+                if isinstance(result, dict):
+                    display = result.get("vm_name") or result.get("name")
+                    if not vm and display:
+                        op.vm_name = str(display)
+                return result
         except policy.PolicyDenied as exc:
             return {"ok": False, "error": str(exc), "error_class": "policy"}
-        except console.ConsoleError as exc:
-            return {"ok": False, "error": str(exc), "error_class": "transport"}
+        except CredentialError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "credential"}
         except VMBusy as exc:
             return {"ok": False, "error": str(exc), "error_class": "busy"}
         except ValueError as exc:
             return {"ok": False, "error": str(exc), "error_class": "invalid"}
+        except TimeoutError as exc:
+            return {"ok": False, "error": str(exc), "error_class": "timeout"}
+        # ConsoleError subclasses RuntimeError and maps identically
+        # ("transport"), so the catch-all below covers it (PRR-020).
         except RuntimeError as exc:
             return {"ok": False, "error": str(exc), "error_class": "transport"}
 
@@ -1051,10 +1085,13 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         Returns: [ImageContent(image/png), TextContent(json metadata)]
         """
         try:
-            with _audit("hyperv_console_screenshot", vm_name, "read"):
+            with _audit("hyperv_console_screenshot", vm_name, "read") as op:
                 img, meta = console.screenshot(
                     _cfg(), vm_name, width, height, save_path, vm_id=vm_id
                 )
+                # PRR-004: by-id adoption from the console module's metadata.
+                if not vm_name and meta.get("vm_name"):
+                    op.vm_name = str(meta["vm_name"])
                 buf = io.BytesIO()
                 img.save(buf, format="PNG")
                 # ImageContent is a pydantic model; the raw FastMCP Image
@@ -1165,18 +1202,21 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
     @mcp.tool()
     def hyperv_console_mouse_move(
-        vm_name: str = "", x: int = 0, y: int = 0, frame_width: int = 0,
-        frame_height: int = 0, vm_id: str = "",
+        vm_name: str = "", x: int | None = None, y: int | None = None,
+        frame_width: int = 0, frame_height: int = 0, vm_id: str = "",
     ) -> dict:
         """Position the synthetic mouse. Coordinates are in the space of the
         image you observed; give frame_width/frame_height (the snapshot
         dimensions) to scale them to display-head space. Without frame dims
         the head resolution must be available, else the tool errors rather
-        than clicking blind. Policy: console_input.
+        than clicking blind. x and y are REQUIRED — omission is an invalid
+        call (it never means (0,0); use hyperv_console_click at (0,0) for a
+        click at the current position). Policy: console_input.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, operation, head_x, head_y} or {ok: false, error, error_class}
+        Returns: {ok, operation, vm_name, head_x, head_y} or {ok: false,
+        error, error_class}.
         """
         return _run_console_tool(
             "hyperv_console_mouse_move", vm_name, "console_input",
@@ -1254,12 +1294,15 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                             against nothing — first poll's frame is baseline)
         """
         try:
-            with _audit("hyperv_console_wait_frame_change", vm_name, "read"):
+            with _audit("hyperv_console_wait_frame_change", vm_name, "read") as op:
                 out = console.wait_frame_change(
                     _cfg(), vm_name, baseline_hash, width, height, timeout_s,
                     interval_s, vm_id=vm_id
                 )
                 meta = {k: v for k, v in out.items() if k != "image"}
+                # PRR-004: by-id adoption from the console module's metadata.
+                if not vm_name and meta.get("vm_name"):
+                    op.vm_name = str(meta["vm_name"])
                 if "image" in out:
                     buf = io.BytesIO()
                     out["image"].save(buf, format="PNG")
@@ -1294,11 +1337,14 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
         """
         try:
-            with _audit("hyperv_console_capture_sequence", vm_name, "read"):
+            with _audit("hyperv_console_capture_sequence", vm_name, "read") as op:
                 out = console.capture_sequence(
                     _cfg(), vm_name, count, interval_s, width, height, vm_id=vm_id
                 )
                 meta = {k: v for k, v in out.items() if k != "images"}
+                # PRR-004: by-id adoption from the console module's metadata.
+                if not vm_name and meta.get("vm_name"):
+                    op.vm_name = str(meta["vm_name"])
                 parts: list = []
                 imgs = list(out["images"])
                 for img in imgs:
@@ -1353,6 +1399,9 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             final = lifecycle.wait_for_vm_state(
                 _cfg(), vm_name, list(states), timeout_s, vm_id=vm_id
             )
+            # wait_for_vm_state returns the bare state string; by-id waits
+            # audit under the empty caller name (documented PRR-005 fallback —
+            # no fabricated name).
             return {"ok": True, "final_state": final, "guest_channel": "ps_direct_unverified"}
 
         return _run_guest_tool("hyperv_wait_vm_state", vm_name, "read", _wait)
@@ -1501,16 +1550,18 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
     @mcp.tool()
     def hyperv_vm_tpm_set(
-        vm_name: str = "", enabled: bool = False, confirm: bool = False, vm_id: str = ""
+        vm_name: str = "", *, enabled: bool, confirm: bool = False, vm_id: str = ""
     ) -> dict:
         """Enable or disable the virtual TPM (Gen2 only).
         Policy: vm_provision + confirm=true.
 
         Args:
             vm_name: Name of the VM
+            enabled: REQUIRED — true to enable, false to disable (omission is
+                     a schema error; it never silently defaults to disable)
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, tpm_enabled} or {ok: false, error, error_class}.
+        Returns: {ok, tpm_enabled, vm_name} or {ok: false, error, error_class}.
         """
         return _run_guest_tool(
             "hyperv_vm_tpm_set", vm_name, "vm_provision",
@@ -1520,7 +1571,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
     @mcp.tool()
     def hyperv_vm_secureboot_set(
-        vm_name: str = "", enabled: bool = False, template: str = "",
+        vm_name: str = "", *, enabled: bool, template: str = "",
         confirm: bool = False, vm_id: str = "",
     ) -> dict:
         """Enable or disable Secure Boot (Gen2 only), optionally setting the
@@ -1529,10 +1580,12 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         Args:
             vm_name: Name of the VM
+            enabled: REQUIRED — true to enable, false to disable (omission is
+                     a schema error; it never silently defaults to disable)
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, secure_boot, secure_boot_template} or {ok: false,
-        error, error_class}.
+        Returns: {ok, secure_boot, secure_boot_template, vm_name} or {ok:
+        false, error, error_class}.
         """
         return _run_guest_tool(
             "hyperv_vm_secureboot_set", vm_name, "vm_provision",

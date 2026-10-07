@@ -325,6 +325,46 @@ def test_kdcom_requires_off_state_note_and_gates(monkeypatch, unrestricted):
     assert "Set-VMComPort" in fake.scripts[1]
 
 
+def test_kdcom_by_id_default_pipe_derives_from_resolved_name(monkeypatch, unrestricted):
+    """PRR-007: a by-id call with no pipe_name derives the pipe from the
+    RESOLVED name — the caller name is empty, and deriving from it handed
+    every by-id VM the same bare \\\\.\\pipe\\kd_ (cross-VM kernel-debug
+    pipe collision the validator happily accepted)."""
+    name = "deb ghost"
+    scripts: list[str] = []
+
+    def fake_run(script, **kwargs):
+        scripts.append(script)
+        if script.rstrip().endswith("$vm.Name"):  # by-id resolve leg -> name
+            return pswindows.PSResult(stdout=name, returncode=0)
+        if "Set-VMComPort" in script:  # kdcom step 1
+            return pswindows.PSResult(stdout="", returncode=0)
+        return pswindows.PSResult(stdout=json.dumps({"DbgSettings": "ok"}), returncode=0)
+
+    monkeypatch.setattr(pswindows, "run_ps", fake_run)
+    out = lifecycle.configure_kdcom(
+        unrestricted, vm_id=GUID, com_port=1, reboot=False, confirm=True, cred=CRED,
+    )
+    assert out["pipe_path"] == "\\\\.\\pipe\\kd_deb_ghost"
+    assert out["pipe_path"] != "\\\\.\\pipe\\kd_"  # the old bare-pipe collision
+    # The Set-VMComPort leg carries the derived per-VM pipe.
+    assert "-Path '\\\\.\\pipe\\kd_deb_ghost'" in scripts[1]
+
+
+def test_by_id_gate_strings_fall_back_to_vm_id():
+    """PRR-016: by-id calls render the GUID (not an empty name) in the
+    human-facing confirm-gate detail; both gates precede any PowerShell."""
+    cfg = Config(allowed_vm_patterns=["test-*"])
+    cfg.destructive.stop = True
+    with pytest.raises(PolicyDenied) as ei:
+        lifecycle.stop_vm(cfg, vm_id=GUID, method="turnoff", confirm=False)
+    assert f"stop VM '{GUID}'" in str(ei.value)
+    cfg.destructive.kd_reboot = True
+    with pytest.raises(PolicyDenied) as ei:
+        lifecycle.configure_kdnet(cfg, vm_id=GUID, host_ip="192.0.2.1", confirm=False, cred=CRED)
+    assert f"configure KDNET on '{GUID}'" in str(ei.value)
+
+
 def test_label_validation():
     unrestricted = Config(unrestricted=True)
     with pytest.raises(ValueError):

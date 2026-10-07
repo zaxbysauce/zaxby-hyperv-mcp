@@ -180,8 +180,11 @@ def test_authority_form_target_rejected_400(monkeypatch):
         sock.sendall(b"GET @evil.example:8080/json HTTP/1.1\r\nHost: x\r\n\r\n")
         data = sock.recv(4096)
     assert b" 400 " in data.split(b"\r\n")[0]
-    # No guest forward leg ran (only relay_start's resolution leg).
+    # No guest forward leg ran, and the surviving script IS the by-name
+    # resolution leg (relay_start's identity resolution; a guest forward or
+    # any other leg would not emit $vmTarget as its last line).
     assert len(fake.scripts) == 1
+    assert fake.scripts[0].rstrip().endswith("$vmTarget")
 
 
 def test_rejected_request_body_cannot_smuggle_followup(monkeypatch):
@@ -214,6 +217,7 @@ def test_rejected_request_body_cannot_smuggle_followup(monkeypatch):
     assert b"Connection: close" in data
     assert b" 200 " not in data
     assert len(fake.scripts) == 1  # only the resolution leg; no guest forward
+    assert fake.scripts[0].rstrip().endswith("$vmTarget")
 
 
 def test_chunked_transfer_encoding_rejected_411(monkeypatch):
@@ -235,6 +239,7 @@ def test_chunked_transfer_encoding_rejected_411(monkeypatch):
     assert b" 411 " in data.split(b"\r\n")[0]
     assert b"Connection: close" in data
     assert len(fake.scripts) == 1  # only the resolution leg; no guest forward
+    assert fake.scripts[0].rstrip().endswith("$vmTarget")
 
 
 def test_forward_script_host_is_always_loopback():
@@ -307,6 +312,7 @@ def test_negative_content_length_rejected_400(monkeypatch):
     assert b" 400 " in data.split(b"\r\n")[0]
     assert b"Connection: close" in data
     assert len(fake.scripts) == 1  # only the resolution leg; no guest forward
+    assert fake.scripts[0].rstrip().endswith("$vmTarget")
 
 
 def test_start_requires_credentials():
@@ -333,6 +339,7 @@ def test_request_with_nulled_cred_gets_clean_503(monkeypatch):
         raised = exc.code == 503
     assert raised
     assert len(fake.scripts) == 1  # only the resolution leg; no guest forward
+    assert fake.scripts[0].rstrip().endswith("$vmTarget")
 
 
 def test_concurrent_stop_single_shutdown(monkeypatch):

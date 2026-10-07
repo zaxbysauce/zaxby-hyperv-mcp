@@ -87,9 +87,12 @@ def capture_evidence(
 ) -> dict:
     """Screenshot + evidence metadata, optionally with a guest UIA tree.
 
-    Resolves the target once (name or GUID); the UIA leg addresses the guest
-    by the resolved GUID via run_guest_inner, and console.screenshot receives
-    the same GUID so the whole bundle acts on one identity.
+    Resolves the target once (name or GUID) — the ONLY resolve in this
+    module — and the UIA leg addresses the guest by that resolved GUID via
+    run_guest_inner. console.screenshot receives ONLY the GUID (no name):
+    it re-resolves the fresh name itself by GUID, so a rename between this
+    module's resolve and the screenshot can never fork the bundle's
+    identity (PRR-006), and the whole bundle acts on one identity.
 
     Returns {ok, image: <PIL.Image>, meta: <screenshot meta extended with
     ui_tree>} mirroring console.screenshot's (image, meta) tuple contract;
@@ -105,7 +108,9 @@ def capture_evidence(
             )
         tree_cred = cred
 
-    image, meta = console.screenshot(cfg, ref.name, width, height, save_path, vm_id=ref.id)
+    image, meta = console.screenshot(
+        cfg, width=width, height=height, save_path=save_path, vm_id=ref.id
+    )
     ui: dict[str, Any] = {"requested": ui_tree}
     if tree_cred is not None:
         try:

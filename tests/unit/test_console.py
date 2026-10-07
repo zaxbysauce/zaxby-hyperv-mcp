@@ -193,6 +193,22 @@ def test_console_input_denied_by_default(monkeypatch):
     assert called.scripts == []
 
 
+def test_mouse_move_requires_x_and_y(monkeypatch):
+    """PRR-014: x/y are semantically required — omission must raise before any
+    policy check or spawn; it must never mean a silent SetAbsolutePosition(0,0)."""
+    fake = FakePS([])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    unrestricted = Config(unrestricted=True)
+    for kwargs in ({}, {"x": 5}, {"y": 5}):
+        with pytest.raises(ValueError, match="x and y are required"):
+            console.mouse_move(unrestricted, "vm1", **kwargs)
+    # the check precedes policy: a DENIED config still reports the invalid
+    # call (no spawn either way)
+    with pytest.raises(ValueError, match="x and y are required"):
+        console.mouse_move(Config(), "vm1")
+    assert fake.scripts == []
+
+
 def test_console_input_allowed_when_enabled(monkeypatch, unrestricted):
     fake = FakePS()
     monkeypatch.setattr(pswindows, "run_ps", fake)
@@ -273,14 +289,16 @@ def test_type_scancodes_rejects_out_of_range(unrestricted):
 
 
 def test_type_scancodes_chunks_at_64(monkeypatch, unrestricted):
-    fake = FakePS([pswindows.PSResult(stdout="RC=1 CHUNK=x", returncode=0)] * 3)
+    fake = FakePS([pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0)]
+                  + [pswindows.PSResult(stdout="RC=1 CHUNK=x", returncode=0)] * 3)
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = console.type_scancodes(unrestricted, "vm1", [0x39, 0xB9] * 96)
     assert out["chunks"] == 3 and out["scancodes_sent"] == 192
 
 
 def test_press_key_sends_make_break_via_keyboard_association(monkeypatch, unrestricted):
-    fake = FakePS([pswindows.PSResult(stdout="RC=1 CHUNK=1/1", returncode=0)])
+    fake = FakePS([pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
+        pswindows.PSResult(stdout="RC=1 CHUNK=1/1", returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     console.press_key(unrestricted, "vm1", "enter")
     script = fake.scripts[-1]
@@ -517,3 +535,67 @@ def test_click_at_origin_skips_positioning(monkeypatch, unrestricted):
     script = fake.scripts[-1]
     assert "SetAbsolutePosition" not in script
     assert "ClickButton" in script
+
+
+# ---------------------------------------------------------------------------
+# issue #8 audit attribution: every dict-returning op carries the resolved
+# VM display name (PRR-004/005) so by-id tool calls can adopt it
+# ---------------------------------------------------------------------------
+
+def test_console_ops_report_resolved_vm_name(monkeypatch, unrestricted):
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+
+    def fresh():
+        nonlocal fake
+        fake = FakePS()
+        monkeypatch.setattr(pswindows, "run_ps", fake)
+
+    fresh()
+    assert console.press_key(unrestricted, "vm1", "enter")["vm_name"] == "vm1"
+    fresh()
+    assert console.key_combo(unrestricted, "vm1", ["ctrl", "a"])["vm_name"] == "vm1"
+    fresh()
+    assert console.type_scancodes(unrestricted, "vm1", [0x1C])["vm_name"] == "vm1"
+    fresh()
+    assert console.type_text(unrestricted, "vm1", "hi")["vm_name"] == "vm1"
+    fresh()
+    out = console.mouse_move(unrestricted, "vm1", 5, 5)
+    assert out["vm_name"] == "vm1" and out["head_x"] == 5 and out["head_y"] == 5
+    fresh()
+    assert console.click(unrestricted, "vm1", 0, 0)["vm_name"] == "vm1"
+    fresh()
+    assert console.mouse_button(unrestricted, "vm1", 1, True)["vm_name"] == "vm1"
+    fresh()
+    assert console.scroll(unrestricted, "vm1", 1)["vm_name"] == "vm1"
+    fresh()
+    assert console.get_display_info(unrestricted, "vm1")["vm_name"] == "vm1"
+    fresh()
+    deadline = pswindows.PSResult(stdout="STOP=deadline POLLS=1 HASH=abc", returncode=0)
+    fake.responses = [
+        pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
+        deadline,
+    ]
+    out = console.wait_frame_change(unrestricted, "vm1")
+    assert out["vm_name"] == "vm1"
+    fresh()
+    out = console.capture_sequence(unrestricted, "vm1", count=1)
+    assert out["vm_name"] == "vm1"
+    # screenshot's metadata sidecar carries it too (pre-existing)
+    fresh()
+    _, meta = console.screenshot(unrestricted, "vm1")
+    assert meta["vm_name"] == "vm1"
+
+
+def test_console_by_id_reports_resolved_name(monkeypatch, unrestricted):
+    """By-id resolution answers with the VM's NAME ($vm.Name); it must reach
+    every result so by-id audit rows adopt the real display name."""
+    name = "Resolved By Id"
+    fake = FakePS([
+        pswindows.PSResult(stdout=name, returncode=0),  # by-id resolve leg
+        pswindows.PSResult(stdout="RC=1 CHUNK=1/1", returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    guid = "e953c649-dcab-438d-9a54-3af74a82b624"
+    out = console.press_key(unrestricted, vm_id=guid, key="enter")
+    assert out["vm_name"] == name

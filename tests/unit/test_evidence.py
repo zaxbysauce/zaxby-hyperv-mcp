@@ -48,7 +48,7 @@ VM_GUID = "e953c649-1234-5678-9abc-def012345678"
 def fake_screenshot(monkeypatch):
     captured = {}
 
-    def _capture(cfg, vm_name, width=1024, height=768, save_path="", vm_id=""):
+    def _capture(cfg, vm_name="", width=1024, height=768, save_path="", vm_id=""):
         captured["vm_name"] = vm_name
         captured["vm_id"] = vm_id
         return FakeImage(), _base_meta()
@@ -83,16 +83,47 @@ def test_screenshot_only_path_needs_no_credentials(fake_screenshot):
     assert meta["width"] == 1024 and meta["height"] == 768
     assert len(meta["frame_hash"]) == 64
     assert meta["ui_tree"] == {"requested": False}
-    # issue #8: the screenshot leg receives the SAME resolved GUID the UIA
-    # leg would use — one identity for the whole bundle.
+    # issue #8 + PRR-006: the screenshot leg receives ONLY the resolved GUID
+    # — no name argument. console.screenshot resolves the fresh name itself
+    # by GUID, so evidence's own resolve is the bundle's single resolve and
+    # a rename between legs can never fork the identity.
     assert fake_screenshot.captured["vm_id"] == VM_GUID
-    assert fake_screenshot.captured["vm_name"] == "test-vm"
+    assert fake_screenshot.captured["vm_name"] == ""
 
 
 def test_ui_tree_without_credentials_raises(fake_screenshot):
     cfg = Config(unrestricted=True)
     with pytest.raises(CredentialError, match="UI element tree"):
         evidence.capture_evidence(cfg, "test-vm", ui_tree=True, cred=None)
+
+
+def test_single_resolve_contract_guid_only_screenshot_leg(monkeypatch):
+    """PRR-006: capture_evidence resolves exactly once and hands
+    console.screenshot ONLY the GUID — the screenshot leg re-resolves the
+    fresh name itself, so a rename between the two can never make a valid
+    capture fail as invalid (double-resolve) or fork the bundle identity."""
+    cfg = Config(unrestricted=True)
+    calls: list[str] = []
+    captured: dict = {}
+
+    def fake_run(script, **kw):
+        calls.append(script)
+        return pswindows.PSResult(stdout=VM_GUID, returncode=0)
+
+    def _capture(cfg_, vm_name="", width=1024, height=768, save_path="", vm_id=""):
+        captured["vm_name"] = vm_name
+        captured["vm_id"] = vm_id
+        return FakeImage(), _base_meta()
+
+    monkeypatch.setattr(pswindows, "run_ps", fake_run)
+    monkeypatch.setattr(evidence.console, "screenshot", _capture)
+    out = evidence.capture_evidence(cfg, "test-vm")
+    assert out["ok"] is True
+    assert captured["vm_name"] == ""
+    assert captured["vm_id"] == VM_GUID
+    # With the screenshot leg faked, the ONLY PowerShell leg in the bundle
+    # is evidence's own resolve — exactly one resolution, no second leg.
+    assert len(calls) == 1 and calls[0].rstrip().endswith("$vmTarget")
 
 
 def test_ui_tree_with_credentials_merges_tree(fake_screenshot, monkeypatch):

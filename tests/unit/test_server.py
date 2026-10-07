@@ -141,6 +141,20 @@ def test_inline_credential_mode_exposes_params(tmp_path, fresh_server):
     assert "password" not in props
 
 
+def test_tpm_secureboot_enabled_required_in_schema(fresh_server):
+    """PRR-001: `enabled` must be semantically required — omission+confirm must
+    never silently DISABLE TPM/SecureBoot. The keyword-only no-default param
+    makes FastMCP publish required:["enabled"] (probe-verified)."""
+    mod = fresh_server({})
+    schemas = _schemas(mod)
+    for name in ("hyperv_vm_tpm_set", "hyperv_vm_secureboot_set"):
+        required = schemas[name].get("required", [])
+        assert "enabled" in required, f"{name}: enabled must be schema-required"
+        # defaulted siblings stay optional
+        assert "confirm" not in required
+    assert "template" not in schemas["hyperv_vm_secureboot_set"].get("required", [])
+
+
 def test_destructive_tools_have_confirm_param(fresh_server):
     mod = fresh_server({})
     schemas = _schemas(mod)
@@ -206,7 +220,7 @@ def test_check_env_exit_zero(fresh_server, capsys):
     rc = mod.main(["--check-env"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "hyperv-mcp 0.3.0" in out
+    assert "hyperv-mcp 0.4.0" in out
     assert "DENY ALL" in out
 
 
@@ -383,7 +397,7 @@ def test_version_flag(fresh_server, capsys):
     with pytest.raises(SystemExit) as exc:
         mod.main(["--version"])
     assert exc.value.code == 0
-    assert "0.3.0" in capsys.readouterr().out
+    assert "0.4.0" in capsys.readouterr().out
 
 
 def test_mcp_compat_import_bootstraps(fresh_server):
@@ -440,3 +454,43 @@ def test_credential_error_envelope_at_tool_layer(fresh_server, tmp_path):
     envelope = _json.loads(text_blocks[0].text)
     assert envelope["ok"] is False
     assert envelope["error_class"] == "credential"
+
+
+def _envelope_from_call(mcp, tool: str, args: dict) -> dict:
+    result = asyncio.run(mcp.call_tool(tool, args))
+    content = result[0] if isinstance(result, tuple) else result
+    text_blocks = [c for c in content if getattr(c, "type", "") == "text"]
+    assert text_blocks, f"expected a text envelope for {tool}"
+    return json.loads(text_blocks[0].text)
+
+
+@pytest.fixture()
+def unrestricted_server(tmp_path, fresh_server):
+    doc = {"allowed_vm_patterns": ["test-*"], "unrestricted": True}
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mod = fresh_server({"HYPERV_MCP_CONFIG": str(p)})
+    return mod.get_mcp()
+
+
+def test_media_error_envelope_maps_invalid(unrestricted_server, tmp_path):
+    """PRR-020: MediaError subclasses RuntimeError; without the explicit
+    clause a missing-ISO fault (caller/vm-state, not transport) is mislabeled
+    "transport" by the catch-all. Drives the real registered tool through
+    mcp.call_tool; the fault fires before any PowerShell leg."""
+    envelope = _envelope_from_call(
+        unrestricted_server, "hyperv_vm_media_attach",
+        {"vm_name": "test-vm", "iso_path": str(tmp_path / "nope.iso")},
+    )
+    assert envelope["ok"] is False
+    assert envelope["error_class"] == "invalid"
+    assert "nope.iso" in envelope["error"]
+
+
+def test_mouse_move_omission_is_invalid_envelope(unrestricted_server):
+    """PRR-014: omitting x/y on hyperv_console_mouse_move must surface as
+    {ok:false, error_class:"invalid"} — it must never mean (0,0)."""
+    envelope = _envelope_from_call(unrestricted_server, "hyperv_console_mouse_move", {})
+    assert envelope["ok"] is False
+    assert envelope["error_class"] == "invalid"
+    assert "x and y are required" in envelope["error"]

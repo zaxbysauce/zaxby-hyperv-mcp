@@ -22,6 +22,7 @@ SRC = Path(__file__).resolve().parents[2] / "src" / "hyperv_mcp"
 ALLOWED_LOCK_KEYS = {"vm_create"}
 
 
+
 def _module_files():
     return sorted(SRC.glob("*.py"))
 
@@ -30,9 +31,21 @@ def _tree(path: Path):
     return ast.parse(path.read_text(encoding="utf-8"))
 
 
+def _build_parents(tree):
+    # Every node -> its immediate parent. The comprehension must iterate the
+    # PARENT's children (ast.iter_child_nodes(parent)), not the module's —
+    # the original form keyed only module-level children, so every nested
+    # call resolved to "<module>" and the vm_create exemption was dead.
+    return {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+
 def _func_name_of(node, parents):
     scope = node
-    while scope is not None and not isinstance(scope, ast.FunctionDef):
+    while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
         scope = parents.get(scope)
     return scope.name if scope is not None else "<module>"
 
@@ -46,22 +59,56 @@ def _call_name(node):
     return None
 
 
+# vm_lock first-argument expressions that ARE resolved identities (or are
+# statically verifiable GUID keys). Anything else must sit inside a function
+# listed in ALLOWED_LOCK_KEYS.
+_ALLOWED_KEY_EXPRS = ("ref.id", "vm_id", "entry", "ctx")
+
+
+def _lock_key_source(arg) -> str | None:
+    """Render the vm_lock key expression's identity-bearing source, or None
+    when the expression is not a simple identity form we can static-check."""
+    if isinstance(arg, ast.Attribute) and isinstance(arg.value, ast.Name):
+        return f"{arg.value.id}.{arg.attr}"
+    if isinstance(arg, ast.Name):
+        return arg.id
+    if isinstance(arg, ast.Subscript) and isinstance(arg.slice, ast.Constant):
+        return f"{ast.unparse(arg.value)}[{arg.slice.value!r}]"
+    return None
+
+
 @pytest.mark.parametrize("path", _module_files(), ids=lambda p: p.name)
 def test_no_name_keyed_vm_locks(path):
-    """vm_lock must never be keyed on a caller-supplied VM name."""
+    """vm_lock must never be keyed on a caller-supplied VM name.
+
+    The predicate is GUID-shape-based, not spelling-based: any first argument
+    that is not a recognized identity expression (ref.id / vm_id /
+    entry["vm_id"] / ctx["vm_id"]) must sit inside an explicitly allowlisted
+    function (vm_create locks the not-yet-existing VM's name).
+    """
     tree = _tree(path)
-    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(tree)}
+    parents = _build_parents(tree)
     bad = []
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and _call_name(node) == "vm_lock"):
             continue
         if not node.args:
             continue
-        arg = node.args[0]
-        key = arg.id if isinstance(arg, ast.Name) else None
-        if key == "vm_name" and _func_name_of(node, parents) not in ALLOWED_LOCK_KEYS:
-            bad.append(_func_name_of(node, parents))
-    assert not bad, f"{path.name}: name-keyed vm_lock calls: {bad}"
+        source = _lock_key_source(node.args[0])
+        if source is not None and any(
+            source == allowed or source.startswith(allowed + "[")
+            for allowed in _ALLOWED_KEY_EXPRS
+        ):
+            # A recognized resolved-identity expression (ref.id / vm_id /
+            # entry["vm_id"] / ctx["vm_id"]).
+            continue
+        # Anything else — a plain local (e.g. vm_create's `name`) or an
+        # unrecognized expression — is a name-keyed lock unless this exact
+        # function is allowlisted.
+        func = _func_name_of(node, parents)
+        if func not in ALLOWED_LOCK_KEYS:
+            bad.append(f"{func}({ast.unparse(node.args[0])})")
+    assert not bad, f"{path.name}: non-identity-keyed vm_lock calls: {bad}"
 
 
 def test_guest_registry_legs_never_address_by_stored_name():
@@ -87,9 +134,10 @@ def test_psdirect_vm_target_runs_only_inside_vmident():
     callers = {}
     for path in _module_files():
         tree = _tree(path)
+        parents = _build_parents(tree)
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and _call_name(node) in ("psdirect_vm_target", "psdirect_vm_target_id"):
-                callers.setdefault(path.name, set()).add(_func_name_of(node, {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}))
+                callers.setdefault(path.name, set()).add(_func_name_of(node, parents))
     allowed = {"guestexec.py", "vmident.py"}
     stray = {mod: fns for mod, fns in callers.items() if mod not in allowed}
     assert not stray, f"name resolver called outside guestexec/vmident: {stray}"

@@ -60,6 +60,10 @@ def resolve(cfg: Config, vm_name: str = "", vm_id: str = "") -> VMRef:
             # spawn even though the GUID alone would identify the VM.
             _checked_caller_name(vm_name)
             policy.vm_allowed(cfg, vm_name)
+        # Normalize caller whitespace BEFORE validation: a copied GUID with a
+        # trailing newline would validate under a loose anchor and then split
+        # the vm_lock key space (review PRR-012).
+        vm_id = vm_id.strip()
         guestexec.validate_vm_guid(vm_id)
         result = pswindows.run_ps(
             guestexec.psdirect_vm_target_id(vm_id), timeout_s=60
@@ -83,4 +87,8 @@ def resolve(cfg: Config, vm_name: str = "", vm_id: str = "") -> VMRef:
     guid = result.stdout.strip()
     if not guid:
         raise ValueError(f"VM '{vm_name}' resolved to an empty Id")
+    # The by-name GUID is host-derived but still passes the same shape gate as
+    # caller-supplied ids before it reaches any generated script or the
+    # console %GUID% templating (review PRR-028).
+    guestexec.validate_vm_guid(guid)
     return VMRef(id=guid.lower(), name=vm_name)

@@ -341,13 +341,18 @@ def job_start(
         raise ValueError("guest credentials are required")
 
     job_id = uuid.uuid4().hex[:12]
+    # Identity resolution BEFORE the slot reservation (PRR-008): a rejected
+    # resolve (unknown GUID, denied name) must not evict stopped-job history
+    # or null stored credentials — the reservation's eviction side effects
+    # are only ever paid by starts that pass identity. The reservation still
+    # precedes the guest start leg, preserving the pinned behavior that a
+    # registry-full start is rejected before any guest work.
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     _reserve_slot(job_id)
     try:
         # Wrapper building and pid parsing stay inside the release window so
         # no exception between reservation and registration can strand an
-        # in-flight placeholder (review round 3 question, adopted); the
-        # identity resolution rides the same window for the same reason.
-        ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+        # in-flight placeholder (review round 3 question, adopted).
         wrapper = _wrapper_script(command, args, cwd)
         outcome = run_guest_inner(
             cfg, ref.id, _start_script(job_id, wrapper), cred, timeout_ms=timeout_ms,
@@ -404,7 +409,10 @@ def job_start(
 def job_status(cfg: Config, job_id: str) -> dict:
     entry = _lookup(job_id)
     if entry.get("stopped"):
-        return {"ok": True, "job_id": job_id, "status": "stopped", "pid": entry["pid"]}
+        return {
+            "ok": True, "job_id": job_id, "vm_name": entry["vm_name"],
+            "status": "stopped", "pid": entry["pid"],
+        }
     cred = entry["cred"]
     if cred is None:
         raise RuntimeError(f"job {job_id} has no stored credentials (stopped or evicted)")
@@ -416,6 +424,7 @@ def job_status(cfg: Config, job_id: str) -> dict:
     return {
         "ok": True,
         "job_id": job_id,
+        "vm_name": entry["vm_name"],
         "pid": entry["pid"],
         "status": str(outcome.get("status", "unknown")),
         "process_name": outcome.get("process_name"),
@@ -430,7 +439,10 @@ def job_output(cfg: Config, job_id: str, *, tail_bytes: int = 65536) -> dict:
     cred = entry["cred"]
     if cred is None:
         raise RuntimeError(f"job {job_id} has no stored credentials (stopped or evicted)")
-    result: dict[str, Any] = {"ok": True, "job_id": job_id, "pid": entry["pid"], "tail_bytes": tail_bytes}
+    result: dict[str, Any] = {
+        "ok": True, "job_id": job_id, "vm_name": entry["vm_name"],
+        "pid": entry["pid"], "tail_bytes": tail_bytes,
+    }
     for key, path_key in (("stdout", "out_path"), ("stderr", "err_path")):
         path = entry[path_key]
         if not path:
@@ -475,7 +487,8 @@ def job_stop(cfg: Config, job_id: str) -> dict:
         # documented repeat-contract constants (this call observed nothing
         # new), not fresh observations.
         return {
-            "ok": True, "job_id": job_id, "pid": entry["pid"],
+            "ok": True, "job_id": job_id, "vm_name": entry["vm_name"],
+            "pid": entry["pid"],
             "stopped": True, "alive_pids": [], "job_dir_removed": None,
             "pid_reused": False, "note": "was already stopped",
         }
@@ -493,7 +506,8 @@ def job_stop(cfg: Config, job_id: str) -> dict:
         # so the 7-key contract holds on the error path too (PRR-004); the
         # entry stays stoppable and the credential retained for a retry.
         return {
-            "ok": False, "job_id": job_id, "pid": entry["pid"],
+            "ok": False, "job_id": job_id, "vm_name": entry["vm_name"],
+            "pid": entry["pid"],
             "stopped": False, "alive_pids": [], "job_dir_removed": None,
             "pid_reused": False,
             "error": pswindows.redact(str(exc)), "error_class": "transport",
@@ -508,7 +522,8 @@ def job_stop(cfg: Config, job_id: str) -> dict:
         # aftermath (PRR-016): report the same full-key error envelope with
         # error_class "invalid"; the entry stays stoppable for a retry.
         return {
-            "ok": False, "job_id": job_id, "pid": entry["pid"],
+            "ok": False, "job_id": job_id, "vm_name": entry["vm_name"],
+            "pid": entry["pid"],
             "stopped": False, "alive_pids": [], "job_dir_removed": None,
             "pid_reused": False,
             "error": "guest stop payload carried a non-numeric alive_pids member",
@@ -527,6 +542,7 @@ def job_stop(cfg: Config, job_id: str) -> dict:
     return {
         "ok": stopped,
         "job_id": job_id,
+        "vm_name": entry["vm_name"],
         "pid": entry["pid"],
         "stopped": stopped,
         "alive_pids": alive_pids,

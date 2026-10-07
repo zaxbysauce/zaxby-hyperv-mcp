@@ -478,11 +478,11 @@ def test_parse_media_firmware_and_security(monkeypatch, parsed_ps):
         lambda: media.vm_firmware_get(UNRESTRICTED, "vm1"),
         lambda: media.vm_firmware_set_boot_order(UNRESTRICTED, "vm1", "Drive", True),
         lambda: media.vm_firmware_set_boot_order(UNRESTRICTED, "vm1", "Network", True),
-        lambda: media.vm_tpm_set(UNRESTRICTED, "vm1", True, True),
-        lambda: media.vm_tpm_set(UNRESTRICTED, "vm1", False, True),
-        lambda: media.vm_secureboot_set(UNRESTRICTED, "vm1", True, "", True),
-        lambda: media.vm_secureboot_set(UNRESTRICTED, "vm1", False, "", True),
-        lambda: media.vm_secureboot_set(UNRESTRICTED, "vm1", True, "MicrosoftWindows", True),
+        lambda: media.vm_tpm_set(UNRESTRICTED, "vm1", enabled=True, confirm=True),
+        lambda: media.vm_tpm_set(UNRESTRICTED, "vm1", enabled=False, confirm=True),
+        lambda: media.vm_secureboot_set(UNRESTRICTED, "vm1", enabled=True, template="", confirm=True),
+        lambda: media.vm_secureboot_set(UNRESTRICTED, "vm1", enabled=False, template="", confirm=True),
+        lambda: media.vm_secureboot_set(UNRESTRICTED, "vm1", enabled=True, template="MicrosoftWindows", confirm=True),
     ):
         rec = Recorder()
         monkeypatch.setattr(pswindows, "run_ps", rec)

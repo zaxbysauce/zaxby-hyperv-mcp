@@ -230,10 +230,10 @@ $snaps = (Get-VMSnapshot -VM $vm -ErrorAction Stop | Measure-Object).Count
 }} | ConvertTo-Json -Compress -Depth 4
 """
     result = pswindows.run_ps(script, timeout_s=60)
-    pswindows.check_result(result, f"hyperv_get_vm_info({vm_name})")
+    pswindows.check_result(result, f"hyperv_get_vm_info({vm_name or vm_id})")
     rows = _parse_json_objects(result, "get_vm_info")
     if not rows:
-        raise RuntimeError(f"hyperv_get_vm_info({vm_name}): no data returned")
+        raise RuntimeError(f"hyperv_get_vm_info({vm_name or vm_id}): no data returned")
     return _add_legacy_aliases(rows[0], _INFO_KEY_ALIASES)
 
 
@@ -248,7 +248,7 @@ if ($initial -ne 'Running') {{ Start-VM -VM $vm -ErrorAction Stop }}
 """
     with vmlocks.vm_lock(ref.id):
         result = pswindows.run_ps(script, timeout_s=60)
-        pswindows.check_result(result, f"hyperv_start_vm({vm_name})")
+        pswindows.check_result(result, f"hyperv_start_vm({vm_name or vm_id})")
         rows = _parse_json_objects(result, "start_vm")
         initial = rows[0].get("initial_state", "") if rows else ""
         final = _wait_for_state(cfg, ref, ["Running"], timeout_s=90)
@@ -274,7 +274,7 @@ def stop_vm(
 ) -> dict:
     if method not in _STOP_SPECS:
         raise ValueError("method must be one of: shutdown, shutdown-force, save, turnoff")
-    _require_destructive(cfg, "stop", confirm, f"stop VM '{vm_name}' ({method})")
+    _require_destructive(cfg, "stop", confirm, f"stop VM '{vm_name or vm_id}' ({method})")
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     flags, wanted, _ = _STOP_SPECS[method]
     script = f"""
@@ -288,7 +288,7 @@ if ($initial -notin ({", ".join(f"'{w}'" for w in wanted)})) {{
 """
     with vmlocks.vm_lock(ref.id):
         result = pswindows.run_ps(script, timeout_s=60)
-        pswindows.check_result(result, f"hyperv_stop_vm({vm_name}, {method})")
+        pswindows.check_result(result, f"hyperv_stop_vm({vm_name or vm_id}, {method})")
         rows = _parse_json_objects(result, "stop_vm")
         initial = rows[0].get("initial_state", "") if rows else ""
         final = _wait_for_state(cfg, ref, wanted, timeout_s=300 if method == "shutdown" else 120)
@@ -301,7 +301,7 @@ if ($initial -notin ({", ".join(f"'{w}'" for w in wanted)})) {{
 
 
 def reset_vm(cfg: Config, vm_name: str = "", confirm: bool = False, vm_id: str = "") -> dict:
-    _require_destructive(cfg, "reset", confirm, f"hard reset VM '{vm_name}'")
+    _require_destructive(cfg, "reset", confirm, f"hard reset VM '{vm_name or vm_id}'")
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     script = f"""
 {guestexec.vm_target_preamble(ref.id)}
@@ -311,7 +311,7 @@ Start-VM -VM $vm -ErrorAction Stop
 """
     with vmlocks.vm_lock(ref.id):
         result = pswindows.run_ps(script, timeout_s=60)
-        pswindows.check_result(result, f"hyperv_reset_vm({vm_name})")
+        pswindows.check_result(result, f"hyperv_reset_vm({vm_name or vm_id})")
         final = _wait_for_state(cfg, ref, ["Running"], timeout_s=90)
         return {"status": "reset", "vm_name": ref.name, "state": final}
 
@@ -333,7 +333,7 @@ $vm = Get-VM -Id $vmTarget -ErrorAction Stop
 Checkpoint-VM -VM $vm -SnapshotName {cn} -ErrorAction Stop
 """
         result = pswindows.run_ps(script, timeout_s=300)
-        pswindows.check_result(result, f"hyperv_checkpoint_create({vm_name})")
+        pswindows.check_result(result, f"hyperv_checkpoint_create({vm_name or vm_id})")
         return {"status": "created", "vm_name": ref.name, "checkpoint_name": checkpoint_name}
 
 
@@ -349,7 +349,7 @@ Get-VMSnapshot -VM $vm -ErrorAction Stop |
   ConvertTo-Json -Compress -Depth 2
 """
     result = pswindows.run_ps(script, timeout_s=60)
-    pswindows.check_result(result, f"hyperv_checkpoint_list({vm_name})")
+    pswindows.check_result(result, f"hyperv_checkpoint_list({vm_name or vm_id})")
     return [_add_legacy_aliases(row, _SNAPSHOT_KEY_ALIASES) for row in _parse_json_objects(result, "checkpoint_list")]
 
 
@@ -357,7 +357,7 @@ def checkpoint_restore(
     cfg: Config, vm_name: str = "", checkpoint_name: str = "", confirm: bool = False, vm_id: str = ""
 ) -> dict:
     _checked_label(checkpoint_name, "checkpoint_name")
-    _require_destructive(cfg, "checkpoint_restore", confirm, f"restore VM '{vm_name}' to '{checkpoint_name}'")
+    _require_destructive(cfg, "checkpoint_restore", confirm, f"restore VM '{vm_name or vm_id}' to '{checkpoint_name}'")
     cn = pswindows.ps_name(checkpoint_name)
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     with vmlocks.vm_lock(ref.id):
@@ -366,7 +366,7 @@ def checkpoint_restore(
 Restore-VMSnapshot -Name {cn} -VM (Get-VM -Id $vmTarget -ErrorAction Stop) -Confirm:$false -ErrorAction Stop
 """
         result = pswindows.run_ps(script, timeout_s=300)
-        pswindows.check_result(result, f"hyperv_checkpoint_restore({vm_name}, {checkpoint_name})")
+        pswindows.check_result(result, f"hyperv_checkpoint_restore({vm_name or vm_id}, {checkpoint_name})")
         # Restoring a checkpoint whose subtree has descendants merges their
         # differencing disks; the VM can stay in transitional states for many
         # minutes (observed: >120s on a 10-deep tree). Wait generously.
@@ -389,7 +389,7 @@ def checkpoint_remove(
     vm_id: str = "",
 ) -> dict:
     _checked_label(checkpoint_name, "checkpoint_name")
-    detail = f"remove checkpoint '{checkpoint_name}' on '{vm_name}'" + (" (subtree)" if include_subtree else "")
+    detail = f"remove checkpoint '{checkpoint_name}' on '{vm_name or vm_id}'" + (" (subtree)" if include_subtree else "")
     _require_destructive(cfg, "checkpoint_remove", confirm, detail)
     cn = pswindows.ps_name(checkpoint_name)
     subtree = "-IncludeAllChildSnapshots" if include_subtree else ""
@@ -400,7 +400,7 @@ def checkpoint_remove(
 Remove-VMSnapshot -Name {cn} -VM (Get-VM -Id $vmTarget -ErrorAction Stop) {subtree} -Confirm:$false -ErrorAction Stop
 """
         result = pswindows.run_ps(script, timeout_s=300)
-        pswindows.check_result(result, f"hyperv_checkpoint_remove({vm_name})")
+        pswindows.check_result(result, f"hyperv_checkpoint_remove({vm_name or vm_id})")
         return {"status": "removed", "vm_name": ref.name, "checkpoint_name": checkpoint_name}
 
 
@@ -460,7 +460,7 @@ def configure_kdnet(
         raise ValueError("guest credentials are required")
     _require_destructive(
         cfg, "kd_reboot", confirm,
-        f"configure KDNET on '{vm_name}'" + (" and reboot it" if reboot else ""),
+        f"configure KDNET on '{vm_name or vm_id}'" + (" and reboot it" if reboot else ""),
     )
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     eip = pswindows.ps_quote(host_ip)
@@ -484,7 +484,7 @@ $out | ConvertTo-Json -Compress
 """
     with vmlocks.vm_lock(ref.id):
         result = pswindows.run_ps(script.strip(), timeout_s=60, stdin_b64=pswindows.utf8_b64(cred.password))
-        pswindows.check_result(result, f"hyperv_configure_kdnet({vm_name})")
+        pswindows.check_result(result, f"hyperv_configure_kdnet({vm_name or vm_id})")
         bcd = json.loads(result.stdout)
 
         rebooting = False
@@ -497,7 +497,7 @@ Invoke-Command -VMId $vmTarget -Credential $cred -ScriptBlock {{ & 'shutdown.exe
             rr = pswindows.run_ps(
                 reboot_script.strip(), timeout_s=30, stdin_b64=pswindows.utf8_b64(cred.password)
             )
-            pswindows.check_result(rr, f"hyperv_configure_kdnet reboot({vm_name})")
+            pswindows.check_result(rr, f"hyperv_configure_kdnet reboot({vm_name or vm_id})")
             rebooting = True
 
         return {
@@ -524,14 +524,23 @@ def configure_kdcom(
 ) -> dict:
     if com_port not in (1, 2):
         raise ValueError("com_port must be 1 or 2")
-    if not pipe_name:
-        safe = re.sub(r"[^A-Za-z0-9._\-]", "_", vm_name)
-        pipe_name = f"\\\\.\\pipe\\kd_{safe}"
-    _validate_pipe_name(pipe_name)
+    if pipe_name:
+        # Caller-supplied pipe is validated BEFORE any gate or PowerShell
+        # spawn; the per-VM DEFAULT is derived (and validated) after resolve
+        # below, because it comes from the resolved name (PRR-007).
+        _validate_pipe_name(pipe_name)
     if cred is None:
         raise ValueError("guest credentials are required")
-    _require_destructive(cfg, "kd_reboot", confirm, f"configure KDCOM on '{vm_name}'" + (" and reboot it" if reboot else ""))
+    _require_destructive(cfg, "kd_reboot", confirm, f"configure KDCOM on '{vm_name or vm_id}'" + (" and reboot it" if reboot else ""))
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    # Default pipe derives from the RESOLVED name so a by-id call still gets
+    # a per-VM pipe: the caller name is empty there, and deriving from it
+    # handed every by-id VM the same bare \\.\pipe\kd_ (cross-VM kernel-
+    # debug pipe collision, PRR-007).
+    if not pipe_name:
+        safe = re.sub(r"[^A-Za-z0-9._\-]", "_", ref.name)
+        pipe_name = f"\\\\.\\pipe\\kd_{safe}"
+    _validate_pipe_name(pipe_name)
 
     pn = pswindows.ps_name(pipe_name)
     cred_prefix = psdirect_prefix(cred)
@@ -558,9 +567,9 @@ $out | ConvertTo-Json -Compress
 """
     with vmlocks.vm_lock(ref.id):
         r1 = pswindows.run_ps(step1, timeout_s=60)
-        pswindows.check_result(r1, f"hyperv_configure_kdcom Set-VMComPort({vm_name})")
+        pswindows.check_result(r1, f"hyperv_configure_kdcom Set-VMComPort({vm_name or vm_id})")
         r2 = pswindows.run_ps(step2.strip(), timeout_s=60, stdin_b64=pswindows.utf8_b64(cred.password))
-        pswindows.check_result(r2, f"hyperv_configure_kdcom bcdedit({vm_name})")
+        pswindows.check_result(r2, f"hyperv_configure_kdcom bcdedit({vm_name or vm_id})")
         bcd = json.loads(r2.stdout)
 
         rebooting = False
@@ -573,7 +582,7 @@ Invoke-Command -VMId $vmTarget -Credential $cred -ScriptBlock {{ & 'shutdown.exe
             rr = pswindows.run_ps(
                 reboot_script.strip(), timeout_s=30, stdin_b64=pswindows.utf8_b64(cred.password)
             )
-            pswindows.check_result(rr, f"hyperv_configure_kdcom reboot({vm_name})")
+            pswindows.check_result(rr, f"hyperv_configure_kdcom reboot({vm_name or vm_id})")
             rebooting = True
 
         return {

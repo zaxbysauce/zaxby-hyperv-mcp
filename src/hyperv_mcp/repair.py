@@ -1,7 +1,8 @@
 """Narrow guest-access repair with a dry run by default (AC9).
 
-Step 1 reuses diagnostics' GUID-native report builder (_diagnose_report —
-the same legs diagnose_vm_access runs after its own resolve, no copy and no
+Step 1 reuses diagnostics' GUID-native report builder (diagnose_report —
+the no-re-resolve entry point that diagnose_vm_access wraps after its own
+resolve, no copy and no
 second name resolution). Step 2 maps findings
 to narrow fix proposals. Only explicit apply=True with the destructive
 confirm leg satisfied (category guest_repair) performs any guest mutation;
@@ -208,7 +209,7 @@ def repair_guest_access(
             f"apply guest access repairs on '{ref.name}'",
         )
 
-    report = diagnostics._diagnose_report(cfg, ref.id, ref.name, cred, 90000)
+    report = diagnostics.diagnose_report(cfg, ref.id, ref.name, cred, 90000)
     items = _plan_items(report)
 
     result: dict[str, Any] = {
@@ -248,7 +249,7 @@ def repair_guest_access(
                 change["error"] = pswindows.redact(str(exc))
         changes.append(change)
 
-    verify_report = diagnostics._diagnose_report(cfg, ref.id, ref.name, cred, 90000)
+    verify_report = diagnostics.diagnose_report(cfg, ref.id, ref.name, cred, 90000)
     remaining = {f.get("id") for f in verify_report.get("findings") or []}
     for item, change in zip(items, changes, strict=True):
         if item["verify_finding"] in remaining:

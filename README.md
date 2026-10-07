@@ -263,7 +263,8 @@ claude mcp add hyperv -- hyperv-mcp
 ### VM identity: `vm_name` and `vm_id` (0.4.0)
 
 Every tool that takes `vm_name` also takes an optional `vm_id` (the VM's CIM
-GUID); exactly one of the two is required. VMs are resolved by GUID end to
+GUID); at least one of `vm_name`/`vm_id` is required (both may be given when
+they refer to the same VM). VMs are resolved by GUID end to
 end: operations lock on the resolved GUID (stable across renames),
 `hyperv_list_vms` and `hyperv_get_vm_info` report each VM's `id`, and a name
 that matches more than one VM fails closed with an error listing every
@@ -272,7 +273,9 @@ candidate as `name=guid` so the call can be retried with `vm_id`. When both
 the call is rejected as `invalid`. Policy (`allowed_vm_patterns`) applies to
 the caller-supplied name first, and to the name resolved from a `vm_id`
 before anything runs. `hyperv_vm_create` refuses a name that already exists
-(the in-script guard matches the resolver's notion of same-name).
+(the in-script guard matches the resolver's notion of same-name). TPM and
+Secure Boot changes require an explicit `enabled` argument (true or false) —
+omission is rejected rather than defaulting to a disable.
 
 ### VM Lifecycle
 
@@ -280,9 +283,9 @@ before anything runs. `hyperv_vm_create` refuses a name that already exists
 |------|-----------|---------|
 | `hyperv_list_vms` | — | `[{id, name, state, status, memory_mb, cpu_count, uptime_seconds}]` |
 | `hyperv_get_vm_info` | `vm_name` or `vm_id` | `{id, name, state, generation, memory_mb, cpu_count, checkpoint_count, com_ports, network_adapters, hard_drives, ...}` |
-| `hyperv_start_vm` | `vm_name` | `{status: started\|already_running, vm_name, state}` — waits for Running |
-| `hyperv_stop_vm` | `vm_name`, `method`, `confirm` | `{status, vm_name, method, state}` — waits for final state |
-| `hyperv_reset_vm` | `vm_name`, `confirm` | `{status, vm_name, state}` — waits for Running |
+| `hyperv_start_vm` | `vm_name` or `vm_id` | `{status: started\|already_running, vm_name, state}` — waits for Running |
+| `hyperv_stop_vm` | `vm_name` or `vm_id`, `method`, `confirm` | `{status, vm_name, method, state}` — waits for final state |
+| `hyperv_reset_vm` | `vm_name` or `vm_id`, `confirm` | `{status, vm_name, state}` — waits for Running |
 
 **`hyperv_stop_vm` methods:** `shutdown` (graceful via Integration Services,
 default), `shutdown-force` (forced), `save` (suspend to disk), `turnoff`
@@ -295,10 +298,10 @@ last observed state.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_checkpoint_create` | `vm_name`, `checkpoint_name?` | `{status, vm_name, checkpoint_name}` |
-| `hyperv_checkpoint_list` | `vm_name` | `[{name, type, created, parent_name}]` |
-| `hyperv_checkpoint_restore` | `vm_name`, `checkpoint_name`, `confirm` | `{status, vm_name, checkpoint_name, state, note}` |
-| `hyperv_checkpoint_remove` | `vm_name`, `checkpoint_name`, `include_subtree`, `confirm` | `{status, vm_name, checkpoint_name}` |
+| `hyperv_checkpoint_create` | `vm_name` or `vm_id`, `checkpoint_name?` | `{status, vm_name, checkpoint_name}` |
+| `hyperv_checkpoint_list` | `vm_name` or `vm_id` | `[{name, type, created, parent_name}]` |
+| `hyperv_checkpoint_restore` | `vm_name` or `vm_id`, `checkpoint_name`, `confirm` | `{status, vm_name, checkpoint_name, state, note}` |
+| `hyperv_checkpoint_remove` | `vm_name` or `vm_id`, `checkpoint_name`, `include_subtree`, `confirm` | `{status, vm_name, checkpoint_name}` |
 
 `checkpoint_name` auto-generates (`MCP-YYYYMMDD-HHMMSS`) only on **create**;
 restore/remove require it. Restore stops the VM (waits up to 600 s for
@@ -309,8 +312,8 @@ Off/Saved/Paused while any checkpoint merge completes) — call
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_configure_kdnet` | `vm_name`, `host_ip`, `port=50000`, `key?`, `reboot`, `confirm` | `{status, kernel_attach_string, key, bcdedit_output, rebooting, ...}` |
-| `hyperv_configure_kdcom` | `vm_name`, `pipe_name?`, `com_port=1`, `reboot`, `confirm` | `{status, kernel_attach_string, pipe_path, bcdedit_output, rebooting, ...}` |
+| `hyperv_configure_kdnet` | `vm_name` or `vm_id`, `host_ip`, `port=50000`, `key?`, `reboot`, `confirm` | `{status, kernel_attach_string, key, bcdedit_output, rebooting, ...}` |
+| `hyperv_configure_kdcom` | `vm_name` or `vm_id`, `pipe_name?`, `com_port=1`, `reboot`, `confirm` | `{status, kernel_attach_string, pipe_path, bcdedit_output, rebooting, ...}` |
 
 `host_ip` must be a valid IP; `key` must match kdnet hex-group format
 (auto-generated cryptographically if omitted — save it, you need it for
@@ -323,12 +326,12 @@ cases and requires the VM Off/Saved for the `Set-VMComPort` step.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_guest_run` | `vm_name`, `command`, `args[]`, `cwd?`, `timeout_ms` (default 60000), `elevated`, `confirm` | `{ok, exit_code, stdout, stderr, timed_out, truncated}` |
-| `hyperv_guest_run_ps` | `vm_name`, `script`, `timeout_ms` (default 60000), `elevated`, `confirm` | same envelope |
-| `hyperv_guest_put` | `vm_name`, `local_path`, `remote_path`, `confirm`, `verify?` | `{ok, bytes_copied, sha256_local?, sha256_remote?}` |
-| `hyperv_guest_get` | `vm_name`, `remote_path`, `local_path`, `verify?` | same envelope |
-| `hyperv_guest_read_file` | `vm_name`, `remote_path`, `max_bytes>=1` (default 262144) | `{ok, content_b64, bytes_read, truncated}` |
-| `hyperv_guest_list_dir` | `vm_name`, `remote_path` | `{ok, entries[{name, is_dir, size_bytes, modified}]}` |
+| `hyperv_guest_run` | `vm_name` or `vm_id`, `command`, `args[]`, `cwd?`, `timeout_ms` (default 60000), `elevated`, `confirm` | `{ok, exit_code, stdout, stderr, timed_out, truncated}` |
+| `hyperv_guest_run_ps` | `vm_name` or `vm_id`, `script`, `timeout_ms` (default 60000), `elevated`, `confirm` | same envelope |
+| `hyperv_guest_put` | `vm_name` or `vm_id`, `local_path`, `remote_path`, `confirm`, `verify?` | `{ok, bytes_copied, sha256_local?, sha256_remote?}` |
+| `hyperv_guest_get` | `vm_name` or `vm_id`, `remote_path`, `local_path`, `verify?` | same envelope |
+| `hyperv_guest_read_file` | `vm_name` or `vm_id`, `remote_path`, `max_bytes>=1` (default 262144) | `{ok, content_b64, bytes_read, truncated}` |
+| `hyperv_guest_list_dir` | `vm_name` or `vm_id`, `remote_path` | `{ok, entries[{name, is_dir, size_bytes, modified}]}` |
 
 **0.2.0 behavior changes (documented breaking):**
 
@@ -338,8 +341,9 @@ cases and requires the VM Off/Saved for the `Set-VMComPort` step.
   elevated runs merge both into `stdout` (the result carries a `note`).
 - Failures return `{ok: false, error, error_class}` where `error_class` is
   one of `timeout | transport | policy | credential | busy | invalid | parse |
-  integrity | not_found | guest`. Host-side tools (lifecycle, checkpoints)
-  still raise — both styles are the contract.
+  integrity | not_found | guest`. All VM, guest, and console tools return
+  these `{ok: false, error, error_class}` envelopes on failure — only
+  schema-level validation errors are rejected by the client transport.
 - **Timeout semantics:** the host kills its whole PowerShell process tree
   (Job Object) at the timeout and reports `timed_out: true` with an explicit
   warning — **the guest-side child may still be running**. Guest temp scripts
@@ -350,8 +354,8 @@ cases and requires the VM Off/Saved for the `Set-VMComPort` step.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_victim_run` | `vm_name`, `command`, `args[]`, `cwd?`, `timeout_ms` | standard guest envelope |
-| `hyperv_victim_run_ps` | `vm_name`, `script`, `timeout_ms` | standard guest envelope |
+| `hyperv_victim_run` | `vm_name` or `vm_id`, `command`, `args[]`, `cwd?`, `timeout_ms` | standard guest envelope |
+| `hyperv_victim_run_ps` | `vm_name` or `vm_id`, `script`, `timeout_ms` | standard guest envelope |
 
 Environment-only victim credentials; never elevated.
 
@@ -359,8 +363,8 @@ Environment-only victim credentials; never elevated.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_diagnose_vm_access` | `vm_name`, `timeout_ms=90000` | `{ok, vm_name, vm, ps_direct, guest, findings[], checked_at}` |
-| `hyperv_repair_guest_access` | `vm_name`, `apply=false`, `confirm=false` | `{ok, vm_name, applied, plan[], changes[], verification_findings[], backup_path?}` |
+| `hyperv_diagnose_vm_access` | `vm_name` or `vm_id`, `timeout_ms=90000` | `{ok, vm_name, vm, ps_direct, guest, findings[], checked_at}` |
+| `hyperv_repair_guest_access` | `vm_name` or `vm_id`, `apply=false`, `confirm=false` | `{ok, vm_name, applied, plan[], changes[], verification_findings[], backup_path?}` |
 
 `hyperv_diagnose_vm_access` is ONE read-only call that reports host VM state,
 guest identity (hostname/OS), current guest IPv4/IPv6 addresses, PowerShell
@@ -385,7 +389,7 @@ reports the binding still present — and re-verifies every action, returning pe
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_guest_job_start` | `vm_name`, `command`, `args[]?`, `cwd?`, `timeout_ms=60000` | `{ok, job_id, vm_name, pid, start_time_ticks, job_dir, out_path, err_path, exit_path, started_at}` |
+| `hyperv_guest_job_start` | `vm_name` or `vm_id`, `command`, `args[]?`, `cwd?`, `timeout_ms=60000` | `{ok, job_id, vm_name, pid, start_time_ticks, job_dir, out_path, err_path, exit_path, started_at}` |
 | `hyperv_guest_job_status` | `job_id` | `{ok, job_id, pid, status: running\|exited\|exiting\|stopped, process_name?, exit_code?}` |
 | `hyperv_guest_job_output` | `job_id`, `tail_bytes=65536` | `{ok, job_id, pid, tail_bytes, stdout, stderr, *_truncated, *_encoding, *_size}` |
 | `hyperv_guest_job_stop` | `job_id` | `{ok, job_id, pid, stopped, alive_pids, job_dir_removed, pid_reused}` (same key set on every path; a failure adds `error`/`error_class` with `stopped: false`; a repeat stop adds `note: "was already stopped"`) |
@@ -438,7 +442,7 @@ correlated to the specific job or relay that started it.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_wait_guest_recovery` | `vm_name`, `services[]?`, `processes[]?`, `timeout_s=300`, `interval_s=3` | `{ok, vm_name, ps_direct, services[], processes[], failures[], checked_at}` |
+| `hyperv_wait_guest_recovery` | `vm_name` or `vm_id`, `services[]?`, `processes[]?`, `timeout_s=300`, `interval_s=3` | `{ok, vm_name, ps_direct, services[], processes[], failures[], checked_at}` |
 
 Waits a bounded time for PowerShell Direct to answer (the first thing that
 comes back after a reboot), then verifies each named service is Running and
@@ -450,7 +454,7 @@ Direct only.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_relay_start` | `vm_name`, `guest_port`, `host_port=0` (ephemeral) | `{ok, relay_id, url, host_port, ...}` |
+| `hyperv_relay_start` | `vm_name` or `vm_id`, `guest_port`, `host_port=0` (ephemeral) | `{ok, relay_id, url, host_port, ...}` |
 | `hyperv_relay_status` | `relay_id?` | `{ok, relays[{relay_id, url, counters, stopped, ...}]}` |
 | `hyperv_relay_stop` | `relay_id` | `{ok, relay_id, host_port, stopped}` |
 
@@ -469,8 +473,9 @@ with 400, so a caller can never steer the guest-side request to another
 host); error replies close the connection so a rejected request's body can
 never be re-parsed as a follow-up request; handler sockets time out, so a
 stalled client cannot park a thread forever; per-request PS Direct legs
-deliberately do not serialize behind the per-VM lock and are NOT audited
-(only the three lifecycle tools write audit rows). The guest endpoint's
+deliberately do not serialize behind the per-VM lock and are not audited
+(the relay HTTP legs address the guest endpoint, not a tool call — every
+tool call itself writes an audit row). The guest endpoint's
 redirect responses are followed BY THE GUEST (Invoke-WebRequest default) —
 a guest endpoint serving a 3xx sends the guest to the redirect target.
 Trust model: the listener binds 127.0.0.1 but has NO application-layer
@@ -486,7 +491,7 @@ arrives as 404 with the relay error envelope); a request racing
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_capture_evidence` | `vm_name`, `width=1024`, `height=768`, `save_path?`, `ui_tree=false`, `ui_tree_depth=3`, `ui_tree_max_elements=200` | `[ImageContent, TextContent(meta)]` |
+| `hyperv_capture_evidence` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `ui_tree=false`, `ui_tree_depth=3`, `ui_tree_max_elements=200` | `[ImageContent, TextContent(meta)]` |
 
 One call pairing the console screenshot with `captured_at` (UTC ISO-8601),
 `vm_id`, capture dimensions, `frame_hash`, and — when `ui_tree=true` — a
@@ -502,18 +507,18 @@ screenshot still ships.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_console_screenshot` | `vm_name`, `width=1024`, `height=768`, `save_path?` | MCP ImageContent(image/png) + metadata text (vm_id, frame_hash, head res, scale note, fallback_used, captured_at) |
-| `hyperv_console_get_display_info` | `vm_name` | `{ok, enabled_state, head_horizontal, head_vertical, keyboard_present, keyboard_enabled, mouse_present, mouse_enabled, guest_channel, guest_channel_note, vm_id}` |
-| `hyperv_console_type_text` | `vm_name`, `text` (ASCII) | `{ok, chunks, chars}` |
-| `hyperv_console_press_key` | `vm_name`, `key`, `modifiers[]` | `{ok, scancodes_sent, chunks}` |
-| `hyperv_console_key_combo` | `vm_name`, `keys[]` | `{ok, scancodes_sent, chunks}` |
-| `hyperv_console_type_scancodes` | `vm_name`, `scancodes[]` (0..255) | `{ok, scancodes_sent, chunks}` |
-| `hyperv_console_mouse_move` | `vm_name`, `x`, `y`, `frame_width?`, `frame_height?` | `{ok, operation, head_x, head_y}` |
-| `hyperv_console_click` | `vm_name`, `x?=0`, `y?=0`, `frame_width?=0`, `frame_height?=0`, `button=1` | `{ok, operation, head_x?, head_y?}` |
-| `hyperv_console_button` | `vm_name`, `button`, `is_down` | `{ok, operation}` |
-| `hyperv_console_scroll` | `vm_name`, `delta` | `{ok, operation}` |
-| `hyperv_console_wait_frame_change` | `vm_name`, `baseline_hash=""`, `width=640`, `height=480`, `timeout_s=60`, `interval_s=2` | list[ImageContent(image/png), TextContent({stop_reason: changed\|deadline, polls, elapsed_ms, frame_hash})] or deadline dict |
-| `hyperv_console_capture_sequence` | `vm_name`, `count=3`, `interval_s=2`, `width=640`, `height=480` | [first Image, last Image (a single Image when count==1), meta_text(frames[] with per-frame hash + changed_bytes_vs_previous)] |
+| `hyperv_console_screenshot` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?` | MCP ImageContent(image/png) + metadata text (vm_id, frame_hash, head res, scale note, fallback_used, captured_at) |
+| `hyperv_console_get_display_info` | `vm_name` or `vm_id` | `{ok, enabled_state, head_horizontal, head_vertical, keyboard_present, keyboard_enabled, mouse_present, mouse_enabled, guest_channel, guest_channel_note, vm_id}` |
+| `hyperv_console_type_text` | `vm_name` or `vm_id`, `text` (ASCII) | `{ok, chunks, chars}` |
+| `hyperv_console_press_key` | `vm_name` or `vm_id`, `key`, `modifiers[]` | `{ok, scancodes_sent, chunks}` |
+| `hyperv_console_key_combo` | `vm_name` or `vm_id`, `keys[]` | `{ok, scancodes_sent, chunks}` |
+| `hyperv_console_type_scancodes` | `vm_name` or `vm_id`, `scancodes[]` (0..255) | `{ok, scancodes_sent, chunks}` |
+| `hyperv_console_mouse_move` | `vm_name` or `vm_id`, `x`, `y`, `frame_width?`, `frame_height?` | `{ok, operation, head_x, head_y}` |
+| `hyperv_console_click` | `vm_name` or `vm_id`, `x?=0`, `y?=0`, `frame_width?=0`, `frame_height?=0`, `button=1` | `{ok, operation, head_x?, head_y?}` |
+| `hyperv_console_button` | `vm_name` or `vm_id`, `button`, `is_down` | `{ok, operation}` |
+| `hyperv_console_scroll` | `vm_name` or `vm_id`, `delta` | `{ok, operation}` |
+| `hyperv_console_wait_frame_change` | `vm_name` or `vm_id`, `baseline_hash=""`, `width=640`, `height=480`, `timeout_s=60`, `interval_s=2` | list[ImageContent(image/png), TextContent({stop_reason: changed\|deadline, polls, elapsed_ms, frame_hash})] or deadline dict |
+| `hyperv_console_capture_sequence` | `vm_name` or `vm_id`, `count=3`, `interval_s=2`, `width=640`, `height=480` | [first Image, last Image (a single Image when count==1), meta_text(frames[] with per-frame hash + changed_bytes_vs_previous)] |
 
 Console notes: text rides the stdin channel (never in argv/script/errors); non-ASCII input must use type_scancodes; mouse coordinates are in the space of the observed image — pass `frame_width`/`frame_height` matching your screenshot dimensions to scale to head space, or omit them to use head coordinates directly; `wait_frame_change` with `baseline_hash=""` treats the first polled frame as the baseline, and a returned `frame_hash` can be passed back as `baseline_hash` to detect changes across calls (both are the full lowercase-hex sha256 of the raw frame payload); WinPE errors and wizard screens are returned as images for visual interpretation (no OCR is performed).
 
@@ -522,22 +527,22 @@ Console notes: text rides the stdin channel (never in argv/script/errors); non-A
 | Tool | Parameters | Returns |
 |------|-----------|---------|
 | `hyperv_vm_create` | `name`, `vhd_path`, `memory_mb=2048`, `cpu_count=1`, `generation=2`, `vhd_size_gb=64`, `switch_name?`, `confirm` | `{ok, id, name, state, generation}` |
-| `hyperv_vm_disk_add` | `vm_name`, `path`, `size_gb`, `controller_type=SCSI`, `confirm` | `{ok, vhd_path, disk_count}` (`disk_count` is `null` if the post-add read failed) |
-| `hyperv_vm_disk_list` | `vm_name` | `{ok, disks[]}` |
-| `hyperv_vm_media_attach` | `vm_name`, `iso_path` | `{ok, iso_path, attached}` (`attached` is `null` if the post-attach read failed) |
-| `hyperv_vm_media_detach` | `vm_name` | `{ok, removed[]}` |
-| `hyperv_vm_media_list` | `vm_name` | `{ok, media[]}` |
-| `hyperv_vm_firmware_get` | `vm_name` | `{ok, secure_boot, secure_boot_template, boot_order, tpm_enabled}` |
-| `hyperv_vm_firmware_set_boot_order` | `vm_name`, `boot_type (Drive\|Network\|File)`, `confirm` | `{ok, first_boot}` |
-| `hyperv_vm_tpm_set` | `vm_name`, `enabled`, `confirm` | `{ok, tpm_enabled}` |
-| `hyperv_vm_secureboot_set` | `vm_name`, `enabled`, `template?`, `confirm` | `{ok, secure_boot, secure_boot_template}` |
-| `hyperv_vm_network_set` | `vm_name`, `switch_name` | `{ok, switch_name}` |
+| `hyperv_vm_disk_add` | `vm_name` or `vm_id`, `path`, `size_gb`, `controller_type=SCSI`, `confirm` | `{ok, vhd_path, disk_count}` (`disk_count` is `null` if the post-add read failed) |
+| `hyperv_vm_disk_list` | `vm_name` or `vm_id` | `{ok, disks[]}` |
+| `hyperv_vm_media_attach` | `vm_name` or `vm_id`, `iso_path` | `{ok, iso_path, attached}` (`attached` is `null` if the post-attach read failed) |
+| `hyperv_vm_media_detach` | `vm_name` or `vm_id` | `{ok, removed[]}` |
+| `hyperv_vm_media_list` | `vm_name` or `vm_id` | `{ok, media[]}` |
+| `hyperv_vm_firmware_get` | `vm_name` or `vm_id` | `{ok, secure_boot, secure_boot_template, boot_order, tpm_enabled}` |
+| `hyperv_vm_firmware_set_boot_order` | `vm_name` or `vm_id`, `boot_type (Drive\|Network\|File)`, `confirm` | `{ok, first_boot}` |
+| `hyperv_vm_tpm_set` | `vm_name` or `vm_id`, `enabled`, `confirm` | `{ok, tpm_enabled}` |
+| `hyperv_vm_secureboot_set` | `vm_name` or `vm_id`, `enabled`, `template?`, `confirm` | `{ok, secure_boot, secure_boot_template}` |
+| `hyperv_vm_network_set` | `vm_name` or `vm_id`, `switch_name` | `{ok, switch_name}` |
 
 ### Orchestration
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_wait_vm_state` | `vm_name`, `states[]` (Off/Running/Saved/Paused/...), `timeout_s=300` | `{ok, final_state, guest_channel: "ps_direct_unverified"}` |
+| `hyperv_wait_vm_state` | `vm_name` or `vm_id`, `states[]` (Off/Running/Saved/Paused/...), `timeout_s=300` | `{ok, final_state, guest_channel: "ps_direct_unverified"}` |
 
 ### Server Provenance (0.3.0)
 

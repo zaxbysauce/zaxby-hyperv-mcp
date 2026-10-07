@@ -5,12 +5,14 @@ These tests pin the complementary, equally load-bearing direction: a GUID
 whose resolved name IS allowed must be ADMITTED under restricted patterns —
 so a lazy predicate keyed on the raw vm_id string (which never matches a
 name pattern) or on an empty name cannot pass here — and a both-given
-mismatch is still rejected before any script runs.
+mismatch is still rejected before any action script runs.
 """
 
 import json
 
-from hyperv_mcp import lifecycle, pswindows, vmident
+import pytest
+
+from hyperv_mcp import guestexec, lifecycle, pswindows, vmident
 from hyperv_mcp.config import Config
 from hyperv_mcp.policy import PolicyDenied
 
@@ -86,3 +88,23 @@ def test_both_given_mismatch_rejected_before_action(monkeypatch):
     else:
         raise AssertionError("name/id mismatch must raise")
     assert fake.scripts == [fake.scripts[0]], "no action leg after mismatch"
+
+
+def test_trailing_newline_vm_id_cannot_split_the_lock_key(monkeypatch):
+    """PRR-012: a copied GUID with a trailing newline must validate and lock
+    identically to the canonical form — the review's live probe showed
+    Get-VM -Id resolves a newline-suffixed Guid, so an un-normalized id
+    would silently exempt the operation from mutual exclusion."""
+    with pytest.raises(ValueError):
+        guestexec.validate_vm_guid(TEST_ID + "\n")  # the shape gate rejects outright
+    cfg = Config(allowed_vm_patterns=["test-*"])
+    fake = _ByIdFake("test-vm-1")
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    canonical = vmident.resolve(cfg, vm_id=TEST_ID)
+    try:
+        suffixed = vmident.resolve(cfg, vm_id=TEST_ID + "\n")
+    except ValueError:
+        # Rejection is an acceptable fail-closed outcome; the invariant under
+        # test is that the two forms never yield DIFFERENT valid identities.
+        return
+    assert suffixed.id == canonical.id, "newline variant must canonicalize to the same lock key"

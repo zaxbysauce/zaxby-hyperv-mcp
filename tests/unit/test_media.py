@@ -82,6 +82,27 @@ def test_vm_create_guard_is_literal_not_wildcard(monkeypatch, unrestricted, tmp_
     assert "`" not in guard  # no backtick escaping inside the guard
 
 
+def test_vm_create_name_literal_matches_guard_literal(monkeypatch, unrestricted, tmp_path):
+    """PRR-025: New-VM -Name is a plain String parameter — the creation literal
+    must be the SAME string as the duplicate-guard literal, so the created
+    ElementName is exactly the name the guard tested and by-name resolution
+    of the requested name works (a ps_name-escaped form would plant backticks
+    in ElementName for wildcard-bearing names)."""
+    name = "test-*"
+    fake = FakePS([pswindows.PSResult(
+        stdout='{"id": "GUID-1", "name": "test-*", "state": "Off", "generation": 2}',
+        returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    media.vm_create(unrestricted, name, vhd_path=str(tmp_path / "a.vhdx"), confirm=True)
+    script = fake.scripts[0]
+    literal = pswindows.ps_quote(name)
+    assert literal == "'test-*'"
+    assert f"($_.ElementName -eq {literal})" in script   # guard: literal -eq
+    assert f"New-VM -Name {literal}" in script           # creation: same literal
+    # and no backticked variant of the name anywhere in the create script
+    assert pswindows.ps_name(name) not in script
+
+
 def test_vm_create_requires_confirm():
     # confirm fires BEFORE the category check (no category-enablement leak)
     cfg = Config(allowed_vm_patterns=["test-*"])
@@ -312,9 +333,9 @@ def test_verify_and_write_path_reads_use_error_action_stop(monkeypatch, unrestri
          0, "{}", "$off = @(Get-VMNetworkAdapter -VM $vm -ErrorAction Stop | "),
         (lambda: media.vm_firmware_set_boot_order(unrestricted, "vm", "Drive", confirm=True),
          1, '{"first_boot": "Drive"}', "$f2 = Get-VMFirmware -VM $vm -ErrorAction Stop"),
-        (lambda: media.vm_tpm_set(unrestricted, "vm", True, confirm=True),
+        (lambda: media.vm_tpm_set(unrestricted, "vm", enabled=True, confirm=True),
          1, '{"tpm_enabled": true}', "$sec = Get-VMSecurity -VM $vm -ErrorAction Stop"),
-        (lambda: media.vm_secureboot_set(unrestricted, "vm", True, confirm=True),
+        (lambda: media.vm_secureboot_set(unrestricted, "vm", enabled=True, confirm=True),
          1, '{"secure_boot": "On"}', "$f = Get-VMFirmware -VM $vm -ErrorAction Stop\n[PSCustomObject]@{ secure_boot"),
     ]
     for call, idx, out, pin in cases:
@@ -337,7 +358,80 @@ def test_media_attach_surfaces_attached_flag(monkeypatch, tmp_path):
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = media.vm_media_attach(cfg, "test-vm", str(iso))
     # expected path derived independently of the value under test
-    assert out == {"ok": True, "iso_path": os.path.normpath(os.path.abspath(str(iso))), "attached": True}
+    assert out == {"ok": True, "iso_path": os.path.normpath(os.path.abspath(str(iso))),
+                   "attached": True, "vm_name": "test-vm"}
+
+
+# ---------------------------------------------------------------------------
+# review-fix coverage: issue #8 audit attribution + required `enabled`
+# ---------------------------------------------------------------------------
+
+def test_media_results_carry_resolved_vm_name(monkeypatch, unrestricted, tmp_path):
+    """PRR-004/005: every media result carries the RESOLVED VM display name so
+    a by-id tool call can adopt it for its audit row (the caller name is
+    empty there). By-name resolution echoes the caller name into ref.name."""
+    cfg = Config(allowed_vm_patterns=["test-*"], host_read_roots=[str(tmp_path)])
+    cfg.destructive.media = True
+    cfg.destructive.vm_provision = True
+    cfg.destructive.require_confirm = False
+    iso = tmp_path / "media.iso"
+    iso.write_bytes(b"x")
+
+    def run(fake, call):
+        monkeypatch.setattr(pswindows, "run_ps", fake)
+        return call()
+
+    out = run(FakePS([_guid_res(), pswindows.PSResult(stdout='{"disk_count": 1}', returncode=0)]),
+              lambda: media.vm_disk_add(unrestricted, "test-vm", str(tmp_path / "d.vhdx"), 10, confirm=True))
+    assert out["vm_name"] == "test-vm"
+    out = run(FakePS([_guid_res()]),
+              lambda: media.vm_disk_list(unrestricted, "test-vm"))
+    assert out["vm_name"] == "test-vm"
+    out = run(FakePS([_guid_res()]),
+              lambda: media.vm_media_attach(cfg, "test-vm", str(iso)))
+    assert out["vm_name"] == "test-vm"
+    out = run(FakePS([_guid_res(), pswindows.PSResult(stdout='{"removed": []}', returncode=0)]),
+              lambda: media.vm_media_detach(unrestricted, "test-vm"))
+    assert out["vm_name"] == "test-vm"
+    out = run(FakePS([_guid_res()]),
+              lambda: media.vm_media_list(unrestricted, "test-vm"))
+    assert out["vm_name"] == "test-vm"
+    out = run(FakePS([_guid_res()]),
+              lambda: media.vm_network_set(unrestricted, "test-vm", "LabSwitch"))
+    assert out["vm_name"] == "test-vm"
+    gen2 = pswindows.PSResult(stdout="2", returncode=0)  # generation guard
+    out = run(FakePS([_guid_res(), gen2]),
+              lambda: media.vm_firmware_get(unrestricted, "test-vm"))
+    assert out["vm_name"] == "test-vm"
+    out = run(FakePS([_guid_res(), pswindows.PSResult(stdout="2", returncode=0),
+                      pswindows.PSResult(stdout='{"first_boot": "Drive"}', returncode=0)]),
+              lambda: media.vm_firmware_set_boot_order(unrestricted, "test-vm", "Drive", confirm=True))
+    assert out["vm_name"] == "test-vm"
+    out = run(FakePS([_guid_res(), pswindows.PSResult(stdout="2", returncode=0),
+                      pswindows.PSResult(stdout='{"secure_boot": "On"}', returncode=0)]),
+              lambda: media.vm_secureboot_set(unrestricted, "test-vm", enabled=True, confirm=True))
+    assert out["vm_name"] == "test-vm"
+    # by-id: the resolver leg answers with the NAME; it must reach the result
+    by_id = FakePS([
+        pswindows.PSResult(stdout="Resolved Name", returncode=0),  # by-id resolve -> $vm.Name
+        pswindows.PSResult(stdout="2", returncode=0),              # generation guard
+        pswindows.PSResult(stdout='{"tpm_enabled": true}', returncode=0),
+    ])
+    out = run(by_id, lambda: media.vm_tpm_set(
+        unrestricted, vm_id=GUID, enabled=True, confirm=True))
+    assert out["vm_name"] == "Resolved Name"
+
+
+def test_tpm_and_secureboot_enabled_are_keyword_required(unrestricted):
+    """PRR-001: `enabled` is keyword-only and required at the module layer —
+    omission is a TypeError, never a silent default to disable."""
+    with pytest.raises(TypeError, match="enabled"):
+        media.vm_tpm_set(unrestricted, "vm", confirm=True)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="enabled"):
+        media.vm_secureboot_set(unrestricted, "vm", confirm=True)  # type: ignore[call-arg]
+    # positional passing is rejected too (the server passes it by keyword)
+    with pytest.raises(TypeError):
+        media.vm_tpm_set(unrestricted, "vm", True, confirm=True)  # type: ignore[misc]
 
 
 def test_post_mutation_info_reads_cannot_fail_non_idempotent_calls(monkeypatch, unrestricted, tmp_path):
@@ -424,7 +518,7 @@ def test_tpm_set_enable(monkeypatch, unrestricted):
         pswindows.PSResult(stdout='{"tpm_enabled": true}', returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
-    out = media.vm_tpm_set(unrestricted, "vm", True, confirm=True)
+    out = media.vm_tpm_set(unrestricted, "vm", enabled=True, confirm=True)
     assert out["tpm_enabled"] is True
     assert "Enable-VMTPM" in fake.scripts[2]
 
@@ -436,7 +530,7 @@ def test_tpm_set_disable(monkeypatch, unrestricted):
         pswindows.PSResult(stdout='{"tpm_enabled": false}', returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
-    media.vm_tpm_set(unrestricted, "vm", False, confirm=True)
+    media.vm_tpm_set(unrestricted, "vm", enabled=False, confirm=True)
     assert "Disable-VMTPM" in fake.scripts[2]
 
 
@@ -448,7 +542,7 @@ def test_secureboot_set_maps_bool_to_onoff_enum(monkeypatch, unrestricted):
         pswindows.PSResult(stdout='{"secure_boot": "On"}', returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
-    media.vm_secureboot_set(unrestricted, "vm", True, confirm=True)
+    media.vm_secureboot_set(unrestricted, "vm", enabled=True, confirm=True)
     assert "-EnableSecureBoot On" in fake.scripts[2]
 
 
@@ -459,7 +553,7 @@ def test_secureboot_set_off(monkeypatch, unrestricted):
         pswindows.PSResult(stdout='{"secure_boot": "Off"}', returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
-    media.vm_secureboot_set(unrestricted, "vm", False, confirm=True)
+    media.vm_secureboot_set(unrestricted, "vm", enabled=False, confirm=True)
     assert "-EnableSecureBoot Off" in fake.scripts[2]
 
 
@@ -470,7 +564,7 @@ def test_secureboot_template_quoted(monkeypatch, unrestricted):
         pswindows.PSResult(stdout='{"secure_boot": "On"}', returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
-    media.vm_secureboot_set(unrestricted, "vm", True, "MicrosoftUEFICertificateAuthority", confirm=True)
+    media.vm_secureboot_set(unrestricted, "vm", enabled=True, template="MicrosoftUEFICertificateAuthority", confirm=True)
     assert "'MicrosoftUEFICertificateAuthority'" in fake.scripts[2]
 
 
@@ -483,7 +577,7 @@ def test_secureboot_template_injection_rejected(monkeypatch, unrestricted):
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     hostile = "Microsoft'; Invoke-Expression 'calc'; '"
-    media.vm_secureboot_set(unrestricted, "vm", True, hostile, confirm=True)
+    media.vm_secureboot_set(unrestricted, "vm", enabled=True, template=hostile, confirm=True)
     script = fake.scripts[2]
     assert "Invoke-Expression" not in script.replace("'" + hostile.replace("'", "''") + "'", "")
     # the hostile text appears ONLY inside a doubled-quote literal
@@ -493,7 +587,7 @@ def test_secureboot_template_injection_rejected(monkeypatch, unrestricted):
 def test_secureboot_requires_confirm():
     cfg = Config(allowed_vm_patterns=["test-*"])
     with pytest.raises(PolicyDenied, match="confirm=true"):
-        media.vm_secureboot_set(cfg, "test-vm", True, confirm=False)
+        media.vm_secureboot_set(cfg, "test-vm", enabled=True, confirm=False)
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +602,7 @@ def test_ps_failure_maps_to_media_error(monkeypatch, unrestricted, tmp_path):
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     with pytest.raises(MediaError, match="Access denied"):
-        media.vm_secureboot_set(unrestricted, "vm", True, confirm=True)
+        media.vm_secureboot_set(unrestricted, "vm", enabled=True, confirm=True)
 
 
 # ---------------------------------------------------------------------------
@@ -525,19 +619,19 @@ def test_gen1_denied_for_boot_order_tpm_secureboot(monkeypatch, unrestricted):
     fake = FakePS([_guid_res(), pswindows.PSResult(stdout="1", returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     with pytest.raises(MediaError, match="Generation 1"):
-        media.vm_tpm_set(unrestricted, "vm", True, confirm=True)
+        media.vm_tpm_set(unrestricted, "vm", enabled=True, confirm=True)
     fake = FakePS([_guid_res(), pswindows.PSResult(stdout="1", returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     with pytest.raises(MediaError, match="Generation 1"):
-        media.vm_secureboot_set(unrestricted, "vm", True, confirm=True)
+        media.vm_secureboot_set(unrestricted, "vm", enabled=True, confirm=True)
 
 
 def test_tpm_set_requires_confirm():
     cfg = Config(allowed_vm_patterns=["test-*"])
     with pytest.raises(PolicyDenied, match="confirm=true"):
-        media.vm_tpm_set(cfg, "test-vm", True, confirm=False)
+        media.vm_tpm_set(cfg, "test-vm", enabled=True, confirm=False)
     with pytest.raises(PolicyDenied, match="vm_provision"):
-        media.vm_tpm_set(cfg, "test-vm", True, confirm=True)
+        media.vm_tpm_set(cfg, "test-vm", enabled=True, confirm=True)
 
 
 def test_provision_category_denied_for_all_destructive_ops(tmp_path):
@@ -549,7 +643,7 @@ def test_provision_category_denied_for_all_destructive_ops(tmp_path):
     with pytest.raises(PolicyDenied, match="vm_provision"):
         media.vm_firmware_set_boot_order(cfg, "test-vm", "Drive", confirm=True)
     with pytest.raises(PolicyDenied, match="vm_provision"):
-        media.vm_secureboot_set(cfg, "test-vm", True, confirm=True)
+        media.vm_secureboot_set(cfg, "test-vm", enabled=True, confirm=True)
     # vm_tpm_set's confirm-then-category ordering is covered above
 
 

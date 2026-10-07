@@ -75,6 +75,7 @@ def test_put_success_byte_counts_and_staging(monkeypatch, rooted_cfg, tmp_path):
         confirm=True, verify=False, cred=CRED,
     )
     assert out["ok"] and out["bytes_copied"] == 2
+    assert out["vm_name"] == "test-vm"  # resolved display name (PRR-005)
     script = fake.scripts[1]
     assert "-LiteralPath" in script
     assert ".mcptmp" in script
@@ -262,7 +263,7 @@ def test_list_dir_empty(monkeypatch, rooted_cfg):
     fake = FakePS([pswindows.PSResult(stdout="[]", returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = filetransfer.guest_list_dir(rooted_cfg, "test-vm", r"C:\g-read\empty", cred=CRED)
-    assert out == {"ok": True, "entries": []}
+    assert out == {"ok": True, "vm_name": "test-vm", "entries": []}
 
 
 def test_guest_root_assertion_embedded_when_roots_set(monkeypatch, rooted_cfg):
@@ -495,6 +496,21 @@ def test_put_container_check_classified_invalid_and_precedes_copy(monkeypatch, r
     script = fake.scripts[1]
     assert "PathType Container" in script
     assert script.index("PathType Container") < script.index("Copy-Item -ToSession")
+
+
+def test_get_denied_vm_name_creates_no_directories(monkeypatch, rooted_cfg, tmp_path):
+    """PRR-010: guest_get resolves identity BEFORE creating the local
+    destination dirs — a call rejected at resolve (denied VM name) must not
+    orphan host directories (the failure cleanup only runs post-resolve)."""
+    dest = tmp_path / "host-dst" / "newdir" / "out.bin"
+    fake = FakePS([])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(PolicyDenied, match="vm"):
+        filetransfer.guest_get(
+            rooted_cfg, "prod-db", r"C:\g-read\a.bin", str(dest), cred=CRED,
+        )
+    assert fake.scripts == []       # denied name spawns no PowerShell
+    assert not dest.parent.exists()  # and no directory was created at all
 
 
 def test_get_denied_leaves_no_created_dirs(monkeypatch, rooted_cfg, tmp_path):

@@ -202,8 +202,8 @@ def test_stop_transport_error_returns_full_key_set(monkeypatch):
     )
     out = guestjobs.job_stop(cfg, start["job_id"])
     assert set(out) == {
-        "ok", "job_id", "pid", "stopped", "alive_pids", "job_dir_removed",
-        "pid_reused", "error", "error_class",
+        "ok", "job_id", "vm_name", "pid", "stopped", "alive_pids",
+        "job_dir_removed", "pid_reused", "error", "error_class",
     }
     assert out["ok"] is False
     assert out["stopped"] is False
@@ -243,8 +243,8 @@ def test_stop_nonnumeric_alive_pids_returns_invalid_envelope(monkeypatch):
                                "job_dir_removed": True, "pid_reused": False}))
     out = guestjobs.job_stop(cfg, start["job_id"])
     assert set(out) == {
-        "ok", "job_id", "pid", "stopped", "alive_pids", "job_dir_removed",
-        "pid_reused", "error", "error_class",
+        "ok", "job_id", "vm_name", "pid", "stopped", "alive_pids",
+        "job_dir_removed", "pid_reused", "error", "error_class",
     }
     assert out["ok"] is False
     assert out["error_class"] == "invalid"

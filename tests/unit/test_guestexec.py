@@ -57,6 +57,7 @@ def test_run_ps_success_envelope(monkeypatch, unrestricted):
     assert out == {
         "ok": True, "exit_code": 0, "stdout": "out-text", "stderr": "",
         "timed_out": False, "truncated": False,
+        "vm_name": "vm1",  # resolved display name for by-id audit attribution
     }
 
 

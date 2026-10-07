@@ -138,6 +138,7 @@ def test_status_running_then_exited(monkeypatch):
     running = guestjobs.job_status(cfg, start["job_id"])
     assert running["status"] == "running"
     assert running["process_name"] == "sqlprobe"
+    assert running["vm_name"] == "test-vm"  # resolved name from the registry (PRR-005)
     exited = guestjobs.job_status(cfg, start["job_id"])
     assert exited["status"] == "exited"
     assert exited["exit_code"] == "0"
@@ -173,6 +174,7 @@ def test_output_tail_and_encodings(monkeypatch):
     assert out["stdout_encoding"] == "utf-8"
     assert out["stdout_truncated"] is False
     assert out["stderr"] == ""
+    assert out["vm_name"] == "test-vm"  # resolved name from the registry (PRR-005)
 
 
 def test_output_truncated_utf16_tail_decodes_via_head_bom(monkeypatch):
@@ -262,10 +264,36 @@ def test_registry_cap_rejects_when_full_of_active_jobs(monkeypatch):
         with pytest.raises(RuntimeError, match="registry is full"):
             guestjobs._reserve_slot("next")
         assert len(guestjobs._jobs) == 1
-        # And job_start surfaces the same rejection BEFORE any guest leg.
+        # And job_start surfaces the same rejection BEFORE any guest start
+        # leg: identity resolution now runs BEFORE the reservation (PRR-008
+        # — a rejected identity must not consume a slot or evict history),
+        # so the by-name resolution leg is the ONLY script recorded.
         with pytest.raises(RuntimeError, match="registry is full"):
             guestjobs.job_start(Config(unrestricted=True), "test-vm", "x.exe", cred=CRED)
-        assert fake.scripts == []
+        assert len(fake.scripts) == 1 and _is_resolution_leg(fake.scripts[0])
+    finally:
+        guestjobs._MAX_JOBS = 128
+
+
+def test_rejected_resolve_does_not_evict_registry(monkeypatch):
+    """PRR-008: identity resolution runs BEFORE the slot reservation — a
+    start whose resolve REJECTS (denied VM name) must not evict stopped-job
+    history nor null stored credentials, even at the cap."""
+    cfg = Config(allowed_vm_patterns=["test-*"])  # 'prod-db' is denied
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+    guestjobs._jobs["old"] = {
+        "job_id": "old", "vm_name": "vm", "pid": 1, "job_dir": "d",
+        "out_path": "o", "err_path": "e", "exit_path": "x",
+        "started_at": "2026-01-01T00:00:00Z", "cred": CRED, "stopped": True,
+    }
+    guestjobs._MAX_JOBS = 1
+    try:
+        with pytest.raises(PolicyDenied):
+            guestjobs.job_start(cfg, "prod-db", "x.exe", cred=CRED)
+        # Registry untouched: the stopped entry survives WITH its credential
+        # and no in-flight placeholder was left behind.
+        assert set(guestjobs._jobs) == {"old"}
+        assert guestjobs._jobs["old"]["cred"] is CRED
     finally:
         guestjobs._MAX_JOBS = 128
 
@@ -284,8 +312,9 @@ def test_registry_cap_atomic_across_concurrent_starts(monkeypatch):
         def fake_run(script, **kwargs):
             calls.append(script)
             if _is_resolution_leg(script):
-                # Identity leg answers before the barrier: only admitted
-                # starts reach it (rejected starts never resolve). Per-name
+                # Identity leg answers before the barrier and now runs BEFORE
+                # the reservation (PRR-008): every attempt resolves first,
+                # only admitted starts reach the barrier/start leg. Per-name
                 # GUIDs keep the 3 VMs distinct under the GUID-keyed lock.
                 return pswindows.PSResult(stdout=_resolved_guid(script), returncode=0)
             barrier.wait()  # all admitted starts overlap before any registers
@@ -320,7 +349,9 @@ def test_registry_cap_atomic_across_concurrent_starts(monkeypatch):
         assert len(rejected) == 3, results
         assert all("registry is full" in r[1] for r in rejected)
         assert len(guestjobs._jobs) == 3
-        assert len(calls) == 6  # per admitted start: resolution leg + start leg
+        # Every attempt resolves first (PRR-008); the 3 admitted starts add
+        # one guest leg each: 6 resolution legs + 3 start legs.
+        assert len(calls) == 9
     finally:
         guestjobs._MAX_JOBS = 128
 
@@ -377,7 +408,7 @@ def test_repeat_stop_returns_full_result_contract(monkeypatch):
     assert first["stopped"] is True
     second = guestjobs.job_stop(cfg, start["job_id"])
     assert second == {
-        "ok": True, "job_id": start["job_id"], "pid": 4242,
+        "ok": True, "job_id": start["job_id"], "vm_name": "test-vm", "pid": 4242,
         "stopped": True, "alive_pids": [], "job_dir_removed": None,
         "pid_reused": False, "note": "was already stopped",
     }

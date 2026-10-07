@@ -361,14 +361,16 @@ def run_guest_inner(
 # -- public API ------------------------------------------------------------
 
 
-def _diagnose_report(
+def diagnose_report(
     cfg: Config, vm_id: str, display_name: str,
     cred: CredentialSet, timeout_ms: int,
 ) -> dict:
     """GUID-native report builder: host leg + guest probe + findings.
 
-    No name resolution inside — diagnose_vm_access resolves and hands the
-    GUID in; repair reuses this for its initial and verification passes so a
+    This is the no-re-resolve entry point for composite callers: it takes a
+    pre-resolved GUID (and the display name to report) and never resolves a
+    VM name itself. diagnose_vm_access is the public resolving wrapper around
+    it; repair reuses it for its initial and verification passes so a
     composite repair resolves exactly once per public call.
     """
     checked_at = _utc_now_iso()
@@ -436,7 +438,7 @@ def diagnose_vm_access(
     if cred is None:
         raise ValueError("guest credentials are required")
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
-    return _diagnose_report(cfg, ref.id, ref.name, cred, timeout_ms)
+    return diagnose_report(cfg, ref.id, ref.name, cred, timeout_ms)
 
 
 # -- reboot recovery (F4) ---------------------------------------------------

@@ -157,7 +157,11 @@ def vm_create(
         # If New-VM fails the fresh VHDX would orphan on the host and wedge
         # every retry against the exists-refusal below — clean it up first.
         "try {\n"
-        f"  $vm = New-VM -Name {pswindows.ps_name(name)} -MemoryStartupBytes ({int(memory_mb)}MB) "
+        # New-VM -Name is a plain String parameter (no wildcard semantics at
+        # creation), so the name is ps_quote'd: the created ElementName is the
+        # literal the guard above tested (PRR-025 — a ps_name-escaped form
+        # would plant backticks in ElementName for wildcard-bearing names).
+        f"  $vm = New-VM -Name {pswindows.ps_quote(name)} -MemoryStartupBytes ({int(memory_mb)}MB) "
         f"-Generation {generation} -VHDPath $vhd.Path -ErrorAction Stop\n"
         "} catch {\n"
         f"  Remove-Item -LiteralPath {pswindows.ps_quote(vhd)} -Force -ErrorAction SilentlyContinue\n"
@@ -185,7 +189,7 @@ def vm_disk_add(
     cfg: Config, vm_name: str = "", path: str = "", size_gb: int = 0,
     controller_type: str = "SCSI", confirm: bool = False, vm_id: str = "",
 ) -> dict:
-    policy.require_destructive(cfg, "vm_provision", confirm, f"add {size_gb}GB disk '{path}' to '{vm_name}'")
+    policy.require_destructive(cfg, "vm_provision", confirm, f"add {size_gb}GB disk '{path}' to '{vm_name or vm_id}'")
     if controller_type not in ("SCSI", "IDE"):
         raise ValueError("controller_type must be SCSI or IDE")
     vhd = _checked_file_path(cfg, path, write=True, must_exist=False, extensions=(".vhdx", ".vhd"))
@@ -215,7 +219,9 @@ def vm_disk_add(
             raise MediaError(f"VHD already exists: {vhd} (refusing to overwrite)")
         result = _run(cfg, _resolve_vm_prefix(ref) + "\n".join(lines), f"vm_disk_add({ref.name})")
     out = _json_out(result, "vm_disk_add")
-    return {"ok": True, "vhd_path": vhd, **out} if isinstance(out, dict) else {"ok": True, "vhd_path": vhd}
+    if isinstance(out, dict):
+        return {"ok": True, **out, "vhd_path": vhd, "vm_name": ref.name}
+    return {"ok": True, "vhd_path": vhd, "vm_name": ref.name}
 
 
 def vm_disk_list(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
@@ -231,7 +237,7 @@ def vm_disk_list(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
     drives = [] if not raw or raw == "null" else json.loads(raw)
     if isinstance(drives, dict):
         drives = [drives]
-    return {"ok": True, "disks": drives}
+    return {"ok": True, "disks": drives, "vm_name": ref.name}
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +245,7 @@ def vm_disk_list(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
 # ---------------------------------------------------------------------------
 
 def vm_media_attach(cfg: Config, vm_name: str = "", iso_path: str = "", vm_id: str = "") -> dict:
-    policy.require_category(cfg, "media", f"attach ISO to '{vm_name}'")
+    policy.require_category(cfg, "media", f"attach ISO to '{vm_name or vm_id}'")
     iso = _checked_file_path(cfg, iso_path, write=False, must_exist=True, extensions=(".iso",))
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     script = _resolve_vm_prefix(ref) + (
@@ -257,11 +263,11 @@ def vm_media_attach(cfg: Config, vm_name: str = "", iso_path: str = "", vm_id: s
         result = _run(cfg, script, f"vm_media_attach({ref.name})")
     out = _json_out(result, "vm_media_attach")
     attached = out.get("attached") if isinstance(out, dict) else None
-    return {"ok": True, "iso_path": iso, "attached": attached}
+    return {"ok": True, "iso_path": iso, "attached": attached, "vm_name": ref.name}
 
 
 def vm_media_detach(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
-    policy.require_category(cfg, "media", f"detach media from '{vm_name}'")
+    policy.require_category(cfg, "media", f"detach media from '{vm_name or vm_id}'")
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     script = _resolve_vm_prefix(ref) + (
         "$drives = Get-VMDvdDrive -VM $vm -ErrorAction Stop\n"
@@ -273,7 +279,7 @@ def vm_media_detach(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
         result = _run(cfg, script, f"vm_media_detach({ref.name})")
     out = _json_out(result, "vm_media_detach")
     removed = out.get("removed", []) if isinstance(out, dict) else []
-    return {"ok": True, "removed": removed}
+    return {"ok": True, "removed": removed, "vm_name": ref.name}
 
 
 def vm_media_list(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
@@ -288,11 +294,11 @@ def vm_media_list(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
     drives = [] if not raw or raw == "null" else json.loads(raw)
     if isinstance(drives, dict):
         drives = [drives]
-    return {"ok": True, "media": drives}
+    return {"ok": True, "media": drives, "vm_name": ref.name}
 
 
 def vm_network_set(cfg: Config, vm_name: str = "", switch_name: str = "", vm_id: str = "") -> dict:
-    policy.require_category(cfg, "media", f"connect '{vm_name}' to switch '{switch_name}'")
+    policy.require_category(cfg, "media", f"connect '{vm_name or vm_id}' to switch '{switch_name}'")
     if not switch_name or not switch_name.strip():
         raise ValueError("switch_name is required")
     # Connect-VMNetworkAdapter has no -VM parameter; bind the adapter objects
@@ -313,7 +319,7 @@ def vm_network_set(cfg: Config, vm_name: str = "", switch_name: str = "", vm_id:
     out = _json_out(result, "vm_network_set")
     if isinstance(out, dict) and out.get("connected") is False:
         raise MediaError(f"vm_network_set({ref.name}): not every adapter is on switch '{switch_name}' after connect")
-    return {"ok": True, "switch_name": switch_name}
+    return {"ok": True, "switch_name": switch_name, "vm_name": ref.name}
 
 
 # ---------------------------------------------------------------------------
@@ -332,13 +338,15 @@ def vm_firmware_get(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
     )
     result = _run(cfg, script, f"vm_firmware_get({ref.name})")
     out = _json_out(result, "vm_firmware_get")
-    return {"ok": True, **out} if isinstance(out, dict) else {"ok": True}
+    if isinstance(out, dict):
+        return {"ok": True, **out, "vm_name": ref.name}
+    return {"ok": True, "vm_name": ref.name}
 
 
 def vm_firmware_set_boot_order(
     cfg: Config, vm_name: str = "", boot_type: str = "Drive", confirm: bool = False, vm_id: str = "",
 ) -> dict:
-    policy.require_destructive(cfg, "vm_provision", confirm, f"set '{vm_name}' first boot device to {boot_type}")
+    policy.require_destructive(cfg, "vm_provision", confirm, f"set '{vm_name or vm_id}' first boot device to {boot_type}")
     if boot_type not in _BOOT_TYPES:
         raise ValueError(f"boot_type must be one of {_BOOT_TYPES}")
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
@@ -354,13 +362,17 @@ def vm_firmware_set_boot_order(
     with vmlocks.vm_lock(ref.id):
         result = _run(cfg, script, f"vm_firmware_set_boot_order({ref.name})")
     out = _json_out(result, "vm_firmware_set_boot_order")
-    return {"ok": True, **out} if isinstance(out, dict) else {"ok": True}
+    if isinstance(out, dict):
+        return {"ok": True, **out, "vm_name": ref.name}
+    return {"ok": True, "vm_name": ref.name}
 
 
 def vm_tpm_set(
-    cfg: Config, vm_name: str = "", enabled: bool = False, confirm: bool = False, vm_id: str = "",
+    cfg: Config, vm_name: str = "", *, enabled: bool, confirm: bool = False, vm_id: str = "",
 ) -> dict:
-    policy.require_destructive(cfg, "vm_provision", confirm, f"{'enable' if enabled else 'disable'} TPM on '{vm_name}'")
+    """`enabled` is keyword-only and REQUIRED (PRR-001): omission must be a
+    signature-level error, never a silent default to disable."""
+    policy.require_destructive(cfg, "vm_provision", confirm, f"{'enable' if enabled else 'disable'} TPM on '{vm_name or vm_id}'")
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     _generation_guard(cfg, ref)
     cmdlet = "Enable-VMTPM" if enabled else "Disable-VMTPM"
@@ -372,14 +384,18 @@ def vm_tpm_set(
     with vmlocks.vm_lock(ref.id):
         result = _run(cfg, script, f"vm_tpm_set({ref.name})")
     out = _json_out(result, "vm_tpm_set")
-    return {"ok": True, **out} if isinstance(out, dict) else {"ok": True}
+    if isinstance(out, dict):
+        return {"ok": True, **out, "vm_name": ref.name}
+    return {"ok": True, "vm_name": ref.name}
 
 
 def vm_secureboot_set(
-    cfg: Config, vm_name: str = "", enabled: bool = False, template: str = "",
+    cfg: Config, vm_name: str = "", *, enabled: bool, template: str = "",
     confirm: bool = False, vm_id: str = "",
 ) -> dict:
-    policy.require_destructive(cfg, "vm_provision", confirm, f"{'enable' if enabled else 'disable'} SecureBoot on '{vm_name}'")
+    """`enabled` is keyword-only and REQUIRED (PRR-001): omission must be a
+    signature-level error, never a silent default to disable."""
+    policy.require_destructive(cfg, "vm_provision", confirm, f"{'enable' if enabled else 'disable'} SecureBoot on '{vm_name or vm_id}'")
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     _generation_guard(cfg, ref)
     onoff = _SECUREBOOT_ONOFF[bool(enabled)]
@@ -398,4 +414,6 @@ def vm_secureboot_set(
     with vmlocks.vm_lock(ref.id):
         result = _run(cfg, script, f"vm_secureboot_set({ref.name})")
     out = _json_out(result, "vm_secureboot_set")
-    return {"ok": True, **out} if isinstance(out, dict) else {"ok": True}
+    if isinstance(out, dict):
+        return {"ok": True, **out, "vm_name": ref.name}
+    return {"ok": True, "vm_name": ref.name}
