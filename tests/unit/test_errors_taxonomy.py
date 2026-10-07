@@ -94,6 +94,42 @@ def test_enrich_failure_keeps_module_classes_and_adds_retry():
     assert out2["timed_out"] is True  # module diagnostics ride along
 
 
+def test_unknown_argument_audited_once(monkeypatch, tmp_path):
+    """The guard is the only audit for a rejected call (it runs before any
+    tool body's audit region), so 'every failure audited once' rests on its
+    single log_operation line — deleting it must fail here (implementation
+    review round 1, finding 2)."""
+    import asyncio
+    import json as _json
+
+    audit = tmp_path / "audit.jsonl"
+    doc = {"allowed_vm_patterns": ["test-*"], "unrestricted": True,
+           "audit_log_path": str(audit)}
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mod = importlib.reload(server_module)
+    mod.bootstrap({"HYPERV_MCP_CONFIG": str(p)})
+    mcp = mod.get_mcp()
+
+    def fake_list(cfg):
+        raise AssertionError("tool body must not run for an unknown argument")
+
+    monkeypatch.setattr("hyperv_mcp.lifecycle.list_vms", fake_list)
+    asyncio.run(mcp.call_tool("hyperv_list_vms", {"confirm_everything": True}))
+
+    records = [_json.loads(ln) for ln in
+               audit.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    guard_records = [r for r in records if r.get("tool") == "hyperv_list_vms"
+                     and r.get("error_class") == "invalid"]
+    assert len(guard_records) == 1, (
+        f"expected exactly one audited rejection, got {len(guard_records)} "
+        f"of {len(records)} records"
+    )
+    rec = guard_records[0]
+    assert rec["ok"] is False
+    assert rec["category"] == ""
+
+
 @pytest.fixture()
 def registered_tools():
     mod = importlib.reload(server_module)
