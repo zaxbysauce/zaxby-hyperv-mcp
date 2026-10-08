@@ -18,10 +18,51 @@ import hashlib
 import json
 import ntpath
 import os
+import re
 from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar
 
 SCHEMA_VERSION = 1
+
+# Agent ids become audit `agent_id` values and verifier principals (issue #10).
+# "local-cli" is the LEGACY shared-token principal — a configured agent must
+# never collapse into it. fullmatch (not match+$) so a trailing newline can
+# never smuggle a control character past the documented charset.
+_AGENT_ID_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+_RESERVED_AGENT_IDS = {"local-cli"}
+# Config values must BE environment variable NAMES: a token pasted here would
+# otherwise be echoed to stderr by the missing-variable startup error.
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _set_agents(value: Any) -> dict[str, str]:
+    """Validate the http.agents mapping (agent id -> env var NAME)."""
+    if not isinstance(value, dict):
+        raise ConfigError("http.agents must be an object of agent id -> env var name")
+    agents: dict[str, str] = {}
+    for agent_id, env_name in value.items():
+        if not isinstance(agent_id, str) or not _AGENT_ID_RE.fullmatch(agent_id):
+            raise ConfigError(
+                f"http.agents agent id {agent_id!r} must match "
+                "[A-Za-z0-9_.-]{1,64}"
+            )
+        if agent_id in _RESERVED_AGENT_IDS:
+            raise ConfigError(
+                f"http.agents agent id {agent_id!r} is reserved for the legacy "
+                "single-token principal"
+            )
+        if (
+            not isinstance(env_name, str)
+            or not env_name.strip()
+            or not _ENV_NAME_RE.fullmatch(env_name.strip())
+        ):
+            raise ConfigError(
+                f"http.agents[{agent_id!r}] must name a valid environment "
+                "variable (a NAME like MY_AGENT_TOKEN — the token value "
+                "itself never goes in config)"
+            )
+        agents[agent_id] = env_name.strip()
+    return agents
 
 
 class ConfigError(RuntimeError):
@@ -52,6 +93,10 @@ class HttpPolicy:
     host: str = "127.0.0.1"
     port: int = 8787
     token_env: str = "HYPERV_MCP_HTTP_TOKEN"
+    # Per-agent bearer tokens: agent id -> ENV VAR NAME holding that agent's
+    # token (issue #10). Values are names, never token material; the token
+    # values are resolved from the environment at startup only.
+    agents: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -156,6 +201,13 @@ class Config:
                 f"http.token_env must not shadow the functional environment "
                 f"variable {token_env}"
             )
+        for agent_id, env_name in self.http.agents.items():
+            agent_env = env_name.strip().upper()
+            if agent_env in reserved_functional_env:
+                raise ConfigError(
+                    f"http.agents[{agent_id!r}] must not shadow the functional "
+                    f"environment variable {agent_env}"
+                )
         for key in ("host_read_roots", "host_write_roots", "guest_read_roots", "guest_write_roots"):
             for root in getattr(self, key):
                 if not isinstance(root, str) or not root.strip():
@@ -264,7 +316,7 @@ class Config:
     def _set_http(self, value: Any) -> None:
         if not isinstance(value, dict):
             raise ConfigError("http must be an object")
-        unknown = set(value) - {"host", "port", "token_env"}
+        unknown = set(value) - {"host", "port", "token_env", "agents"}
         if unknown:
             raise ConfigError(f"unknown http key(s): {sorted(unknown)}")
         http = HttpPolicy()
@@ -273,6 +325,8 @@ class Config:
                 if not isinstance(val, int) or isinstance(val, bool) or not (1 <= val <= 65535):
                     raise ConfigError("http.port must be an integer in 1..65535")
                 http.port = val
+            elif key == "agents":
+                http.agents = _set_agents(val)
             elif isinstance(val, str) and val.strip():
                 # token_env is matched by exact (case-insensitive) name
                 # downstream; store it trimmed so padding cannot defeat the

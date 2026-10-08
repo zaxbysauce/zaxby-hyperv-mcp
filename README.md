@@ -62,6 +62,28 @@ carries Hyper-V rights. Two supported fixes:
    tool, including destructive ones — disposable labs only). Loopback bind is
    the default; binding beyond it prints a loud warning.
 
+   **Per-agent tokens** (issue #10): to tell multiple agents apart, configure
+   one token variable per agent and each caller authenticates as its own
+   principal — audit rows record the caller's agent id and a server-generated
+   request id:
+
+   ```json
+   { "http": { "agents": { "agent-a": "HYPERV_MCP_TOKEN_AGENT_A",
+                           "agent-b": "HYPERV_MCP_TOKEN_AGENT_B" } } }
+   ```
+
+   The values are ENVIRONMENT VARIABLE NAMES — token material lives only in
+   the environment, never in the config file. Every agent's variable must be
+   set at startup (blank counts as unset); two agents resolving to the same
+   token value (or an agent token equal to the legacy `token_env` value) is a
+   startup error naming the agent ids, never the values. With `agents`
+   configured, `http.token_env` stays optional: when its variable is also
+   set, the legacy shared principal (`local-cli`) keeps working alongside the
+   agents. Agent ids match `[A-Za-z0-9_.-]{1,64}` (`local-cli` is reserved);
+   agent token variables are stripped from every spawned child process
+   environment like the other server secrets. `--allow-anonymous` overrides
+   both modes (explicit opt-out).
+
 **Do not run your MCP client as Administrator.** With stdio the client spawns
 the server, so the server inherits the client's token — prefer fix 1.
 
@@ -153,7 +175,8 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
   "host_powershell_path": null,        // default: Windows PowerShell 5.1
   "verify_sha256": false,              // default integrity check for transfers
   "ps_timeout_s": 120,                 // default host PowerShell timeout
-  "http": { "host": "127.0.0.1", "port": 8787, "token_env": "HYPERV_MCP_HTTP_TOKEN" }
+  "http": { "host": "127.0.0.1", "port": 8787, "token_env": "HYPERV_MCP_HTTP_TOKEN",
+            "agents": { "agent-a": "HYPERV_MCP_TOKEN_AGENT_A" } }
 }
 ```
 
@@ -465,10 +488,15 @@ rejected once the cap is reached) and holds the start-time credentials until
 a successful stop, cap eviction, or process exit — plan accordingly on
 shared hosts. `exiting` is not a terminal state: if the guest wrapper dies
 before writing its exit-code file, status stays `exiting` until you call
-`hyperv_guest_job_stop`. Registry follow-ups (status/output/stop) write
-audit rows with an empty vm_name and no job/relay id (they address the
-host-side registry, not a VM operation) — a follow-up row cannot be
-correlated to the specific job or relay that started it.
+`hyperv_guest_job_stop`. Every job/relay tool call writes an audit row
+naming the caller's agent id (null on stdio or `--allow-anonymous`) and a
+server-generated request id. When the call addresses or creates a specific
+handle, the row also carries that `job_id`/`relay_id` and — for known ids —
+the VM from the registry, so a follow-up row joins to the start row that
+created the handle (issue #10). Shapes that honestly audit empty/null
+attribution: `hyperv_relay_status` without a relay id (list-all), calls on
+unknown ids, rejections of calls addressing unknown ids, and (for the VM
+half) follow-ups racing a still-starting job.
 
 ### Reboot Recovery (0.3.0)
 
@@ -651,8 +679,11 @@ CI (`.github/workflows/ci.yml`) runs ruff + mypy + unit tests on
   any process that can talk to it can attempt every enabled tool. Policy
   allowlists and confirm gates are the mitigation — keep `unrestricted`
   off on shared hosts.
-- The streamable-http endpoint is single-token: possession of the token is
-  full authority. Loopback + file ACLs are the boundary.
+- The streamable-http endpoint's authority is its bearer token(s): with one
+  shared token, possession is full authority; with `http.agents`, each token
+  carries the same tool authority but calls are attributable to their agent
+  in the audit log (no per-agent authorization yet — ownership enforcement
+  is a planned follow-up). Loopback + file ACLs are the boundary.
 - Guest command/script contents are executed as-is inside the guest by
   design (this is a research tool); guest-path allowlists govern *file
   transfer* roots, not arguments inside commands you choose to run.

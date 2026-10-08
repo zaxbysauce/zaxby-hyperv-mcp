@@ -39,6 +39,23 @@ def _elevated() -> bool:
         return False
 
 
+def _tokens_match(presented: str, expected: str) -> bool:
+    """Constant-time token comparison that tolerates any Unicode input.
+
+    secrets.compare_digest raises TypeError on non-ASCII str operands, and
+    the auth middleware does not guard verifier exceptions — so the compare
+    runs on UTF-8 bytes (surrogatepass keeps arbitrary header-decoded text
+    encodable) and degrades to a plain non-match instead of a 500.
+    """
+    try:
+        return secrets.compare_digest(
+            presented.encode("utf-8", "surrogatepass"),
+            expected.encode("utf-8", "surrogatepass"),
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 class _StaticTokenVerifier(TokenVerifier):
     """Single shared-token verifier for a loopback research endpoint."""
 
@@ -46,9 +63,86 @@ class _StaticTokenVerifier(TokenVerifier):
         self._token = token
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        if token and secrets.compare_digest(token, self._token):
+        if token and _tokens_match(token, self._token):
             return AccessToken(token=token, client_id="local-cli", scopes=[])
         return None
+
+
+class _MultiTokenVerifier(TokenVerifier):
+    """Per-agent bearer tokens (issue #10): each configured agent's token
+    verifies to that agent's own client_id, so audit rows can name the
+    caller. Compares the presented token against EVERY pair with
+    secrets.compare_digest (constant-time per pair, no dict keyed by the
+    secret); duplicate token values are refused at startup, so at most one
+    pair can match."""
+
+    def __init__(self, pairs: list[tuple[str, str]]) -> None:
+        self._pairs = list(pairs)
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if not token:
+            return None
+        matched: str | None = None
+        for agent_id, expected in self._pairs:
+            if _tokens_match(token, expected):
+                matched = agent_id
+        if matched is None:
+            return None
+        return AccessToken(token=token, client_id=matched, scopes=[])
+
+
+def _resolve_agent_tokens(
+    agents: dict[str, str], legacy_token: str
+) -> tuple[int, list[tuple[str, str]]]:
+    """Resolve per-agent token values from the environment (issue #10).
+
+    Returns (rc, pairs). rc 0 carries the (agent_id, token) pairs; the legacy
+    shared token joins them as ("local-cli", ...) when its env var is also
+    set to a non-blank value, so single-token deployments keep working
+    alongside per-agent tokens. Values are stripped (a padded export must
+    still authenticate) and non-ASCII values are refused (they could never
+    survive an HTTP Authorization header round-trip). rc 2 means startup
+    must abort: a missing/blank agent token variable, a non-ASCII value, or
+    a collision — two agents (or an agent and the legacy token) resolving to
+    the same value would reintroduce the identity collapse this scheme
+    removes. Errors name agent ids, never token values.
+    """
+    pairs: list[tuple[str, str]] = []
+    for agent_id in sorted(agents):
+        value = os.environ.get(agents[agent_id], "").strip()
+        if not value:
+            print(
+                f"ERROR: agent '{agent_id}' token environment variable "
+                f"{agents[agent_id]} is not set. Generate a token "
+                "(python -c \"import secrets; print(secrets.token_urlsafe(32))\") "
+                "and export it before starting.",
+                file=sys.stderr,
+            )
+            return 2, []
+        if not value.isascii():
+            print(
+                f"ERROR: agent '{agent_id}' token must contain only ASCII "
+                "characters (an HTTP Authorization header could never carry "
+                "the configured value). Token values are never printed.",
+                file=sys.stderr,
+            )
+            return 2, []
+        pairs.append((agent_id, value))
+    legacy = legacy_token.strip()
+    if legacy:
+        pairs.append(("local-cli", legacy))
+    owner: dict[str, str] = {}
+    for agent_id, value in pairs:
+        if value in owner:
+            print(
+                f"ERROR: token collision: '{owner[value]}' and '{agent_id}' "
+                "resolve to the same bearer token. Give each agent its own "
+                "token (token values are never printed).",
+                file=sys.stderr,
+            )
+            return 2, []
+        owner[value] = agent_id
+    return 0, pairs
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -75,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
     token_env = cfg.http.token_env
     token = os.environ.get(token_env, "")
 
-    verifier = None
+    verifier: TokenVerifier | None = None
     if ns.allow_anonymous:
         print(
             "WARNING: --allow-anonymous is set. Every local process that can "
@@ -83,6 +177,14 @@ def main(argv: list[str] | None = None) -> int:
             "ones. This is only acceptable on a disposable research host.",
             file=sys.stderr,
         )
+    elif cfg.http.agents:
+        # Per-agent tokens take over the endpoint; the legacy shared token is
+        # not required (agents-only mode starts fine without it) but joins the
+        # pair list when its variable is also set.
+        rc, pairs = _resolve_agent_tokens(cfg.http.agents, token)
+        if rc != 0:
+            return rc
+        verifier = _MultiTokenVerifier(pairs)
     elif not token:
         print(
             f"ERROR: {token_env} is not set. Generate a token "
@@ -122,13 +224,23 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     print(f"endpoint:            http://{host}:{port}/mcp", file=sys.stderr)
-    print(f"auth:                {'bearer token' if verifier else 'ANONYMOUS (--allow-anonymous)'}", file=sys.stderr)
+    if isinstance(verifier, _MultiTokenVerifier):
+        auth_desc = f"per-agent bearer tokens ({len(cfg.http.agents)} agent(s))"
+        if len(verifier._pairs) > len(cfg.http.agents):
+            # The legacy shared token joined the pair list: disclose it so an
+            # operator who meant to run agents-only sees the extra principal.
+            auth_desc += " + legacy shared token (local-cli)"
+    else:
+        auth_desc = "bearer token" if verifier else "ANONYMOUS (--allow-anonymous)"
+    print(f"auth:                {auth_desc}", file=sys.stderr)
 
     if host not in ("127.0.0.1", "::1", "localhost"):
         print(
             f"WARNING: binding to {host} exposes the endpoint beyond this "
-            "machine. MCP streamable-http here has no per-user identity — "
-            "prefer an SSH tunnel or a reverse proxy with auth.",
+            "machine. The bearer token(s) are the only identity on this "
+            "endpoint (per agent when http.agents is configured; one shared "
+            "principal otherwise) — prefer an SSH tunnel or a reverse proxy "
+            "with auth.",
             file=sys.stderr,
         )
 
