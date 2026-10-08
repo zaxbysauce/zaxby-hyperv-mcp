@@ -547,7 +547,12 @@ forwarding; any request without the correct secret — including a bare
 connection closed and no PowerShell process spawned. The secret (>=128
 bits, `secrets`-generated) exists ONLY in the starting agent's
 `relay_start` result: `hyperv_relay_status` row urls are identifiers, not
-request-capable URLs. Ownership (issue #11): a relay belongs to the agent
+request-capable URLs. The capability path must be followed by a
+non-empty path segment: a request to the bare capability URL
+(`http://127.0.0.1:<port>/<secret>/`) answers 401 like any other
+unauthenticated request — address the guest root as
+`<capability-url>json/version`-style paths (e.g. append `/` or a real
+path). Ownership (issue #11): a relay belongs to the agent
 that started it (the bearer token's agent identity); `relay_status` lists
 only the calling agent's relays, and `relay_status`/`relay_stop` with
 another agent's id return the same `unknown relay_id` error as an absent

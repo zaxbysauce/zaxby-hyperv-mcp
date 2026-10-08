@@ -481,23 +481,39 @@ def relay_start(
     thread = threading.Thread(
         target=server.serve_forever, name=f"hyperv-relay-{relay_id}", daemon=True,
     )
-    thread.start()
-    entry = {
-        "relay_id": relay_id,
-        "vm_name": ref.name,
-        "vm_id": ref.id,
-        "guest_port": int(guest_port),
-        "bind": bind,
-        "host_port": server.server_address[1],
-        "server": server,
-        "thread": thread,
-        "context": context,
-        "owner": owner,
-        "started_at": _utc_now_iso(),
-        "stopped": False,
-    }
-    with _relays_lock:
-        _relays[relay_id] = entry
+    try:
+        thread.start()
+        entry = {
+            "relay_id": relay_id,
+            "vm_name": ref.name,
+            "vm_id": ref.id,
+            "guest_port": int(guest_port),
+            "bind": bind,
+            "host_port": server.server_address[1],
+            "server": server,
+            "thread": thread,
+            "context": context,
+            "owner": owner,
+            "started_at": _utc_now_iso(),
+            "stopped": False,
+        }
+        with _relays_lock:
+            _relays[relay_id] = entry
+    except BaseException:
+        # No exception between the bind and the registration may strand the
+        # in-flight placeholder (it is invisible to status, unstoppable,
+        # and would consume a cap slot and block this vm:guest_port forever
+        # via the duplicate scan — implementation-review round 1, Finding 1)
+        # nor leak the bound socket. server_close (not shutdown: a failed
+        # start never entered serve_forever, and shutdown would wait on a
+        # loop that will never run) releases the listener; the placeholder
+        # release mirrors guestjobs job_start's reserve-to-register window.
+        _release()
+        try:
+            server.server_close()
+        except Exception:
+            pass
+        raise
     host_port_actual = entry["host_port"]
     return {
         "ok": True,

@@ -144,3 +144,55 @@ def test_foreign_in_flight_job_id_reads_unknown():
     finally:
         with guestjobs._jobs_lock:
             guestjobs._jobs.clear()
+
+
+def test_bind_failure_after_reservation_releases_placeholder(monkeypatch):
+    """A bind OSError AFTER the reservation must release the in-flight
+    placeholder: no stranded slot, registry empty (issue #11 review)."""
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+    monkeypatch.setattr(relay, "_RelayServer", lambda addr, handler: (_ for _ in ()).throw(OSError("boom")))
+    cfg = _relay_cfg()
+    with pytest.raises(RuntimeError, match="could not bind"):
+        relay.relay_start(cfg, "test-vm", 9222, cred=CRED)
+    assert relay._relays == {}
+
+
+def test_thread_start_failure_releases_placeholder_and_closes_socket(monkeypatch):
+    """A post-bind failure (Thread.start under resource exhaustion raises
+    RuntimeError) must release the in-flight placeholder AND close the
+    bound socket — an unreleased strand would be invisible to status,
+    unstoppable, cap-consuming, and would block that vm:port forever via
+    the duplicate scan (issue #11 implementation review, Finding 1)."""
+    import threading as threading_mod
+
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+
+    class BoomThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    closed = []
+
+    class StubServer:
+        daemon_threads = True
+        allow_reuse_address = True
+
+        def __init__(self, addr, handler):
+            self.server_address = (addr[0], 0)
+
+        def serve_forever(self, poll_interval=0.5):
+            raise AssertionError("never runs: Thread.start is stubbed to fail")
+
+        def server_close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(relay, "_RelayServer", StubServer)
+    monkeypatch.setattr(threading_mod, "Thread", BoomThread)
+    cfg = _relay_cfg()
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        relay.relay_start(cfg, "test-vm", 9222, cred=CRED)
+    assert relay._relays == {}
+    assert closed == [True]
