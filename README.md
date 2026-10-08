@@ -488,11 +488,15 @@ rejected once the cap is reached) and holds the start-time credentials until
 a successful stop, cap eviction, or process exit — plan accordingly on
 shared hosts. `exiting` is not a terminal state: if the guest wrapper dies
 before writing its exit-code file, status stays `exiting` until you call
-`hyperv_guest_job_stop`. Every job/relay tool call — starts and registry
-follow-ups alike — writes an audit row naming the caller's agent id, a
-server-generated request id, the VM the job/relay runs on, and the
-`job_id`/`relay_id` it acted on, so a follow-up row joins to the start row
-that created the handle (issue #10).
+`hyperv_guest_job_stop`. Every job/relay tool call writes an audit row
+naming the caller's agent id (null on stdio or `--allow-anonymous`) and a
+server-generated request id. When the call addresses or creates a specific
+handle, the row also carries that `job_id`/`relay_id` and — for known ids —
+the VM from the registry, so a follow-up row joins to the start row that
+created the handle (issue #10). Shapes that honestly audit empty/null
+attribution: `hyperv_relay_status` without a relay id (list-all), calls on
+unknown ids, calls rejected before the tool body runs, and (for the VM
+half) follow-ups racing a still-starting job.
 
 ### Reboot Recovery (0.3.0)
 

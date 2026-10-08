@@ -26,9 +26,13 @@ SCHEMA_VERSION = 1
 
 # Agent ids become audit `agent_id` values and verifier principals (issue #10).
 # "local-cli" is the LEGACY shared-token principal — a configured agent must
-# never collapse into it.
-_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+# never collapse into it. fullmatch (not match+$) so a trailing newline can
+# never smuggle a control character past the documented charset.
+_AGENT_ID_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 _RESERVED_AGENT_IDS = {"local-cli"}
+# Config values must BE environment variable NAMES: a token pasted here would
+# otherwise be echoed to stderr by the missing-variable startup error.
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _set_agents(value: Any) -> dict[str, str]:
@@ -37,7 +41,7 @@ def _set_agents(value: Any) -> dict[str, str]:
         raise ConfigError("http.agents must be an object of agent id -> env var name")
     agents: dict[str, str] = {}
     for agent_id, env_name in value.items():
-        if not isinstance(agent_id, str) or not _AGENT_ID_RE.match(agent_id):
+        if not isinstance(agent_id, str) or not _AGENT_ID_RE.fullmatch(agent_id):
             raise ConfigError(
                 f"http.agents agent id {agent_id!r} must match "
                 "[A-Za-z0-9_.-]{1,64}"
@@ -47,10 +51,15 @@ def _set_agents(value: Any) -> dict[str, str]:
                 f"http.agents agent id {agent_id!r} is reserved for the legacy "
                 "single-token principal"
             )
-        if not isinstance(env_name, str) or not env_name.strip():
+        if (
+            not isinstance(env_name, str)
+            or not env_name.strip()
+            or not _ENV_NAME_RE.fullmatch(env_name.strip())
+        ):
             raise ConfigError(
-                f"http.agents[{agent_id!r}] must name a non-empty environment "
-                "variable (the token value itself never goes in config)"
+                f"http.agents[{agent_id!r}] must name a valid environment "
+                "variable (a NAME like MY_AGENT_TOKEN — the token value "
+                "itself never goes in config)"
             )
         agents[agent_id] = env_name.strip()
     return agents

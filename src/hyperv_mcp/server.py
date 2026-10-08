@@ -2080,15 +2080,27 @@ def _harden_tools(mcp: FastMCP) -> None:
                 value = str(args.get(key) or "")
                 return value or None
 
+            job_id = _opt_id("job_id")
+            relay_id = _opt_id("relay_id")
+            vm_name = str(args.get("vm_name") or "")
+            if not vm_name:
+                # A rejected by-id follow-up still knows its registry entry:
+                # resolve the VM so the row joins to the start row like the
+                # success path does (impl-review PRR-003).
+                if job_id:
+                    vm_name = guestjobs.peek_vm_name(job_id)
+                elif relay_id:
+                    vm_name = relay.peek_vm_name(relay_id)
+
             try:
                 auditlog.log_operation(
                     tool=name,
-                    vm_name=str(args.get("vm_name") or ""),
+                    vm_name=vm_name,
                     category="",
                     ok=False,
                     error_class=str(env.get("error_class") or ""),
-                    job_id=_opt_id("job_id"),
-                    relay_id=_opt_id("relay_id"),
+                    job_id=job_id,
+                    relay_id=relay_id,
                 )
             except Exception as audit_exc:  # noqa: BLE001 - best-effort: a
                 # broken audit sink must not turn a rejection into a raw
