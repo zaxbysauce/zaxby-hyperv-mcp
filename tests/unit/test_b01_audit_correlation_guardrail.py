@@ -168,15 +168,47 @@ def test_authenticated_rejections_carry_agent_id_and_distinct_request_ids(audite
 
 def test_wrong_typed_job_id_rejection_still_writes_one_row(audited_server):
     """A wrong-typed job_id argument is str()-coerced: exactly one rejection
-    row, carrying job_id '123'; an absent relay_id serializes as null."""
+    row, carrying job_id '123'; an absent relay_id serializes as null. A
+    falsy numeric id (0) shares the absent representation — the empty handle
+    is not a resource reference, matching the vm_name idiom at the same
+    site."""
     mod, log = audited_server
     mcp = mod.get_mcp()
     asyncio.run(mcp.call_tool("hyperv_guest_job_status", {"job_id": 123}))
+    asyncio.run(mcp.call_tool("hyperv_guest_job_status", {"job_id": 0}))
     rows = [r for r in _rows(log) if r["tool"] == "hyperv_guest_job_status"]
-    assert len(rows) == 1, f"expected exactly one rejection row, got {len(rows)}"
-    assert rows[0]["ok"] is False
-    assert rows[0]["job_id"] == "123"
-    assert rows[0]["relay_id"] is None
+    assert len(rows) == 2, f"expected exactly two rejection rows, got {len(rows)}"
+    assert all(r["ok"] is False for r in rows)
+    by_id = {r["job_id"]: r for r in rows}
+    assert "123" in by_id and by_id["123"]["relay_id"] is None
+    assert None in by_id  # 0 coerces to the absent representation
+
+
+def test_failed_job_followup_audit_row_carries_supplied_job_id(audited_server):
+    """A job follow-up whose tool leg RAISES (unknown job_id) still audits
+    the row with the job_id the call supplied — the failure path is the only
+    source when no result dict exists to adopt from (impl review P2)."""
+    mod, log = audited_server
+    mcp = mod.get_mcp()
+    asyncio.run(mcp.call_tool("hyperv_guest_job_status", {"job_id": "no-such-job-id-123"}))
+    rows = [r for r in _rows(log) if r["tool"] == "hyperv_guest_job_status" and r["ok"] is False]
+    assert len(rows) == 1, f"expected one failure row, got {len(rows)}"
+    assert rows[0]["error_class"] == "invalid"
+    assert rows[0]["job_id"] == "no-such-job-id-123"
+    assert rows[0]["vm_name"] == ""  # peek of an unknown id: honest empty
+
+
+def test_failed_relay_stop_audit_row_carries_supplied_relay_id(audited_server):
+    """The relay failure analogue: relay_stop on an unknown relay_id audits
+    relay_id with the supplied value and an honest empty vm_name."""
+    mod, log = audited_server
+    mcp = mod.get_mcp()
+    asyncio.run(mcp.call_tool("hyperv_relay_stop", {"relay_id": "relay-404-nope"}))
+    rows = [r for r in _rows(log) if r["tool"] == "hyperv_relay_stop" and r["ok"] is False]
+    assert len(rows) == 1, f"expected one failure row, got {len(rows)}"
+    assert rows[0]["error_class"] == "invalid"
+    assert rows[0]["relay_id"] == "relay-404-nope"
+    assert rows[0]["vm_name"] == ""
 
 
 def test_guest_tool_credential_failure_envelope_and_audit(audited_server, monkeypatch):
