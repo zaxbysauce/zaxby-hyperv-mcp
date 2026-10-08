@@ -538,13 +538,33 @@ deliberately do not serialize behind the per-VM lock and are not audited
 tool call itself writes an audit row). The guest endpoint's
 redirect responses are followed BY THE GUEST (Invoke-WebRequest default) —
 a guest endpoint serving a 3xx sends the guest to the redirect target.
-Trust model: the listener binds 127.0.0.1 but has NO application-layer
-auth — any local process that can reach the port can drive the stored
-guest credential while the relay runs; loopback binding is the entire
-boundary, so treat the port like any other unauthenticated local service.
-The relay holds the start-time credentials until `hyperv_relay_stop`.
-Guest-side HTTP error statuses pass through to the caller (a guest 404
-arrives as 404 with the relay error envelope); a request racing
+Trust model: the listener binds 127.0.0.1 and requires the relay's own
+secret on every request (issue #11): `hyperv_relay_start` returns a
+capability URL, `http://127.0.0.1:<port>/<secret>/`, and the listener
+verifies (constant-time) and strips that first path segment before
+forwarding; any request without the correct secret — including a bare
+`curl http://127.0.0.1:<port>/json/version` — answers 401 with the
+connection closed and no PowerShell process spawned. The secret (>=128
+bits, `secrets`-generated) exists ONLY in the starting agent's
+`relay_start` result: `hyperv_relay_status` row urls are identifiers, not
+request-capable URLs. Ownership (issue #11): a relay belongs to the agent
+that started it (the bearer token's agent identity); `relay_status` lists
+only the calling agent's relays, and `relay_status`/`relay_stop` with
+another agent's id return the same `unknown relay_id` error as an absent
+id, so ids cannot be probed. Without an identity (stdio in-process,
+`--allow-anonymous`), all callers form one local principal and behavior
+is unchanged. The registry is capped at 16 active relays; stopped entries
+are evicted oldest-first (their stored credentials released) when the cap
+is reached, and the duplicate-target check and the registry reservation
+are one atomic step, so two concurrent starts for the same VM and guest
+port admit exactly one (the loser gets the duplicate-target error, which
+names the existing relay's id — an accepted residual disclosure: the
+secret, not the id, is the capability). The relay holds the start-time
+credentials until `hyperv_relay_stop`, cap-time eviction, or process
+exit. Job ids and relay ids carry 128 bits of randomness (32 hex / 32
+hex), so an id learned from a transcript or audit row cannot be guessed
+either. Guest-side HTTP error statuses pass through to the caller (a
+guest 404 arrives as 404 with the relay error envelope); a request racing
 `hyperv_relay_stop` receives a clean 503 relay-stopped envelope.
 
 ### Evidence Capture (0.3.0)

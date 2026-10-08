@@ -11,7 +11,30 @@ Lock policy: the relay lifecycle tools are audited tool calls, but the
 per-request PS Direct legs deliberately SKIP vm_lock (pinned in the plan) —
 a proxied request must not fail because an unrelated tool call holds the
 VM. Credential lifetime: the stored credential set lives until
-relay_stop/eviction/process exit; stop nulls the field.
+relay_stop/EVICTION/process exit; stop nulls the field and cap-time
+eviction nulls an evicted entry's field before deleting it.
+
+Ownership and listener auth (issue #11): a relay belongs to the agent
+that started it (`owner`, the bearer token's client_id; None = the
+unattributed local principal on stdio/anonymous/direct-module paths) —
+status/stop from a different agent get the SAME `unknown relay_id`
+response as an absent id, and listings show only the caller's own relays.
+Each relay start mints a per-relay secret (>=128 bits, secrets.token_urlsafe)
+returned ONLY inside the starting agent's `relay_start` result, embedded
+in the returned url as a capability path prefix (`/<secret>/`). The
+listener verifies and strips that prefix (constant-time, byte-wise)
+before any forwarding; any other request gets 401 with the connection
+closed and no PowerShell leg. The secret never appears in relay_status
+rows (their urls are identifiers, not request-capable), logs, or audit
+rows, and is stripped before the guest-side URL is built.
+
+Registry discipline (issue #11, mirroring guestjobs): the registry is
+capped at _MAX_RELAYS, the duplicate-target check and an in-flight
+placeholder reservation share ONE critical section (concurrent duplicate
+starts admit exactly one — the loser is rejected before binding), the
+listener binds outside the lock and a bind failure releases the
+placeholder, and stopped entries are evicted oldest-first at reservation
+time (credential nulled before delete).
 
 Identity (issue #8): relay_start resolves the target ONCE via
 vmident.resolve and stores the resolved GUID (`vm_id`) alongside the
@@ -25,8 +48,8 @@ from __future__ import annotations
 
 import base64
 import json
+import secrets
 import threading
-import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -40,6 +63,7 @@ _LOOPBACK_BINDS = {"127.0.0.1", "localhost", "::1"}
 _MAX_BODY_BYTES = 1024 * 1024
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 _REQUEST_TIMEOUT_S = 30
+_MAX_RELAYS = 16
 
 _relays: dict[str, dict[str, Any]] = {}
 _relays_lock = threading.Lock()
@@ -62,13 +86,15 @@ def peek_vm_name(relay_id: str) -> str:
     """Read-only vm_name lookup for audit rows (issue #10).
 
     Unlike the inline get-and-raise in relay_status/relay_stop this never
-    raises: an unknown or empty id reads as "" (an honest absence), so a
-    relay call's audit row can name the VM even when the tool leg itself
-    fails. Read-only by design — it never touches credentials or stop state.
+    raises: an unknown, empty, or in-flight placeholder id reads as ""
+    (an honest absence — the issue #11 guard keeps placeholder state out
+    of any audit row, mirroring guestjobs.peek_vm_name), so a relay call's
+    audit row can name the VM even when the tool leg itself fails.
+    Read-only by design — it never touches credentials or stop state.
     """
     with _relays_lock:
         entry = _relays.get(relay_id or "")
-    if entry is None:
+    if entry is None or entry.get("in_flight"):
         return ""
     return str(entry.get("vm_name") or "")
 
@@ -218,6 +244,37 @@ class _RelayHandler(BaseHTTPRequestHandler):
         ctx = self.context
         self._bump("requests")
         try:
+            # Capability check FIRST (issue #11): the caller must present
+            # the relay's secret as the first url path segment, exactly as
+            # relay_start returned it (url = http://<bind>:<port>/<secret>/).
+            # The segment is compared byte-wise and constant-time (a
+            # str-vs-str compare_digest would raise TypeError on a
+            # non-ASCII segment — request targets are latin-1-decoded and
+            # attacker-chosen — and surface as 502 instead of 401).
+            # Anything else is rejected with the connection closed and NO
+            # guest leg. The remainder (everything after the secret's
+            # closing slash, VERBATIM — never re-slash-joined) then flows
+            # through the existing path-absolute / chunked / Content-Length
+            # guards unchanged: an appended path brings its own leading
+            # slash, so `url + "/json/version"` forwards as
+            # `/json/version`, while a smuggled `@host` target still 400s.
+            raw = self.path
+            first_slash = raw.find("/", 1)
+            if first_slash == -1:
+                supplied, remainder = raw[1:], ""
+            else:
+                # The secret segment closes at first_slash; everything
+                # AFTER it is the verbatim remainder (url + "/path"
+                # arrivals carry their own leading slash there, so the
+                # forwarded path is byte-identical to a bare-path request
+                # against the pre-#11 listener).
+                supplied, remainder = raw[1:first_slash], raw[first_slash + 1:]
+            if (not supplied or not remainder or not secrets.compare_digest(
+                supplied.encode("utf-8"), str(ctx["secret"]).encode("utf-8"),
+            )):
+                self._reply_error(401, "relay secret required")
+                return
+            self.path = remainder
             # The relay forwards ONLY path-absolute targets. An
             # authority-form target ("GET @evil.example/ HTTP/1.1") or an
             # absolute-form URL would let a caller steer the guest-side
@@ -325,6 +382,7 @@ def relay_start(
     host_port: int = 0,
     bind: str = "127.0.0.1",
     cred: CredentialSet | None = None,
+    owner: str | None = None,
 ) -> dict:
     """Start a loopback HTTP relay to the guest's 127.0.0.1:guest_port.
 
@@ -332,6 +390,15 @@ def relay_start(
     vmident.resolve enforces identity and policy). The stored GUID addresses
     every per-request leg, and the duplicate check compares it, so renames
     never fork or retarget a relay.
+
+    Issue #11: `owner` records the starting agent (None = the unattributed
+    local principal); the returned `url` is a capability URL embedding the
+    relay's per-relay secret (`/<secret>/` prefix) — the ONLY place the
+    secret is ever returned. The duplicate check and the registry
+    reservation share one critical section, so concurrent duplicate starts
+    admit exactly one (the loser is rejected before binding); the registry
+    is capped at _MAX_RELAYS and stopped entries are evicted oldest-first
+    (credential nulled) to make room.
     """
     if cred is None:
         raise ValueError("guest credentials are required")
@@ -346,6 +413,16 @@ def relay_start(
     # name — caller-supplied or resolved from the GUID).
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
 
+    relay_id = f"relay-{guest_port}-{secrets.token_hex(16)}"
+    secret = secrets.token_urlsafe(16)
+
+    # ONE critical section owns the duplicate check AND the reservation
+    # (issue #11, FND-10): the in-flight placeholder counts as a live
+    # target for the duplicate scan (stopped entries skipped) and against
+    # the cap, so two concurrent starts for the same vm/port admit exactly
+    # one — the loser raises here, before binding anything. At capacity,
+    # stopped entries are evicted oldest-first (credential nulled before
+    # delete, mirroring guestjobs._reserve_slot).
     with _relays_lock:
         for entry in _relays.values():
             if not entry.get("stopped") and entry["vm_id"] == ref.id \
@@ -353,6 +430,36 @@ def relay_start(
                 raise ValueError(
                     f"a relay to {ref.name}:{guest_port} already exists ({entry['relay_id']})"
                 )
+        if len(_relays) >= _MAX_RELAYS:
+            stopped = sorted(
+                (k for k, v in _relays.items() if v.get("stopped")),
+                key=lambda k: _relays[k]["started_at"],
+            )
+            for key in stopped[: max(1, len(_relays) - _MAX_RELAYS + 1)]:
+                evicted = _relays[key]
+                evicted["context"]["cred"] = None
+                del _relays[key]
+        if len(_relays) >= _MAX_RELAYS:
+            raise RuntimeError(
+                f"relay registry is full ({_MAX_RELAYS} active relays); "
+                "stop relays before starting more"
+            )
+        _relays[relay_id] = {
+            "relay_id": relay_id,
+            "vm_name": ref.name,
+            "vm_id": ref.id,
+            "guest_port": int(guest_port),
+            "owner": owner,
+            "in_flight": True,
+            "started_at": _utc_now_iso(),
+            "stopped": False,
+        }
+
+    def _release() -> None:
+        with _relays_lock:
+            current = _relays.get(relay_id)
+            if current is not None and current.get("in_flight"):
+                del _relays[relay_id]
 
     context: dict[str, Any] = {
         "cfg": cfg,
@@ -360,6 +467,7 @@ def relay_start(
         "vm_id": ref.id,
         "guest_port": int(guest_port),
         "cred": cred,
+        "secret": secret,
         "counters": _new_counters(),
         "counter_lock": threading.Lock(),
     }
@@ -367,8 +475,8 @@ def relay_start(
     try:
         server = _RelayServer((bind, int(host_port)), handler)
     except OSError as exc:
+        _release()
         raise RuntimeError(f"could not bind {bind}:{host_port or 0}: {exc}") from None
-    relay_id = f"relay-{guest_port}-{uuid.uuid4().hex[:8]}"
     context["relay_id"] = relay_id
     thread = threading.Thread(
         target=server.serve_forever, name=f"hyperv-relay-{relay_id}", daemon=True,
@@ -384,32 +492,52 @@ def relay_start(
         "server": server,
         "thread": thread,
         "context": context,
+        "owner": owner,
         "started_at": _utc_now_iso(),
         "stopped": False,
     }
     with _relays_lock:
         _relays[relay_id] = entry
+    host_port_actual = entry["host_port"]
     return {
         "ok": True,
         "relay_id": relay_id,
         "vm_name": ref.name,
         "guest_port": int(guest_port),
         "bind": bind,
-        "host_port": entry["host_port"],
-        "url": f"http://{bind}:{entry['host_port']}",
+        "host_port": host_port_actual,
+        # Capability URL (issue #11): the per-relay secret rides as the
+        # first path segment; requests without it get 401 at the listener.
+        "url": f"http://{bind}:{host_port_actual}/{secret}/",
         "started_at": entry["started_at"],
     }
 
 
-def relay_status(cfg: Config, relay_id: str = "") -> dict:
+def relay_status(cfg: Config, relay_id: str = "", *, owner: str | None = None) -> dict:
+    """List the calling principal's relays (or one by id).
+
+    Issue #11: a non-None owner sees only its OWN relays — a foreign or
+    unknown id is the SAME `unknown relay_id` ValueError, and in-flight
+    placeholders (starts still binding) are invisible. None (stdio/
+    anonymous/direct module calls) is the unattributed local principal
+    and skips the ownership filter. Row urls are IDENTIFIERS: the
+    capability secret appears only in the starting agent's relay_start
+    result.
+    """
     with _relays_lock:
         if relay_id:
             entry = _relays.get(relay_id)
-            if entry is None:
+            if entry is None or entry.get("in_flight") or (
+                owner is not None and entry.get("owner") != owner
+            ):
                 raise ValueError(f"unknown relay_id {relay_id!r}")
             selected = [entry]
         else:
-            selected = list(_relays.values())
+            selected = [
+                e for e in _relays.values()
+                if not e.get("in_flight")
+                and (owner is None or e.get("owner") == owner)
+            ]
     rows = []
     for entry in selected:
         with entry["context"]["counter_lock"]:
@@ -420,7 +548,7 @@ def relay_status(cfg: Config, relay_id: str = "") -> dict:
             "guest_port": entry["guest_port"],
             "bind": entry["bind"],
             "host_port": entry["host_port"],
-            "url": f"http://{entry['bind']}:{entry['host_port']}",
+            "url": f"http://{entry['bind']}:{entry['host_port']}/",
             "started_at": entry["started_at"],
             "stopped": bool(entry["stopped"]),
             "thread_alive": bool(entry["thread"].is_alive()),
@@ -429,12 +557,20 @@ def relay_status(cfg: Config, relay_id: str = "") -> dict:
     return {"ok": True, "relays": rows}
 
 
-def relay_stop(cfg: Config, relay_id: str) -> dict:
+def relay_stop(cfg: Config, relay_id: str, *, owner: str | None = None) -> dict:
+    """Stop a relay: close the loopback listener and release the stored
+    credentials. Issue #11: a non-None owner may stop only its OWN relay
+    — a foreign or unknown id is the SAME `unknown relay_id` ValueError
+    (no existence oracle); an in-flight placeholder (start still binding)
+    is invisible. The stopped entry stays in the registry (visible as
+    stopped in relay_status) until cap-time eviction."""
     if not relay_id:
         raise ValueError("relay_id is required")
     with _relays_lock:
         entry = _relays.get(relay_id)
-        if entry is None:
+        if entry is None or entry.get("in_flight") or (
+            owner is not None and entry.get("owner") != owner
+        ):
             raise ValueError(f"unknown relay_id {relay_id!r}")
         already = bool(entry["stopped"])
         entry["stopped"] = True

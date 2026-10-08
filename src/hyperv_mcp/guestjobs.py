@@ -15,6 +15,16 @@ display name; every follow-up leg (status/output/stop) addresses the guest
 by that stored GUID, so a VM rename between legs can never retarget a leg
 at a different VM.
 
+Ownership (issue #11): every entry records the starting agent's verified
+identity (`owner`, the bearer token's client_id; None = the unattributed
+local principal on stdio/anonymous/direct-module paths). A follow-up from
+a different agent gets the SAME `unknown job_id` response as an absent id
+— no guest leg runs and no stored credential is touched for a foreign
+caller — and the check precedes the in-flight check so an in-flight start
+is never disclosed to a foreign probe. Job ids are 128-bit (`uuid4().hex`);
+ids appear in transcripts and audit rows, so ownership is the
+authorization and the width removes guessing as a residual vector.
+
 Lock policy: every guest leg (start/status/output/stop) runs under vm_lock
 acquired per leg inside diagnostics.run_guest_inner (keyed on the GUID);
 registry bookkeeping
@@ -76,7 +86,7 @@ def peek_vm_name(job_id: str) -> str:
     return str(entry.get("vm_name") or "")
 
 
-def _reserve_slot(job_id: str) -> None:
+def _reserve_slot(job_id: str, owner: str | None = None) -> None:
     """Atomically reserve a registry slot BEFORE the guest start leg.
 
     Evicts oldest stopped entries when at capacity; rejects when the
@@ -84,7 +94,8 @@ def _reserve_slot(job_id: str) -> None:
     placeholder) counts against the cap from the moment it is taken, so
     concurrent starts on different VMs cannot collectively exceed
     _MAX_JOBS (review round 2, N2); on a failed start the caller must
-    _release_slot it.
+    _release_slot it. The placeholder carries the owning agent so the
+    slot cannot be re-registered under a different owner (issue #11).
     """
     with _jobs_lock:
         if len(_jobs) >= _MAX_JOBS:
@@ -102,7 +113,7 @@ def _reserve_slot(job_id: str) -> None:
             )
         _jobs[job_id] = {
             "job_id": job_id, "vm_name": "", "vm_id": "", "pid": 0,
-            "in_flight": True,
+            "in_flight": True, "owner": owner,
             "started_at": _utc_now_iso(), "cred": None, "stopped": False,
         }
 
@@ -119,12 +130,26 @@ def _register(job: dict[str, Any]) -> None:
         _jobs[job["job_id"]] = job
 
 
-def _lookup(job_id: str) -> dict[str, Any]:
+def _lookup(job_id: str, owner: str | None = None) -> dict[str, Any]:
+    """Resolve a job entry for the calling principal (issue #11).
+
+    A non-None owner (the verified agent id from the bearer token) may
+    only address its OWN entries: a foreign id raises the SAME
+    `unknown job_id` ValueError as an absent one — same message shape,
+    same envelope — so ids cannot be probed for existence, and the check
+    runs BEFORE the in-flight check so an in-flight start is never
+    disclosed to a foreign caller. None (stdio in-process, anonymous,
+    direct module calls) is the unattributed local principal and skips
+    the ownership check entirely — the documented single-principal
+    contract these callers have always had.
+    """
     if not job_id:
         raise ValueError("job_id is required")
     with _jobs_lock:
         entry = _jobs.get(job_id)
     if entry is None:
+        raise ValueError(f"unknown job_id {job_id!r}")
+    if owner is not None and entry.get("owner") != owner:
         raise ValueError(f"unknown job_id {job_id!r}")
     if entry.get("in_flight"):
         raise ValueError(f"job {job_id!r} is still starting")
@@ -342,6 +367,7 @@ def job_start(
     *,
     cred: CredentialSet | None = None,
     timeout_ms: int = 60000,
+    owner: str | None = None,
 ) -> dict:
     """Start a guest command as a tracked job; returns without waiting.
 
@@ -349,13 +375,19 @@ def job_start(
     vmident.resolve enforces identity and policy). The start leg runs against
     the RESOLVED GUID, and the registry entry stores it, so every follow-up
     leg below addresses the same VM even if it is renamed mid-job.
+    `owner` (issue #11) is the verified agent identity — follow-ups from a
+    different agent are refused with the unknown-id response; None records
+    the unattributed local principal.
     """
     if not command:
         raise ValueError("command is required")
     if cred is None:
         raise ValueError("guest credentials are required")
 
-    job_id = uuid.uuid4().hex[:12]
+    # Issue #11: full-width ids — job ids appear in transcripts and audit
+    # rows; ownership makes them non-authoritative, 128-bit randomness
+    # removes guessing as a residual vector.
+    job_id = uuid.uuid4().hex
     # Identity resolution BEFORE the slot reservation (PRR-008): a rejected
     # resolve (unknown GUID, denied name) must not evict stopped-job history
     # or null stored credentials — the reservation's eviction side effects
@@ -363,7 +395,7 @@ def job_start(
     # precedes the guest start leg, preserving the pinned behavior that a
     # registry-full start is rejected before any guest work.
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
-    _reserve_slot(job_id)
+    _reserve_slot(job_id, owner)
     try:
         # Wrapper building and pid parsing stay inside the release window so
         # no exception between reservation and registration can strand an
@@ -404,6 +436,7 @@ def job_start(
         "exit_path": f"{job_dir}\\exitcode.txt" if job_dir else "",
         "started_at": _utc_now_iso(),
         "cred": cred,
+        "owner": owner,
         "stopped": False,
     }
     _register(entry)
@@ -421,8 +454,8 @@ def job_start(
     }
 
 
-def job_status(cfg: Config, job_id: str) -> dict:
-    entry = _lookup(job_id)
+def job_status(cfg: Config, job_id: str, *, owner: str | None = None) -> dict:
+    entry = _lookup(job_id, owner)
     if entry.get("stopped"):
         return {
             "ok": True, "job_id": job_id, "vm_name": entry["vm_name"],
@@ -447,10 +480,11 @@ def job_status(cfg: Config, job_id: str) -> dict:
     }
 
 
-def job_output(cfg: Config, job_id: str, *, tail_bytes: int = 65536) -> dict:
+def job_output(cfg: Config, job_id: str, *, tail_bytes: int = 65536,
+               owner: str | None = None) -> dict:
     if tail_bytes < 1:
         raise ValueError("tail_bytes must be >= 1")
-    entry = _lookup(job_id)
+    entry = _lookup(job_id, owner)
     cred = entry["cred"]
     if cred is None:
         raise RuntimeError(f"job {job_id} has no stored credentials (stopped or evicted)")
@@ -476,7 +510,7 @@ def job_output(cfg: Config, job_id: str, *, tail_bytes: int = 65536) -> dict:
     return result
 
 
-def job_stop(cfg: Config, job_id: str) -> dict:
+def job_stop(cfg: Config, job_id: str, *, owner: str | None = None) -> dict:
     """Stop this job's guest process and its descendants, reporting what
     actually happened.
 
@@ -495,7 +529,7 @@ def job_stop(cfg: Config, job_id: str) -> dict:
     path — success, survivor, repeat, and transport-error alike (an error
     adds `error`/`error_class` with `stopped: false`).
     """
-    entry = _lookup(job_id)
+    entry = _lookup(job_id, owner)
     if entry.get("stopped"):
         # Same key set as a real stop, so a client written to the documented
         # contract never hits a missing key on a repeat call. These are the

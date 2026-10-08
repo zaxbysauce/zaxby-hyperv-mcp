@@ -37,8 +37,13 @@ _config: Config | None = None
 _UNSET_AGENT = object()
 
 
-def _current_agent_id() -> str | None:
-    """The authenticated caller's client_id, or None outside a request."""
+def current_agent_id() -> str | None:
+    """The authenticated caller's client_id, or None outside a request.
+
+    Public since issue #11: the job/relay tool layer passes this down as
+    the ownership principal for registry entries (None = the unattributed
+    local principal on stdio/anonymous/direct-module paths).
+    """
     token = get_access_token()
     if token is not None and token.client_id:
         return str(token.client_id)
@@ -83,7 +88,7 @@ def log_operation(
     if agent_id is _UNSET_AGENT:
         # Direct/out-of-band callers (e.g. the pre-tool rejection writer) get
         # the same identity resolution as context-managed operations.
-        agent_value: str | None = _current_agent_id()
+        agent_value: str | None = current_agent_id()
     else:
         agent_value = agent_id  # type: ignore[assignment]
     if request_id is None:
@@ -155,7 +160,7 @@ class operation:  # noqa: N801 - context manager reads like a decorator
 
     def __enter__(self) -> operation:
         self.start = time.monotonic()
-        self.agent_id = _current_agent_id()
+        self.agent_id = current_agent_id()
         self.request_id = uuid.uuid4().hex
         return self
 
