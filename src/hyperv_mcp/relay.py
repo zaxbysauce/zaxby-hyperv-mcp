@@ -58,6 +58,21 @@ def clear_registry_for_tests() -> None:
         _shutdown_server(entry)
 
 
+def peek_vm_name(relay_id: str) -> str:
+    """Read-only vm_name lookup for audit rows (issue #10).
+
+    Unlike the inline get-and-raise in relay_status/relay_stop this never
+    raises: an unknown or empty id reads as "" (an honest absence), so a
+    relay call's audit row can name the VM even when the tool leg itself
+    fails. Read-only by design — it never touches credentials or stop state.
+    """
+    with _relays_lock:
+        entry = _relays.get(relay_id or "")
+    if entry is None:
+        return ""
+    return str(entry.get("vm_name") or "")
+
+
 def _shutdown_server(entry: dict[str, Any]) -> None:
     server = entry.get("server")
     thread = entry.get("thread")

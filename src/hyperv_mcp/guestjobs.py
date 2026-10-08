@@ -61,6 +61,21 @@ def clear_registry_for_tests() -> None:
         _jobs.clear()
 
 
+def peek_vm_name(job_id: str) -> str:
+    """Read-only vm_name lookup for audit rows (issue #10).
+
+    Unlike _lookup this never raises: an unknown, empty, or still-in-flight
+    id reads as "" (an honest absence), so a follow-up call's audit row can
+    name the VM even when the tool leg itself fails. Read-only by design —
+    it never touches credentials or stop state.
+    """
+    with _jobs_lock:
+        entry = _jobs.get(job_id or "")
+    if entry is None or entry.get("in_flight"):
+        return ""
+    return str(entry.get("vm_name") or "")
+
+
 def _reserve_slot(job_id: str) -> None:
     """Atomically reserve a registry slot BEFORE the guest start leg.
 

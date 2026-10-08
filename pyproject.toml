@@ -78,6 +78,13 @@ src = ["src", "tests"]
 select = ["E", "F", "W", "I", "UP", "B"]
 ignore = ["E501"]
 
+[tool.ruff.lint.per-file-ignores]
+# tests/unit/test_b01_agent_identity.py is the byte-locked acceptance-check
+# file of the issue-#10 red checkpoint (manifest blob 3008efa1...): its bytes
+# are frozen by the trace protocol, so its author-era import order cannot be
+# re-sorted by the linter.
+"tests/unit/test_b01_agent_identity.py" = ["I001"]
+
 [tool.mypy]
 python_version = "3.10"
 ignore_missing_imports = true

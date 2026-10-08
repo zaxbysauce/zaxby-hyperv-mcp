@@ -48,7 +48,8 @@ _PWSH7_SHARED_MODULES = r"C:\Program Files\PowerShell\Modules"
 # case-insensitively (Windows env names); the configured http.token_env name is
 # unioned in at call time by child_env(), together with the literal default
 # HYPERV_MCP_HTTP_TOKEN name (so customizing token_env never re-enables the
-# default variable).
+# default variable) and every env variable named by http.agents (the per-agent
+# bearer-token variables, issue #10).
 _SECRET_ENV_NAMES = frozenset({
     "HYPERV_GUEST_PASSWORD",
     "HYPERV_GUEST_PASSWORD_FILE",
@@ -174,8 +175,10 @@ def child_env() -> dict[str, str]:
     Inherit the server environment minus credential and HTTP-token variable
     names (case-insensitive): the configured http.token_env name (trimmed, so
     a whitespace-padded config value still matches), the literal default
-    HYPERV_MCP_HTTP_TOKEN name even when token_env is customized, and
-    GIT_DIR/GIT_WORK_TREE (they would redirect the git provenance probe).
+    HYPERV_MCP_HTTP_TOKEN name even when token_env is customized, every env
+    variable named by http.agents (the per-agent bearer-token variables,
+    issue #10), and GIT_DIR/GIT_WORK_TREE (they would redirect the git
+    provenance probe).
 
     The child always receives a PowerShell 5.1-only PSModulePath: pwsh7 module
     directories and empty entries are dropped, the 5.1 system module directory
@@ -189,7 +192,13 @@ def child_env() -> dict[str, str]:
     """
     env = dict(os.environ)
     token_name = _config.http.token_env if _config is not None else HttpPolicy().token_env
-    secret_names = _SECRET_ENV_NAMES | {"HYPERV_MCP_HTTP_TOKEN", token_name.strip().upper()}
+    agents = _config.http.agents if _config is not None else {}
+    agent_env_names = {name.strip().upper() for name in agents.values()}
+    secret_names = (
+        _SECRET_ENV_NAMES
+        | {"HYPERV_MCP_HTTP_TOKEN", token_name.strip().upper()}
+        | agent_env_names
+    )
     strip_names = secret_names | _GIT_ENV_NAMES
     for key in [k for k in env if k.upper() in strip_names]:
         del env[key]

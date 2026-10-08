@@ -337,7 +337,14 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             result["meta"],
         ]
 
-    def _run_guest_tool(tool: str, vm: str, category: str, fn, *args, cred_factory=None, **kwargs) -> Any:
+    def _run_guest_tool(
+        tool: str, vm: str, category: str, fn, *args,
+        cred_factory=None,
+        audit_vm_name: str = "",
+        audit_job_id: str = "",
+        audit_relay_id: str = "",
+        **kwargs,
+    ) -> Any:
         """Run a guest/transfer tool; every failure leaves as one envelope.
 
         cred_factory resolves credentials INSIDE the audited region so a
@@ -347,8 +354,21 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         retry fields and leave as isError CallToolResults (issue #9: one
         envelope with error_class/retryable/retry_after_ms for every tool,
         from the same errors.classify taxonomy the audit log uses).
+
+        Audit-only kwargs (issue #10) — consumed here, never forwarded to
+        fn: audit_vm_name (registry-resolved VM for by-id follow-ups that
+        accept no vm_name argument), audit_job_id/audit_relay_id (the handle
+        the call addresses). Results that carry job_id/relay_id (start tools,
+        and follow-ups echoing them) adopt them into the audit row after the
+        call, the same way the resolved vm_name is adopted below.
         """
-        op = auditlog.operation(tool=tool, vm_name=vm, category=category)
+        op = auditlog.operation(
+            tool=tool,
+            vm_name=vm or audit_vm_name,
+            category=category,
+            job_id=audit_job_id or None,
+            relay_id=audit_relay_id or None,
+        )
         try:
             with op:
                 if cred_factory is not None:
@@ -369,6 +389,13 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                     display = result.get("vm_name") or result.get("name")
                     if not vm and display:
                         op.vm_name = str(display)
+                    # Issue #10 audit clause: adopt the resource handle the
+                    # result carries so start rows can be joined to the
+                    # follow-up rows that address the same job/relay.
+                    if result.get("job_id"):
+                        op.job_id = str(result["job_id"])
+                    if result.get("relay_id"):
+                        op.relay_id = str(result["relay_id"])
                     if not op.ok:
                         # Enrich FIRST, then audit from the enriched dict so
                         # the audit's error_class is the envelope's by
@@ -1927,6 +1954,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         return _run_guest_tool(
             "hyperv_guest_job_status", "", "exec",
             guestjobs.job_status, _cfg(), job_id,
+            audit_job_id=job_id, audit_vm_name=guestjobs.peek_vm_name(job_id),
         )
 
     @mcp.tool()
@@ -1940,6 +1968,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         return _run_guest_tool(
             "hyperv_guest_job_output", "", "exec",
             guestjobs.job_output, _cfg(), job_id, tail_bytes=tail_bytes,
+            audit_job_id=job_id, audit_vm_name=guestjobs.peek_vm_name(job_id),
         )
 
     @mcp.tool()
@@ -1966,6 +1995,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         return _run_guest_tool(
             "hyperv_guest_job_stop", "", "exec",
             guestjobs.job_stop, _cfg(), job_id,
+            audit_job_id=job_id, audit_vm_name=guestjobs.peek_vm_name(job_id),
         )
 
     @mcp.tool()
@@ -1977,6 +2007,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         return _run_guest_tool(
             "hyperv_relay_status", "", "relay",
             relay.relay_status, _cfg(), relay_id,
+            audit_relay_id=relay_id,
+            audit_vm_name=relay.peek_vm_name(relay_id) if relay_id else "",
         )
 
     @mcp.tool()
@@ -1989,6 +2021,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         return _run_guest_tool(
             "hyperv_relay_stop", "", "relay",
             relay.relay_stop, _cfg(), relay_id,
+            audit_relay_id=relay_id, audit_vm_name=relay.peek_vm_name(relay_id),
         )
 
     _harden_tools(mcp)
@@ -2039,13 +2072,23 @@ def _harden_tools(mcp: FastMCP) -> None:
         original_run = tool.run
 
         def _audited_rejection(name: str, arguments: dict, env: dict) -> CallToolResult:
+            args = arguments or {}
+            # str()-coerce before redaction (credentials.redact raises on
+            # non-str) and normalize the empty string to None, so absent ids
+            # serialize as JSON null like every other audit row (issue #10).
+            def _opt_id(key: str) -> str | None:
+                value = str(args.get(key) or "")
+                return value or None
+
             try:
                 auditlog.log_operation(
                     tool=name,
-                    vm_name=str((arguments or {}).get("vm_name") or ""),
+                    vm_name=str(args.get("vm_name") or ""),
                     category="",
                     ok=False,
                     error_class=str(env.get("error_class") or ""),
+                    job_id=_opt_id("job_id"),
+                    relay_id=_opt_id("relay_id"),
                 )
             except Exception as audit_exc:  # noqa: BLE001 - best-effort: a
                 # broken audit sink must not turn a rejection into a raw
