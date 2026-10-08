@@ -486,7 +486,11 @@ only (RunAs cannot redirect streams). The in-process registry is capped at
 128 active jobs (oldest stopped entries are evicted first; new starts are
 rejected once the cap is reached) and holds the start-time credentials until
 a successful stop, cap eviction, or process exit — plan accordingly on
-shared hosts. `exiting` is not a terminal state: if the guest wrapper dies
+shared hosts. Every job belongs to the agent that started it: a
+status/output/stop call from a different agent gets the same `unknown
+job_id` error as an absent id (a foreign caller's id is never distinguishable
+from a made-up one, and no guest leg runs for it). `exiting` is not a
+terminal state: if the guest wrapper dies
 before writing its exit-code file, status stays `exiting` until you call
 `hyperv_guest_job_stop`. Every job/relay tool call writes an audit row
 naming the caller's agent id (null on stdio or `--allow-anonymous`) and a
@@ -548,15 +552,16 @@ connection closed and no PowerShell process spawned. The secret (>=128
 bits, `secrets`-generated) exists ONLY in the starting agent's
 `relay_start` result: `hyperv_relay_status` row urls are identifiers, not
 request-capable URLs. The capability path must be followed by a
-non-empty path segment: a request to the bare capability URL
-(`http://127.0.0.1:<port>/<secret>/`) answers 401 like any other
-unauthenticated request — address the guest root as
-`<capability-url>json/version`-style paths (e.g. append `/` or a real
-path). Ownership (issue #11): a relay belongs to the agent
-that started it (the bearer token's agent identity); `relay_status` lists
+non-empty path segment starting with `/`: a request to the bare capability
+URL (`http://127.0.0.1:<port>/<secret>/`) answers 401 like any other
+unauthenticated request, and appending a path WITHOUT its leading slash
+(e.g. `<capability-url>json/version`) answers 400 — address the guest as
+`<capability-url>/json/version`, i.e. keep the url exactly as returned and
+append `/` plus the target path. Ownership (issue #11): a relay belongs
+to the agent that started it (the bearer token's agent identity); `relay_status` lists
 only the calling agent's relays, and `relay_status`/`relay_stop` with
 another agent's id return the same `unknown relay_id` error as an absent
-id, so ids cannot be probed. Without an identity (stdio in-process,
+id, so ids cannot be probed through the tools. Without an identity (stdio in-process,
 `--allow-anonymous`), all callers form one local principal and behavior
 is unchanged. The registry is capped at 16 active relays; stopped entries
 are evicted oldest-first (their stored credentials released) when the cap
@@ -566,9 +571,9 @@ port admit exactly one (the loser gets the duplicate-target error, which
 names the existing relay's id — an accepted residual disclosure: the
 secret, not the id, is the capability). The relay holds the start-time
 credentials until `hyperv_relay_stop`, cap-time eviction, or process
-exit. Job ids and relay ids carry 128 bits of randomness (32 hex / 32
-hex), so an id learned from a transcript or audit row cannot be guessed
-either. Guest-side HTTP error statuses pass through to the caller (a
+exit. Relay ids carry 128 bits of randomness and job ids 122 (a v4 UUID's
+32 hex chars fix 6 version/variant bits), so an id learned from a
+transcript or audit row cannot be guessed either. Guest-side HTTP error statuses pass through to the caller (a
 guest 404 arrives as 404 with the relay error envelope); a request racing
 `hyperv_relay_stop` receives a clean 503 relay-stopped envelope.
 
@@ -707,8 +712,12 @@ CI (`.github/workflows/ci.yml`) runs ruff + mypy + unit tests on
 - The streamable-http endpoint's authority is its bearer token(s): with one
   shared token, possession is full authority; with `http.agents`, each token
   carries the same tool authority but calls are attributable to their agent
-  in the audit log (no per-agent authorization yet — ownership enforcement
-  is a planned follow-up). Loopback + file ACLs are the boundary.
+  in the audit log, and guest jobs and relays are OWNED by the agent that
+  started them — follow-ups from another agent get the same unknown-id
+  error as an absent id (issue #11). What is still shared: VM-lifecycle
+  tools (start/stop/checkpoint/…) are authorized by category, not by
+  agent, and the relay registry cap is a host-wide resource.
+  Loopback + file ACLs are the boundary.
 - Guest command/script contents are executed as-is inside the guest by
   design (this is a research tool); guest-path allowlists govern *file
   transfer* roots, not arguments inside commands you choose to run.

@@ -21,9 +21,10 @@ local principal on stdio/anonymous/direct-module paths). A follow-up from
 a different agent gets the SAME `unknown job_id` response as an absent id
 — no guest leg runs and no stored credential is touched for a foreign
 caller — and the check precedes the in-flight check so an in-flight start
-is never disclosed to a foreign probe. Job ids are 128-bit (`uuid4().hex`);
-ids appear in transcripts and audit rows, so ownership is the
-authorization and the width removes guessing as a residual vector.
+is never disclosed to a foreign probe. Job ids are full-width 32-hex
+v4 UUIDs (122 random bits of the 128 encoded); ids appear in transcripts
+and audit rows, so ownership is the authorization and the width removes
+guessing as a residual vector.
 
 Lock policy: every guest leg (start/status/output/stop) runs under vm_lock
 acquired per leg inside diagnostics.run_guest_inner (keyed on the GUID);
@@ -385,8 +386,9 @@ def job_start(
         raise ValueError("guest credentials are required")
 
     # Issue #11: full-width ids — job ids appear in transcripts and audit
-    # rows; ownership makes them non-authoritative, 128-bit randomness
-    # removes guessing as a residual vector.
+    # rows; ownership makes them non-authoritative, and the 122 random
+    # bits of a v4 UUID (32 hex chars) remove guessing as a residual
+    # vector.
     job_id = uuid.uuid4().hex
     # Identity resolution BEFORE the slot reservation (PRR-008): a rejected
     # resolve (unknown GUID, denied name) must not evict stopped-job history

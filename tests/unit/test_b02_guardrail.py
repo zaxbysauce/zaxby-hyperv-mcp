@@ -196,3 +196,183 @@ def test_thread_start_failure_releases_placeholder_and_closes_socket(monkeypatch
         relay.relay_start(cfg, "test-vm", 9222, cred=CRED)
     assert relay._relays == {}
     assert closed == [True]
+
+
+def test_relay_cap_eviction_releases_evicted_entry_state(monkeypatch):
+    """Cap-time eviction removes the OLDEST stopped entry and its stored
+    credential is released at that moment (held by reference so the
+    evicted dict stays observable after the del; issue #11 review
+    PRR-010). The credential is normally already None because relay_stop
+    nulls it on stop — this pin documents that the invariant still holds
+    at eviction time (relay.py nulls it defensively before delete)."""
+    monkeypatch.setattr(relay, "_MAX_RELAYS", 2, raising=False)
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+    cfg = _relay_cfg()
+    ids = [
+        relay.relay_start(cfg, "test-vm", port, cred=CRED, owner="agent-a")["relay_id"]
+        for port in (9201, 9202)
+    ]
+    relay.relay_stop(cfg, ids[0])
+    evicted_entry = relay._relays[ids[0]]  # held reference survives the del
+    assert evicted_entry["context"]["cred"] is None
+    out3 = relay.relay_start(cfg, "test-vm", 9203, cred=CRED, owner="agent-a")
+    assert ids[0] not in relay._relays
+    assert ids[1] in relay._relays and out3["relay_id"] in relay._relays
+    assert evicted_entry["context"]["cred"] is None
+
+
+def test_positive_owner_by_id_status_and_stop(monkeypatch):
+    """The RIGHTFUL owner can address its own relay by id — the positive
+    arm of the ownership check (inverting the comparison would deny the
+    owner; issue #11 review PRR-009)."""
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+    cfg = _relay_cfg()
+    out = relay.relay_start(cfg, "test-vm", 9222, cred=CRED, owner="agent-a")
+    status = relay.relay_status(cfg, out["relay_id"], owner="agent-a")
+    assert status["ok"] is True and len(status["relays"]) == 1
+    assert status["relays"][0]["relay_id"] == out["relay_id"]
+    stopped = relay.relay_stop(cfg, out["relay_id"], owner="agent-a")
+    assert stopped["ok"] is True and stopped["stopped"] is True
+
+
+def test_owner_listing_positive_control(monkeypatch):
+    """agent-a's listing shows its OWN relay while agent-b's shows none —
+    the filter must not over-filter (issue #11 review PRR-009)."""
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+    cfg = _relay_cfg()
+    out = relay.relay_start(cfg, "test-vm", 9222, cred=CRED, owner="agent-a")
+    own = relay.relay_status(cfg, owner="agent-a")
+    assert [r["relay_id"] for r in own["relays"]] == [out["relay_id"]]
+    other = relay.relay_status(cfg, owner="agent-b")
+    assert other["relays"] == []
+
+
+def test_status_rows_never_carry_the_secret(monkeypatch):
+    """The capability secret appears ONLY in relay_start's returned url —
+    never in any relay_status row url (issue #11 review PRR-009)."""
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+    cfg = _relay_cfg()
+    out = relay.relay_start(cfg, "test-vm", 9222, cred=CRED, owner="agent-a")
+    secret = out["url"].split("/", 3)[3].rstrip("/")
+    assert secret and len(secret) >= 22  # returned url carries it
+    status = relay.relay_status(cfg, out["relay_id"], owner="agent-a")
+    row_url = status["relays"][0]["url"]
+    assert secret not in row_url
+    assert row_url == f"http://127.0.0.1:{out['host_port']}/"
+
+
+def test_relay_placeholder_is_invisible():
+    """An in-flight placeholder (start still binding) is invisible: by-id
+    status/stop answer the unknown-id error and the listing omits it
+    (issue #11 review PRR-009)."""
+    cfg = _relay_cfg()
+    ghost = "relay-9222-" + "0" * 32
+    with relay._relays_lock:
+        relay._relays[ghost] = {
+            "relay_id": ghost, "vm_name": "test-vm", "vm_id": "g",
+            "guest_port": 9222, "owner": "agent-a", "in_flight": True,
+            "started_at": "2026-10-08T00:00:00.000+00:00", "stopped": False,
+        }
+    try:
+        with pytest.raises(ValueError, match="unknown relay_id"):
+            relay.relay_status(cfg, ghost, owner="agent-a")
+        with pytest.raises(ValueError, match="unknown relay_id"):
+            relay.relay_stop(cfg, ghost, owner="agent-a")
+        assert relay.relay_status(cfg, owner="agent-a")["relays"] == []
+    finally:
+        with relay._relays_lock:
+            relay._relays.clear()
+
+
+def test_foreign_and_unknown_envelopes_are_identical(monkeypatch):
+    """A foreign id and a nonexistent id are indistinguishable in EVERY
+    caller-visible surface: the response is a pure function of the
+    caller's own input — the echo-shaped unknown-id text — with no
+    registry state in it, so existence cannot be probed (issue #11
+    review PRR-012; refutes the claim that the probes allow a distinct
+    access-denied response for foreign ids)."""
+    fake = FakePS([_ok({"pid": 4242, "job_dir": "C:/Temp/hyperv-mcp-job-x"})])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    cfg = Config(unrestricted=True)
+    started = guestjobs.job_start(cfg, "test-vm", "x.exe", cred=CRED, owner="agent-a")
+    foreign = started["job_id"]
+    unknown = "f" * 32
+    with pytest.raises(ValueError) as exc_foreign:
+        guestjobs.job_status(cfg, foreign, owner="agent-b")
+    with pytest.raises(ValueError) as exc_unknown:
+        guestjobs.job_status(cfg, unknown, owner="agent-b")
+    # Each response is exactly the echo of the caller's own input: same
+    # message template, same exception type, zero registry information.
+    assert str(exc_foreign.value) == f"unknown job_id '{foreign}'"
+    assert str(exc_unknown.value) == f"unknown job_id '{unknown}'"
+    assert type(exc_foreign.value) is type(exc_unknown.value)
+    # Same property for relay ids (module-level, no guest legs involved).
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+    relay_cfg = _relay_cfg()
+    relay_out = relay.relay_start(relay_cfg, "test-vm", 9222, cred=CRED, owner="agent-a")
+    with pytest.raises(ValueError) as r_foreign:
+        relay.relay_stop(relay_cfg, relay_out["relay_id"], owner="agent-b")
+    with pytest.raises(ValueError) as r_unknown:
+        relay.relay_stop(relay_cfg, "relay-9222-" + "f" * 32, owner="agent-b")
+    assert str(r_foreign.value) == f"unknown relay_id '{relay_out['relay_id']}'"
+    assert str(r_unknown.value) == f"unknown relay_id 'relay-9222-{'f' * 32}'"
+    assert type(r_foreign.value) is type(r_unknown.value)
+
+
+def test_thread_constructor_failure_releases_placeholder(monkeypatch):
+    """A Thread-CONSTRUCTOR failure (resource exhaustion) sits before the
+    server bind but inside the release window: the placeholder must be
+    released and nothing bound (issue #11 PR review round 2, NEW-B —
+    the window now covers construction, not just start)."""
+    import threading as threading_mod
+
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+
+    class BoomCtorThread:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("can't create new thread")
+
+    constructed = []
+
+    class StubServer:
+        daemon_threads = True
+        allow_reuse_address = True
+
+        def __init__(self, addr, handler):
+            self.server_address = (addr[0], 0)
+            constructed.append(self)
+
+        def serve_forever(self, poll_interval=0.5):
+            raise AssertionError("never runs: Thread construction is stubbed to fail")
+
+        def server_close(self):
+            raise AssertionError("bind never completed: no socket to close")
+
+    monkeypatch.setattr(relay, "_RelayServer", StubServer)
+    monkeypatch.setattr(threading_mod, "Thread", BoomCtorThread)
+    cfg = _relay_cfg()
+    with pytest.raises(RuntimeError, match="can't create new thread"):
+        relay.relay_start(cfg, "test-vm", 9222, cred=CRED)
+    assert relay._relays == {}
+    # The server WAS constructed (it precedes the Thread ctor) but its
+    # socket is released when the propagating exception drops the frame
+    # (CPython refcounting) — server_close is deliberately not attempted
+    # on this path because the stub would flag any call.
+    assert len(constructed) == 1
+
+
+def test_non_oserror_server_construction_failure_releases_placeholder(monkeypatch):
+    """A non-OSError from the server constructor (outside the OSError bind
+    conversion) must also release the placeholder (issue #11 PR review
+    round 2, NEW-B)."""
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+
+    class BoomServer:
+        def __init__(self, addr, handler):
+            raise ValueError("bad address family")
+
+    monkeypatch.setattr(relay, "_RelayServer", BoomServer)
+    cfg = _relay_cfg()
+    with pytest.raises(ValueError, match="bad address family"):
+        relay.relay_start(cfg, "test-vm", 9222, cred=CRED)
+    assert relay._relays == {}

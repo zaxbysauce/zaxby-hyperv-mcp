@@ -105,6 +105,12 @@ def _shutdown_server(entry: dict[str, Any]) -> None:
     if server is not None:
         try:
             server.shutdown()
+        except Exception:
+            pass
+        try:
+            # Separate from shutdown(): a shutdown failure must not skip
+            # the only close of the listening socket (PR review round 2,
+            # PRR-008).
             server.server_close()
         except Exception:
             pass
@@ -461,26 +467,35 @@ def relay_start(
             if current is not None and current.get("in_flight"):
                 del _relays[relay_id]
 
-    context: dict[str, Any] = {
-        "cfg": cfg,
-        "vm_name": ref.name,
-        "vm_id": ref.id,
-        "guest_port": int(guest_port),
-        "cred": cred,
-        "secret": secret,
-        "counters": _new_counters(),
-        "counter_lock": threading.Lock(),
-    }
-    handler = type("BoundRelayHandler", (_RelayHandler,), {"context": context})
     try:
+        context: dict[str, Any] = {
+            "cfg": cfg,
+            "vm_name": ref.name,
+            "vm_id": ref.id,
+            "guest_port": int(guest_port),
+            "cred": cred,
+            "secret": secret,
+            "counters": _new_counters(),
+            "counter_lock": threading.Lock(),
+        }
+        handler = type("BoundRelayHandler", (_RelayHandler,), {"context": context})
+        context["relay_id"] = relay_id
         server = _RelayServer((bind, int(host_port)), handler)
+        thread = threading.Thread(
+            target=server.serve_forever, name=f"hyperv-relay-{relay_id}", daemon=True,
+        )
     except OSError as exc:
         _release()
         raise RuntimeError(f"could not bind {bind}:{host_port or 0}: {exc}") from None
-    context["relay_id"] = relay_id
-    thread = threading.Thread(
-        target=server.serve_forever, name=f"hyperv-relay-{relay_id}", daemon=True,
-    )
+    except BaseException:
+        # Context/handler/thread construction and the bind itself sit inside
+        # the release window: any failure here (Thread constructor under
+        # resource exhaustion, a non-OSError from the server constructor)
+        # must not strand the in-flight placeholder (PR review round 2,
+        # NEW-B). A bound socket that never started serving dies with the
+        # frame on CPython.
+        _release()
+        raise
     try:
         thread.start()
         entry = {
@@ -500,14 +515,16 @@ def relay_start(
         with _relays_lock:
             _relays[relay_id] = entry
     except BaseException:
-        # No exception between the bind and the registration may strand the
-        # in-flight placeholder (it is invisible to status, unstoppable,
-        # and would consume a cap slot and block this vm:guest_port forever
-        # via the duplicate scan — implementation-review round 1, Finding 1)
-        # nor leak the bound socket. server_close (not shutdown: a failed
-        # start never entered serve_forever, and shutdown would wait on a
-        # loop that will never run) releases the listener; the placeholder
-        # release mirrors guestjobs job_start's reserve-to-register window.
+        # No exception between the reservation and the registration may
+        # strand the in-flight placeholder (it is invisible to status,
+        # unstoppable, and would consume a cap slot and block this
+        # vm:guest_port forever via the duplicate scan — implementation
+        # review round 1, Finding 1, widened to the construction window by
+        # PR-review round 2, NEW-B) nor leak the bound socket. server_close
+        # (not shutdown: a failed start never entered serve_forever, and
+        # shutdown would wait on a loop that will never run) releases the
+        # listener; the placeholder release mirrors guestjobs job_start's
+        # reserve-to-register window.
         _release()
         try:
             server.server_close()
