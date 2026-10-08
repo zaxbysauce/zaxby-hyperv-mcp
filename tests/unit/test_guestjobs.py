@@ -81,7 +81,7 @@ def test_start_returns_job_handle_without_wait(monkeypatch):
     out = guestjobs.job_start(cfg, "test-vm", "sqlprobe.exe", ["--long"], cwd="C:\\work", cred=CRED)
     assert out["ok"] is True
     assert out["pid"] == 4242
-    assert out["job_id"] and len(out["job_id"]) == 12
+    assert out["job_id"] and len(out["job_id"]) == 32
     assert out["out_path"].endswith("stdout.log")
     assert out["exit_path"].endswith("exitcode.txt")
     # Async by construction: splat Start-Process, NO Wait member.

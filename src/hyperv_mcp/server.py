@@ -1698,6 +1698,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 guestjobs.job_start, _cfg(), vm_name, command, args, cwd,
                 timeout_ms=timeout_ms, vm_id=vm_id,
                 cred_factory=lambda: _cred_args(username, password),
+                owner=auditlog.current_agent_id(),
             )
 
         @mcp.tool()
@@ -1740,13 +1741,16 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-            Returns: {ok, relay_id, url, host_port, ...}.
+            Returns: {ok, relay_id, url, host_port, ...}. The url is a
+            capability URL embedding the relay's per-relay secret (the only
+            place the secret is returned); requests without it get 401.
             """
             return _run_guest_tool(
                 "hyperv_relay_start", vm_name, "relay",
                 relay.relay_start, _cfg(), vm_name, guest_port,
                 host_port=host_port, vm_id=vm_id,
                 cred_factory=lambda: _cred_args(username, password),
+                owner=auditlog.current_agent_id(),
             )
 
         @mcp.tool()
@@ -1860,6 +1864,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 guestjobs.job_start, _cfg(), vm_name, command, args, cwd,
                 timeout_ms=timeout_ms, vm_id=vm_id,
                 cred_factory=credentials.resolve_guest,
+                owner=auditlog.current_agent_id(),
             )
 
         @mcp.tool()
@@ -1898,13 +1903,16 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-            Returns: {ok, relay_id, url, host_port, ...}.
+            Returns: {ok, relay_id, url, host_port, ...}. The url is a
+            capability URL embedding the relay's per-relay secret (the only
+            place the secret is returned); requests without it get 401.
             """
             return _run_guest_tool(
                 "hyperv_relay_start", vm_name, "relay",
                 relay.relay_start, _cfg(), vm_name, guest_port,
                 host_port=host_port, vm_id=vm_id,
                 cred_factory=credentials.resolve_guest,
+                owner=auditlog.current_agent_id(),
             )
 
         @mcp.tool()
@@ -1954,6 +1962,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         return _run_guest_tool(
             "hyperv_guest_job_status", "", "exec",
             guestjobs.job_status, _cfg(), job_id,
+            owner=auditlog.current_agent_id(),
             audit_job_id=job_id, audit_vm_name=guestjobs.peek_vm_name(job_id),
         )
 
@@ -1968,6 +1977,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         return _run_guest_tool(
             "hyperv_guest_job_output", "", "exec",
             guestjobs.job_output, _cfg(), job_id, tail_bytes=tail_bytes,
+            owner=auditlog.current_agent_id(),
             audit_job_id=job_id, audit_vm_name=guestjobs.peek_vm_name(job_id),
         )
 
@@ -1995,6 +2005,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         return _run_guest_tool(
             "hyperv_guest_job_stop", "", "exec",
             guestjobs.job_stop, _cfg(), job_id,
+            owner=auditlog.current_agent_id(),
             audit_job_id=job_id, audit_vm_name=guestjobs.peek_vm_name(job_id),
         )
 
@@ -2007,6 +2018,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         return _run_guest_tool(
             "hyperv_relay_status", "", "relay",
             relay.relay_status, _cfg(), relay_id,
+            owner=auditlog.current_agent_id(),
             audit_relay_id=relay_id,
             audit_vm_name=relay.peek_vm_name(relay_id) if relay_id else "",
         )
@@ -2021,6 +2033,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         return _run_guest_tool(
             "hyperv_relay_stop", "", "relay",
             relay.relay_stop, _cfg(), relay_id,
+            owner=auditlog.current_agent_id(),
             audit_relay_id=relay_id, audit_vm_name=relay.peek_vm_name(relay_id),
         )
 

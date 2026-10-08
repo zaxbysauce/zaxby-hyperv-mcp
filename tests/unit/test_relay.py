@@ -17,6 +17,12 @@ from hyperv_mcp.policy import PolicyDenied
 
 CRED = CredentialSet("Administrator", "placeholder-pass")
 
+
+def _cap_path(url: str) -> str:
+    """The capability path of a relay_start url: /<secret>/ (issue #11)."""
+    assert url.startswith("http://")
+    return "/" + url.split("//", 1)[1].split("/", 1)[1]
+
 _ENC_RE = re.compile(r"\$enc = '([A-Za-z0-9+/=]+)'")
 
 # Identity resolution (issue #8): vmident.resolve runs a by-name leg before
@@ -97,7 +103,10 @@ def test_start_binds_real_ephemeral_port(monkeypatch):
     assert out["ok"] is True
     assert out["bind"] == "127.0.0.1"
     assert out["host_port"] > 0
-    assert out["url"] == f"http://127.0.0.1:{out['host_port']}"
+    # Capability URL (issue #11): the returned url carries the relay's
+    # secret as its first path segment — the only place it is returned.
+    assert out["url"].startswith(f"http://127.0.0.1:{out['host_port']}/")
+    assert len(out["url"].split("/", 3)[3].rstrip("/")) >= 22
     # Listener is live: a TCP connect succeeds (and forwards via the queue-less
     # fake raising inside the handler thread -> 502 envelope, proving the path).
     fake.responses.append(pswindows.PSResult(stdout="", returncode=1, stderr="boom"))
@@ -174,10 +183,13 @@ def test_authority_form_target_rejected_400(monkeypatch):
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = relay.relay_start(cfg, "test-vm", 9222, cred=CRED)
     # Python's HTTP server accepts authority-form; the handler must reject.
+    # The capability path authenticates; the original raw target follows it
+    # verbatim, so the strip hands the guards exactly what they saw before.
     import socket
 
+    target = _cap_path(out["url"]).encode() + b"@evil.example:8080/json"
     with socket.create_connection(("127.0.0.1", out["host_port"]), timeout=10) as sock:
-        sock.sendall(b"GET @evil.example:8080/json HTTP/1.1\r\nHost: x\r\n\r\n")
+        sock.sendall(b"GET " + target + b" HTTP/1.1\r\nHost: x\r\n\r\n")
         data = sock.recv(4096)
     assert b" 400 " in data.split(b"\r\n")[0]
     # No guest forward leg ran, and the surviving script IS the by-name
@@ -198,9 +210,10 @@ def test_rejected_request_body_cannot_smuggle_followup(monkeypatch):
     import socket
 
     smuggled = b"GET /smuggled-by-reject HTTP/1.1\r\nHost: x\r\n\r\n"
+    cap = _cap_path(out["url"]).encode()
     with socket.create_connection(("127.0.0.1", out["host_port"]), timeout=10) as sock:
         sock.sendall(
-            b"POST @evil.example:8080/x HTTP/1.1\r\nHost: x\r\n"
+            b"POST " + cap + b"@evil.example:8080/x HTTP/1.1\r\nHost: x\r\n"
             + b"Content-Length: " + str(len(smuggled)).encode() + b"\r\n\r\n"
             + smuggled
         )
@@ -230,9 +243,11 @@ def test_chunked_transfer_encoding_rejected_411(monkeypatch):
     out = relay.relay_start(cfg, "test-vm", 9222, cred=CRED)
     import socket
 
+    cap = _cap_path(out["url"]).encode()
     with socket.create_connection(("127.0.0.1", out["host_port"]), timeout=10) as sock:
         sock.sendall(
-            b"POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+            b"POST " + cap + b"/upload HTTP/1.1\r\nHost: x\r\n"
+            b"Transfer-Encoding: chunked\r\n\r\n"
             b"5\r\nhello\r\n0\r\n\r\n"
         )
         data = sock.recv(4096)
@@ -306,8 +321,11 @@ def test_negative_content_length_rejected_400(monkeypatch):
     out = relay.relay_start(cfg, "test-vm", 9222, cred=CRED)
     import socket
 
+    cap = _cap_path(out["url"]).encode()
     with socket.create_connection(("127.0.0.1", out["host_port"]), timeout=10) as sock:
-        sock.sendall(b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n")
+        sock.sendall(
+            b"POST " + cap + b"/x HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n"
+        )
         data = sock.recv(4096)
     assert b" 400 " in data.split(b"\r\n")[0]
     assert b"Connection: close" in data
