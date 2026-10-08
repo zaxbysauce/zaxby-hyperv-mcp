@@ -471,7 +471,7 @@ def test_job_output_and_job_stop_audit_names_vm_and_job(audited_server, monkeypa
     """Success-path attribution for job_output and job_stop: the result
     dicts carry job_id/vm_name and the adoption clause lands them in the
     audit rows (the call-site audit kwargs are pinned separately on the
-    raise path — see test_raising_job_output_audit_kwargs_sole_source)."""
+    raise path — see test_raising_job_output_kwargs_are_sole_source)."""
     mod, log = audited_server
     _guest_env(monkeypatch)
     payload = {
@@ -551,14 +551,17 @@ def test_rejection_on_registered_job_resolves_vm(audited_server, monkeypatch):
     assert row.get("vm_name") == "test-vm"
 
 
-def test_raising_job_output_and_job_stop_kwargs_are_sole_source(audited_server, monkeypatch):
-    """On the raise path no result dict exists, so the call-site
-    audit_job_id/audit_vm_name kwargs are the SOLE source of the row's
-    correlation keys — deleting either tool's kwarg pair must fail here
-    (review round 1, PRR-009c)."""
+def test_raising_job_output_kwargs_are_sole_source(audited_server, monkeypatch):
+    """job_output's guest-leg raise produces no result dict, so the
+    call-site audit_job_id/audit_vm_name kwargs are the SOLE source of the
+    row's correlation keys — deleting job_output's kwarg pair must fail
+    here (review round 1, PRR-009c). job_stop has no equivalent kill shot:
+    its transport-error dict carries the ids (adoption fills the row), and
+    its only kwarg-sole-source path — the unknown-id _lookup raise — is
+    pinned by test_unknown_job_stop_row_carries_supplied_job_id below."""
     mod, log = audited_server
     _guest_env(monkeypatch)
-    fake = FakePS([_start_ok(), RuntimeError("guest leg boom"), RuntimeError("guest leg boom 2")])
+    fake = FakePS([_start_ok(), RuntimeError("guest leg boom")])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     mcp = mod.get_mcp()
     started = _envelope(mcp, "hyperv_guest_job_start", {
@@ -568,15 +571,24 @@ def test_raising_job_output_and_job_stop_kwargs_are_sole_source(audited_server, 
     job_id = started["job_id"]
     out = _envelope(mcp, "hyperv_guest_job_output", {"job_id": job_id})
     assert out.get("ok") is False  # the guest leg raised
-    stop = _envelope(mcp, "hyperv_guest_job_stop", {"job_id": job_id})
-    assert stop.get("ok") is False
-    rows = _rows(log)
-    out_row = _newest(rows, "hyperv_guest_job_output")
+    out_row = _newest(_rows(log), "hyperv_guest_job_output")
     assert out_row.get("vm_name") == "test-vm", "output raise path lost the VM"
     assert out_row.get("job_id") == job_id, "output raise path lost the job_id"
-    stop_row = _newest(rows, "hyperv_guest_job_stop")
-    assert stop_row.get("vm_name") == "test-vm", "stop raise path lost the VM"
-    assert stop_row.get("job_id") == job_id, "stop raise path lost the job_id"
+
+
+def test_unknown_job_stop_row_carries_supplied_job_id(audited_server):
+    """hyperv_guest_job_stop on an UNKNOWN id raises out of guestjobs
+    (_lookup) with no result dict, so the row's job_id comes solely from
+    the call-site audit_job_id kwarg — deleting that kwarg nulls the row
+    and must fail here (review round 2, the C0 gap)."""
+    mod, log = audited_server
+    mcp = mod.get_mcp()
+    stop = _envelope(mcp, "hyperv_guest_job_stop", {"job_id": "no-such-job-stop"})
+    assert stop.get("ok") is False
+    row = _newest(_rows(log), "hyperv_guest_job_stop")
+    assert row.get("error_class") == "invalid"
+    assert row.get("job_id") == "no-such-job-stop"
+    assert row.get("vm_name") == ""  # unknown id: peek honestly empty
 
 
 def test_rejection_ids_are_str_coerced_at_the_server_seam(audited_server, monkeypatch):
