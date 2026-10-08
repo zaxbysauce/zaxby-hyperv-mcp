@@ -468,9 +468,10 @@ def test_multi_verifier_scans_every_pair_and_handles_empty(monkeypatch):
 
 
 def test_job_output_and_job_stop_audit_names_vm_and_job(audited_server, monkeypatch):
-    """job_output and job_stop carry audit_job_id/audit_vm_name on the same
-    registered job as job_status (impl review PRR-009c — deleting either
-    call site's kwargs must fail here)."""
+    """Success-path attribution for job_output and job_stop: the result
+    dicts carry job_id/vm_name and the adoption clause lands them in the
+    audit rows (the call-site audit kwargs are pinned separately on the
+    raise path — see test_raising_job_output_audit_kwargs_sole_source)."""
     mod, log = audited_server
     _guest_env(monkeypatch)
     payload = {
@@ -548,6 +549,34 @@ def test_rejection_on_registered_job_resolves_vm(audited_server, monkeypatch):
     assert row.get("ok") is False and row.get("error_class") == "invalid"
     assert row.get("job_id") == job_id
     assert row.get("vm_name") == "test-vm"
+
+
+def test_raising_job_output_and_job_stop_kwargs_are_sole_source(audited_server, monkeypatch):
+    """On the raise path no result dict exists, so the call-site
+    audit_job_id/audit_vm_name kwargs are the SOLE source of the row's
+    correlation keys — deleting either tool's kwarg pair must fail here
+    (review round 1, PRR-009c)."""
+    mod, log = audited_server
+    _guest_env(monkeypatch)
+    fake = FakePS([_start_ok(), RuntimeError("guest leg boom"), RuntimeError("guest leg boom 2")])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    mcp = mod.get_mcp()
+    started = _envelope(mcp, "hyperv_guest_job_start", {
+        "vm_name": "test-vm", "command": "cmd.exe",
+    })
+    assert started.get("ok") is True, f"job_start failed: {started}"
+    job_id = started["job_id"]
+    out = _envelope(mcp, "hyperv_guest_job_output", {"job_id": job_id})
+    assert out.get("ok") is False  # the guest leg raised
+    stop = _envelope(mcp, "hyperv_guest_job_stop", {"job_id": job_id})
+    assert stop.get("ok") is False
+    rows = _rows(log)
+    out_row = _newest(rows, "hyperv_guest_job_output")
+    assert out_row.get("vm_name") == "test-vm", "output raise path lost the VM"
+    assert out_row.get("job_id") == job_id, "output raise path lost the job_id"
+    stop_row = _newest(rows, "hyperv_guest_job_stop")
+    assert stop_row.get("vm_name") == "test-vm", "stop raise path lost the VM"
+    assert stop_row.get("job_id") == job_id, "stop raise path lost the job_id"
 
 
 def test_rejection_ids_are_str_coerced_at_the_server_seam(audited_server, monkeypatch):

@@ -495,7 +495,7 @@ handle, the row also carries that `job_id`/`relay_id` and — for known ids —
 the VM from the registry, so a follow-up row joins to the start row that
 created the handle (issue #10). Shapes that honestly audit empty/null
 attribution: `hyperv_relay_status` without a relay id (list-all), calls on
-unknown ids, calls rejected before the tool body runs, and (for the VM
+unknown ids, rejections of calls addressing unknown ids, and (for the VM
 half) follow-ups racing a still-starting job.
 
 ### Reboot Recovery (0.3.0)
