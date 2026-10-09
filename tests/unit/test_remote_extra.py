@@ -227,7 +227,9 @@ def test_composed_remote_scripts_parse(monkeypatch, tmp_path):
         _remote_cfg(allowed_vm_patterns=["test-*"]), "test-vm", "Get-Date", cred=CRED,
     )
     put_script = _capture_put_remote(monkeypatch, tmp_path)                     # mixed transfer
-    scripts = [fake.scripts[0], fake.scripts[1], put_script]
+    # C3 (cubic): parse EVERY captured script — index-based selection picked
+    # the VM-identity leg twice and never the PS-Direct envelope.
+    scripts = list(fake.scripts) + [put_script]
     for script in scripts:
         assert WRAP in script
         problems = _parse_errors(script)
@@ -441,6 +443,14 @@ def test_guest_get_host_creds_two_line_stdin(monkeypatch, tmp_path):
     assert WRAP in script
     assert "-Credential $__hostcred" in script
     assert "-ArgumentList $__p0" in script
+    # C7 (cubic): the local verify scriptblock must be INVOKED after the hop
+    # (its DEFINITION textually before the wrap is necessary but not
+    # sufficient — moving verify into the remote block would leave a
+    # definition-only pin green).
+    lines = script.splitlines()
+    invoke_at = next(i for i, ln in enumerate(lines) if "& $__verifyGet" in ln)
+    wrap_at = next(i for i, ln in enumerate(lines) if WRAP in ln)
+    assert invoke_at > wrap_at, "verify must execute outside (after) the remote hop"
     import base64
     stdin_lines = kwargs["stdin_b64"].split("\n")
     assert len(stdin_lines) == 2, (

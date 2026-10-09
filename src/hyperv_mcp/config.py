@@ -129,8 +129,10 @@ class Config:
     host_powershell_path: str | None = None
     verify_sha256: bool = False
     ps_timeout_s: int = 120
-    hyperv: HyperVTarget = field(default_factory=HyperVTarget)
     http: HttpPolicy = field(default_factory=HttpPolicy)
+    # Appended AFTER the pre-existing fields (not before http) so positional
+    # constructions of the pre-0.5 dataclass keep their argument order.
+    hyperv: HyperVTarget = field(default_factory=HyperVTarget)
     # Provenance set by load() only (deliberately NOT in _FIELD_MAP, so a JSON
     # config can never set them and unknown-key rejection stays intact):
     # config_path is the effective HYPERV_MCP_CONFIG path, config_sha256 is

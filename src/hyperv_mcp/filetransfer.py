@@ -229,20 +229,14 @@ def _run(cfg: Config, script: str, *, timeout_s: float | None = None, stdin_b64:
 
 
 # Per-chunk size for remote-mode byte crossing: safely under the default
-# ~500 KiB WS-Man MaxEnvelopeSizeKB. Remote put/get trade Copy-Item
-# -ToSession's single-stream for per-chunk round trips (README documents the
-# performance caveat); local mode is untouched.
+# ~500 KiB WS-Man MaxEnvelopeSizeKB. Put chunks the base64 STRING (262144
+# chars); get chunks RAW BYTES at a multiple of 3 (196608 B) so interior
+# chunks carry no base64 padding — only the final chunk may pad, and
+# padding is valid at the end of a concatenation. Remote put/get trade
+# Copy-Item -ToSession's single-stream for per-chunk round trips (README
+# documents the performance caveat); local mode is untouched.
 _CHUNK_B64_CHARS = 262144
-
-
-def _hop(cfg: Config) -> str:
-    """'Invoke-Command -ComputerName <host> [-Credential $__hostcred]' for a
-    single remote leg inside a remote-mode transfer script (empty local)."""
-    host = pswindows.hyperv_host(cfg)
-    if not host:
-        return ""
-    args = f"-ComputerName {pswindows.ps_quote(host)}"
-    return "Invoke-Command " + args + " -Credential $__hostcred"
+_CHUNK_RAW_BYTES = 196608
 
 
 
@@ -322,7 +316,6 @@ def _remote_put_script(
     lp: str,
     rp: str,
     staged: str,
-    staged_raw: str,
     fragment: str,
     assert_block: str,
     do_verify: bool,
@@ -331,13 +324,14 @@ def _remote_put_script(
 
     Local legs (source hash/size/read) run on the MCP machine; the file
     crosses the WS-Man hop in bounded base64 chunks (each its own
-    Invoke-Command, under MaxEnvelopeSizeKB); a final remote leg creates the
-    PS-Direct session ON the Hyper-V host and runs the same staged-copy /
-    verify / move semantics as the local body. D1 pin ordering: the local
-    Get-FileHash precedes the first -ComputerName leg; New-PSSession -VMId
-    follows it.
+    Invoke-Command with -ErrorAction Stop, under MaxEnvelopeSizeKB, remote
+    staging pre-created so a zero-byte source works and removed on any
+    failure); a final remote leg creates the PS-Direct session ON the
+    Hyper-V host and runs the same staged-copy / verify / move semantics as
+    the local body. D1 pin ordering: the local Get-FileHash precedes the
+    first -ComputerName leg; New-PSSession -VMId follows it.
     """
-    hop = _hop(cfg)
+    hop = pswindows.hop_line(cfg)
     prelude, stdin = pswindows.remote_prelude(
         cfg, payload_lines=1, stdin_b64=pswindows.utf8_b64(cred.password)
     )
@@ -348,6 +342,8 @@ def _remote_put_script(
         "$shaLocal = (Get-FileHash -LiteralPath $src -Algorithm SHA256).Hash"
         if do_verify else "$shaLocal = $null"
     )
+    # Both branches are f-strings: a plain branch would emit literal {{ }}
+    # and {fragment...} text (PRR-005 — the default verify=False cell).
     verify_move = f"""
         $shaStaged = Invoke-Command -Session $s -ScriptBlock {{ param($p) (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash }} -ArgumentList $stagedGuest -ErrorAction Stop
         if ($shaLocal -and ($shaLocal -ne $shaStaged)) {{ throw 'SHA-256 mismatch (staged copy differs from source)' }}
@@ -357,7 +353,7 @@ def _remote_put_script(
             Move-Item -LiteralPath $staged -Destination $final -Force -ErrorAction Stop
         }} -ArgumentList $stagedGuest, $final -ErrorAction Stop
         $shaRemote = $shaStaged
-""" if do_verify else """
+""" if do_verify else f"""
         $shaRemote = $null
         Invoke-Command -Session $s -ScriptBlock {{
             param($staged, $final)
@@ -371,18 +367,24 @@ $bytesLocal = (Get-Item -LiteralPath $src).Length
 $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($src))
 $rsB64Name = '{n_b64}'
 $rsBinName = '{n_bin}'
-$pos = 0
-while ($pos -lt $b64.Length) {{
-    $take = [Math]::Min({_CHUNK_B64_CHARS}, $b64.Length - $pos)
-    $chunk = $b64.Substring($pos, $take)
+try {{
     {hop} -ScriptBlock {{
-        param($n, $c)
+        param($n)
         $p = Join-Path ([IO.Path]::GetTempPath()) $n
-        [IO.File]::AppendAllText($p, $c)
-    }} -ArgumentList $rsB64Name, $chunk
-    $pos += $take
-}}
-$__put = {hop} -ScriptBlock {{
+        [IO.File]::WriteAllText($p, '')
+    }} -ArgumentList $rsB64Name -ErrorAction Stop
+    $pos = 0
+    while ($pos -lt $b64.Length) {{
+        $take = [Math]::Min({_CHUNK_B64_CHARS}, $b64.Length - $pos)
+        $chunk = $b64.Substring($pos, $take)
+        {hop} -ScriptBlock {{
+            param($n, $c)
+            $p = Join-Path ([IO.Path]::GetTempPath()) $n
+            [IO.File]::AppendAllText($p, $c)
+        }} -ArgumentList $rsB64Name, $chunk -ErrorAction Stop
+        $pos += $take
+    }}
+    $__put = {hop} -ScriptBlock {{
     param($__p0, $nB64, $nBin, $final, $stagedGuest, $shaLocal, $bytesLocal)
 {_guest_cred_lines(cred)}
     $vmTarget = '{vm_id}'
@@ -420,8 +422,16 @@ $__put = {hop} -ScriptBlock {{
         if ($rb64) {{ Remove-Item -LiteralPath $rb64 -Force -ErrorAction SilentlyContinue }}
         if ($rbin) {{ Remove-Item -LiteralPath $rbin -Force -ErrorAction SilentlyContinue }}
     }}
-}} -ArgumentList $__p0, $rsB64Name, $rsBinName, {rp}, {staged}, $shaLocal, $bytesLocal
-$__put
+}} -ArgumentList $__p0, $rsB64Name, $rsBinName, {rp}, {staged}, $shaLocal, $bytesLocal -ErrorAction Stop
+    $__put
+}} catch {{
+    {hop} -ScriptBlock {{
+        param($n)
+        $p = Join-Path ([IO.Path]::GetTempPath()) $n
+        Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+    }} -ArgumentList $rsB64Name -ErrorAction SilentlyContinue
+    throw
+}}
 """, stdin
 
 
@@ -432,8 +442,6 @@ def _remote_get_script(
     rp: str,
     lp: str,
     staged: str,
-    staged_raw: str,
-    fragment: str,
     assert_block: str,
     do_verify: bool,
 ) -> tuple[str, str | None]:
@@ -441,12 +449,16 @@ def _remote_get_script(
 
     The local verify scriptblock (destination write + hash + move) is
     DEFINED before the hop so the MCP-machine legs stay textually local; the
-    first remote leg creates the PS-Direct session ON the Hyper-V host and
-    pulls to remote staging; a chunked loop reads the staging file back in
-    bounded base64 ranges; the local verify block then runs on the received
-    bytes. Same staged-then-move semantics as the local body.
+    first remote leg creates the PS-Direct session ON the Hyper-V host,
+    pulls to remote staging, and returns a live PSCustomObject (NO
+    ConvertTo-Json — remoting deserializes it, so ``$__get.len`` is the
+    file length, PRR-003); the chunked loop seeks to each offset and reads
+    3-multiple raw-byte ranges (no interior base64 padding, PRR-002) with
+    short-read handling; remote staging is removed only after the loop
+    (PRR-001) and on any exit path (PRR-007); every leg carries -ErrorAction
+    Stop (PRR-004). The local verify block then runs on the received bytes.
     """
-    hop = _hop(cfg)
+    hop = pswindows.hop_line(cfg)
     prelude, stdin = pswindows.remote_prelude(
         cfg, payload_lines=1, stdin_b64=pswindows.utf8_b64(cred.password)
     )
@@ -481,55 +493,64 @@ def _remote_get_script(
         "$shaLocal = $null\n"
     )
     return f"""{prelude}{local_verify}$src = {rp}
+$rsBinName = '{n_bin}'
+# No ConvertTo-Json here: remoting deserializes the PSCustomObject, so
+# $__get.len / .bytes_remote / .sha_remote are real values (PRR-003). The
+# remote staging file is intentionally NOT removed in this leg — the chunk
+# loop below still reads it (PRR-001); cleanup runs after the loop.
 $__get = {hop} -ScriptBlock {{
-    param($__p0, $nBin, $src, $stagedGuest)
+    param($__p0, $nBin, $src)
 {_guest_cred_lines(cred)}
     $vmTarget = '{vm_id}'
     $s = New-PSSession -VMId $vmTarget -Credential $gcred -ErrorAction Stop
-    $rbin = $null
     try {{
         $rbin = Join-Path ([IO.Path]::GetTempPath()) $nBin
 {assert_block}        Copy-Item -FromSession $s -LiteralPath $src -Destination $rbin -Force -ErrorAction Stop
 {remote_sha}        $bytesRemote = Invoke-Command -Session $s -ScriptBlock {{ param($p) (Get-Item -LiteralPath $p).Length }} -ArgumentList $src -ErrorAction Stop
-        $len = (Get-Item -LiteralPath $rbin).Length
-        [PSCustomObject]@{{ len = $len; bytes_remote = $bytesRemote; sha_remote = $shaRemote }} | ConvertTo-Json -Compress
-    }} catch {{
-        Invoke-Command -Session $s -ScriptBlock {{
-            param($staged) Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
-        }} -ArgumentList $stagedGuest -ErrorAction SilentlyContinue
-        throw
+        [PSCustomObject]@{{ len = (Get-Item -LiteralPath $rbin).Length; bytes_remote = $bytesRemote; sha_remote = $shaRemote }}
     }} finally {{
         Remove-PSSession $s -ErrorAction SilentlyContinue
-        if ($rbin) {{ Remove-Item -LiteralPath $rbin -Force -ErrorAction SilentlyContinue }}
     }}
-}} -ArgumentList $__p0, '{n_bin}', {rp}, {staged}
-$len = $__get.len
-$bytesRemote = $__get.bytes_remote
-$shaRemote = $__get.sha_remote
+}} -ArgumentList $__p0, '{n_bin}', {rp} -ErrorAction Stop
 $outB64 = ''
 $off = 0
-while ($off -lt $len) {{
-    $take = [Math]::Min({_CHUNK_B64_CHARS}, $len - $off)
-    $outB64 += {hop} -ScriptBlock {{
-        param($n, $o, $l)
+try {{
+    while ($off -lt $__get.len) {{
+        $take = [Math]::Min({_CHUNK_RAW_BYTES}, $__get.len - $off)
+        $outB64 += {hop} -ScriptBlock {{
+            param($n, $o, $l)
+            $p = Join-Path ([IO.Path]::GetTempPath()) $n
+            $fs = [IO.File]::OpenRead($p)
+            try {{
+                [void]$fs.Seek($o, 'Begin')
+                $buf = New-Object byte[] $l
+                $read = 0
+                while ($read -lt $l) {{
+                    $n2 = $fs.Read($buf, $read, $l - $read)
+                    if ($n2 -le 0) {{ break }}
+                    $read += $n2
+                }}
+                [Convert]::ToBase64String($buf, 0, $read)
+            }} finally {{ $fs.Dispose() }}
+        }} -ArgumentList '{n_bin}', $off, $take -ErrorAction Stop
+        $off += $take
+    }}
+}} finally {{
+    {hop} -ScriptBlock {{
+        param($n)
         $p = Join-Path ([IO.Path]::GetTempPath()) $n
-        $fs = [IO.File]::OpenRead($p)
-        try {{
-            $buf = New-Object byte[] $l
-            [void]$fs.Read($buf, 0, $l)
-            [Convert]::ToBase64String($buf)
-        }} finally {{ $fs.Dispose() }}
-    }} -ArgumentList '{n_bin}', $off, $take
-    $off += $take
+        Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+    }} -ArgumentList '{n_bin}' -ErrorAction SilentlyContinue
 }}
+$shaRemote = $__get.sha_remote
 {final_verify}$bytesLocal = (Get-Item -LiteralPath {lp}).Length
 [PSCustomObject]@{{
     ok = $true
     bytes_copied = $bytesLocal
     bytes_local = $bytesLocal
-    bytes_remote = $bytesRemote
+    bytes_remote = $__get.bytes_remote
     sha256_local = $shaLocal
-    sha256_remote = $shaRemote
+    sha256_remote = $__get.sha_remote
 }} | ConvertTo-Json -Compress
 """, stdin
 
@@ -678,7 +699,7 @@ def guest_put(
     }} | ConvertTo-Json -Compress
 """
     remote_script, remote_stdin = _remote_put_script(
-        cfg, cred, ref.id, lp, rp, staged, staged_raw,
+        cfg, cred, ref.id, lp, rp, staged,
         fragment, assert_block, do_verify,
     ) if pswindows.hyperv_host(cfg) else (None, None)
     with vmlocks.vm_lock(ref.id):
@@ -781,8 +802,8 @@ def guest_get(
     }} | ConvertTo-Json -Compress
 """
     remote_script, remote_stdin = _remote_get_script(
-        cfg, cred, ref.id, rp, lp, staged, staged_raw,
-        fragment, assert_block, do_verify,
+        cfg, cred, ref.id, rp, lp, staged,
+        assert_block, do_verify,
     ) if pswindows.hyperv_host(cfg) else (None, None)
     with vmlocks.vm_lock(ref.id):
         try:

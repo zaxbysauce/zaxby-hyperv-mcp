@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import re
 
-from . import policy, pswindows, vmident, vmlocks
+from . import credentials, policy, pswindows, vmident, vmlocks
 from .config import Config
 from .credentials import CredentialSet
 
@@ -301,6 +301,10 @@ def _run_inner(
             stdin_b64=pswindows.utf8_b64(cred.password),
         )
         result = pswindows.run_ps(script, timeout_s=timeout_s, stdin_b64=stdin)
+    except credentials.CredentialError as exc:
+        # Remote-mode host-credential configuration errors are caller
+        # configuration, not transport (cubic PR #47 finding).
+        return _result_err(cfg, str(exc), "invalid")
     except Exception as exc:  # transport-level failure, redacted by pswindows
         return _result_err(cfg, str(exc), "transport")
 

@@ -2217,8 +2217,25 @@ def main(argv: list[str] | None = None) -> int:
         ):
             print(f"{name:36}{'set' if name in os.environ else 'not set'}")
         if host_target:
-            probe = f"$ProgressPreference='SilentlyContinue'; try {{ Invoke-Command -ComputerName {pswindows.ps_quote(host_target)} -ScriptBlock {{ $true }} -ErrorAction Stop | Out-Null; 'OK' }} catch {{ 'UNREACHABLE: ' + $_.Exception.Message }}"
-            result = pswindows.run_ps(probe, timeout_s=8)
+            # Credentials-aware probe (cubic PR #47 finding): composed through
+            # the same hop builder the tools use, so it validates the identity
+            # the tools will actually use (HYPERV_HOST_* when configured,
+            # ambient user otherwise). Transport-missing is fail-soft like
+            # _powershell_provenance.
+            probe_body = (
+                "$ProgressPreference='SilentlyContinue'; "
+                "try { Invoke-Command "
+                f"-ComputerName {pswindows.ps_quote(host_target)} "
+                "-ScriptBlock { $true } -ErrorAction Stop | Out-Null; 'OK' } "
+                "catch { 'UNREACHABLE: ' + $_.Exception.Message }"
+            )
+            probe_script, probe_stdin = pswindows.compose_remote(cfg, probe_body)
+            try:
+                result = pswindows.run_ps(
+                    probe_script, timeout_s=8, stdin_b64=probe_stdin
+                )
+            except pswindows.PowerShellTransportError as exc:
+                result = pswindows.PSResult(returncode=1, stderr=f"unavailable: {exc}")
             detail = (result.stdout.strip() or result.stderr.strip() or "unknown error")
             print(f"hyperv.target_probe {pswindows.redact(detail)}")
         ps_info = _powershell_provenance(cfg)

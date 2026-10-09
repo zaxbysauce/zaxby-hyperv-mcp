@@ -525,16 +525,26 @@ def remote_prelude(cfg, *, payload_lines: int = 0, stdin_b64: str | None = None)
     return "\n".join(lines) + "\n", new_stdin
 
 
-def remote_wrap(cfg, body: str, *, payload_lines: int = 0, cred_mode: str = "auto") -> str:
-    """Script-text composer for the remote hop (identity in local mode).
+def hop_line(cfg) -> str:
+    """Invoke-Command opening for ONE remote leg; empty string in local mode.
 
-    See compose_remote; this is the script-only API for payload-free host
-    operations. cred_mode "explicit"/"implicit" force host-credential
-    resolution semantics; "auto" resolves per call (explicit iff
-    HYPERV_HOST_* provides a complete pair).
+    Single source for the hop shape so per-leg emitters (filetransfer's
+    transfer builders) cannot drift from compose_remote: ``-Credential
+    $__hostcred`` is appended only when a complete HYPERV_HOST_* pair
+    resolves — mirroring the preamble that defines ``$__hostcred`` — so
+    implicit-auth deployments never reference an undefined variable
+    (PRR-006). Callers append ``-ScriptBlock { ... } [-ArgumentList ...]
+    -ErrorAction Stop``.
     """
-    script, _ = compose_remote(cfg, body, payload_lines=payload_lines, cred_mode=cred_mode)
-    return script
+    host = hyperv_host(cfg)
+    if not host:
+        return ""
+    from . import credentials  # local import: credentials does not import pswindows
+
+    line = f"Invoke-Command -ComputerName {ps_quote(host)}"
+    if credentials.resolve_host() is not None:
+        line += " -Credential $__hostcred"
+    return line
 
 
 def compose_remote(
@@ -543,7 +553,6 @@ def compose_remote(
     *,
     payload_lines: int = 0,
     stdin_b64: str | None = None,
-    cred_mode: str = "auto",
 ) -> tuple[str, str | None]:
     """Compose the WS-Man hop for a script body (issue #43).
 
@@ -566,20 +575,9 @@ def compose_remote(
     host = hyperv_host(cfg)
     if not host:
         return body, stdin_b64
-    lines, new_stdin, host_cred, params = _remote_parts(
+    lines, new_stdin, _host_cred, params = _remote_parts(
         cfg, payload_lines=payload_lines, stdin_b64=stdin_b64
     )
-    if cred_mode == "explicit" and host_cred is None:
-        from . import credentials
-
-        raise credentials.CredentialError(
-            "cred_mode=explicit requires HYPERV_HOST_USERNAME and "
-            "HYPERV_HOST_PASSWORD (or HYPERV_HOST_PASSWORD_FILE)"
-        )
-
-    hop_args = [f"-ComputerName {ps_quote(host)}"]
-    if host_cred is not None:
-        hop_args.append("-Credential $__hostcred")
 
     inner = (
         (f"param({', '.join(params)})\n" if params else "")
@@ -590,10 +588,12 @@ def compose_remote(
     )
     script = (
         "\n".join(lines)
-        + ("" if lines else "")
-        + f"\nInvoke-Command {' '.join(hop_args)} -ScriptBlock {{\n"
+        + "\n"
+        + hop_line(cfg)
+        + " -ScriptBlock {\n"
         + inner
         + "\n}"
         + (f" -ArgumentList {', '.join(params)}" if params else "")
+        + " -ErrorAction Stop"
     )
     return script, new_stdin

@@ -27,7 +27,6 @@ SRC = Path(__file__).resolve().parents[2] / "src" / "hyperv_mcp"
 RUN_PS_ALLOWLIST = {
     ("pswindows.py", "run_ps"),            # the transport itself
     ("pswindows.py", "compose_remote"),    # calls the transport
-    ("pswindows.py", "remote_prelude"),    # (pure preamble helper; kept for clarity)
     ("lifecycle.py", "_run"),
     ("console.py", "_run"),
     ("vmident.py", "_run"),
@@ -82,6 +81,19 @@ def census_readline() -> list[tuple[str, str, int]]:
     return out
 
 
+def census_run_ps_from_imports() -> list[tuple[str, int]]:
+    """Modules that import run_ps directly (bypasses the pswindows.run_ps(
+    reference the main census counts — MA-7/cubic C19 blind spot)."""
+    out: list[tuple[str, int]] = []
+    for py in sorted(SRC.glob("*.py")):
+        if py.name == "pswindows.py":
+            continue
+        for i, line in enumerate(py.read_text(encoding="utf-8").splitlines()):
+            if re.search(r"from\s+\.?pswindows\s+import[^#]*run_ps", line):
+                out.append((py.name, i + 1))
+    return out
+
+
 def test_every_run_ps_reference_is_choked():
     rows = census_run_ps()
     assert rows, "census must find the transport references"
@@ -91,12 +103,37 @@ def test_every_run_ps_reference_is_choked():
         "(implicitly-local Hyper-V addressing class): "
         f"{offenders}"
     )
+    importers = census_run_ps_from_imports()
+    assert importers == [], (
+        "run_ps imported directly (the main census cannot see bare "
+        f"run_ps( call sites in these modules): {importers}"
+    )
+
+
+# Exact per-function ReadLine budgets: a NEW read added to a remote branch
+# of an allowlisted function would hang every remote call (a remote
+# scriptblock cannot read local stdin), so function-level membership alone
+# is not enough (cubic C18).
+READLINE_BUDGETS = {
+    ("pswindows.py", "_remote_parts"): 2,      # hostpw line + param-loop f-string
+    ("guestexec.py", "psdirect_prefix"): 1,    # pinned local-mode emission
+    ("console.py", "type_text"): 1,            # pinned local-mode inline emission
+}
 
 
 def test_readline_surface_is_pinned():
     rows = census_readline()
-    offenders = [r for r in rows if (r[0], r[1]) not in READLINE_ALLOWLIST]
+    offenders = [r for r in rows if (r[0], r[1]) not in READLINE_BUDGETS]
     assert offenders == [], (
         "[Console]::In.ReadLine() outside the composer preamble / pinned "
         f"local-mode emissions: {offenders}"
     )
+    counts: dict[tuple[str, str], int] = {}
+    for fname, fn, _line in rows:
+        counts[(fname, fn)] = counts.get((fname, fn), 0) + 1
+    for key, budget in READLINE_BUDGETS.items():
+        actual = counts.get(key, 0)
+        assert actual == budget, (
+            f"{key}: expected exactly {budget} ReadLine emission(s), found "
+            f"{actual} — a new read in a remote branch would hang remote calls"
+        )
