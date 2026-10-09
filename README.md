@@ -355,10 +355,9 @@ error — fix that before calling tools (see Troubleshooting).
   report `hyperv_target` alongside the error instead of re-running blind.
   If `hyperv-mcp --check-env` printed `hyperv.target_probe UNREACHABLE`,
   fix connectivity first; tool calls will keep failing until the hop works.
-  Note the probe authenticates with your current Windows user (it does not
-  use `HYPERV_HOST_*`), so on a workgroup deployment it may report
-  UNREACHABLE while credentialed tools succeed — confirm with a real tool
-  call before concluding the host is down.
+  The probe composes through the same credential hop as the tools (it uses
+  `HYPERV_HOST_*` when configured, your current user otherwise), so its
+  verdict reflects what real tool calls will do.
 - **Destructive operations hit the remote host.** The same category
   switches (`stop`, `reset`, `checkpoint_restore`, ...) plus `confirm=true`
   gate them, exactly as locally — treat a remote production host with the

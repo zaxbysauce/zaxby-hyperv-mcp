@@ -219,7 +219,6 @@ def _capture_put_remote(monkeypatch, tmp_path):
 
 
 def test_composed_remote_scripts_parse(monkeypatch, tmp_path):
-    pytest.importorskip("subprocess")
     fake = FakePS()
     monkeypatch.setattr(pswindows, "run_ps", fake)
     lifecycle.list_vms(_remote_cfg(unrestricted=True))                          # host op
