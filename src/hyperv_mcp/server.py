@@ -155,6 +155,18 @@ def bootstrap(environ: dict[str, str] | None = None) -> Config:
 
 
 def _startup_banner(cfg: Config) -> None:
+    # The Hyper-V target line prints FIRST and unconditionally: unrestricted
+    # mode early-returns below, and remote lab deployments are exactly the
+    # unrestricted ones (issue #43) — the target must never be silenced.
+    target = cfg.hyperv.host
+    if target:
+        print(
+            f"[hyperv-mcp] Hyper-V target: remote host {target} "
+            "(run `hyperv-mcp --check-env` to verify target reachability)",
+            file=sys.stderr,
+        )
+    else:
+        print("[hyperv-mcp] Hyper-V target: local host", file=sys.stderr)
     print(f"[hyperv-mcp] policy: {cfg.policy_summary()}", file=sys.stderr)
     if cfg.unrestricted:
         print(
@@ -291,12 +303,20 @@ def _mcp_sdk_version() -> str:
         return "unknown"
 
 
+def _hyperv_target_block(cfg: Config) -> dict[str, Any]:
+    """Effective Hyper-V target for hyperv_server_info (issue #43):
+    local mode by default; the configured remote host when hyperv.host set."""
+    host = cfg.hyperv.host
+    return {"mode": "remote" if host else "local", "host": host}
+
+
 def _server_info_payload(cfg: Config) -> dict[str, Any]:
     """Read-only runtime provenance payload for the hyperv_server_info tool."""
     return {
         "version": VERSION,
         "git_revision": _git_revision(),
         "powershell": _powershell_provenance(cfg),
+        "hyperv_target": _hyperv_target_block(cfg),
         "config_path": cfg.config_path,
         "config_sha256": cfg.config_sha256,
         "mcp_sdk_version": _mcp_sdk_version(),
@@ -2185,13 +2205,40 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(f"hyperv-mcp {VERSION}")
         print(cfg.policy_summary())
+        host_target = cfg.hyperv.host
+        print(f"hyperv.target {'remote host ' + host_target if host_target else 'local host'}")
         for name in (
             "HYPERV_GUEST_USERNAME", "HYPERV_GUEST_PASSWORD", "HYPERV_GUEST_PASSWORD_FILE",
             "HYPERV_GUEST_VICTIM_USERNAME", "HYPERV_GUEST_VICTIM_PASSWORD",
-            "HYPERV_GUEST_VICTIM_PASSWORD_FILE", "HYPERV_MCP_CONFIG",
+            "HYPERV_GUEST_VICTIM_PASSWORD_FILE", "HYPERV_HOST_USERNAME",
+            "HYPERV_HOST_PASSWORD", "HYPERV_HOST_PASSWORD_FILE",
+            "HYPERV_MCP_CONFIG",
             "HYPERV_MCP_UNRESTRICTED", "HYPERV_MCP_HTTP_TOKEN",
         ):
             print(f"{name:36}{'set' if name in os.environ else 'not set'}")
+        if host_target:
+            # The composed hop IS the probe: it validates exactly the
+            # agent→host leg (and identity) the tools use — no inner
+            # self-hop (cubic PR #47 round: a probe-body Invoke-Command
+            # double-hopped host→host→self and could misreport UNREACHABLE
+            # while tools succeeded). Transport-missing is fail-soft like
+            # _powershell_provenance.
+            probe_script, probe_stdin = pswindows.compose_remote(cfg, "'OK'")
+            try:
+                result = pswindows.run_ps(
+                    probe_script, timeout_s=8, stdin_b64=probe_stdin
+                )
+            except pswindows.PowerShellTransportError as exc:
+                result = pswindows.PSResult(returncode=1, stderr=f"unavailable: {exc}")
+            if result.ok() and result.stdout.strip() == "OK":
+                detail = "OK"
+            else:
+                detail = "UNREACHABLE: " + (
+                    result.stderr.strip()
+                    or result.stdout.strip()
+                    or "unknown error"
+                )
+            print(f"hyperv.target_probe {pswindows.redact(detail)}")
         ps_info = _powershell_provenance(cfg)
         print(f"powershell.path {ps_info['path']}")
         print(f"powershell.edition {ps_info['edition']}")

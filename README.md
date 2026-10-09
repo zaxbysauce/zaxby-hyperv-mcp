@@ -18,8 +18,19 @@ file transfer, structured audit logging, and a unit/integration test split.
 
 ## Requirements
 
-- Windows 10/11 or Windows Server with the Hyper-V role/module installed
-  (the `vmms` service running; verified with `Get-Service vmms`)
+- **Hyper-V host** (the machine whose `vmms` service is managed): Windows
+  10/11 or Windows Server with the Hyper-V role/module installed (the `vmms`
+  service running; verified with `Get-Service vmms`).
+  - **Local mode (default)**: the server runs ON the Hyper-V host.
+  - **Remote host mode**: the server runs on another box (e.g. an agent
+    desktop with the GPUs) and manages Hyper-V over WS-Man remoting — see
+    [Remote Hyper-V host](#remote-hyper-v-host). The remote host needs WS-Man
+    remoting enabled (`Enable-PSRemoting -SkipNetworkProfileCheck`; Hyper-V
+    Manager connectivity implies it is already on); the **agent box** needs
+    the WS-Man client and, in workgroup deployments (the common
+    desktop→NUC layout), must trust the host:
+    `Set-Item WSMan:\localhost\Client\TrustedHosts -Value '<host>' -Concatenate`
+    (or use HTTPS/CredSSP instead).
 - Python 3.10+
 - Guest OS: any Windows guest supported by PowerShell Direct (Windows
   Server 2012 R2+ / Windows 8.1+) with working Integration Services
@@ -120,6 +131,13 @@ Resolution order:
      ACL)
 2. `HYPERV_GUEST_VICTIM_USERNAME` + `HYPERV_GUEST_VICTIM_PASSWORD` /
    `HYPERV_GUEST_VICTIM_PASSWORD_FILE` for the Medium-IL victim tools.
+3. Optional, remote-host mode only: `HYPERV_HOST_USERNAME` +
+   `HYPERV_HOST_PASSWORD` / `HYPERV_HOST_PASSWORD_FILE` authenticates the
+   WS-Man hop to the remote Hyper-V host. When unset, the hop uses the
+   current user's implicit credentials (works for domain or matching local
+   accounts; workgroup boxes typically need the explicit pair or
+   TrustedHosts). The host password rides the same stdin channel as guest
+   passwords and is redacted everywhere.
 
 Hardening properties:
 
@@ -175,6 +193,9 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
   "host_powershell_path": null,        // default: Windows PowerShell 5.1
   "verify_sha256": false,              // default integrity check for transfers
   "ps_timeout_s": 120,                 // default host PowerShell timeout
+  // "hyperv": { "host": "nuc01" },    // remote Hyper-V host (issue #43);
+  //                                    // OMIT the section entirely for local mode
+  //                                    // (the section requires a non-empty host)
   "http": { "host": "127.0.0.1", "port": 8787, "token_env": "HYPERV_MCP_HTTP_TOKEN",
             "agents": { "agent-a": "HYPERV_MCP_TOKEN_AGENT_A" } }
 }
@@ -192,6 +213,182 @@ directories stripped, the 5.1 system module directory appended). Pointing
 not recommended: the pwsh7 child would lose its pwsh7 module directories on
 every spawn. The knob exists for exotic 5.1 layouts; leave it `null` for
 PowerShell 7 hosts.
+
+## Remote Hyper-V host
+
+Set `hyperv.host` to manage Hyper-V on another machine — the layout where
+the agent (and its GPUs) live on a desktop while the Hyper-V role and VMs
+live on, say, a NUC:
+
+```jsonc
+{ "hyperv": { "host": "nuc01" } }
+```
+
+How it works: with a host configured, every Hyper-V operation is wrapped in
+`Invoke-Command -ComputerName '<host>'` so the cmdlets, the
+`root\virtualization\v2` CIM/WMI queries, and the PowerShell Direct
+(`-VMId`) hops execute ON the Hyper-V host; secrets cross the WS-Man hop as
+scriptblock parameters over the existing stdin channel, never in script
+text. With `hyperv.host` unset (default) every generated script is
+byte-identical to the local-mode emissions. `hyperv_server_info` reports the
+effective target (`hyperv_target.mode`/`hyperv_target.host`), the startup
+banner names it, and `hyperv-mcp --check-env` runs a one-shot reachability
+probe of the target.
+
+### Setup walkthrough (desktop agent + NUC host)
+
+One-time preparation, then a config line. In this walkthrough the Hyper-V
+host is `nuc01` and the agent box is the desktop where hyperv-mcp runs.
+
+**Step 1 — prepare the Hyper-V host (`nuc01`, elevated PowerShell):**
+
+```powershell
+# WS-Man remoting (skip the network-profile guard on a private/home LAN)
+Enable-PSRemoting -SkipNetworkProfileCheck
+# The box needs the Hyper-V role (or at minimum the Hyper-V PowerShell
+# module) and an account that may manage VMs — membership of the remote
+# machine's "Hyper-V Administrators" group is preferred (see Permissions).
+```
+
+**Step 2 — prepare the agent box (desktop, elevated PowerShell):**
+
+```powershell
+# WORKGROUP deployments (the common desktop->NUC case): the WS-Man client
+# must trust the host, and NTLM auth needs explicit credentials (step 3).
+Set-Item WSMan:\localhost\Client\TrustedHosts -Value 'nuc01' -Concatenate
+# Domain-joined boxes usually need neither TrustedHosts nor explicit
+# credentials (Kerberos current-user auth works); HTTPS/CredSSP are the
+# hardened alternatives to TrustedHosts.
+# Quick connectivity test before touching hyperv-mcp:
+Test-WSMan -ComputerName nuc01
+```
+
+**Step 3 — host credentials for the hop (agent box):** set
+`HYPERV_HOST_USERNAME` plus `HYPERV_HOST_PASSWORD_FILE` (preferred — a
+UTF-8 file holding just the password, restrictive ACL) or
+`HYPERV_HOST_PASSWORD` in the **server's** environment (see the
+`.mcp.json` example in step 4). Set BOTH the username and a password
+source: a password without a username is ignored (the hop silently uses
+your current Windows user), while a username without any password source
+fails with a naming error. With all three unset the hop uses your current
+Windows user (implicit auth) — fine on a domain, usually not on a
+workgroup. The host password rides the hop as `-Credential` (built from a
+stdin-fed value, never in script text); the GUEST password crosses to the
+remote host as a scriptblock parameter — meaning the remote Hyper-V host
+must be trusted with the guest's credentials, the same trust level as
+running PowerShell Direct there. Both secrets are redacted from all output
+and stripped from every child process environment. File transfers stage a
+temporary copy of the file in the remote host's TEMP during the hop
+(removed on success and failure; a hard timeout can leave it).
+
+**Step 4 — point hyperv-mcp at the host** (add the section to your
+`HYPERV_MCP_CONFIG` JSON; `hyperv.host` accepts a DNS hostname or IPv4
+literal — letters, digits, `.`, `-`, `_`, `:` — because it is
+embedded in generated PowerShell):
+
+```jsonc
+{
+  "schema_version": 1,
+  "hyperv": { "host": "nuc01" },
+  "allowed_vm_patterns": ["lab-*"],
+  "guest_read_roots":  ["C:\\Windows\\Temp"],
+  "guest_write_roots": ["C:\\Windows\\Temp"]
+}
+```
+
+And wire the client (`.mcp.json`) with the host credentials alongside the
+usual guest credentials:
+
+```json
+{
+  "mcpServers": {
+    "hyperv": {
+      "command": "hyperv-mcp",
+      "env": {
+        "HYPERV_MCP_CONFIG": "C:\\Lab\\hyperv-mcp.json",
+        "HYPERV_GUEST_USERNAME": "Administrator",
+        "HYPERV_GUEST_PASSWORD_FILE": "C:\\Lab\\secrets\\guest.pw",
+        "HYPERV_HOST_USERNAME": "nuc01\\vmadmin",
+        "HYPERV_HOST_PASSWORD_FILE": "C:\\Lab\\secrets\\host.pw"
+      }
+    }
+  }
+}
+```
+
+**Step 5 — verify:**
+
+```text
+$ hyperv-mcp --check-env
+hyperv-mcp 0.4.0
+hyperv.target remote host nuc01
+HYPERV_HOST_USERNAME                set
+HYPERV_HOST_PASSWORD                not set
+HYPERV_HOST_PASSWORD_FILE           set
+...
+hyperv.target_probe OK
+```
+
+The server's stderr banner also names the target on every start
+(`[hyperv-mcp] Hyper-V target: remote host nuc01 ...`), and
+`hyperv_server_info` reports
+`"hyperv_target": {"mode": "remote", "host": "nuc01"}` at runtime. A probe
+that prints `hyperv.target_probe UNREACHABLE: ...` names the exact WS-Man
+error — fix that before calling tools (see Troubleshooting).
+
+### Notes for agents (MCP clients driving this server)
+
+- **Detect the mode before assuming one:** call `hyperv_server_info` and
+  read `hyperv_target`. `{"mode": "local", "host": null}` means every path
+  in `host_*_roots` is on this machine; `{"mode": "remote", "host": ...}`
+  means VM operations execute on that host while file-transfer policy still
+  applies to the machine running the server.
+- **File transfers are split-brained in remote mode:** `hyperv_guest_put`'s
+  source and `hyperv_guest_get`'s destination live on the **agent box**
+  (governed by `host_read_roots`/`host_write_roots`); the guest side lives
+  on the VM. Transfers cross the WS-Man hop in bounded base64 chunks
+  (192 KiB of file data per hop), so large files are slow — warn the user, and for bulk moves suggest the
+  alternative layout below instead of looping retries.
+- **Know which host you are operating on.** WS-Man connection failures
+  quote the configured host in their message text; other failures (policy,
+  credentials, timeouts) do not name it — call `hyperv_server_info` and
+  report `hyperv_target` alongside the error instead of re-running blind.
+  If `hyperv-mcp --check-env` printed `hyperv.target_probe UNREACHABLE`,
+  fix connectivity first; tool calls will keep failing until the hop works.
+  The probe composes through the same credential hop as the tools (it uses
+  `HYPERV_HOST_*` when configured, your current user otherwise), so its
+  verdict reflects what real tool calls will do.
+- **Destructive operations hit the remote host.** The same category
+  switches (`stop`, `reset`, `checkpoint_restore`, ...) plus `confirm=true`
+  gate them, exactly as locally — treat a remote production host with the
+  same care, and confirm with the user which host a destructive call will
+  land on when both a local and a remote deployment exist.
+- **Credentials never go in config values or tool arguments.** Host
+  credentials come from the environment / password files; if a user pastes
+  a password into chat, direct them to a password file instead of
+  `allow_inline_credentials`.
+- **File-backed media ops are local-mode only in this release** (VHD/ISO
+  paths are consumed by the remote host, not the agent box) — steer users
+  to local mode for `hyperv_vm_create`/`hyperv_vm_disk_add`/
+  `hyperv_vm_media_attach`; all other media/firmware operations work
+  remotely.
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `hyperv.target_probe UNREACHABLE: The client cannot connect to the destination specified` | WinRM not listening on the host, or the agent box does not trust it (workgroup) | `Enable-PSRemoting -SkipNetworkProfileCheck` on the host; `Set-Item WSMan:\localhost\Client\TrustedHosts -Value '<host>' -Concatenate` on the agent box; retest with `Test-WSMan -ComputerName <host>` |
+| `Access is denied` (or 0x80070005) on every remote tool | Wrong `HYPERV_HOST_*` credentials, or the account lacks remote VM rights | Check the credential env vars are in the **server's** environment (restart the MCP client after editing `.mcp.json`); put the account in the host's `Hyper-V Administrators` group |
+| Tools worked locally; after adding `hyperv.host` every call fails | Server process started before the env/config landed | Config is read at server start; env per call but from the server's process — restart the MCP client and re-check the banner line |
+| `CONFIG ERROR: hyperv.host must be a hostname or IP literal` | Metacharacters in the configured host | Use the bare hostname/IP; quoting is applied by the server |
+| Transfers of large files are much slower than local mode | Remote put/get cross the hop in bounded base64 chunks (192 KiB of file data per hop, sized under the WS-Man envelope limit) | Expected; for bulk transfers run the server on the Hyper-V host (local mode) instead |
+| A tool reported timeout but the VM state kept changing | The local kill does not reach a command already running on the remote host | Inherent to WS-Man remoting; re-check state with `hyperv_get_vm_info` before retrying |
+| `hyperv_vm_create`/`hyperv_vm_disk_add`/`hyperv_vm_media_attach` fail with "does not support ... in this release" | File-backed media ops validate VHD/ISO paths on the agent box but consume them on the remote host — unsupported remotely in this release | Pre-place the file on the remote host and run the operation in local mode; path-free operations (`hyperv_media_detach`, `hyperv_vm_disk_list`, firmware/TPM/SecureBoot) work remotely |
+| Remote screenshots fail on large resolutions | The capture payload crosses one WS-Man hop; very large captures can exceed the envelope limit | Lower the resolution, or run the server locally for screenshot-heavy work |
+
+Alternative layout: running the server ON the Hyper-V host and pointing
+the agent at `hyperv-mcp-http` (with a token) over an SSH tunnel also
+works and needs no remote-mode config.
 
 **Path checks** canonicalize before comparing: `..` collapse, mixed
 separators, drive-relative rejection, `\\?\`/UNC prefixes, and

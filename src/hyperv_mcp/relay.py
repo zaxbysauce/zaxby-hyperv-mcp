@@ -62,6 +62,10 @@ from .diagnostics import build_guest_script
 _LOOPBACK_BINDS = {"127.0.0.1", "localhost", "::1"}
 _MAX_BODY_BYTES = 1024 * 1024
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+# Remote-mode single-hop caps: a base64'd request AND its base64'd response
+# must each fit one WS-Man envelope (~500 KiB default) with headroom.
+_REMOTE_BODY_BYTES = 192 * 1024
+_REMOTE_RESPONSE_BYTES = 192 * 1024
 _REQUEST_TIMEOUT_S = 30
 _MAX_RELAYS = 16
 
@@ -131,7 +135,8 @@ _FORWARD_HEADER_ALLOWLIST = ("accept", "authorization", "user-agent")
 
 
 def _forward_script(guest_port: int, method: str, path: str,
-                    headers: dict[str, str], body: bytes) -> str:
+                    headers: dict[str, str], body: bytes,
+                    response_cap: int = _MAX_RESPONSE_BYTES) -> str:
     url = f"http://127.0.0.1:{guest_port}{path}"
     fwd_headers = {
         k: v for k, v in headers.items()
@@ -169,7 +174,7 @@ try {{
     $resp = Invoke-WebRequest @sp
     $ct = ''
     if ($resp.Headers -and $resp.Headers['Content-Type']) {{ $ct = [string]$resp.Headers['Content-Type'] }}
-    if ($resp.RawContentStream.Length -gt {int(_MAX_RESPONSE_BYTES)}) {{ throw 'guest response exceeds relay limit' }}
+    if ($resp.RawContentStream.Length -gt {int(response_cap)}) {{ throw 'guest response exceeds relay limit' }}
     $bytes = $resp.RawContentStream.ToArray()
     [PSCustomObject]@{{
         status      = [int]$resp.StatusCode
@@ -184,10 +189,15 @@ try {{
 """.strip()
 
 
-def _run_forward(script: str, cred: CredentialSet) -> dict:
+def _run_forward(cfg, script: str, cred: CredentialSet) -> dict:
+    """relay's guest-leg choke (issue #43): composes the remote hop from the
+    relay's start-time cfg before spawning; identity in local mode."""
+    script, stdin = pswindows.compose_remote(
+        cfg, script, payload_lines=1, stdin_b64=pswindows.utf8_b64(cred.password),
+    )
     result = pswindows.run_ps(
         script, timeout_s=_REQUEST_TIMEOUT_S + 20,
-        stdin_b64=pswindows.utf8_b64(cred.password),
+        stdin_b64=stdin,
     )
     if result.timed_out:
         return {"error": "guest request timed out", "status": 0}
@@ -305,6 +315,17 @@ class _RelayHandler(BaseHTTPRequestHandler):
                 if length > _MAX_BODY_BYTES:
                     self._reply_error(413, "body exceeds relay limit")
                     return
+                if length > _REMOTE_BODY_BYTES and pswindows.hyperv_host(ctx["cfg"]):
+                    # Remote mode: the whole body crosses one WS-Man hop;
+                    # keep it under the ~500 KiB MaxEnvelopeSizeKB instead of
+                    # failing mid-forward with an opaque transport error.
+                    self._reply_error(
+                        413,
+                        "body exceeds the remote-mode relay limit "
+                        f"({_REMOTE_BODY_BYTES} bytes); use local mode for "
+                        "large payloads",
+                    )
+                    return
                 body = self.rfile.read(length)
             headers = {
                 k: v for k, v in self.headers.items()
@@ -312,6 +333,11 @@ class _RelayHandler(BaseHTTPRequestHandler):
             }
             inner = _forward_script(
                 ctx["guest_port"], self.command, self.path, headers, body,
+                response_cap=(
+                    _REMOTE_RESPONSE_BYTES
+                    if pswindows.hyperv_host(ctx["cfg"])
+                    else _MAX_RESPONSE_BYTES
+                ),
             )
             cred = ctx["cred"]
             if cred is None:
@@ -320,9 +346,9 @@ class _RelayHandler(BaseHTTPRequestHandler):
                 # internal AttributeError from psdirect_prefix.
                 self._reply_error(503, "relay is stopped")
                 return
-            script = build_guest_script(ctx["vm_id"], inner, cred)
+            script = build_guest_script(ctx["vm_id"], inner, cred, ctx["cfg"])
             self._bump("bytes_in", len(body))
-            outcome = _run_forward(script, cred)
+            outcome = _run_forward(ctx["cfg"], script, cred)
         except Exception as exc:
             self._reply_error(502, str(exc))
             return

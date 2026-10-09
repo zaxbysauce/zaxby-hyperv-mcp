@@ -153,3 +153,33 @@ def resolve_victim(environ: dict[str, str] | None = None) -> CredentialSet:
         else "HYPERV_GUEST_VICTIM_PASSWORD"
     )
     return CredentialSet(u, _validated_password(p, p_source))
+
+
+def resolve_host(environ: dict[str, str] | None = None) -> CredentialSet | None:
+    """Resolve the remote Hyper-V host credential (issue #43).
+
+    Used for the WS-Man hop when config declares hyperv.host. Precedence and
+    validation mirror resolve_guest: HYPERV_HOST_USERNAME plus
+    HYPERV_HOST_PASSWORD_FILE or HYPERV_HOST_PASSWORD; line-break/<3-char
+    rejection and redaction registration ride _validated_password.
+
+    Returns None — implicit current-user authentication for the hop — when
+    the username is absent, even if password sources are set (dangling
+    password variables must not break startup or every tool call).
+    """
+    env = dict(os.environ if environ is None else environ)
+    u = env.get("HYPERV_HOST_USERNAME", "")
+    if not u:
+        return None
+    p = _read_password_file("HYPERV_HOST_PASSWORD_FILE", env)
+    if p:
+        p_source = "HYPERV_HOST_PASSWORD_FILE"
+    else:
+        p = env.get("HYPERV_HOST_PASSWORD", "")
+        p_source = "HYPERV_HOST_PASSWORD"
+    if not p:
+        raise CredentialError(
+            "Remote host credentials are incomplete. Set HYPERV_HOST_USERNAME "
+            "and HYPERV_HOST_PASSWORD (or HYPERV_HOST_PASSWORD_FILE)"
+        )
+    return CredentialSet(u, _validated_password(p, p_source))

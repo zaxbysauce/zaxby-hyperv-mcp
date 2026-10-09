@@ -55,6 +55,8 @@ _SECRET_ENV_NAMES = frozenset({
     "HYPERV_GUEST_PASSWORD_FILE",
     "HYPERV_GUEST_VICTIM_PASSWORD",
     "HYPERV_GUEST_VICTIM_PASSWORD_FILE",
+    "HYPERV_HOST_PASSWORD",
+    "HYPERV_HOST_PASSWORD_FILE",
 })
 # Inheriting these would redirect the git provenance probe (server.py
 # _git_revision spawns under child_env()); they are not secrets but must not
@@ -452,3 +454,146 @@ def check_result(result: PSResult, ctx: str = "") -> PSResult:
         detail = result.stderr.strip() or result.stdout.strip() or "unknown PowerShell error"
         raise RuntimeError(f"{ctx}: {detail}" if ctx else detail)
     return result
+
+
+# ---------------------------------------------------------------------------
+# remote Hyper-V host composition (issue #43)
+# ---------------------------------------------------------------------------
+
+def hyperv_host(cfg) -> str | None:
+    """The configured remote Hyper-V host, or None for local mode.
+
+    Reads the CALLER's config object — never the pswindows module global —
+    so per-call tool configs (and tests mixing local and remote configs in
+    one process) each compose correctly.
+    """
+    target = getattr(cfg, "hyperv", None)
+    return getattr(target, "host", None) if target is not None else None
+
+
+def _remote_parts(cfg, *, payload_lines: int, stdin_b64: str | None):
+    """Shared internals of the remote composition: resolve host credentials
+    per call and build (preamble_lines, composed_stdin, host_cred, params).
+
+    Local mode: ([], stdin_b64, None, []).
+    """
+    from . import credentials  # local import: credentials does not import pswindows
+
+    host = hyperv_host(cfg)
+    if not host:
+        return [], stdin_b64, None, []
+    if payload_lines and stdin_b64 is None:
+        raise ValueError("payload_lines > 0 requires stdin_b64")
+    host_cred = credentials.resolve_host()
+    params = [f"$__p{i}" for i in range(payload_lines)]
+    lines: list[str] = []
+    new_stdin = stdin_b64
+    if host_cred is not None:
+        lines.append("$__hostpwRaw = [Console]::In.ReadLine()")
+        new_stdin = utf8_b64(host_cred.password)
+        if stdin_b64 is not None:
+            new_stdin = new_stdin + "\n" + stdin_b64
+    lines.extend(f"$__p{i} = [Console]::In.ReadLine()" for i in range(payload_lines))
+    if host_cred is not None:
+        lines.extend([
+            "$__hostpwText = [System.Text.Encoding]::UTF8.GetString("
+            "[Convert]::FromBase64String($__hostpwRaw))",
+            "$__hostsec = $__hostpwText | ConvertTo-SecureString -AsPlainText -Force",
+            "$__hostcred = [System.Management.Automation.PSCredential]::new("
+            f"{ps_quote(host_cred.username)}, $__hostsec)",
+            "$__hostpwRaw = $null; $__hostpwText = $null; $__hostsec = $null",
+        ])
+    return lines, new_stdin, host_cred, params
+
+
+def remote_prelude(cfg, *, payload_lines: int = 0, stdin_b64: str | None = None) -> tuple[str, str | None]:
+    """Local preamble lines + composed stdin for a remote-mode script.
+
+    Shared by compose_remote (single outer wrap) and filetransfer's transfer
+    builders (multiple per-leg hops): emits the stdin reads — host password
+    first (when a complete HYPERV_HOST_* pair resolves; decoded locally into
+    $__hostcred, never forwarded, never in script text), caller payload
+    lines after ($__p0…) — and returns (preamble_text, stdin_b64) where the
+    stdin is the fully composed multi-line payload. Identity ("", unchanged
+    stdin) in local mode.
+    """
+    lines, new_stdin, _cred, _params = _remote_parts(
+        cfg, payload_lines=payload_lines, stdin_b64=stdin_b64
+    )
+    if not lines:
+        return "", new_stdin
+    return "\n".join(lines) + "\n", new_stdin
+
+
+def hop_line(cfg) -> str:
+    """Invoke-Command opening for ONE remote leg; empty string in local mode.
+
+    Single source for the hop shape so per-leg emitters (filetransfer's
+    transfer builders) cannot drift from compose_remote: ``-Credential
+    $__hostcred`` is appended only when a complete HYPERV_HOST_* pair
+    resolves — mirroring the preamble that defines ``$__hostcred`` — so
+    implicit-auth deployments never reference an undefined variable
+    (PRR-006). Callers append ``-ScriptBlock { ... } [-ArgumentList ...]
+    -ErrorAction Stop``.
+    """
+    host = hyperv_host(cfg)
+    if not host:
+        return ""
+    from . import credentials  # local import: credentials does not import pswindows
+
+    line = f"Invoke-Command -ComputerName {ps_quote(host)}"
+    if credentials.resolve_host() is not None:
+        line += " -Credential $__hostcred"
+    return line
+
+
+def compose_remote(
+    cfg,
+    body: str,
+    *,
+    payload_lines: int = 0,
+    stdin_b64: str | None = None,
+) -> tuple[str, str | None]:
+    """Compose the WS-Man hop for a script body (issue #43).
+
+    Identity in local mode: returns (body, stdin_b64) untouched, so local
+    scripts stay byte-identical to the pre-feature emissions.
+
+    Remote mode wraps the body in ``Invoke-Command -ComputerName '<host>'``
+    (hostname ps_quote'd; charset-validated at config load — defense in
+    depth). Host credentials resolve PER CALL from HYPERV_HOST_* (so the
+    environment is read at tool-call time, matching every other credential
+    resolution in this server); when a complete pair exists the host
+    password becomes the FIRST stdin line — decoded locally, never embedded
+    in script text — and ``-Credential`` rides the Invoke-Command. Caller
+    payload lines follow on stdin and cross the hop as scriptblock
+    parameters (``param($__p0, ...)`` + ``-ArgumentList``), because a remote
+    scriptblock cannot read the local process's stdin. Inside the block only
+    $ProgressPreference is pinned; the OutputEncoding assignment is
+    try/catch-guarded (a console-less remote runspace may reject it).
+    """
+    host = hyperv_host(cfg)
+    if not host:
+        return body, stdin_b64
+    lines, new_stdin, _host_cred, params = _remote_parts(
+        cfg, payload_lines=payload_lines, stdin_b64=stdin_b64
+    )
+
+    inner = (
+        (f"param({', '.join(params)})\n" if params else "")
+        + "$ProgressPreference='SilentlyContinue';\n"
+        + "try { [Console]::OutputEncoding="
+        "[System.Text.UTF8Encoding]::new($false) } catch { }\n"
+        + body
+    )
+    script = (
+        "\n".join(lines)
+        + "\n"
+        + hop_line(cfg)
+        + " -ScriptBlock {\n"
+        + inner
+        + "\n}"
+        + (f" -ArgumentList {', '.join(params)}" if params else "")
+        + " -ErrorAction Stop"
+    )
+    return script, new_stdin

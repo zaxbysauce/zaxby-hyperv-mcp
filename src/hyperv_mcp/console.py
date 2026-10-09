@@ -253,6 +253,19 @@ def _check_rc(result: pswindows.PSResult, ctx: str) -> pswindows.PSResult:
         raise ConsoleError(str(exc)) from None
 
 
+def _run(cfg: Config, script: str, *, timeout_s: float | None = None, stdin_b64: str | None = None):
+    """console's PowerShell choke (issue #43): composes the remote hop from
+    the CALLER's cfg before spawning; identity in local mode."""
+    script, stdin = pswindows.compose_remote(
+        cfg, script,
+        payload_lines=1 if stdin_b64 is not None else 0,
+        stdin_b64=stdin_b64,
+    )
+    if stdin is None:
+        return pswindows.run_ps(script, timeout_s=timeout_s)
+    return pswindows.run_ps(script, timeout_s=timeout_s, stdin_b64=stdin)
+
+
 def _decode_rgb565(raw: bytes, width: int, height: int) -> bytes:
     """Decode a thumbnail payload (4-byte opaque prefix + RGB565) to PNG.
 
@@ -299,7 +312,7 @@ def _capture_raw(cfg: Config, guid: str, width: int, height: int) -> bytes:
         .replace("%W", str(width))
         .replace("%H", str(height))
     )
-    result = pswindows.run_ps(script.strip(), timeout_s=90)
+    result = _run(cfg, script.strip(), timeout_s=90)
     _check_rc(result, "console screenshot")
     try:
         data = json.loads(result.stdout)
@@ -316,7 +329,7 @@ def _capture_raw(cfg: Config, guid: str, width: int, height: int) -> bytes:
 
 def _head_resolution(cfg: Config, guid: str) -> tuple[int, int] | None:
     script = _HEAD_RES_SCRIPT.replace("%NS%", _WMI_NS).replace("%GUID%", guid.lower())
-    result = pswindows.run_ps(script.strip(), timeout_s=60)
+    result = _run(cfg, script.strip(), timeout_s=60)
     if result.returncode != 0:
         return None
     try:
@@ -469,7 +482,7 @@ def screenshot(
 def get_display_info(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     script = _DISPLAY_INFO_SCRIPT.replace("%NS%", _WMI_NS).replace("%GUID%", ref.id)
-    result = pswindows.run_ps(script.strip(), timeout_s=60)
+    result = _run(cfg, script.strip(), timeout_s=60)
     _check_rc(result, "console display info")
     try:
         data = json.loads(result.stdout)
@@ -498,9 +511,18 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
         for i, chunk in enumerate(chunks):
             # Text rides stdin as UTF-8 base64 — never in the script, argv, or
             # error records (CLIXML errors quote script lines).
+            # Remote mode: the composer's local preamble read the line and
+            # forwarded it as scriptblock parameter $__p0 (a remote block
+            # cannot read local stdin); local mode keeps the inline read
+            # byte-identical to the historic emission.
+            read_expr = (
+                "[Convert]::FromBase64String($__p0)"
+                if pswindows.hyperv_host(cfg) else
+                "[Convert]::FromBase64String([Console]::In.ReadLine())"
+            )
             call = (
                 "$text = [System.Text.Encoding]::UTF8.GetString("
-                "[Convert]::FromBase64String([Console]::In.ReadLine()))\n"
+                + read_expr + ")\n"
                 "$r = Invoke-CimMethod -InputObject $kb -MethodName TypeText "
                 "-ErrorAction Stop -Arguments @{ AsciiText = $text }\n"
                 "if ($r.ReturnValue -ne 0) { throw ('TypeText failed with ReturnValue=' + $r.ReturnValue) }\n"
@@ -509,7 +531,7 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
             script = _KEYBOARD_SCRIPT_TMPL.replace("%NS%", _WMI_NS).replace(
                 "%GUID%", guid.lower()
             ).replace("%CALL%", call)
-            result = pswindows.run_ps(
+            result = _run(cfg,
                 script.strip(), timeout_s=90, stdin_b64=pswindows.utf8_b64(chunk)
             )
             _check_rc(result, f"console type_text chunk {i + 1}/{len(chunks)}")
@@ -563,7 +585,7 @@ def _send_scancodes_locked(cfg: Config, ref: vmident.VMRef, codes: list[int]) ->
             script = _KEYBOARD_SCRIPT_TMPL.replace("%NS%", _WMI_NS).replace(
                 "%GUID%", ref.id
             ).replace("%CALL%", call)
-            result = pswindows.run_ps(script.strip(), timeout_s=90)
+            result = _run(cfg, script.strip(), timeout_s=90)
             _check_rc(result, f"console scancodes chunk {i + 1}/{len(chunks)}")
             sent += len(chunk)
             if i < len(chunks) - 1:
@@ -667,7 +689,7 @@ def _mouse_op(
         .replace("%CALL%", call)
     )
     with vmlocks.vm_lock(ref.id):
-        result = pswindows.run_ps(script.strip(), timeout_s=90)
+        result = _run(cfg, script.strip(), timeout_s=90)
     _check_rc(result, f"console mouse {detail}")
     out = {"ok": True, "operation": detail, "vm_name": ref.name}
     if extra:
@@ -706,7 +728,7 @@ def wait_frame_change(
         .replace("%BASELINE%", baseline_hash)
     )
     started = time.monotonic()
-    result = pswindows.run_ps(script.strip(), timeout_s=int(timeout_s) + 15)
+    result = _run(cfg, script.strip(), timeout_s=int(timeout_s) + 15)
     elapsed_ms = int((time.monotonic() - started) * 1000)
     _check_rc(result, "console wait_frame_change")
 

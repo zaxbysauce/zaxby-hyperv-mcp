@@ -41,6 +41,25 @@ def _checked_new_name(cfg: Config, name: str) -> str:
     return name
 
 
+def _reject_remote_file_ops(cfg: Config, what: str) -> None:
+    """Fail loud for file-backed media ops in remote mode (cubic PR #47 P1).
+
+    VHD/ISO paths are validated against agent-box policy and local existence
+    here, but in remote mode they are consumed BY the remote Hyper-V host —
+    a host-local path would fail the local must_exist check, and a local
+    path would create/attach the wrong machine's file. Fail with the honest
+    limitation instead of silently operating on the wrong machine.
+    """
+    if pswindows.hyperv_host(cfg):
+        raise MediaError(
+            f"remote Hyper-V host mode does not support {what} in this "
+            "release: the file path is validated on the agent box but the "
+            "operation executes on the remote host, so the file must exist "
+            "there. Run this operation in local mode (server on the Hyper-V "
+            "host) or pre-place the file on the remote host."
+        )
+
+
 def _checked_file_path(cfg: Config, path: str, *, write: bool, must_exist: bool, extensions: tuple[str, ...]) -> str:
     if not path or not path.strip():
         raise ValueError("path is required")
@@ -58,7 +77,11 @@ def _checked_file_path(cfg: Config, path: str, *, write: bool, must_exist: bool,
 
 
 def _run(cfg: Config, script: str, ctx: str, timeout_s: int = 300) -> pswindows.PSResult:
-    result = pswindows.run_ps(script.strip(), timeout_s=timeout_s)
+    script, stdin = pswindows.compose_remote(cfg, script.strip())
+    if stdin is None:
+        result = pswindows.run_ps(script, timeout_s=timeout_s)
+    else:
+        result = pswindows.run_ps(script, timeout_s=timeout_s, stdin_b64=stdin)
     try:
         return pswindows.check_result(result, ctx)
     except RuntimeError as exc:
@@ -81,7 +104,7 @@ def _generation_guard(cfg: Config, ref: vmident.VMRef) -> None:
         guestexec.vm_target_preamble(ref.id)
         + "\n(Get-VM -Id $vmTarget -ErrorAction Stop).Generation.ToString()\n"
     )
-    result = pswindows.run_ps(script, timeout_s=60)
+    result = _run(cfg, script, f"resolve generation of '{ref.name}'", timeout_s=60)
     try:
         pswindows.check_result(result, f"resolve generation of '{ref.name}'")
     except RuntimeError as exc:
@@ -127,6 +150,7 @@ def vm_create(
         raise ValueError("generation must be 1 or 2")
     if not vhd_path:
         raise ValueError("vhd_path is required")
+    _reject_remote_file_ops(cfg, "vm_create (VHD path)")
     vhd = _checked_file_path(cfg, vhd_path, write=True, must_exist=False, extensions=(".vhdx", ".vhd"))
     if not (1 <= vhd_size_gb <= 2048):
         raise ValueError("vhd_size_gb must be within 1..2048")
@@ -192,6 +216,7 @@ def vm_disk_add(
     policy.require_destructive(cfg, "vm_provision", confirm, f"add {size_gb}GB disk '{path}' to '{vm_name or vm_id}'")
     if controller_type not in ("SCSI", "IDE"):
         raise ValueError("controller_type must be SCSI or IDE")
+    _reject_remote_file_ops(cfg, "vm_disk_add (VHD path)")
     vhd = _checked_file_path(cfg, path, write=True, must_exist=False, extensions=(".vhdx", ".vhd"))
     if not (1 <= size_gb <= 2048):
         raise ValueError("size_gb must be within 1..2048")
@@ -246,6 +271,7 @@ def vm_disk_list(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
 
 def vm_media_attach(cfg: Config, vm_name: str = "", iso_path: str = "", vm_id: str = "") -> dict:
     policy.require_category(cfg, "media", f"attach ISO to '{vm_name or vm_id}'")
+    _reject_remote_file_ops(cfg, "vm_media_attach (ISO path)")
     iso = _checked_file_path(cfg, iso_path, write=False, must_exist=True, extensions=(".iso",))
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     script = _resolve_vm_prefix(ref) + (
