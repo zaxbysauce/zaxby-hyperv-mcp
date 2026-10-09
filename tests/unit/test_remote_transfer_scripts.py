@@ -188,6 +188,7 @@ def test_get_chunk_loop_reassembles_multichunk_payload(monkeypatch, tmp_path):
     staging location (no command-line payload — the 200 KB base64 would blow
     the 32K CreateProcess limit via -EncodedCommand).
     """
+    import base64
     import hashlib
     import json
 
@@ -229,6 +230,10 @@ def test_get_chunk_loop_reassembles_multichunk_payload(monkeypatch, tmp_path):
         "throw ('REASSEMBLY LEN MISMATCH got=' + $outB64.Length + "
         "' expected=' + $expectedB64Len + ' filelen=' + $__get.len) }\n"
     )
+    # Echo the reassembled base64 so Python can pinpoint the first differing
+    # byte if the reassembly is ever wrong again (CI-only Seek anomaly,
+    # reviewer round 5 F3).
+    harness += "Write-Output ('OUTB64:' + $outB64)\n"
 
     # Pre-write the "remote" staging file in the child's TEMP: the chunk
     # loop reads Join-Path([IO.Path]::GetTempPath(), name), so Python and
@@ -251,10 +256,29 @@ def test_get_chunk_loop_reassembles_multichunk_payload(monkeypatch, tmp_path):
     )
     assert proc.returncode == 0, f"stderr: {proc.stderr[-500:]}"
     lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
-    result = json.loads(lines[-1])
+    outb64_line = next((ln for ln in lines if ln.startswith("OUTB64:")), None)
+    env_line = next((ln for ln in lines if ln.startswith('{"ok"')), None)
+    assert env_line, f"result envelope not found; stdout tail: {proc.stdout[-300:]!r}"
+    result = json.loads(env_line)
     assert result["ok"] is True, result
     assert result["bytes_local"] == size, result
     assert result["sha256_local"] == result["sha256_remote"], result
+    expected_b64 = base64.b64encode(payload).decode("ascii")
+    if outb64_line is not None:
+        got = outb64_line[len("OUTB64:"):]
+        if got != expected_b64:
+            diff_at = next(
+                (i for i, (a, b) in enumerate(zip(got, expected_b64)) if a != b),
+                min(len(got), len(expected_b64)),
+            )
+            chunk1_chars = (196608 // 3) * 4
+            region = "chunk 1" if diff_at < chunk1_chars else "chunk 2"
+            raise AssertionError(
+                f"reassembly differs at base64 char {diff_at} ({region}): "
+                f"got={got[diff_at:diff_at + 8]!r} "
+                f"expected={expected_b64[diff_at:diff_at + 8]!r} "
+                f"got_len={len(got)} expected_len={len(expected_b64)}"
+            )
     assert final.read_bytes() == payload, (
         "reassembled destination differs from the source payload"
     )
