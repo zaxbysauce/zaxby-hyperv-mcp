@@ -275,11 +275,25 @@ def test_composer_mechanics_execute_under_real_powershell(monkeypatch, tmp_path)
     assert proc.returncode == 0, proc.stderr[-400:]
     import json as _json
     lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
-    assert lines, f"no output; stderr: {proc.stderr[-400:]}"
-    result = _json.loads(lines[-1])
-    assert result["user"] == CRED.username
-    assert result["payload_ok"] is True, "guest payload crossed as $__p0 and decoded"
-    assert result["hostcred_ok"] is True, "host password decoded locally into $__hostcred"
+    # Select OUR JSON object by content, not position: on some hosts (CI
+    # runners observed) trailing non-JSON output lines can follow the
+    # script's own emission, so lines[-1] is not reliably the payload.
+    result = None
+    for ln in reversed(lines):
+        try:
+            candidate = _json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(candidate, dict) and "user" in candidate:
+            result = candidate
+            break
+    assert result is not None, (
+        f"composed output JSON not found; stdout tail: {proc.stdout[-400:]!r}; "
+        f"stderr tail: {proc.stderr[-400:]!r}"
+    )
+    assert result["user"] == CRED.username, f"full result: {result}"
+    assert result["payload_ok"] is True, f"guest payload crossed as $__p0; full: {result}"
+    assert result["hostcred_ok"] is True, f"host password decoded locally; full: {result}"
 
 
 # ---------------------------------------------------------------------------
