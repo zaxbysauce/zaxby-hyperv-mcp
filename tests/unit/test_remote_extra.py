@@ -375,5 +375,44 @@ def test_guest_put_host_creds_two_line_stdin_and_hop_argumentlist(monkeypatch, t
     assert base64.b64decode(stdin_lines[1]).decode("utf-8") == CRED.password
 
 
+def test_guest_get_host_creds_two_line_stdin(monkeypatch, tmp_path):
+    """Round-2 pin: guest_get's composed branch must feed _run_transfer the
+    composed two-line stdin — deleting `composed_stdin=remote_stdin`
+    (filetransfer guest_get) left the whole suite green in review round 2's
+    mutation (e), silently reintroducing the round-1 Critical on the get
+    path (guest password consumed as the host line)."""
+    host_pw = _set_host_creds(monkeypatch, tmp_path)
+    dst = tmp_path / "hd"
+    dst.mkdir()
+    cfg = Config.from_dict({
+        "hyperv": {"host": HOST},
+        "allowed_vm_patterns": ["test-*"],
+        "host_read_roots": [str(tmp_path)], "host_write_roots": [str(dst)],
+        "guest_read_roots": ["C:\\g-read"], "guest_write_roots": ["C:\\g-write"],
+    })
+    fake = FakePS([pswindows.PSResult(stdout=json.dumps({
+        "ok": True, "bytes_copied": 2, "bytes_local": 2, "bytes_remote": 2,
+        "sha256_local": None, "sha256_remote": None,
+    }), returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    from hyperv_mcp import filetransfer
+    filetransfer.guest_get(
+        cfg, "test-vm", r"C:\g-read\src.bin", str(dst / "out.bin"),
+        verify=True, cred=CRED,
+    )
+    script, kwargs = fake.scripts[1], fake.kwargs[1]
+    assert WRAP in script
+    assert "-Credential $__hostcred" in script
+    assert "-ArgumentList $__p0" in script
+    import base64
+    stdin_lines = kwargs["stdin_b64"].split("\n")
+    assert len(stdin_lines) == 2, (
+        "get must ride the composed two-line stdin: host password first, "
+        "guest payload second"
+    )
+    assert base64.b64decode(stdin_lines[0]).decode("utf-8") == host_pw
+    assert base64.b64decode(stdin_lines[1]).decode("utf-8") == CRED.password
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
