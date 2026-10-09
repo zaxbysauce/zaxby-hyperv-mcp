@@ -254,8 +254,13 @@ def test_composer_mechanics_execute_under_real_powershell(monkeypatch, tmp_path)
         guestexec.psdirect_prefix(CRED, _remote_cfg())
         + "\n$payload_ok = ($cred.GetNetworkCredential().Password -eq '" + CRED.password + "')\n"
         + "$hostcred_ok = ($null -ne $__hostcred)\n"
+        # Runner-side diagnostics: distinguish empty stdin lines from
+        # per-statement errors (statement-abort-continue lets the script
+        # exit 0 with nulls — the CI failure class observed on round 4).
+        + "$p0_len = \"$($__p0)\".Length\n"
+        + "$err0 = if ($Error.Count) { $Error[0].ToString() } else { '' }\n"
         + "[PSCustomObject]@{ user = $cred.UserName; payload_ok = $payload_ok; "
-        "hostcred_ok = $hostcred_ok } | ConvertTo-Json -Compress\n"
+        "hostcred_ok = $hostcred_ok; p0_len = $p0_len; err0 = $err0 } | ConvertTo-Json -Compress\n"
     )
     script, stdin = pswindows.compose_remote(
         _remote_cfg(), body, payload_lines=1, stdin_b64=pswindows.utf8_b64(CRED.password),
@@ -267,17 +272,19 @@ def test_composer_mechanics_execute_under_real_powershell(monkeypatch, tmp_path)
     )
     assert local != script, "transport token must be present to strip"
     encoded = pswindows.encode_command(pswindows._PS_PIN + local)
+    # Spawn EXACTLY like production pswindows.run_ps: binary stdin via
+    # communicate (not text=True), eliminating the text-mode wrapper as a
+    # variable between hosts.
     proc = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-        input=(stdin or "") + "\n",
-        capture_output=True, text=True, timeout=60,
+        input=((stdin or "") + "\n").encode("ascii"),
+        capture_output=True, timeout=60,
     )
-    assert proc.returncode == 0, proc.stderr[-400:]
+    stdout = proc.stdout.decode("utf-8", "replace")
+    stderr = proc.stderr.decode("utf-8", "replace")
+    assert proc.returncode == 0, stderr[-400:]
     import json as _json
-    lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
-    # Select OUR JSON object by content, not position: on some hosts (CI
-    # runners observed) trailing non-JSON output lines can follow the
-    # script's own emission, so lines[-1] is not reliably the payload.
+    lines = [ln for ln in stdout.strip().splitlines() if ln.strip()]
     result = None
     for ln in reversed(lines):
         try:
@@ -288,12 +295,13 @@ def test_composer_mechanics_execute_under_real_powershell(monkeypatch, tmp_path)
             result = candidate
             break
     assert result is not None, (
-        f"composed output JSON not found; stdout tail: {proc.stdout[-400:]!r}; "
-        f"stderr tail: {proc.stderr[-400:]!r}"
+        f"composed output JSON not found; stdout tail: {stdout[-400:]!r}; "
+        f"stderr tail: {stderr[-400:]!r}"
     )
-    assert result["user"] == CRED.username, f"full result: {result}"
-    assert result["payload_ok"] is True, f"guest payload crossed as $__p0; full: {result}"
-    assert result["hostcred_ok"] is True, f"host password decoded locally; full: {result}"
+    diag = f"full result: {result}; stdout tail: {stdout[-200:]!r}; stderr tail: {stderr[-200:]!r}"
+    assert result["user"] == CRED.username, diag
+    assert result["payload_ok"] is True, f"guest payload crossed as $__p0; {diag}"
+    assert result["hostcred_ok"] is True, f"host password decoded locally; {diag}"
 
 
 # ---------------------------------------------------------------------------
