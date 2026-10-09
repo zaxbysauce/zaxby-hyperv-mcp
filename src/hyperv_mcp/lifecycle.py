@@ -35,6 +35,8 @@ def _run(cfg: Config, script: str, *, timeout_s: float | None = None, stdin_b64:
         payload_lines=1 if stdin_b64 is not None else 0,
         stdin_b64=stdin_b64,
     )
+    if stdin is None:
+        return pswindows.run_ps(script, timeout_s=timeout_s)
     return pswindows.run_ps(script, timeout_s=timeout_s, stdin_b64=stdin)
 
 _KEY_RE = re.compile(r"^[0-9a-f.]+$")

@@ -282,5 +282,98 @@ def test_composer_mechanics_execute_under_real_powershell(monkeypatch, tmp_path)
     assert result["hostcred_ok"] is True, "host password decoded locally into $__hostcred"
 
 
+# ---------------------------------------------------------------------------
+# explicit host-credential mode: EVERY choke must feed the composed stdin
+# (review round 1 finding 1 — vmident/media/filetransfer dropped it, so the
+# preamble's host-password ReadLine hit EOF and put/get fed the GUEST
+# password as the host line)
+# ---------------------------------------------------------------------------
+
+def _set_host_creds(monkeypatch, tmp_path):
+    pw_file = tmp_path / "host-pw.txt"
+    pw_file.write_text("host-pw-123", encoding="utf-8")
+    monkeypatch.setenv("HYPERV_HOST_USERNAME", "lab\\admin")
+    monkeypatch.setenv("HYPERV_HOST_PASSWORD_FILE", str(pw_file))
+    return "host-pw-123"
+
+
+def test_vmident_choke_feeds_host_password_stdin(monkeypatch, tmp_path):
+    host_pw = _set_host_creds(monkeypatch, tmp_path)
+    from hyperv_mcp import vmident
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    vmident.resolve(_remote_cfg(allowed_vm_patterns=["test-*"]), "test-vm")
+    script, kwargs = fake.scripts[0], fake.kwargs[0]
+    assert WRAP in script
+    assert "$__hostpwRaw = [Console]::In.ReadLine()" in script
+    assert "-Credential $__hostcred" in script
+    assert "[Console]::In.ReadLine()" not in script.split(WRAP, 1)[1], (
+        "no payload read may live inside the remote block"
+    )
+    stdin = kwargs.get("stdin_b64")
+    assert stdin is not None, "choke must feed the composed stdin"
+    import base64
+    assert base64.b64decode(stdin.split("\n")[0]).decode("utf-8") == host_pw
+
+
+def test_media_choke_feeds_host_password_stdin(monkeypatch, tmp_path):
+    host_pw = _set_host_creds(monkeypatch, tmp_path)
+    from hyperv_mcp import media
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    media.vm_disk_list(_remote_cfg(allowed_vm_patterns=["test-*"]), "test-vm")
+    script, kwargs = fake.scripts[1], fake.kwargs[1]  # [0] is vmident resolve
+    assert WRAP in script and "-Credential $__hostcred" in script
+    stdin = kwargs.get("stdin_b64")
+    assert stdin is not None
+    import base64
+    assert base64.b64decode(stdin).decode("utf-8") == host_pw
+
+
+def test_guest_put_host_creds_two_line_stdin_and_hop_argumentlist(monkeypatch, tmp_path):
+    host_pw = _set_host_creds(monkeypatch, tmp_path)
+    src = tmp_path / "hs"
+    src.mkdir()
+    dst = tmp_path / "hd"
+    dst.mkdir()
+    cfg = Config.from_dict({
+        "hyperv": {"host": HOST},
+        "allowed_vm_patterns": ["test-*"],
+        "host_read_roots": [str(src)], "host_write_roots": [str(dst)],
+        "guest_read_roots": ["C:\\g-read"], "guest_write_roots": ["C:\\g-write"],
+    })
+    cfg.destructive.guest_write = True
+    cfg.destructive.require_confirm = False
+    src_file = src / "tool.exe"
+    src_file.write_bytes(b"MZ")
+    fake = FakePS([pswindows.PSResult(stdout=json.dumps({
+        "ok": True, "bytes_copied": 2, "bytes_local": 2, "bytes_remote": 2,
+        "sha256_local": None, "sha256_remote": None,
+    }), returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    from hyperv_mcp import filetransfer
+    filetransfer.guest_put(
+        cfg, "test-vm", str(src_file), r"C:\g-write\tool.exe",
+        confirm=True, verify=True, cred=CRED,
+    )
+    script, kwargs = fake.scripts[1], fake.kwargs[1]
+    reads = [i for i, _ in enumerate(script.splitlines()) if "[Console]::In.ReadLine()" in _]
+    assert len(reads) == 2, "host-password line + guest payload line"
+    wrap_line = next(i for i, _ in enumerate(script.splitlines()) if WRAP in _)
+    assert max(reads) < wrap_line, "both reads live in the local preamble"
+    assert "-Credential $__hostcred" in script
+    # HOP-level -ArgumentList forwarding (the inner -ArgumentList $enc / session
+    # legs must not satisfy this pin — pin the exact forwarding token):
+    assert "-ArgumentList $__p0" in script, (
+        "the hop must forward the guest payload as $__p0 (M2 showed the "
+        "frozen pin alone cannot distinguish inner -ArgumentList)"
+    )
+    import base64
+    stdin_lines = kwargs["stdin_b64"].split("\n")
+    assert len(stdin_lines) == 2
+    assert base64.b64decode(stdin_lines[0]).decode("utf-8") == host_pw
+    assert base64.b64decode(stdin_lines[1]).decode("utf-8") == CRED.password
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))

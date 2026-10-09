@@ -47,8 +47,13 @@ def _checked_caller_name(vm_name: str) -> str:
 
 def _run(cfg: Config, script: str):
     """vmident's PowerShell choke (issue #43): composes the remote hop from
-    the CALLER's cfg before spawning; identity in local mode."""
-    return pswindows.run_ps(pswindows.remote_wrap(cfg, script), timeout_s=60)
+    the CALLER's cfg before spawning, feeding run_ps the stdin the composed
+    preamble reads (the host-password line in explicit-credential mode);
+    identity in local mode."""
+    script, stdin = pswindows.compose_remote(cfg, script)
+    if stdin is None:
+        return pswindows.run_ps(script, timeout_s=60)
+    return pswindows.run_ps(script, timeout_s=60, stdin_b64=stdin)
 
 
 def resolve(cfg: Config, vm_name: str = "", vm_id: str = "") -> VMRef:

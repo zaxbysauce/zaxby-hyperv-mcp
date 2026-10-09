@@ -223,6 +223,8 @@ def _run(cfg: Config, script: str, *, timeout_s: float | None = None, stdin_b64:
         payload_lines=1 if stdin_b64 is not None else 0,
         stdin_b64=stdin_b64,
     )
+    if stdin is None:
+        return pswindows.run_ps(script, timeout_s=timeout_s)
     return pswindows.run_ps(script, timeout_s=timeout_s, stdin_b64=stdin)
 
 
@@ -324,8 +326,8 @@ def _remote_put_script(
     fragment: str,
     assert_block: str,
     do_verify: bool,
-) -> str:
-    """Remote-mode guest_put script (explicit composition ownership).
+) -> tuple[str, str | None]:
+    """Remote-mode guest_put script + composed stdin (explicit ownership).
 
     Local legs (source hash/size/read) run on the MCP machine; the file
     crosses the WS-Man hop in bounded base64 chunks (each its own
@@ -336,7 +338,7 @@ def _remote_put_script(
     follows it.
     """
     hop = _hop(cfg)
-    prelude, _stdin = pswindows.remote_prelude(
+    prelude, stdin = pswindows.remote_prelude(
         cfg, payload_lines=1, stdin_b64=pswindows.utf8_b64(cred.password)
     )
     tag = secrets.token_hex(8)
@@ -420,7 +422,7 @@ $__put = {hop} -ScriptBlock {{
     }}
 }} -ArgumentList $__p0, $rsB64Name, $rsBinName, {rp}, {staged}, $shaLocal, $bytesLocal
 $__put
-"""
+""", stdin
 
 
 def _remote_get_script(
@@ -434,8 +436,8 @@ def _remote_get_script(
     fragment: str,
     assert_block: str,
     do_verify: bool,
-) -> str:
-    """Remote-mode guest_get script (explicit composition ownership).
+) -> tuple[str, str | None]:
+    """Remote-mode guest_get script + composed stdin (explicit ownership).
 
     The local verify scriptblock (destination write + hash + move) is
     DEFINED before the hop so the MCP-machine legs stay textually local; the
@@ -445,7 +447,7 @@ def _remote_get_script(
     bytes. Same staged-then-move semantics as the local body.
     """
     hop = _hop(cfg)
-    prelude, _stdin = pswindows.remote_prelude(
+    prelude, stdin = pswindows.remote_prelude(
         cfg, payload_lines=1, stdin_b64=pswindows.utf8_b64(cred.password)
     )
     tag = secrets.token_hex(8)
@@ -529,7 +531,7 @@ while ($off -lt $len) {{
     sha256_local = $shaLocal
     sha256_remote = $shaRemote
 }} | ConvertTo-Json -Compress
-"""
+""", stdin
 
 
 def _run_transfer(
@@ -540,6 +542,7 @@ def _run_transfer(
     timeout_s: int = 300,
     *,
     composed_script: str | None = None,
+    composed_stdin: str | None = None,
 ) -> dict:
     """Run one transfer script.
 
@@ -551,7 +554,7 @@ def _run_transfer(
     """
     if composed_script is not None:
         script: str = composed_script
-        stdin: str | None = pswindows.utf8_b64(cred.password)
+        stdin: str | None = composed_stdin
     else:
         script, stdin = pswindows.compose_remote(
             cfg,
@@ -674,15 +677,15 @@ def guest_put(
         sha256_remote = $shaRemote
     }} | ConvertTo-Json -Compress
 """
-    remote_script = (
-        _remote_put_script(
-            cfg, cred, ref.id, lp, rp, staged, staged_raw,
-            fragment, assert_block, do_verify,
-        )
-        if pswindows.hyperv_host(cfg) else None
-    )
+    remote_script, remote_stdin = _remote_put_script(
+        cfg, cred, ref.id, lp, rp, staged, staged_raw,
+        fragment, assert_block, do_verify,
+    ) if pswindows.hyperv_host(cfg) else (None, None)
     with vmlocks.vm_lock(ref.id):
-        result = _run_transfer(cfg, ref.id, body, cred, composed_script=remote_script)
+        result = _run_transfer(
+            cfg, ref.id, body, cred,
+            composed_script=remote_script, composed_stdin=remote_stdin,
+        )
         if result.get("error_class") == "timeout":
             _cleanup_guest_staged(ref.id, staged_raw, cred, cfg)
     result["vm_name"] = ref.name
@@ -777,16 +780,16 @@ def guest_get(
         sha256_remote = $shaRemote
     }} | ConvertTo-Json -Compress
 """
-    remote_script = (
-        _remote_get_script(
-            cfg, cred, ref.id, rp, lp, staged, staged_raw,
-            fragment, assert_block, do_verify,
-        )
-        if pswindows.hyperv_host(cfg) else None
-    )
+    remote_script, remote_stdin = _remote_get_script(
+        cfg, cred, ref.id, rp, lp, staged, staged_raw,
+        fragment, assert_block, do_verify,
+    ) if pswindows.hyperv_host(cfg) else (None, None)
     with vmlocks.vm_lock(ref.id):
         try:
-            result = _run_transfer(cfg, ref.id, body, cred, composed_script=remote_script)
+            result = _run_transfer(
+                cfg, ref.id, body, cred,
+                composed_script=remote_script, composed_stdin=remote_stdin,
+            )
         except Exception:
             _cleanup_failed_get(staged_raw, created_dirs)
             raise

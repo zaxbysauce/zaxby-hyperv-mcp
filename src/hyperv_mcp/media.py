@@ -58,8 +58,8 @@ def _checked_file_path(cfg: Config, path: str, *, write: bool, must_exist: bool,
 
 
 def _run(cfg: Config, script: str, ctx: str, timeout_s: int = 300) -> pswindows.PSResult:
-    script, _stdin = pswindows.compose_remote(cfg, script.strip())
-    result = pswindows.run_ps(script, timeout_s=timeout_s)
+    script, stdin = pswindows.compose_remote(cfg, script.strip())
+    result = pswindows.run_ps(script, timeout_s=timeout_s, stdin_b64=stdin)
     try:
         return pswindows.check_result(result, ctx)
     except RuntimeError as exc:
