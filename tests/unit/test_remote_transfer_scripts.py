@@ -182,7 +182,6 @@ def test_get_chunk_loop_reassembles_multichunk_payload(
     hop (which needs a real VM) is replaced by a stub object with the true
     file length — everything else is the builder's own emitted text.
     """
-    import base64
     import hashlib
 
     # 200,000 bytes: chunk 1 = 196,608, chunk 2 = 3,392 (crosses boundary).
@@ -226,8 +225,8 @@ def test_get_chunk_loop_reassembles_multichunk_payload(
     # is what makes the seek/padding assertions real: with the original
     # PRR-002 defect the second chunk re-reads offset 0 and the byte
     # comparison below fails.
-    import re as _re
     import os as _os
+    import re as _re
 
     m = _re.search(r"hyperv-mcp-get-([0-9a-f]{16})\.bin", get)
     assert m, "staging tag not found in generated get script"
