@@ -233,5 +233,54 @@ def test_composed_remote_scripts_parse(monkeypatch, tmp_path):
         assert problems == ["PARSE-OK"], problems[:5]
 
 
+def test_composer_mechanics_execute_under_real_powershell(monkeypatch, tmp_path):
+    """Execution lane for the composed preamble + scriptblock param binding
+    (the runtime-semantics class the parse lane cannot catch).
+
+    The full composed script executes under real powershell.exe with the
+    WS-Man transport keyword removed (`-ComputerName ... -Credential ...` →
+    plain Invoke-Command): everything else is byte-identical to production —
+    the two-line stdin order (host password first, guest payload second),
+    the base64/SecureString/PSCredential decode chain, the param($__p0)
+    binding, and -ArgumentList forwarding. The WS-Man transport leg itself
+    stays integration-gated (no WinRM listener on the unit-test host).
+    """
+    pw_file = tmp_path / "host-pw.txt"
+    pw_file.write_text("host-pw-123", encoding="utf-8")
+    monkeypatch.setenv("HYPERV_HOST_USERNAME", "lab\\admin")
+    monkeypatch.setenv("HYPERV_HOST_PASSWORD_FILE", str(pw_file))
+
+    body = (
+        guestexec.psdirect_prefix(CRED, _remote_cfg())
+        + "\n$payload_ok = ($cred.GetNetworkCredential().Password -eq '" + CRED.password + "')\n"
+        + "$hostcred_ok = ($null -ne $__hostcred)\n"
+        + "[PSCustomObject]@{ user = $cred.UserName; payload_ok = $payload_ok; "
+        "hostcred_ok = $hostcred_ok } | ConvertTo-Json -Compress\n"
+    )
+    script, stdin = pswindows.compose_remote(
+        _remote_cfg(), body, payload_lines=1, stdin_b64=pswindows.utf8_b64(CRED.password),
+    )
+    # Drop only the transport keywords; keep the binding shape byte-identical.
+    local = script.replace(
+        f"Invoke-Command -ComputerName '{HOST}' -Credential $__hostcred -ScriptBlock {{",
+        "Invoke-Command -ScriptBlock {",
+    )
+    assert local != script, "transport token must be present to strip"
+    encoded = pswindows.encode_command(pswindows._PS_PIN + local)
+    proc = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        input=(stdin or "") + "\n",
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr[-400:]
+    import json as _json
+    lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
+    assert lines, f"no output; stderr: {proc.stderr[-400:]}"
+    result = _json.loads(lines[-1])
+    assert result["user"] == CRED.username
+    assert result["payload_ok"] is True, "guest payload crossed as $__p0 and decoded"
+    assert result["hostcred_ok"] is True, "host password decoded locally into $__hostcred"
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-q"]))
