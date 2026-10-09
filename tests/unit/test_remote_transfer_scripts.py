@@ -230,10 +230,12 @@ def test_get_chunk_loop_reassembles_multichunk_payload(monkeypatch, tmp_path):
         "throw ('REASSEMBLY LEN MISMATCH got=' + $outB64.Length + "
         "' expected=' + $expectedB64Len + ' filelen=' + $__get.len) }\n"
     )
-    # Echo the reassembled base64 so Python can pinpoint the first differing
-    # byte if the reassembly is ever wrong again (CI-only Seek anomaly,
-    # reviewer round 5 F3).
-    harness += "Write-Output ('OUTB64:' + $outB64)\n"
+    # Echo the reassembled base64 immediately BEFORE the verify invocation:
+    # if the SHA gate ever throws on a runner, stdout still carries the full
+    # reassembled base64 for Python-side pinpointing (reviewer round 5 F3).
+    harness = harness.replace(
+        "& $__verifyGet", "Write-Output ('OUTB64:' + $outB64)\n& $__verifyGet"
+    )
 
     # Pre-write the "remote" staging file in the child's TEMP: the chunk
     # loop reads Join-Path([IO.Path]::GetTempPath(), name), so Python and
@@ -268,7 +270,13 @@ def test_get_chunk_loop_reassembles_multichunk_payload(monkeypatch, tmp_path):
         got = outb64_line[len("OUTB64:"):]
         if got != expected_b64:
             diff_at = next(
-                (i for i, (a, b) in enumerate(zip(got, expected_b64)) if a != b),
+                (
+                    i
+                    for i, (a, b) in enumerate(
+                        zip(got, expected_b64, strict=False)
+                    )
+                    if a != b
+                ),
                 min(len(got), len(expected_b64)),
             )
             chunk1_chars = (196608 // 3) * 4
