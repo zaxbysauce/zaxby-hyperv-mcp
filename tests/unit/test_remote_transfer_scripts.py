@@ -14,12 +14,16 @@ on every Windows host (parse lane) plus deterministic shape pins:
   ConvertTo-Json (PRR-003);
 - the get staging cleanup must come after the read loop (PRR-001);
 - every hop leg carries -ErrorAction Stop (PRR-004);
-- the put staging file is pre-created (zero-byte source, cubic C8).
+- the put staging file is pre-created (zero-byte source, cubic C8);
+- the get chunk loop + base64 reassembly EXECUTES under real PowerShell
+  with a boundary-crossing payload (reviewer round-5 F3).
 
-Runtime execution of these scripts stays with the GITHUB_ACTIONS-gated
-lane in test_remote_extra.py (dev hosts only).
+The GITHUB_ACTIONS-gated execution lane in test_remote_extra.py covers the
+composed preamble/binding chain on dev hosts.
 """
 
+import os
+import re
 import subprocess
 
 import pytest
@@ -169,38 +173,37 @@ def test_verify_false_put_branch_is_interpolated(monkeypatch, tmp_path):
     assert "{{" not in put and "{fragment" not in put
 
 
-def test_get_chunk_loop_reassembles_multichunk_payload(
-    monkeypatch, tmp_path
-):
+def test_get_chunk_loop_reassembles_multichunk_payload(monkeypatch, tmp_path):
     """Reviewer round-5 F3: execute the get chunk loop + base64 reassembly
     under REAL PowerShell with a payload that CROSSES the chunk boundary
-    (196608-byte raw chunks → 2 chunks). This is the exact defect class
+    (196608-byte raw chunks -> 2 chunks). This is the exact defect class
     PRR-001/002/003 shipped in (no seek, per-chunk padding, dead length) —
     text asserts could not see it; this execution can.
 
-    The transport hop is stripped to a local Invoke-Command, and the meta
-    hop (which needs a real VM) is replaced by a stub object with the true
-    file length — everything else is the builder's own emitted text.
+    The meta hop (New-PSSession -VMId) needs a real VM, so it is REPLACED by
+    a stub result object; the chunk loop, staging cleanup, verify invocation,
+    and result envelope are the builder's own emitted text with the
+    transport hop stripped to a local Invoke-Command. The child PowerShell's
+    TEMP is pointed at tmp_path so Python and PowerShell provably share one
+    staging location (no command-line payload — the 200 KB base64 would blow
+    the 32K CreateProcess limit via -EncodedCommand).
     """
+    import base64
     import hashlib
+    import json
 
-    # 200,000 bytes: chunk 1 = 196,608, chunk 2 = 3,392 (crosses boundary).
     size = 200_000
-    src = tmp_path / "remote-src.bin"
     payload = bytes((i * 7 + (i >> 8)) % 256 for i in range(0, size, 997))[: size % 997 or size]
     payload = (payload * (size // len(payload) + 1))[:size]
-    src.write_bytes(payload)
 
     cfg = _matrix_cfg()
     get, _stdin = filetransfer._remote_get_script(
         cfg, CRED, "guid", "'C:/r'", "'C:/l'", "'C:/st'", "ASSERT-MARKER\n", True
     )
-    # Assemble an executable tail: local verify def (verbatim) + a stub for
-    # the meta hop's result object (the meta hop itself needs a real VM, so
-    # its statement is REPLACED — otherwise it would overwrite the stub with
-    # a failed connection's $null) + the builder's own chunk loop, cleanup,
-    # verify invocation, and result envelope, all with the transport hop
-    # stripped to a local Invoke-Command.
+    m = re.search(r"hyperv-mcp-get-([0-9a-f]{16})\.bin", get)
+    assert m, "staging tag not found in generated get script"
+    n_bin = f"hyperv-mcp-get-{m.group(1)}.bin"
+
     verify_start = get.index("$__verifyGet = {")
     meta_start = get.index("$__get = ")
     loop_start = get.index("$outB64 = ''")
@@ -219,21 +222,20 @@ def test_get_chunk_loop_reassembles_multichunk_payload(
         + get[loop_start:]
     ).replace(hop, "Invoke-Command")
     assert "New-PSSession" not in harness, "meta hop must be fully replaced"
+    # In-script reassembly shape check: interior chunks are 3-multiples (no
+    # padding), so the total base64 length must be exactly ceil(len/3)*4.
+    harness += (
+        "$expectedB64Len = [int][Math]::Ceiling($__get.len / 3) * 4\n"
+        "if ($outB64.Length -ne $expectedB64Len) { "
+        "throw ('REASSEMBLY LEN MISMATCH got=' + $outB64.Length + "
+        "' expected=' + $expectedB64Len + ' filelen=' + $__get.len) }\n"
+    )
 
-    # Materialize the "remote" staging file at the PowerShell TEMP path the
-    # chunk loop reads (the tag is embedded in the generated script). This
-    # is what makes the seek/padding assertions real: with the original
-    # PRR-002 defect the second chunk re-reads offset 0 and the byte
-    # comparison below fails.
-    import os as _os
-    import re as _re
-
-    m = _re.search(r"hyperv-mcp-get-([0-9a-f]{16})\.bin", get)
-    assert m, "staging tag not found in generated get script"
-    staging = _os.path.join(_os.environ.get("TEMP", _os.environ.get("TMP", "")),
-                            f"hyperv-mcp-get-{m.group(1)}.bin")
-    with open(staging, "wb") as fh:
-        fh.write(payload)
+    # Pre-write the "remote" staging file in the child's TEMP: the chunk
+    # loop reads Join-Path([IO.Path]::GetTempPath(), name), so Python and
+    # PowerShell provably share one location.
+    staging = tmp_path / n_bin
+    staging.write_bytes(payload)
 
     staged = tmp_path / "staged.bin"
     final = tmp_path / "final.bin"
@@ -241,20 +243,20 @@ def test_get_chunk_loop_reassembles_multichunk_payload(
         "'C:/l'", f"'{final}'"
     )
     encoded = pswindows.encode_command(pswindows._PS_PIN + harness)
+    child_env = dict(os.environ)
+    child_env["TEMP"] = str(tmp_path)
+    child_env["TMP"] = str(tmp_path)
     proc = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=120, env=child_env,
     )
     assert proc.returncode == 0, f"stderr: {proc.stderr[-500:]}"
-    import json
-
-    result = json.loads(proc.stdout.strip().splitlines()[-1])
+    lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
+    result = json.loads(lines[-1])
     assert result["ok"] is True, result
     assert result["bytes_local"] == size, result
     assert result["sha256_local"] == result["sha256_remote"], result
     assert final.read_bytes() == payload, (
         "reassembled destination differs from the source payload"
     )
-    # Proof the loop actually crossed the chunk boundary: two base64 chunks
-    # were consumed (196608 raw + 3392 raw).
-    assert size > 196608
+    assert size > 196608  # proof the loop crossed the chunk boundary
