@@ -188,7 +188,6 @@ def test_get_chunk_loop_reassembles_multichunk_payload(monkeypatch, tmp_path):
     staging location (no command-line payload — the 200 KB base64 would blow
     the 32K CreateProcess limit via -EncodedCommand).
     """
-    import base64
     import hashlib
     import json
 
