@@ -26,6 +26,17 @@ from .config import Config
 from .credentials import CredentialSet
 from .guestexec import psdirect_prefix  # re-exported prefix for kd tools
 
+
+def _run(cfg: Config, script: str, *, timeout_s: float | None = None, stdin_b64: str | None = None):
+    """lifecycle's PowerShell choke (issue #43): composes the remote hop
+    from the CALLER's cfg before spawning; identity in local mode."""
+    script, stdin = pswindows.compose_remote(
+        cfg, script,
+        payload_lines=1 if stdin_b64 is not None else 0,
+        stdin_b64=stdin_b64,
+    )
+    return pswindows.run_ps(script, timeout_s=timeout_s, stdin_b64=stdin)
+
 _KEY_RE = re.compile(r"^[0-9a-f.]+$")
 
 
@@ -109,7 +120,7 @@ if ([string]$vm.State -notin ({wanted_ps})) {{ exit 3 }}
 
 
 def _wait_for_state(cfg: Config, ref: vmident.VMRef, wanted: list[str], timeout_s: int) -> str:
-    result = pswindows.run_ps(_wait_state_script(cfg, ref, wanted, timeout_s), timeout_s=timeout_s + 15)
+    result = _run(cfg, _wait_state_script(cfg, ref, wanted, timeout_s), timeout_s=timeout_s + 15)
     if result.timed_out:
         raise RuntimeError(f"hyperv state wait timed out for '{ref.name}'")
     if result.returncode not in (0, 3):
@@ -189,7 +200,7 @@ def list_vms(cfg: Config) -> list[dict]:
     if not cfg.unrestricted:
         if not cfg.allowed_vm_patterns:
             raise policy.PolicyDenied("vm", "no allowed_vm_patterns configured")
-    result = pswindows.run_ps(_LIST_VM_SCRIPT)
+    result = _run(cfg, _LIST_VM_SCRIPT)
     pswindows.check_result(result, "hyperv_list_vms")
     rows = [_add_legacy_aliases(row, _VM_KEY_ALIASES) for row in _parse_json_objects(result, "list_vms")]
     if cfg.unrestricted:
@@ -229,7 +240,7 @@ $snaps = (Get-VMSnapshot -VM $vm -ErrorAction Stop | Measure-Object).Count
     hard_drives      = @($hdd)
 }} | ConvertTo-Json -Compress -Depth 4
 """
-    result = pswindows.run_ps(script, timeout_s=60)
+    result = _run(cfg, script, timeout_s=60)
     pswindows.check_result(result, f"hyperv_get_vm_info({vm_name or vm_id})")
     rows = _parse_json_objects(result, "get_vm_info")
     if not rows:
@@ -247,7 +258,7 @@ if ($initial -ne 'Running') {{ Start-VM -VM $vm -ErrorAction Stop }}
 [PSCustomObject]@{{ initial_state=$initial }} | ConvertTo-Json -Compress
 """
     with vmlocks.vm_lock(ref.id):
-        result = pswindows.run_ps(script, timeout_s=60)
+        result = _run(cfg, script, timeout_s=60)
         pswindows.check_result(result, f"hyperv_start_vm({vm_name or vm_id})")
         rows = _parse_json_objects(result, "start_vm")
         initial = rows[0].get("initial_state", "") if rows else ""
@@ -287,7 +298,7 @@ if ($initial -notin ({", ".join(f"'{w}'" for w in wanted)})) {{
 [PSCustomObject]@{{ initial_state=$initial }} | ConvertTo-Json -Compress
 """
     with vmlocks.vm_lock(ref.id):
-        result = pswindows.run_ps(script, timeout_s=60)
+        result = _run(cfg, script, timeout_s=60)
         pswindows.check_result(result, f"hyperv_stop_vm({vm_name or vm_id}, {method})")
         rows = _parse_json_objects(result, "stop_vm")
         initial = rows[0].get("initial_state", "") if rows else ""
@@ -310,7 +321,7 @@ Stop-VM -VM $vm -TurnOff -ErrorAction Stop
 Start-VM -VM $vm -ErrorAction Stop
 """
     with vmlocks.vm_lock(ref.id):
-        result = pswindows.run_ps(script, timeout_s=60)
+        result = _run(cfg, script, timeout_s=60)
         pswindows.check_result(result, f"hyperv_reset_vm({vm_name or vm_id})")
         final = _wait_for_state(cfg, ref, ["Running"], timeout_s=90)
         return {"status": "reset", "vm_name": ref.name, "state": final}
@@ -332,7 +343,7 @@ def checkpoint_create(cfg: Config, vm_name: str = "", checkpoint_name: str = "",
 $vm = Get-VM -Id $vmTarget -ErrorAction Stop
 Checkpoint-VM -VM $vm -SnapshotName {cn} -ErrorAction Stop
 """
-        result = pswindows.run_ps(script, timeout_s=300)
+        result = _run(cfg, script, timeout_s=300)
         pswindows.check_result(result, f"hyperv_checkpoint_create({vm_name or vm_id})")
         return {"status": "created", "vm_name": ref.name, "checkpoint_name": checkpoint_name}
 
@@ -348,7 +359,7 @@ Get-VMSnapshot -VM $vm -ErrorAction Stop |
                 @{N='parent_name';E={$_.ParentSnapshotName}} |
   ConvertTo-Json -Compress -Depth 2
 """
-    result = pswindows.run_ps(script, timeout_s=60)
+    result = _run(cfg, script, timeout_s=60)
     pswindows.check_result(result, f"hyperv_checkpoint_list({vm_name or vm_id})")
     return [_add_legacy_aliases(row, _SNAPSHOT_KEY_ALIASES) for row in _parse_json_objects(result, "checkpoint_list")]
 
@@ -365,7 +376,7 @@ def checkpoint_restore(
 {guestexec.vm_target_preamble(ref.id)}
 Restore-VMSnapshot -Name {cn} -VM (Get-VM -Id $vmTarget -ErrorAction Stop) -Confirm:$false -ErrorAction Stop
 """
-        result = pswindows.run_ps(script, timeout_s=300)
+        result = _run(cfg, script, timeout_s=300)
         pswindows.check_result(result, f"hyperv_checkpoint_restore({vm_name or vm_id}, {checkpoint_name})")
         # Restoring a checkpoint whose subtree has descendants merges their
         # differencing disks; the VM can stay in transitional states for many
@@ -399,7 +410,7 @@ def checkpoint_remove(
 {guestexec.vm_target_preamble(ref.id)}
 Remove-VMSnapshot -Name {cn} -VM (Get-VM -Id $vmTarget -ErrorAction Stop) {subtree} -Confirm:$false -ErrorAction Stop
 """
-        result = pswindows.run_ps(script, timeout_s=300)
+        result = _run(cfg, script, timeout_s=300)
         pswindows.check_result(result, f"hyperv_checkpoint_remove({vm_name or vm_id})")
         return {"status": "removed", "vm_name": ref.name, "checkpoint_name": checkpoint_name}
 
@@ -465,7 +476,7 @@ def configure_kdnet(
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     eip = pswindows.ps_quote(host_ip)
     ekey = pswindows.ps_quote(key)
-    cred_prefix = psdirect_prefix(cred)
+    cred_prefix = psdirect_prefix(cred, cfg)
     vm_target = guestexec.vm_target_preamble(ref.id)
     script = f"""
 {cred_prefix}
@@ -483,7 +494,7 @@ $out = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -Scrip
 $out | ConvertTo-Json -Compress
 """
     with vmlocks.vm_lock(ref.id):
-        result = pswindows.run_ps(script.strip(), timeout_s=60, stdin_b64=pswindows.utf8_b64(cred.password))
+        result = _run(cfg, script.strip(), timeout_s=60, stdin_b64=pswindows.utf8_b64(cred.password))
         pswindows.check_result(result, f"hyperv_configure_kdnet({vm_name or vm_id})")
         bcd = json.loads(result.stdout)
 
@@ -494,7 +505,7 @@ $out | ConvertTo-Json -Compress
 {vm_target}
 Invoke-Command -VMId $vmTarget -Credential $cred -ScriptBlock {{ & 'shutdown.exe' '/r' '/t' '3' }} -ErrorAction Stop
 """
-            rr = pswindows.run_ps(
+            rr = _run(cfg,
                 reboot_script.strip(), timeout_s=30, stdin_b64=pswindows.utf8_b64(cred.password)
             )
             pswindows.check_result(rr, f"hyperv_configure_kdnet reboot({vm_name or vm_id})")
@@ -543,7 +554,7 @@ def configure_kdcom(
     _validate_pipe_name(pipe_name)
 
     pn = pswindows.ps_name(pipe_name)
-    cred_prefix = psdirect_prefix(cred)
+    cred_prefix = psdirect_prefix(cred, cfg)
     vm_target = guestexec.vm_target_preamble(ref.id)
 
     step1 = f"""
@@ -566,9 +577,9 @@ $out = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -Scrip
 $out | ConvertTo-Json -Compress
 """
     with vmlocks.vm_lock(ref.id):
-        r1 = pswindows.run_ps(step1, timeout_s=60)
+        r1 = _run(cfg, step1, timeout_s=60)
         pswindows.check_result(r1, f"hyperv_configure_kdcom Set-VMComPort({vm_name or vm_id})")
-        r2 = pswindows.run_ps(step2.strip(), timeout_s=60, stdin_b64=pswindows.utf8_b64(cred.password))
+        r2 = _run(cfg, step2.strip(), timeout_s=60, stdin_b64=pswindows.utf8_b64(cred.password))
         pswindows.check_result(r2, f"hyperv_configure_kdcom bcdedit({vm_name or vm_id})")
         bcd = json.loads(r2.stdout)
 
@@ -579,7 +590,7 @@ $out | ConvertTo-Json -Compress
 {vm_target}
 Invoke-Command -VMId $vmTarget -Credential $cred -ScriptBlock {{ & 'shutdown.exe' '/r' '/t' '3' }} -ErrorAction Stop
 """
-            rr = pswindows.run_ps(
+            rr = _run(cfg,
                 reboot_script.strip(), timeout_s=30, stdin_b64=pswindows.utf8_b64(cred.password)
             )
             pswindows.check_result(rr, f"hyperv_configure_kdcom reboot({vm_name or vm_id})")

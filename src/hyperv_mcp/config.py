@@ -24,6 +24,13 @@ from typing import Any, ClassVar
 
 SCHEMA_VERSION = 1
 
+# The remote Hyper-V host name. Strict charset (hostname / IPv4 / IPv6
+# literal): the value is embedded into generated PowerShell inside a
+# single-quoted literal, so quote/semicolon/space spellings are an injection
+# vector — rejected at load time, ps_quote'd again at emission (defense in
+# depth). Underscores included for workgroup machine names.
+_HOSTNAME_RE = re.compile(r"[A-Za-z0-9_.:-]+")
+
 # Agent ids become audit `agent_id` values and verifier principals (issue #10).
 # "local-cli" is the LEGACY shared-token principal — a configured agent must
 # never collapse into it. fullmatch (not match+$) so a trailing newline can
@@ -100,6 +107,14 @@ class HttpPolicy:
 
 
 @dataclass
+class HyperVTarget:
+    """Hyper-V host targeting (issue #43). host=None means the local host —
+    the only mode before this section existed; every generated script stays
+    byte-identical in that case."""
+    host: str | None = None
+
+
+@dataclass
 class Config:
     allowed_vm_patterns: list[str] = field(default_factory=list)
     host_read_roots: list[str] = field(default_factory=list)
@@ -114,6 +129,7 @@ class Config:
     host_powershell_path: str | None = None
     verify_sha256: bool = False
     ps_timeout_s: int = 120
+    hyperv: HyperVTarget = field(default_factory=HyperVTarget)
     http: HttpPolicy = field(default_factory=HttpPolicy)
     # Provenance set by load() only (deliberately NOT in _FIELD_MAP, so a JSON
     # config can never set them and unknown-key rejection stays intact):
@@ -336,6 +352,31 @@ class Config:
                 raise ConfigError(f"http.{key} must be a non-empty string")
         object.__setattr__(self, "http", http)
 
+    def _set_hyperv(self, value: Any) -> None:
+        """Validate the optional hyperv section (issue #43).
+
+        host is the remote Hyper-V host name; it is embedded into generated
+        PowerShell, so the charset is strict and empty/whitespace/malformed
+        values fail loudly at load time (wording pinned by acceptance C1).
+        """
+        if not isinstance(value, dict):
+            raise ConfigError("hyperv must be an object")
+        unknown = set(value) - {"host"}
+        if unknown:
+            raise ConfigError(
+                f"unknown hyperv key(s): {sorted(unknown)} — "
+                f"offending key: {sorted(unknown)[0]}"
+            )
+        host = value.get("host")
+        if not isinstance(host, str) or not host.strip():
+            raise ConfigError("hyperv.host must be a non-empty string")
+        if not _HOSTNAME_RE.fullmatch(host):
+            raise ConfigError(
+                "hyperv.host must be a hostname or IP literal "
+                f"(letters, digits, '.', '-', '_', ':') — got: {host!r}"
+            )
+        object.__setattr__(self, "hyperv", HyperVTarget(host=host))
+
 
 Config._FIELD_MAP = {  # type: ignore[attr-defined]
     "allowed_vm_patterns": lambda c, v: c._set_str_list("allowed_vm_patterns", v),
@@ -351,5 +392,6 @@ Config._FIELD_MAP = {  # type: ignore[attr-defined]
     "host_powershell_path": lambda c, v: c._set_str_opt("host_powershell_path", v),
     "verify_sha256": lambda c, v: c._set_bool("verify_sha256", v),
     "ps_timeout_s": lambda c, v: c._set_int("ps_timeout_s", v),
+    "hyperv": lambda c, v: c._set_hyperv(v),
     "http": lambda c, v: c._set_http(v),
 }

@@ -42,6 +42,19 @@ def _err(cfg: Config, error: str, error_class: str) -> dict:
 # -- host leg (no credentials) -------------------------------------------
 
 
+def _run(
+    cfg: Config, script: str, *, timeout_s: float | None = None, stdin_b64: str | None = None,
+) -> pswindows.PSResult:
+    """diagnostics' PowerShell choke (issue #43): composes the remote hop
+    from the CALLER's cfg before spawning; identity in local mode."""
+    script, stdin = pswindows.compose_remote(
+        cfg, script,
+        payload_lines=1 if stdin_b64 is not None else 0,
+        stdin_b64=stdin_b64,
+    )
+    return pswindows.run_ps(script, timeout_s=timeout_s, stdin_b64=stdin)
+
+
 def _host_leg_script(vm_id: str) -> str:
     """GUID-native: opens with the validated $vmTarget preamble (the caller
     resolved the identity via vmident; no name resolution inside)."""
@@ -60,7 +73,7 @@ $up = if ($vm.Uptime) {{ [int][math]::Floor($vm.Uptime.TotalSeconds) }} else {{ 
 
 
 def _run_host_leg(cfg: Config, vm_id: str) -> dict:
-    result = pswindows.run_ps(_host_leg_script(vm_id), timeout_s=90)
+    result = _run(cfg, _host_leg_script(vm_id), timeout_s=90)
     if result.timed_out:
         raise RuntimeError(f"host leg timed out for '{vm_id}'")
     pswindows.check_result(result)
@@ -166,10 +179,10 @@ $r | ConvertTo-Json -Compress -Depth 6
 """
 
 
-def _guest_leg_script(vm_id: str, inner_script: str, cred: CredentialSet) -> str:
+def _guest_leg_script(vm_id: str, inner_script: str, cred: CredentialSet, cfg=None) -> str:
     """GUID-native PS Direct wrapper: $vmTarget preamble + Invoke-Command -VMId."""
     return f"""
-{guestexec.psdirect_prefix(cred)}
+{guestexec.psdirect_prefix(cred, cfg)}
 {guestexec.vm_target_preamble(vm_id)}
 $enc = '{pswindows.utf8_b64(inner_script)}'
 $out = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{
@@ -186,8 +199,8 @@ $out
 def _run_guest_probe(cfg: Config, vm_id: str, cred: CredentialSet, timeout_ms: int) -> dict:
     """One PS Direct probe leg. Returns the parsed section dict or raises."""
     timeout_s = max(30, timeout_ms // 1000 + guestexec._GRACE_S)
-    script = _guest_leg_script(vm_id, _GUEST_PROBE_SCRIPT, cred)
-    result = pswindows.run_ps(script, timeout_s=timeout_s, stdin_b64=pswindows.utf8_b64(cred.password))
+    script = _guest_leg_script(vm_id, _GUEST_PROBE_SCRIPT, cred, cfg)
+    result = _run(cfg, script, timeout_s=timeout_s, stdin_b64=pswindows.utf8_b64(cred.password))
     if result.timed_out:
         raise TimeoutError(f"guest probe timed out for '{vm_id}'")
     pswindows.check_result(result)
@@ -317,7 +330,7 @@ def _findings(_vm: dict, guest: dict | None) -> list[dict]:
     return out
 
 
-def build_guest_script(vm_id: str, inner_script: str, cred: CredentialSet) -> str:
+def build_guest_script(vm_id: str, inner_script: str, cred: CredentialSet, cfg=None) -> str:
     """Host PS wrapper (PS Direct) around an inner guest script, no lock.
 
     GUID-native: the target arrives pre-resolved (vmident); the script opens
@@ -328,7 +341,7 @@ def build_guest_script(vm_id: str, inner_script: str, cred: CredentialSet) -> st
     call holds the VM) while every tool-call leg goes through
     run_guest_inner, which acquires the lock.
     """
-    return _guest_leg_script(vm_id, inner_script, cred)
+    return _guest_leg_script(vm_id, inner_script, cred, cfg)
 
 
 def run_guest_inner(
@@ -346,10 +359,10 @@ def run_guest_inner(
     Raises on transport failure/timeout; callers own error envelopes.
     """
     timeout_s = max(30, timeout_ms // 1000 + guestexec._GRACE_S)
-    script = _guest_leg_script(vm_id, inner_script, cred)
+    script = _guest_leg_script(vm_id, inner_script, cred, cfg)
     with vm_lock(vm_id):
-        result = pswindows.run_ps(
-            script, timeout_s=timeout_s,
+        result = _run(
+            cfg, script, timeout_s=timeout_s,
             stdin_b64=pswindows.utf8_b64(cred.password),
         )
     if result.timed_out:
@@ -466,13 +479,13 @@ foreach ($name in @($items.processes)) {
 
 def _recovery_script(
     vm_id: str, cred: CredentialSet, services: list[str], processes: list[str],
-    timeout_s: int, interval_s: int,
+    timeout_s: int, interval_s: int, cfg=None,
 ) -> str:
     items_b64 = pswindows.utf8_b64(json.dumps({"services": services, "processes": processes}))
     verify_b64 = pswindows.utf8_b64(_VERIFY_SCRIPT)
     max_attempts = max(1, math.ceil(timeout_s / max(1, interval_s)))
     return f"""
-{guestexec.psdirect_prefix(cred)}
+{guestexec.psdirect_prefix(cred, cfg)}
 {guestexec.vm_target_preamble(vm_id)}
 $deadline = (Get-Date).AddSeconds({timeout_s})
 $interval = {interval_s}
@@ -536,10 +549,10 @@ def wait_guest_recovery(
     processes = [p.strip() for p in (processes or []) if p and p.strip()]
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
 
-    script = _recovery_script(ref.id, cred, services, processes, timeout_s, interval_s)
+    script = _recovery_script(ref.id, cred, services, processes, timeout_s, interval_s, cfg)
     with vm_lock(ref.id):
-        result = pswindows.run_ps(
-            script,
+        result = _run(
+            cfg, script,
             timeout_s=timeout_s + 15,
             stdin_b64=pswindows.utf8_b64(cred.password),
         )

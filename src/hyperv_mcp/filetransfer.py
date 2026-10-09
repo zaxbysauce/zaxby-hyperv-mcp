@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 from uuid import uuid4
 
 from . import policy, pswindows, vmident, vmlocks
@@ -200,10 +201,10 @@ def _deny_root_destination(cfg: Config, cp: policy.CanonicalPath, key: str, cate
             raise policy.PolicyDenied(category, "destination equals a configured root")
 
 
-def _session_body(cred: CredentialSet, vm_id: str, script_body: str) -> str:
+def _session_body(cred: CredentialSet, vm_id: str, script_body: str, cfg=None) -> str:
     """GUID-native session wrapper: $vmTarget preamble, no name resolution."""
     return f"""
-{psdirect_prefix(cred)}
+{psdirect_prefix(cred, cfg)}
 {vm_target_preamble(vm_id)}
 $s = New-PSSession -VMId $vmTarget -Credential $cred -ErrorAction Stop
 try {{
@@ -214,7 +215,49 @@ try {{
 """
 
 
-def _cleanup_guest_staged(vm_id: str, staged_raw: str, cred: CredentialSet) -> None:
+def _run(cfg: Config, script: str, *, timeout_s: float | None = None, stdin_b64: str | None = None):
+    """filetransfer's PowerShell choke (issue #43): composes the remote hop
+    from the CALLER's cfg before spawning; identity in local mode."""
+    script, stdin = pswindows.compose_remote(
+        cfg, script,
+        payload_lines=1 if stdin_b64 is not None else 0,
+        stdin_b64=stdin_b64,
+    )
+    return pswindows.run_ps(script, timeout_s=timeout_s, stdin_b64=stdin)
+
+
+# Per-chunk size for remote-mode byte crossing: safely under the default
+# ~500 KiB WS-Man MaxEnvelopeSizeKB. Remote put/get trade Copy-Item
+# -ToSession's single-stream for per-chunk round trips (README documents the
+# performance caveat); local mode is untouched.
+_CHUNK_B64_CHARS = 262144
+
+
+def _hop(cfg: Config) -> str:
+    """'Invoke-Command -ComputerName <host> [-Credential $__hostcred]' for a
+    single remote leg inside a remote-mode transfer script (empty local)."""
+    host = pswindows.hyperv_host(cfg)
+    if not host:
+        return ""
+    args = f"-ComputerName {pswindows.ps_quote(host)}"
+    return "Invoke-Command " + args + " -Credential $__hostcred"
+
+
+
+def _guest_cred_lines(cred: CredentialSet) -> str:
+    """Remote-block variant of psdirect_prefix: consumes the forwarded $__p0
+    parameter instead of reading local stdin (psdirect_prefix(cred, cfg))."""
+    return "\n".join([
+        "$secText = [System.Text.Encoding]::UTF8.GetString("
+        "[Convert]::FromBase64String($__p0))",
+        "$sec = $secText | ConvertTo-SecureString -AsPlainText -Force",
+        f"$gcred = [System.Management.Automation.PSCredential]::new("
+        f"{pswindows.ps_quote(cred.username)}, $sec)",
+        "$secText = $null; $sec = $null",
+    ])
+
+
+def _cleanup_guest_staged(vm_id: str, staged_raw: str, cred: CredentialSet, cfg=None) -> None:
     """Best-effort removal of a guest staged file after a host timeout.
 
     The timeout kill terminates the transfer script before its own catch
@@ -223,13 +266,15 @@ def _cleanup_guest_staged(vm_id: str, staged_raw: str, cred: CredentialSet) -> N
     the module docstring). Addressed by the pre-resolved GUID.
     """
     try:
-        pswindows.run_ps(
+        _run(
+            cfg if cfg is not None else Config(),
             _session_body(
                 cred,
                 vm_id,
                 "Remove-Item -LiteralPath "
                 + pswindows.ps_quote(staged_raw)
                 + " -Force -ErrorAction SilentlyContinue",
+                cfg,
             ).strip(),
             timeout_s=30,
             stdin_b64=pswindows.utf8_b64(cred.password),
@@ -268,12 +313,253 @@ def _cleanup_failed_get(staged_raw: str, created_dirs: list[str]) -> None:
             pass
 
 
-def _run_transfer(cfg: Config, vm_id: str, body: str, cred: CredentialSet, timeout_s: int = 300) -> dict:
-    result = pswindows.run_ps(
-        _session_body(cred, vm_id, body).strip(),
-        timeout_s=timeout_s,
-        stdin_b64=pswindows.utf8_b64(cred.password),
+def _remote_put_script(
+    cfg: Config,
+    cred: CredentialSet,
+    vm_id: str,
+    lp: str,
+    rp: str,
+    staged: str,
+    staged_raw: str,
+    fragment: str,
+    assert_block: str,
+    do_verify: bool,
+) -> str:
+    """Remote-mode guest_put script (explicit composition ownership).
+
+    Local legs (source hash/size/read) run on the MCP machine; the file
+    crosses the WS-Man hop in bounded base64 chunks (each its own
+    Invoke-Command, under MaxEnvelopeSizeKB); a final remote leg creates the
+    PS-Direct session ON the Hyper-V host and runs the same staged-copy /
+    verify / move semantics as the local body. D1 pin ordering: the local
+    Get-FileHash precedes the first -ComputerName leg; New-PSSession -VMId
+    follows it.
+    """
+    hop = _hop(cfg)
+    prelude, _stdin = pswindows.remote_prelude(
+        cfg, payload_lines=1, stdin_b64=pswindows.utf8_b64(cred.password)
     )
+    tag = secrets.token_hex(8)
+    n_b64 = f"hyperv-mcp-put-{tag}.b64"
+    n_bin = f"hyperv-mcp-put-{tag}.bin"
+    local_hash = (
+        "$shaLocal = (Get-FileHash -LiteralPath $src -Algorithm SHA256).Hash"
+        if do_verify else "$shaLocal = $null"
+    )
+    verify_move = f"""
+        $shaStaged = Invoke-Command -Session $s -ScriptBlock {{ param($p) (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash }} -ArgumentList $stagedGuest -ErrorAction Stop
+        if ($shaLocal -and ($shaLocal -ne $shaStaged)) {{ throw 'SHA-256 mismatch (staged copy differs from source)' }}
+        Invoke-Command -Session $s -ScriptBlock {{
+            param($staged, $final)
+            {fragment.rstrip()}
+            Move-Item -LiteralPath $staged -Destination $final -Force -ErrorAction Stop
+        }} -ArgumentList $stagedGuest, $final -ErrorAction Stop
+        $shaRemote = $shaStaged
+""" if do_verify else """
+        $shaRemote = $null
+        Invoke-Command -Session $s -ScriptBlock {{
+            param($staged, $final)
+            {fragment.rstrip()}
+            Move-Item -LiteralPath $staged -Destination $final -Force -ErrorAction Stop
+        }} -ArgumentList $stagedGuest, $final -ErrorAction Stop
+"""
+    return f"""{prelude}$src = {lp}
+{local_hash}
+$bytesLocal = (Get-Item -LiteralPath $src).Length
+$b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($src))
+$rsB64Name = '{n_b64}'
+$rsBinName = '{n_bin}'
+$pos = 0
+while ($pos -lt $b64.Length) {{
+    $take = [Math]::Min({_CHUNK_B64_CHARS}, $b64.Length - $pos)
+    $chunk = $b64.Substring($pos, $take)
+    {hop} -ScriptBlock {{
+        param($n, $c)
+        $p = Join-Path ([IO.Path]::GetTempPath()) $n
+        [IO.File]::AppendAllText($p, $c)
+    }} -ArgumentList $rsB64Name, $chunk
+    $pos += $take
+}}
+$__put = {hop} -ScriptBlock {{
+    param($__p0, $nB64, $nBin, $final, $stagedGuest, $shaLocal, $bytesLocal)
+{_guest_cred_lines(cred)}
+    $vmTarget = '{vm_id}'
+    $s = New-PSSession -VMId $vmTarget -Credential $gcred -ErrorAction Stop
+    $rb64 = $null; $rbin = $null
+    try {{
+        $rb64 = Join-Path ([IO.Path]::GetTempPath()) $nB64
+        $rbin = Join-Path ([IO.Path]::GetTempPath()) $nBin
+        [IO.File]::WriteAllBytes($rbin, [Convert]::FromBase64String([IO.File]::ReadAllText($rb64)))
+        $dir = Split-Path -Path $final -Parent
+        Invoke-Command -Session $s -ScriptBlock {{
+            param($d, $dest)
+            if (Test-Path -LiteralPath $dest -PathType Container) {{
+                throw "invalid destination: $dest is an existing directory"
+            }}
+            if ($d -and -not (Test-Path -LiteralPath $d)) {{ New-Item -ItemType Directory -Path $d -Force -ErrorAction Stop | Out-Null }}
+        }} -ArgumentList $dir, $final -ErrorAction Stop
+{assert_block}        Copy-Item -ToSession $s -LiteralPath $rbin -Destination $stagedGuest -Force -ErrorAction Stop
+{verify_move}        $bytesRemote = Invoke-Command -Session $s -ScriptBlock {{ param($p) (Get-Item -LiteralPath $p).Length }} -ArgumentList $final -ErrorAction Stop
+        [PSCustomObject]@{{
+            ok = $true
+            bytes_copied = $bytesRemote
+            bytes_local = $bytesLocal
+            bytes_remote = $bytesRemote
+            sha256_local = $shaLocal
+            sha256_remote = $shaRemote
+        }} | ConvertTo-Json -Compress
+    }} catch {{
+        Invoke-Command -Session $s -ScriptBlock {{
+            param($staged) Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+        }} -ArgumentList $stagedGuest -ErrorAction SilentlyContinue
+        throw
+    }} finally {{
+        Remove-PSSession $s -ErrorAction SilentlyContinue
+        if ($rb64) {{ Remove-Item -LiteralPath $rb64 -Force -ErrorAction SilentlyContinue }}
+        if ($rbin) {{ Remove-Item -LiteralPath $rbin -Force -ErrorAction SilentlyContinue }}
+    }}
+}} -ArgumentList $__p0, $rsB64Name, $rsBinName, {rp}, {staged}, $shaLocal, $bytesLocal
+$__put
+"""
+
+
+def _remote_get_script(
+    cfg: Config,
+    cred: CredentialSet,
+    vm_id: str,
+    rp: str,
+    lp: str,
+    staged: str,
+    staged_raw: str,
+    fragment: str,
+    assert_block: str,
+    do_verify: bool,
+) -> str:
+    """Remote-mode guest_get script (explicit composition ownership).
+
+    The local verify scriptblock (destination write + hash + move) is
+    DEFINED before the hop so the MCP-machine legs stay textually local; the
+    first remote leg creates the PS-Direct session ON the Hyper-V host and
+    pulls to remote staging; a chunked loop reads the staging file back in
+    bounded base64 ranges; the local verify block then runs on the received
+    bytes. Same staged-then-move semantics as the local body.
+    """
+    hop = _hop(cfg)
+    prelude, _stdin = pswindows.remote_prelude(
+        cfg, payload_lines=1, stdin_b64=pswindows.utf8_b64(cred.password)
+    )
+    tag = secrets.token_hex(8)
+    n_bin = f"hyperv-mcp-get-{tag}.bin"
+    local_verify = (
+        "$__verifyGet = {\n"
+        "    param($stagedPath, $final, $b64, $shaExp)\n"
+        "    [IO.File]::WriteAllBytes($stagedPath, [Convert]::FromBase64String($b64))\n"
+        "    $sha = (Get-FileHash -LiteralPath $stagedPath -Algorithm SHA256).Hash\n"
+        "    if ($shaExp -and ($sha -ne $shaExp)) { throw 'SHA-256 mismatch (received bytes differ from guest source)' }\n"
+        "    Move-Item -LiteralPath $stagedPath -Destination $final -Force -ErrorAction Stop\n"
+        "}\n"
+        if do_verify else
+        "$__verifyGet = {\n"
+        "    param($stagedPath, $final, $b64, $shaExp)\n"
+        "    [IO.File]::WriteAllBytes($stagedPath, [Convert]::FromBase64String($b64))\n"
+        "    Move-Item -LiteralPath $stagedPath -Destination $final -Force -ErrorAction Stop\n"
+        "}\n"
+    )
+    remote_sha = (
+        "        $shaRemote = Invoke-Command -Session $s -ScriptBlock "
+        "{ param($p) (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash } "
+        "-ArgumentList $src -ErrorAction Stop\n"
+        if do_verify else "        $shaRemote = $null\n"
+    )
+    final_verify = (
+        f"& $__verifyGet {staged} {lp} $outB64 $shaRemote\n"
+        "$shaLocal = $shaRemote\n"
+        if do_verify else
+        f"& $__verifyGet {staged} {lp} $outB64 $null\n"
+        "$shaLocal = $null\n"
+    )
+    return f"""{prelude}{local_verify}$src = {rp}
+$__get = {hop} -ScriptBlock {{
+    param($__p0, $nBin, $src, $stagedGuest)
+{_guest_cred_lines(cred)}
+    $vmTarget = '{vm_id}'
+    $s = New-PSSession -VMId $vmTarget -Credential $gcred -ErrorAction Stop
+    $rbin = $null
+    try {{
+        $rbin = Join-Path ([IO.Path]::GetTempPath()) $nBin
+{assert_block}        Copy-Item -FromSession $s -LiteralPath $src -Destination $rbin -Force -ErrorAction Stop
+{remote_sha}        $bytesRemote = Invoke-Command -Session $s -ScriptBlock {{ param($p) (Get-Item -LiteralPath $p).Length }} -ArgumentList $src -ErrorAction Stop
+        $len = (Get-Item -LiteralPath $rbin).Length
+        [PSCustomObject]@{{ len = $len; bytes_remote = $bytesRemote; sha_remote = $shaRemote }} | ConvertTo-Json -Compress
+    }} catch {{
+        Invoke-Command -Session $s -ScriptBlock {{
+            param($staged) Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+        }} -ArgumentList $stagedGuest -ErrorAction SilentlyContinue
+        throw
+    }} finally {{
+        Remove-PSSession $s -ErrorAction SilentlyContinue
+        if ($rbin) {{ Remove-Item -LiteralPath $rbin -Force -ErrorAction SilentlyContinue }}
+    }}
+}} -ArgumentList $__p0, '{n_bin}', {rp}, {staged}
+$len = $__get.len
+$bytesRemote = $__get.bytes_remote
+$shaRemote = $__get.sha_remote
+$outB64 = ''
+$off = 0
+while ($off -lt $len) {{
+    $take = [Math]::Min({_CHUNK_B64_CHARS}, $len - $off)
+    $outB64 += {hop} -ScriptBlock {{
+        param($n, $o, $l)
+        $p = Join-Path ([IO.Path]::GetTempPath()) $n
+        $fs = [IO.File]::OpenRead($p)
+        try {{
+            $buf = New-Object byte[] $l
+            [void]$fs.Read($buf, 0, $l)
+            [Convert]::ToBase64String($buf)
+        }} finally {{ $fs.Dispose() }}
+    }} -ArgumentList '{n_bin}', $off, $take
+    $off += $take
+}}
+{final_verify}$bytesLocal = (Get-Item -LiteralPath {lp}).Length
+[PSCustomObject]@{{
+    ok = $true
+    bytes_copied = $bytesLocal
+    bytes_local = $bytesLocal
+    bytes_remote = $bytesRemote
+    sha256_local = $shaLocal
+    sha256_remote = $shaRemote
+}} | ConvertTo-Json -Compress
+"""
+
+
+def _run_transfer(
+    cfg: Config,
+    vm_id: str,
+    body: str,
+    cred: CredentialSet,
+    timeout_s: int = 300,
+    *,
+    composed_script: str | None = None,
+) -> dict:
+    """Run one transfer script.
+
+    composed_script is the remote-mode transfer script built by the put/get
+    builders themselves (explicit composition ownership): the local-FS legs
+    stay on the MCP machine while each session/chunk leg carries its own
+    -ComputerName hop, so no outer wrap is applied here. Local mode passes
+    no composed_script and keeps the historic byte-identical body.
+    """
+    if composed_script is not None:
+        script: str = composed_script
+        stdin: str | None = pswindows.utf8_b64(cred.password)
+    else:
+        script, stdin = pswindows.compose_remote(
+            cfg,
+            _session_body(cred, vm_id, body, cfg).strip(),
+            payload_lines=1,
+            stdin_b64=pswindows.utf8_b64(cred.password),
+        )
+    result = pswindows.run_ps(script, timeout_s=timeout_s, stdin_b64=stdin)
     if result.timed_out:
         return {"ok": False, "error": f"host timeout after {timeout_s}s; transfer aborted", "error_class": "timeout"}
     if result.returncode != 0:
@@ -388,10 +674,17 @@ def guest_put(
         sha256_remote = $shaRemote
     }} | ConvertTo-Json -Compress
 """
+    remote_script = (
+        _remote_put_script(
+            cfg, cred, ref.id, lp, rp, staged, staged_raw,
+            fragment, assert_block, do_verify,
+        )
+        if pswindows.hyperv_host(cfg) else None
+    )
     with vmlocks.vm_lock(ref.id):
-        result = _run_transfer(cfg, ref.id, body, cred)
+        result = _run_transfer(cfg, ref.id, body, cred, composed_script=remote_script)
         if result.get("error_class") == "timeout":
-            _cleanup_guest_staged(ref.id, staged_raw, cred)
+            _cleanup_guest_staged(ref.id, staged_raw, cred, cfg)
     result["vm_name"] = ref.name
     return result
 
@@ -484,9 +777,16 @@ def guest_get(
         sha256_remote = $shaRemote
     }} | ConvertTo-Json -Compress
 """
+    remote_script = (
+        _remote_get_script(
+            cfg, cred, ref.id, rp, lp, staged, staged_raw,
+            fragment, assert_block, do_verify,
+        )
+        if pswindows.hyperv_host(cfg) else None
+    )
     with vmlocks.vm_lock(ref.id):
         try:
-            result = _run_transfer(cfg, ref.id, body, cred)
+            result = _run_transfer(cfg, ref.id, body, cred, composed_script=remote_script)
         except Exception:
             _cleanup_failed_get(staged_raw, created_dirs)
             raise
@@ -515,7 +815,7 @@ def guest_read_file(
     remote = cpr.normalized
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     body = f"""
-{psdirect_prefix(cred)}
+{psdirect_prefix(cred, cfg)}
 {vm_target_preamble(ref.id)}
 $r = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{
     param($path, $maxb)
@@ -541,8 +841,8 @@ $r = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptB
 $r | ConvertTo-Json -Compress
 """
     with vmlocks.vm_lock(ref.id):
-        result = pswindows.run_ps(
-            body.strip(), timeout_s=120, stdin_b64=pswindows.utf8_b64(cred.password)
+        result = _run(
+            cfg, body.strip(), timeout_s=120, stdin_b64=pswindows.utf8_b64(cred.password)
         )
     if result.timed_out:
         return {"ok": False, "vm_name": ref.name, "error": "host timeout reading guest file", "error_class": "timeout"}
@@ -580,7 +880,7 @@ def guest_list_dir(
     remote = cpr.normalized
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     body = f"""
-{psdirect_prefix(cred)}
+{psdirect_prefix(cred, cfg)}
 {vm_target_preamble(ref.id)}
 $items = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{
     param($path)
@@ -597,8 +897,8 @@ $items = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -Scr
 if ($items) {{ @($items) | ConvertTo-Json -Compress }} else {{ '[]' }}
 """
     with vmlocks.vm_lock(ref.id):
-        result = pswindows.run_ps(
-            body.strip(), timeout_s=60, stdin_b64=pswindows.utf8_b64(cred.password)
+        result = _run(
+            cfg, body.strip(), timeout_s=60, stdin_b64=pswindows.utf8_b64(cred.password)
         )
     if result.timed_out:
         return {"ok": False, "vm_name": ref.name, "error": "host timeout listing guest directory", "error_class": "timeout"}

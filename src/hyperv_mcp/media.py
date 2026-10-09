@@ -58,7 +58,8 @@ def _checked_file_path(cfg: Config, path: str, *, write: bool, must_exist: bool,
 
 
 def _run(cfg: Config, script: str, ctx: str, timeout_s: int = 300) -> pswindows.PSResult:
-    result = pswindows.run_ps(script.strip(), timeout_s=timeout_s)
+    script, _stdin = pswindows.compose_remote(cfg, script.strip())
+    result = pswindows.run_ps(script, timeout_s=timeout_s)
     try:
         return pswindows.check_result(result, ctx)
     except RuntimeError as exc:
@@ -81,7 +82,7 @@ def _generation_guard(cfg: Config, ref: vmident.VMRef) -> None:
         guestexec.vm_target_preamble(ref.id)
         + "\n(Get-VM -Id $vmTarget -ErrorAction Stop).Generation.ToString()\n"
     )
-    result = pswindows.run_ps(script, timeout_s=60)
+    result = _run(cfg, script, f"resolve generation of '{ref.name}'", timeout_s=60)
     try:
         pswindows.check_result(result, f"resolve generation of '{ref.name}'")
     except RuntimeError as exc:

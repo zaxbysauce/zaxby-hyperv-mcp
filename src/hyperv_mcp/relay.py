@@ -184,10 +184,15 @@ try {{
 """.strip()
 
 
-def _run_forward(script: str, cred: CredentialSet) -> dict:
+def _run_forward(cfg, script: str, cred: CredentialSet) -> dict:
+    """relay's guest-leg choke (issue #43): composes the remote hop from the
+    relay's start-time cfg before spawning; identity in local mode."""
+    script, stdin = pswindows.compose_remote(
+        cfg, script, payload_lines=1, stdin_b64=pswindows.utf8_b64(cred.password),
+    )
     result = pswindows.run_ps(
         script, timeout_s=_REQUEST_TIMEOUT_S + 20,
-        stdin_b64=pswindows.utf8_b64(cred.password),
+        stdin_b64=stdin,
     )
     if result.timed_out:
         return {"error": "guest request timed out", "status": 0}
@@ -320,9 +325,9 @@ class _RelayHandler(BaseHTTPRequestHandler):
                 # internal AttributeError from psdirect_prefix.
                 self._reply_error(503, "relay is stopped")
                 return
-            script = build_guest_script(ctx["vm_id"], inner, cred)
+            script = build_guest_script(ctx["vm_id"], inner, cred, ctx["cfg"])
             self._bump("bytes_in", len(body))
-            outcome = _run_forward(script, cred)
+            outcome = _run_forward(ctx["cfg"], script, cred)
         except Exception as exc:
             self._reply_error(502, str(exc))
             return

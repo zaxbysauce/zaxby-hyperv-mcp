@@ -66,10 +66,24 @@ _EXIT_PROPAGATION = (
 )
 
 
-def psdirect_prefix(cred: CredentialSet) -> str:
-    """PSCredential construction lines; the password arrives via stdin b64."""
+def psdirect_prefix(cred: CredentialSet, cfg=None) -> str:
+    """PSCredential construction lines; the password arrives via stdin b64.
+
+    Local mode (cfg None or no hyperv.host): byte-identical to the historic
+    emission — the exact lines are pinned by tests/unit/test_guestexec.py.
+
+    Remote mode (issue #43): the whole envelope executes inside the remote
+    scriptblock, which cannot read local stdin; the password line was read
+    by the composer's local preamble and crossed the hop as the scriptblock
+    parameter $__p0, so the first line consumes that parameter instead.
+    """
+    first = (
+        "$secRaw = $__p0"
+        if pswindows.hyperv_host(cfg)
+        else "$secRaw = [Console]::In.ReadLine()"
+    )
     return "\n".join([
-        "$secRaw = [Console]::In.ReadLine()",
+        first,
         "$secText = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($secRaw))",
         "$sec = $secText | ConvertTo-SecureString -AsPlainText -Force",
         f"$cred = [System.Management.Automation.PSCredential]::new({pswindows.ps_quote(cred.username)}, $sec)",
@@ -240,7 +254,7 @@ try {
 """
 
 
-def _host_script(vm_id: str, inner_script: str, cred: CredentialSet, elevated: bool) -> str:
+def _host_script(vm_id: str, inner_script: str, cred: CredentialSet, elevated: bool, cfg=None) -> str:
     body = _elevated_body() if elevated else _normal_body()
     # $enc MUST be passed via -ArgumentList (the comment at the Invoke-Command
     # says so — regression F-A round 2 caught it missing) and the temp .ps1 is
@@ -249,7 +263,7 @@ def _host_script(vm_id: str, inner_script: str, cred: CredentialSet, elevated: b
     # residue (a fresh unique name, no side-effect file to clean up). The VM
     # is addressed by the pre-resolved GUID ($vmTarget preamble, vmident).
     return f"""
-{psdirect_prefix(cred)}
+{psdirect_prefix(cred, cfg)}
 {vm_target_preamble(vm_id)}
 $enc = '{pswindows.utf8_b64(inner_script)}'
 $r = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{
@@ -280,11 +294,13 @@ def _run_inner(
     """
     timeout_s = max(30, timeout_ms // 1000 + _GRACE_S)
     try:
-        result = pswindows.run_ps(
-            _host_script(vm_id, inner_script, cred, elevated).strip(),
-            timeout_s=timeout_s,
+        script, stdin = pswindows.compose_remote(
+            cfg,
+            _host_script(vm_id, inner_script, cred, elevated, cfg).strip(),
+            payload_lines=1,
             stdin_b64=pswindows.utf8_b64(cred.password),
         )
+        result = pswindows.run_ps(script, timeout_s=timeout_s, stdin_b64=stdin)
     except Exception as exc:  # transport-level failure, redacted by pswindows
         return _result_err(cfg, str(exc), "transport")
 
