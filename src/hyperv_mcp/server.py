@@ -1611,9 +1611,11 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
     @mcp.tool()
     def hyperv_vm_get_video(vm_name: str = "", vm_id: str = "") -> dict:
-        """Current VM video settings (Get-VMVideo): the configured resolution
-        type (Single/Maximum/Default) and dimensions of the first video head,
-        plus the observed head resolution from Msvm_VideoHead. Read-only.
+        """Current VM video settings: the host-configured resolution type
+        (returned Title-case: Single/Maximum/Default) and dimensions from
+        Get-VMVideo, plus the observed head resolution read from
+        Msvm_VideoHead (meaningful only while the VM is running; null
+        otherwise). Read-only.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
@@ -1641,14 +1643,20 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         Set-VMVideo on a running VM: without restart=true the VM must be
         stopped (the change applies at its next start and the result says
         effective_after_restart: true). With restart=true the tool stops the
-        VM first (hard TurnOff, reset_vm semantics), sets the mode while
-        off, then starts it — behind the destructive stop category +
-        confirm=true — and reports the observed post-start head.
-        Observed_* values come from Msvm_VideoHead, never from the request.
+        VM first (hard power-off via TurnOff — NOT a graceful shutdown; an
+        already-stopped VM is simply started), sets the mode while off, then
+        starts it — behind the destructive stop category + confirm=true —
+        and reports the observed post-start head (a mid-leg failure
+        compensates with a best-effort start so the VM is not stranded
+        off). Observed_* values come from Msvm_VideoHead, never from the
+        request, and the guest's display driver may keep its own mode, so
+        observed_* can differ from the configured values (or be null while
+        the VM is off).
         Gen1 VMs are unverified; unsupported modes are refused by the host.
         Enhanced Session Mode is out of scope.
         Policy: display (no confirm); restart=true additionally
-        destructive.stop + confirm=true.
+        destructive.stop + confirm=true. Audit category: "destructive" when
+        restart=true (the power-cycle), else "display".
 
         Args:
             vm_name: Name of the VM
@@ -1668,7 +1676,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                   error_class, retryable, retry_after_ms}.
         """
         return _run_guest_tool(
-            "hyperv_vm_set_resolution", vm_name, "display",
+            "hyperv_vm_set_resolution", vm_name,
+            "destructive" if restart else "display",
             media.vm_set_resolution, _cfg(), vm_name,
             width=width, height=height, resolution_type=resolution_type,
             restart=restart, confirm=confirm, vm_id=vm_id,

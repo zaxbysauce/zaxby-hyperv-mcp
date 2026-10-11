@@ -15,6 +15,7 @@ disposable VM + guest credentials; see tests/integration/conftest.py).
 
 import itertools
 import json
+import time
 
 import pytest
 
@@ -28,7 +29,9 @@ def guarded_vm(it):
     """Checkpoint before invasive work; restore afterwards."""
     from hyperv_mcp import lifecycle
 
-    checkpoint = f"issue44-video-{next(_SEQ)}"
+    # timestamp like test_hyperv_real: restored snapshots persist on the VM,
+    # so a fixed per-process counter would collide on the next run
+    checkpoint = f"issue44-video-{time.strftime('%Y%m%d-%H%M%S')}-{next(_SEQ)}"
     lifecycle.checkpoint_create(it.cfg, it.vm, checkpoint)
     yield it
     try:

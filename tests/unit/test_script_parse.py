@@ -517,24 +517,50 @@ def test_parse_wait_vm_state(monkeypatch, parsed_ps):
             assert _parse_errors(script) == []
 
 
+class _VideoRestartRecorder(Recorder):
+    """Serves the wait and observed-head legs so the restart flow runs to
+    completion and EVERY generated script (stop, set, start, wait, head)
+    reaches the parser — the head script is the one emission with hand-rolled
+    nested quoting and must not be silently skipped (PRR-008)."""
+
+    def __call__(self, script, **kwargs):
+        self.scripts.append(script)
+        if _is_resolution_leg(script):
+            return pswindows.PSResult(stdout=VM_GUID, returncode=0)
+        if "final_state" in script:
+            return pswindows.PSResult(stdout='{"final_state": "Running"}', returncode=0)
+        if "CurrentHorizontalResolution" in script:
+            return pswindows.PSResult(
+                stdout='{"observed_horizontal": 1920, "observed_vertical": 1080}',
+                returncode=0)
+        return pswindows.PSResult(stdout="", returncode=0)
+
+
 def test_parse_media_video(monkeypatch, parsed_ps):
     """Issue #44: Set/Get-VMVideo emissions parse clean, including the
-    restart flow's reset_vm-shaped stop/start, state-wait and observed-head
-    legs."""
-    for op in (
-        lambda: media.vm_get_video(UNRESTRICTED, "vm1"),
-        lambda: media.vm_set_resolution(UNRESTRICTED, "vm1", 1920, 1080, "single", confirm=True),
-        lambda: media.vm_set_resolution(UNRESTRICTED, "vm1", 1920, 1080, "maximum", confirm=True),
-        lambda: media.vm_set_resolution(UNRESTRICTED, "vm1", resolution_type="default", confirm=True),
-        lambda: media.vm_set_resolution(
-            UNRESTRICTED, "vm1", 1920, 1080, "single", restart=True, confirm=True),
-    ):
-        rec = Recorder()
+    restart flow's stop/start, state-wait and observed-head legs."""
+    def _restart_call():
+        return media.vm_set_resolution(
+            UNRESTRICTED, "vm1", 1920, 1080, "single", restart=True, confirm=True)
+
+    cases = (
+        (lambda: media.vm_get_video(UNRESTRICTED, "vm1"), Recorder),
+        (lambda: media.vm_set_resolution(UNRESTRICTED, "vm1", 1920, 1080, "single", confirm=True), Recorder),
+        (lambda: media.vm_set_resolution(UNRESTRICTED, "vm1", 1920, 1080, "maximum", confirm=True), Recorder),
+        (lambda: media.vm_set_resolution(UNRESTRICTED, "vm1", resolution_type="default", confirm=True), Recorder),
+        (_restart_call, _VideoRestartRecorder),
+    )
+    for op, recorder in cases:
+        rec = recorder()
         monkeypatch.setattr(pswindows, "run_ps", rec)
         try:
             op()
         except Exception:
             pass
         assert rec.scripts, "no scripts were generated"
+        if op is _restart_call:
+            assert any("Stop-VM" in s for s in rec.scripts), "restart legs not generated"
+            assert any("CurrentHorizontalResolution" in s and "Get-VMVideo" not in s
+                       for s in rec.scripts), "observed-head script not generated"
         for script in rec.scripts:
             assert _parse_errors(script) == []

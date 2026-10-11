@@ -831,13 +831,18 @@ Console notes: text rides the stdin channel (never in argv/script/errors); non-A
 
 Display notes (issue #44): `single` forces exactly width x height (160..4096);
 `maximum` allows that size and smaller standard modes; `default` reverts and
-ignores the dimensions. The host REFUSES Set-VMVideo on a running VM: without
-`restart=true` the VM must be stopped, and the mode applies at its next start
-(`effective_after_restart: true`); `restart=true` stops the VM first (hard
-TurnOff, reset_vm semantics), sets the mode while off, then starts it —
-behind the destructive `stop` category + `confirm` — and reports the observed
-post-start head. `observed_*` always come from `Msvm_VideoHead`, never from
-the request. Gen1 VMs are unverified; unsupported modes are refused by the
+ignores the dimensions (the returned `resolution_type` is Title-case:
+Single/Maximum/Default). The host REFUSES Set-VMVideo on a running VM:
+without `restart=true` the VM must be stopped, and the mode applies at its
+next start (`effective_after_restart: true`); `restart=true` stops the VM
+first (hard power-off via TurnOff — not a graceful shutdown; an
+already-stopped VM is simply started), sets the mode while off, then starts
+it — behind the destructive `stop` category + `confirm`; a mid-leg failure
+compensates with a best-effort start so the tool never strands a confirmed
+restart powered off. `observed_*` always come from `Msvm_VideoHead`, never from
+the request — and they are guest-dependent: the guest's display driver may
+keep its own mode, so observed_* can differ from the configured values (and
+is null while the VM is off or the head cannot be read). Gen1 VMs are unverified; unsupported modes are refused by the
 host. Enhanced Session Mode is out of scope (it renders over RDP, invisible
 to the WMI thumbnail and synthetic input). Snapshot-scale defaults elsewhere
 (1024x768 screenshots, 640x480 frame waits) are deliberate: a 1920x1080 RGB565

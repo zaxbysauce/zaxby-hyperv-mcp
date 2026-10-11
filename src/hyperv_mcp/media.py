@@ -456,14 +456,18 @@ def vm_secureboot_set(
 # video (read: open; write: display category, no confirm; Gen1 unverified)
 # ---------------------------------------------------------------------------
 
+_CIM_HEAD_LOOKUP = (
+    "$cs = Get-CimInstance -Namespace 'root/virtualization/v2' -ClassName Msvm_ComputerSystem"
+    " -Filter ('Name=' + \"'\" + $vm.Id.ToString() + \"'\") -ErrorAction Stop\n"
+    "$vh = Get-CimAssociatedInstance -InputObject $cs -ResultClassName Msvm_VideoHead | Select-Object -First 1\n"
+)
+
 _VIDEO_READBACK = """
 $v = Get-VMVideo -VM $vm -ErrorAction Stop | Select-Object -First 1
 if (-not $v) { throw 'no video settings returned for the VM' }
 $vh = $null
 try {
-  $cs = Get-CimInstance -Namespace 'root/virtualization/v2' -ClassName Msvm_ComputerSystem -Filter ('Name=' + "'" + $vm.Id.ToString() + "'") -ErrorAction Stop
-  $vh = Get-CimAssociatedInstance -InputObject $cs -ResultClassName Msvm_VideoHead | Select-Object -First 1
-} catch { }
+""" + _CIM_HEAD_LOOKUP + """} catch { }
 [PSCustomObject]@{
     resolution_type = [string]$v.ResolutionType
     horizontal = $v.HorizontalResolution
@@ -497,10 +501,15 @@ def vm_set_resolution(
     vertical resolution"), so without restart=true the call must target a
     stopped VM and the change applies at its next start
     (effective_after_restart: true). When `restart=true` the tool stops the VM
-    FIRST (guarded TurnOff, reset_vm semantics), sets the mode while off, then
+    FIRST (hard power-off via TurnOff, not a graceful shutdown; an
+    already-stopped VM is simply started), sets the mode while off, then
     starts it and reports the observed post-start head; that leg is gated by
-    the destructive `stop` category + confirm. Observed values come only from
-    Msvm_VideoHead, never from the request.
+    the destructive `stop` category + confirm, and a mid-leg failure
+    compensates with a best-effort start so the tool never strands a
+    confirmed restart powered off. Observed values come only from
+    Msvm_VideoHead, never from the request — and the guest's display driver
+    may keep its own mode, so observed_* can legitimately differ from the
+    configured values (null while the VM is off or the head cannot be read).
     """
     policy.require_category(cfg, "display", f"set display resolution of '{vm_name or vm_id}'")
     if restart:
@@ -509,6 +518,13 @@ def vm_set_resolution(
     if resolution_type not in _VIDEO_TYPES:
         raise ValueError(f"resolution_type must be one of {_VIDEO_TYPES}")
     if resolution_type != "default":
+        # Coerce BEFORE the bounds check so the validated value is the value
+        # emitted, and non-numeric input fails as ValueError ("invalid"),
+        # not TypeError ("transport").
+        try:
+            width, height = int(width), int(height)
+        except (TypeError, ValueError):
+            raise ValueError("width and height must be integers") from None
         if width <= 0 or height <= 0:
             raise ValueError("width and height are required for resolution_type "
                              f"'{resolution_type}'")
@@ -519,8 +535,8 @@ def vm_set_resolution(
         set_line = "Set-VMVideo -VM $vm -ResolutionType Default -ErrorAction Stop\n"
     else:
         set_line = (
-            f"Set-VMVideo -VM $vm -HorizontalResolution {int(width)} "
-            f"-VerticalResolution {int(height)} "
+            f"Set-VMVideo -VM $vm -HorizontalResolution {width} "
+            f"-VerticalResolution {height} "
             f"-ResolutionType {_VIDEO_RES_TYPE[resolution_type]} -ErrorAction Stop\n"
         )
     script = _resolve_vm_prefix(ref) + set_line + _VIDEO_READBACK
@@ -534,27 +550,60 @@ def vm_set_resolution(
                 "if ([string]$vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -ErrorAction Stop }\n"
             )
             _run(cfg, stop_script, f"vm_set_resolution stop({ref.name})", timeout_s=180)
-        result = _run(cfg, script, f"vm_set_resolution({ref.name})")
-        parsed = _json_out(result, "vm_set_resolution")
-        if isinstance(parsed, dict):
-            out = parsed
-        if restart:
-            start_script = _resolve_vm_prefix(ref) + "Start-VM -VM $vm -ErrorAction Stop\n"
-            _run(cfg, start_script, f"vm_set_resolution start({ref.name})", timeout_s=180)
-            final = lifecycle.wait_for_vm_state(
-                cfg, vm_name=ref.name, states=["Running"], timeout_s=120)
-            head_script = _resolve_vm_prefix(ref) + (
-                "$cs = Get-CimInstance -Namespace 'root/virtualization/v2' -ClassName Msvm_ComputerSystem"
-                " -Filter ('Name=' + \"'\" + $vm.Id.ToString() + \"'\") -ErrorAction Stop\n"
-                "$vh = Get-CimAssociatedInstance -InputObject $cs -ResultClassName Msvm_VideoHead"
-                " | Select-Object -First 1\n"
-                "if (-not $vh) { throw 'no video head associated with the VM' }\n"
-                "[PSCustomObject]@{ observed_horizontal = $vh.CurrentHorizontalResolution;"
-                " observed_vertical = $vh.CurrentVerticalResolution } | ConvertTo-Json -Compress\n"
-            )
-            head_result = _run(cfg, head_script, f"vm_set_resolution observed({ref.name})", timeout_s=90)
-            head_out = _json_out(head_result, "vm_set_resolution observed")
-            if isinstance(head_out, dict):
-                out = {**out, **head_out}
-            out["state"] = final
+        started = False
+        try:
+            result = _run(cfg, script, f"vm_set_resolution({ref.name})")
+            parsed = _json_out(result, "vm_set_resolution")
+            if isinstance(parsed, dict):
+                out = parsed
+            if restart:
+                start_script = _resolve_vm_prefix(ref) + "Start-VM -VM $vm -ErrorAction Stop\n"
+                _run(cfg, start_script, f"vm_set_resolution start({ref.name})", timeout_s=180)
+                started = True
+                try:
+                    final = lifecycle._wait_for_state(cfg, ref, ["Running"], timeout_s=120)
+                except RuntimeError as exc:
+                    # A wait timeout is a boot/timeout fault, not transport;
+                    # reclassify so the envelope carries the timeout class.
+                    raise TimeoutError(
+                        f"vm_set_resolution({ref.name}): {exc}") from None
+                # Best-effort observation: a failed head read must not erase a
+                # committed change, and the pre-restart readback's observed_*
+                # are stale (read while off) — replace them with the post-start
+                # read or an explicit null.
+                try:
+                    head_script = _resolve_vm_prefix(ref) + (
+                        "Start-Sleep -Seconds 2\n"
+                        + _CIM_HEAD_LOOKUP
+                        + "if (-not $vh) { throw 'no video head associated with the VM' }\n"
+                        "[PSCustomObject]@{ observed_horizontal = $vh.CurrentHorizontalResolution;"
+                        " observed_vertical = $vh.CurrentVerticalResolution }"
+                        " | ConvertTo-Json -Compress\n"
+                    )
+                    head_result = _run(
+                        cfg, head_script, f"vm_set_resolution observed({ref.name})", timeout_s=90)
+                    head_out = _json_out(head_result, "vm_set_resolution observed")
+                except MediaError:
+                    head_out = {}
+                out.pop("observed_horizontal", None)
+                out.pop("observed_vertical", None)
+                if isinstance(head_out, dict) and head_out:
+                    out.update(head_out)
+                out["observed_horizontal"] = out.get("observed_horizontal")
+                out["observed_vertical"] = out.get("observed_vertical")
+                out["state"] = final
+        except Exception as exc:
+            if restart and not started:
+                # The stop leg already powered the VM off; compensate with a
+                # best-effort start so a confirmed restart is never stranded.
+                try:
+                    start_script = _resolve_vm_prefix(ref) + "Start-VM -VM $vm -ErrorAction Stop\n"
+                    _run(cfg, start_script, f"vm_set_resolution restart-recover({ref.name})",
+                         timeout_s=180)
+                    recovered = "the VM was restarted"
+                except MediaError:
+                    recovered = "the VM is still OFF (start it with hyperv_start_vm)"
+                raise MediaError(
+                    f"{str(exc)} (this call stopped the VM; {recovered})") from None
+            raise
     return {"ok": True, **out, "effective_after_restart": not restart, "vm_name": ref.name}
