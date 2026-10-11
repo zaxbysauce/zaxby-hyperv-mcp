@@ -41,6 +41,9 @@ hyperv-mcp = "hyperv_mcp.server:main"
 hyperv-mcp-http = "hyperv_mcp.http_entry:main"
 
 [project.optional-dependencies]
+wmi = [
+    "pywin32>=306; platform_system == 'Windows'",
+]
 dev = [
     "pytest>=8",
     "pytest-timeout>=2",
