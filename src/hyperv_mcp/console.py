@@ -6,9 +6,13 @@ powershell.exe spawns per call) when it is available and can serve the
 target, and over the generated-PowerShell transport below otherwise
 (automatic fallback, including a remote Hyper-V host whose DCOM endpoint is
 unreachable — the WS-Man hop composes exactly as before). A WMI METHOD
-failure is a structured error and is never retried through PowerShell so
-input can never double-send. Both transports report a per-call ``timings``
-breakdown on every result.
+failure (or a mid-op backend unavailability) is a structured error and is
+never retried through PowerShell so input can never double-send. Every
+SUCCESSFUL result reports a per-call ``timings`` breakdown (failure
+envelopes carry the standard error shape without timings); the WMI
+transport additionally has no per-call COM timeout — a hung provider
+blocks that VM's operations until it returns, where the PowerShell
+transport's child process is killed at its timeout.
 
 All operations target root\\virtualization\\v2 WMI objects — independent of
 VMConnect windows, the host foreground window, guest login, and guest
@@ -316,10 +320,15 @@ def _try_backend(cfg: Config) -> tuple[Any | None, float]:
 def _wmi_ref(be, cfg: Config, vm_name: str, vm_id: str) -> vmident.VMRef:
     """Resolve the VM in-process. BackendUnavailable propagates so the
     caller can select the PowerShell transport; WMIError becomes
-    ConsoleError (mirrors vmident's ValueError surfacing)."""
+    ConsoleError (mirrors vmident's ValueError surfacing). BackendUnavailable
+    raised MID-OPERATION (after selection) is converted to ConsoleError by
+    the op handlers together with WMIError — no mid-op transport switch."""
     try:
         return be.resolve_vm(cfg, vm_name=vm_name, vm_id=vm_id)
     except wmiconsole.WMIError as exc:
+        # selection-time BackendUnavailable must PROPAGATE past here so the
+        # caller's selection wrapper can fall back to PowerShell; only
+        # WMIError (a resolution failure on a present plane) normalizes.
         raise ConsoleError(str(exc)) from None
 
 
@@ -617,7 +626,7 @@ def _screenshot_wmi(
                 if (w, h) != chain[0]:
                     fallback_used = f"{chain[0][0]}x{chain[0][1]} failed; captured at {w}x{h}"
                 break
-            except wmiconsole.WMIError as exc:
+            except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
                 if (w, h) == chain[-1]:
                     raise ConsoleError(str(exc)) from None
                 fallback_used = f"{chain[0][0]}x{chain[0][1]}: {exc}"
@@ -652,7 +661,7 @@ def _screenshot_wmi(
                 fh.write(png)
             meta["saved_path"] = save_path
         return img, meta
-    except wmiconsole.WMIError as exc:
+    except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
         raise ConsoleError(str(exc)) from None
 
 
@@ -668,7 +677,7 @@ def get_display_info(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
         assert ref is not None
         try:
             info, t = be.display_info(ref.id)
-        except wmiconsole.WMIError as exc:
+        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
             raise ConsoleError(str(exc)) from None
         return {
             "ok": True,
@@ -727,7 +736,7 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
                     calls += 1
                     if i < len(chunks) - 1:
                         time.sleep(0.05)
-        except wmiconsole.WMIError as exc:
+        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
             raise ConsoleError(str(exc)) from None
         return {
             "ok": True, "chunks": calls, "chars": len(text), "vm_name": ref.name,
@@ -853,7 +862,7 @@ def _send_scancodes_locked(
                     sent += len(chunk)
                     if i < len(chunks) - 1:
                         time.sleep(0.02)  # pacing: let the Hyper-V input buffer drain
-        except wmiconsole.WMIError as exc:
+        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
             raise ConsoleError(str(exc)) from None
         return {
             "ok": True, "scancodes_sent": sent, "chunks": len(chunks),
@@ -897,14 +906,15 @@ def mouse_move(
     if be is not None and ref is not None:
         try:
             with vmlocks.vm_lock(ref.id):
-                head, _t = be.head_resolution(ref.id)
+                head, t_head = be.head_resolution(ref.id)
                 hx, hy = _scale_to_head(x, y, frame_width, frame_height, head)
                 _r, t = be.mouse_move(ref.id, hx, hy)
-        except wmiconsole.WMIError as exc:
+        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
             raise ConsoleError(str(exc)) from None
         return {
             "ok": True, "operation": f"move to ({hx},{hy})", "vm_name": ref.name,
-            "head_x": hx, "head_y": hy, "timings": _wmi_timings(connect_ms, t),
+            "head_x": hx, "head_y": hy,
+            "timings": _wmi_timings(connect_ms, t_head, t),
         }
     timing = _PsTiming()
     ref = _resolve_ps(cfg, vm_name, vm_id, timing)
@@ -929,17 +939,18 @@ def click(
             with vmlocks.vm_lock(ref.id):
                 extra: dict = {}
                 if x or y:
-                    head, _t = be.head_resolution(ref.id)
+                    head, t_head = be.head_resolution(ref.id)
                     hx, hy = _scale_to_head(x, y, frame_width, frame_height, head)
                     _r, t = be.mouse_click(ref.id, button, hx, hy)
                     extra = {"head_x": hx, "head_y": hy}
                 else:
+                    t_head = {}
                     _r, t = be.mouse_click(ref.id, button)
-        except wmiconsole.WMIError as exc:
+        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
             raise ConsoleError(str(exc)) from None
         return {
             "ok": True, "operation": f"click button {button}", "vm_name": ref.name,
-            "timings": _wmi_timings(connect_ms, t), **extra,
+            "timings": _wmi_timings(connect_ms, t_head, t), **extra,
         }
     timing = _PsTiming()
     ref = _resolve_ps(cfg, vm_name, vm_id, timing)
@@ -979,7 +990,7 @@ def mouse_button(
         try:
             with vmlocks.vm_lock(ref.id):
                 _r, t = be.mouse_button(ref.id, button, is_down)
-        except wmiconsole.WMIError as exc:
+        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
             raise ConsoleError(str(exc)) from None
         return {
             "ok": True, "operation": f"button {button} {'down' if is_down else 'up'}",
@@ -1002,7 +1013,7 @@ def scroll(cfg: Config, vm_name: str = "", delta: int = 0, vm_id: str = "") -> d
         try:
             with vmlocks.vm_lock(ref.id):
                 _r, t = be.mouse_scroll(ref.id, delta)
-        except wmiconsole.WMIError as exc:
+        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
             raise ConsoleError(str(exc)) from None
         return {
             "ok": True, "operation": f"scroll {delta}", "vm_name": ref.name,
@@ -1074,6 +1085,9 @@ def wait_frame_change(
         )
     timing = _PsTiming()
     ref = _resolve_ps(cfg, vm_name, vm_id, timing)
+    # On the WMI transport the deadline is enforced BETWEEN polls (a single
+    # in-flight COM capture is not interruptible; the PowerShell transport's
+    # child process is killed at timeout_s + 15). See README console-transport.
     max_polls = math.ceil(timeout_s / interval_s)
     script = (
         _WAIT_FRAME_SCRIPT_TMPL.replace("%NS%", _WMI_NS)
@@ -1159,7 +1173,7 @@ def _wait_frame_change_wmi(
                 stop_reason = "deadline"
                 break
             time.sleep(interval_s)
-    except wmiconsole.WMIError as exc:
+    except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
         raise ConsoleError(str(exc)) from None
     elapsed_ms = int((time.monotonic() - started) * 1000)
     out: dict = {
@@ -1265,7 +1279,7 @@ def _capture_sequence_wmi(
             prev_raw = raw
             if i < count - 1:
                 time.sleep(interval_s)
-    except wmiconsole.WMIError as exc:
+    except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
         raise ConsoleError(str(exc)) from None
     return {
         "ok": True,

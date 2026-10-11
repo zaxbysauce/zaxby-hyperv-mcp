@@ -12,12 +12,14 @@ def _ps_transport_default(monkeypatch):
     in-process WMI backend is likewise never real here — on boxes with
     pywin32 AND a live namespace it would otherwise serve silently).
     Tests that exercise the WMI path install their own fake backend
-    explicitly and re-enable it via wmiconsole.COM_AVAILABLE (issue #45)."""
-    try:
-        from hyperv_mcp import wmiconsole
-    except ImportError:  # pre-issue-45 trees
-        return
-    monkeypatch.setattr(wmiconsole, "COM_AVAILABLE", False, raising=False)
+    explicitly and re-enable it via wmiconsole.COM_AVAILABLE (issue #45).
+    The backend/negative-cache state is reset per test so no test inherits
+    another test's fake service (review F3-C/P24)."""
+    from hyperv_mcp import wmiconsole
+
+    monkeypatch.setattr(wmiconsole, "COM_AVAILABLE", False)
+    monkeypatch.setattr(wmiconsole, "_backends", {})
+    monkeypatch.setattr(wmiconsole, "_connect_failures", {})
 
 
 @pytest.fixture()

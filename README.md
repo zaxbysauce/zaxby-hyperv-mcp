@@ -838,21 +838,43 @@ automatically per call:
   present in the WMI plane.
 
 Fallback happens only at connect/selection time: a WMI **method** failure
-(non-zero `ReturnValue`, bad payload) is a structured error and is never
+(non-zero `ReturnValue`, bad payload, raw COM failure) — or a backend
+unavailability raised mid-operation — is a structured error and is never
 retried through PowerShell, so console input can never double-send. Every
-result carries a per-call `timings` breakdown:
-`{"transport": "powershell", "spawn_ms": [...]}` (one entry per
+SUCCESSFUL result carries a per-call `timings` breakdown (failure
+envelopes carry the standard error shape without timings):
+`{"transport": "powershell", "spawn_ms": [12.5, 380.1]}` (one float per
 `powershell.exe` spawn, the identity-resolution leg included) or
-`{"transport": "wmi", "connect_ms", "rebind_ms", "method_ms"}`.
+`{"transport": "wmi", "connect_ms": 0.0, "rebind_ms": 0.8,
+"method_ms": 31.2}`. On the WMI path `connect_ms` is the measured
+backend lookup (near-zero on a warm cache — one real DCOM connect per host
+per process, shared by concurrent callers),
+`rebind_ms` the cached-identity re-bind and state check, and `method_ms`
+the operation's WMI work; chunked and polling operations (type_text,
+type_scancodes, wait_frame_change, capture_sequence) SUM these phases
+across their iterations. In-process COM calls have no per-call timeout: a
+hung WMI provider blocks that VM's operations until the provider returns,
+where the PowerShell transport's child process is killed at its timeout.
+The screenshot metadata's `capture_method` field names the serving
+transport ("... in-process WMI ..." vs "... WMI root\virtualization\v2").
 
 Benchmark the two transports on a real host with a disposable VM:
 
 ```powershell
 python -m hyperv_mcp.consolebench --vm "Deployment Test 3" --n 15                # after (auto)
 python -m hyperv_mcp.consolebench --vm "Deployment Test 3" --n 15 --transport powershell   # before
+python -m hyperv_mcp.consolebench --vm "Deployment Test 3" --n 15 --transport powershell --baseline before.json  # before/after table
 python -m hyperv_mcp.consolebench --vm "Deployment Test 3" --agents 4            # multi-agent soak
 python -m hyperv_mcp.consolebench --selftest                                     # offline selftest
 ```
+
+The benchmark CLI runs with an UNRESTRICTED in-process config (it is an
+operator tool driving the host directly, not the policy-gated MCP
+server): `--vm` is not subject to `allowed_vm_patterns` and input ops are
+not gated by the console_input category — only point it at disposable
+VMs. Failed soak ops are counted and excluded from the percentiles, and
+the run exits non-zero when any op failed; `--transport wmi` verifies the
+served transport and exits non-zero if the WMI plane could not serve.
 
 ### VM & Media Preparation (deployment testing)
 

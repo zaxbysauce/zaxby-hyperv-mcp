@@ -171,7 +171,9 @@ def test_wait_frame_change_wmi_semantics(monkeypatch, unrestricted_cfg):
                                      baseline_hash="",
                                      width=320, height=240, timeout_s=10, interval_s=1)
     assert out3["stop_reason"] == "deadline" and out3["changed"] is False
-    assert out3["polls"] == 10  # max_polls = ceil(10/1)
+    assert 2 <= out3["polls"] <= 10  # polls ran up to the max_polls bound
+    # (ceil(10/1)); with real sleeps the wall-clock deadline (checked
+    # between polls) can stop the loop earlier
     assert "image" not in out3
     # deadline keeps the LAST polled hash even when unchanged
     assert out3["frame_hash"] == console._frame_hash(
@@ -443,3 +445,449 @@ def test_f5_display_info_reports_absent_devices(monkeypatch, unrestricted_cfg):
     out = console.get_display_info(unrestricted_cfg, "vm1")
     assert out["ok"] is True
     assert out["keyboard_present"] is False and out["mouse_present"] is False
+
+
+# ---------------------------------------------------------------------------
+# swarm-pr-review fixes (PRR-002/003/004/005/006/008/013/015/016/023/025):
+# regression pins for the review findings, plus the frozen-file lock.
+# ---------------------------------------------------------------------------
+
+def test_frozen_acceptance_file_intact():
+    """PRR-023: the byte-locked acceptance file's freeze is machine-checked
+    in-repo (not just trace process). If the trace protocol SANCTIONED an
+    amend of that file, update this hash with the amend."""
+    import subprocess
+
+    out = subprocess.run(
+        ["git", "hash-object", "tests/unit/test_wmiconsole.py"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert out == "638f10c477479c0aae8b6577541730244eb070c3", out
+
+
+def test_capture_guard_no_image_data(monkeypatch, unrestricted_cfg):
+    """PRR-015: a capture whose result carries no ImageData is WMIError."""
+    from types import SimpleNamespace
+
+    from hyperv_mcp import wmiconsole
+
+    class NoImageService(FakeWMIService):
+        def exec_method(self, obj, name, in_params):
+            if name == "GetVirtualSystemThumbnailImage":
+                return SimpleNamespace(ReturnValue=0)
+            return super().exec_method(obj, name, in_params)
+
+    svc = NoImageService(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    be = wmiconsole.backend(unrestricted_cfg)
+    with pytest.raises(wmiconsole.WMIError, match="no image data"):
+        be.capture(GUID, 320, 240)
+
+
+def test_capture_guard_length_mismatch(monkeypatch, unrestricted_cfg):
+    """PRR-015: a short thumbnail payload is a length-mismatch error, never
+    a silently-corrupt image."""
+    from types import SimpleNamespace
+
+    from hyperv_mcp import wmiconsole
+
+    class ShortService(FakeWMIService):
+        def exec_method(self, obj, name, in_params):
+            if name == "GetVirtualSystemThumbnailImage":
+                return SimpleNamespace(ReturnValue=0, ImageData=b"\x00\x00")
+            return super().exec_method(obj, name, in_params)
+
+    svc = ShortService(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    be = wmiconsole.backend(unrestricted_cfg)
+    with pytest.raises(wmiconsole.WMIError, match="length mismatch"):
+        be.capture(GUID, 320, 240)
+
+
+@pytest.mark.parametrize("op_name", ["click", "mouse_button", "scroll", "type_text", "capture"])
+def test_method_failure_is_console_error_no_ps(monkeypatch, unrestricted_cfg, op_name):
+    """PRR-015/PRR-002: a non-zero WMI ReturnValue converts to ConsoleError
+    with ZERO PowerShell sends on every input/capture op (not just
+    type_text)."""
+    from hyperv_mcp.console import ConsoleError
+
+    svc = FakeWMIService(head=(320, 240))
+    svc.method_rc = 5
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    stub = _ps(monkeypatch)
+
+    calls = {
+        "click": lambda: console.click(unrestricted_cfg, "vm1", 10, 10,
+                                       frame_width=320, frame_height=240),
+        "mouse_button": lambda: console.mouse_button(unrestricted_cfg, "vm1", 1, True),
+        "scroll": lambda: console.scroll(unrestricted_cfg, "vm1", 1),
+        "type_text": lambda: console.type_text(unrestricted_cfg, "vm1", "no send"),
+        "capture": lambda: console.screenshot(unrestricted_cfg, "vm1",
+                                              width=320, height=240),
+    }
+    with pytest.raises(ConsoleError, match="ReturnValue=9|ReturnValue=5"):
+        calls[op_name]()
+    assert stub.scripts == []
+
+
+def test_by_id_resolve_wmi_success(monkeypatch, unrestricted_cfg):
+    """PRR-015: the by-id WMI resolve SUCCESS path (policy on the resolved
+    name, VMRef returned, zero PowerShell)."""
+    svc = FakeWMIService(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    stub = _ps(monkeypatch)
+    out = console.type_text(unrestricted_cfg, vm_id=GUID, text="by id")
+    assert out["ok"] is True and out["vm_name"] == "vm1"
+    assert stub.scripts == []
+
+
+def test_com_entry_points_join_mta_before_com(monkeypatch):
+    """PRR-001 guard: connect_service and resolve_vm join the MTA BEFORE
+    their first COM call — the order is pinned, so a revert re-breaks
+    threaded workers loudly."""
+    from hyperv_mcp import wmiconsole
+
+    order: list[str] = []
+
+    def fake_join():
+        order.append("join")
+
+    class FakeLocator:
+        def ConnectServer(self, *a):
+            order.append("connect")
+            return "svc"
+
+    monkeypatch.setattr(wmiconsole, "_COM_IMPORT_OK", True)
+    monkeypatch.setattr(wmiconsole, "_ensure_thread_com", fake_join)
+    monkeypatch.setattr(wmiconsole, "_locator", lambda: FakeLocator())
+
+    wmiconsole.connect_service(Config(unrestricted=True))
+    assert order == ["join", "connect"], order
+
+    order.clear()
+    be = wmiconsole.ConsoleWMI(object())
+    monkeypatch.setattr(wmiconsole, "_com",
+                        lambda op, fn, *a, **k: order.append("query") or [])
+    with pytest.raises(wmiconsole.BackendUnavailable):
+        be.resolve_vm(Config(unrestricted=True), vm_name="no-such-vm")
+    assert order and order[0] == "join", order
+
+
+def test_screenshot_wmi_size_fallback_chain(monkeypatch, unrestricted_cfg):
+    """PRR-015: the WMI screenshot fallback chain retries smaller sizes on a
+    WMIError and stays on the wmi transport (never touches PowerShell)."""
+
+    class PickyService(FakeWMIService):
+        def exec_method(self, obj, name, in_params):
+            if name == "GetVirtualSystemThumbnailImage":
+                w = int(in_params.values["WidthPixels"])
+                if w != 320:
+                    from types import SimpleNamespace
+                    return SimpleNamespace(ReturnValue=9)
+            return super().exec_method(obj, name, in_params)
+
+    svc = PickyService(head=(1024, 768))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    stub = _ps(monkeypatch)
+    _img, meta = console.screenshot(unrestricted_cfg, "vm1", width=1024, height=768)
+    assert stub.scripts == []
+    assert meta["timings"]["transport"] == "wmi"
+    assert "failed" in meta["fallback_used"]
+
+
+def test_stale_cs_recovery_drops_devices(monkeypatch, unrestricted_cfg):
+    """PRR-006: a VMMS rebuild whose EnabledState is unchanged must still
+    drop cached device paths (checkpoint-apply case) — the next input op
+    re-resolves the keyboard instead of exec-ing a stale path forever."""
+
+    class RebuiltService(FakeWMIService):
+        def __init__(self):
+            super().__init__(head=(320, 240))
+            self._rebuilt = False
+
+        def Get(self, path):
+            if self._rebuilt and path == self._vm._props["Path_"].Path:
+                raise KeyError(path)  # old CS path dead after rebuild
+            return super().Get(path)
+
+    svc = RebuiltService()
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    be = wmiconsole.backend(unrestricted_cfg)
+    be.type_text(GUID, "warm")  # caches the keyboard path
+    kb_queries = svc.counts["keyboard"]
+
+    svc._rebuilt = True  # VMMS rebuild, EnabledState still 2
+    assert be.type_text(GUID, "after rebuild")[0] is None
+    assert svc.counts["keyboard"] > kb_queries  # devices were re-resolved
+
+
+def test_midop_backendunavailable_is_console_error(monkeypatch, unrestricted_cfg):
+    """PRR-002: a BackendUnavailable raised MID-operation (VM vanishes
+    between resolve and op) surfaces as ConsoleError, not a raw escape."""
+
+    class VanishingService(FakeWMIService):
+        def ExecQuery(self, wql):
+            if "Msvm_VirtualSystemManagementService" in wql:
+                return []
+            return super().ExecQuery(wql)
+
+    from hyperv_mcp.console import ConsoleError
+
+    svc = VanishingService(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    _ps(monkeypatch)
+    with pytest.raises(ConsoleError):
+        console.screenshot(unrestricted_cfg, "vm1", width=320, height=240)
+
+
+def test_com_error_wrapped_as_wmi_error(monkeypatch, unrestricted_cfg):
+    """PRR-005: a raw COM failure (e.g. pywintypes com_error) inside a WMI
+    call becomes a structured WMIError, never an unclassified escape."""
+
+    class ExplodingService(FakeWMIService):
+        def Get(self, path):
+            if "-mouse" in path:
+                raise OSError("(-2147467259, 'Unspecified error')")
+            return super().Get(path)
+
+    from hyperv_mcp import wmiconsole
+
+    svc = ExplodingService(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    be = wmiconsole.backend(unrestricted_cfg)
+    with pytest.raises(wmiconsole.WMIError, match="WMI"):
+        be.mouse_move(GUID, 5, 5)
+
+
+def test_rows_normalizer_shapes():
+    """PRR-015: _rows handles the shapes real SWbem and fakes produce."""
+    from hyperv_mcp import wmiconsole
+
+    assert wmiconsole._rows(None) == []
+    assert wmiconsole._rows([1, 2]) == [1, 2]
+
+    class Blob:
+        pass
+
+    single = Blob()
+    assert wmiconsole._rows(single) == [single]
+    assert wmiconsole._rows("x") == ["x"]
+
+    class OneShot:
+        def __iter__(self):
+            return iter([single])
+
+    assert wmiconsole._rows(OneShot()) == [single]
+
+
+def test_mouse_click_half_none_rejected():
+    from hyperv_mcp import wmiconsole
+
+    be = wmiconsole.ConsoleWMI(object())
+    with pytest.raises(ValueError, match="both hx and hy"):
+        be.mouse_click(GUID, 1, hx=5, hy=None)
+
+
+def test_shutdown_clears_caches_and_memo(monkeypatch):
+    """PRR-015: shutdown() drops backend entries, per-VM caches, and the
+    negative-connect memo (nothing survives to a next process phase)."""
+    from test_wmiconsole import FakeWmiObject
+
+    from hyperv_mcp import wmiconsole
+
+    be = wmiconsole.ConsoleWMI(object())
+    be._seed_cache(GUID, FakeWmiObject(be, "fake://cs", {"Name": GUID}))
+    monkeypatch.setattr(wmiconsole, "_backends", {"local": be})
+    monkeypatch.setattr(
+        wmiconsole, "_connect_failures",
+        {"nuc01": (0.0, wmiconsole.BackendUnavailable("down"))},
+    )
+    wmiconsole.shutdown()
+    assert wmiconsole._backends == {}
+    assert wmiconsole._connect_failures == {}
+    assert GUID not in be._vms
+
+
+def test_negative_connect_memo_within_ttl(monkeypatch):
+    """PRR-012: a failed connect is memoized per host key; a second
+    backend() within the TTL re-raises without re-connecting."""
+
+    calls: list = []
+
+    def failing_connect(cfg):
+        calls.append(cfg)
+        raise wmiconsole.BackendUnavailable("dcom down")
+
+    monkeypatch.setattr(wmiconsole, "connect_service", failing_connect)
+    monkeypatch.setattr(wmiconsole, "_backends", {})
+    monkeypatch.setattr(wmiconsole, "_connect_failures", {})
+
+    with pytest.raises(wmiconsole.BackendUnavailable):
+        wmiconsole.backend(unrestricted := Config(unrestricted=True))
+    with pytest.raises(wmiconsole.BackendUnavailable):
+        wmiconsole.backend(unrestricted)
+    assert len(calls) == 1  # memo served the second call
+
+
+def test_host_key_separates_local_from_remote_dot(monkeypatch):
+    """PRR-020: a remote cfg with hyperv.host='.' must not share the
+    local-mode backend entry (different credential intents)."""
+    assert wmiconsole._host_key(Config(unrestricted=True)) == "local"
+    remote = Config.from_dict({"hyperv": {"host": "."}, "unrestricted": True})
+    assert wmiconsole._host_key(remote) == "."
+
+
+def test_cs_by_name_skips_host_computer_system(monkeypatch, unrestricted_cfg):
+    """PRR-016: a VM name colliding with the host CS (non-GUID Name row,
+    live-observed as ElementName='VSAN', Name='VSAN') resolves the VM, and
+    the host row is never cached."""
+
+    from test_wmiconsole import FakeWmiObject
+
+    class HostCollisionService(FakeWMIService):
+        def __init__(self):
+            super().__init__(head=(320, 240))
+            self._host = FakeWmiObject(
+                self,
+                'Msvm_ComputerSystem.CreationClassName="host"',
+                {"Name": "vm1", "ElementName": "vm1", "EnabledState": 2},
+            )
+
+        def ExecQuery(self, wql):
+            text = " ".join(wql.split())
+            if "Msvm_ComputerSystem" in text and "ElementName" in text:
+                return [self._host, self._vm]  # host row FIRST, non-GUID Name
+            return super().ExecQuery(wql)
+
+    svc = HostCollisionService()
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    be = wmiconsole.backend(unrestricted_cfg)
+    ref = be.resolve_vm(unrestricted_cfg, vm_name="vm1")
+    assert ref.id == GUID  # the VM row, not the hijacking host row
+    assert GUID in be._vms and "CreationClassName" not in " ".join(be._vms)
+
+
+def test_consolebench_soak_excludes_failures():
+    """PRR-008: failed soak ops are counted, excluded from percentiles, and
+    split per op."""
+    from hyperv_mcp import consolebench
+
+    def bad():
+        raise RuntimeError("boom")
+
+    def good():
+        pass
+
+    row = consolebench.run_soak([bad, good], agents=1, n=1)[0]
+    assert row["errors"] == 1 and row["n"] == 1
+    assert row["per_op_ms"][0] == [] and len(row["per_op_ms"][1]) == 1
+
+
+def test_bench_last_result_enables_transport_verification():
+    from hyperv_mcp import consolebench
+
+    stats = consolebench.bench(lambda: {"timings": {"transport": "wmi"}}, 2)
+    assert consolebench._transport_of(stats["last_result"]) == "wmi"
+    assert consolebench._transport_of({"timings": {"transport": "powershell"}}) == "powershell"
+    assert consolebench._transport_of(None) is None
+
+
+def test_wmi_timings_reports_measured_rebind(monkeypatch, unrestricted_cfg):
+    """PRR-003: the mouse ops thread the head-resolution phase dict into the
+    breakdown, and backend methods measure rebind_ms (not hardcoded 0)."""
+    svc = FakeWMIService(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    be = wmiconsole.backend(unrestricted_cfg)
+
+    # Deterministic clock: each monotonic() read advances 25 ms, so every
+    # timed phase (rebind, then method) must report exactly 25.0 ms — a
+    # hardcoded 0.0 or an omitted phase fails this assertion.
+    class _FakeClock:
+        def __init__(self):
+            self._now = 0.0
+
+        def monotonic(self):
+            self._now += 0.025
+            return self._now
+
+    fake = _FakeClock()
+    monkeypatch.setattr(wmiconsole.time, "monotonic", fake.monotonic)
+    _r, t_move = be.mouse_move(GUID, 5, 5)
+    assert t_move["rebind_ms"] == pytest.approx(25.0), t_move
+    assert t_move["method_ms"] == pytest.approx(25.0), t_move
+
+    from hyperv_mcp import console
+
+    out = console.mouse_move(unrestricted_cfg, "vm1", 10, 20,
+                             frame_width=320, frame_height=240)
+    phases = [out["timings"]["rebind_ms"], out["timings"]["method_ms"]]
+    assert all(isinstance(v, float) for v in phases)
+
+
+def test_display_info_reports_none_for_null_head_resolution(monkeypatch, unrestricted_cfg):
+    """PRR-004: a head present with NULL resolution reports None (PS $null
+    parity), not 0."""
+    svc = FakeWMIService(head=(320, 240))
+    svc.set_head(0, 0)  # the live 'VM off' shape reads as null/0
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    _ps(monkeypatch)
+    out = console.get_display_info(unrestricted_cfg, "vm1")
+    assert out["head_horizontal"] is None and out["head_vertical"] is None
+
+
+def test_display_info_absent_vs_failed_device(monkeypatch, unrestricted_cfg):
+    """PRR-013: an ABSENT device reports present=False; a FAILED device
+    lookup raises ConsoleError instead of laundering to absent."""
+
+    class NoDevicesService(FakeWMIService):
+        def ExecQuery(self, wql):
+            text = " ".join(wql.split()).upper()
+            if "MSVM_KEYBOARD" in text or "MSVM_SYNTHETICMOUSE" in text:
+                return []
+            return super().ExecQuery(wql)
+
+    svc = NoDevicesService(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    _ps(monkeypatch)
+    out = console.get_display_info(unrestricted_cfg, "vm1")
+    assert out["keyboard_present"] is False and out["mouse_present"] is False
+
+    class FailedMouseProbeService(FakeWMIService):
+        """MOUSE-ONLY probe failure: the keyboard ASSOCIATORS succeeds via
+        super(), the mouse enumerate raises — so the ConsoleError this test
+        demands can only come from the mouse channel (a reintroduced
+        launder-to-absent catch would fail this test)."""
+
+        def ExecQuery(self, wql):
+            text = " ".join(wql.split()).upper()
+            if "SELECT * FROM MSVM_SYNTHETICMOUSE" in text:
+                raise OSError("rpc down")  # probe failure, NOT an empty result
+            return super().ExecQuery(wql)
+
+    failing = FailedMouseProbeService(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: failing)
+    from hyperv_mcp.console import ConsoleError
+
+    with pytest.raises(ConsoleError):
+        console.get_display_info(unrestricted_cfg, "vm1")
+
+
+def test_type_text_multichunk_wmi(monkeypatch, unrestricted_cfg):
+    """PRR-015: >512-char type_text chunks on the WMI path (chunks==2)."""
+    svc = FakeWMIService(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    _ps(monkeypatch)
+    out = console.type_text(unrestricted_cfg, "vm1", "a" * 600)
+    assert out["chunks"] == 2
+    typed = [m for m in svc.methods if m[1] == "TypeText"]
+    assert len(typed) == 2
+
+
+def test_vm_id_whitespace_only_rejected(monkeypatch, unrestricted_cfg):
+    """PRR-019: a whitespace-only vm_id is rejected (vmident parity), not
+    silently by-name resolved."""
+    svc = FakeWMIService(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    be = wmiconsole.backend(unrestricted_cfg)
+    with pytest.raises(ValueError, match="GUID"):
+        be.resolve_vm(unrestricted_cfg, vm_name="vm1", vm_id="   ")
