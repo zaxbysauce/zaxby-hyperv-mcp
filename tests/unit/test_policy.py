@@ -308,3 +308,19 @@ def test_drive_relative_root_never_matches():
     cfg = Config(host_read_roots=["C:"])
     with pytest.raises(PolicyDenied):
         check_host_read(cfg, r"C:\Windows\System32\config\SAM")
+
+
+def test_display_category_matrix():
+    """display is a no-confirm require_category (issue #44): reversible,
+    applies at the next start; the set op's optional restart leg is gated
+    separately by the destructive stop category + confirm."""
+    from hyperv_mcp.policy import require_category
+
+    with pytest.raises(PolicyDenied, match="category:display"):
+        require_category(Config(), "display", "set display resolution")
+    cfg = Config()
+    cfg.destructive.display = True
+    require_category(cfg, "display", "set display resolution")
+    require_category(Config(unrestricted=True), "display", "set display resolution")
+    cfg.destructive.require_confirm = True  # no confirm leg: must stay irrelevant
+    require_category(cfg, "display", "set display resolution")

@@ -771,3 +771,128 @@ def test_vhd_existence_check_runs_inside_vm_lock(monkeypatch, unrestricted, tmp_
     monkeypatch.setattr(pswindows, "run_ps", fake)
     media.vm_disk_add(unrestricted, "test-vm", str(vhd), 10, confirm=True)
     assert order == ["lock", "isfile"]
+
+
+def test_vm_set_resolution_policy_order(monkeypatch):
+    """category:display denies before any spawn; the restart leg's confirm
+    denial (require_destructive internals: confirm before destructive:stop)
+    also precedes any spawn; validation errors never reach PowerShell."""
+    cfg_off = Config(allowed_vm_patterns=["test-*"])
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(PolicyDenied, match="category:display"):
+        media.vm_set_resolution(cfg_off, "test-vm", 1920, 1080)
+    assert fake.scripts == []
+    cfg_on = Config.from_dict({
+        "allowed_vm_patterns": ["test-*"], "destructive": {"display": True}})
+    with pytest.raises(PolicyDenied, match="confirm=true"):
+        media.vm_set_resolution(cfg_on, "test-vm", 1920, 1080, restart=True)
+    assert fake.scripts == []
+    with pytest.raises(ValueError, match="width and height are required"):
+        media.vm_set_resolution(cfg_on, "test-vm")
+    assert fake.scripts == []
+
+
+def test_vm_set_resolution_restart_result_pins(monkeypatch):
+    """effective_after_restart is False once the tool's own stop/start applied
+    the mode, and observed_* come from the post-start head leg, overriding the
+    pre-restart readback (issue #44 AC3/AC4: never report stale observations)."""
+    cfg = Config.from_dict({
+        "allowed_vm_patterns": ["test-*"],
+        "destructive": {"display": True, "stop": True},
+    })
+    fake = FakePS([
+        _guid_res(),  # vmident resolve
+        pswindows.PSResult(stdout='{"ok": true}', returncode=0),  # stop leg
+        pswindows.PSResult(
+            stdout='{"resolution_type": "Single", "horizontal": 1920, "vertical": 1080,'
+                   ' "observed_horizontal": 1024, "observed_vertical": 768}',
+            returncode=0),  # set-leg readback (VM off)
+        pswindows.PSResult(stdout='{"ok": true}', returncode=0),  # start leg
+        pswindows.PSResult(stdout='{"final_state": "Running"}', returncode=0),
+        pswindows.PSResult(
+            stdout='{"observed_horizontal": 1920, "observed_vertical": 1080}',
+            returncode=0),  # observed-head leg
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    result = media.vm_set_resolution(cfg, "test-vm", 1920, 1080, "single",
+                                     restart=True, confirm=True)
+    assert result["ok"] is True
+    assert result["effective_after_restart"] is False
+    assert result["state"] == "Running"
+    assert result["observed_horizontal"] == 1920
+    assert result["observed_vertical"] == 1080
+    stop_script = fake.scripts[1]
+    assert "Stop-VM -VM $vm -TurnOff" in stop_script
+    assert "Start-VM" not in stop_script
+    # already-off guard: the conditional wraps ONLY the stop line (PRR-009 pin)
+    assert "if ([string]$vm.State -ne 'Off')" in stop_script
+    set_script = fake.scripts[2]
+    assert "Set-VMVideo" in set_script
+    start_script = fake.scripts[3]
+    assert "Start-VM -VM $vm" in start_script
+    assert "Stop-VM" not in start_script
+    # the post-start head script must READ the head, never echo config (AC4)
+    head_script = fake.scripts[5]
+    assert "Msvm_VideoHead" in head_script
+    assert "Get-VMVideo" not in head_script
+    assert "CurrentHorizontalResolution" in head_script
+
+
+def test_vm_set_resolution_restart_stop_category_denied():
+    """PRR-009 pin: the restart leg is gated on the destructive STOP category
+    (not just confirm) — a display-enabled config without stop must be
+    refused with destructive:stop even when confirm=true."""
+    cfg = Config.from_dict({
+        "allowed_vm_patterns": ["test-*"], "destructive": {"display": True}})
+    with pytest.raises(PolicyDenied, match="destructive:stop"):
+        media.vm_set_resolution(cfg, "test-vm", 1920, 1080, "single",
+                                restart=True, confirm=True)
+
+
+def test_vm_set_resolution_set_failure_after_stop_compensates(monkeypatch):
+    """PRR-001 pin: a set-leg failure after the stop must attempt a
+    best-effort start and say so in the error, never strand the VM off."""
+    cfg = Config.from_dict({
+        "allowed_vm_patterns": ["test-*"],
+        "destructive": {"display": True, "stop": True},
+    })
+    fake = FakePS([
+        _guid_res(),  # vmident resolve
+        pswindows.PSResult(stdout='{"ok": true}', returncode=0),  # stop leg
+        pswindows.PSResult(
+            stderr="Set-VMVideo : The VM must be turned off when setting "
+                   "resolution type", returncode=1),  # set leg fails
+        pswindows.PSResult(stdout='{"ok": true}', returncode=0),  # recover start
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(MediaError, match=r"this call stopped the VM.*restarted"):
+        media.vm_set_resolution(cfg, "test-vm", 1920, 1080, "single",
+                                restart=True, confirm=True)
+    recover_script = fake.scripts[3]
+    assert "Start-VM -VM $vm" in recover_script
+
+
+def test_vm_set_resolution_start_failure_reports_off(monkeypatch):
+    """PRR-001 pin: a start-leg failure also compensates (retry) and the
+    error states the VM is still off."""
+    cfg = Config.from_dict({
+        "allowed_vm_patterns": ["test-*"],
+        "destructive": {"display": True, "stop": True},
+    })
+    fake = FakePS([
+        _guid_res(),  # vmident resolve
+        pswindows.PSResult(stdout='{"ok": true}', returncode=0),  # stop leg
+        pswindows.PSResult(
+            stdout='{"resolution_type": "Single", "horizontal": 1920, "vertical": 1080,'
+                   ' "observed_horizontal": null, "observed_vertical": null}',
+            returncode=0),  # set leg ok
+        pswindows.PSResult(
+            stderr="Start-VM : 'test-vm' failed to start.", returncode=1),
+        pswindows.PSResult(
+            stderr="Start-VM : 'test-vm' failed to start.", returncode=1),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(MediaError, match="still OFF"):
+        media.vm_set_resolution(cfg, "test-vm", 1920, 1080, "single",
+                                restart=True, confirm=True)

@@ -42,6 +42,7 @@ TOOL_NAMES = {
     "hyperv_vm_media_attach", "hyperv_vm_media_detach", "hyperv_vm_media_list",
     "hyperv_vm_firmware_get", "hyperv_vm_firmware_set_boot_order",
     "hyperv_vm_tpm_set", "hyperv_vm_secureboot_set", "hyperv_vm_network_set",
+    "hyperv_vm_get_video", "hyperv_vm_set_resolution",
     # orchestration
     "hyperv_wait_vm_state",
     # server provenance (read-only)
@@ -61,7 +62,7 @@ CONFIRM_TOOLS = {
     "hyperv_guest_put",
     "hyperv_vm_create", "hyperv_vm_disk_add",
     "hyperv_vm_firmware_set_boot_order", "hyperv_vm_tpm_set",
-    "hyperv_vm_secureboot_set",
+    "hyperv_vm_secureboot_set", "hyperv_vm_set_resolution",
     "hyperv_repair_guest_access",
 }
 
@@ -86,7 +87,7 @@ def test_tool_inventory_registered(fresh_server):
     mod = fresh_server({})
     schemas = _schemas(mod)
     assert set(schemas) == TOOL_NAMES
-    assert len(schemas) == 55
+    assert len(schemas) == 57
 
 
 def test_every_vm_tool_schema_has_vm_id(fresh_server):
