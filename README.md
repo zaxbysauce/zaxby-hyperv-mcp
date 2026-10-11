@@ -1,7 +1,7 @@
 # hyperv-mcp (hardened fork)
 
 An MCP (Model Context Protocol) server for Hyper-V VM management and guest
-execution. Exposes 55 tools for VM lifecycle, checkpoint management, kernel
+execution. Exposes 57 tools for VM lifecycle, checkpoint management, kernel
 debug setup (KDNET/KDCOM), and guest file transfer/command execution via
 PowerShell Direct (no WinRM required).
 
@@ -182,6 +182,7 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
     "console_input": true,        // virtual keyboard + mouse input
     "media": true,                // ISO attach/detach, network connect
     "vm_provision": true,         // VM create, disk add, firmware, TPM, SecureBoot
+    "display": true,              // VM display resolution (Set-VMVideo; restart leg needs stop + confirm)
     "guest_repair": true,         // APPLY guest access repairs (dry run needs no switch)
     "relay": true,                // host->guest HTTP relay listener
     "require_confirm": true       // tools additionally need confirm=true
@@ -443,6 +444,7 @@ These tools refuse to run unless their category is enabled **and** (when
 | `hyperv_console_type_text` / `press_key` / `key_combo` / `type_scancodes` / `mouse_move` / `click` / `button` / `scroll` | `console_input` (no confirm — non-destructive interactive input) |
 | `hyperv_vm_media_attach` / `media_detach` / `network_set` | `media` (reversible, no confirm) |
 | `hyperv_vm_create` / `disk_add` / `firmware_set_boot_order` / `tpm_set` / `secureboot_set` | `vm_provision` + `confirm` |
+| `hyperv_vm_set_resolution` | `display` (reversible, no confirm; applies at next start) — its `restart=true` stop/start additionally needs `stop` + `confirm` |
 | `hyperv_repair_guest_access` with `apply=true` | `guest_repair` + `confirm` (dry run is read-only) |
 | `hyperv_relay_start` | `relay` (standing loopback listener, no confirm) |
 | `hyperv_repair_guest_access` (dry run) | none (read-only) |
@@ -478,7 +480,7 @@ claude mcp add hyperv -- hyperv-mcp
 
 ---
 
-## Available Tools (55 total)
+## Available Tools (57 total)
 
 Every registered tool in the tables below returns failures the same way:
 the one-envelope contract (`ok/error/error_class/retryable/retry_after_ms`,
@@ -824,6 +826,24 @@ Console notes: text rides the stdin channel (never in argv/script/errors); non-A
 | `hyperv_vm_tpm_set` | `vm_name` or `vm_id`, `enabled`, `confirm` | `{ok, tpm_enabled}` |
 | `hyperv_vm_secureboot_set` | `vm_name` or `vm_id`, `enabled`, `template?`, `confirm` | `{ok, secure_boot, secure_boot_template}` |
 | `hyperv_vm_network_set` | `vm_name` or `vm_id`, `switch_name` | `{ok, switch_name}` |
+| `hyperv_vm_get_video` | `vm_name` or `vm_id` | `{ok, resolution_type, horizontal, vertical, observed_horizontal, observed_vertical, vm_name}` |
+| `hyperv_vm_set_resolution` | `vm_name` or `vm_id`, `width`, `height`, `resolution_type=single`, `restart=false`, `confirm` | `{ok, resolution_type, horizontal, vertical, observed_horizontal, observed_vertical, effective_after_restart, vm_name}` (`state` added on the restart path) |
+
+Display notes (issue #44): `single` forces exactly width x height (160..4096);
+`maximum` allows that size and smaller standard modes; `default` reverts and
+ignores the dimensions. The host REFUSES Set-VMVideo on a running VM: without
+`restart=true` the VM must be stopped, and the mode applies at its next start
+(`effective_after_restart: true`); `restart=true` stops the VM first (hard
+TurnOff, reset_vm semantics), sets the mode while off, then starts it —
+behind the destructive `stop` category + `confirm` — and reports the observed
+post-start head. `observed_*` always come from `Msvm_VideoHead`, never from
+the request. Gen1 VMs are unverified; unsupported modes are refused by the
+host. Enhanced Session Mode is out of scope (it renders over RDP, invisible
+to the WMI thumbnail and synthetic input). Snapshot-scale defaults elsewhere
+(1024x768 screenshots, 640x480 frame waits) are deliberate: a 1920x1080 RGB565
+frame is about 4 MB before encoding, and the screenshot fallback chain already
+prefers the head-native mode as its second tier — pass explicit
+width/height/frame dimensions when you need head-sized captures.
 
 ### Orchestration
 

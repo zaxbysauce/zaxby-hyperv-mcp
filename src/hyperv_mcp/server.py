@@ -1,11 +1,11 @@
 """
 hyperv_mcp.server -- MCP server for Hyper-V VM management (hardened fork).
 
-Exposes 55 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
+Exposes 57 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
 guest execution and file transfer via PowerShell Direct, guest access
 diagnostics/repair and managed guest jobs, reboot recovery verification,
 host-to-guest HTTP relay, console observation and input (WMI), evidence
-capture, VM/media provisioning, orchestration waits, and server runtime
+capture, VM/media/video provisioning, orchestration waits, and server runtime
 provenance. Security model:
 
   - Credentials resolve from env vars / credential files; username/password
@@ -1607,6 +1607,71 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             "hyperv_vm_secureboot_set", vm_name, "vm_provision",
             media.vm_secureboot_set, _cfg(), vm_name,
             enabled=enabled, template=template, confirm=confirm, vm_id=vm_id,
+        )
+
+    @mcp.tool()
+    def hyperv_vm_get_video(vm_name: str = "", vm_id: str = "") -> dict:
+        """Current VM video settings (Get-VMVideo): the configured resolution
+        type (Single/Maximum/Default) and dimensions of the first video head,
+        plus the observed head resolution from Msvm_VideoHead. Read-only.
+
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
+        Returns: {ok, resolution_type, horizontal, vertical,
+                  observed_horizontal, observed_vertical, vm_name} or the
+        failure envelope {ok: false, error, error_class, retryable,
+        retry_after_ms}.
+        """
+        return _run_guest_tool(
+            "hyperv_vm_get_video", vm_name, "read",
+            media.vm_get_video, _cfg(), vm_name,
+            vm_id=vm_id,
+        )
+
+    @mcp.tool()
+    def hyperv_vm_set_resolution(
+        vm_name: str = "", width: int = 0, height: int = 0,
+        resolution_type: str = "single", restart: bool = False,
+        confirm: bool = False, vm_id: str = "",
+    ) -> dict:
+        """Set the VM display resolution via Set-VMVideo so modern apps are
+        not stuck at 1024x768. resolution_type "single" forces exactly
+        width x height; "maximum" allows that size and smaller standard
+        modes; "default" reverts and ignores width/height. The host REFUSES
+        Set-VMVideo on a running VM: without restart=true the VM must be
+        stopped (the change applies at its next start and the result says
+        effective_after_restart: true). With restart=true the tool stops the
+        VM first (hard TurnOff, reset_vm semantics), sets the mode while
+        off, then starts it — behind the destructive stop category +
+        confirm=true — and reports the observed post-start head.
+        Observed_* values come from Msvm_VideoHead, never from the request.
+        Gen1 VMs are unverified; unsupported modes are refused by the host.
+        Enhanced Session Mode is out of scope.
+        Policy: display (no confirm); restart=true additionally
+        destructive.stop + confirm=true.
+
+        Args:
+            vm_name: Name of the VM
+            width: Horizontal resolution in pixels (160..4096; required
+                   unless resolution_type is "default")
+            height: Vertical resolution in pixels (160..4096; required
+                    unless resolution_type is "default")
+            resolution_type: single | maximum | default
+            restart: stop/start the VM now so the mode applies immediately
+            confirm: required for the stop/start when restart=true
+            vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+
+        Returns: {ok, resolution_type, horizontal, vertical,
+                  observed_horizontal, observed_vertical,
+                  effective_after_restart, vm_name} (state added on the
+                  restart path) or the failure envelope {ok: false, error,
+                  error_class, retryable, retry_after_ms}.
+        """
+        return _run_guest_tool(
+            "hyperv_vm_set_resolution", vm_name, "display",
+            media.vm_set_resolution, _cfg(), vm_name,
+            width=width, height=height, resolution_type=resolution_type,
+            restart=restart, confirm=confirm, vm_id=vm_id,
         )
 
     @mcp.tool()

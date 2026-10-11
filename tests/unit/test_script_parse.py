@@ -515,3 +515,26 @@ def test_parse_wait_vm_state(monkeypatch, parsed_ps):
             pass
         for script in rec.scripts:
             assert _parse_errors(script) == []
+
+
+def test_parse_media_video(monkeypatch, parsed_ps):
+    """Issue #44: Set/Get-VMVideo emissions parse clean, including the
+    restart flow's reset_vm-shaped stop/start, state-wait and observed-head
+    legs."""
+    for op in (
+        lambda: media.vm_get_video(UNRESTRICTED, "vm1"),
+        lambda: media.vm_set_resolution(UNRESTRICTED, "vm1", 1920, 1080, "single", confirm=True),
+        lambda: media.vm_set_resolution(UNRESTRICTED, "vm1", 1920, 1080, "maximum", confirm=True),
+        lambda: media.vm_set_resolution(UNRESTRICTED, "vm1", resolution_type="default", confirm=True),
+        lambda: media.vm_set_resolution(
+            UNRESTRICTED, "vm1", 1920, 1080, "single", restart=True, confirm=True),
+    ):
+        rec = Recorder()
+        monkeypatch.setattr(pswindows, "run_ps", rec)
+        try:
+            op()
+        except Exception:
+            pass
+        assert rec.scripts, "no scripts were generated"
+        for script in rec.scripts:
+            assert _parse_errors(script) == []

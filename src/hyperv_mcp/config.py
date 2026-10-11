@@ -90,6 +90,7 @@ class DestructivePolicy:
     console_input: bool = False
     media: bool = False
     vm_provision: bool = False
+    display: bool = False
     guest_repair: bool = False
     relay: bool = False
     require_confirm: bool = True

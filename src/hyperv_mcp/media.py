@@ -2,8 +2,11 @@
 
 All operations are policy-scoped to the VM allowlist and host path roots.
 Gate matrix (see README):
-  - read-only: disk_list, media_list, firmware_get
+  - read-only: disk_list, media_list, firmware_get, video_get
   - media category, no confirm (reversible): media attach/detach, network set
+  - display category, no confirm (reversible, applies at next start): video
+    resolution set; its optional restart leg is additionally gated by the
+    destructive stop category + confirm
   - vm_provision category + confirm: vm create, disk add, firmware boot
     order, TPM set, SecureBoot set
 
@@ -18,12 +21,16 @@ from __future__ import annotations
 import json
 import os
 
-from . import guestexec, policy, pswindows, vmident, vmlocks
+from . import guestexec, lifecycle, policy, pswindows, vmident, vmlocks
 from .config import Config
 
 _BOOT_TYPES = ("Drive", "Network", "File")
 
 _SECUREBOOT_ONOFF = {True: "On", False: "Off"}
+
+_VIDEO_TYPES = ("single", "maximum", "default")
+
+_VIDEO_RES_TYPE = {"single": "Single", "maximum": "Maximum"}
 
 
 class MediaError(RuntimeError):
@@ -443,3 +450,111 @@ def vm_secureboot_set(
     if isinstance(out, dict):
         return {"ok": True, **out, "vm_name": ref.name}
     return {"ok": True, "vm_name": ref.name}
+
+
+# ---------------------------------------------------------------------------
+# video (read: open; write: display category, no confirm; Gen1 unverified)
+# ---------------------------------------------------------------------------
+
+_VIDEO_READBACK = """
+$v = Get-VMVideo -VM $vm -ErrorAction Stop | Select-Object -First 1
+if (-not $v) { throw 'no video settings returned for the VM' }
+$vh = $null
+try {
+  $cs = Get-CimInstance -Namespace 'root/virtualization/v2' -ClassName Msvm_ComputerSystem -Filter ('Name=' + "'" + $vm.Id.ToString() + "'") -ErrorAction Stop
+  $vh = Get-CimAssociatedInstance -InputObject $cs -ResultClassName Msvm_VideoHead | Select-Object -First 1
+} catch { }
+[PSCustomObject]@{
+    resolution_type = [string]$v.ResolutionType
+    horizontal = $v.HorizontalResolution
+    vertical = $v.VerticalResolution
+    observed_horizontal = if ($vh) { $vh.CurrentHorizontalResolution } else { $null }
+    observed_vertical = if ($vh) { $vh.CurrentVerticalResolution } else { $null }
+} | ConvertTo-Json -Compress
+"""
+
+
+def vm_get_video(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    script = _resolve_vm_prefix(ref) + _VIDEO_READBACK
+    result = _run(cfg, script, f"vm_get_video({ref.name})")
+    out = _json_out(result, "vm_get_video")
+    if isinstance(out, dict):
+        return {"ok": True, **out, "vm_name": ref.name}
+    return {"ok": True, "vm_name": ref.name}
+
+
+def vm_set_resolution(
+    cfg: Config, vm_name: str = "", width: int = 0, height: int = 0,
+    resolution_type: str = "single", restart: bool = False,
+    confirm: bool = False, vm_id: str = "",
+) -> dict:
+    """Set the VM's configured display resolution (Set-VMVideo, issue #44).
+
+    `display` category, no confirm — the change is reversible (resolution_type
+    "default"). The host REFUSES Set-VMVideo on a running VM (probe-verified:
+    "must be turned off when setting resolution type, horizontal resolution or
+    vertical resolution"), so without restart=true the call must target a
+    stopped VM and the change applies at its next start
+    (effective_after_restart: true). When `restart=true` the tool stops the VM
+    FIRST (guarded TurnOff, reset_vm semantics), sets the mode while off, then
+    starts it and reports the observed post-start head; that leg is gated by
+    the destructive `stop` category + confirm. Observed values come only from
+    Msvm_VideoHead, never from the request.
+    """
+    policy.require_category(cfg, "display", f"set display resolution of '{vm_name or vm_id}'")
+    if restart:
+        policy.require_destructive(
+            cfg, "stop", confirm, f"restart VM '{vm_name or vm_id}' to apply the display resolution")
+    if resolution_type not in _VIDEO_TYPES:
+        raise ValueError(f"resolution_type must be one of {_VIDEO_TYPES}")
+    if resolution_type != "default":
+        if width <= 0 or height <= 0:
+            raise ValueError("width and height are required for resolution_type "
+                             f"'{resolution_type}'")
+        if not (160 <= width <= 4096 and 160 <= height <= 4096):
+            raise ValueError("width and height must be within 160..4096")
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    if resolution_type == "default":
+        set_line = "Set-VMVideo -VM $vm -ResolutionType Default -ErrorAction Stop\n"
+    else:
+        set_line = (
+            f"Set-VMVideo -VM $vm -HorizontalResolution {int(width)} "
+            f"-VerticalResolution {int(height)} "
+            f"-ResolutionType {_VIDEO_RES_TYPE[resolution_type]} -ErrorAction Stop\n"
+        )
+    script = _resolve_vm_prefix(ref) + set_line + _VIDEO_READBACK
+    out: dict = {}
+    with vmlocks.vm_lock(ref.id):
+        if restart:
+            # The host refuses Set-VMVideo on a running VM, so the stop comes
+            # FIRST; the guard covers only the Stop line so an already-off VM
+            # still starts below.
+            stop_script = _resolve_vm_prefix(ref) + (
+                "if ([string]$vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -ErrorAction Stop }\n"
+            )
+            _run(cfg, stop_script, f"vm_set_resolution stop({ref.name})", timeout_s=180)
+        result = _run(cfg, script, f"vm_set_resolution({ref.name})")
+        parsed = _json_out(result, "vm_set_resolution")
+        if isinstance(parsed, dict):
+            out = parsed
+        if restart:
+            start_script = _resolve_vm_prefix(ref) + "Start-VM -VM $vm -ErrorAction Stop\n"
+            _run(cfg, start_script, f"vm_set_resolution start({ref.name})", timeout_s=180)
+            final = lifecycle.wait_for_vm_state(
+                cfg, vm_name=ref.name, states=["Running"], timeout_s=120)
+            head_script = _resolve_vm_prefix(ref) + (
+                "$cs = Get-CimInstance -Namespace 'root/virtualization/v2' -ClassName Msvm_ComputerSystem"
+                " -Filter ('Name=' + \"'\" + $vm.Id.ToString() + \"'\") -ErrorAction Stop\n"
+                "$vh = Get-CimAssociatedInstance -InputObject $cs -ResultClassName Msvm_VideoHead"
+                " | Select-Object -First 1\n"
+                "if (-not $vh) { throw 'no video head associated with the VM' }\n"
+                "[PSCustomObject]@{ observed_horizontal = $vh.CurrentHorizontalResolution;"
+                " observed_vertical = $vh.CurrentVerticalResolution } | ConvertTo-Json -Compress\n"
+            )
+            head_result = _run(cfg, head_script, f"vm_set_resolution observed({ref.name})", timeout_s=90)
+            head_out = _json_out(head_result, "vm_set_resolution observed")
+            if isinstance(head_out, dict):
+                out = {**out, **head_out}
+            out["state"] = final
+    return {"ok": True, **out, "effective_after_restart": not restart, "vm_name": ref.name}
