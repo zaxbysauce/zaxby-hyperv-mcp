@@ -5,6 +5,23 @@ import pytest
 from hyperv_mcp.config import Config
 
 
+@pytest.fixture(autouse=True)
+def _ps_transport_default(monkeypatch):
+    """Unit tests default to the PowerShell console transport: no real
+    Hyper-V through EITHER transport (the suite stubs run_ps; the
+    in-process WMI backend is likewise never real here — on boxes with
+    pywin32 AND a live namespace it would otherwise serve silently).
+    Tests that exercise the WMI path install their own fake backend
+    explicitly and re-enable it via wmiconsole.COM_AVAILABLE (issue #45).
+    The backend/negative-cache state is reset per test so no test inherits
+    another test's fake service (review F3-C/P24)."""
+    from hyperv_mcp import wmiconsole
+
+    monkeypatch.setattr(wmiconsole, "COM_AVAILABLE", False)
+    monkeypatch.setattr(wmiconsole, "_backends", {})
+    monkeypatch.setattr(wmiconsole, "_connect_failures", {})
+
+
 @pytest.fixture()
 def deny_all_cfg() -> Config:
     return Config()

@@ -1,9 +1,23 @@
 """Host-side VM console observation and input via Hyper-V WMI.
 
-All operations go through the pswindows transport and target
-root\\virtualization\\v2 WMI objects — independent of VMConnect windows, the
-host foreground window, guest login, and guest networking. Verified against
-the live host (see tasks/console-controller probes):
+Transport selection (issue #45): every public operation runs over the
+in-process WMI backend (``wmiconsole``, optional pywin32 dependency — zero
+powershell.exe spawns per call) when it is available and can serve the
+target, and over the generated-PowerShell transport below otherwise
+(automatic fallback, including a remote Hyper-V host whose DCOM endpoint is
+unreachable — the WS-Man hop composes exactly as before). A WMI METHOD
+failure (or a mid-op backend unavailability) is a structured error and is
+never retried through PowerShell so input can never double-send. Every
+SUCCESSFUL result reports a per-call ``timings`` breakdown (failure
+envelopes carry the standard error shape without timings); the WMI
+transport additionally has no per-call COM timeout — a hung provider
+blocks that VM's operations until it returns, where the PowerShell
+transport's child process is killed at its timeout.
+
+All operations target root\\virtualization\\v2 WMI objects — independent of
+VMConnect windows, the host foreground window, guest login, and guest
+networking. Verified against the live host (see tasks/console-controller
+probes):
 
   - Screenshot: Msvm_VirtualSystemManagementService.GetVirtualSystemThumbnailImage
     takes TargetSystem/WidthPixels/HeightPixels (parameter is TargetSystem —
@@ -45,10 +59,11 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from typing import Any
 
 from PIL import Image as PILImage
 
-from . import policy, pswindows, vmident, vmlocks
+from . import policy, pswindows, vmident, vmlocks, wmiconsole
 from .config import Config
 
 _WMI_NS = "root\\virtualization\\v2"
@@ -253,17 +268,103 @@ def _check_rc(result: pswindows.PSResult, ctx: str) -> pswindows.PSResult:
         raise ConsoleError(str(exc)) from None
 
 
-def _run(cfg: Config, script: str, *, timeout_s: float | None = None, stdin_b64: str | None = None):
+# ---------------------------------------------------------------------------
+# transport selection (issue #45)
+# ---------------------------------------------------------------------------
+
+class _PsTiming:
+    """Per-op PowerShell timing accumulator: one float per run_ps call the
+    operation made (the vmident.resolve leg included)."""
+
+    __slots__ = ("spawn_ms",)
+
+    def __init__(self) -> None:
+        self.spawn_ms: list[float] = []
+
+
+def _ps_timings(timing: _PsTiming) -> dict:
+    return {"transport": "powershell", "spawn_ms": timing.spawn_ms}
+
+
+def _wmi_timings(connect_ms: float, *phase_dicts: dict) -> dict:
+    rebind = sum(float(t.get("rebind_ms", 0.0)) for t in phase_dicts)
+    method = sum(float(t.get("method_ms", 0.0)) for t in phase_dicts)
+    return {
+        "transport": "wmi",
+        "connect_ms": float(connect_ms),
+        "rebind_ms": float(rebind),
+        "method_ms": float(method),
+    }
+
+
+def _try_backend(cfg: Config) -> tuple[Any | None, float]:
+    """(backend, connect_ms) when the in-process WMI transport can serve
+    this call, (None, 0.0) otherwise.
+
+    Selection: COM_AVAILABLE is read at CALL time via the module attribute
+    (tests patch it). BackendUnavailable raised while constructing the
+    backend (connect failure, unusable namespace) selects the PowerShell
+    transport — as does a VM that the WMI plane cannot resolve. A WMIError
+    from a backend METHOD never falls back: input must never double-send.
+    """
+    if not wmiconsole.COM_AVAILABLE:
+        return None, 0.0
+    t0 = time.monotonic()
+    try:
+        be = wmiconsole.backend(cfg)
+    except wmiconsole.BackendUnavailable:
+        return None, 0.0
+    return be, (time.monotonic() - t0) * 1000.0
+
+
+def _wmi_ref(be, cfg: Config, vm_name: str, vm_id: str) -> vmident.VMRef:
+    """Resolve the VM in-process. BackendUnavailable propagates so the
+    caller can select the PowerShell transport; WMIError becomes
+    ConsoleError (mirrors vmident's ValueError surfacing). BackendUnavailable
+    raised MID-OPERATION (after selection) is converted to ConsoleError by
+    the op handlers together with WMIError — no mid-op transport switch."""
+    try:
+        return be.resolve_vm(cfg, vm_name=vm_name, vm_id=vm_id)
+    except wmiconsole.WMIError as exc:
+        # selection-time BackendUnavailable must PROPAGATE past here so the
+        # caller's selection wrapper can fall back to PowerShell; only
+        # WMIError (a resolution failure on a present plane) normalizes.
+        raise ConsoleError(str(exc)) from None
+
+
+def _resolve_ps(cfg: Config, vm_name: str, vm_id: str, timing: _PsTiming) -> vmident.VMRef:
+    """vmident.resolve with the resolve leg's wall-clock recorded as one
+    spawn_ms entry (vmident makes exactly one run_ps call per resolve, so
+    the count parity with a recording run_ps stub is exact)."""
+    t0 = time.monotonic()
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    timing.spawn_ms.append((time.monotonic() - t0) * 1000.0)
+    return ref
+
+
+def _run(
+    cfg: Config,
+    script: str,
+    *,
+    timeout_s: float | None = None,
+    stdin_b64: str | None = None,
+    timing: _PsTiming | None = None,
+):
     """console's PowerShell choke (issue #43): composes the remote hop from
-    the CALLER's cfg before spawning; identity in local mode."""
+    the CALLER's cfg before spawning; identity in local mode. The optional
+    timing accumulator records one entry per spawn (issue #45)."""
     script, stdin = pswindows.compose_remote(
         cfg, script,
         payload_lines=1 if stdin_b64 is not None else 0,
         stdin_b64=stdin_b64,
     )
     if stdin is None:
-        return pswindows.run_ps(script, timeout_s=timeout_s)
-    return pswindows.run_ps(script, timeout_s=timeout_s, stdin_b64=stdin)
+        result = pswindows.run_ps(script, timeout_s=timeout_s)
+    else:
+        result = pswindows.run_ps(script, timeout_s=timeout_s, stdin_b64=stdin)
+    if timing is not None:
+        timing.spawn_ms.append(float(result.duration_ms))
+    return result
 
 
 def _decode_rgb565(raw: bytes, width: int, height: int) -> bytes:
@@ -305,14 +406,16 @@ def _frame_hash(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def _capture_raw(cfg: Config, guid: str, width: int, height: int) -> bytes:
+def _capture_raw(
+    cfg: Config, guid: str, width: int, height: int, timing: _PsTiming | None = None
+) -> bytes:
     script = (
         _CAPTURE_SCRIPT_TMPL.replace("%NS%", _WMI_NS)
         .replace("%GUID%", guid.lower())
         .replace("%W", str(width))
         .replace("%H", str(height))
     )
-    result = _run(cfg, script.strip(), timeout_s=90)
+    result = _run(cfg, script.strip(), timeout_s=90, timing=timing)
     _check_rc(result, "console screenshot")
     try:
         data = json.loads(result.stdout)
@@ -327,9 +430,11 @@ def _capture_raw(cfg: Config, guid: str, width: int, height: int) -> bytes:
     return payload
 
 
-def _head_resolution(cfg: Config, guid: str) -> tuple[int, int] | None:
+def _head_resolution(
+    cfg: Config, guid: str, timing: _PsTiming | None = None
+) -> tuple[int, int] | None:
     script = _HEAD_RES_SCRIPT.replace("%NS%", _WMI_NS).replace("%GUID%", guid.lower())
-    result = _run(cfg, script.strip(), timeout_s=60)
+    result = _run(cfg, script.strip(), timeout_s=60, timing=timing)
     if result.returncode != 0:
         return None
     try:
@@ -426,9 +531,20 @@ def screenshot(
     MCP image content. Raises on failure (uniform list-form success shape)."""
     if not (160 <= width <= 4096 and 160 <= height <= 4096):
         raise ValueError("width/height must be within 160..4096")
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    be, connect_ms = _try_backend(cfg)
+    ref: vmident.VMRef | None = None
+    if be is not None:
+        try:
+            ref = _wmi_ref(be, cfg, vm_name, vm_id)
+        except wmiconsole.BackendUnavailable:
+            be = None
+    if be is not None:
+        assert ref is not None
+        return _screenshot_wmi(cfg, be, connect_ms, ref, width, height, save_path)
+    timing = _PsTiming()
+    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
     guid = ref.id
-    head = _head_resolution(cfg, guid)
+    head = _head_resolution(cfg, guid, timing)
     fallback_used = ""
     raw: bytes | None = None
     actual_w, actual_h = width, height
@@ -438,7 +554,7 @@ def screenshot(
     chain.extend([(640, 480), (320, 240)])
     for w, h in chain:
         try:
-            raw = _capture_raw(cfg, guid, w, h)
+            raw = _capture_raw(cfg, guid, w, h, timing)
             actual_w, actual_h = w, h
             if (w, h) != chain[0]:
                 fallback_used = f"{chain[0][0]}x{chain[0][1]} failed; captured at {w}x{h}"
@@ -467,6 +583,7 @@ def screenshot(
         ),
         "capture_method": "GetVirtualSystemThumbnailImage (WMI root\\virtualization\\v2)",
         "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "timings": _ps_timings(timing),
     }
     if save_path:
         policy.check_host_write(cfg, save_path)
@@ -479,10 +596,105 @@ def screenshot(
     return img, meta
 
 
+def _screenshot_wmi(
+    cfg: Config,
+    be,
+    connect_ms: float,
+    ref: vmident.VMRef,
+    width: int,
+    height: int,
+    save_path: str,
+) -> tuple[PILImage.Image, dict]:
+    """Screenshot over the in-process WMI backend: same metadata contract
+    as the PowerShell path (the capture chain keeps its pre-existing
+    per-size retry — same operation, next size)."""
+    try:
+        head, t_head = be.head_resolution(ref.id)
+        chain: list[tuple[int, int]] = [(width, height)]
+        if head and (width, height) != head:
+            chain.append(head)
+        chain.extend([(640, 480), (320, 240)])
+        fallback_used = ""
+        raw: bytes | None = None
+        actual_w, actual_h = width, height
+        phase_dicts = [t_head]
+        for w, h in chain:
+            try:
+                raw, t = be.capture(ref.id, w, h)
+                phase_dicts.append(t)
+                actual_w, actual_h = w, h
+                if (w, h) != chain[0]:
+                    fallback_used = f"{chain[0][0]}x{chain[0][1]} failed; captured at {w}x{h}"
+                break
+            except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
+                if (w, h) == chain[-1]:
+                    raise ConsoleError(str(exc)) from None
+                fallback_used = f"{chain[0][0]}x{chain[0][1]}: {exc}"
+        assert raw is not None
+        prefix_hex = raw[:_PREFIX_LEN].hex()
+        png = _decode_rgb565(raw, actual_w, actual_h)
+        img = PILImage.open(io.BytesIO(png))
+        meta = {
+            "vm_name": ref.name,
+            "vm_id": ref.id,
+            "width": actual_w,
+            "height": actual_h,
+            "frame_hash": _frame_hash(raw),
+            "prefix_hex": prefix_hex,
+            "fallback_used": fallback_used,
+            "head_resolution": {"horizontal": head[0], "vertical": head[1]} if head else None,
+            "scale_note": (
+                "mouse tools accept frame_width/frame_height to scale image coords "
+                f"to head space ({head[0]}x{head[1]})"
+                if head else "head resolution unavailable: pass display resolution as frame dims"
+            ),
+            "capture_method": "GetVirtualSystemThumbnailImage (in-process WMI, issue #45)",
+            "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "timings": _wmi_timings(connect_ms, *phase_dicts),
+        }
+        if save_path:
+            policy.check_host_write(cfg, save_path)
+            parent = os.path.dirname(save_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(save_path, "wb") as fh:
+                fh.write(png)
+            meta["saved_path"] = save_path
+        return img, meta
+    except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
+        raise ConsoleError(str(exc)) from None
+
+
 def get_display_info(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    be, connect_ms = _try_backend(cfg)
+    ref: vmident.VMRef | None = None
+    if be is not None:
+        try:
+            ref = _wmi_ref(be, cfg, vm_name, vm_id)
+        except wmiconsole.BackendUnavailable:
+            be = None
+    if be is not None:
+        assert ref is not None
+        try:
+            info, t = be.display_info(ref.id)
+        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
+            raise ConsoleError(str(exc)) from None
+        return {
+            "ok": True,
+            **info,
+            "vm_id": ref.id,
+            "guest_channel": "ps_direct_unverified",
+            "guest_channel_note": (
+                "console input works from firmware/WinPE; PowerShell Direct requires a "
+                "running supported guest OS with credentials — verify before switching"
+            ),
+            "vm_name": ref.name,
+            "timings": _wmi_timings(connect_ms, t),
+        }
+    timing = _PsTiming()
+    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
     script = _DISPLAY_INFO_SCRIPT.replace("%NS%", _WMI_NS).replace("%GUID%", ref.id)
-    result = _run(cfg, script.strip(), timeout_s=60)
+    result = _run(cfg, script.strip(), timeout_s=60, timing=timing)
     _check_rc(result, "console display info")
     try:
         data = json.loads(result.stdout)
@@ -494,6 +706,7 @@ def get_display_info(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
         "console input works from firmware/WinPE; PowerShell Direct requires a "
         "running supported guest OS with credentials — verify before switching"
     )
+    data["timings"] = _ps_timings(timing)
     return {"ok": True, **data, "vm_name": ref.name}
 
 
@@ -503,7 +716,34 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
         raise ValueError("text is required")
     if any(ord(c) > 127 for c in text):
         raise ValueError("text must be ASCII; use hyperv_console_type_scancodes for other input")
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    be, connect_ms = _try_backend(cfg)
+    ref: vmident.VMRef | None = None
+    if be is not None:
+        try:
+            ref = _wmi_ref(be, cfg, vm_name, vm_id)
+        except wmiconsole.BackendUnavailable:
+            be = None
+    if be is not None:
+        assert ref is not None
+        chunks = [text[i:i + 512] for i in range(0, len(text), 512)]
+        calls = 0
+        phase_dicts: list[dict] = []
+        try:
+            with vmlocks.vm_lock(ref.id):
+                for i, chunk in enumerate(chunks):
+                    _r, t = be.type_text(ref.id, chunk)
+                    phase_dicts.append(t)
+                    calls += 1
+                    if i < len(chunks) - 1:
+                        time.sleep(0.05)
+        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
+            raise ConsoleError(str(exc)) from None
+        return {
+            "ok": True, "chunks": calls, "chars": len(text), "vm_name": ref.name,
+            "timings": _wmi_timings(connect_ms, *phase_dicts),
+        }
+    timing = _PsTiming()
+    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
     guid = ref.id
     chunks = [text[i:i + 512] for i in range(0, len(text), 512)]
     calls = 0
@@ -532,31 +772,59 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
                 "%GUID%", guid.lower()
             ).replace("%CALL%", call)
             result = _run(cfg,
-                script.strip(), timeout_s=90, stdin_b64=pswindows.utf8_b64(chunk)
+                script.strip(), timeout_s=90, stdin_b64=pswindows.utf8_b64(chunk),
+                timing=timing,
             )
             _check_rc(result, f"console type_text chunk {i + 1}/{len(chunks)}")
             calls += 1
             if i < len(chunks) - 1:
                 time.sleep(0.05)
-    return {"ok": True, "chunks": calls, "chars": len(text), "vm_name": ref.name}
+    return {
+        "ok": True, "chunks": calls, "chars": len(text), "vm_name": ref.name,
+        "timings": _ps_timings(timing),
+    }
+
+
+def _select_backend_and_ref(cfg: Config, vm_name: str, vm_id: str) -> tuple[Any | None, float, vmident.VMRef | None]:
+    """Shared selection preamble for input ops: (backend, connect_ms, ref)
+    with be=None when the PowerShell transport is selected. Policy checks
+    stay in the callers (a denied name must reach neither transport)."""
+    be, connect_ms = _try_backend(cfg)
+    ref = None
+    if be is not None:
+        try:
+            ref = _wmi_ref(be, cfg, vm_name, vm_id)
+        except wmiconsole.BackendUnavailable:
+            be = None
+    return be, connect_ms, ref
 
 
 def press_key(
     cfg: Config, vm_name: str = "", key: str = "", modifiers: list[str] | None = None, vm_id: str = "",
 ) -> dict:
     policy.require_category(cfg, "console_input", f"press {key} on '{vm_name}' console")
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
+    if be is not None and ref is not None:
+        codes = _scancodes_for_combo([key] + list(modifiers or []))
+        return _send_scancodes_locked(cfg, ref, codes, be=be, connect_ms=connect_ms)
+    timing = _PsTiming()
+    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
     codes = _scancodes_for_combo([key] + list(modifiers or []))
-    return _send_scancodes_locked(cfg, ref, codes)
+    return _send_scancodes_locked(cfg, ref, codes, timing=timing)
 
 
 def key_combo(cfg: Config, vm_name: str = "", keys: list[str] | None = None, vm_id: str = "") -> dict:
     policy.require_category(cfg, "console_input", f"send combo {keys!r} on '{vm_name}' console")
     if not keys:
         raise ValueError("keys list is required")
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
+    if be is not None and ref is not None:
+        codes = _scancodes_for_combo(keys)
+        return _send_scancodes_locked(cfg, ref, codes, be=be, connect_ms=connect_ms)
+    timing = _PsTiming()
+    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
     codes = _scancodes_for_combo(keys)
-    return _send_scancodes_locked(cfg, ref, codes)
+    return _send_scancodes_locked(cfg, ref, codes, timing=timing)
 
 
 def type_scancodes(cfg: Config, vm_name: str = "", scancodes: list[int] | None = None, vm_id: str = "") -> dict:
@@ -566,12 +834,40 @@ def type_scancodes(cfg: Config, vm_name: str = "", scancodes: list[int] | None =
     for code in scancodes:
         if type(code) is not int or not (0 <= code <= 255):
             raise ValueError(f"scancodes must be integers 0..255 (bools rejected); got {code!r}")
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
-    return _send_scancodes_locked(cfg, ref, list(scancodes))
+    be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
+    if be is not None and ref is not None:
+        return _send_scancodes_locked(cfg, ref, list(scancodes), be=be, connect_ms=connect_ms)
+    timing = _PsTiming()
+    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
+    return _send_scancodes_locked(cfg, ref, list(scancodes), timing=timing)
 
 
-def _send_scancodes_locked(cfg: Config, ref: vmident.VMRef, codes: list[int]) -> dict:
+def _send_scancodes_locked(
+    cfg: Config,
+    ref: vmident.VMRef,
+    codes: list[int],
+    be=None,
+    connect_ms: float = 0.0,
+    timing: _PsTiming | None = None,
+) -> dict:
     chunks = [codes[i:i + 64] for i in range(0, len(codes), 64)]
+    if be is not None:
+        sent = 0
+        phase_dicts: list[dict] = []
+        try:
+            with vmlocks.vm_lock(ref.id):
+                for i, chunk in enumerate(chunks):
+                    _r, t = be.type_scancodes(ref.id, chunk)
+                    phase_dicts.append(t)
+                    sent += len(chunk)
+                    if i < len(chunks) - 1:
+                        time.sleep(0.02)  # pacing: let the Hyper-V input buffer drain
+        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
+            raise ConsoleError(str(exc)) from None
+        return {
+            "ok": True, "scancodes_sent": sent, "chunks": len(chunks),
+            "vm_name": ref.name, "timings": _wmi_timings(connect_ms, *phase_dicts),
+        }
     sent = 0
     with vmlocks.vm_lock(ref.id):
         for i, chunk in enumerate(chunks):
@@ -585,12 +881,15 @@ def _send_scancodes_locked(cfg: Config, ref: vmident.VMRef, codes: list[int]) ->
             script = _KEYBOARD_SCRIPT_TMPL.replace("%NS%", _WMI_NS).replace(
                 "%GUID%", ref.id
             ).replace("%CALL%", call)
-            result = _run(cfg, script.strip(), timeout_s=90)
+            result = _run(cfg, script.strip(), timeout_s=90, timing=timing)
             _check_rc(result, f"console scancodes chunk {i + 1}/{len(chunks)}")
             sent += len(chunk)
             if i < len(chunks) - 1:
                 time.sleep(0.02)  # pacing: let the Hyper-V input buffer drain
-    return {"ok": True, "scancodes_sent": sent, "chunks": len(chunks), "vm_name": ref.name}
+    out = {"ok": True, "scancodes_sent": sent, "chunks": len(chunks), "vm_name": ref.name}
+    if timing is not None:
+        out["timings"] = _ps_timings(timing)
+    return out
 
 
 def mouse_move(
@@ -603,13 +902,28 @@ def mouse_move(
     if x is None or y is None:
         raise ValueError("x and y are required")
     policy.require_category(cfg, "console_input", f"move mouse on '{vm_name}' console")
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
-    head = _head_resolution(cfg, ref.id)
+    be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
+    if be is not None and ref is not None:
+        try:
+            with vmlocks.vm_lock(ref.id):
+                head, t_head = be.head_resolution(ref.id)
+                hx, hy = _scale_to_head(x, y, frame_width, frame_height, head)
+                _r, t = be.mouse_move(ref.id, hx, hy)
+        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
+            raise ConsoleError(str(exc)) from None
+        return {
+            "ok": True, "operation": f"move to ({hx},{hy})", "vm_name": ref.name,
+            "head_x": hx, "head_y": hy,
+            "timings": _wmi_timings(connect_ms, t_head, t),
+        }
+    timing = _PsTiming()
+    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
+    head = _head_resolution(cfg, ref.id, timing)
     hx, hy = _scale_to_head(x, y, frame_width, frame_height, head)
     return _mouse_op(cfg, ref, f"move to ({hx},{hy})",
                      "SetAbsolutePosition",
                      f"@{{ HorizontalPosition = {hx}; VerticalPosition = {hy} }}",
-                     extra={"head_x": hx, "head_y": hy})
+                     extra={"head_x": hx, "head_y": hy}, timing=timing)
 
 
 def click(
@@ -619,8 +933,28 @@ def click(
     policy.require_category(cfg, "console_input", f"click on '{vm_name}' console")
     if button not in (1, 2):
         raise ValueError("button must be 1 (left) or 2 (right)")
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
-    head = _head_resolution(cfg, ref.id)
+    be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
+    if be is not None and ref is not None:
+        try:
+            with vmlocks.vm_lock(ref.id):
+                extra: dict = {}
+                if x or y:
+                    head, t_head = be.head_resolution(ref.id)
+                    hx, hy = _scale_to_head(x, y, frame_width, frame_height, head)
+                    _r, t = be.mouse_click(ref.id, button, hx, hy)
+                    extra = {"head_x": hx, "head_y": hy}
+                else:
+                    t_head = {}
+                    _r, t = be.mouse_click(ref.id, button)
+        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
+            raise ConsoleError(str(exc)) from None
+        return {
+            "ok": True, "operation": f"click button {button}", "vm_name": ref.name,
+            "timings": _wmi_timings(connect_ms, t_head, t), **extra,
+        }
+    timing = _PsTiming()
+    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
+    head = _head_resolution(cfg, ref.id, timing)
     if x or y:
         hx, hy = _scale_to_head(x, y, frame_width, frame_height, head)
         move_call = (
@@ -641,7 +975,7 @@ def click(
         + "    if ($r.ReturnValue -ne 0) { throw ('ClickButton failed with ReturnValue=' + $r.ReturnValue) }\n"
         + "    Write-Output ('RC=' + $r.ReturnValue)\n"
     )
-    out = _mouse_op(cfg, ref, f"click button {button}", call=call, extra=extra)
+    out = _mouse_op(cfg, ref, f"click button {button}", call=call, extra=extra, timing=timing)
     return out
 
 
@@ -651,19 +985,45 @@ def mouse_button(
     policy.require_category(cfg, "console_input", f"button {'down' if is_down else 'up'} on '{vm_name}' console")
     if button not in (1, 2):
         raise ValueError("button must be 1 (left) or 2 (right)")
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
+    if be is not None and ref is not None:
+        try:
+            with vmlocks.vm_lock(ref.id):
+                _r, t = be.mouse_button(ref.id, button, is_down)
+        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
+            raise ConsoleError(str(exc)) from None
+        return {
+            "ok": True, "operation": f"button {button} {'down' if is_down else 'up'}",
+            "vm_name": ref.name, "timings": _wmi_timings(connect_ms, t),
+        }
+    timing = _PsTiming()
+    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
     return _mouse_op(
         cfg, ref, f"button {button} {'down' if is_down else 'up'}",
         "SetButtonState",
         f"@{{ ButtonIndex = {button}; IsDown = ${'true' if is_down else 'false'} }}",
+        timing=timing,
     )
 
 
 def scroll(cfg: Config, vm_name: str = "", delta: int = 0, vm_id: str = "") -> dict:
     policy.require_category(cfg, "console_input", f"scroll on '{vm_name}' console")
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
+    if be is not None and ref is not None:
+        try:
+            with vmlocks.vm_lock(ref.id):
+                _r, t = be.mouse_scroll(ref.id, delta)
+        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
+            raise ConsoleError(str(exc)) from None
+        return {
+            "ok": True, "operation": f"scroll {delta}", "vm_name": ref.name,
+            "timings": _wmi_timings(connect_ms, t),
+        }
+    timing = _PsTiming()
+    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
     return _mouse_op(cfg, ref, f"scroll {delta}",
-                     "SetScrollPosition", f"@{{ ScrollPositionDelta = {int(delta)} }}")
+                     "SetScrollPosition", f"@{{ ScrollPositionDelta = {int(delta)} }}",
+                     timing=timing)
 
 
 def _mouse_op(
@@ -674,6 +1034,7 @@ def _mouse_op(
     args_literal: str = "",
     call: str | None = None,
     extra: dict | None = None,
+    timing: _PsTiming | None = None,
 ) -> dict:
     if call is None:
         assert method is not None
@@ -689,11 +1050,13 @@ def _mouse_op(
         .replace("%CALL%", call)
     )
     with vmlocks.vm_lock(ref.id):
-        result = _run(cfg, script.strip(), timeout_s=90)
+        result = _run(cfg, script.strip(), timeout_s=90, timing=timing)
     _check_rc(result, f"console mouse {detail}")
     out = {"ok": True, "operation": detail, "vm_name": ref.name}
     if extra:
         out.update(extra)
+    if timing is not None:
+        out["timings"] = _ps_timings(timing)
     return out
 
 
@@ -715,7 +1078,16 @@ def wait_frame_change(
         raise ValueError("width/height must be within 160..4096")
     if baseline_hash and not re.fullmatch(r"[0-9a-f]{64}", baseline_hash):
         raise ValueError("baseline_hash must be an empty string or a 64-char hex sha256")
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    be, connect_ms, ref_wmi = _select_backend_and_ref(cfg, vm_name, vm_id)
+    if be is not None and ref_wmi is not None:
+        return _wait_frame_change_wmi(
+            be, connect_ms, ref_wmi, baseline_hash, width, height, timeout_s, interval_s
+        )
+    timing = _PsTiming()
+    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
+    # On the WMI transport the deadline is enforced BETWEEN polls (a single
+    # in-flight COM capture is not interruptible; the PowerShell transport's
+    # child process is killed at timeout_s + 15). See README console-transport.
     max_polls = math.ceil(timeout_s / interval_s)
     script = (
         _WAIT_FRAME_SCRIPT_TMPL.replace("%NS%", _WMI_NS)
@@ -728,7 +1100,7 @@ def wait_frame_change(
         .replace("%BASELINE%", baseline_hash)
     )
     started = time.monotonic()
-    result = _run(cfg, script.strip(), timeout_s=int(timeout_s) + 15)
+    result = _run(cfg, script.strip(), timeout_s=int(timeout_s) + 15, timing=timing)
     elapsed_ms = int((time.monotonic() - started) * 1000)
     _check_rc(result, "console wait_frame_change")
 
@@ -754,6 +1126,7 @@ def wait_frame_change(
         "elapsed_ms": elapsed_ms,
         "width": width,
         "height": height,
+        "timings": _ps_timings(timing),
     }
     if last_hash:
         out["frame_hash"] = last_hash
@@ -762,6 +1135,63 @@ def wait_frame_change(
         png = _decode_rgb565(raw, width, height)
         img = PILImage.open(io.BytesIO(png))
         out["image"] = img
+        out["frame_hash"] = _frame_hash(raw)
+    return out
+
+
+def _wait_frame_change_wmi(
+    be, connect_ms: float, ref: vmident.VMRef, baseline_hash: str,
+    width: int, height: int, timeout_s: int, interval_s: int,
+) -> dict:
+    """wait_frame_change over the in-process WMI backend: the poll loop runs
+    in Python, preserving the PowerShell contract (first-poll-baseline,
+    supplied-baseline discrimination, deadline stop, hash round-tripping,
+    polls bounded by the derived max_polls, deadline keeps the last hash)."""
+    max_polls = math.ceil(timeout_s / interval_s)
+    phase_dicts: list[dict] = []
+    stop_reason, polls, last_hash = "deadline", 0, ""
+    raw: bytes | None = None
+    started = time.monotonic()
+    deadline_t = started + timeout_s
+    try:
+        baseline = baseline_hash
+        while polls < max_polls:
+            if time.monotonic() >= deadline_t:
+                stop_reason = "deadline"
+                break
+            raw, t = be.capture(ref.id, width, height)
+            phase_dicts.append(t)
+            polls += 1
+            h = _frame_hash(raw)
+            last_hash = h
+            if not baseline:
+                baseline = h
+            if h != baseline:
+                stop_reason = "changed"
+                break
+            if polls >= max_polls or time.monotonic() >= deadline_t:
+                stop_reason = "deadline"
+                break
+            time.sleep(interval_s)
+    except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
+        raise ConsoleError(str(exc)) from None
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    out: dict = {
+        "ok": True,
+        "vm_name": ref.name,
+        "stop_reason": stop_reason,
+        "changed": stop_reason == "changed",
+        "polls": polls,
+        "elapsed_ms": elapsed_ms,
+        "width": width,
+        "height": height,
+        "timings": _wmi_timings(connect_ms, *phase_dicts),
+    }
+    if last_hash:
+        out["frame_hash"] = last_hash
+    if stop_reason == "changed" and raw is not None:
+        png = _decode_rgb565(raw, width, height)
+        out["image"] = PILImage.open(io.BytesIO(png))
         out["frame_hash"] = _frame_hash(raw)
     return out
 
@@ -776,14 +1206,18 @@ def capture_sequence(
         raise ValueError("interval_s must be >= 1")
     if not (160 <= width <= 4096 and 160 <= height <= 4096):
         raise ValueError("width/height must be within 160..4096")
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    be, connect_ms, ref_wmi = _select_backend_and_ref(cfg, vm_name, vm_id)
+    if be is not None and ref_wmi is not None:
+        return _capture_sequence_wmi(be, connect_ms, ref_wmi, count, interval_s, width, height)
+    timing = _PsTiming()
+    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
     guid = ref.id
     frames: list[dict] = []
     images: list = []
     prev_raw: bytes | None = None
     started = time.monotonic()
     for i in range(count):
-        raw = _capture_raw(cfg, guid, width, height)
+        raw = _capture_raw(cfg, guid, width, height, timing)
         h = _frame_hash(raw)
         changed_bytes = (
             sum(1 for a, b in zip(prev_raw, raw, strict=True) if a != b) if prev_raw is not None else 0
@@ -808,4 +1242,52 @@ def capture_sequence(
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "width": width,
         "height": height,
+        "timings": _ps_timings(timing),
+    }
+
+
+def _capture_sequence_wmi(
+    be, connect_ms: float, ref: vmident.VMRef, count: int, interval_s: int,
+    width: int, height: int,
+) -> dict:
+    """capture_sequence over the in-process WMI backend, preserving the
+    per-frame bookkeeping contract (strict-zip changed-byte counts over
+    equal-length payloads, first-and-last-only images)."""
+    frames: list[dict] = []
+    images: list = []
+    prev_raw: bytes | None = None
+    phase_dicts: list[dict] = []
+    started = time.monotonic()
+    try:
+        for i in range(count):
+            raw, t = be.capture(ref.id, width, height)
+            phase_dicts.append(t)
+            h = _frame_hash(raw)
+            changed_bytes = (
+                sum(1 for a, b in zip(prev_raw, raw, strict=True) if a != b)
+                if prev_raw is not None else 0
+            )
+            frames.append({
+                "index": i,
+                "frame_hash": h,
+                "changed_bytes_vs_previous": changed_bytes,
+                "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            })
+            if i == 0 or i == count - 1:
+                png = _decode_rgb565(raw, width, height)
+                images.append(PILImage.open(io.BytesIO(png)))
+            prev_raw = raw
+            if i < count - 1:
+                time.sleep(interval_s)
+    except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
+        raise ConsoleError(str(exc)) from None
+    return {
+        "ok": True,
+        "vm_name": ref.name,
+        "frames": frames,
+        "images": images,
+        "elapsed_ms": int((time.monotonic() - started) * 1000),
+        "width": width,
+        "height": height,
+        "timings": _wmi_timings(connect_ms, *phase_dicts),
     }
