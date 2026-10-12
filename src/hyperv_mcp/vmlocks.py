@@ -1,10 +1,21 @@
 """Per-VM mutual exclusion so conflicting operations never overlap.
 
-FastMCP dispatches tool calls concurrently; a checkpoint restore racing a
-guest execution on the same VM is exactly the kind of interference this
-prevents. Locks are keyed by the case-folded VM GUID (the identity resolved
-by vmident.resolve, stable across renames) and acquired non-blocking: a
-second conflicting call fails fast with VMBusy instead of queueing behind an
+When the server dispatches tool calls concurrently WITHIN one process (an
+SDK- or config-dependent property — current sync tools mostly run inline on
+the event loop), a checkpoint restore racing a guest execution on the same
+VM is exactly the kind of interference this prevents; the lock is the
+arbitration point for that in-process concurrency whenever it occurs. The lock covers ONE process only: it is
+a module-dict entry, so two separately spawned `hyperv-mcp` servers never
+exclude each other — which is why the default deployment proxies every
+client to the ONE shared controller (see stdio_proxy / README "Shared
+controller"), putting every agent's calls into this lock's process. Within
+that process the path applies across agents; observable cross-agent VMBusy
+lands once the controller stops serializing sync tool calls (FND-01,
+Workstream C PR 3 / issue #16) — until then a second agent's call queues
+behind the first instead of fast-failing.
+Locks are keyed by the case-folded VM GUID (the identity resolved by
+vmident.resolve, stable across renames) and acquired non-blocking: a second
+conflicting call fails fast with VMBusy instead of queueing behind an
 unknown-duration operation. The key is an opaque string; vm_create locks on
 the not-yet-existing VM's name, which the duplicate-name guard keeps unique.
 Known residual: between `New-VM` committing inside vm_create's script and

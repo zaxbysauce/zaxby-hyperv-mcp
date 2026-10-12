@@ -37,6 +37,9 @@ RUN_PS_ALLOWLIST = {
     ("guestexec.py", "_run_inner"),
     ("relay.py", "_run_forward"),
     ("server.py", "_powershell_provenance"),  # deliberate: probes the LOCAL interpreter
+    # deliberate: the logon-task launcher registers a scheduled task (a
+    # service-management script), not Hyper-V addressing (issue #13)
+    ("http_entry.py", "_handle_logon_task"),
     ("server.py", "main"),                    # deliberate: --check-env reachability probe
 }
 

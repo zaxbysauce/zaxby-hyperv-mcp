@@ -31,6 +31,11 @@ from dataclasses import dataclass
 from .config import Config, HttpPolicy
 
 _CREATE_SUSPENDED = 0x00000004
+# Console-less servers (stdio child of a GUI host) make every console app
+# they spawn allocate a NEW VISIBLE console window unless this flag suppresses
+# it. Orthogonal to CREATE_SUSPENDED; safe to combine.
+CREATE_NO_WINDOW = 0x08000000
+_CREATE_NO_WINDOW = CREATE_NO_WINDOW
 _TH32CS_SNAPTHREAD = 0x00000004
 _THREAD_SUSPEND_RESUME = 0x0002
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
@@ -314,6 +319,7 @@ def _taskkill_tree(pid: int) -> None:
         ["taskkill", "/T", "/F", "/PID", str(pid)],
         capture_output=True, timeout=15, check=False,
         env=child_env(),
+        creationflags=_CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
 
 
@@ -370,9 +376,11 @@ def run_ps(
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            creationflags=creationflags,
-            env=child_env(),
-        )
+        creationflags=(
+            creationflags | _CREATE_NO_WINDOW if os.name == "nt" else creationflags
+        ),
+        env=child_env(),
+    )
     except OSError as exc:
         if job:
             ctypes.windll.kernel32.CloseHandle(job)

@@ -55,6 +55,7 @@ from . import (
     pswindows,
     relay,
     repair,
+    stdio_proxy,
 )
 from .config import Config, ConfigError
 
@@ -251,6 +252,7 @@ def _git_revision() -> str:
             text=True,
             timeout=5,
             check=False,
+            creationflags=pswindows.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except (OSError, subprocess.SubprocessError):
         return "unknown"
@@ -2269,6 +2271,19 @@ def main(argv: list[str] | None = None) -> int:
              "runtime provenance (PowerShell probe, config digest, git "
              "revision), then exit",
     )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--proxy", metavar="URL", default=None,
+        help="run as a thin stdio->streamable-HTTP proxy to the shared "
+             "controller at URL (e.g. http://127.0.0.1:8787/mcp) instead of "
+             "serving in-process; never starts a controller",
+    )
+    mode.add_argument(
+        "--standalone", action="store_true",
+        help="serve this client with a private in-process server (the "
+             "pre-0.4.0 behavior) instead of proxying to the shared "
+             "controller; coordination state stays per-process",
+    )
     ns = parser.parse_args(argv)
 
     if ns.check_env:
@@ -2290,6 +2305,18 @@ def main(argv: list[str] | None = None) -> int:
             "HYPERV_MCP_UNRESTRICTED", "HYPERV_MCP_HTTP_TOKEN",
         ):
             print(f"{name:36}{'set' if name in os.environ else 'not set'}")
+        # http.agents decides proxy/controller auth in agents-mode; name the
+        # variables this run actually depends on (they are env VAR NAMES only).
+        listed = (
+            "HYPERV_GUEST_USERNAME HYPERV_GUEST_PASSWORD HYPERV_GUEST_PASSWORD_FILE "
+            "HYPERV_GUEST_VICTIM_USERNAME HYPERV_GUEST_VICTIM_PASSWORD "
+            "HYPERV_GUEST_VICTIM_PASSWORD_FILE HYPERV_HOST_USERNAME "
+            "HYPERV_HOST_PASSWORD HYPERV_HOST_PASSWORD_FILE HYPERV_MCP_CONFIG "
+            "HYPERV_MCP_UNRESTRICTED HYPERV_MCP_HTTP_TOKEN"
+        ).split()
+        for agent_var in sorted(set(cfg.http.agents.values())):
+            if agent_var not in listed:
+                print(f"{agent_var:36}{'set' if agent_var in os.environ else 'not set'}")
         if host_target:
             # The composed hop IS the probe: it validates exactly the
             # agent→host leg (and identity) the tools use — no inner
@@ -2323,15 +2350,41 @@ def main(argv: list[str] | None = None) -> int:
         print(f"git.revision {_git_revision()}")
         return 0
 
+    if ns.standalone:
+        try:
+            bootstrap()
+        except ConfigError as exc:
+            print(f"CONFIG ERROR: {exc}", file=sys.stderr)
+            return 2
+
+        mcp_run = get_mcp()
+        mcp_run.run()
+        return 0
+
+    # Default and --proxy mode: a thin bridge to the ONE shared controller,
+    # so per-VM locks, job/relay registries and the audit sink cover every
+    # agent. The proxy never bootstraps Hyper-V machinery and never falls
+    # back to in-process serving; an unreachable or rejecting controller is
+    # a JSON-RPC error to the client, not a private server.
     try:
-        bootstrap()
+        cfg = Config.load()
     except ConfigError as exc:
         print(f"CONFIG ERROR: {exc}", file=sys.stderr)
         return 2
-
-    mcp_run = get_mcp()
-    mcp_run.run()
-    return 0
+    try:
+        token, token_env_name = stdio_proxy.resolve_proxy_token(cfg)
+        if ns.proxy:
+            url = stdio_proxy.validate_proxy_url(ns.proxy)
+        else:
+            url = stdio_proxy.validate_proxy_url(
+                stdio_proxy.default_controller_url(cfg.http.host, cfg.http.port)
+            )
+            if not stdio_proxy.port_listening(cfg.http.host, cfg.http.port):
+                stdio_proxy.ensure_controller(cfg)
+        return stdio_proxy.run_proxy(url, token, token_env_name)
+    except stdio_proxy.ProxyRefused as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

@@ -95,8 +95,69 @@ carries Hyper-V rights. Two supported fixes:
    environment like the other server secrets. `--allow-anonymous` overrides
    both modes (explicit opt-out).
 
-**Do not run your MCP client as Administrator.** With stdio the client spawns
-the server, so the server inherits the client's token — prefer fix 1.
+**Do not run your MCP client as Administrator.** With `--standalone` the
+client spawns a private server that inherits the client's token — prefer fix 1.
+
+## Shared controller (default proxy mode; 0.4.0 breaking change)
+
+Since 0.4.0, `hyperv-mcp` is a **thin proxy** by default: it forwards MCP
+messages unchanged between the client's stdio and the ONE shared
+`hyperv-mcp-http` controller, so every agent shares the same per-VM locks,
+job/relay registries and audit sink. With `http.agents` configured, every
+audit row names the calling agent; with the shared token alone, rows carry
+the shared principal (`local-cli`). Cross-agent mutual exclusion through that one shared lock lands with
+the controller's concurrency work (Workstream C): until then, a second
+agent's conflicting call queues behind the first (FND-01) instead of
+fast-failing with `error_class: "busy"` — the in-process busy path itself is
+shipped and pinned by the unit suite.
+
+- **Default (no flags):** proxy to the controller at `http.host`/`http.port`
+  from your config (default `127.0.0.1:8787`). If nothing is listening
+  there, `hyperv-mcp` auto-starts a detached `hyperv-mcp-http` with the same
+  config and environment, waits up to 15 s (one wall-clock budget covering
+  spawn and the port wait), and proxies. Under a concurrent second launch
+  the bind loser exits cleanly and its proxy connects to the winner.
+  NOTE: the auto-started controller inherits the launching client's full
+  environment — including its security token — so the controller runs with
+  the same rights as the client that started it; if you need a privileged
+  shared controller, start `hyperv-mcp-http` yourself from a shell with the
+  right token rather than letting a client auto-start it. Auto-start works
+  for a single shared token or a single-agent `http.agents` deployment (the
+  one agent's variable must be set); with MULTIPLE configured agents
+  auto-start is unsupported by design — the controller validates every
+  agent variable at startup while a proxy may present exactly one — so
+  start `hyperv-mcp-http` manually from a shell that has them all.
+  Auto-start checks only that the port accepts connections — it does not
+  handshake versions — so stop any stale pre-0.4.0 `hyperv-mcp-http` before
+  upgrading.
+- **`--proxy URL`:** proxy to an explicit controller URL; never auto-starts.
+- **`--standalone`:** the pre-0.4.0 behavior — a private in-process server.
+  Use it for disposable single-agent work.
+- **`--check-env`:** unchanged (prints policy/provenance, exits; never
+  contacts or starts a controller).
+
+Failure behavior: if the controller is unreachable or rejects the token, a
+pending request is answered with a JSON-RPC error (code -32000) and the
+proxy exits non-zero. There is **no silent fallback** to in-process serving.
+Cleartext `http://` is accepted for loopback controller addresses only.
+
+The proxy's token comes from the environment variable named by
+`http.token_env` (or, when `http.agents` is configured, from the single
+agent token variable you set) — never from argv, and never logged or echoed.
+
+Client config snippet:
+
+```json
+{ "command": "hyperv-mcp", "env": { "HYPERV_MCP_HTTP_TOKEN": "<this agent's token>" } }
+```
+
+Controller as a service: `hyperv-mcp-http --install-logon-task` registers a
+per-user logon scheduled task (`hyperv-mcp-http`, RunLevel Limited — Hyper-V
+Administrators membership, no UAC — no execution time limit, IgnoreNew,
+restart-on-failure) and `--uninstall-logon-task` removes it. The task
+definition stores no secrets: set the token variable once for the user
+(`setx HYPERV_MCP_HTTP_TOKEN <token>` — available from the next logon) and
+the task-spawned controller reads it from the environment.
 
 ---
 
@@ -121,8 +182,10 @@ per-call `powershell.exe` start from console tools):
 pip install -e ".[wmi]"   # adds pywin32 on Windows
 ```
 
-Console scripts: `hyperv-mcp` (stdio server; `--version`, `--check-env`) and
-`hyperv-mcp-http` (streamable-http server). `python -m hyperv_mcp` also works.
+Console scripts: `hyperv-mcp` (default: proxy to the shared controller;
+`--proxy URL`, `--standalone`, `--version`, `--check-env`) and
+`hyperv-mcp-http` (streamable-http controller; `--install-logon-task`,
+`--uninstall-logon-task`). `python -m hyperv_mcp` also works.
 
 ---
 
@@ -699,7 +762,9 @@ from a made-up one, and no guest leg runs for it). `exiting` is not a
 terminal state: if the guest wrapper dies
 before writing its exit-code file, status stays `exiting` until you call
 `hyperv_guest_job_stop`. Every job/relay tool call writes an audit row
-naming the caller's agent id (null on stdio or `--allow-anonymous`) and a
+naming the caller's agent id (null for `--standalone`/in-process stdio or
+`--allow-anonymous`; the default proxy mode authenticates, so its rows
+carry `local-cli` or the configured agent) and a
 server-generated request id. When the call addresses or creates a specific
 handle, the row also carries that `job_id`/`relay_id` and — for known ids —
 the VM from the registry, so a follow-up row joins to the start row that
@@ -767,7 +832,7 @@ append `/` plus the target path. Ownership (issue #11): a relay belongs
 to the agent that started it (the bearer token's agent identity); `relay_status` lists
 only the calling agent's relays, and `relay_status`/`relay_stop` with
 another agent's id return the same `unknown relay_id` error as an absent
-id, so ids cannot be probed through the tools. Without an identity (stdio in-process,
+id, so ids cannot be probed through the tools. Without an identity (`--standalone` in-process,
 `--allow-anonymous`), all callers form one local principal and behavior
 is unchanged. The registry is capped at 16 active relays; stopped entries
 are evicted oldest-first (their stored credentials released) when the cap
@@ -992,10 +1057,12 @@ CI (`.github/workflows/ci.yml`) runs ruff + mypy + unit tests on
 
 ## Security limitations
 
-- A stdio MCP server is trusted with the rights of its own process token;
-  any process that can talk to it can attempt every enabled tool. Policy
-  allowlists and confirm gates are the mitigation — keep `unrestricted`
-  off on shared hosts.
+- In default proxy mode the stdio client holds no Hyper-V rights of its
+  own: the trust boundary is the shared controller process plus the bearer
+  token(s) — anyone presenting a configured token gets full tool authority
+  through the controller, and `--standalone` still trusts the client's
+  process token directly. Policy allowlists and confirm gates remain the
+  mitigation — keep `unrestricted` off on shared hosts.
 - The streamable-http endpoint's authority is its bearer token(s): with one
   shared token, possession is full authority; with `http.agents`, each token
   carries the same tool authority but calls are attributable to their agent
