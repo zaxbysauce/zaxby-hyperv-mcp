@@ -1,5 +1,7 @@
 """Shared unit-test fixtures. No real Hyper-V is touched."""
 
+import time
+
 import pytest
 
 from hyperv_mcp.config import Config
@@ -64,3 +66,71 @@ def envelope_from_result(result, label: str) -> dict:
     texts = [c for c in blocks if getattr(c, "type", "") == "text"]
     assert texts, f"expected a text envelope block for {label}"
     return json.loads(texts[0].text)
+
+@pytest.fixture(scope="session", autouse=True)
+def _reap_stray_controllers():
+    """Session-end safety net (PRR-012): any controller that outlived its
+    test — e.g. AC8's failure path, whose frozen-file reap sits after its
+    assertion (the test file is checkpoint-anchored and cannot be edited) —
+    is terminated here. Controllers created before the session started (an
+    operator's own hyperv-mcp-http) are never touched."""
+    started = time.time()
+    yield
+    try:
+        import psutil
+    except ImportError:  # dev extra absent: warn, never mask test results
+        return
+
+    victims = []
+    for proc in psutil.process_iter(["pid", "cmdline", "create_time"]):
+        try:
+            cmd = " ".join(proc.info.get("cmdline") or [])
+            created = proc.info.get("create_time") or 0
+        except psutil.Error:
+            continue
+        if "hyperv_mcp.http_entry" in cmd or "hyperv-mcp-http" in cmd:
+            if created >= started:
+                victims.append(proc)
+    for proc in victims:
+        try:
+            proc.terminate()
+        except psutil.Error:
+            pass
+    if victims:
+        psutil.wait_procs(victims, timeout=5.0)
+        for proc in victims:
+            try:
+                proc.kill()
+            except psutil.Error:
+                pass
+
+
+@pytest.fixture(autouse=True)
+def _restore_bootstrap_module_globals():
+    """Per-test isolation (PRR-014): bootstrap() writes _config into
+    credentials/pswindows/auditlog AND server._bootstrapped/CFG — a server
+    reload alone cannot undo it (the b01 guard's scope, generalized).
+    AC5 in test_b03_stdio_proxy reaches bootstrap() through the launcher
+    with no teardown of its own, so this fixture is the boundary that keeps
+    one test's config out of the next test."""
+    from hyperv_mcp import auditlog as _a
+    from hyperv_mcp import credentials as _c
+    from hyperv_mcp import pswindows as _pw
+    from hyperv_mcp import server as _srv
+
+    saved = {
+        ("auditlog", "_config"): getattr(_a, "_config", None),
+        ("credentials", "_config"): getattr(_c, "_config", None),
+        ("pswindows", "_config"): getattr(_pw, "_config", None),
+        ("pswindows", "_redact"): getattr(_pw, "_redact", None),
+        ("server", "_bootstrapped"): getattr(_srv, "_bootstrapped", False),
+        ("server", "CFG"): getattr(_srv, "CFG", None),
+    }
+    yield
+    _a._config = saved[("auditlog", "_config")]
+    _c._config = saved[("credentials", "_config")]
+    _pw._config = saved[("pswindows", "_config")]
+    _pw._redact = saved[("pswindows", "_redact")]
+    _srv._bootstrapped = saved[("server", "_bootstrapped")]
+    _srv.CFG = saved[("server", "CFG")]
+

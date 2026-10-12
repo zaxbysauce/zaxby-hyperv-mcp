@@ -2270,13 +2270,14 @@ def main(argv: list[str] | None = None) -> int:
              "runtime provenance (PowerShell probe, config digest, git "
              "revision), then exit",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--proxy", metavar="URL", default=None,
         help="run as a thin stdio->streamable-HTTP proxy to the shared "
              "controller at URL (e.g. http://127.0.0.1:8787/mcp) instead of "
              "serving in-process; never starts a controller",
     )
-    parser.add_argument(
+    mode.add_argument(
         "--standalone", action="store_true",
         help="serve this client with a private in-process server (the "
              "pre-0.4.0 behavior) instead of proxying to the shared "
@@ -2303,6 +2304,18 @@ def main(argv: list[str] | None = None) -> int:
             "HYPERV_MCP_UNRESTRICTED", "HYPERV_MCP_HTTP_TOKEN",
         ):
             print(f"{name:36}{'set' if name in os.environ else 'not set'}")
+        # http.agents decides proxy/controller auth in agents-mode; name the
+        # variables this run actually depends on (they are env VAR NAMES only).
+        listed = (
+            "HYPERV_GUEST_USERNAME HYPERV_GUEST_PASSWORD HYPERV_GUEST_PASSWORD_FILE "
+            "HYPERV_GUEST_VICTIM_USERNAME HYPERV_GUEST_VICTIM_PASSWORD "
+            "HYPERV_GUEST_VICTIM_PASSWORD_FILE HYPERV_HOST_USERNAME "
+            "HYPERV_HOST_PASSWORD HYPERV_HOST_PASSWORD_FILE HYPERV_MCP_CONFIG "
+            "HYPERV_MCP_UNRESTRICTED HYPERV_MCP_HTTP_TOKEN"
+        ).split()
+        for agent_var in sorted(set(cfg.http.agents.values())):
+            if agent_var not in listed:
+                print(f"{agent_var:36}{'set' if agent_var in os.environ else 'not set'}")
         if host_target:
             # The composed hop IS the probe: it validates exactly the
             # agent→host leg (and identity) the tools use — no inner
@@ -2363,7 +2376,7 @@ def main(argv: list[str] | None = None) -> int:
             url = stdio_proxy.validate_proxy_url(ns.proxy)
         else:
             url = stdio_proxy.validate_proxy_url(
-                f"http://{cfg.http.host}:{cfg.http.port}/mcp"
+                stdio_proxy.default_controller_url(cfg.http.host, cfg.http.port)
             )
             if not stdio_proxy.port_listening(cfg.http.host, cfg.http.port):
                 stdio_proxy.ensure_controller(cfg)

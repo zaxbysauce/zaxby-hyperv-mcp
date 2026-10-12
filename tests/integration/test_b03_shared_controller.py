@@ -17,6 +17,7 @@ import asyncio
 import itertools
 import json
 import os
+import re
 import secrets
 import socket
 import subprocess
@@ -97,7 +98,9 @@ def _child_env(updates: dict[str, str | None]) -> dict[str, str]:
 
 
 def _spawn_controller(port: int, env: dict[str, str]) -> subprocess.Popen:
-    """A real detached hyperv-mcp-http controller child on the given port."""
+    """A real detached hyperv-mcp-http controller child on the given port.
+    Termination on the assertion path too (PRR-012/T-2): the caller's
+    try/finally only exists if this function returns."""
     proc = subprocess.Popen(
         [sys.executable, "-m", "hyperv_mcp.http_entry", "--port", str(port)],
         cwd=str(REPO_ROOT),
@@ -106,9 +109,18 @@ def _spawn_controller(port: int, env: dict[str, str]) -> subprocess.Popen:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    assert _wait_listening(port, timeout_s=60.0), (
-        f"the hyperv-mcp-http controller never listened on 127.0.0.1:{port}"
-    )
+    if not _wait_listening(port, timeout_s=60.0):
+        try:
+            proc.terminate()
+            proc.wait(timeout=10.0)
+        except Exception:  # noqa: BLE001 - best-effort reap before re-raising
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        raise AssertionError(
+            f"the hyperv-mcp-http controller never listened on 127.0.0.1:{port}"
+        )
     return proc
 
 
@@ -187,12 +199,17 @@ def _terminate_processes(procs: list) -> None:
             pass
 
 
+def _mentions_port(cmdline: str, port: int) -> bool:
+    """Whole-number port match (PRR-020): '1234' must not match 51234."""
+    return re.search(r"(?<!\d)" + str(port) + r"(?!\d)", cmdline) is not None
+
+
 def _terminate_controllers_on_port(port: int) -> int:
-    """Reap controller children matched by the port in their cmdline, so
-    unrelated hyperv-mcp-http processes stay untouched."""
-    port_str = str(port)
+    """Reap controller children matched by the EXACT port in their cmdline,
+    so unrelated hyperv-mcp-http processes (including operators' and any
+    controller whose port merely contains these digits) stay untouched."""
     procs = _scan_processes(
-        lambda cmdline: port_str in cmdline
+        lambda cmdline: _mentions_port(cmdline, port)
         and ("hyperv_mcp.http_entry" in cmdline or TASK_NAME in cmdline)
     )
     _terminate_processes(procs)
@@ -430,6 +447,9 @@ def test_two_proxies_share_vm_lock(it, guarded_vm, tmp_path):
         while not a_done.is_set():
             envelope = _agent_b_fire_once()
             b_envelopes.append(str(envelope)[:120])
+            if envelope is None:
+                # dead/failed session: avoid a CPU-pegging spin (PRR-026)
+                time.sleep(0.5)
 
         agent_a_thread.join(timeout=300.0)
         stop_monitor.set()
@@ -463,7 +483,8 @@ def test_two_proxies_share_vm_lock(it, guarded_vm, tmp_path):
         )
         serving = len(
             _scan_processes(
-                lambda cmdline: "hyperv_mcp.http_entry" in cmdline and str(port) in cmdline
+                lambda cmdline: "hyperv_mcp.http_entry" in cmdline
+                and _mentions_port(cmdline, port)
             )
         )
         assert serving == 1, (
@@ -510,6 +531,11 @@ def test_logon_task_controller_serves_proxy(it, monkeypatch, tmp_path):
     LastRunTime shows Ready with a fresh LastRunTime, and 127.0.0.1:8787
     accepts). Cleanup unregisters the task, restores the user environment,
     and terminates ONLY the task-spawned controller PID."""
+    if _port_open(TASK_PORT):
+        pytest.skip(
+            f"port {TASK_PORT} already has a listener (a controller is "
+            "already running); AC10 needs the logon task to own it"
+        )
     token = secrets.token_urlsafe(32)
     monkeypatch.delenv("HYPERV_MCP_CONFIG", raising=False)
     env_name = "HYPERV_MCP_HTTP_TOKEN"
@@ -522,10 +548,13 @@ def test_logon_task_controller_serves_proxy(it, monkeypatch, tmp_path):
         encoding="utf-8",
     )
 
+    def _psq(value: str) -> str:
+        return value.replace("'", "''")
+
     def _user_env(operation: str, name: str, value: str = "") -> bool:
         script = (
             "[Environment]::"
-            f"{operation}EnvironmentVariable('{name}', '{value}', 'User')"
+            f"{operation}EnvironmentVariable('{_psq(name)}', '{_psq(value)}', 'User')"
         )
         result = pswindows.run_ps(script)
         return result.ok()
@@ -630,16 +659,23 @@ def test_logon_task_controller_serves_proxy(it, monkeypatch, tmp_path):
             except psutil.NoSuchProcess:
                 continue
         _terminate_processes(victims)
+        restored = True
         if prior_token is None:
-            pswindows.run_ps(
+            restored &= pswindows.run_ps(
                 f"[Environment]::SetEnvironmentVariable('{env_name}', $null, 'User')"
-            )
+            ).ok()
         else:
-            _user_env("Set", env_name, prior_token)
+            restored &= _user_env("Set", env_name, prior_token)
         if prior_cfg_value is None:
-            pswindows.run_ps(
+            restored &= pswindows.run_ps(
                 "[Environment]::SetEnvironmentVariable("
                 "'HYPERV_MCP_CONFIG', $null, 'User')"
-            )
+            ).ok()
         else:
-            _user_env("Set", "HYPERV_MCP_CONFIG", prior_cfg_value)
+            restored &= _user_env("Set", "HYPERV_MCP_CONFIG", prior_cfg_value)
+        if not restored:
+            print(
+                "WARNING: user-scope env restore failed; the developer's "
+                "registry may still hold the test token/config (PRR-026)",
+                file=sys.stderr,
+            )

@@ -350,7 +350,17 @@ class Config:
                 # token_env is matched by exact (case-insensitive) name
                 # downstream; store it trimmed so padding cannot defeat the
                 # match and the secret variable survives into children.
-                setattr(http, key, val.strip() if key == "token_env" else val)
+                trimmed = val.strip() if key == "token_env" else val
+                if key == "token_env" and not _ENV_NAME_RE.fullmatch(trimmed):
+                    # Same contract as http.agents values: config carries
+                    # environment-variable NAMES only, so a value pasted
+                    # here can never be echoed by the missing-var error
+                    # paths (PRR-016).
+                    raise ConfigError(
+                        "http.token_env must be a valid environment "
+                        f"variable name, got {trimmed!r}"
+                    )
+                setattr(http, key, trimmed)
             else:
                 raise ConfigError(f"http.{key} must be a non-empty string")
         object.__setattr__(self, "http", http)

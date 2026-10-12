@@ -160,7 +160,15 @@ def _controller_command() -> tuple[str, str]:
     return sys.executable, "-m hyperv_mcp.http_entry"
 
 
-def _install_script() -> str:
+def _ps_quote(value: str) -> str:
+    """Single-quote-escape for embedding a filesystem-derived string into a
+    PowerShell single-quoted literal (PRR-006: a path or config value
+    containing an apostrophe must not break — or inject into — the task
+    definition or the user-scope probe)."""
+    return value.replace("'", "''")
+
+
+def _install_script(host: str = "", port: str = "") -> str:
     """The Register-ScheduledTask script for the per-user logon task. The
     controller runs as the logged-on user at RunLevel Limited (Hyper-V
     Administrators membership — no UAC), with no execution time limit,
@@ -168,7 +176,9 @@ def _install_script() -> str:
     re-running this command an idempotent replace. No secrets: the task
     definition stores no token material."""
     execute, arguments = _controller_command()
-    argument_part = f" -Argument '{arguments}'" if arguments else ""
+    argument_part = f" -Argument '{_ps_quote(arguments)}'" if arguments else ""
+    if host and port:
+        argument_part += f" --host {_ps_quote(host)} --port {_ps_quote(port)}"
     return (
         "$ErrorActionPreference = 'Stop'\n"
         "$action = New-ScheduledTaskAction "
@@ -193,6 +203,7 @@ def _uninstall_script() -> str:
         f"$task = Get-ScheduledTask -TaskName '{TASK_NAME}' "
         "-ErrorAction SilentlyContinue\n"
         "if ($task) { "
+        f"Stop-ScheduledTask -TaskName '{TASK_NAME}' -ErrorAction SilentlyContinue; "
         f"Unregister-ScheduledTask -TaskName '{TASK_NAME}' -Confirm:$false; "
         "Write-Output 'REMOVED' } "
         "else { Write-Output 'NOT-REGISTERED' }\n"
@@ -208,7 +219,9 @@ def _token_env_names(cfg: Config) -> list[str]:
     return names
 
 
-def _handle_logon_task(cfg: Config, install: bool) -> int:
+def _handle_logon_task(
+    cfg: Config, install: bool, host: str = "", port: str = "", allow_anonymous: bool = False
+) -> int:
     """Register/unregister the per-user logon task through pswindows.
 
     bootstrap() must run first: run_ps raises PowerShellTransportError
@@ -216,8 +229,23 @@ def _handle_logon_task(cfg: Config, install: bool) -> int:
     catch a missing init (a real operator install would crash while every
     test passes). The token VALUE never enters any script; persistence is
     operator-side (a user-scope env var set once, e.g. via setx, survives
-    logons and is what the task-spawned controller reads)."""
-    bootstrap()
+    logons and is what the task-spawned controller reads). Flags meant for
+    the live server (--allow-anonymous) are refused here rather than
+    silently ignored; explicit --host/--port are embedded in the task
+    action (PRR-027)."""
+    if allow_anonymous:
+        print(
+            "ERROR: --allow-anonymous cannot be combined with "
+            "--install-logon-task: a logon-started controller must require "
+            "its token (set the token environment variable instead).",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        bootstrap()
+    except ConfigError as exc:
+        print(f"CONFIG ERROR: {exc}", file=sys.stderr)
+        return 2
     if install:
         names = _token_env_names(cfg)
         if not any(os.environ.get(name, "").strip() for name in names):
@@ -226,7 +254,7 @@ def _handle_logon_task(cfg: Config, install: bool) -> int:
             # (already-running) shell — so consult the user registry before
             # refusing.
             probe = (
-                "foreach ($n in @(" + ", ".join(f"'{n}'" for n in names) + ")) { "
+                "foreach ($n in @(" + ", ".join(f"'{_ps_quote(n)}'" for n in names) + ")) { "
                 "$v = [Environment]::GetEnvironmentVariable($n, 'User'); "
                 "if ($v) { Write-Output $n; break } }"
             )
@@ -242,7 +270,7 @@ def _handle_logon_task(cfg: Config, install: bool) -> int:
                     file=sys.stderr,
                 )
                 return 2
-        script = _install_script()
+        script = _install_script(host=host, port=port)
     else:
         script = _uninstall_script()
     try:
@@ -290,7 +318,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"CONFIG ERROR: {exc}", file=sys.stderr)
         return 2
     if ns.install_logon_task or ns.uninstall_logon_task:
-        return _handle_logon_task(cfg, install=ns.install_logon_task)
+        return _handle_logon_task(
+            cfg,
+            install=ns.install_logon_task,
+            host=ns.host or "",
+            port=str(ns.port) if ns.port else "",
+            allow_anonymous=ns.allow_anonymous,
+        )
     token_env = cfg.http.token_env
     token = os.environ.get(token_env, "")
 
@@ -374,6 +408,17 @@ def main(argv: list[str] | None = None) -> int:
     mcp.settings.port = port
     try:
         mcp.run(transport="streamable-http")
+    except SystemExit as exc:
+        # uvicorn converts a bind OSError into SystemExit(STARTUP_FAILURE)
+        # before the OSError handler below can see it.
+        if exc.code:
+            print(
+                "ERROR: streamable-http server failed to start "
+                f"(exit {exc.code}) — is the port already in use?",
+                file=sys.stderr,
+            )
+            return 1
+        raise
     except OSError as exc:
         # e.g. port already bound — surface a clean operator error, not a traceback.
         print(f"ERROR: streamable-http server failed: {exc}", file=sys.stderr)

@@ -1,8 +1,10 @@
 """Per-VM mutual exclusion so conflicting operations never overlap.
 
-FastMCP dispatches tool calls concurrently WITHIN one server process; a
-checkpoint restore racing a guest execution on the same VM is exactly the
-kind of interference this prevents. The lock covers ONE process only: it is
+When the server dispatches tool calls concurrently WITHIN one process (an
+SDK- or config-dependent property — current sync tools mostly run inline on
+the event loop), a checkpoint restore racing a guest execution on the same
+VM is exactly the kind of interference this prevents; the lock is the
+arbitration point for that in-process concurrency whenever it occurs. The lock covers ONE process only: it is
 a module-dict entry, so two separately spawned `hyperv-mcp` servers never
 exclude each other — which is why the default deployment proxies every
 client to the ONE shared controller (see stdio_proxy / README "Shared

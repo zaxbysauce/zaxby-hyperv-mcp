@@ -18,14 +18,18 @@ the proxy exits non-zero. Connection and rejection failures surface as a
 RAISED exception group when the upstream client context unwinds (probe-
 verified: post failures cancel the transport task group and re-raise at its
 boundary), so the emit path is driven from that raised group as well as from
-exception items on the upstream read stream.
+exception items on the upstream read stream and from failures inside the
+client->upstream reader task itself.
 
 Tokens come only from the environment: the variable named by
 `http.token_env`, or — when `http.agents` is configured — the single set
 agent variable (exactly one; more than one is a refusal, because the child
 could not know which principal it presents). A missing token is NOT a
 refusal: the proxy simply presents no Authorization header and the
-controller's 401 becomes the standard error reply.
+controller's 401 becomes the standard error reply. Auto-start additionally
+requires every configured agent variable to be present in the environment
+(the spawned controller validates them all at startup), so a partial set
+fails fast with a named-variable refusal instead of a 15 s port timeout.
 """
 
 from __future__ import annotations
@@ -60,8 +64,13 @@ PROXY_ERROR_CODE = -32000
 # on the POST path.
 UPSTREAM_CONNECT_TIMEOUT_S = 5.0
 UPSTREAM_WRITE_TIMEOUT_S = 30.0
+# One budget for the WHOLE auto-start (spawn + listen wait): the 15 s in the
+# README and the operator message is a wall-clock deadline, not per-phase.
 AUTOSTART_WAIT_S = 15.0
 LISTEN_PROBE_TIMEOUT_S = 0.5
+# The controller log resets when it outgrows this (bounded retention; a
+# detached controller's stderr is unbounded by nature).
+MAX_CONTROLLER_LOG_BYTES = 5 * 1024 * 1024
 
 if sys.version_info >= (3, 11):
     BaseExceptionGroupType = BaseExceptionGroup  # noqa: F821 - 3.11 builtin
@@ -72,10 +81,26 @@ else:  # pragma: no cover - 3.10 path; the backport ships with anyio
 _DETACHED_PROCESS = 0x00000008
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CREATE_NO_WINDOW = 0x08000000
+_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+# Fixed source for the WMI-branch logging wrapper: Win32_Process.Create
+# cannot redirect stdio, so the WMI-created process is a tiny python that
+# re-spawns the controller with stdout/stderr bound to the per-user log file.
+# argv contract: python -c <this> <controller_python> <host> <port> <log_path>
+# (sys.argv[1..4] from -c's perspective: ['-c', python, host, port, log]).
+_WMI_LOG_WRAPPER = "\n".join([
+    "import os, subprocess, sys",
+    "log = open(sys.argv[4], 'a', encoding='utf-8', errors='replace')",
+    "subprocess.Popen([sys.argv[1], '-m', 'hyperv_mcp.http_entry', '--host', sys.argv[2], '--port', sys.argv[3]],",
+    "                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,",
+    "                 env=dict(os.environ),",
+    "                 creationflags=0x00000008 | 0x00000200 | 0x08000000)",
+])
 
 
 class ProxyRefused(Exception):
-    """Operator-facing refusal (bad URL, ambiguous agent identity).
+    """Operator-facing refusal (bad URL, ambiguous agent identity,
+    auto-start precondition or failure).
 
     The message is printed to stderr; it must never contain token material.
     """
@@ -94,15 +119,48 @@ def is_loopback_host(host: str) -> bool:
         return False
 
 
+def _connect_host(host: str) -> str:
+    """The address a client should CONNECT to for a controller bound to
+    host. A wildcard bind (0.0.0.0 / ::) is reachable over loopback, and a
+    loopback connect keeps the cleartext-allowed path intact."""
+    bare = host.strip("[]")
+    if bare in ("0.0.0.0", "0"):
+        return "127.0.0.1"
+    if bare in ("::", "::0"):
+        return "::1"
+    return bare
+
+
+def default_controller_url(host: str, port: int) -> str:
+    """The controller URL for default (no --proxy) mode, derived from the
+    configured bind address: wildcard binds map to loopback and IPv6
+    literals get the brackets urlparse requires."""
+    target = _connect_host(host)
+    if ":" in target and not target.startswith("["):
+        target = f"[{target}]"
+    return f"http://{target}:{port}/mcp"
+
+
 def validate_proxy_url(url: str) -> str:
     """Refuse anything but a well-formed http(s) controller URL; cleartext
     http is loopback-only because the bearer token would otherwise cross the
-    network in cleartext. Returns the URL unchanged when acceptable."""
-    parsed = urlparse(url)
+    network in cleartext, and embedded userinfo (user:pass@) is refused so
+    credentials never ride the URL into stderr diagnostics. Returns the URL
+    unchanged when acceptable."""
+    try:
+        parsed = urlparse(url)
+    except ValueError as exc:
+        raise ProxyRefused(f"invalid controller URL {url!r}: {exc}") from None
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ProxyRefused(
             f"invalid controller URL {url!r}: expected http://host:port/mcp "
             "or https://host:port/mcp"
+        )
+    if parsed.username or parsed.password:
+        raise ProxyRefused(
+            "controller URLs must not embed credentials (user:pass@host); "
+            "the proxy takes its token from the environment only, and a "
+            "credential in the URL would be echoed to stderr on failure"
         )
     if parsed.scheme == "http" and not is_loopback_host(parsed.hostname or ""):
         raise ProxyRefused(
@@ -150,9 +208,10 @@ def resolve_proxy_token(cfg) -> tuple[str | None, str]:
 
 
 def port_listening(host: str, port: int, timeout_s: float = LISTEN_PROBE_TIMEOUT_S) -> bool:
-    """Whether a TCP listener accepts connections at host:port right now."""
+    """Whether a TCP listener accepts connections at the connect target for
+    this (possibly wildcard) bind address right now."""
     try:
-        with socket.create_connection((host, port), timeout=timeout_s):
+        with socket.create_connection((_connect_host(host), port), timeout=timeout_s):
             return True
     except OSError:
         return False
@@ -160,11 +219,12 @@ def port_listening(host: str, port: int, timeout_s: float = LISTEN_PROBE_TIMEOUT
 
 def ensure_controller(cfg) -> None:
     """Start the shared controller detached from this process tree and wait
-    (bounded) for its port. The child inherits THIS process's environment —
-    including the token variables — but never carries token material on its
-    command line (only --host/--port). Concurrent first launches converge:
-    the bind loser exits cleanly and this proxy connects to the winner once
-    its port accepts. Explicit --proxy invocations never reach this path.
+    (bounded by one wall-clock AUTOSTART_WAIT_S budget) for its port. The
+    child inherits THIS process's environment — including the token
+    variables — but never carries token material on its command line (only
+    --host/--port). Concurrent first launches converge: the bind loser exits
+    cleanly and this proxy connects to the winner once its port accepts.
+    Explicit --proxy invocations never reach this path.
 
     The controller MUST survive this proxy's death: the client library's
     stdio shutdown wraps the proxy in a kill-on-terminate Job Object and
@@ -175,14 +235,37 @@ def ensure_controller(cfg) -> None:
     CREATE_BREAKAWAY_FROM_JOB when the job permits it, else creation via
     WMI Win32_Process.Create, whose children belong to the WMI service —
     outside this job entirely — with the environment carried in the CIM
-    startup block (no token ever on a command line). The controller logs to
-    a per-user file so a silent death always leaves evidence."""
+    startup block (no token ever on a command line). Every spawn failure
+    (timeout, OSError, unbreakable job, WMI refusal, unwritable log dir)
+    surfaces as ProxyRefused so main() can print one clean operator error
+    instead of a traceback, and the controller's stdout/stderr always lands
+    in the per-user log file on BOTH spawn branches. In http.agents mode
+    every agent variable must already be in this environment (the spawned
+    controller validates them at startup), so a partial set fails fast here
+    rather than timing out the port wait."""
+    agents = getattr(cfg.http, "agents", None) or {}
+    if agents:
+        missing = sorted(
+            {env_name for env_name in agents.values() if not os.environ.get(env_name, "").strip()}
+        )
+        if missing:
+            raise ProxyRefused(
+                "auto-start with http.agents requires every agent token "
+                f"variable in this environment; missing: {', '.join(missing)}. "
+                "Start hyperv-mcp-http manually from a shell that has all of "
+                "them, or configure the shared http.token_env token for "
+                "auto-start"
+            )
+    deadline = time.monotonic() + AUTOSTART_WAIT_S
     log_path = _controller_log_path(cfg.http.port)
     host = cfg.http.host
     port = str(cfg.http.port)
     if os.name != "nt":
         # No job-object inheritance on POSIX: plain detached spawn.
-        log = open(log_path, "a", encoding="utf-8", errors="replace")  # noqa: SIM115 - lives for the detached child
+        try:
+            log = open(log_path, "a", encoding="utf-8", errors="replace")  # noqa: SIM115 - lives for the detached child
+        except OSError as exc:
+            raise ProxyRefused(f"cannot open the controller log {log_path}: {exc}") from None
         try:
             subprocess.Popen(  # noqa: S603 - fixed argv, no shell, no secrets in argv
                 [sys.executable, "-m", "hyperv_mcp.http_entry",
@@ -191,9 +274,10 @@ def ensure_controller(cfg) -> None:
                 stderr=subprocess.STDOUT, env=dict(os.environ),
                 start_new_session=True,
             )
-        finally:
+        except OSError as exc:
             log.close()
-        deadline = time.monotonic() + AUTOSTART_WAIT_S
+            raise ProxyRefused(f"could not spawn the controller process: {exc}") from None
+        log.close()
         while time.monotonic() < deadline:
             if port_listening(host, int(port)):
                 return
@@ -202,21 +286,26 @@ def ensure_controller(cfg) -> None:
     spawner = "\n".join([
         "import base64, os, subprocess, sys",
         "host, port, log_path = sys.argv[1], sys.argv[2], sys.argv[3]",
+        "wrapper = sys.argv[4]",
         "argv = [sys.executable, '-m', 'hyperv_mcp.http_entry', '--host', host, '--port', port]",
         "log = open(log_path, 'a', encoding='utf-8', errors='replace')",
         "try:",
-        "    flags = 0x00000008 | 0x00000200 | 0x08000000 | 0x01000000",
+        f"    flags = {_DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW | _CREATE_BREAKAWAY_FROM_JOB}",
         "    subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log,",
         "                     stderr=subprocess.STDOUT, env=dict(os.environ),",
         "                     creationflags=flags)",
         "    print('breakaway')",
         "except OSError:",
         "    # The job forbids breakaway (mcp's stdio job uses default flags).",
-        "    # Create the controller via WMI: the WMI service is outside this",
-        "    # job, so the controller never becomes a job member. The",
-        "    # environment (token variables included) rides in the CIM startup",
-        "    # block - never on a command line.",
-        "    cmdline = subprocess.list2cmdline(argv)",
+        "    # Create a WMI-launched LOGGING WRAPPER via Win32_Process.Create:",
+        "    # the WMI service is outside this job, so the wrapper — and the",
+        "    # controller it re-spawns with stdout/stderr bound to the log —",
+        "    # never become job members. The environment (token variables",
+        "    # included) rides in the CIM startup block; the command line is",
+        "    # only python -c <wrapper source> python host port log (the",
+        "    # wrapper source itself contains no secrets).",
+        "    wmi_argv = [sys.executable, '-c', wrapper, sys.executable, host, port, log_path]",
+        "    cmdline = subprocess.list2cmdline(wmi_argv)",
         "    ps = '\\n'.join([",
         "        \"$ErrorActionPreference = 'Stop'\",",
         "        \"$cmd = '\" + cmdline.replace(\"'\", \"''\") + \"'\",",
@@ -229,21 +318,30 @@ def ensure_controller(cfg) -> None:
         "    encoded = base64.b64encode(ps.encode('utf-16-le')).decode('ascii')",
         "    run = subprocess.run(['powershell', '-NoProfile', '-EncodedCommand', encoded],",
         "                         capture_output=True, text=True)",
-        "    if 'wmi' not in (run.stdout or ''):",
+        "    if not (run.stdout or '').strip().endswith('wmi'):",
         "        raise SystemExit('WMI spawn failed: ' + (run.stderr or run.stdout or '')[-300:])",
         "    print('wmi')",
     ])
-    result = subprocess.run(  # noqa: S603 - fixed argv, no shell, no secrets in argv
-        [sys.executable, "-c", spawner, host, port, log_path],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        env=dict(os.environ),
-        creationflags=_CREATE_NO_WINDOW,
-        timeout=AUTOSTART_WAIT_S,
-        check=False,
-    )
-    if "wmi" not in (result.stdout or "") and "breakaway" not in (result.stdout or ""):
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed argv, no shell, no secrets in argv
+            [sys.executable, "-c", spawner, host, port, log_path, _WMI_LOG_WRAPPER],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env=dict(os.environ),
+            creationflags=_CREATE_NO_WINDOW,
+            timeout=max(1.0, deadline - time.monotonic()),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise ProxyRefused(
+            f"the controller spawner did not finish within {AUTOSTART_WAIT_S:.0f}s "
+            f"(WMI/CIM hung?); check the controller log for this port"
+        ) from None
+    except OSError as exc:
+        raise ProxyRefused(f"could not launch the controller spawner: {exc}") from None
+    marker = ((result.stdout or "").strip().splitlines() or [""])[-1].strip()
+    if marker not in ("wmi", "breakaway"):
         # The spawner could not sever job inheritance; say so loudly instead
         # of shipping a controller that dies with this client.
         detail = (result.stderr or result.stdout or "no output").strip()[-400:]
@@ -251,7 +349,6 @@ def ensure_controller(cfg) -> None:
             "could not auto-start the controller outside this client's job "
             f"object: {detail}"
         )
-    deadline = time.monotonic() + AUTOSTART_WAIT_S
     while time.monotonic() < deadline:
         if port_listening(cfg.http.host, cfg.http.port):
             return
@@ -269,10 +366,22 @@ def _autostart_timeout_message(host: str, port: str) -> str:
 
 
 def _controller_log_path(port: int) -> str:
-    base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or os.getcwd()
-    log_dir = os.path.join(base, "hyperv-mcp")
-    os.makedirs(log_dir, exist_ok=True)
-    return os.path.join(log_dir, f"http-controller-{port}.log")
+    base = ""
+    try:
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or os.getcwd()
+        log_dir = os.path.join(base, "hyperv-mcp")
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError as exc:
+        raise ProxyRefused(
+            f"cannot create the controller log directory under {base!r}: {exc}"
+        ) from None
+    path = os.path.join(log_dir, f"http-controller-{port}.log")
+    try:
+        if os.path.getsize(path) > MAX_CONTROLLER_LOG_BYTES:
+            os.remove(path)  # bounded retention: start fresh, never rotate secrets
+    except OSError:
+        pass  # absent or locked: never block auto-start on a size hint
+    return path
 
 
 def _request_id_of(message: SessionMessage):
@@ -293,9 +402,13 @@ def _error_reply(request_id, note: str) -> SessionMessage:
 
 
 def _iter_group_exceptions(exc: BaseException) -> list[BaseException]:
-    """Flatten (possibly nested) exception groups into leaf exceptions."""
+    """Flatten (possibly nested) exception groups into leaf exceptions;
+    a plain (non-group) exception is its own single leaf."""
+    causes = getattr(exc, "exceptions", None)
+    if not causes:
+        return [exc]
     leaves: list[BaseException] = []
-    for cause in getattr(exc, "exceptions", ()) or ():
+    for cause in causes:
         if isinstance(cause, BaseExceptionGroupType):
             leaves.extend(_iter_group_exceptions(cause))
         else:
@@ -303,9 +416,12 @@ def _iter_group_exceptions(exc: BaseException) -> list[BaseException]:
     return leaves
 
 
-def _http_status_of(eg: BaseException) -> int | None:
-    """The HTTP status the transport group carries, when it carries one."""
-    for leaf in _iter_group_exceptions(eg):
+def _http_status_of(exc: BaseException | None) -> int | None:
+    """The HTTP status the failure carries, when it carries one (group or
+    single exception with an attached httpx response)."""
+    if exc is None:
+        return None
+    for leaf in _iter_group_exceptions(exc):
         response = getattr(leaf, "response", None)
         status = getattr(response, "status_code", None)
         if isinstance(status, int):
@@ -313,11 +429,13 @@ def _http_status_of(eg: BaseException) -> int | None:
     return None
 
 
-def _describe_group(eg: BaseException) -> str:
-    leaves = _iter_group_exceptions(eg)
-    if leaves:
-        return "; ".join(f"{type(leaf).__name__}: {leaf}" for leaf in leaves[:3])
-    return type(eg).__name__
+def _describe_failure(exc: BaseException | None) -> str:
+    if exc is None:
+        return "session ended"
+    leaves = _iter_group_exceptions(exc)
+    if len(leaves) == 1 and leaves[0] is exc:
+        return f"{type(exc).__name__}: {exc}"
+    return "; ".join(f"{type(leaf).__name__}: {leaf}" for leaf in leaves[:3])
 
 
 class _UpstreamClosed(Exception):
@@ -344,20 +462,34 @@ async def _run_proxy(
     async with stdio_server() as (client_read, client_write):
 
         async def read_client() -> None:
-            async for message in client_read:
-                if isinstance(message, Exception):
-                    # Malformed client input cannot be answered meaningfully
-                    # here; the MCP client sees its own transport error.
-                    continue
-                root = _request_id_of(message)
-                if isinstance(root, JSONRPCRequest):
-                    outstanding.add(root.id)
-                elif isinstance(root, (JSONRPCResponse, JSONRPCError)):
-                    outstanding.discard(root.id)
-                if upstream:
-                    await upstream[0].send(message)
-                else:
-                    buffered.append(message)
+            try:
+                async for message in client_read:
+                    if isinstance(message, Exception):
+                        # Malformed client input cannot be answered
+                        # meaningfully here; the MCP client sees its own
+                        # transport error.
+                        continue
+                    root = _request_id_of(message)
+                    if isinstance(root, JSONRPCRequest):
+                        outstanding.add(root.id)
+                    elif isinstance(root, (JSONRPCResponse, JSONRPCError)):
+                        outstanding.discard(root.id)
+                    if upstream:
+                        await upstream[0].send(message)
+                    else:
+                        buffered.append(message)
+            except (anyio.get_cancelled_exc_class(), KeyboardInterrupt, SystemExit):
+                # Clean shutdown (client EOF cancels the group) and process
+                # interrupts are not transport failures.
+                raise
+            except BaseException as exc:  # noqa: BLE001 - contract conversion
+                # A failure in the client->upstream direction (e.g. send on a
+                # stream the host task has already unwound) must still answer
+                # every outstanding id: a task-group child exception would
+                # otherwise surface only at the group's __aexit__, AFTER the
+                # emit handlers, breaking the "never waits forever" contract.
+                # The emit path hard-exits, so this never returns.
+                await _fail_outstanding(client_write, outstanding, exc, token_env_name, url)
             # Client closed stdin: the session is over for the client. Exit
             # promptly — lingering on the upstream SSE stream leaves the
             # process for the CLIENT library's tree-kill escalation, which
@@ -365,7 +497,6 @@ async def _run_proxy(
             # with it.
             tg.cancel_scope.cancel()
 
-        exit_code = 0
         async with anyio.create_task_group() as tg:
             tg.start_soon(read_client)
             try:
@@ -386,28 +517,27 @@ async def _run_proxy(
                             await client_write.send(item)
                         raise _UpstreamClosed("controller closed the session stream")
             except BaseExceptionGroupType as eg:
-                exit_code = await _fail_outstanding(
-                    client_write, outstanding, eg, token_env_name, url
-                )
+                await _fail_outstanding(client_write, outstanding, eg, token_env_name, url)
             except _UpstreamClosed:
-                exit_code = await _fail_outstanding(
-                    client_write, outstanding, None, token_env_name, url
-                )
+                await _fail_outstanding(client_write, outstanding, None, token_env_name, url)
             finally:
+                upstream.clear()  # no sends on a stream the unwound context closed
                 tg.cancel_scope.cancel()
-        return exit_code
+        return 0
 
 
 async def _fail_outstanding(
     client_write,
     outstanding: set,
-    eg: BaseExceptionGroupType | None,
+    exc: BaseException | None,
     token_env_name: str,
     url: str,
-) -> int:
+) -> None:
     """Answer every outstanding request id with the JSON-RPC error contract
-    and explain on stderr. Never echoes token material."""
-    status = _http_status_of(eg) if eg is not None else None
+    and explain on stderr. Never echoes token material. Always hard-exits
+    (the stdio server cannot unwind while the client keeps stdin open), so
+    this function never returns."""
+    status = _http_status_of(exc)
     if status in (401, 403):
         print(
             f"hyperv-mcp proxy: the controller rejected the bearer token "
@@ -417,9 +547,9 @@ async def _fail_outstanding(
         )
         note = "controller rejected the proxy's bearer token"
     else:
-        detail = _describe_group(eg) if eg is not None else "session ended"
         print(
-            f"hyperv-mcp proxy: cannot reach the controller at {url}: {detail}",
+            f"hyperv-mcp proxy: cannot reach the controller at {url}: "
+            f"{_describe_failure(exc)}",
             file=sys.stderr,
         )
         note = "proxy transport failure"
@@ -432,13 +562,16 @@ async def _fail_outstanding(
     # The stdio server cannot unwind while the client keeps stdin open (its
     # reader blocks on the pipe), so a failed proxy flushes and hard-exits:
     # the client already holds the error reply and there is nothing to clean
-    # up by design (no locks, no registries). Give the stdio writer task its
-    # scheduled slice first so the reply bytes reach the pipe.
+    # up by design (no locks, no registries). The sleep gives mcp's stdio
+    # writer task its scheduled slice; flushing both wrapper and raw buffer
+    # covers the bytes mcp wrote through its own TextIOWrapper over the same
+    # underlying buffer before os._exit kills the writer thread.
     await anyio.sleep(0.2)
     try:
         sys.stdout.flush()
+        sys.stdout.buffer.flush()
         sys.stderr.flush()
-    except (OSError, ValueError):
+    except (OSError, ValueError, AttributeError):
         pass
     os._exit(EXIT_TRANSPORT_FAILURE)
 
