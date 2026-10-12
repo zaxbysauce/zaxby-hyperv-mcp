@@ -140,17 +140,34 @@ def test_parse_oracle_can_fail():
     assert not ok, f"the parse oracle can never fail: {detail}"
 
 
-def test_install_script_embeds_host_port_inside_argument():
+def test_install_script_embeds_host_port_inside_argument(monkeypatch):
     """--host/--port must ride INSIDE the -Argument literal so the generated
-    New-ScheduledTaskAction line parses (reviewer finding F1)."""
-    script = http_entry._install_script(host="10.0.0.5", port="9999")
-    action = next(line for line in script.splitlines() if "New-ScheduledTaskAction" in line)
-    assert "'-Argument '" in action or "-Argument '" in action, action
-    # the flags are INSIDE the quoted argument value, not bare on the line
-    assert " --host 10.0.0.5 --port 9999" in action.split("-Argument", 1)[1], action
-    assert "' --host" not in action, action
-    ok, detail = _parses_in_powershell(script)
-    assert ok, detail
+    New-ScheduledTaskAction line parses (reviewer finding F1). Parametrized
+    over both _controller_command shapes — the console script on PATH (empty
+    base arguments) and the -m module fallback — because which one resolves
+    depends on how the environment installed the package (CI installs the
+    console script; a bare interpreter does not), and the assertions must
+    not depend on that."""
+    for base_args in ("", "-m hyperv_mcp.http_entry"):
+        monkeypatch.setattr(
+            http_entry,
+            "_controller_command",
+            lambda b=base_args: ("C:\\py\\hyperv-mcp-http.exe", b),
+        )
+        script = http_entry._install_script(host="10.0.0.5", port="9999")
+        action = next(
+            line for line in script.splitlines() if "New-ScheduledTaskAction" in line
+        )
+        assert "-Argument '" in action, action
+        # the flags are INSIDE the quoted argument value: they appear in the
+        # text after -Argument and --port 9999 is followed by the closing
+        # quote of the literal, never by the bare line
+        after = action.split("-Argument", 1)[1]
+        assert "--host 10.0.0.5 --port 9999" in after, action
+        assert "--port 9999'" in after, action
+        assert "' --host" not in action, action
+        ok, detail = _parses_in_powershell(script)
+        assert ok, detail
 
 
 def test_install_script_default_parses():
