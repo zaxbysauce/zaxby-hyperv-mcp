@@ -250,9 +250,8 @@ def ensure_controller(cfg) -> None:
         )
         if missing:
             note = (
-                "Start hyperv-mcp-http manually from a shell that has all of "
-                "them, or configure the shared http.token_env token for "
-                "auto-start"
+                "start hyperv-mcp-http manually from a shell that has the "
+                "agent token variable set"
             )
             if len(agents) > 1:
                 # resolve_proxy_token also refuses a proxy environment with

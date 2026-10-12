@@ -115,17 +115,29 @@ def test_single_agent_autostart_passes_the_guard(monkeypatch):
 
 
 def _parses_in_powershell(script: str) -> tuple[bool, str]:
+    """Real-parser oracle (reviewer round-2 finding: the refs must be
+    PRE-INITIALIZED — [ref]$null on an unassigned variable silently leaves
+    $errs unbound and the oracle can never fail). A deliberate self-test
+    with a parse-broken fixture asserts this oracle itself can fail."""
     enc = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     ps = (
-        f"[System.Management.Automation.Language.Parser]::ParseInput("
-        f"[System.Text.Encoding]::Unicode.GetString("
-        f"[System.Convert]::FromBase64String('{enc}')), [ref]$null, [ref]$errs)"
+        "$errs = $null; $tokens = $null; "
+        "[System.Management.Automation.Language.Parser]::ParseInput("
+        "[System.Text.Encoding]::Unicode.GetString("
+        f"[System.Convert]::FromBase64String('{enc}')), [ref]$tokens, [ref]$errs)"
         " | Out-Null; if ($errs.Count) { 'ERR:' + $errs[0].Message } else { 'PARSE-OK' }"
     )
     result = subprocess.run(
         ["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True
     )
     return ("ERR:" not in (result.stdout or "")), (result.stdout or "").strip()[:200]
+
+
+def test_parse_oracle_can_fail():
+    """Self-test of the oracle: a deliberately unparsable fixture must make
+    it report ok=False (the round-2 reviewer caught a can-not-fail variant)."""
+    ok, detail = _parses_in_powershell("Write-Output 'unterminated")
+    assert not ok, f"the parse oracle can never fail: {detail}"
 
 
 def test_install_script_embeds_host_port_inside_argument():
