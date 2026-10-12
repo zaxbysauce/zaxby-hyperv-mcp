@@ -121,12 +121,15 @@ shipped and pinned by the unit suite.
   environment — including its security token — so the controller runs with
   the same rights as the client that started it; if you need a privileged
   shared controller, start `hyperv-mcp-http` yourself from a shell with the
-  right token rather than letting a client auto-start it. Auto-start under
-  `http.agents` additionally requires every agent token variable in the
-  launching environment (the controller validates them all at startup);
-  otherwise it fails fast with the missing names. Auto-start checks only
-  that the port accepts connections — it does not handshake versions — so
-  stop any stale pre-0.4.0 `hyperv-mcp-http` before upgrading.
+  right token rather than letting a client auto-start it. Auto-start works
+  for a single shared token or a single-agent `http.agents` deployment (the
+  one agent's variable must be set); with MULTIPLE configured agents
+  auto-start is unsupported by design — the controller validates every
+  agent variable at startup while a proxy may present exactly one — so
+  start `hyperv-mcp-http` manually from a shell that has them all.
+  Auto-start checks only that the port accepts connections — it does not
+  handshake versions — so stop any stale pre-0.4.0 `hyperv-mcp-http` before
+  upgrading.
 - **`--proxy URL`:** proxy to an explicit controller URL; never auto-starts.
 - **`--standalone`:** the pre-0.4.0 behavior — a private in-process server.
   Use it for disposable single-agent work.

@@ -252,6 +252,7 @@ def _git_revision() -> str:
             text=True,
             timeout=5,
             check=False,
+            creationflags=pswindows.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except (OSError, subprocess.SubprocessError):
         return "unknown"

@@ -176,13 +176,20 @@ def _install_script(host: str = "", port: str = "") -> str:
     re-running this command an idempotent replace. No secrets: the task
     definition stores no token material."""
     execute, arguments = _controller_command()
-    argument_part = f" -Argument '{_ps_quote(arguments)}'" if arguments else ""
     if host and port:
-        argument_part += f" --host {_ps_quote(host)} --port {_ps_quote(port)}"
+        inner = f"{arguments} --host {host} --port {port}" if arguments else f"--host {host} --port {port}"
+    elif host or port:
+        raise ValueError(
+            "--install-logon-task needs BOTH --host and --port (or neither "
+            "to use the config values)"
+        )
+    else:
+        inner = arguments
+    argument_part = f" -Argument '{_ps_quote(inner)}'" if inner else ""
     return (
         "$ErrorActionPreference = 'Stop'\n"
         "$action = New-ScheduledTaskAction "
-        f"-Execute '{execute}'{argument_part}\n"
+        f"-Execute '{_ps_quote(execute)}'{argument_part}\n"
         "$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME\n"
         "$principal = New-ScheduledTaskPrincipal "
         "-UserId $env:USERNAME -LogonType Interactive -RunLevel Limited\n"
@@ -270,7 +277,11 @@ def _handle_logon_task(
                     file=sys.stderr,
                 )
                 return 2
-        script = _install_script(host=host, port=port)
+        try:
+            script = _install_script(host=host, port=port)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
     else:
         script = _uninstall_script()
     try:

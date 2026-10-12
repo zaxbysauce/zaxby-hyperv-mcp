@@ -249,12 +249,26 @@ def ensure_controller(cfg) -> None:
             {env_name for env_name in agents.values() if not os.environ.get(env_name, "").strip()}
         )
         if missing:
-            raise ProxyRefused(
-                "auto-start with http.agents requires every agent token "
-                f"variable in this environment; missing: {', '.join(missing)}. "
+            note = (
                 "Start hyperv-mcp-http manually from a shell that has all of "
                 "them, or configure the shared http.token_env token for "
                 "auto-start"
+            )
+            if len(agents) > 1:
+                # resolve_proxy_token also refuses a proxy environment with
+                # more than one agent var set (ambiguous identity), so a
+                # multi-agent deployment cannot satisfy both sides at once:
+                # auto-start is unsupported there, by design.
+                note = (
+                    "auto-start is unsupported with multiple agents: the "
+                    "controller requires every agent token variable while a "
+                    "proxy may present exactly one — start hyperv-mcp-http "
+                    "manually from a shell that has all of them"
+                )
+            raise ProxyRefused(
+                "auto-start with http.agents requires every agent token "
+                f"variable in this environment; missing: {', '.join(missing)}. "
+                f"{note}"
             )
     deadline = time.monotonic() + AUTOSTART_WAIT_S
     log_path = _controller_log_path(cfg.http.port)
@@ -277,7 +291,10 @@ def ensure_controller(cfg) -> None:
         except OSError as exc:
             log.close()
             raise ProxyRefused(f"could not spawn the controller process: {exc}") from None
-        log.close()
+        try:
+            log.close()
+        except OSError:
+            pass
         while time.monotonic() < deadline:
             if port_listening(host, int(port)):
                 return
@@ -328,6 +345,8 @@ def ensure_controller(cfg) -> None:
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=dict(os.environ),
             creationflags=_CREATE_NO_WINDOW,
             timeout=max(1.0, deadline - time.monotonic()),
@@ -526,6 +545,9 @@ async def _run_proxy(
         return 0
 
 
+_EMITTED = [False]  # single event loop: check-and-set at entry is atomic
+
+
 async def _fail_outstanding(
     client_write,
     outstanding: set,
@@ -536,7 +558,12 @@ async def _fail_outstanding(
     """Answer every outstanding request id with the JSON-RPC error contract
     and explain on stderr. Never echoes token material. Always hard-exits
     (the stdio server cannot unwind while the client keeps stdin open), so
-    this function never returns."""
+    this function never returns. Idempotent: if read_client and the host
+    task both fail within the same scheduling window, only the first caller
+    emits (the set is single-threaded and cleared before exit)."""
+    if _EMITTED[0]:
+        os._exit(EXIT_TRANSPORT_FAILURE)
+    _EMITTED[0] = True
     status = _http_status_of(exc)
     if status in (401, 403):
         print(

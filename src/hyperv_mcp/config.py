@@ -358,7 +358,9 @@ class Config:
                     # paths (PRR-016).
                     raise ConfigError(
                         "http.token_env must be a valid environment "
-                        f"variable name, got {trimmed!r}"
+                        "variable name (values are never printed — an "
+                        "operator-pasted token must be removed from the "
+                        "config)"
                     )
                 setattr(http, key, trimmed)
             else:
