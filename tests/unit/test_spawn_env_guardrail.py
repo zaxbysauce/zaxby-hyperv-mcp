@@ -162,8 +162,25 @@ def spawn_sites(src_root: Path = _SRC_ROOT) -> list[tuple[str, int, str, str]]:
     return sorted(sites, key=lambda row: (row[0], row[1]))
 
 
+# Reviewed exception (issue #13): stdio_proxy.ensure_controller spawns the
+# auto-started controller with the CALLER'S full environment on purpose - the
+# controller is the shared token-holder and reads the token variables from
+# the environment at startup (pswindows.child_env() strips every token
+# variable, which would make auto-start impossible). The WMI fallback path
+# carries the same environment in the CIM startup block. This is the only
+# sanctioned ambient-inheritance spawn site in the codebase.
+_SANCTIONED_AMBIENT = {
+    ("src/hyperv_mcp/stdio_proxy.py", "subprocess.Popen"),
+    ("src/hyperv_mcp/stdio_proxy.py", "subprocess.run"),
+}
+
+
 def _violations() -> list[tuple[str, int, str, str]]:
-    return [row for row in spawn_sites() if row[3] != "child_env"]
+    return [
+        row
+        for row in spawn_sites()
+        if row[3] != "child_env" and (row[0], row[2]) not in _SANCTIONED_AMBIENT
+    ]
 
 
 def _synthetic_root(tmp_path: Path, name: str, body: str) -> Path:

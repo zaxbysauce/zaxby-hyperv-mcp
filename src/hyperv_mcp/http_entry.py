@@ -24,12 +24,16 @@ import argparse
 import ctypes
 import os
 import secrets
+import shutil
 import sys
 
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 
+from . import pswindows
 from .config import Config, ConfigError
 from .server import VERSION, bootstrap, configure_http_auth, get_mcp
+
+TASK_NAME = "hyperv-mcp-http"
 
 
 def _elevated() -> bool:
@@ -145,6 +149,115 @@ def _resolve_agent_tokens(
     return 0, pairs
 
 
+def _controller_command() -> tuple[str, str]:
+    """(Execute, Arguments) for the task action: the resolved hyperv-mcp-http
+    console script when on PATH, else this interpreter running the module.
+    Never carries token material — the controller reads the token from the
+    environment at task-run time (user-scope env vars survive logons)."""
+    resolved = shutil.which("hyperv-mcp-http")
+    if resolved:
+        return resolved, ""
+    return sys.executable, "-m hyperv_mcp.http_entry"
+
+
+def _install_script() -> str:
+    """The Register-ScheduledTask script for the per-user logon task. The
+    controller runs as the logged-on user at RunLevel Limited (Hyper-V
+    Administrators membership — no UAC), with no execution time limit,
+    IgnoreNew on duplicate instances, and restart-on-failure. -Force makes
+    re-running this command an idempotent replace. No secrets: the task
+    definition stores no token material."""
+    execute, arguments = _controller_command()
+    argument_part = f" -Argument '{arguments}'" if arguments else ""
+    return (
+        "$ErrorActionPreference = 'Stop'\n"
+        "$action = New-ScheduledTaskAction "
+        f"-Execute '{execute}'{argument_part}\n"
+        "$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME\n"
+        "$principal = New-ScheduledTaskPrincipal "
+        "-UserId $env:USERNAME -LogonType Interactive -RunLevel Limited\n"
+        "$settings = New-ScheduledTaskSettingsSet "
+        "-ExecutionTimeLimit (New-TimeSpan -Seconds 0) "
+        "-MultipleInstances IgnoreNew -RestartCount 3 "
+        "-RestartInterval (New-TimeSpan -Minutes 1)\n"
+        f"Register-ScheduledTask -TaskName '{TASK_NAME}' "
+        "-Action $action -Trigger $trigger -Principal $principal "
+        "-Settings $settings -Force | Out-Null\n"
+        "Write-Output 'INSTALLED'\n"
+    )
+
+
+def _uninstall_script() -> str:
+    return (
+        "$ErrorActionPreference = 'Stop'\n"
+        f"$task = Get-ScheduledTask -TaskName '{TASK_NAME}' "
+        "-ErrorAction SilentlyContinue\n"
+        "if ($task) { "
+        f"Unregister-ScheduledTask -TaskName '{TASK_NAME}' -Confirm:$false; "
+        "Write-Output 'REMOVED' } "
+        "else { Write-Output 'NOT-REGISTERED' }\n"
+    )
+
+
+def _token_env_names(cfg: Config) -> list[str]:
+    """Every env-var NAME that may carry a controller token (the legacy
+    shared token variable plus each configured agent's). Names only — never
+    values."""
+    names = [cfg.http.token_env]
+    names.extend(cfg.http.agents.values())
+    return names
+
+
+def _handle_logon_task(cfg: Config, install: bool) -> int:
+    """Register/unregister the per-user logon task through pswindows.
+
+    bootstrap() must run first: run_ps raises PowerShellTransportError
+    unless pswindows.init() has executed, and C5's mocked run_ps cannot
+    catch a missing init (a real operator install would crash while every
+    test passes). The token VALUE never enters any script; persistence is
+    operator-side (a user-scope env var set once, e.g. via setx, survives
+    logons and is what the task-spawned controller reads)."""
+    bootstrap()
+    if install:
+        names = _token_env_names(cfg)
+        if not any(os.environ.get(name, "").strip() for name in names):
+            # The documented persistence path sets the variable user-scope
+            # (setx) — visible to the task's logon session but NOT to this
+            # (already-running) shell — so consult the user registry before
+            # refusing.
+            probe = (
+                "foreach ($n in @(" + ", ".join(f"'{n}'" for n in names) + ")) { "
+                "$v = [Environment]::GetEnvironmentVariable($n, 'User'); "
+                "if ($v) { Write-Output $n; break } }"
+            )
+            result = pswindows.run_ps(probe, timeout_s=30)
+            user_scope = result.ok() and result.stdout.strip()
+            if not user_scope:
+                print(
+                    f"ERROR: no controller token environment variable is set "
+                    f"(expected one of: {', '.join(names)}) in this shell or "
+                    "in the user registry environment. Set it for this user "
+                    "(setx survives logons) before installing the logon "
+                    "task. Token values are never printed.",
+                    file=sys.stderr,
+                )
+                return 2
+        script = _install_script()
+    else:
+        script = _uninstall_script()
+    try:
+        result = pswindows.run_ps(script, timeout_s=60)
+    except pswindows.PowerShellTransportError as exc:
+        print(f"ERROR: PowerShell transport failed: {pswindows.redact(str(exc))}", file=sys.stderr)
+        return 1
+    if not result.ok():
+        stderr = pswindows.redact(result.stderr.strip() or result.stdout.strip() or "unknown error")
+        print(f"ERROR: task registration failed: {stderr}", file=sys.stderr)
+        return 1
+    print(result.stdout.strip() or ("INSTALLED" if install else "NOT-REGISTERED"))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="hyperv-mcp-http",
@@ -156,6 +269,16 @@ def main(argv: list[str] | None = None) -> int:
         "--allow-anonymous", action="store_true",
         help="run WITHOUT a bearer token — any local process could invoke every tool",
     )
+    parser.add_argument(
+        "--install-logon-task", action="store_true",
+        help="register a per-user logon scheduled task that starts this "
+             "controller (RunLevel Limited, no time limit, IgnoreNew, "
+             "restart-on-failure), then exit",
+    )
+    parser.add_argument(
+        "--uninstall-logon-task", action="store_true",
+        help="remove the hyperv-mcp-http logon scheduled task, then exit",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     ns = parser.parse_args(argv)
 
@@ -166,6 +289,8 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"CONFIG ERROR: {exc}", file=sys.stderr)
         return 2
+    if ns.install_logon_task or ns.uninstall_logon_task:
+        return _handle_logon_task(cfg, install=ns.install_logon_task)
     token_env = cfg.http.token_env
     token = os.environ.get(token_env, "")
 

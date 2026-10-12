@@ -55,6 +55,7 @@ from . import (
     pswindows,
     relay,
     repair,
+    stdio_proxy,
 )
 from .config import Config, ConfigError
 
@@ -2269,6 +2270,18 @@ def main(argv: list[str] | None = None) -> int:
              "runtime provenance (PowerShell probe, config digest, git "
              "revision), then exit",
     )
+    parser.add_argument(
+        "--proxy", metavar="URL", default=None,
+        help="run as a thin stdio->streamable-HTTP proxy to the shared "
+             "controller at URL (e.g. http://127.0.0.1:8787/mcp) instead of "
+             "serving in-process; never starts a controller",
+    )
+    parser.add_argument(
+        "--standalone", action="store_true",
+        help="serve this client with a private in-process server (the "
+             "pre-0.4.0 behavior) instead of proxying to the shared "
+             "controller; coordination state stays per-process",
+    )
     ns = parser.parse_args(argv)
 
     if ns.check_env:
@@ -2323,15 +2336,41 @@ def main(argv: list[str] | None = None) -> int:
         print(f"git.revision {_git_revision()}")
         return 0
 
+    if ns.standalone:
+        try:
+            bootstrap()
+        except ConfigError as exc:
+            print(f"CONFIG ERROR: {exc}", file=sys.stderr)
+            return 2
+
+        mcp_run = get_mcp()
+        mcp_run.run()
+        return 0
+
+    # Default and --proxy mode: a thin bridge to the ONE shared controller,
+    # so per-VM locks, job/relay registries and the audit sink cover every
+    # agent. The proxy never bootstraps Hyper-V machinery and never falls
+    # back to in-process serving; an unreachable or rejecting controller is
+    # a JSON-RPC error to the client, not a private server.
     try:
-        bootstrap()
+        cfg = Config.load()
     except ConfigError as exc:
         print(f"CONFIG ERROR: {exc}", file=sys.stderr)
         return 2
-
-    mcp_run = get_mcp()
-    mcp_run.run()
-    return 0
+    try:
+        token, token_env_name = stdio_proxy.resolve_proxy_token(cfg)
+        if ns.proxy:
+            url = stdio_proxy.validate_proxy_url(ns.proxy)
+        else:
+            url = stdio_proxy.validate_proxy_url(
+                f"http://{cfg.http.host}:{cfg.http.port}/mcp"
+            )
+            if not stdio_proxy.port_listening(cfg.http.host, cfg.http.port):
+                stdio_proxy.ensure_controller(cfg)
+        return stdio_proxy.run_proxy(url, token, token_env_name)
+    except stdio_proxy.ProxyRefused as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

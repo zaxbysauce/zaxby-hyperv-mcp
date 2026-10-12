@@ -95,8 +95,54 @@ carries Hyper-V rights. Two supported fixes:
    environment like the other server secrets. `--allow-anonymous` overrides
    both modes (explicit opt-out).
 
-**Do not run your MCP client as Administrator.** With stdio the client spawns
-the server, so the server inherits the client's token — prefer fix 1.
+**Do not run your MCP client as Administrator.** With `--standalone` the
+client spawns a private server that inherits the client's token — prefer fix 1.
+
+## Shared controller (default proxy mode; 0.4.0 breaking change)
+
+Since 0.4.0, `hyperv-mcp` is a **thin proxy** by default: it forwards MCP
+messages unchanged between the client's stdio and the ONE shared
+`hyperv-mcp-http` controller, so every agent shares the same per-VM locks,
+job/relay registries and audit sink, and every audit row names the calling
+agent. Cross-agent mutual exclusion through that one shared lock lands with
+the controller's concurrency work (Workstream C): until then, a second
+agent's conflicting call queues behind the first (FND-01) instead of
+fast-failing with `error_class: "busy"` — the in-process busy path itself is
+shipped and pinned by the unit suite.
+
+- **Default (no flags):** proxy to the controller at `http.host`/`http.port`
+  from your config (default `127.0.0.1:8787`). If nothing is listening
+  there, `hyperv-mcp` auto-starts a detached `hyperv-mcp-http` with the same
+  config and environment, waits up to 15 s for the port, and proxies.
+  Concurrent first launches converge on one controller.
+- **`--proxy URL`:** proxy to an explicit controller URL; never auto-starts.
+- **`--standalone`:** the pre-0.4.0 behavior — a private in-process server.
+  Use it for disposable single-agent work.
+- **`--check-env`:** unchanged (prints policy/provenance, exits; never
+  contacts or starts a controller).
+
+Failure behavior: if the controller is unreachable or rejects the token, a
+pending request is answered with a JSON-RPC error (code -32000) and the
+proxy exits non-zero. There is **no silent fallback** to in-process serving.
+Cleartext `http://` is accepted for loopback controller addresses only.
+
+The proxy's token comes from the environment variable named by
+`http.token_env` (or, when `http.agents` is configured, from the single
+agent token variable you set) — never from argv, and never logged or echoed.
+
+Client config snippet:
+
+```json
+{ "command": "hyperv-mcp", "env": { "HYPERV_MCP_HTTP_TOKEN": "<this agent's token>" } }
+```
+
+Controller as a service: `hyperv-mcp-http --install-logon-task` registers a
+per-user logon scheduled task (`hyperv-mcp-http`, RunLevel Limited — Hyper-V
+Administrators membership, no UAC — no execution time limit, IgnoreNew,
+restart-on-failure) and `--uninstall-logon-task` removes it. The task
+definition stores no secrets: set the token variable once for the user
+(`setx HYPERV_MCP_HTTP_TOKEN <token>` — available from the next logon) and
+the task-spawned controller reads it from the environment.
 
 ---
 
@@ -121,8 +167,10 @@ per-call `powershell.exe` start from console tools):
 pip install -e ".[wmi]"   # adds pywin32 on Windows
 ```
 
-Console scripts: `hyperv-mcp` (stdio server; `--version`, `--check-env`) and
-`hyperv-mcp-http` (streamable-http server). `python -m hyperv_mcp` also works.
+Console scripts: `hyperv-mcp` (default: proxy to the shared controller;
+`--proxy URL`, `--standalone`, `--version`, `--check-env`) and
+`hyperv-mcp-http` (streamable-http controller; `--install-logon-task`,
+`--uninstall-logon-task`). `python -m hyperv_mcp` also works.
 
 ---
 
