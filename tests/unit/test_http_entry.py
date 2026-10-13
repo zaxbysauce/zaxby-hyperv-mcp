@@ -56,6 +56,38 @@ def test_default_token_env_missing_refuses(tmp_path, monkeypatch, fake_server, c
     assert "HYPERV_MCP_HTTP_TOKEN" in capsys.readouterr().err
 
 
+def test_whitespace_token_env_refuses(tmp_path, monkeypatch, fake_server, capsys):
+    """A whitespace-only shared token counts as missing, matching the
+    stdio-proxy auto-start guard's strip semantics (PRR-001): the refusal
+    message claims the controller 'refuses to start without it', so it must
+    be true for '   ' too."""
+    monkeypatch.setenv("HYPERV_MCP_HTTP_TOKEN", "   ")
+    monkeypatch.setenv("HYPERV_MCP_CONFIG", str(tmp_path / "absent.json"))
+    rc = http_entry.main([])
+    assert rc == 2
+    assert "HYPERV_MCP_HTTP_TOKEN" in capsys.readouterr().err
+    assert fake_server.run_calls == []
+
+
+def test_padded_token_env_binds_stripped(tmp_path, monkeypatch, fake_server):
+    """A padded token value must bind the STRIPPED verifier so the proxy's
+    stripped presentation can match (PRR-001: previously the raw padded
+    value bound a verifier no conforming client could ever satisfy, leaving
+    a permanent-401 controller holding the port)."""
+    captured: dict = {}
+
+    def _capture(verifier):
+        captured["verifier"] = verifier
+
+    monkeypatch.setattr(http_entry, "configure_http_auth", _capture)
+    monkeypatch.setenv("HYPERV_MCP_HTTP_TOKEN", "  padded-token  ")
+    monkeypatch.setenv("HYPERV_MCP_CONFIG", str(tmp_path / "absent.json"))
+    rc = http_entry.main([])
+    assert rc == 0
+    assert fake_server.run_calls == ["streamable-http"]
+    assert captured["verifier"]._token == "padded-token"
+
+
 def test_allow_anonymous_runs_without_token(tmp_path, monkeypatch, fake_server):
     monkeypatch.delenv("HYPERV_MCP_HTTP_TOKEN", raising=False)
     monkeypatch.setenv("HYPERV_MCP_CONFIG", str(tmp_path / "absent.json"))

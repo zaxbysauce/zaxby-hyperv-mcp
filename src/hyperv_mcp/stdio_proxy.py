@@ -242,7 +242,12 @@ def ensure_controller(cfg) -> None:
     in the per-user log file on BOTH spawn branches. In http.agents mode
     every agent variable must already be in this environment (the spawned
     controller validates them at startup), so a partial set fails fast here
-    rather than timing out the port wait."""
+    rather than timing out the port wait; outside agents mode the shared
+    http.token_env variable must already be set, because the spawned
+    controller inherits this environment and dies immediately without it —
+    refusing here turns a guaranteed spawn-death loop into one clean error.
+    Callers probe the port first (server.main does); this function assumes
+    it is not listening and is not re-entrant against a live controller."""
     agents = getattr(cfg.http, "agents", None) or {}
     if agents:
         missing = sorted(
@@ -269,6 +274,28 @@ def ensure_controller(cfg) -> None:
                 f"variable in this environment; missing: {', '.join(missing)}. "
                 f"{note}"
             )
+    if not agents and not os.environ.get(cfg.http.token_env, "").strip():
+        # The spawned controller inherits THIS environment and refuses to
+        # start without its token variable, so a tokenless spawn is a
+        # guaranteed immediate death: every client reconnect would repeat
+        # it (observed as an 87-spawn failure storm in one day), each
+        # attempt a fresh process this side of the port wait. Fail fast
+        # with the variable name instead; a controller started MANUALLY
+        # with --allow-anonymous is unaffected because auto-start only
+        # runs while the port is not listening.
+        raise ProxyRefused(
+            f"auto-start needs {cfg.http.token_env} set in this environment: "
+            "the controller refuses to start without it, so the spawn would "
+            "die immediately. Generate a token "
+            '(python -c "import secrets; print(secrets.token_urlsafe(32))") '
+            "and export it in this session; persist it for this user with "
+            f"setx {cfg.http.token_env} YOUR-TOKEN (setx applies to new "
+            "processes only); or start hyperv-mcp-http manually from a "
+            "shell that has it. If a manually started controller "
+            "(e.g. --allow-anonymous) is still coming up, wait for it to "
+            "bind or pass --proxy. Token values are never printed or "
+            "logged."
+        )
     deadline = time.monotonic() + AUTOSTART_WAIT_S
     log_path = _controller_log_path(cfg.http.port)
     host = cfg.http.host
