@@ -702,7 +702,7 @@ def guest_put(
         cfg, cred, ref.id, lp, rp, staged,
         fragment, assert_block, do_verify,
     ) if pswindows.hyperv_host(cfg) else (None, None)
-    with vmlocks.vm_lock(ref.id):
+    with vmlocks.vm_lock(ref.id, mode="read"):
         result = _run_transfer(
             cfg, ref.id, body, cred,
             composed_script=remote_script, composed_stdin=remote_stdin,
@@ -805,7 +805,7 @@ def guest_get(
         cfg, cred, ref.id, rp, lp, staged,
         assert_block, do_verify,
     ) if pswindows.hyperv_host(cfg) else (None, None)
-    with vmlocks.vm_lock(ref.id):
+    with vmlocks.vm_lock(ref.id, mode="read"):
         try:
             result = _run_transfer(
                 cfg, ref.id, body, cred,

@@ -14,7 +14,7 @@ import pytest
 
 from hyperv_mcp import errors, server, vmlocks
 from hyperv_mcp.config import Config, ConfigError
-from hyperv_mcp.vmlocks import VMBusy, _MAX_LOCKS, _pins, vm_lock
+from hyperv_mcp.vmlocks import _MAX_LOCKS, VMBusy, _pins, vm_lock
 
 
 def test_config_default_and_validation():
