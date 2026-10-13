@@ -359,9 +359,9 @@ def run_guest_inner(
     addresses the guest by pre-resolved GUID — no name resolution happens
     inside, so a renamed VM's stored entry can never silently re-target.
     `mode` scopes the VM lock (issue #14): "write" (default) for mutations
-    (repair apply, job stop); "read" for probes that only observe guest
-    state (job status/output, diagnose legs, evidence capture) so they can
-    share the VM with each other.
+    (repair apply); "read" for guest-state legs — job start/status/output/
+    stop, diagnose legs, evidence capture — so they can share the VM with
+    each other while VM-state writers still exclude them.
     Raises on transport failure/timeout; callers own error envelopes.
     """
     timeout_s = max(30, timeout_ms // 1000 + guestexec._GRACE_S)
