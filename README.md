@@ -122,7 +122,10 @@ shipped and pinned by the unit suite.
   the same rights as the client that started it; if you need a privileged
   shared controller, start `hyperv-mcp-http` yourself from a shell with the
   right token rather than letting a client auto-start it. Auto-start works
-  for a single shared token or a single-agent `http.agents` deployment (the
+  for a single shared token (the `http.token_env` variable must already be
+  set — auto-start refuses immediately, naming the variable, rather than
+  spawning a controller that would die without it) or a single-agent
+  `http.agents` deployment (the
   one agent's variable must be set); with MULTIPLE configured agents
   auto-start is unsupported by design — the controller validates every
   agent variable at startup while a proxy may present exactly one — so

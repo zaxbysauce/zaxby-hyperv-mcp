@@ -109,6 +109,57 @@ def test_single_agent_autostart_passes_the_guard(monkeypatch):
     assert started, "the single-agent shape must reach the spawn path"
 
 
+def test_shared_token_autostart_fails_fast_without_spawning(monkeypatch):
+    """No http.agents and a missing shared token_env variable: the spawned
+    controller inherits this environment and dies instantly without the
+    token (observed as an 87-spawn failure storm in one day), so
+    ensure_controller must refuse naming the variable BEFORE any spawn or
+    port wait."""
+    monkeypatch.delenv("HYPERV_MCP_HTTP_TOKEN", raising=False)
+    cfg = Config()
+    sentinel = _NoSpawn()
+    monkeypatch.setattr(stdio_proxy.subprocess, "Popen", sentinel)
+    monkeypatch.setattr(stdio_proxy.subprocess, "run", sentinel)
+    with pytest.raises(stdio_proxy.ProxyRefused) as excinfo:
+        stdio_proxy.ensure_controller(cfg)
+    message = str(excinfo.value)
+    assert "HYPERV_MCP_HTTP_TOKEN" in message, message
+    assert "die immediately" in message, message
+    assert sentinel.calls == [], "the refusal must precede any spawn"
+
+
+def test_shared_token_autostart_passes_the_guard_when_set(monkeypatch):
+    """With the shared token set, the missing-token guard must not refuse:
+    the spawn path is reached (stubbed) and the eventual refusal is the
+    port timeout, not a token message."""
+    monkeypatch.setenv("HYPERV_MCP_HTTP_TOKEN", "shared-value")
+    cfg = Config()
+    monkeypatch.setattr(stdio_proxy, "AUTOSTART_WAIT_S", 0.3)
+    monkeypatch.setattr(stdio_proxy, "port_listening", lambda *a, **k: False)
+    started: list[object] = []
+
+    class _Stub:
+        """Minimal spawn stub: stdout carries the success marker the
+        post-spawn gate inspects; stderr empty."""
+
+        stdout = "breakaway\n"
+        stderr = ""
+        returncode = 0
+
+    def fake_spawn(argv, **kwargs):  # noqa: ARG001 - stub signature
+        started.append(argv)
+        return _Stub()
+
+    monkeypatch.setattr(stdio_proxy.subprocess, "Popen", fake_spawn)
+    monkeypatch.setattr(stdio_proxy.subprocess, "run", fake_spawn)
+    with pytest.raises(stdio_proxy.ProxyRefused) as excinfo:
+        stdio_proxy.ensure_controller(cfg)
+    message = str(excinfo.value)
+    assert "did not accept connections" in message, message
+    assert "HYPERV_MCP_HTTP_TOKEN" not in message, message
+    assert started, "the shared-token shape must reach the spawn path"
+
+
 # ---------------------------------------------------------------------------
 # launcher script generation (PRR-006/PRR-027)
 # ---------------------------------------------------------------------------
