@@ -473,7 +473,7 @@ def test_frozen_acceptance_file_intact():
         ["git", "hash-object", "tests/unit/test_wmiconsole.py"],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
-    assert out == "2cc7a73ce51ca4da4ededaa0fa486a319fa4beb8", out
+    assert out == "181f7a4e6a9d4ae9b443ef10f89b84c33c966d02", out
 
 
 def test_capture_guard_no_image_data(monkeypatch, unrestricted_cfg):

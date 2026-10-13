@@ -127,9 +127,13 @@ def capture_evidence(
                 "tree": outcome.get("tree"),
             }
         except Exception as exc:
+            from . import errors  # late import: errors pulls the policy tree
             ui = {
                 "requested": True, "ok": False,
                 "error": str(exc),
+                # Feedback PRR-004: classify the swallowed failure (a lock
+                # expiry becomes "busy" here instead of an anonymous string).
+                "error_class": errors.classify(exc),
                 "note": "a PowerShell Direct session may not see an interactive desktop",
             }
     meta = dict(meta)

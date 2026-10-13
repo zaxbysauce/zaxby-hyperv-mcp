@@ -2,9 +2,11 @@
 
 On a real disposable VM: two concurrent guest file reads through
 filetransfer.guest_read_file must BOTH succeed with overlapping wall-clock
-intervals (a shared read scope on one VM), and a checkpoint_create that
-runs after them starts only once both readers have released (writer
-exclusion).
+intervals (a shared read scope on one VM), and a checkpoint_create called
+WHILE both readers hold the VM must start its Checkpoint-VM leg only after
+both readers release (writer exclusion under real contention — feedback
+PRR-010: starting the writer after reader joins made that assertion true
+by construction).
 
 Real-host constraint observed live 2026-10-13 (the issue's own AC7 note
  anticipated this: "PS Direct session setup is serialized per VM inside
@@ -35,26 +37,46 @@ import time
 
 import pytest
 
-from hyperv_mcp import filetransfer, lifecycle
+from hyperv_mcp import filetransfer, lifecycle, pswindows
 
 pytestmark = [pytest.mark.hyperv_real]
 
 # Multi-MB read so each leg lasts long enough for the second reader to
 # overlap the first (the issue's AC7: "a file of a few MB").
 _GUEST_FILE = r"C:\Windows\System32\ntoskrnl.exe"
-_READ_BYTES = 2 * 1024 * 1024
-# Stagger past the PS Direct handshake collision window (session
-# establishment takes ~1-2 s on real hosts); well inside the first read's
-# multi-MB hold, so the intervals still overlap.
-_STAGGER_S = 2.5
+_READ_BYTES = 4 * 1024 * 1024
+# Stagger clear of the PS Direct handshake collision window (measured:
+# same-instant establishment collides; 2.0 s leaves margin over the ~1-2 s
+# setup) yet well inside the first read's 4 MB hold (observed ~4-6 s per
+# leg), so the intervals overlap with >= 2 s of margin.
+_STAGGER_S = 2.0
 _SNAPSHOT = "c01-locks-probe"
 
 
-def test_guest_reads_share_vm_and_writer_waits(it):
-    """AC7: concurrent reads on one VM overlap; the writer starts only after
-    both readers release."""
+def test_guest_reads_share_vm_and_writer_waits(it, monkeypatch):
+    """AC7: concurrent reads on one VM overlap; a writer called while both
+    hold the VM starts its checkpoint leg only after they release."""
     cfg = it.cfg
     reads: dict[str, dict] = {}
+    second_read_entered = threading.Event()
+    read_leg_entries = 0
+    leg_lock = threading.Lock()
+    checkpoint_leg_starts: list[float] = []
+
+    real_run_ps = pswindows.run_ps
+
+    def watching_run_ps(script, **kwargs):
+        nonlocal read_leg_entries
+        if _GUEST_FILE in script:
+            with leg_lock:
+                read_leg_entries += 1
+                if read_leg_entries >= 2:
+                    second_read_entered.set()
+        if "Checkpoint-VM" in script:
+            checkpoint_leg_starts.append(time.monotonic())
+        return real_run_ps(script, **kwargs)
+
+    monkeypatch.setattr(pswindows, "run_ps", watching_run_ps)
 
     def read_worker(label: str, delay: float) -> None:
         time.sleep(delay)
@@ -81,48 +103,58 @@ def test_guest_reads_share_vm_and_writer_waits(it):
     r2 = threading.Thread(target=read_worker, args=("r2", _STAGGER_S))
     r1.start()
     r2.start()
+
+    # The writer is called only once BOTH reader legs are live — genuine
+    # three-way contention, not a post-hoc sequence (PRR-010).
+    writer: dict = {}
+
+    def write_worker() -> None:
+        began = time.monotonic()
+        try:
+            out = lifecycle.checkpoint_create(
+                cfg, vm_name=it.vm, checkpoint_name=_SNAPSHOT
+            )
+            writer.update({"called": began, "end": time.monotonic(), "result": out})
+        except Exception as exc:
+            writer.update(
+                {"called": began, "end": time.monotonic(), "error": type(exc).__name__,
+                 "error_text": str(exc)[:200]}
+            )
+
+    w = threading.Thread(target=write_worker)
+    assert second_read_entered.wait(120), "second reader leg never started"
+    w.start()
+
     r1.join(timeout=180)
     r2.join(timeout=180)
+    w.join(timeout=300)
 
-    # The two read legs shared the VM: both ok and their intervals overlapped.
-    assert reads["r1"]["ok"], f"first read failed: {reads['r1']['error']}"
-    assert reads["r2"]["ok"], f"second read failed: {reads['r2']['error']}"
+    # Both reads succeeded and overlapped in wall-clock time.
+    assert reads["r1"]["ok"], f"first read failed: {reads['r1'].get('error')}"
+    assert reads["r2"]["ok"], f"second read failed: {reads['r2'].get('error')}"
     r1_start, r1_end = reads["r1"]["start"], reads["r1"]["end"]
     r2_start, r2_end = reads["r2"]["start"], reads["r2"]["end"]
     assert r1_start <= r2_end and r2_start <= r1_end, (
         "the two concurrent reads did not overlap in time"
     )
 
-    # The writer runs only after both readers released: its call begins at or
-    # after the later read's end, and it succeeds (no busy, no overlap).
-    writer: dict = {}
-
-    def write_worker() -> None:
-        began = time.monotonic()
-        try:
-            out = lifecycle.checkpoint_create(cfg, vm_name=it.vm, checkpoint_name=_SNAPSHOT)
-            writer.update(
-                {"start": began, "end": time.monotonic(), "result": out}
-            )
-        except Exception as exc:
-            writer.update(
-                {"start": began, "end": time.monotonic(), "error": type(exc).__name__}
-            )
-
-    try:
-        w = threading.Thread(target=write_worker)
-        w.start()
-        w.join(timeout=300)
-        assert writer.get("result", {}).get("status") == "created", (
-            f"checkpoint_create did not succeed: {writer}"
+    # The writer really contended: it was CALLED while both reads were
+    # still in flight (before the later read ended) ...
+    assert writer.get("called", float("inf")) < max(r1_end, r2_end), (
+        f"writer was not called during the reads: {writer}"
+    )
+    # ... yet its Checkpoint-VM leg only STARTED after both released, and
+    # the checkpoint succeeded (writer exclusion under live contention).
+    assert checkpoint_leg_starts, f"checkpoint leg never ran: {writer}"
+    assert min(checkpoint_leg_starts) >= max(r1_end, r2_end), (
+        "checkpoint leg started while readers still held the VM"
+    )
+    assert writer.get("result", {}).get("status") == "created", (
+        f"checkpoint_create did not succeed: {writer}"
+    )
+    try:  # best-effort cleanup on a disposable VM
+        lifecycle.checkpoint_remove(
+            cfg, vm_name=it.vm, checkpoint_name=_SNAPSHOT, confirm=True
         )
-        assert writer["start"] >= max(r1_end, r2_end), (
-            "writer started before both readers released"
-        )
-    finally:
-        try:  # best-effort cleanup on a disposable VM
-            lifecycle.checkpoint_remove(
-                cfg, vm_name=it.vm, checkpoint_name=_SNAPSHOT, confirm=True
-            )
-        except Exception:
-            pass
+    except Exception:
+        pass

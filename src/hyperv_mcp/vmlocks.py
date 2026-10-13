@@ -15,11 +15,13 @@ sync tool calls (FND-01, Workstream C PR 3 / issue #16) — until then a
 second agent's call queues behind the first instead of fast-failing.
 
 Each VM key maps to a writer-preferring read/write lock (issue #14,
-FND-02/ENH-02): read-scope legs (guest probes, job status/output, file
-reads) run concurrently with each other; write-scope legs (VM power,
-checkpoints, media, firmware) exclude everything; a waiting writer is
-preferred over newly arriving readers so polling readers can never starve
-`stop_vm`/`checkpoint_restore` out indefinitely. A conflicting acquire
+FND-02/ENH-02): read-scope legs — guest probes, job start/status/output/
+stop, guest script execution, guest file transfers (incl. put/get),
+evidence capture — run concurrently with each other; write-scope legs
+(VM power, checkpoints, media, firmware, repair apply) exclude
+everything; a waiting writer is preferred over newly arriving readers so
+polling readers can never starve `stop_vm`/`checkpoint_restore` out
+indefinitely. A conflicting acquire
 waits up to a bounded window (`wait_s`, defaulting to
 `Config.vm_lock_wait_s`, 0 = fail fast) and then raises `VMBusy` carrying
 holder metadata (tool, mode, since, held_ms) so an agent can tell a 2 s
@@ -27,11 +29,13 @@ screenshot input from a 15 min restore. Re-entry from the holding thread
 fails fast (deadlock guard) and never waits.
 
 Locks are keyed by the case-folded VM GUID (the identity resolved by
-vmident.resolve, stable across renames). The key is an opaque string;
-vm_create locks on the not-yet-existing VM's name, which the
-duplicate-name guard keeps unique. Console input uses a second key
-`(vm_id, "console")` so two agents cannot interleave keystrokes while
-guest work on the VM key proceeds. Known residual: between `New-VM`
+vmident.resolve, stable across renames). A key is an opaque string, or a
+tuple for dual-key scopes; the two types live in disjoint registry
+namespaces, so no client-supplied name can alias a tuple key. vm_create
+locks on the not-yet-existing VM's name, which the duplicate-name guard
+keeps unique. Console input takes READ on the VM key plus a WRITE on the
+second key `(vm_id, "console")` so two agents cannot interleave
+keystrokes while guest work on the VM key proceeds. Known residual: between `New-VM`
 committing inside vm_create's script and that script finishing, the new
 VM is GUID-resolvable while the create still holds only the name key, so
 a concurrent GUID-keyed operation can overlap the (sub-second,
@@ -98,9 +102,41 @@ def _holder_dict(mode: str, since: float) -> dict:
     }
 
 
-def _busy(key: str, holder: dict) -> VMBusy:
+def _live_holder(holder: dict) -> dict:
+    """Copy of a stored holder record with held_ms recomputed at READ time.
+
+    The stored record's held_ms is a birth-time snapshot (~0); the busy
+    payload and message must report how long the holder has held the VM
+    NOW (issue #14 Verification: "a growing held_ms"). max(0, ...) guards
+    against a backward wall-clock step between acquire and failure.
+    """
+    return {
+        **holder,
+        "held_ms": max(0, int((time.time() - holder["since"]) * 1000)),
+    }
+
+
+def _display_key(key: object) -> str:
+    """Human form of a lock key for error messages: tuples join for
+    readability, but they never share a registry namespace with strings."""
+    if isinstance(key, tuple):
+        return "|".join(str(part) for part in key)
+    return str(key)
+
+
+def _busy(key: object, holder: dict | None) -> VMBusy:
+    if holder is None:
+        # Contention drained between the waiter's wakeup and its expiry:
+        # no holder exists, so claim none. Message keeps no tool clause and
+        # the envelope carries no holder key (honest absence over a
+        # fabricated self-blaming record).
+        return VMBusy(
+            f"another operation is already running on VM '{_display_key(key)}'; "
+            "wait for it to finish before starting a conflicting one",
+            holder=None,
+        )
     return VMBusy(
-        f"another operation is already running on VM '{key}': "
+        f"another operation is already running on VM '{_display_key(key)}': "
         f"tool={holder['tool']} mode={holder['mode']} held_ms={holder['held_ms']}; "
         "wait for it to finish before starting a conflicting one",
         holder=holder,
@@ -124,35 +160,44 @@ class _RWLock:
         self._readers: dict[int, dict] = {}  # tid -> holder dict
         self._writer: tuple[int, dict] | None = None  # (tid, holder dict)
         self._waiting_writers = 0
+        # Oldest queued writer's record, so a reader that times out while
+        # ONLY a queued writer blocks it can name that writer instead of
+        # fabricating a record about itself (feedback PRR-008).
+        self._pending_writer: dict | None = None
 
     def _current_holder(self) -> dict | None:
         """The holder record to report on failure: the writer, else the
-        longest-held reader."""
+        longest-held reader, else the oldest queued writer (a real blocker
+        even though not yet admitted), else None (contention drained)."""
         if self._writer is not None:
-            return self._writer[1]
+            return _live_holder(self._writer[1])
         if self._readers:
-            return min(self._readers.values(), key=lambda h: h["since"])
+            return _live_holder(min(self._readers.values(), key=lambda h: h["since"]))
+        if self._pending_writer is not None:
+            return _live_holder(self._pending_writer)
         return None
 
-    def acquire(self, key: str, mode: str, wait_s: float | None, tid: int) -> None:
+    def acquire(self, key: object, mode: str, wait_s: float | None, tid: int) -> None:
         # Re-entry from the holding thread fails fast: this lock is not
         # reentrant, and waiting would deadlock (AC8 keeps the phrase).
         with self._cv:
             if (self._writer is not None and self._writer[0] == tid) or tid in self._readers:
-                holder = self._current_holder()
-                raise _busy(key, holder or _holder_dict(mode, time.time()))
+                raise _busy(key, self._current_holder())
 
             deadline = None if wait_s is None else time.monotonic() + max(0.0, wait_s)
             if mode == "write":
                 self._waiting_writers += 1
+                if self._pending_writer is None:
+                    self._pending_writer = _holder_dict(mode, time.time())
                 try:
                     while self._writer is not None or self._readers:
                         if not self._wait_tick(deadline):
-                            holder = self._current_holder()
-                            raise _busy(key, holder or _holder_dict(mode, time.time()))
+                            raise _busy(key, self._current_holder())
                     self._writer = (tid, _holder_dict(mode, time.time()))
                 finally:
                     self._waiting_writers -= 1
+                    if self._waiting_writers == 0:
+                        self._pending_writer = None
                     # A timeout (or error) here must wake readers queued
                     # behind this writer; on success the new writer blocks
                     # them anyway, so an extra notify is harmless.
@@ -160,8 +205,7 @@ class _RWLock:
             else:
                 while self._writer is not None or self._waiting_writers > 0:
                     if not self._wait_tick(deadline):
-                        holder = self._current_holder()
-                        raise _busy(key, holder or _holder_dict(mode, time.time()))
+                        raise _busy(key, self._current_holder())
                 self._readers[tid] = _holder_dict(mode, time.time())
 
     def _wait_tick(self, deadline: float | None) -> bool:
@@ -194,17 +238,21 @@ class _RWLock:
             )
 
 
-_locks: dict[str, _RWLock] = {}
-_pins: dict[str, int] = {}  # in-flight fetches; never evict a pinned key
+_locks: dict[object, _RWLock] = {}  # str keys (VM ids/names) and tuple keys (dual-key scopes) are disjoint namespaces
+_pins: dict[object, int] = {}  # in-flight fetches; never evict a pinned key
 _registry_lock = threading.Lock()
 _MAX_LOCKS = 4096  # SOFT bound: held locks are never evicted, so a fully-held
 # registry can exceed it — mutual exclusion is never weakened for the bound.
 
 
-def _normalize_key(key: object) -> str:
-    """Case-folded lock key; tuple keys (console dual-key) join with '|'."""
+def _normalize_key(key: object) -> object:
+    """Case-folded lock key. Tuples normalize to TUPLES of case-folded
+    strings — a separate dict-key type that can never alias a plain-string
+    key, so a client-supplied VM name containing '|' (feedback PRR-009)
+    cannot collide with a console dual-key. Display only happens through
+    `_display_key`, which joins tuples for readability."""
     if isinstance(key, tuple):
-        return "|".join(str(part).casefold() for part in key)
+        return tuple(str(part).casefold() for part in key)
     return str(key).casefold()
 
 
@@ -260,8 +308,20 @@ def vm_lock(key: object, mode: str = "write", wait_s: float | None = None) -> It
         raise ValueError(f"vm_lock mode must be 'read' or 'write', not {mode!r}")
     if wait_s is None:
         wait_s = _DEFAULT_WAIT_S
+    # Validate BEFORE taking the pin (feedback PRR-014): a bad value used
+    # to reach max() inside the acquire and surface as TypeError/transport.
+    if not isinstance(wait_s, (int, float)) or isinstance(wait_s, bool):
+        raise ValueError(f"vm_lock wait_s must be a number in 0..{_MAX_WAIT_S:g}, not {wait_s!r}")
+    if not 0 <= float(wait_s) <= _MAX_WAIT_S:
+        raise ValueError(f"vm_lock wait_s must be in 0..{_MAX_WAIT_S:g}, not {wait_s!r}")
+    wait_s = float(wait_s)
+    # Capture the OWNING thread id at entry: if the context manager is
+    # finalized on another thread (ExitStack hand-off / GeneratorExit during
+    # GC — feedback PRR-015), the finally must still release THIS thread's
+    # records instead of silently wedging a phantom holder forever.
+    tid = threading.get_ident()
     lock = _acquire(key, mode, wait_s)
     try:
         yield
     finally:
-        lock.release(threading.get_ident())
+        lock.release(tid)

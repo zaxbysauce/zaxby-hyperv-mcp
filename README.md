@@ -267,6 +267,7 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
   "host_powershell_path": null,        // default: Windows PowerShell 5.1
   "verify_sha256": false,              // default integrity check for transfers
   "ps_timeout_s": 120,                 // default host PowerShell timeout
+  "vm_lock_wait_s": 30,                // per-VM lock bounded wait, 0..600 s (0 = fail fast)
   // "hyperv": { "host": "nuc01" },    // remote Hyper-V host (issue #43);
   //                                    // OMIT the section entirely for local mode
   //                                    // (the section requires a non-empty host)
@@ -523,17 +524,18 @@ These tools refuse to run unless their category is enabled **and** (when
 | `hyperv_repair_guest_access` (dry run) | none (read-only) |
 
 Denials return a structured `policy` error (no secrets, no speculative paths).
-Concurrency is also guarded per VM with scoped read/write locks: read-only
-legs (job status/output, guest file reads, diagnostics probes) share the VM
-with each other, while mutations (power, checkpoints, media, firmware,
-console input) exclude everything. A conflicting call waits up to
+Concurrency is also guarded per VM with scoped read/write locks: read
+legs — job start/status/output/stop, guest script execution, guest file
+transfers, diagnostics probes, evidence capture — share the VM with each
+other, while VM-state mutations (power, checkpoints, media, firmware) and
+repair apply exclude everything. A conflicting call waits up to
 `vm_lock_wait_s` (default 30 s, `0` = fail fast) and then returns a `busy`
 error whose payload carries `holder` — `{tool, mode, since, held_ms}` — so
 the caller can see what holds the VM and for how long. Waiting writers are
 admitted before newly arriving readers, so polling reads cannot starve a
-checkpoint restore. Console input additionally serializes all keystrokes on
-a second per-VM key, so two agents cannot interleave typing while guest work
-proceeds.
+checkpoint restore. Console input runs under a read lock on the VM key
+(guest work proceeds during typing) plus a write lock on a second per-VM
+key, so two agents cannot interleave keystrokes.
 
 ---
 
@@ -657,11 +659,15 @@ cases and requires the VM Off/Saved for the `Set-VMComPort` step.
   protocol), delivered with `isError: true` so failures are visible at the
   MCP protocol level — the envelope rides as the text content AND as
   `structuredContent`. The five keys are the minimum set; module-level
-  diagnostics (`timed_out`, `stopped`, `alive_pids`, ...) ride alongside.
+  diagnostics (`timed_out`, `stopped`, `alive_pids`, ...) ride alongside,
+  and `busy` failures additionally carry `holder`
+  (`{tool, mode, since, held_ms}` — see the Concurrency section above).
   The envelope and the audit log share one isinstance-based taxonomy, so a
   record's `error_class` always equals the envelope's.
 - (0.4.0) **Retry guidance:** `busy` is the only retryable class
-  (`retry_after_ms` is a fixed ~2s hint until per-holder waits land); every
+  (`retry_after_ms` is a fixed ~2s hint; the holder data an FND-14
+  derivation will consume now ships on busy envelopes — the derivation
+  itself remains with Workstream A PR 5); every
   other class — `policy`, `invalid`, `credential`, `timeout`, `transport`,
   `parse`, `integrity`, `not_found`, `guest` — is never retryable. A
   `timeout` is not safe to retry for guest execution because the

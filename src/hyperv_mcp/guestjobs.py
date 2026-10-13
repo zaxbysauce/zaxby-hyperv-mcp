@@ -49,7 +49,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import pswindows, vmident
+from . import pswindows, vmident, vmlocks
 from .config import Config
 from .credentials import CredentialSet
 from .diagnostics import run_guest_inner
@@ -555,6 +555,12 @@ def job_stop(cfg: Config, job_id: str, *, owner: str | None = None) -> dict:
             _stop_script(entry["pid"], entry["job_dir"], entry.get("start_time_ticks")),
             cred, mode="read",
         )
+    except vmlocks.VMBusy:
+        # Feedback PRR-002: a lock-contention expiry must surface as the
+        # server's busy envelope (error_class=busy + holder), not be
+        # rewritten to a non-retryable transport result after waiting the
+        # full bounded window. Re-raise; the tool wrapper envelopes it.
+        raise
     except Exception as exc:
         # Same documented key set as a successful stop plus the error pair,
         # so the 7-key contract holds on the error path too (PRR-004); the
