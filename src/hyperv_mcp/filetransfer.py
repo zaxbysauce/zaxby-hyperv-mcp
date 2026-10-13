@@ -864,7 +864,7 @@ $r = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptB
 }} -ArgumentList {pswindows.ps_quote(remote)}, {int(max_bytes)}
 $r | ConvertTo-Json -Compress
 """
-    with vmlocks.vm_lock(ref.id):
+    with vmlocks.vm_lock(ref.id, mode="read"):
         result = _run(
             cfg, body.strip(), timeout_s=120, stdin_b64=pswindows.utf8_b64(cred.password)
         )
@@ -920,7 +920,7 @@ $items = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -Scr
 }} -ArgumentList {pswindows.ps_quote(remote)}
 if ($items) {{ @($items) | ConvertTo-Json -Compress }} else {{ '[]' }}
 """
-    with vmlocks.vm_lock(ref.id):
+    with vmlocks.vm_lock(ref.id, mode="read"):
         result = _run(
             cfg, body.strip(), timeout_s=60, stdin_b64=pswindows.utf8_b64(cred.password)
         )

@@ -367,7 +367,7 @@ def guest_run_ps(
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     if elevated:
         policy.require_destructive(cfg, "elevated_exec", confirm, f"run an elevated script on '{ref.name}'")
-    with vmlocks.vm_lock(ref.id):
+    with vmlocks.vm_lock(ref.id, mode="read"):
         inner = f"{_LE_RESET}\n{script}\n{_EXIT_PROPAGATION}"
         return _run_inner(cfg, ref.id, inner, cred, timeout_ms, elevated, vm_name=ref.name)
 
@@ -412,7 +412,7 @@ def guest_run(
         lines.append("} finally { Pop-Location }")
     else:
         lines.append(_EXIT_PROPAGATION)
-    with vmlocks.vm_lock(ref.id):
+    with vmlocks.vm_lock(ref.id, mode="read"):
         return _run_inner(cfg, ref.id, "\n".join(lines), cred, timeout_ms, elevated, vm_name=ref.name)
 
 
@@ -430,7 +430,7 @@ def victim_run_ps(
     if (not vm_name and not vm_id) or not script:
         raise ValueError("vm_name (or vm_id) and script are required")
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
-    with vmlocks.vm_lock(ref.id):
+    with vmlocks.vm_lock(ref.id, mode="read"):
         inner = f"{_LE_RESET}\n{script}\n{_EXIT_PROPAGATION}"
         return _run_inner(cfg, ref.id, inner, cred, timeout_ms, elevated=False, vm_name=ref.name)
 

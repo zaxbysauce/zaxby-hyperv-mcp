@@ -523,8 +523,17 @@ These tools refuse to run unless their category is enabled **and** (when
 | `hyperv_repair_guest_access` (dry run) | none (read-only) |
 
 Denials return a structured `policy` error (no secrets, no speculative paths).
-Concurrency is also guarded: one operation per VM at a time (`busy` error
-otherwise).
+Concurrency is also guarded per VM with scoped read/write locks: read-only
+legs (job status/output, guest file reads, diagnostics probes) share the VM
+with each other, while mutations (power, checkpoints, media, firmware,
+console input) exclude everything. A conflicting call waits up to
+`vm_lock_wait_s` (default 30 s, `0` = fail fast) and then returns a `busy`
+error whose payload carries `holder` — `{tool, mode, since, held_ms}` — so
+the caller can see what holds the VM and for how long. Waiting writers are
+admitted before newly arriving readers, so polling reads cannot starve a
+checkpoint restore. Console input additionally serializes all keystrokes on
+a second per-VM key, so two agents cannot interleave typing while guest work
+proceeds.
 
 ---
 

@@ -56,6 +56,7 @@ from . import (
     relay,
     repair,
     stdio_proxy,
+    vmlocks,
 )
 from .config import Config, ConfigError
 
@@ -134,6 +135,7 @@ def bootstrap(environ: dict[str, str] | None = None) -> Config:
     credentials.init(cfg)
     pswindows.init(cfg, credentials.redact)
     auditlog.init(cfg)
+    vmlocks.set_default_wait_s(cfg.vm_lock_wait_s)  # issue #14 bounded lock wait
     auth = None
     if _http_token_verifier is not None:
         # FastMCP requires AuthSettings when a token_verifier is installed.

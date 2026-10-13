@@ -423,9 +423,10 @@ def test_c8_zero_spawns(monkeypatch, unrestricted_cfg):
     real_lock = vmlocks.vm_lock
 
     @contextlib.contextmanager
-    def recording_lock(key):
+    def recording_lock(key, *args, **kwargs):
+        # Issue #14: vm_lock gained mode=/wait_s=; record and pass through.
         locked.append(key)
-        with real_lock(key):
+        with real_lock(key, *args, **kwargs):
             yield
 
     monkeypatch.setattr(vmlocks, "vm_lock", recording_lock)

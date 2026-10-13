@@ -117,7 +117,7 @@ def capture_evidence(
             outcome = run_guest_inner(
                 cfg, ref.id,
                 _uia_script(ui_tree_depth, ui_tree_max_elements), tree_cred,
-                timeout_ms=60000,
+                timeout_ms=60000, mode="read",
             )
             ui = {
                 "requested": True,

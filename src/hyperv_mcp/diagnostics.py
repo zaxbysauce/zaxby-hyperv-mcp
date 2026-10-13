@@ -348,7 +348,7 @@ def build_guest_script(vm_id: str, inner_script: str, cred: CredentialSet, cfg=N
 
 def run_guest_inner(
     cfg: Config, vm_id: str, inner_script: str, cred: CredentialSet,
-    timeout_ms: int = 60000,
+    timeout_ms: int = 60000, mode: str = "write",
 ) -> dict:
     """Run one PS Direct inner script on the VM identified by a pre-resolved
     GUID, under vm_lock keyed on that GUID, and return its parsed JSON.
@@ -358,11 +358,15 @@ def run_guest_inner(
     (guestjobs passes the GUID stored at job_start). Contract: the caller
     addresses the guest by pre-resolved GUID — no name resolution happens
     inside, so a renamed VM's stored entry can never silently re-target.
+    `mode` scopes the VM lock (issue #14): "write" (default) for mutations
+    (repair apply, job stop); "read" for probes that only observe guest
+    state (job status/output, diagnose legs, evidence capture) so they can
+    share the VM with each other.
     Raises on transport failure/timeout; callers own error envelopes.
     """
     timeout_s = max(30, timeout_ms // 1000 + guestexec._GRACE_S)
     script = _guest_leg_script(vm_id, inner_script, cred, cfg)
-    with vm_lock(vm_id):
+    with vm_lock(vm_id, mode=mode):
         result = _run(
             cfg, script, timeout_s=timeout_s,
             stdin_b64=pswindows.utf8_b64(cred.password),
@@ -392,7 +396,7 @@ def diagnose_report(
 
     host_info: dict = {}
     host_error = ""
-    with vm_lock(vm_id):
+    with vm_lock(vm_id, mode="read"):
         try:
             host_info = _run_host_leg(cfg, vm_id)
         except Exception as exc:  # host WMI leg failure is a result, not fatal
@@ -400,7 +404,7 @@ def diagnose_report(
 
     guest: dict | None = None
     ps_direct: dict = {"available": False}
-    with vm_lock(vm_id):
+    with vm_lock(vm_id, mode="read"):
         try:
             guest = _run_guest_probe(cfg, vm_id, cred, timeout_ms)
             ps_direct = {"available": True}
@@ -552,7 +556,7 @@ def wait_guest_recovery(
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
 
     script = _recovery_script(ref.id, cred, services, processes, timeout_s, interval_s, cfg)
-    with vm_lock(ref.id):
+    with vm_lock(ref.id, mode="read"):
         result = _run(
             cfg, script,
             timeout_s=timeout_s + 15,
