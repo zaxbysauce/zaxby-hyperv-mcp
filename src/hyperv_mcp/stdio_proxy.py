@@ -245,7 +245,9 @@ def ensure_controller(cfg) -> None:
     rather than timing out the port wait; outside agents mode the shared
     http.token_env variable must already be set, because the spawned
     controller inherits this environment and dies immediately without it —
-    refusing here turns a guaranteed spawn-death loop into one clean error."""
+    refusing here turns a guaranteed spawn-death loop into one clean error.
+    Callers probe the port first (server.main does); this function assumes
+    it is not listening and is not re-entrant against a live controller."""
     agents = getattr(cfg.http, "agents", None) or {}
     if agents:
         missing = sorted(
@@ -286,10 +288,13 @@ def ensure_controller(cfg) -> None:
             "the controller refuses to start without it, so the spawn would "
             "die immediately. Generate a token "
             '(python -c "import secrets; print(secrets.token_urlsafe(32))") '
-            "and export it, persist it for this user "
-            f"(setx {cfg.http.token_env} <value>), or start hyperv-mcp-http "
-            "manually from a shell that has it. Token values are never "
-            "printed or logged."
+            "and export it in this session; persist it for this user with "
+            f"setx {cfg.http.token_env} YOUR-TOKEN (setx applies to new "
+            "processes only); or start hyperv-mcp-http manually from a "
+            "shell that has it. If a manually started controller "
+            "(e.g. --allow-anonymous) is still coming up, wait for it to "
+            "bind or pass --proxy. Token values are never printed or "
+            "logged."
         )
     deadline = time.monotonic() + AUTOSTART_WAIT_S
     log_path = _controller_log_path(cfg.http.port)

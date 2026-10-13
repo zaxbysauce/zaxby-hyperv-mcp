@@ -1,15 +1,24 @@
 """Feedback-round tests for the stdio proxy's auto-start preconditions and
 the logon-task launcher's script generation (PR 51 swarm-pr-review findings
-PRR-001/PRR-006/PRR-027; NOT part of the checkpoint-anchored C1-C8 file).
+PRR-001/PRR-006/PRR-027 and PR 54 review findings PRR-001..PRR-020; NOT
+part of the checkpoint-anchored C1-C8 file).
 
 - agents-mode auto-start must fail fast naming the missing agent token
   variables (never burn the 15 s port timeout on a controller that cannot
   start), while a single-agent environment passes the guard;
+- shared-token (non-agents) auto-start must fail fast naming http.token_env
+  when it is absent OR whitespace-only, must honor a CONFIGURED custom
+  token_env name, and the token-present shape must reach the spawn without
+  leaking the value into argv or messages;
 - --install-logon-task's generated Register-ScheduledTask script must
   PARSE in real PowerShell with --host/--port embedded inside the
   -Argument literal, and a single-flag usage must be refused rc 2;
 - the -Execute path is single-quote-escaped (a path containing an
   apostrophe must not break the task definition).
+
+NOTE (issue #55): the graceful-EOF test planned for
+test_proxy_exits_after_client_stdin_eof belongs in THIS file — expect a
+mechanical conflict in the shared-token region when that fix lands.
 """
 
 import base64
@@ -75,16 +84,23 @@ def test_agents_autostart_zero_vars_names_all(monkeypatch):
     assert sentinel.calls == []
 
 
-def test_single_agent_autostart_passes_the_guard(monkeypatch):
+def test_single_agent_autostart_passes_the_guard(monkeypatch, tmp_path):
     """With the ONE configured agent's var set, the agents-mode guard must
     not refuse (the spawned controller validates all configured agents and
     exactly one is configured here). Assert via a stub spawn that the guard
     lets the spawn happen — the port never listens, so the refusal that
-    follows must be the TIMEOUT message, not a missing-var message."""
+    follows must be the TIMEOUT message, not a missing-var message. The
+    controller log path is stubbed so the test never touches the operator's
+    real per-user log (PRR-002 applies to every guard-passing test here)."""
     monkeypatch.setenv("FEEDBACK_SOLO_TOKEN", "solo-value")
     cfg = _agents_cfg({"solo": "FEEDBACK_SOLO_TOKEN"})
     monkeypatch.setattr(stdio_proxy, "AUTOSTART_WAIT_S", 0.3)
     monkeypatch.setattr(stdio_proxy, "port_listening", lambda *a, **k: False)
+    monkeypatch.setattr(
+        stdio_proxy,
+        "_controller_log_path",
+        lambda port: str(tmp_path / f"http-controller-{port}.log"),
+    )
     started: list[object] = []
 
     class _Stub:
@@ -125,17 +141,32 @@ def test_shared_token_autostart_fails_fast_without_spawning(monkeypatch):
     message = str(excinfo.value)
     assert "HYPERV_MCP_HTTP_TOKEN" in message, message
     assert "die immediately" in message, message
+    # PRR-006: the manual-anonymous startup window must stay discoverable
+    # from the error text; PRR-016: the setx hint must stay paste-safe —
+    # `setx VAR a b` is a syntax error, so the pasteable fragment must be
+    # exactly two tokens and the caveat must live outside it.
+    assert "wait for it to bind or pass --proxy" in message, message
+    assert "YOUR-TOKEN" in message and "<value>" not in message, message
+    assert "setx HYPERV_MCP_HTTP_TOKEN YOUR-TOKEN" in message, message
+    assert "setx applies to new processes only" in message, message
     assert sentinel.calls == [], "the refusal must precede any spawn"
 
 
-def test_shared_token_autostart_passes_the_guard_when_set(monkeypatch):
+def test_shared_token_autostart_passes_the_guard_when_set(monkeypatch, tmp_path):
     """With the shared token set, the missing-token guard must not refuse:
     the spawn path is reached (stubbed) and the eventual refusal is the
-    port timeout, not a token message."""
+    port timeout, not a token message. The controller log path is stubbed
+    so the test never touches the operator's real per-user log (PRR-002),
+    and neither argv nor message may carry the token value (PRR-011)."""
     monkeypatch.setenv("HYPERV_MCP_HTTP_TOKEN", "shared-value")
     cfg = Config()
     monkeypatch.setattr(stdio_proxy, "AUTOSTART_WAIT_S", 0.3)
     monkeypatch.setattr(stdio_proxy, "port_listening", lambda *a, **k: False)
+    monkeypatch.setattr(
+        stdio_proxy,
+        "_controller_log_path",
+        lambda port: str(tmp_path / f"http-controller-{port}.log"),
+    )
     started: list[object] = []
 
     class _Stub:
@@ -157,7 +188,47 @@ def test_shared_token_autostart_passes_the_guard_when_set(monkeypatch):
     message = str(excinfo.value)
     assert "did not accept connections" in message, message
     assert "HYPERV_MCP_HTTP_TOKEN" not in message, message
+    assert "shared-value" not in message, "token value leaked into the refusal"
     assert started, "the shared-token shape must reach the spawn path"
+    assert not any(
+        "shared-value" in str(argv) for argv in started
+    ), f"token value leaked into spawn argv: {started!r}"
+
+
+def test_shared_token_autostart_refuses_whitespace_only(monkeypatch):
+    """A whitespace-only token is 'not set' for the guard (strip
+    semantics, PRR-003): a mutation dropping .strip() from the predicate
+    must not survive the suite."""
+    monkeypatch.setenv("HYPERV_MCP_HTTP_TOKEN", "   ")
+    cfg = Config()
+    sentinel = _NoSpawn()
+    monkeypatch.setattr(stdio_proxy.subprocess, "Popen", sentinel)
+    monkeypatch.setattr(stdio_proxy.subprocess, "run", sentinel)
+    with pytest.raises(stdio_proxy.ProxyRefused) as excinfo:
+        stdio_proxy.ensure_controller(cfg)
+    message = str(excinfo.value)
+    assert "HYPERV_MCP_HTTP_TOKEN" in message, message
+    assert sentinel.calls == [], "the refusal must precede any spawn"
+
+
+def test_shared_token_autostart_names_custom_token_env(monkeypatch):
+    """A configured http.token_env name must drive BOTH the guard's env
+    lookup and the refusal message (PRR-004): the default name being set
+    must not satisfy a custom-named config, and a hardcoded default name
+    in the message must not survive."""
+    monkeypatch.setenv("HYPERV_MCP_HTTP_TOKEN", "default-name-value")
+    monkeypatch.delenv("CUSTOM_FEEDBACK_TOKEN", raising=False)
+    cfg = Config()
+    object.__setattr__(cfg.http, "token_env", "CUSTOM_FEEDBACK_TOKEN")
+    sentinel = _NoSpawn()
+    monkeypatch.setattr(stdio_proxy.subprocess, "Popen", sentinel)
+    monkeypatch.setattr(stdio_proxy.subprocess, "run", sentinel)
+    with pytest.raises(stdio_proxy.ProxyRefused) as excinfo:
+        stdio_proxy.ensure_controller(cfg)
+    message = str(excinfo.value)
+    assert "CUSTOM_FEEDBACK_TOKEN" in message, message
+    assert "HYPERV_MCP_HTTP_TOKEN" not in message, message
+    assert sentinel.calls == [], "the refusal must precede any spawn"
 
 
 # ---------------------------------------------------------------------------

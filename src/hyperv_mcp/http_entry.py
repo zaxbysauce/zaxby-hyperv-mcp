@@ -337,7 +337,12 @@ def main(argv: list[str] | None = None) -> int:
             allow_anonymous=ns.allow_anonymous,
         )
     token_env = cfg.http.token_env
-    token = os.environ.get(token_env, "")
+    # Strip, matching _resolve_agent_tokens and stdio_proxy's strip
+    # semantics: a padded value must not bind a verifier that the proxy's
+    # stripped presentation could never match (permanent 401 with the port
+    # held), and whitespace-only must read as missing, like the auto-start
+    # guard claims.
+    token = os.environ.get(token_env, "").strip()
 
     verifier: TokenVerifier | None = None
     if ns.allow_anonymous:
