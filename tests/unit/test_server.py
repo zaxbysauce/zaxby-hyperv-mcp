@@ -80,7 +80,8 @@ def fresh_server():
 def _schemas(mod):
     mcp = mod.get_mcp()
     tools = asyncio.run(mcp.list_tools())
-    return {t.name: t.inputSchema for t in tools}
+    # mcp 1.x Tool exposes inputSchema; 2.x exposes input_schema.
+    return {t.name: (getattr(t, "input_schema", None) or t.inputSchema) for t in tools}
 
 
 def test_tool_inventory_registered(fresh_server):
@@ -145,7 +146,7 @@ def test_inline_credential_mode_exposes_params(tmp_path, fresh_server):
 def test_tpm_secureboot_enabled_required_in_schema(fresh_server):
     """PRR-001: `enabled` must be semantically required — omission+confirm must
     never silently DISABLE TPM/SecureBoot. The keyword-only no-default param
-    makes FastMCP publish required:["enabled"] (probe-verified)."""
+    makes the SDK publish required:["enabled"] (probe-verified)."""
     mod = fresh_server({})
     schemas = _schemas(mod)
     for name in ("hyperv_vm_tpm_set", "hyperv_vm_secureboot_set"):

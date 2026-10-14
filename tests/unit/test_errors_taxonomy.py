@@ -35,6 +35,24 @@ class UnknownFault(RuntimeError):
     """An unmapped subclass: must classify as transport, never verbatim."""
 
 
+def _result_envelope(result) -> dict:
+    """The structured envelope from a call_tool result across SDK
+    generations: mcp 1.x CallToolResult exposes structuredContent, 2.x
+    exposes structured_content."""
+    env = getattr(result, "structured_content", None)
+    if env is None:
+        env = getattr(result, "structuredContent", None)
+    assert env is not None, f"no structured envelope on {type(result).__name__}"
+    return env
+
+
+def _result_is_error(result) -> bool:
+    flag = getattr(result, "is_error", None)
+    if flag is None:
+        flag = getattr(result, "isError", None)
+    return flag is True
+
+
 def test_classify_most_specific_first():
     assert errors.classify(PolicyDenied("vm", "denied")) == "policy"
     assert errors.classify(CredentialError("no creds")) == "credential"
@@ -148,7 +166,7 @@ def test_every_tool_has_no_output_model(registered_tools):
     wrapped output model would validate failure CallToolResults against a
     `result:`-keyed model and reject envelope delivery. Only bare
     `-> CallToolResult` annotations (or plain -> dict / -> list) are safe."""
-    from mcp.server.fastmcp.utilities.func_metadata import func_metadata
+    from mcp.server.mcpserver.utilities.func_metadata import func_metadata
 
     bad = []
     for name, fn in registered_tools.items():
@@ -163,7 +181,7 @@ def test_success_result_serializer_matches_convert_to_content():
     changing success_result's to_json indent left the suite green). The
     metadata sidecar text must be byte-identical to what
     func_metadata._convert_to_content produces for the same dict."""
-    from mcp.server.fastmcp.utilities.func_metadata import _convert_to_content
+    from mcp.server.mcpserver.utilities.func_metadata import _convert_to_content
 
     meta = {"vm_id": "e953c649", "frame_hash": "abc", "width": 640,
             "unicode": "café", "nested": {"a": 1}}
@@ -194,8 +212,8 @@ def test_wrong_typed_declared_arg_enveloped_and_audited(monkeypatch, tmp_path):
     result = asyncio.run(mcp.call_tool(
         "hyperv_wait_vm_state", {"vm_name": "test-vm", "states": "Exploded"}
     ))
-    assert result.isError is True
-    env = result.structuredContent
+    assert _result_is_error(result)
+    env = _result_envelope(result)
     assert env["ok"] is False and env["error_class"] == "invalid"
     assert env["retryable"] is False and env["retry_after_ms"] is None
     records = [_json.loads(ln) for ln in
@@ -227,7 +245,7 @@ def test_module_dict_without_error_class_audits_envelope_class(monkeypatch, tmp_
 
     monkeypatch.setattr("hyperv_mcp.lifecycle.get_vm_info", classless_failure)
     result = asyncio.run(mcp.call_tool("hyperv_get_vm_info", {"vm_name": "test-vm"}))
-    env = result.structuredContent
+    env = _result_envelope(result)
     assert env["ok"] is False and env["error"] == "module said no"
     assert env["error_class"] == "transport"
     assert env["retryable"] is False and env["retry_after_ms"] is None
@@ -256,7 +274,7 @@ def test_guard_survives_broken_audit_sink(monkeypatch, tmp_path, capsys):
 
     monkeypatch.setattr(mod.auditlog, "log_operation", broken_sink)
     result = asyncio.run(mcp.call_tool("hyperv_list_vms", {"bogus": True}))
-    env = result.structuredContent
+    env = _result_envelope(result)
     assert env["ok"] is False and env["error_class"] == "invalid"
     assert "bogus" in env["error"]
     captured = capsys.readouterr().err
@@ -266,9 +284,9 @@ def test_guard_survives_broken_audit_sink(monkeypatch, tmp_path, capsys):
 def test_harden_tools_warns_loudly_on_empty_registry(capsys):
     """PRR-015 fix: if the SDK's private tool registry shape changes, the
     hardening pass must say so on stderr instead of failing open silently."""
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
 
-    server_module._harden_tools(FastMCP("probe-empty"))
+    server_module._harden_tools(MCPServer("probe-empty"))
     captured = capsys.readouterr().err
     assert "found no registered tools" in captured
 
@@ -297,7 +315,7 @@ def test_registered_secret_redacted_in_validation_envelope(monkeypatch, tmp_path
         "hyperv_guest_run_ps",
         {"vm_name": "test-vm", "script": {"k": secret}},
     ))
-    env = result.structuredContent
+    env = _result_envelope(result)
     assert env["ok"] is False and env["error_class"] == "invalid"
     assert secret not in env["error"], "registered secret leaked into the envelope"
     assert "***REDACTED***" in env["error"]

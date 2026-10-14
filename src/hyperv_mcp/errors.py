@@ -141,14 +141,14 @@ def enrich_failure(env: dict[str, Any]) -> dict[str, Any]:
 def failure_result(env: dict[str, Any]) -> CallToolResult:
     """Deliver a failure envelope with isError=true.
 
-    FastMCP passes a returned CallToolResult through verbatim
-    (func_metadata.convert_result), so this is the only mechanism by which
+    The SDK passes a returned CallToolResult through verbatim
+    (FuncMetadata.convert_result), so this is the only mechanism by which
     a failure is visible at the protocol level.
     """
     return CallToolResult(
         content=[TextContent(type="text", text=json.dumps(env))],
-        structuredContent=env,
-        isError=True,
+        structured_content=env,
+        is_error=True,
     )
 
 
@@ -158,7 +158,7 @@ def success_result(blocks: list[Any]) -> CallToolResult:
     Blocks already carrying content types (ImageContent/TextContent) pass
     through; plain dicts (metadata sidecars, VM rows) each become one
     TextContent serialized with the same pydantic_core.to_json form
-    func_metadata._convert_to_content uses, so the wire content is
+    FuncMetadata.convert_result uses, so the wire content is
     byte-identical to the converted-list delivery on every interpreter.
     """
     from pydantic_core import to_json
@@ -174,4 +174,4 @@ def success_result(blocks: list[Any]) -> CallToolResult:
             )
         else:
             content.append(block)
-    return CallToolResult(content=content, structuredContent=None, isError=False)
+    return CallToolResult(content=content, structured_content=None, is_error=False)

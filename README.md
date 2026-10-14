@@ -105,11 +105,14 @@ messages unchanged between the client's stdio and the ONE shared
 `hyperv-mcp-http` controller, so every agent shares the same per-VM locks,
 job/relay registries and audit sink. With `http.agents` configured, every
 audit row names the calling agent; with the shared token alone, rows carry
-the shared principal (`local-cli`). Cross-agent mutual exclusion through that one shared lock lands with
-the controller's concurrency work (Workstream C): until then, a second
-agent's conflicting call queues behind the first (FND-01) instead of
-fast-failing with `error_class: "busy"` — the in-process busy path itself is
-shipped and pinned by the unit suite.
+the shared principal (`local-cli`). Since 0.4.0 the controller no longer
+serializes tool calls (FND-01): every tool body runs on an anyio worker
+thread, so a second agent's conflicting call fast-fails with
+`error_class: "busy"` (carrying the holder's tool, mode and wait) instead of
+queueing behind the first — and a fast call no longer waits behind a slow
+one. Tool concurrency is bounded by a dedicated thread limiter sized at
+2x the host PowerShell cap (`max_host_powershell`), installed at server
+start on both transports.
 
 - **Default (no flags):** proxy to the controller at `http.host`/`http.port`
   from your config (default `127.0.0.1:8787`). If nothing is listening
@@ -138,6 +141,28 @@ shipped and pinned by the unit suite.
   Use it for disposable single-agent work.
 - **`--check-env`:** unchanged (prints policy/provenance, exits; never
   contacts or starts a controller).
+
+### 0.4.0 breaking changes
+
+- **SDK major: mcp 2.x.** The package now requires `mcp>=2.3,<3` (was
+  1.x) and the server object is an `mcp.server.mcpserver.MCPServer` (was
+  `FastMCP`). New transitive dependencies arrive with it (`httpx2`,
+  `mcp-types`, `opentelemetry-api`, and `pywin32` on Windows); the stdio
+  proxy's upstream HTTP client is now `httpx2` (the SDK's own HTTP stack).
+- **In-process embedders see the 2.x call shape.** `call_tool()` returns a
+  `CallToolResult` (`.content`, `.structured_content`, `.is_error`) instead
+  of the 1.x content list, and `list_tools()` exposes each tool's schema as
+  `input_schema` (was `inputSchema`). Tool NAMES, parameters, docstrings,
+  `confirm` gating and the failure envelope are unchanged. Embedders that
+  drive `hyperv_mcp.server.get_mcp()` in process should port to the 2.x
+  shapes; clients over stdio or streamable-http see no change.
+- **`from hyperv_mcp.server import mcp`** (the 0xntpower compat import)
+  now yields an `MCPServer` — still without a bearer-token verifier; prefer
+  the `hyperv-mcp-http` entry point for HTTP.
+- **Concurrency is real.** One server process now runs tool calls
+  concurrently (bounded by the 2x-`max_host_powershell` thread limiter), the
+  event loop stays responsive during long calls, and a cancelled request
+  kills its PowerShell tree and releases its VM lock within about a second.
 
 Failure behavior: if the controller is unreachable or rejects the token, a
 pending request is answered with a JSON-RPC error (code -32000) and the
@@ -584,11 +609,14 @@ PowerShell process tree for that leg before returning, releases the slot,
 and closes the Job Object handle — previously the child kept running and
 kept the caller's VM lock held until it finished on its own (the VM lock
 itself is released by the caller as the exception unwinds). When the leg
-runs in an anyio worker thread, `run_ps` also observes host-task
-cancellation between 0.2 s polling slices and kills promptly instead of
-running the leg out; wiring MCP request cancellation end to end (tool
-calls moving off the event loop, `notifications/cancelled` delivery) is a
-separate change. The guest-side process of a PowerShell Direct leg may
+runs in an anyio worker thread — where every tool body runs since 0.4.0
+(mcp 2.x dispatches sync handlers through `anyio.to_thread.run_sync`) —
+`run_ps` also observes host-task cancellation between 0.2 s polling slices
+and kills promptly instead of running the leg out. MCP request cancellation
+is therefore wired end to end: a client cancelling a call (over
+streamable-http, by closing its response stream) settles the call within
+about a second, kills the host PowerShell tree, and releases the VM lock.
+The guest-side process of a PowerShell Direct leg may
 still be running after such a kill; that is the documented timeout
 semantics (see "Timeout semantics") and applies to cancellation the same
 way.

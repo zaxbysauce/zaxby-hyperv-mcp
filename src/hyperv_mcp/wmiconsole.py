@@ -127,7 +127,7 @@ def _com_thread():
     thread. The calling thread joins the process MTA ONCE and never
     uninitializes: repeated CoUninitialize cycles around cached SWbem
     objects segfault at release (live-host verified — the anchor-only
-    probe pattern is the stable one), and FastMCP worker threads live as
+    probe pattern is the stable one), and SDK worker threads live as
     long as the process, so per-thread references are bounded."""
     _ensure_thread_com()
     yield

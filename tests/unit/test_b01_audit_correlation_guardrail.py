@@ -40,7 +40,8 @@ class _FakeMcp:
         self.settings = _FakeSettings()
         self.run_calls = []
 
-    def run(self, transport="stdio"):
+    def run(self, transport="stdio", **kwargs):
+        # 2.x hands the bind (host/port) to run(**kwargs); 1.x used settings.
         self.run_calls.append(transport)
         return 0
 

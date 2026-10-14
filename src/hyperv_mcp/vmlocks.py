@@ -1,18 +1,17 @@
 """Per-VM scoped read/write locks with bounded waits and holder metadata.
 
-When the server dispatches tool calls concurrently WITHIN one process (an
-SDK- or config-dependent property — current sync tools mostly run inline on
-the event loop), a checkpoint restore racing a guest execution on the same
-VM is exactly the kind of interference this prevents; the lock is the
-arbitration point for that in-process concurrency whenever it occurs. The
+The server dispatches tool calls concurrently WITHIN one process: mcp 2.x
+runs every sync tool body on a worker thread, so a checkpoint restore racing
+a guest execution on the same VM is exactly the kind of interference this
+lock prevents; the lock is the arbitration point for that concurrency. The
 lock covers ONE process only: it is a module-dict entry, so two separately
 spawned `hyperv-mcp` servers never exclude each other — which is why the
 default deployment proxies every client to the ONE shared controller (see
 stdio_proxy / README "Shared controller"), putting every agent's calls into
 this lock's process. Within that process the path applies across agents;
-observable cross-agent VMBusy lands once the controller stops serializing
-sync tool calls (FND-01, Workstream C PR 3 / issue #16) — until then a
-second agent's call queues behind the first instead of fast-failing.
+cross-agent VMBusy is observable and fast-fails (with holder metadata)
+instead of queueing — the serialization that used to hide it ended with
+FND-01's fix (Workstream C PR 3 / issue #16).
 
 Each VM key maps to a writer-preferring read/write lock (issue #14,
 FND-02/ENH-02): read-scope legs — guest probes, job start/status/output/

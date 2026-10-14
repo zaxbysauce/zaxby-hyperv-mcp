@@ -32,10 +32,12 @@ import os
 import re
 import subprocess
 import sys
+from contextlib import asynccontextmanager
 from typing import Any
 
+import anyio
 from mcp.server.auth.settings import AuthSettings
-from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.mcpserver import Image, MCPServer
 from mcp.shared.exceptions import UrlElicitationRequiredError
 from mcp.types import LATEST_PROTOCOL_VERSION, CallToolResult
 from pydantic import AnyHttpUrl
@@ -77,7 +79,7 @@ _INSTRUCTIONS = (
     "provenance (PowerShell, config digest, git revision)."
 )
 
-_mcp: FastMCP | None = None
+_mcp: MCPServer | None = None
 _http_token_verifier = None
 _bootstrapped = False
 _compat_warning_shown = False
@@ -88,7 +90,7 @@ def configure_http_auth(token_verifier) -> None:
     """Install a bearer-token verifier BEFORE bootstrap().
 
     Only effective for streamable-http serving (stdio ignores it); must be
-    called before the FastMCP instance is constructed.
+    called before the MCPServer instance is constructed.
     """
     global _http_token_verifier
     if _bootstrapped:
@@ -98,7 +100,7 @@ def configure_http_auth(token_verifier) -> None:
 
 def __getattr__(name: str):
     """`from hyperv_mcp.server import mcp` keeps working (0xntpower serve_http
-    compat): lazily bootstraps and returns the FastMCP instance.
+    compat): lazily bootstraps and returns the MCPServer instance.
 
     WARNING: this compat instance has NO bearer-token verifier installed —
     serving it over streamable-http yields an unauthenticated endpoint.
@@ -108,8 +110,8 @@ def __getattr__(name: str):
         instance = get_mcp()
         if not _compat_warning_shown:
             print(
-                "[hyperv-mcp] WARNING: compat import of `server.mcp` yields a "
-                "FastMCP instance WITHOUT bearer-token auth; serving it over "
+                "[hyperv-mcp] WARNING: compat import of `server.mcp` yields an "
+                "MCPServer instance WITHOUT bearer-token auth; serving it over "
                 "streamable-http exposes an unauthenticated endpoint. Prefer "
                 "the `hyperv-mcp-http` entry point.",
                 file=sys.stderr,
@@ -119,11 +121,36 @@ def __getattr__(name: str):
     raise AttributeError(name)
 
 
-def get_mcp() -> FastMCP:
+def get_mcp() -> MCPServer:
     if _mcp is None:
         bootstrap()
     assert _mcp is not None
     return _mcp
+
+
+def _make_tool_limiter_lifespan(cap: int):
+    """Build the server lifespan that bounds tool concurrency.
+
+    mcp 2.x runs every sync tool body on a worker thread via
+    anyio.to_thread.run_sync, which draws from the process-wide DEFAULT
+    thread limiter (40 tokens, shared with anything else using to_thread).
+    Resize that default limiter to a dedicated bound above the host
+    PowerShell slot pool (2 x max_host_powershell, default 16) at server
+    start: a tool thread queued on a PowerShell slot holds a limiter token,
+    so PS-heavy saturation delays — it cannot deadlock, because slots are
+    released when their child completes and no thread waits on another
+    thread — and PS-free tools keep admission instead of inheriting anyio's
+    global default. Entered once per server run on both transports (stdio
+    and streamable-http), so the bound holds whichever entry point serves.
+    """
+
+    @asynccontextmanager
+    async def _tool_limiter_lifespan(_server: MCPServer):
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        limiter.total_tokens = 2 * cap
+        yield
+
+    return _tool_limiter_lifespan
 
 
 def bootstrap(environ: dict[str, str] | None = None) -> Config:
@@ -138,17 +165,19 @@ def bootstrap(environ: dict[str, str] | None = None) -> Config:
     vmlocks.set_default_wait_s(cfg.vm_lock_wait_s)  # issue #14 bounded lock wait
     auth = None
     if _http_token_verifier is not None:
-        # FastMCP requires AuthSettings when a token_verifier is installed.
+        # MCPServer requires AuthSettings when a token_verifier is installed.
         auth = AuthSettings(
             issuer_url=AnyHttpUrl("http://127.0.0.1"),  # static-token issuer (local)
             resource_server_url=AnyHttpUrl("http://127.0.0.1"),
             validate_token_resource=False,
         )
-    _mcp = FastMCP(
+    _mcp = MCPServer(
         "hyperv_mcp",
         instructions=_INSTRUCTIONS,
         token_verifier=_http_token_verifier,
         auth=auth,
+        version=VERSION,
+        lifespan=_make_tool_limiter_lifespan(cfg.max_host_powershell),
     )
     _register_tools(cfg, _mcp)
     _startup_banner(cfg)
@@ -345,7 +374,19 @@ def _server_info_payload(cfg: Config) -> dict[str, Any]:
 # tool registration
 # ---------------------------------------------------------------------------
 
-def _register_tools(cfg: Config, mcp: FastMCP) -> None:
+def _register_tools(cfg: Config, mcp: MCPServer) -> None:
+    """Register the full tool surface.
+
+    Guest tools are registered TWICE under the same name: when
+    allow_inline_credentials is set, the variant that accepts inline
+    username/password parameters; otherwise the base variant. The tool
+    surface (names, parameters, docstrings) is identical across credential
+    modes apart from those two parameters — pinned by test_server.py's
+    inventory checks. mcp 2.x's typed @tool decorator returns the function
+    it decorates, so the conditional redefinition of each shared name is
+    flagged by mypy as an incompatible redefinition; the ignores on the
+    base-variant definitions below are intentional.
+    """
     creds_allowed = cfg.allow_inline_credentials
 
     def _cred_args(u: str = "", p: str = "") -> credentials.CredentialSet:
@@ -709,7 +750,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
     else:
 
         @mcp.tool()
-        def hyperv_configure_kdnet(
+        def hyperv_configure_kdnet(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", host_ip: str = "", port: int = 50000, key: str = "",
             reboot: bool = False, confirm: bool = False, vm_id: str = "",
         ) -> dict:
@@ -740,7 +781,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             )
 
         @mcp.tool()
-        def hyperv_configure_kdcom(
+        def hyperv_configure_kdcom(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", pipe_name: str = "", com_port: int = 1,
             reboot: bool = False, confirm: bool = False, vm_id: str = "",
         ) -> dict:
@@ -919,7 +960,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
     else:
 
         @mcp.tool()
-        def hyperv_guest_run_ps(
+        def hyperv_guest_run_ps(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", script: str = "", timeout_ms: int = 60000,
             elevated: bool = False, confirm: bool = False, vm_id: str = "",
         ) -> dict:
@@ -942,7 +983,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             )
 
         @mcp.tool()
-        def hyperv_guest_run(
+        def hyperv_guest_run(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", command: str = "", args: list[str] | None = None,
             cwd: str | None = None, timeout_ms: int = 60000,
             elevated: bool = False, confirm: bool = False, vm_id: str = "",
@@ -966,7 +1007,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             )
 
         @mcp.tool()
-        def hyperv_guest_put(
+        def hyperv_guest_put(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", local_path: str = "", remote_path: str = "",
             confirm: bool = False, verify: bool | None = None, vm_id: str = "",
         ) -> dict:
@@ -987,7 +1028,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             )
 
         @mcp.tool()
-        def hyperv_guest_get(
+        def hyperv_guest_get(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", remote_path: str = "", local_path: str = "",
             verify: bool | None = None, vm_id: str = "",
         ) -> dict:
@@ -1006,7 +1047,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             )
 
         @mcp.tool()
-        def hyperv_guest_read_file(
+        def hyperv_guest_read_file(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", remote_path: str = "", max_bytes: int = 262144,
             vm_id: str = "",
         ) -> dict:
@@ -1025,7 +1066,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             )
 
         @mcp.tool()
-        def hyperv_guest_list_dir(vm_name: str = "", remote_path: str = "", vm_id: str = "") -> dict:
+        def hyperv_guest_list_dir(vm_name: str = "", remote_path: str = "", vm_id: str = "") -> dict:  # type: ignore[misc]  # dual registration — see _register_tools
             """List a directory in the guest.
 
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
@@ -1085,7 +1126,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
     # Image-returning tools (screenshot/wait_frame_change/capture_sequence)
     # return a LIST [Image, meta_dict] on success and the failure envelope
     # (as a CallToolResult) on failure, so the success shape is uniformly
-    # image content + a metadata text block (FastMCP converts the list:
+    # image content + a metadata text block (the SDK converts the list:
     # ImageContent + TextContent). Input tools use the {ok,...} envelope on
     # success; every failure leaves as the shared failure envelope
     # (+ holder on busy).
@@ -1148,7 +1189,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                     op.vm_name = str(meta["vm_name"])
                 buf = io.BytesIO()
                 img.save(buf, format="PNG")
-                # ImageContent is a pydantic model; the raw FastMCP Image
+                # ImageContent is a pydantic model; the raw SDK Image
                 # wrapper is not and breaks serialization across the mcp
                 # versions in the CI matrix.
                 return errors.success_result(
@@ -1897,7 +1938,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
     else:
 
         @mcp.tool()
-        def hyperv_diagnose_vm_access(
+        def hyperv_diagnose_vm_access(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", timeout_ms: int = 90000, vm_id: str = ""
         ) -> dict:
             """One-call guest access diagnostic: host VM state, guest
@@ -1918,7 +1959,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             )
 
         @mcp.tool()
-        def hyperv_repair_guest_access(
+        def hyperv_repair_guest_access(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", apply: bool = False, confirm: bool = False,
             vm_id: str = "",
         ) -> dict:
@@ -1943,7 +1984,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             )
 
         @mcp.tool()
-        def hyperv_guest_job_start(
+        def hyperv_guest_job_start(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", command: str = "", args: list[str] | None = None,
             cwd: str = "", timeout_ms: int = 60000, vm_id: str = "",
         ) -> dict:
@@ -1975,7 +2016,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             )
 
         @mcp.tool()
-        def hyperv_wait_guest_recovery(
+        def hyperv_wait_guest_recovery(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", services: list[str] | None = None,
             processes: list[str] | None = None, timeout_s: int = 300,
             interval_s: int = 3, vm_id: str = "",
@@ -1997,7 +2038,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             )
 
         @mcp.tool()
-        def hyperv_relay_start(
+        def hyperv_relay_start(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", guest_port: int = 0, host_port: int = 0,
             vm_id: str = "",
         ) -> dict:
@@ -2023,7 +2064,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             )
 
         @mcp.tool()
-        def hyperv_capture_evidence(
+        def hyperv_capture_evidence(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", width: int = 1024, height: int = 768,
             save_path: str = "", ui_tree: bool = False,
             ui_tree_depth: int = 3, ui_tree_max_elements: int = 200,
@@ -2147,29 +2188,33 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
     _harden_tools(mcp)
 
 
-def _harden_tools(mcp: FastMCP) -> None:
+def _harden_tools(mcp: MCPServer) -> None:
     """Stamp additionalProperties:false and reject bad calls at Tool.run.
 
-    FastMCP 1.x builds argument models with pydantic's default
+    mcp 2.x builds argument models with pydantic's default
     extra="ignore", so an undeclared key is silently dropped before the
     tool body runs — a misspelled confirm/verify/elevated flag would fail
     open. The guard below sits at the Tool.run chokepoint (both
-    FastMCP.call_tool and direct _tool_manager.call_tool traverse it) and
+    MCPServer.call_tool and direct _tool_manager.call_tool traverse it) and
     handles, with one audited envelope each:
 
     - UNDECLARED argument keys: rejected as "invalid", argument named,
       tool body never runs.
-    - Wrong-TYPED declared arguments: FastMCP's Tool.run wraps the
-      pydantic ValidationError into ToolError before any tool body runs;
-      the guard classifies it via the cause ("invalid") and delivers the
-      same audited envelope instead of a raw protocol error (issue #9
-      review PRR-001/PRR-002).
+    - Wrong-TYPED declared arguments: 2.x Tool.run wraps the pydantic
+      ValidationError into ToolError before any tool body runs; the guard
+      classifies it via the cause ("invalid") and delivers the same audited
+      envelope instead of a raw protocol error (issue #9 review
+      PRR-001/PRR-002).
 
     Rejections are audited HERE (one record each) because they happen
     before any tool body's audit region; the audit write is best-effort so
     a broken sink cannot turn a rejection into a raw exception. Tool is a
     pydantic BaseModel, so the wrap is installed with object.__setattr__;
     the marker attribute keeps re-registration from stacking guards.
+
+    Note the 2.x signature: Tool.run takes `context` as a required
+    positional argument (2.x passes it positionally through
+    ToolManager.call_tool), so the guard must accept and forward it.
     """
     tm = getattr(mcp, "_tool_manager", None)
     tools = list(getattr(tm, "_tools", {}).values()) if tm is not None else []
@@ -2232,7 +2277,7 @@ def _harden_tools(mcp: FastMCP) -> None:
                 )
             return errors.failure_result(env)
 
-        async def guard(arguments, _tool=tool, _run=original_run, **kwargs):
+        async def guard(arguments, context=None, convert_result=False, _tool=tool, _run=original_run, **kwargs):
             declared = set((getattr(_tool, "parameters", None) or {}).get("properties", {}))
             unknown = sorted(k for k in (arguments or {}) if k not in declared)
             name = str(getattr(_tool, "name", "unknown-tool"))
@@ -2251,11 +2296,11 @@ def _harden_tools(mcp: FastMCP) -> None:
                     "retry_after_ms": retry_after_ms,
                 })
             try:
-                return await _run(arguments, **kwargs)
+                return await _run(arguments, context, convert_result=convert_result, **kwargs)
             except UrlElicitationRequiredError:
                 raise
             except Exception as exc:
-                # FastMCP's Tool.run wraps the pydantic ValidationError (a
+                # 2.x Tool.run wraps the pydantic ValidationError (a
                 # ValueError) for a declared-but-mistyped argument into
                 # ToolError before any tool body runs. Classify via the
                 # cause so the envelope says "invalid", not "transport".

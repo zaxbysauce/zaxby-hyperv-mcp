@@ -43,14 +43,13 @@ import time
 from urllib.parse import urlparse
 
 import anyio
-import httpx
+import httpx2
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp.types import (
     ErrorData,
     JSONRPCError,
-    JSONRPCMessage,
     JSONRPCRequest,
     JSONRPCResponse,
 )
@@ -430,19 +429,48 @@ def _controller_log_path(port: int) -> str:
 
 
 def _request_id_of(message: SessionMessage):
-    root = getattr(getattr(message, "message", None), "root", None)
-    return root
+    """The JSON-RPC message a SessionMessage carries, across SDK shapes.
+
+    mcp 1.x wrapped every message in a JSONRPCMessage union model whose
+    `.root` held the concrete request/response/error. mcp 2.x made
+    JSONRPCMessage a plain type union and its transports carry the concrete
+    message directly, so the wrapper level is gone (issue #16)."""
+    inner = getattr(message, "message", None)
+    return getattr(inner, "root", None) or inner
 
 
 def _error_reply(request_id, note: str) -> SessionMessage:
+    # 2.x JSONRPCMessage is a plain union: the concrete error IS the message.
     return SessionMessage(
-        message=JSONRPCMessage(
-            root=JSONRPCError(
-                jsonrpc="2.0",
-                id=request_id,
-                error=ErrorData(code=PROXY_ERROR_CODE, message=note),
-            )
+        message=JSONRPCError(
+            jsonrpc="2.0",
+            id=request_id,
+            error=ErrorData(code=PROXY_ERROR_CODE, message=note),
         )
+    )
+
+
+def _note_upstream_error(root, token_env_name: str, noted: list) -> None:
+    """Name the token environment variable when the controller answers a
+    request with a JSON-RPC error.
+
+    mcp 1.x surfaced a controller rejection (e.g. HTTP 401) as a transport
+    exception, so the proxy could classify it by status. mcp 2.x collapses
+    any non-2xx response into a generic JSON-RPC error delivered on the read
+    stream, so the status is no longer observable here; an error answer to
+    one of our requests is the observable signal, and the token env var is
+    the first thing an operator should check. Emitted once per session.
+    Never echoes token material."""
+    if noted:
+        return
+    noted.append(True)
+    error = getattr(root, "error", None)
+    message = str(getattr(error, "message", "") or "")[:200]
+    print(
+        f"hyperv-mcp proxy: the controller answered a request with a "
+        f"JSON-RPC error ({message}); if this is an authentication failure, "
+        f"check the {token_env_name} environment variable, then retry.",
+        file=sys.stderr,
     )
 
 
@@ -493,7 +521,7 @@ async def _run_proxy(
     token_env_name: str,
 ) -> int:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    timeout = httpx.Timeout(
+    timeout = httpx2.Timeout(
         UPSTREAM_CONNECT_TIMEOUT_S, read=None, write=UPSTREAM_WRITE_TIMEOUT_S, pool=5.0
     )
     outstanding: set = set()
@@ -503,6 +531,7 @@ async def _run_proxy(
     # order once the upstream write stream exists.
     buffered: list[SessionMessage] = []
     upstream: list = []  # [write_stream] once connected
+    noted_upstream_error: list = []  # once-per-session stderr note
 
     async with stdio_server() as (client_read, client_write):
 
@@ -545,10 +574,15 @@ async def _run_proxy(
         async with anyio.create_task_group() as tg:
             tg.start_soon(read_client)
             try:
-                async with httpx.AsyncClient(headers=headers, timeout=timeout) as hc:
+                # httpx2 is the SDK's own HTTP stack (mcp 2.x); its client is
+                # what streamable_http_client speaks.
+                async with httpx2.AsyncClient(headers=headers, timeout=timeout) as hc:
+                    # mcp 2.x yields (read_stream, write_stream); 1.x yielded
+                    # a third value (the session-id getter), which the SDK
+                    # removed with the session-id transport change (issue #16).
                     async with streamable_http_client(
                         url, http_client=hc
-                    ) as (upstream_read, upstream_write, _get_session_id_unused):
+                    ) as (upstream_read, upstream_write):
                         upstream.append(upstream_write)
                         for message in buffered:
                             await upstream_write.send(message)
@@ -559,6 +593,10 @@ async def _run_proxy(
                             root = _request_id_of(item)
                             if isinstance(root, (JSONRPCResponse, JSONRPCError)):
                                 outstanding.discard(root.id)
+                                if isinstance(root, JSONRPCError):
+                                    _note_upstream_error(
+                                        root, token_env_name, noted_upstream_error
+                                    )
                             await client_write.send(item)
                         raise _UpstreamClosed("controller closed the session stream")
             except BaseExceptionGroupType as eg:

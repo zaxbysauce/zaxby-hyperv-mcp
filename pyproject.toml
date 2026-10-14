@@ -27,13 +27,15 @@ classifiers = [
     "Topic :: System :: Emulators",
 ]
 dependencies = [
-    "mcp>=1.30.0,<2",
+    "mcp>=2.3,<3",
     "pillow>=10.0",
     # Direct imports of the proxy transport (PRR-019: declared, not just
     # transitive via mcp), and the 3.10 exception-group backport that
-    # stdio_proxy imports on the supported floor (PRR-018).
+    # stdio_proxy imports on the supported floor (PRR-018). mcp 2.x carries
+    # its HTTP stack in the httpx2 fork (issue #16): the proxy's upstream
+    # client must be the same library the SDK itself speaks.
     "anyio>=4.5",
-    "httpx>=0.27",
+    "httpx2>=2.10",
     'exceptiongroup>=1.0.2; python_version < "3.11"',
 ]
 
