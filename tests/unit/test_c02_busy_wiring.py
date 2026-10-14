@@ -157,6 +157,7 @@ def test_slot_dir_hardening_survives_popen_patches(tmp_path, monkeypatch):
 
     monkeypatch.setattr(pswindows.subprocess, "Popen", _NoEnterPopen)
     monkeypatch.setattr(pswindows, "_SLOT_ACLS_DONE", set())  # force the fresh-run path
+    monkeypatch.setattr(pswindows, "_config", Config(unrestricted=True))  # open the harden gate (conftest autouse resets _config=None)
     monkeypatch.setenv("ProgramData", str(tmp_path))  # derived default -> fresh dir
     directory = pswindows._ps_slot_dir()
     assert directory.exists()
