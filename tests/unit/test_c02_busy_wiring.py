@@ -585,7 +585,9 @@ def test_check_env_renders_pool_busy_distinctly(monkeypatch, capsys):
 def test_http_entry_token_probe_transport_error_is_clean(monkeypatch, capsys, tmp_path):
     """PRR-017/027 regression pin: a transport failure in the logon-task token
     probe prints a diagnostic and exits 1 instead of a traceback."""
-    monkeypatch.setenv("HYPERV_MCP_HTTP_TOKEN", "dummy-token")
+    # no token in the environment: the logon-task path then runs the
+    # user-registry probe leg, which is where the transport catch lives
+    monkeypatch.delenv("HYPERV_MCP_HTTP_TOKEN", raising=False)
     monkeypatch.setattr(
         pswindows, "run_ps", _raising_run_ps(
             pswindows.PowerShellTransportError("powershell.exe missing")))
