@@ -268,6 +268,13 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
   "verify_sha256": false,              // default integrity check for transfers
   "ps_timeout_s": 120,                 // default host PowerShell timeout
   "vm_lock_wait_s": 30,                // per-VM lock bounded wait, 0..600 s (0 = fail fast)
+  "max_host_powershell": 8,            // host-wide concurrent powershell.exe cap, 1..64 (issue #15)
+  "host_powershell_wait_s": 60,        // oversubscribed-leg bounded wait, 0..600 s, int or float
+                                       // (0 = fail immediately with a busy error)
+  "ps_slot_dir": null,                 // slot lock-file directory; ABSOLUTE path or null. Default
+                                       // %ProgramData%\hyperv-mcp\ps-slots (shared per host); a shared
+                                       // temp dir when ProgramData is unset (per-account on Windows).
+                                       // All servers on a host must use the same value and cap
   // "hyperv": { "host": "nuc01" },    // remote Hyper-V host (issue #43);
   //                                    // OMIT the section entirely for local mode
   //                                    // (the section requires a non-empty host)
@@ -453,6 +460,8 @@ error — fix that before calling tools (see Troubleshooting).
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `hyperv.target_probe UNREACHABLE: The client cannot connect to the destination specified` | WinRM not listening on the host, or the agent box does not trust it (workgroup) | `Enable-PSRemoting -SkipNetworkProfileCheck` on the host; `Set-Item WSMan:\localhost\Client\TrustedHosts -Value '<host>' -Concatenate` on the agent box; retest with `Test-WSMan -ComputerName <host>` |
+| `hyperv.target_probe POOL_BUSY: host PowerShell pool saturated: ...` | The host-wide PowerShell slot pool is full (`max_host_powershell` children already running) and the bounded wait expired | Retry (the envelope is `busy`, retryable); reduce concurrency or raise `max_host_powershell` (1..64) if the host has headroom |
+| Legs fail as `error_class: "transport"` with `cannot open PowerShell slot file slot-NN.lock` | The slot directory's ACLs do not include the running account (e.g. a second non-admin account against the hardened default directory) | Set `ps_slot_dir` to a directory both accounts can use, or grant the account access to `%ProgramData%\hyperv-mcp\ps-slots`; `--check-env` prints the effective `max_host_powershell`, `host_powershell_wait_s` and `ps_slot_dir` |
 | `Access is denied` (or 0x80070005) on every remote tool | Wrong `HYPERV_HOST_*` credentials, or the account lacks remote VM rights | Check the credential env vars are in the **server's** environment (restart the MCP client after editing `.mcp.json`); put the account in the host's `Hyper-V Administrators` group |
 | Tools worked locally; after adding `hyperv.host` every call fails | Server process started before the env/config landed | Config is read at server start; env per call but from the server's process — restart the MCP client and re-check the banner line |
 | `CONFIG ERROR: hyperv.host must be a hostname or IP literal` | Metacharacters in the configured host | Use the bare hostname/IP; quoting is applied by the server |
@@ -536,6 +545,53 @@ admitted before newly arriving readers, so polling reads cannot starve a
 checkpoint restore. Console input runs under a read lock on the VM key
 (guest work proceeds during typing) plus a write lock on a second per-VM
 key, so two agents cannot interleave keystrokes.
+
+Host PowerShell itself is bounded host-wide (issue #15): every tool leg,
+relay request, and every server process that shares the slot directory
+draws from a pool of `max_host_powershell` (default 8) slot lock files, so
+the number of simultaneous `powershell.exe` children stays at or below the
+cap for the whole host. The cap is only as wide as the slot directory:
+servers configured with different `ps_slot_dir` values run separate pools,
+and a server started with a smaller `max_host_powershell` sees only its own
+first N slots (the effective host-wide bound is then the largest configured
+cap) — keep one slot directory and one cap per host. The wait does not
+consume the leg's own timeout: a caller that queues gets its full
+`timeout_s` budget once it holds a slot. A caller that cannot get a slot
+within `host_powershell_wait_s` (default 60 s) gets a retryable `busy`
+envelope (`retryable: true`, `retry_after_ms: 2000`; unlike the per-VM busy
+envelope it carries no `holder` block, because the pool is host-wide rather
+than a specific VM's holder); relay requests surface it as their existing
+HTTP 502 transport reply. Slots are OS file locks, so a server process that
+dies has its slots released by the OS. The default slot directory
+(`%ProgramData%\hyperv-mcp\ps-slots`) is hardened, best effort, to
+Administrators, Hyper-V Administrators, and the running account — once per
+process, whether or not this process created the directory, so a
+pre-existing directory is not adopted unhardened. Hosts running servers
+under several non-administrative accounts should set `ps_slot_dir`
+explicitly with suitable ACLs (a second account cannot open slots in a
+directory hardened for the first; every leg then fails as a non-retryable
+`transport` error naming the lock file). If the ACL hardening step fails,
+the server continues and logs a warning — but a partially applied `icacls`
+can strip inheritance without granting, after which legs fail until the
+directory's ACLs are fixed by hand; the derived directory is never
+re-hardened for the life of the process. When `ProgramData` is unset (or on
+non-Windows hosts) the pool falls back to a shared temp directory, which is
+per-account on Windows and is not ACL-hardened.
+
+Cancellation is leg-safe now: if a leg unwinds for any reason other than a
+normal completion or its own timeout, `run_ps` kills the whole host
+PowerShell process tree for that leg before returning, releases the slot,
+and closes the Job Object handle — previously the child kept running and
+kept the caller's VM lock held until it finished on its own (the VM lock
+itself is released by the caller as the exception unwinds). When the leg
+runs in an anyio worker thread, `run_ps` also observes host-task
+cancellation between 0.2 s polling slices and kills promptly instead of
+running the leg out; wiring MCP request cancellation end to end (tool
+calls moving off the event loop, `notifications/cancelled` delivery) is a
+separate change. The guest-side process of a PowerShell Direct leg may
+still be running after such a kill; that is the documented timeout
+semantics (see "Timeout semantics") and applies to cancellation the same
+way.
 
 ---
 
@@ -660,8 +716,10 @@ cases and requires the VM Off/Saved for the `Set-VMComPort` step.
   MCP protocol level — the envelope rides as the text content AND as
   `structuredContent`. The five keys are the minimum set; module-level
   diagnostics (`timed_out`, `stopped`, `alive_pids`, ...) ride alongside,
-  and `busy` failures additionally carry `holder`
-  (`{tool, mode, since, held_ms}` — see the Concurrency section above).
+  and per-VM `busy` failures additionally carry `holder`
+  (`{tool, mode, since, held_ms}` — see the Concurrency section above; the
+  host-wide PowerShell-pool `busy` is a capacity condition and carries no
+  `holder`).
   The envelope and the audit log share one isinstance-based taxonomy, so a
   record's `error_class` always equals the envelope's.
 - (0.4.0) **Retry guidance:** `busy` is the only retryable class

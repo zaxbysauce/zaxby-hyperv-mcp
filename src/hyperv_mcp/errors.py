@@ -56,6 +56,11 @@ def classify(exc: BaseException) -> str:
         return "credential"
     if isinstance(exc, VMBusy):
         return "busy"
+    from . import pswindows  # late import: errors -> media -> guestexec -> pswindows
+
+    if isinstance(exc, pswindows.PowerShellBusy):
+        # Issue #15: pool saturation is busy/retryable, same as a busy VM.
+        return "busy"
     if isinstance(exc, MediaError):
         # PRR-020: caller/vm-state faults, not transport — matches the
         # shipped envelope contract (test_media_error_envelope_maps_invalid).

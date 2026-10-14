@@ -49,7 +49,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import pswindows, vmident, vmlocks
+from . import errors, pswindows, vmident, vmlocks
 from .config import Config
 from .credentials import CredentialSet
 from .diagnostics import run_guest_inner
@@ -570,7 +570,9 @@ def job_stop(cfg: Config, job_id: str, *, owner: str | None = None) -> dict:
             "pid": entry["pid"],
             "stopped": False, "alive_pids": [], "job_dir_removed": None,
             "pid_reused": False,
-            "error": pswindows.redact(str(exc)), "error_class": "transport",
+            "error": pswindows.redact(str(exc)), "error_class": errors.classify(exc),
+            # issue #15: a PowerShellBusy stop leg is busy/retryable, not
+            # transport; the key set is unchanged (PRR-004 shape).
         }
     # The guest payload is the truth. A legacy single-key response
     # ({"stopped": true}) leaves the observation fields as honest unknowns.

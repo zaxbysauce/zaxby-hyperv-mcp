@@ -562,6 +562,8 @@ def vm_set_resolution(
                 started = True
                 try:
                     final = lifecycle._wait_for_state(cfg, ref, ["Running"], timeout_s=120)
+                except pswindows.PowerShellBusy:
+                    raise  # issue #15: pool saturation is busy/retryable, never a timeout
                 except RuntimeError as exc:
                     # A wait timeout is a boot/timeout fault, not transport;
                     # reclassify so the envelope carries the timeout class.
@@ -601,8 +603,17 @@ def vm_set_resolution(
                     _run(cfg, start_script, f"vm_set_resolution restart-recover({ref.name})",
                          timeout_s=180)
                     recovered = "the VM was restarted"
-                except MediaError:
+                except (MediaError, pswindows.PowerShellBusy):
+                    # A busy compensation leg must not escape this handler:
+                    # the original failure (and the "VM is still OFF" state
+                    # note) has to survive into the envelope the caller sees.
                     recovered = "the VM is still OFF (start it with hyperv_start_vm)"
+                if isinstance(exc, pswindows.PowerShellBusy):
+                    # issue #15: re-raise busy itself (retryable) instead of
+                    # wrapping it in a non-retryable MediaError; the
+                    # compensation outcome rides the busy message.
+                    raise pswindows.PowerShellBusy(
+                        f"{exc} (this call stopped the VM; {recovered})") from None
                 raise MediaError(
                     f"{str(exc)} (this call stopped the VM; {recovered})") from None
             raise

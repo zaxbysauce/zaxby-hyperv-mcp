@@ -306,7 +306,13 @@ def _run_inner(
         # configuration, not transport (cubic PR #47 finding).
         return _result_err(cfg, str(exc), "invalid")
     except Exception as exc:  # transport-level failure, redacted by pswindows
-        return _result_err(cfg, str(exc), "transport")
+        # issue #15: classify truthfully — PowerShellBusy reports busy/retryable
+        # instead of a non-retryable transport result; unknown types still
+        # default to "transport" inside classify. Late import: a module-level
+        # errors import cycles (errors -> media -> lifecycle -> guestexec).
+        from . import errors
+
+        return _result_err(cfg, str(exc), errors.classify(exc))
 
     if result.timed_out:
         return {

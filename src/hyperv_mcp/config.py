@@ -20,6 +20,7 @@ import ntpath
 import os
 import re
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, ClassVar
 
 SCHEMA_VERSION = 1
@@ -145,6 +146,15 @@ class Config:
     # fail-fast. Appended last so every pre-existing positional construction
     # keeps its argument order.
     vm_lock_wait_s: int = 30
+    # Issue #15 (FND-13): host-wide PowerShell slot pool. max_host_powershell
+    # bounds the number of concurrent host powershell.exe children across ALL
+    # server processes on the host (slot lock files under ps_slot_dir);
+    # host_powershell_wait_s bounds how long an oversubscribed caller waits
+    # before failing with PowerShellBusy (0 = fail immediately). Appended
+    # last for the same positional-compat reason.
+    max_host_powershell: int = 8
+    host_powershell_wait_s: float = 60.0
+    ps_slot_dir: str | None = None
 
     # -- loading ---------------------------------------------------------
 
@@ -215,6 +225,24 @@ class Config:
             raise ConfigError("vm_lock_wait_s must be an integer in 0..600")
         if not 0 <= self.vm_lock_wait_s <= 600:
             raise ConfigError("vm_lock_wait_s must be an integer in 0..600")
+        if not isinstance(self.max_host_powershell, int) or isinstance(self.max_host_powershell, bool):
+            raise ConfigError("max_host_powershell must be an integer in 1..64")
+        if not 1 <= self.max_host_powershell <= 64:
+            raise ConfigError("max_host_powershell must be an integer in 1..64")
+        if not isinstance(self.host_powershell_wait_s, (int, float)) or isinstance(
+            self.host_powershell_wait_s, bool
+        ):
+            raise ConfigError("host_powershell_wait_s must be a number in 0..600")
+        if not 0 <= self.host_powershell_wait_s <= 600:
+            raise ConfigError("host_powershell_wait_s must be a number in 0..600")
+        if self.ps_slot_dir is not None:
+            if not self.ps_slot_dir.strip():
+                raise ConfigError("ps_slot_dir must be a non-empty path or null")
+            # A relative slot dir resolves against each process's CWD, which
+            # silently splits the host-wide pool (the cap stops being
+            # host-wide). Reject it at load time.
+            if not Path(self.ps_slot_dir).is_absolute():
+                raise ConfigError("ps_slot_dir must be an absolute path or null")
         # child_env() strips the token_env-named variable from every spawned
         # child; naming a functional variable would break that child (bare-name
         # resolution, PowerShell internals), so reject it at load time.
@@ -300,6 +328,9 @@ class Config:
             f"destructive={self.destructive}",
             f"allow_inline_credentials={self.allow_inline_credentials}",
             f"audit_log_path={self.audit_log_path or '(stderr)'}",
+            f"max_host_powershell={self.max_host_powershell}",
+            f"host_powershell_wait_s={self.host_powershell_wait_s:g}",
+            f"ps_slot_dir={self.ps_slot_dir or '(derived default)'}",
         ]
         return "; ".join(lines)
 
@@ -321,6 +352,13 @@ class Config:
         if not isinstance(value, int) or isinstance(value, bool):
             raise ConfigError(f"{key} must be an integer")
         object.__setattr__(self, key, value)
+
+    def _set_number(self, key: str, value: Any) -> None:
+        # int OR float (bool rejected): the PowerShell pool wait is a float
+        # in nature but commonly configured as a whole number of seconds.
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ConfigError(f"{key} must be a number")
+        object.__setattr__(self, key, float(value))
 
     def _set_str_opt(self, key: str, value: Any) -> None:
         if value is not None and not isinstance(value, str):
@@ -416,6 +454,9 @@ Config._FIELD_MAP = {  # type: ignore[attr-defined]
     "verify_sha256": lambda c, v: c._set_bool("verify_sha256", v),
     "ps_timeout_s": lambda c, v: c._set_int("ps_timeout_s", v),
     "vm_lock_wait_s": lambda c, v: c._set_int("vm_lock_wait_s", v),
+    "max_host_powershell": lambda c, v: c._set_int("max_host_powershell", v),
+    "host_powershell_wait_s": lambda c, v: c._set_number("host_powershell_wait_s", v),
+    "ps_slot_dir": lambda c, v: c._set_str_opt("ps_slot_dir", v),
     "hyperv": lambda c, v: c._set_hyperv(v),
     "http": lambda c, v: c._set_http(v),
 }
