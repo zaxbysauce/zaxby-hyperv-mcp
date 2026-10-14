@@ -404,8 +404,11 @@ def _ps_slot_dir() -> Path:
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
+        # directory.name only (like the sibling slot-file error): the full
+        # path would disclose the host filesystem layout - and on the tempdir
+        # fallback the local account name - to MCP clients.
         raise PowerShellTransportError(
-            f"cannot create PowerShell slot directory {directory}: {redact(str(exc))}"
+            f"cannot create PowerShell slot directory {directory.name}: {redact(str(exc))}"
         ) from None
     if hardening_scope and os.name == "nt":
         # Harden the derived ProgramData default once per process whether or

@@ -17,17 +17,29 @@ No real process spawns: run_ps is monkeypatched at the pswindows module
 attribute each consumer calls.
 """
 
+import json
 import os
 import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
 
 import pytest
 
+import hyperv_mcp.http_entry as http_entry
 from hyperv_mcp import errors, guestexec, guestjobs, pswindows
 from hyperv_mcp.config import Config, ConfigError
 from hyperv_mcp.credentials import CredentialSet
 
 CRED = CredentialSet("Administrator", "placeholder-pass")
 
+
+def _raising_run_ps(exc):
+    def fake_run_ps(script, *, timeout_s=None, stdin_b64=None):
+        raise exc
+
+    return fake_run_ps
 
 VM_GUID = "e953c649-1234-5678-9abc-def012345678"  # same canned GUID as test_guestexec
 
@@ -278,7 +290,12 @@ def test_slot_dir_fault_surfaces_through_run_ps(monkeypatch, tmp_path):
     monkeypatch.setattr(pswindows, "_config", Config(ps_slot_dir=str(blocker / "sub")))
     with pytest.raises(pswindows.PowerShellTransportError) as excinfo:
         pswindows.run_ps("# probe")
-    assert "cannot create PowerShell slot directory" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "cannot create PowerShell slot directory sub" in message
+    # minimization: the client-visible message names the directory leaf, not
+    # the absolute path (which would disclose host layout, and on the tempdir
+    # fallback the local account name)
+    assert str(tmp_path) not in message
 
 
 def test_hardening_pin_proves_hardening_ran(monkeypatch, tmp_path):
@@ -403,3 +420,176 @@ def test_failing_kill_helper_does_not_mask_propagating_exception(monkeypatch, tm
     with pytest.raises(RuntimeError, match="non-timeout unwind"):
         pswindows.run_ps("# probe")
     assert released, "the slot was not released when the kill helper raised"
+
+
+# -- merge-blocker regression pins (reviewer round 2: probes proved the
+# -- committed suite could not detect a regression of either fix) -----------
+
+_RECORDER_SRC = (
+    "import json, os, sys, time\n"
+    "recorder = os.environ['RECORDER_FILE']\n"
+    "sleep_s = float(os.environ.get('SLEEP_S', '1'))\n"
+    "with open(recorder, 'a', encoding='utf-8') as fh:\n"
+    "    fh.write(json.dumps({'pid': os.getpid(), 'event': 'start'}) + chr(10))\n"
+    "time.sleep(sleep_s)\n"
+    "with open(recorder, 'a', encoding='utf-8') as fh:\n"
+    "    fh.write(json.dumps({'pid': os.getpid(), 'event': 'end'}) + chr(10))\n"
+)
+
+
+def _write_recorder_shim(workdir: Path) -> Path:
+    recorder_py = workdir / "fake_ps_recorder.py"
+    recorder_py.write_text(_RECORDER_SRC, encoding="utf-8")
+    shim = workdir / "fake_ps.cmd"
+    shim.write_text(
+        f'@echo off\r\n"{sys.executable}" "{recorder_py}"\r\n', encoding="utf-8"
+    )
+    return shim
+
+
+def test_slot_wait_does_not_consume_the_leg_timeout(monkeypatch, tmp_path):
+    """PRR-001 regression pin: the leg clock starts AFTER the slot wait, so a
+    queued caller gets its full timeout budget. With a 0.9 s wait and a
+    1.5 s timeout, a 1.2 s child must still run to completion — at base the
+    wait was charged against the timeout and the child was killed at 0.6 s."""
+    workdir = tmp_path / "w"
+    workdir.mkdir()
+    shim = _write_recorder_shim(workdir)
+    events = workdir / "events.jsonl"
+    monkeypatch.setenv("RECORDER_FILE", str(events))
+    monkeypatch.setenv("SLEEP_S", "1.2")
+    monkeypatch.setattr(
+        pswindows, "_ps_path", str(shim)
+    )
+    monkeypatch.setattr(
+        pswindows, "_config",
+        Config(max_host_powershell=1, host_powershell_wait_s=5.0,
+               ps_timeout_s=1.5, ps_slot_dir=str(tmp_path / "slots")),
+    )
+    held = pswindows._acquire_ps_slot()
+    threading.Timer(0.9, pswindows._release_ps_slot, args=(held,)).start()
+
+    result = pswindows.run_ps("# leg", timeout_s=1.5)
+
+    assert result.returncode == 0, (
+        "the child did not survive its own budget after the slot wait — "
+        "the wait is still being charged against the leg timeout"
+    )
+    records = [json.loads(line) for line in events.read_text().splitlines()]
+    assert [r["event"] for r in records] == ["start", "end"]
+
+
+def test_cancelled_caller_does_not_wait_out_the_slot_pool(monkeypatch, tmp_path):
+    """PRR-002 regression pin: a cancelled caller blocked in the slot wait
+    must be cancelled promptly, not sit out host_powershell_wait_s and then
+    be told to retry a call it cancelled."""
+    import anyio
+
+    workdir = tmp_path / "w"
+    workdir.mkdir()
+    monkeypatch.setattr(
+        pswindows, "_config",
+        Config(max_host_powershell=1, host_powershell_wait_s=10.0,
+               ps_timeout_s=10, ps_slot_dir=str(tmp_path / "slots")),
+    )
+    monkeypatch.setattr(pswindows, "_ps_path", "powershell")
+    held = pswindows._acquire_ps_slot()  # saturate the pool
+    outcome: dict = {}
+
+    async def scenario():
+        started = time.monotonic()
+        with anyio.move_on_after(0.5):
+            try:
+                await anyio.to_thread.run_sync(lambda: pswindows.run_ps("# leg"))
+                outcome["result"] = "completed"
+            except BaseException as exc:  # noqa: BLE001 - recording the outcome
+                outcome["result"] = type(exc).__name__
+        outcome["elapsed"] = time.monotonic() - started
+
+    try:
+        anyio.run(scenario)
+    finally:
+        pswindows._release_ps_slot(held)
+
+    assert outcome["result"] == "CancelledError", (
+        f"a cancelled caller in the slot wait ended as {outcome['result']!r} "
+        "(at base it blocked the full wait and then raised PowerShellBusy)"
+    )
+    assert outcome["elapsed"] < 2.0
+
+
+def test_pre_existing_default_slot_dir_is_hardened(monkeypatch, tmp_path):
+    """PRR-011 regression pin: the derived default directory is hardened even
+    when it already existed before this process first saw it (a squatted or
+    deployment-pre-created directory must not be adopted unhardened)."""
+    seen: dict = {}
+
+    class _RecordingPopen:
+        def __init__(self, argv, **kwargs):
+            seen["argv"] = list(argv)
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return b"", b""
+
+    monkeypatch.setattr(pswindows, "_REAL_POPEN", _RecordingPopen)
+    monkeypatch.setattr(pswindows, "_SLOT_ACLS_DONE", set())
+    monkeypatch.setattr(pswindows, "_config", Config(unrestricted=True))
+    program_data = tmp_path / "ProgramData"
+    (program_data / "hyperv-mcp" / "ps-slots").mkdir(parents=True)  # pre-existing
+    monkeypatch.setenv("ProgramData", str(program_data))
+
+    pswindows._ps_slot_dir()
+
+    assert seen, "a pre-existing default slot dir was adopted without hardening"
+
+
+def test_host_leg_timeout_classifies_as_timeout(monkeypatch):
+    """PRR-016 regression pin: the host leg's timeout raises TimeoutError, so
+    errors.classify reports 'timeout' — the class its sibling guest leg
+    reports for the same condition on the same report."""
+    from hyperv_mcp import diagnostics
+
+    monkeypatch.setattr(
+        diagnostics, "_run",
+        lambda cfg, script, **kw: pswindows.PSResult(timed_out=True),
+    )
+    with pytest.raises(TimeoutError):
+        diagnostics._run_host_leg(
+            Config(unrestricted=True), "11111111-2222-3333-4444-555555555555"
+        )
+
+
+def test_check_env_renders_pool_busy_distinctly(monkeypatch, capsys):
+    """PRR-017/026 regression pin: pool saturation renders as POOL_BUSY in the
+    operator-facing target probe, not under the UNREACHABLE label."""
+    from hyperv_mcp import server as server_module
+    from hyperv_mcp.config import HyperVTarget
+
+    cfg = Config(unrestricted=True, hyperv=HyperVTarget(host="nuc01"))
+    monkeypatch.setattr(server_module, "bootstrap", lambda: cfg)
+    monkeypatch.setattr(server_module.pswindows, "run_ps", _raising_run_ps(
+        pswindows.PowerShellBusy("pool saturated: 8 children; waited 60s")))
+    monkeypatch.setattr(server_module.pswindows, "compose_remote",
+                        lambda cfg, script, **kw: (script, None))
+    monkeypatch.setattr(server_module, "_powershell_provenance",
+                        lambda cfg: {"path": "p", "edition": "e", "version": "v",
+                                     "psmodulepath": "m"})
+    rc = server_module.main(["--check-env"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "POOL_BUSY" in out
+    assert "UNREACHABLE" not in out
+
+
+def test_http_entry_token_probe_transport_error_is_clean(monkeypatch, capsys, tmp_path):
+    """PRR-017/027 regression pin: a transport failure in the logon-task token
+    probe prints a diagnostic and exits 1 instead of a traceback."""
+    monkeypatch.setenv("HYPERV_MCP_HTTP_TOKEN", "dummy-token")
+    monkeypatch.setattr(
+        pswindows, "run_ps", _raising_run_ps(
+            pswindows.PowerShellTransportError("powershell.exe missing")))
+    cfg = Config(unrestricted=True)
+    rc = http_entry._handle_logon_task(cfg, True, host="127.0.0.1", port="8787")
+    assert rc == 1
+    assert "PowerShell transport failed" in capsys.readouterr().err
