@@ -396,11 +396,15 @@ def diagnose_report(
 
     host_info: dict = {}
     host_error = ""
+    host_error_class = ""
     with vm_lock(vm_id, mode="read"):
         try:
             host_info = _run_host_leg(cfg, vm_id)
         except Exception as exc:  # host WMI leg failure is a result, not fatal
             host_error = str(exc)
+            # issue #15: report the classified class here too — a busy host
+            # leg shows error_class "busy", not just the message text.
+            host_error_class = errors.classify(exc)
 
     guest: dict | None = None
     ps_direct: dict = {"available": False}
@@ -428,6 +432,7 @@ def diagnose_report(
             "id": "host_query_failed", "severity": "low", "route": "host",
             "summary": "host-side Get-VM query failed",
             "detail": host_error,
+            "error_class": host_error_class,
         })
 
     return {

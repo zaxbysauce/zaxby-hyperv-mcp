@@ -379,26 +379,30 @@ _SLOT_ACLS_DONE: set[str] = set()  # directories already hardened (best effort)
 
 
 def _ps_slot_dir() -> Path:
-    """Resolve (and create) the slot directory from config or platform default."""
-    if _config is not None and _config.ps_slot_dir:
-        directory = Path(_config.ps_slot_dir)
-        created = not directory.exists()
-        directory.mkdir(parents=True, exist_ok=True)
-        return directory
-    if os.name == "nt":
-        base = os.environ.get("ProgramData")
-        directory = (
-            Path(base) / "hyperv-mcp" / "ps-slots" if base else Path.cwd() / ".ps-slots"
-        )
-        created = not directory.exists()
-        directory.mkdir(parents=True, exist_ok=True)
-        if created:
-            _harden_slot_dir_acl(directory)
-        return directory
+    """Resolve (and create) the slot directory from config or platform default.
+    An uncreatable/unwritable directory is a config/environment fault, so it
+    fails the LEG as PowerShellTransportError, never the server."""
     import tempfile
 
-    directory = Path(tempfile.gettempdir()) / "hyperv-mcp-ps-slots"
-    directory.mkdir(parents=True, exist_ok=True)
+    if _config is not None and _config.ps_slot_dir:
+        directory = Path(_config.ps_slot_dir)
+    elif os.name == "nt" and os.environ.get("ProgramData"):
+        directory = Path(os.environ["ProgramData"]) / "hyperv-mcp" / "ps-slots"
+    else:
+        # tempdir default keeps the pool host-wide (a cwd fallback would not
+        # be shared by processes with different working directories).
+        directory = Path(tempfile.gettempdir()) / "hyperv-mcp-ps-slots"
+    created = not directory.exists()
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise PowerShellTransportError(
+            f"cannot create PowerShell slot directory {directory}: {redact(str(exc))}"
+        ) from None
+    if created and os.name == "nt" and _config is not None and _config.ps_slot_dir is None:
+        # Harden only the derived Windows default, never a caller-named dir
+        # (its ACLs are the caller's policy).
+        _harden_slot_dir_acl(directory)
     return directory
 
 
@@ -444,7 +448,12 @@ def _try_lock_slot(path: Path) -> int | None:
     flags = os.O_RDWR | os.O_CREAT
     if os.name == "nt":
         flags |= os.O_BINARY
-    fd = os.open(path, flags)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise PowerShellTransportError(
+            f"cannot open PowerShell slot file {path.name}: {redact(str(exc))}"
+        ) from None
     try:
         if os.name == "nt":
             os.lseek(fd, 0, os.SEEK_SET)
