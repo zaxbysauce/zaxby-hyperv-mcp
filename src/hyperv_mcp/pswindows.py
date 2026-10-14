@@ -23,12 +23,21 @@ import ctypes
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from ctypes import wintypes
 from dataclasses import dataclass
+from pathlib import Path
+
+import anyio
 
 from .config import Config, HttpPolicy
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 _CREATE_SUSPENDED = 0x00000004
 # Console-less servers (stdio child of a GUI host) make every console app
@@ -71,6 +80,11 @@ _GIT_ENV_NAMES = frozenset({"GIT_DIR", "GIT_WORK_TREE"})
 
 class PowerShellTransportError(RuntimeError):
     """powershell.exe missing or process machinery failed."""
+
+
+class PowerShellBusy(RuntimeError):
+    """The host-wide PowerShell slot pool is saturated and the bounded wait
+    expired (issue #15 / FND-13). Maps to error_class "busy" — retryable."""
 
 
 @dataclass
@@ -347,6 +361,152 @@ def redact(text: str) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# host-wide PowerShell slot pool (issue #15 / FND-13)
+#
+# Every run_ps call — from any tool leg, any relay request thread, any of the
+# several server processes agents start on one host — must hold one of N slot
+# lock files before it may spawn a child. The locks are OS file locks
+# (msvcrt.locking on Windows, fcntl.flock elsewhere), so the host-wide count
+# is bounded across processes AND a holder that dies has its slot released by
+# the OS (a named kernel semaphore would leak capacity instead). A fresh
+# open per acquisition excludes correctly between threads of one process
+# (separate file objects / open file descriptions) and across processes.
+
+_POLL_SLICE_S = 0.2  # communicate() polling slice; also the cancellation window
+_SLOT_RETRY_S = 0.05
+_SLOT_ACLS_DONE: set[str] = set()  # directories already hardened (best effort)
+
+
+def _ps_slot_dir() -> Path:
+    """Resolve (and create) the slot directory from config or platform default."""
+    if _config is not None and _config.ps_slot_dir:
+        directory = Path(_config.ps_slot_dir)
+        created = not directory.exists()
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+    if os.name == "nt":
+        base = os.environ.get("ProgramData")
+        directory = (
+            Path(base) / "hyperv-mcp" / "ps-slots" if base else Path.cwd() / ".ps-slots"
+        )
+        created = not directory.exists()
+        directory.mkdir(parents=True, exist_ok=True)
+        if created:
+            _harden_slot_dir_acl(directory)
+        return directory
+    import tempfile
+
+    directory = Path(tempfile.gettempdir()) / "hyperv-mcp-ps-slots"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _harden_slot_dir_acl(directory: Path) -> None:
+    """Best-effort ACL restriction of a freshly created default slot directory
+    to Administrators, Hyper-V Administrators (both by well-known SID, so the
+    grant survives localized group names) and the creating account. Failure
+    is a warning, never fatal: the cap still works, only the
+    non-admin-starvation hardening is weaker (README documents this)."""
+    key = str(directory)
+    if key in _SLOT_ACLS_DONE:
+        return
+    _SLOT_ACLS_DONE.add(key)
+    if os.name != "nt":
+        return
+    import getpass
+
+    argv = [
+        "icacls", str(directory), "/inheritance:r",
+        "/grant", "*S-1-5-32-544:(OI)(CI)F",      # BUILTIN\Administrators
+        "/grant", "*S-1-5-32-578:(OI)(CI)F",      # BUILTIN\Hyper-V Administrators
+    ]
+    account = getpass.getuser()
+    if account:
+        argv += ["/grant", f"{account}:(OI)(CI)F"]
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, timeout=30, env=child_env()
+        )
+        if completed.returncode != 0:
+            print(
+                "pswindows: slot-dir ACL hardening failed (continuing): "
+                + redact(completed.stderr.decode("utf-8", "replace").strip()),
+                file=sys.stderr,
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"pswindows: slot-dir ACL hardening failed (continuing): {exc}", file=sys.stderr)
+
+
+def _try_lock_slot(path: Path) -> int | None:
+    """Open `path` fresh and take a non-blocking exclusive lock on byte 0.
+    Returns the held fd, or None (after closing the attempt) when taken."""
+    flags = os.O_RDWR | os.O_CREAT
+    if os.name == "nt":
+        flags |= os.O_BINARY
+    fd = os.open(path, flags)
+    try:
+        if os.name == "nt":
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
+        return fd
+    except OSError:
+        os.close(fd)  # never strand per-attempt fds
+        return None
+
+
+def _acquire_ps_slot() -> int:
+    """Acquire one slot, round-robin, waiting up to the configured bound."""
+    assert _config is not None  # run_ps already requires init()
+    cap = _config.max_host_powershell
+    wait_s = float(_config.host_powershell_wait_s)
+    directory = _ps_slot_dir()
+    names = [directory / f"slot-{i:02d}.lock" for i in range(cap)]
+    deadline = time.monotonic() + wait_s
+    start_index = (threading.get_ident() + int(time.monotonic() * 1000)) % cap
+    while True:
+        for offset in range(cap):
+            fd = _try_lock_slot(names[(start_index + offset) % cap])
+            if fd is not None:
+                return fd
+        if time.monotonic() >= deadline:
+            raise PowerShellBusy(
+                f"host PowerShell pool saturated: {cap} concurrent children "
+                f"already running; waited {wait_s:g}s"
+            )
+        time.sleep(_SLOT_RETRY_S)
+
+
+def _release_ps_slot(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass  # closing the fd releases the lock anyway
+        else:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)  # type: ignore[attr-defined]
+            except OSError:
+                pass
+    finally:
+        os.close(fd)  # unconditional: an unlock failure must never strand the fd
+
+
+def _check_ps_cancellation() -> None:
+    """Observe anyio host-task cancellation from inside a worker thread (the
+    dispatch mcp uses for sync tools). Outside a worker thread this raises
+    RuntimeError (NoEventLoopError included) — swallowed here, so plain
+    threads and CLI callers keep today's behavior."""
+    try:
+        anyio.from_thread.check_cancelled()
+    except RuntimeError:
+        pass
+
+
 def run_ps(
     script: str,
     *,
@@ -357,8 +517,13 @@ def run_ps(
 
     The script is passed via -EncodedCommand so no secret ever lands on the
     process command line; the optional stdin_b64 payload (e.g. the base64
-    guest password) arrives on stdin. On timeout the whole host-side process
-    tree is killed via the Job Object (taskkill fallback). All output text is
+    guest password) arrives on stdin. The call must hold one of the
+    host-wide slot pool's lock files before spawning (issue #15): an
+    oversubscribed caller waits up to the configured bound and then raises
+    PowerShellBusy. On ANY exit other than normal completion — timeout,
+    exception, cancellation observed from an anyio worker thread — the whole
+    host-side process tree is killed via the Job Object (taskkill fallback),
+    the Job handle is closed, and the slot is released. All output text is
     redacted before return.
     """
     if _ps_path is None:
@@ -368,53 +533,85 @@ def run_ps(
     stdin_bytes = (stdin_b64 + "\n").encode("ascii") if stdin_b64 is not None else None
 
     start = time.monotonic()
-    job = _make_kill_on_close_job() if os.name == "nt" else None
-    try:
-        creationflags = _CREATE_SUSPENDED if os.name == "nt" else 0
-        proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        creationflags=(
-            creationflags | _CREATE_NO_WINDOW if os.name == "nt" else creationflags
-        ),
-        env=child_env(),
-    )
-    except OSError as exc:
-        if job:
-            ctypes.windll.kernel32.CloseHandle(job)
-        raise PowerShellTransportError(f"failed to spawn powershell: {redact(str(exc))}") from None
-
+    # One protected region from slot acquisition to release: no exit path —
+    # timeout, injected exception, cancellation, spawn failure, or an
+    # exception raised by job assignment/resume — may strand a slot fd, the
+    # Job handle, a spawned child, or mask a propagating exception (issue #15).
+    slot = _acquire_ps_slot()
+    job = None
+    proc = None
     job_assigned = False
-    if job is not None:
-        job_assigned = _assign_to_job(job, int(proc._handle))  # type: ignore[attr-defined]
-    resumed = _resume_process(proc.pid) if os.name == "nt" else True
-    if not resumed:
-        proc.kill()
-        if job:
-            ctypes.windll.kernel32.CloseHandle(job)
-        raise PowerShellTransportError("could not resume suspended powershell process")
-
+    completed = False
     timed_out = False
+    first_slice = True
+    out_b = err_b = b""
     try:
-        out_b, err_b = proc.communicate(input=stdin_bytes, timeout=effective_timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        if job is not None and job_assigned:
-            ctypes.windll.kernel32.TerminateJobObject(job, 1)
-        else:
-            _taskkill_tree(proc.pid)
+        job = _make_kill_on_close_job() if os.name == "nt" else None
         try:
-            proc.kill()
-        except OSError:
-            pass
-        out_b, err_b = proc.communicate()
+            creationflags = _CREATE_SUSPENDED if os.name == "nt" else 0
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=(
+                    creationflags | _CREATE_NO_WINDOW if os.name == "nt" else creationflags
+                ),
+                env=child_env(),
+            )
+        except OSError as exc:
+            raise PowerShellTransportError(
+                f"failed to spawn powershell: {redact(str(exc))}"
+            ) from None
+
+        if job is not None:
+            job_assigned = _assign_to_job(job, int(proc._handle))  # type: ignore[attr-defined]
+        if os.name == "nt" and not _resume_process(proc.pid):
+            raise PowerShellTransportError("could not resume suspended powershell process")
+            # the finally below kills the still-suspended child and cleans up
+
+        deadline = start + effective_timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                out_b, err_b = proc.communicate(
+                    input=stdin_bytes if first_slice else None,
+                    timeout=min(_POLL_SLICE_S, remaining),
+                )
+                completed = True
+                break
+            except subprocess.TimeoutExpired:
+                first_slice = False
+                _check_ps_cancellation()
+    finally:
+        if proc is not None and not completed:
+            try:  # best-effort tree kill; never masks a propagating exception
+                if job is not None and job_assigned:
+                    ctypes.windll.kernel32.TerminateJobObject(job, 1)
+                elif os.name == "nt":
+                    _taskkill_tree(proc.pid)
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            except Exception:
+                pass
+        if timed_out and proc is not None:
+            try:
+                out_b, err_b = proc.communicate()
+            except Exception:
+                out_b = err_b = b""  # partial output is best-effort
+        if job is not None:
+            try:
+                ctypes.windll.kernel32.CloseHandle(job)  # kill-on-close safety net
+            except OSError:
+                pass
+        _release_ps_slot(slot)
 
     duration_ms = int((time.monotonic() - start) * 1000)
-    if job is not None:
-        ctypes.windll.kernel32.CloseHandle(job)  # kill-on-close safety net
-
     result = PSResult(
         stdout=redact(out_b.decode("utf-8", "replace")).strip(),
         stderr=redact(_decode_clixml(err_b.decode("utf-8", "replace"))).strip(),

@@ -265,7 +265,11 @@ def _handle_logon_task(
                 "$v = [Environment]::GetEnvironmentVariable($n, 'User'); "
                 "if ($v) { Write-Output $n; break } }"
             )
-            result = pswindows.run_ps(probe, timeout_s=30)
+            try:
+                result = pswindows.run_ps(probe, timeout_s=30)
+            except pswindows.PowerShellBusy as exc:
+                print(f"ERROR: host PowerShell pool busy: {pswindows.redact(str(exc))}", file=sys.stderr)
+                return 1
             user_scope = result.ok() and result.stdout.strip()
             if not user_scope:
                 print(
@@ -288,6 +292,9 @@ def _handle_logon_task(
         result = pswindows.run_ps(script, timeout_s=60)
     except pswindows.PowerShellTransportError as exc:
         print(f"ERROR: PowerShell transport failed: {pswindows.redact(str(exc))}", file=sys.stderr)
+        return 1
+    except pswindows.PowerShellBusy as exc:
+        print(f"ERROR: host PowerShell pool busy: {pswindows.redact(str(exc))}", file=sys.stderr)
         return 1
     if not result.ok():
         stderr = pswindows.redact(result.stderr.strip() or result.stdout.strip() or "unknown error")

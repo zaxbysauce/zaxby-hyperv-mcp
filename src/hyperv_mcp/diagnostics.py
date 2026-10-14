@@ -20,7 +20,7 @@ import json
 import math
 from datetime import datetime, timezone
 
-from . import guestexec, pswindows, vmident
+from . import errors, guestexec, pswindows, vmident
 from .config import Config
 from .credentials import CredentialSet
 from .vmlocks import vm_lock
@@ -411,7 +411,10 @@ def diagnose_report(
         except TimeoutError as exc:
             ps_direct = {"available": False, "error": str(exc), "error_class": "timeout"}
         except Exception as exc:
-            ps_direct = {"available": False, "error": str(exc), "error_class": "transport"}
+            # issue #15: classify truthfully — a PowerShellBusy probe reports
+            # busy, not a fake transport failure; unknown types still default
+            # to "transport" inside classify.
+            ps_direct = {"available": False, "error": str(exc), "error_class": errors.classify(exc)}
 
     findings = _findings(host_info, guest)
     if not ps_direct.get("available"):

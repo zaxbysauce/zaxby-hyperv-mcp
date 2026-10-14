@@ -2334,6 +2334,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
             except pswindows.PowerShellTransportError as exc:
                 result = pswindows.PSResult(returncode=1, stderr=f"unavailable: {exc}")
+            except pswindows.PowerShellBusy as exc:
+                result = pswindows.PSResult(returncode=1, stderr=f"pool busy: {exc}")
             if result.ok() and result.stdout.strip() == "OK":
                 detail = "OK"
             else:

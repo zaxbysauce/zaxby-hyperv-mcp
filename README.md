@@ -268,6 +268,10 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
   "verify_sha256": false,              // default integrity check for transfers
   "ps_timeout_s": 120,                 // default host PowerShell timeout
   "vm_lock_wait_s": 30,                // per-VM lock bounded wait, 0..600 s (0 = fail fast)
+  "max_host_powershell": 8,            // host-wide concurrent powershell.exe cap, 1..64 (issue #15)
+  "host_powershell_wait_s": 60,        // oversubscribed-leg bounded wait, 0..600 s, int or float
+                                       // (0 = fail immediately with a busy error)
+  "ps_slot_dir": null,                 // slot lock-file directory; default %ProgramData%\hyperv-mcp\ps-slots
   // "hyperv": { "host": "nuc01" },    // remote Hyper-V host (issue #43);
   //                                    // OMIT the section entirely for local mode
   //                                    // (the section requires a non-empty host)
@@ -536,6 +540,33 @@ admitted before newly arriving readers, so polling reads cannot starve a
 checkpoint restore. Console input runs under a read lock on the VM key
 (guest work proceeds during typing) plus a write lock on a second per-VM
 key, so two agents cannot interleave keystrokes.
+
+Host PowerShell itself is bounded host-wide (issue #15): every tool leg,
+relay request, and every server process on the host shares a pool of
+`max_host_powershell` (default 8) slot lock files, so the number of
+simultaneous `powershell.exe` children can never exceed the cap no matter
+how many agents or server processes are running. A caller that cannot get a
+slot within `host_powershell_wait_s` (default 60 s) gets the same retryable
+`busy` envelope (`retryable: true`, `retry_after_ms: 2000`); relay requests
+surface it as their existing HTTP 502 transport reply. Slots are OS file
+locks, so a server process that dies has its slots released by the OS. The
+default slot directory (`%ProgramData%\hyperv-mcp\ps-slots`) is hardened,
+best effort, to Administrators, Hyper-V Administrators, and the creating
+account; hosts running servers under several non-administrative accounts
+should set `ps_slot_dir` explicitly with suitable ACLs (a second account
+cannot open slots in a directory hardened for the first). If the ACL
+hardening step fails, the server continues and logs a warning — the cap
+still works, only the non-admin-starvation hardening is weaker.
+
+Cancellation is also leg-safe now: if the MCP client cancels a request (or
+a call unwinds for any reason other than a normal completion or its own
+timeout), `run_ps` kills the whole host PowerShell process tree for that
+leg before returning, releases the VM lock and the slot, and closes the Job
+Object handle — previously the child kept running and kept the VM lock
+held until it finished on its own. The guest-side process of a PowerShell
+Direct leg may still be running after such a kill; that is the documented
+timeout semantics (see "Timeout semantics") and applies to cancellation
+the same way.
 
 ---
 
