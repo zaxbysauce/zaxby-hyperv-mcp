@@ -132,11 +132,11 @@ def _make_tool_limiter_lifespan(cap: int):
     """Build the server lifespan that bounds tool concurrency.
 
     mcp 2.x runs every sync tool body on a worker thread via
-    anyio.to_thread.run_sync, which draws from the process-wide DEFAULT
-    thread limiter (40 tokens, shared with anything else using to_thread).
-    Resize that default limiter to a dedicated bound above the host
-    PowerShell slot pool (2 x max_host_powershell, default 16) at server
-    start: a tool thread queued on a PowerShell slot holds a limiter token,
+    anyio.to_thread.run_sync, which draws from the DEFAULT thread limiter
+    (40 tokens, scoped to the running event loop and shared with anything
+    else using to_thread). Resize that default limiter to a dedicated bound
+    above the host PowerShell slot pool (2 x max_host_powershell, default
+    16) at server start: a tool thread queued on a PowerShell slot holds a limiter token,
     so PS-heavy saturation delays — it cannot deadlock, because slots are
     released when their child completes and no thread waits on another
     thread — and PS-free tools keep admission instead of inheriting anyio's

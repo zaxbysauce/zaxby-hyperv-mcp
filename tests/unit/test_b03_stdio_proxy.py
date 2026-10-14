@@ -26,7 +26,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import httpx
+import httpx2
 import pytest
 import uvicorn
 from mcp import ClientSession
@@ -586,7 +586,9 @@ def test_proxy_refuses_cleartext_non_loopback_url(monkeypatch, capsys):
             "client construction"
         )
 
-    monkeypatch.setattr(httpx.AsyncClient, "__init__", _no_async_client)
+    # mcp 2.x speaks httpx2 (the SDK's own HTTP stack); the tripwire guards
+    # the client class the proxy actually constructs.
+    monkeypatch.setattr(httpx2.AsyncClient, "__init__", _no_async_client)
     try:
         rc = server_module.main(["--proxy", "http://203.0.113.5:8787/mcp"])
     except SystemExit as exc:  # argparse refusal spelling
