@@ -111,3 +111,35 @@ def test_busy_envelope_end_to_end():
     assert env["error_class"] == "busy"
     assert env["retryable"] is True
     assert env["retry_after_ms"] == errors.BUSY_RETRY_MS
+
+
+def test_slot_dir_fault_is_transport_error(tmp_path, monkeypatch):
+    """Reviewer round-1 revision: an uncreatable slot directory fails the leg
+    as PowerShellTransportError (redacted), not a raw OSError traceback."""
+    from hyperv_mcp import diagnostics  # noqa: F401  (import-order sanity)
+
+    blocker = tmp_path / "probe-file.txt"
+    blocker.write_text("x", encoding="utf-8")
+    cfg = Config(ps_slot_dir=str(blocker / "sub"))
+    monkeypatch.setattr(pswindows, "_config", cfg)
+    with pytest.raises(pswindows.PowerShellTransportError) as excinfo:
+        pswindows._ps_slot_dir()
+    assert "cannot create PowerShell slot directory" in str(excinfo.value)
+
+
+def test_host_leg_busy_reports_class(monkeypatch, unrestricted):
+    """Reviewer round-1 revision: a busy host leg carries error_class "busy"
+    on the host_query_failed finding (plan Change 4 site 4, second half)."""
+    from hyperv_mcp import diagnostics
+
+    def busy(*args, **kwargs):
+        raise pswindows.PowerShellBusy("pool saturated")
+
+    monkeypatch.setattr(diagnostics, "_run_host_leg", busy)
+    monkeypatch.setattr(diagnostics, "_run_guest_probe", busy)
+    report = diagnostics.diagnose_report(
+        unrestricted, "11111111-2222-3333-4444-555555555555", "vm1", CRED, 3000
+    )
+    finding = next(f for f in report["findings"] if f["id"] == "host_query_failed")
+    assert finding["error_class"] == "busy"
+    assert report["ps_direct"]["error_class"] == "busy"
