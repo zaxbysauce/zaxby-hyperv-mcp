@@ -450,14 +450,17 @@ def _write_recorder_shim(workdir: Path) -> Path:
 def test_slot_wait_does_not_consume_the_leg_timeout(monkeypatch, tmp_path):
     """PRR-001 regression pin: the leg clock starts AFTER the slot wait, so a
     queued caller gets its full timeout budget. With a 0.9 s wait and a
-    1.5 s timeout, a 1.2 s child must still run to completion — at base the
-    wait was charged against the timeout and the child was killed at 0.6 s."""
+    1.5 s timeout, a 1.0 s child must still run to completion (at base the
+    wait was charged against the timeout and the child was killed at 0.6 s
+    of its life). The ~0.5 s head-side margin covers recorder-interpreter
+    startup on a loaded runner; the assertions are on recorded events, not
+    wall clock."""
     workdir = tmp_path / "w"
     workdir.mkdir()
     shim = _write_recorder_shim(workdir)
     events = workdir / "events.jsonl"
     monkeypatch.setenv("RECORDER_FILE", str(events))
-    monkeypatch.setenv("SLEEP_S", "1.2")
+    monkeypatch.setenv("SLEEP_S", "1.0")
     monkeypatch.setattr(
         pswindows, "_ps_path", str(shim)
     )
