@@ -143,3 +143,21 @@ def test_host_leg_busy_reports_class(monkeypatch, unrestricted):
     finding = next(f for f in report["findings"] if f["id"] == "host_query_failed")
     assert finding["error_class"] == "busy"
     assert report["ps_direct"]["error_class"] == "busy"
+
+
+def test_slot_dir_hardening_survives_popen_patches(tmp_path, monkeypatch):
+    """CI regression (PR #61 round 1): the ACL hardening spawn must use the
+    import-time REAL Popen, never the module attribute — issue #5's frozen
+    a01 checks patch subprocess.Popen with fakes that have no context-manager
+    surface, and the first-ever creation of the derived default slot dir runs
+    icacls right in the middle of such a test on a fresh CI runner."""
+    class _NoEnterPopen:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("hardening must not use the patched Popen attribute")
+
+    monkeypatch.setattr(pswindows.subprocess, "Popen", _NoEnterPopen)
+    monkeypatch.setattr(pswindows, "_SLOT_ACLS_DONE", set())  # force the fresh-run path
+    monkeypatch.setenv("ProgramData", str(tmp_path))  # derived default -> fresh dir
+    directory = pswindows._ps_slot_dir()
+    assert directory.exists()
+    assert directory.parent.name == "hyperv-mcp"

@@ -373,6 +373,8 @@ def redact(text: str) -> str:
 # open per acquisition excludes correctly between threads of one process
 # (separate file objects / open file descriptions) and across processes.
 
+_REAL_POPEN = subprocess.Popen  # bound at import: survives test patches of the module attribute
+
 _POLL_SLICE_S = 0.2  # communicate() polling slice; also the cancellation window
 _SLOT_RETRY_S = 0.05
 _SLOT_ACLS_DONE: set[str] = set()  # directories already hardened (best effort)
@@ -429,13 +431,23 @@ def _harden_slot_dir_acl(directory: Path) -> None:
     if account:
         argv += ["/grant", f"{account}:(OI)(CI)F"]
     try:
-        completed = subprocess.run(
-            argv, capture_output=True, timeout=30, env=child_env()
+        # Deliberately the import-time _REAL_POPEN, never the (patchable)
+        # module attribute: unit tests intercept run_ps spawns by patching
+        # subprocess.Popen and their fakes have no context-manager/timeout
+        # surface — infrastructure must not route through them.
+        proc = _REAL_POPEN(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env()
         )
-        if completed.returncode != 0:
+        try:
+            _, err_b = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+        if proc.returncode != 0:
             print(
                 "pswindows: slot-dir ACL hardening failed (continuing): "
-                + redact(completed.stderr.decode("utf-8", "replace").strip()),
+                + redact((err_b or b"").decode("utf-8", "replace").strip()),
                 file=sys.stderr,
             )
     except (OSError, subprocess.TimeoutExpired) as exc:
