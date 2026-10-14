@@ -20,6 +20,7 @@ command), GREEN after the fix.
 """
 
 import ctypes
+import json
 import os
 import secrets
 import socket
@@ -107,6 +108,23 @@ def _wait_listening(port: int, timeout_s: float = 20.0) -> bool:
     return False
 
 
+def _running_vm_id(result, name: str) -> str | None:
+    """The id of the RUNNING VM named `name` in a list_vms result (None when
+    absent or not running). The id is the stable handle when a drifted host
+    has more than one VM sharing the name."""
+    blocks = getattr(result, "content", None) or []
+    for block in blocks:
+        if getattr(block, "type", "") != "text":
+            continue
+        try:
+            row = json.loads(block.text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict) and row.get("name") == name and row.get("state") == "Running":
+            return row.get("id")
+    return None
+
+
 def test_screenshot_not_queued_behind_guest_command(it):
     """AC14: over the real transport, a console screenshot on the test VM
     returns while another client's 60 s guest command is still running, and
@@ -158,6 +176,16 @@ def test_screenshot_not_queued_behind_guest_command(it):
                     await agent_a.initialize()
                     await agent_b.initialize()
 
+                    # Resolve the test VM by id: the name may be ambiguous on
+                    # a drifted host (the resolver fails closed on duplicate
+                    # names), and vm_id is the stable handle.
+                    listed = await agent_a.call_tool("hyperv_list_vms", {})
+                    vm_id = _running_vm_id(listed, vm)
+                    assert vm_id, (
+                        f"no running VM named {vm!r} in the inventory; "
+                        "the test VM must be running for this check"
+                    )
+
                     # client A: the 60 s guest command, cancelled later
                     a_scope = anyio.CancelScope()
 
@@ -165,7 +193,7 @@ def test_screenshot_not_queued_behind_guest_command(it):
                         with a_scope:
                             await agent_a.call_tool(
                                 "hyperv_guest_run_ps",
-                                {"vm_name": vm, "script": GUEST_COMMAND},
+                                {"vm_id": vm_id, "script": GUEST_COMMAND},
                             )
 
                     async def screenshot():
@@ -173,7 +201,7 @@ def test_screenshot_not_queued_behind_guest_command(it):
                         started = time.monotonic()
                         result = await agent_b.call_tool(
                             "hyperv_console_screenshot",
-                            {"vm_name": vm, "width": 320, "height": 240},
+                            {"vm_id": vm_id, "width": 320, "height": 240},
                         )
                         return time.monotonic() - started, result
 
@@ -185,12 +213,21 @@ def test_screenshot_not_queued_behind_guest_command(it):
                         is_error = getattr(result, "is_error", None)
                         if is_error is None:
                             is_error = getattr(result, "isError", None)
-                        assert not is_error, (
-                            f"the screenshot failed while the guest command ran: {result}"
-                        )
+                        assert not is_error, f"the screenshot failed while the guest command ran: {result}"
                         assert screenshot_elapsed < 10.0, (
                             f"the screenshot took {screenshot_elapsed:.1f}s — it queued "
                             "behind the in-flight guest command (FND-01)"
+                        )
+                        # Anti-vacuity oracle: the guest leg must still be in
+                        # flight when the screenshot returns — the controller
+                        # holds a live host powershell.exe child for it. Without
+                        # this, a leg that failed instantly (or never started)
+                        # would make the timing assertion pass vacuously.
+                        in_flight = _descendant_pids(controller.pid, "powershell.exe")
+                        assert in_flight, (
+                            "no host powershell.exe child of the controller was in "
+                            "flight when the screenshot returned — the guest leg "
+                            "was not actually running, so the overlap is unproven"
                         )
                         # cancel A's call the way an impatient client would
                         a_scope.cancel()

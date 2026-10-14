@@ -126,10 +126,12 @@ def test_credentialed_leg_from_pwsh7_parent(running_vm, monkeypatch):
         mod.bootstrap({})
         mcp = mod.get_mcp()
         raw = asyncio.run(mcp.call_tool("hyperv_server_info", {}))
-        content = raw[0] if isinstance(raw, tuple) else raw
+        # generation-agnostic content blocks (1.x tuple/list, 2.x CallToolResult)
+        from tests.unit.conftest import content_blocks
+
         response_text = "".join(
             getattr(block, "text", "")
-            for block in content
+            for block in content_blocks(raw)
             if getattr(block, "type", "") == "text"
         )
         payload = json.loads(response_text)
