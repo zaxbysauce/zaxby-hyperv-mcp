@@ -87,13 +87,15 @@ def test_cancelled_guest_leg_leaves_no_host_powershell(it):
 
     from hyperv_mcp import guestexec, lifecycle
 
+    start = time.monotonic()
+    leg_starts: list[float] = []
+
     def leg():
+        leg_starts.append(time.monotonic() - start)
         return guestexec.guest_run_ps(
             it.cfg, it.vm, "Start-Sleep -Seconds 60",
             timeout_ms=90000, cred=it.creds,
         )
-
-    start = time.monotonic()
 
     async def scenario():
         with anyio.move_on_after(3):
@@ -104,6 +106,16 @@ def test_cancelled_guest_leg_leaves_no_host_powershell(it):
     assert elapsed <= 5, (
         f"the cancelled guest leg returned after {elapsed:.1f}s (bound: 5s); "
         "cancellation must stop the host-side leg promptly"
+    )
+    # Anti-vacuity oracle: the cancel budget must land on the GUEST leg, not
+    # on the earlier vmident.resolve leg. If resolve alone consumed the 3 s
+    # budget the guest leg never starts and the assertions below would pass
+    # without exercising cancellation at all — so require the guest leg to
+    # have started before the 3 s deadline.
+    assert leg_starts and leg_starts[0] < 3.0, (
+        f"the guest leg started at {leg_starts[0] if leg_starts else 'never'}s "
+        "into a 3s cancel budget — the scope cancelled an earlier leg "
+        "(vmident.resolve), so guest-leg cancellation was never exercised"
     )
 
     survivors = _powershell_descendant_pids()

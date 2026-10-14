@@ -603,7 +603,10 @@ def vm_set_resolution(
                     _run(cfg, start_script, f"vm_set_resolution restart-recover({ref.name})",
                          timeout_s=180)
                     recovered = "the VM was restarted"
-                except MediaError:
+                except (MediaError, pswindows.PowerShellBusy):
+                    # A busy compensation leg must not escape this handler:
+                    # the original failure (and the "VM is still OFF" state
+                    # note) has to survive into the envelope the caller sees.
                     recovered = "the VM is still OFF (start it with hyperv_start_vm)"
                 if isinstance(exc, pswindows.PowerShellBusy):
                     # issue #15: re-raise busy itself (retryable) instead of

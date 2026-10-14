@@ -275,6 +275,14 @@ def _powershell_provenance(cfg: Config) -> dict[str, str]:
     answers = {"path": "", "edition": "", "version": "", "psmodulepath": ""}
     try:
         result = pswindows.run_ps(_PROVENANCE_SCRIPT, timeout_s=10)
+    except pswindows.PowerShellBusy:
+        # Pool saturation is a capacity condition, not missing provenance:
+        # report it as such instead of the "unknown" fallback (PR review).
+        answers["edition"] = "unknown (host PowerShell pool busy)"
+        answers["version"] = "unknown (host PowerShell pool busy)"
+        answers["psmodulepath"] = "unknown (host PowerShell pool busy)"
+        answers["path"] = pswindows.find_powershell(cfg.host_powershell_path)
+        return answers
     except Exception:
         result = None
     if result is not None and result.ok():
@@ -2338,6 +2346,11 @@ def main(argv: list[str] | None = None) -> int:
                 result = pswindows.PSResult(returncode=1, stderr=f"pool busy: {exc}")
             if result.ok() and result.stdout.strip() == "OK":
                 detail = "OK"
+            elif "pool busy" in result.stderr:
+                # Pool saturation is a capacity condition, not connectivity:
+                # label it distinctly so operators are not sent to WinRM
+                # remedies (README troubleshooting has the matching row).
+                detail = "POOL_BUSY: " + result.stderr.strip()
             else:
                 detail = "UNREACHABLE: " + (
                     result.stderr.strip()

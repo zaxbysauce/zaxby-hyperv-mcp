@@ -270,6 +270,9 @@ def _handle_logon_task(
             except pswindows.PowerShellBusy as exc:
                 print(f"ERROR: host PowerShell pool busy: {pswindows.redact(str(exc))}", file=sys.stderr)
                 return 1
+            except pswindows.PowerShellTransportError as exc:
+                print(f"ERROR: PowerShell transport failed: {pswindows.redact(str(exc))}", file=sys.stderr)
+                return 1
             user_scope = result.ok() and result.stdout.strip()
             if not user_scope:
                 print(

@@ -77,7 +77,10 @@ $up = if ($vm.Uptime) {{ [int][math]::Floor($vm.Uptime.TotalSeconds) }} else {{ 
 def _run_host_leg(cfg: Config, vm_id: str) -> dict:
     result = _run(cfg, _host_leg_script(vm_id), timeout_s=90)
     if result.timed_out:
-        raise RuntimeError(f"host leg timed out for '{vm_id}'")
+        # TimeoutError (not bare RuntimeError) so errors.classify reports
+        # "timeout" — the same class the sibling guest leg reports for the
+        # same condition on the same report.
+        raise TimeoutError(f"host leg timed out for '{vm_id}'")
     pswindows.check_result(result)
     payload = json.loads(result.stdout.strip() or "{}")
     if not isinstance(payload, dict) or "state" not in payload:
@@ -426,6 +429,7 @@ def diagnose_report(
             "id": "ps_direct_unavailable", "severity": "high", "route": "ps_direct",
             "summary": "PowerShell Direct could not reach the guest",
             "detail": ps_direct.get("error", ""),
+            "error_class": ps_direct.get("error_class", ""),
         })
     if host_error:
         findings.append({

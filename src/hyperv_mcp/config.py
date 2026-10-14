@@ -20,6 +20,7 @@ import ntpath
 import os
 import re
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, ClassVar
 
 SCHEMA_VERSION = 1
@@ -234,8 +235,14 @@ class Config:
             raise ConfigError("host_powershell_wait_s must be a number in 0..600")
         if not 0 <= self.host_powershell_wait_s <= 600:
             raise ConfigError("host_powershell_wait_s must be a number in 0..600")
-        if self.ps_slot_dir is not None and not self.ps_slot_dir.strip():
-            raise ConfigError("ps_slot_dir must be a non-empty path or null")
+        if self.ps_slot_dir is not None:
+            if not self.ps_slot_dir.strip():
+                raise ConfigError("ps_slot_dir must be a non-empty path or null")
+            # A relative slot dir resolves against each process's CWD, which
+            # silently splits the host-wide pool (the cap stops being
+            # host-wide). Reject it at load time.
+            if not Path(self.ps_slot_dir).is_absolute():
+                raise ConfigError("ps_slot_dir must be an absolute path or null")
         # child_env() strips the token_env-named variable from every spawned
         # child; naming a functional variable would break that child (bare-name
         # resolution, PowerShell internals), so reject it at load time.
@@ -321,6 +328,9 @@ class Config:
             f"destructive={self.destructive}",
             f"allow_inline_credentials={self.allow_inline_credentials}",
             f"audit_log_path={self.audit_log_path or '(stderr)'}",
+            f"max_host_powershell={self.max_host_powershell}",
+            f"host_powershell_wait_s={self.host_powershell_wait_s:g}",
+            f"ps_slot_dir={self.ps_slot_dir or '(derived default)'}",
         ]
         return "; ".join(lines)
 

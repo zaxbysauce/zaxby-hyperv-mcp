@@ -376,6 +376,7 @@ def redact(text: str) -> str:
 _REAL_POPEN = subprocess.Popen  # bound at import: survives test patches of the module attribute
 
 _POLL_SLICE_S = 0.2  # communicate() polling slice; also the cancellation window
+_DRAIN_TIMEOUT_S = 2.0  # bound on the post-kill partial-output drain
 _SLOT_RETRY_S = 0.05
 _SLOT_ACLS_DONE: set[str] = set()  # directories already hardened (best effort)
 
@@ -388,30 +389,38 @@ def _ps_slot_dir() -> Path:
 
     if _config is not None and _config.ps_slot_dir:
         directory = Path(_config.ps_slot_dir)
+        hardening_scope = False  # caller-named dirs keep the caller's ACL policy
     elif os.name == "nt" and os.environ.get("ProgramData"):
         directory = Path(os.environ["ProgramData"]) / "hyperv-mcp" / "ps-slots"
+        hardening_scope = True
     else:
         # tempdir default keeps the pool host-wide (a cwd fallback would not
-        # be shared by processes with different working directories).
+        # be shared by processes with different working directories). On
+        # Windows this resolves under the calling account's %LOCALAPPDATA%,
+        # so the pool is per-account there (README documents this); it is not
+        # ACL-hardened because hardening a shared temp root is wrong.
         directory = Path(tempfile.gettempdir()) / "hyperv-mcp-ps-slots"
-    created = not directory.exists()
+        hardening_scope = False
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise PowerShellTransportError(
             f"cannot create PowerShell slot directory {directory}: {redact(str(exc))}"
         ) from None
-    if created and os.name == "nt" and _config is not None and _config.ps_slot_dir is None:
-        # Harden only the derived Windows default, never a caller-named dir
-        # (its ACLs are the caller's policy).
+    if hardening_scope and os.name == "nt":
+        # Harden the derived ProgramData default once per process whether or
+        # not THIS process created it: a pre-existing (or squatted) directory
+        # must not be adopted unhardened — the issue's constraint is that the
+        # slot directory must not be writable by non-administrative users.
+        # _SLOT_ACLS_DONE keeps it once-per-directory per process.
         _harden_slot_dir_acl(directory)
     return directory
 
 
 def _harden_slot_dir_acl(directory: Path) -> None:
-    """Best-effort ACL restriction of a freshly created default slot directory
-    to Administrators, Hyper-V Administrators (both by well-known SID, so the
-    grant survives localized group names) and the creating account. Failure
+    """Best-effort ACL restriction of the derived default slot directory to
+    Administrators, Hyper-V Administrators (both by well-known SID, so the
+    grant survives localized group names) and the running account. Failure
     is a warning, never fatal: the cap still works, only the
     non-admin-starvation hardening is weaker (README documents this)."""
     key = str(directory)
@@ -420,14 +429,23 @@ def _harden_slot_dir_acl(directory: Path) -> None:
     _SLOT_ACLS_DONE.add(key)
     if os.name != "nt":
         return
-    import getpass
 
     argv = [
         "icacls", str(directory), "/inheritance:r",
         "/grant", "*S-1-5-32-544:(OI)(CI)F",      # BUILTIN\Administrators
         "/grant", "*S-1-5-32-578:(OI)(CI)F",      # BUILTIN\Hyper-V Administrators
     ]
-    account = getpass.getuser()
+    # The account grant is best-effort: getpass.getuser() falls back to the
+    # pwd module (absent on Windows) when the environment carries no user
+    # name, so it must never be able to fail the leg. A derived-but-unknown
+    # account simply skips the grant (Administrators + Hyper-V
+    # Administrators still hold the directory).
+    try:
+        import getpass
+
+        account = getpass.getuser()
+    except Exception:
+        account = ""
     if account:
         argv += ["/grant", f"{account}:(OI)(CI)F"]
     try:
@@ -436,7 +454,8 @@ def _harden_slot_dir_acl(directory: Path) -> None:
         # subprocess.Popen and their fakes have no context-manager/timeout
         # surface — infrastructure must not route through them.
         proc = _REAL_POPEN(
-            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env()
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env(),
+            creationflags=_CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         try:
             _, err_b = proc.communicate(timeout=30)
@@ -451,7 +470,13 @@ def _harden_slot_dir_acl(directory: Path) -> None:
                 file=sys.stderr,
             )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        print(f"pswindows: slot-dir ACL hardening failed (continuing): {exc}", file=sys.stderr)
+        # Type + message only: a TimeoutExpired stringifies as the whole
+        # command line (slot-directory path and account name included).
+        print(
+            f"pswindows: slot-dir ACL hardening failed (continuing): "
+            f"{type(exc).__name__}: {redact(str(exc)) if not isinstance(exc, subprocess.TimeoutExpired) else 'timed out after 30s'}",
+            file=sys.stderr,
+        )
 
 
 def _try_lock_slot(path: Path) -> int | None:
@@ -479,48 +504,63 @@ def _try_lock_slot(path: Path) -> int | None:
 
 
 def _acquire_ps_slot() -> int:
-    """Acquire one slot, round-robin, waiting up to the configured bound."""
-    assert _config is not None  # run_ps already requires init()
+    """Acquire one slot, round-robin, waiting up to the configured bound.
+
+    The wait itself observes anyio cancellation each retry tick, so a
+    cancelled caller never sits out the full bound and never gets told to
+    retry a call it cancelled.
+    """
+    if _config is None:
+        raise PowerShellTransportError("pswindows.init() was not called")
     cap = _config.max_host_powershell
     wait_s = float(_config.host_powershell_wait_s)
     directory = _ps_slot_dir()
     names = [directory / f"slot-{i:02d}.lock" for i in range(cap)]
-    deadline = time.monotonic() + wait_s
-    start_index = (threading.get_ident() + int(time.monotonic() * 1000)) % cap
+    started = time.monotonic()
+    deadline = started + wait_s
+    start_index = (threading.get_ident() + int(started * 1000)) % cap
     while True:
         for offset in range(cap):
+            if wait_s and time.monotonic() >= deadline:
+                break  # check the deadline inside the sweep: never overshoot
             fd = _try_lock_slot(names[(start_index + offset) % cap])
             if fd is not None:
                 return fd
-        if time.monotonic() >= deadline:
+        waited = time.monotonic() - started
+        if waited >= wait_s:
             raise PowerShellBusy(
                 f"host PowerShell pool saturated: {cap} concurrent children "
-                f"already running; waited {wait_s:g}s"
+                f"already running; waited {waited:.3g}s"
             )
+        _check_ps_cancellation()
         time.sleep(_SLOT_RETRY_S)
 
 
 def _release_ps_slot(fd: int) -> None:
     try:
-        if os.name == "nt":
-            os.lseek(fd, 0, os.SEEK_SET)
-            try:
+        try:
+            if os.name == "nt":
+                os.lseek(fd, 0, os.SEEK_SET)
                 msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-            except OSError:
-                pass  # closing the fd releases the lock anyway
-        else:
-            try:
+            else:
                 fcntl.flock(fd, fcntl.LOCK_UN)  # type: ignore[attr-defined]
-            except OSError:
-                pass
+        except OSError:
+            pass  # closing the fd releases the lock anyway
     finally:
-        os.close(fd)  # unconditional: an unlock failure must never strand the fd
+        try:
+            os.close(fd)  # unconditional: an unlock failure must never strand the fd
+        except OSError:
+            pass  # never mask the exception this release is unwinding past
 
 
 def _check_ps_cancellation() -> None:
-    """Observe anyio host-task cancellation from inside a worker thread (the
-    dispatch mcp uses for sync tools). Outside a worker thread this raises
-    RuntimeError (NoEventLoopError included) — swallowed here, so plain
+    """Observe anyio host-task cancellation from inside a worker thread.
+
+    anyio.to_thread.run_sync workers (the dispatch shape MCP request
+    cancellation will use once tool calls move off the event loop, issue #16)
+    get their cancellation exception raised here. Anywhere else — including
+    the event-loop thread mcp 1.x uses for sync tools today — this raises
+    RuntimeError (NoEventLoopError included), which is swallowed, so plain
     threads and CLI callers keep today's behavior."""
     try:
         anyio.from_thread.check_cancelled()
@@ -553,12 +593,16 @@ def run_ps(
     argv = [_ps_path, "-NonInteractive", "-NoProfile", "-EncodedCommand", encode_command(_PS_PIN + script)]
     stdin_bytes = (stdin_b64 + "\n").encode("ascii") if stdin_b64 is not None else None
 
-    start = time.monotonic()
     # One protected region from slot acquisition to release: no exit path —
     # timeout, injected exception, cancellation, spawn failure, or an
     # exception raised by job assignment/resume — may strand a slot fd, the
     # Job handle, a spawned child, or mask a propagating exception (issue #15).
     slot = _acquire_ps_slot()
+    # The leg clock starts AFTER the slot wait: the bounded wait is its own
+    # budget (host_powershell_wait_s) and must not consume the caller's
+    # script timeout, or saturation would surface as a non-retryable timeout
+    # with empty output instead of the retryable busy envelope.
+    start = time.monotonic()
     job = None
     proc = None
     job_assigned = False
@@ -609,20 +653,30 @@ def run_ps(
                 _check_ps_cancellation()
     finally:
         if proc is not None and not completed:
-            try:  # best-effort tree kill; never masks a propagating exception
+            # Best-effort tree kill; never masks a propagating exception. Each
+            # kill step is independent: a failing taskkill must not skip the
+            # direct-child kill, and the whole block must not skip close/release.
+            try:
                 if job is not None and job_assigned:
                     ctypes.windll.kernel32.TerminateJobObject(job, 1)
-                elif os.name == "nt":
-                    _taskkill_tree(proc.pid)
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
             except Exception:
                 pass
-        if timed_out and proc is not None:
             try:
-                out_b, err_b = proc.communicate()
+                if job is None or not job_assigned:
+                    if os.name == "nt":
+                        _taskkill_tree(proc.pid)
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        if timed_out and proc is not None:
+            # Bounded drain: a surviving grandchild holding the inherited
+            # stdout handle must not be able to wedge the cleanup forever
+            # while this leg still holds its slot (issue #15 review).
+            try:
+                out_b, err_b = proc.communicate(timeout=_DRAIN_TIMEOUT_S)
             except Exception:
                 out_b = err_b = b""  # partial output is best-effort
         if job is not None:
