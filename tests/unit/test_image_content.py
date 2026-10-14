@@ -145,7 +145,7 @@ def test_deadline_wait_returns_no_image_block(monkeypatch, fresh_server):
 
 
 def test_tools_never_return_raw_image_objects(monkeypatch, fresh_server):
-    """Tool functions must return mcp.types ImageContent, never the FastMCP
+    """Tool functions must return mcp.types ImageContent, never the SDK
     Image wrapper. On Python 3.10, `-> Any` builds a wrapped output model and
     convert_result model_dumps the raw return — a raw Image raises
     PydanticSerializationError there. Python 3.11+ skips that path, so CI's
