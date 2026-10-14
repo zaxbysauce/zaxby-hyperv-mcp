@@ -56,6 +56,7 @@ from . import (
     relay,
     repair,
     stdio_proxy,
+    vmlocks,
 )
 from .config import Config, ConfigError
 
@@ -134,6 +135,7 @@ def bootstrap(environ: dict[str, str] | None = None) -> Config:
     credentials.init(cfg)
     pswindows.init(cfg, credentials.redact)
     auditlog.init(cfg)
+    vmlocks.set_default_wait_s(cfg.vm_lock_wait_s)  # issue #14 bounded lock wait
     auth = None
     if _http_token_verifier is not None:
         # FastMCP requires AuthSettings when a token_verifier is installed.
@@ -496,7 +498,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         Returns: {status, vm_name, state}
 
-        Failure: {ok: false, error, error_class, retryable, retry_after_ms}.        """
+        Failure: {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).        """
         return _run_guest_tool(
             "hyperv_start_vm", vm_name, "lifecycle",
             lifecycle.start_vm, _cfg(), vm_name, vm_id=vm_id,
@@ -518,7 +520,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         Returns: {status, vm_name, method, state}
 
-        Failure: {ok: false, error, error_class, retryable, retry_after_ms}.        """
+        Failure: {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).        """
         return _run_guest_tool(
             "hyperv_stop_vm", vm_name, "destructive",
             lifecycle.stop_vm, _cfg(), vm_name,
@@ -537,7 +539,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         Returns: {status, vm_name, state}
 
-        Failure: {ok: false, error, error_class, retryable, retry_after_ms}.        """
+        Failure: {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).        """
         return _run_guest_tool(
             "hyperv_reset_vm", vm_name, "destructive",
             lifecycle.reset_vm, _cfg(), vm_name, confirm=confirm, vm_id=vm_id,
@@ -556,7 +558,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         Returns: {status, vm_name, checkpoint_name}
 
-        Failure: {ok: false, error, error_class, retryable, retry_after_ms}.        """
+        Failure: {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).        """
         return _run_guest_tool(
             "hyperv_checkpoint_create", vm_name, "checkpoint",
             lifecycle.checkpoint_create, _cfg(), vm_name,
@@ -597,7 +599,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         Returns: {status, vm_name, checkpoint_name, state, note}
 
-        Failure: {ok: false, error, error_class, retryable, retry_after_ms}.        """
+        Failure: {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).        """
         return _run_guest_tool(
             "hyperv_checkpoint_restore", vm_name, "destructive",
             lifecycle.checkpoint_restore, _cfg(), vm_name,
@@ -621,7 +623,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         Returns: {status, vm_name, checkpoint_name}
 
-        Failure: {ok: false, error, error_class, retryable, retry_after_ms}.        """
+        Failure: {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).        """
         return _run_guest_tool(
             "hyperv_checkpoint_remove", vm_name, "destructive",
             lifecycle.checkpoint_remove, _cfg(), vm_name,
@@ -656,7 +658,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
             Returns: {status, vm_name, host_ip, port, key,
                       kernel_attach_string, bcdedit_output, rebooting}
-            Failure: {ok: false, error, error_class, retryable, retry_after_ms}.
+            Failure: {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_guest_tool(
                 "hyperv_configure_kdnet", vm_name, "destructive",
@@ -686,7 +688,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
             Returns: {status, vm_name, com_port, pipe_path,
                       kernel_attach_string, bcdedit_output, rebooting}
-            Failure: {ok: false, error, error_class, retryable, retry_after_ms}.
+            Failure: {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_guest_tool(
                 "hyperv_configure_kdcom", vm_name, "destructive",
@@ -719,7 +721,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
             Returns: {status, vm_name, host_ip, port, key,
                       kernel_attach_string, bcdedit_output, rebooting}
-            Failure: {ok: false, error, error_class, retryable, retry_after_ms}.
+            Failure: {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_guest_tool(
                 "hyperv_configure_kdnet", vm_name, "destructive",
@@ -748,7 +750,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
             Returns: {status, vm_name, com_port, pipe_path,
                       kernel_attach_string, bcdedit_output, rebooting}
-            Failure: {ok: false, error, error_class, retryable, retry_after_ms}.
+            Failure: {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_guest_tool(
                 "hyperv_configure_kdcom", vm_name, "destructive",
@@ -779,7 +781,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
-            or {ok: false, error, error_class, retryable, retry_after_ms}
+            or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
             return _run_guest_tool(
                 "hyperv_guest_run_ps", vm_name, "exec",
@@ -805,7 +807,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
-            or {ok: false, error, error_class, retryable, retry_after_ms}
+            or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
             return _run_guest_tool(
                 "hyperv_guest_run", vm_name, "exec",
@@ -830,7 +832,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, bytes_copied, sha256_local?, sha256_remote?}
-            or {ok: false, error, error_class, retryable, retry_after_ms}
+            or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
             return _run_guest_tool(
                 "hyperv_guest_put", vm_name, "transfer",
@@ -854,7 +856,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, bytes_copied, sha256_local?, sha256_remote?}
-            or {ok: false, error, error_class, retryable, retry_after_ms}
+            or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
             return _run_guest_tool(
                 "hyperv_guest_get", vm_name, "transfer",
@@ -877,7 +879,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, content_b64, bytes_read, truncated}
-            or {ok: false, error, error_class, retryable, retry_after_ms}
+            or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
             return _run_guest_tool(
                 "hyperv_guest_read_file", vm_name, "transfer",
@@ -898,7 +900,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, entries: [{name, is_dir, size_bytes, modified}]}
-            or {ok: false, error, error_class, retryable, retry_after_ms}
+            or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
             return _run_guest_tool(
                 "hyperv_guest_list_dir", vm_name, "transfer",
@@ -922,7 +924,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
-            or {ok: false, error, error_class, retryable, retry_after_ms}
+            or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
             return _run_guest_tool(
                 "hyperv_guest_run_ps", vm_name, "exec",
@@ -946,7 +948,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
-            or {ok: false, error, error_class, retryable, retry_after_ms}
+            or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
             return _run_guest_tool(
                 "hyperv_guest_run", vm_name, "exec",
@@ -967,7 +969,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, bytes_copied, sha256_local?, sha256_remote?}
-            or {ok: false, error, error_class, retryable, retry_after_ms}
+            or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
             return _run_guest_tool(
                 "hyperv_guest_put", vm_name, "transfer",
@@ -987,7 +989,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, bytes_copied, sha256_local?, sha256_remote?}
-            or {ok: false, error, error_class, retryable, retry_after_ms}
+            or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
             return _run_guest_tool(
                 "hyperv_guest_get", vm_name, "transfer",
@@ -1006,7 +1008,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, content_b64, bytes_read, truncated}
-            or {ok: false, error, error_class, retryable, retry_after_ms}
+            or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
             return _run_guest_tool(
                 "hyperv_guest_read_file", vm_name, "transfer",
@@ -1021,7 +1023,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
             Returns: {ok, entries: [{name, is_dir, size_bytes, modified}]}
-            or {ok: false, error, error_class, retryable, retry_after_ms}
+            or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
             return _run_guest_tool(
                 "hyperv_guest_list_dir", vm_name, "transfer",
@@ -1043,7 +1045,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
-        or {ok: false, error, error_class, retryable, retry_after_ms}
+        or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
         """
         return _run_guest_tool(
             "hyperv_victim_run", vm_name, "victim",
@@ -1062,7 +1064,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
-        or {ok: false, error, error_class, retryable, retry_after_ms}
+        or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
         """
         return _run_guest_tool(
             "hyperv_victim_run_ps", vm_name, "victim",
@@ -1077,7 +1079,8 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
     # (as a CallToolResult) on failure, so the success shape is uniformly
     # image content + a metadata text block (FastMCP converts the list:
     # ImageContent + TextContent). Input tools use the {ok,...} envelope on
-    # success; every failure leaves as the shared 5-key envelope.
+    # success; every failure leaves as the shared failure envelope
+    # (+ holder on busy).
 
     def _run_console_tool(tool: str, vm: str, category: str, fn, *args, **kwargs) -> Any:
         op = _audit(tool, vm, category)
@@ -1175,7 +1178,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, chunks, chars} or {ok: false, error, error_class, retryable, retry_after_ms}
+        Returns: {ok, chunks, chars} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
         """
         return _run_console_tool(
             "hyperv_console_type_text", vm_name, "console_input",
@@ -1194,7 +1197,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class, retryable, retry_after_ms}
+        Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
         """
         return _run_console_tool(
             "hyperv_console_press_key", vm_name, "console_input",
@@ -1211,7 +1214,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class, retryable, retry_after_ms}
+        Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
         """
         return _run_console_tool(
             "hyperv_console_key_combo", vm_name, "console_input",
@@ -1228,7 +1231,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class, retryable, retry_after_ms}
+        Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
         """
         return _run_console_tool(
             "hyperv_console_type_scancodes", vm_name, "console_input",
@@ -1251,7 +1254,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {ok, operation, vm_name, head_x, head_y} or the failure
-        envelope {ok: false, error, error_class, retryable, retry_after_ms}.
+        envelope {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
         """
         return _run_console_tool(
             "hyperv_console_mouse_move", vm_name, "console_input",
@@ -1271,7 +1274,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, operation, head_x?, head_y?} or {ok: false, error, error_class, retryable, retry_after_ms}
+        Returns: {ok, operation, head_x?, head_y?} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
         """
         return _run_console_tool(
             "hyperv_console_click", vm_name, "console_input",
@@ -1288,7 +1291,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, operation} or {ok: false, error, error_class, retryable, retry_after_ms}
+        Returns: {ok, operation} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
         """
         return _run_console_tool(
             "hyperv_console_button", vm_name, "console_input",
@@ -1302,7 +1305,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, operation} or {ok: false, error, error_class, retryable, retry_after_ms}
+        Returns: {ok, operation} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
         """
         return _run_console_tool(
             "hyperv_console_scroll", vm_name, "console_input",
@@ -1436,7 +1439,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
         Policy: vm_provision category + confirm=true.
 
         Returns: {ok, id, name, state, generation} or the failure envelope
-        {ok: false, error, error_class, retryable, retry_after_ms}.
+        {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
         """
         return _run_guest_tool(
             "hyperv_vm_create", name, "vm_provision",
@@ -1458,7 +1461,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_name: Name of the VM
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, vhd_path, disk_count} or {ok: false, error, error_class, retryable, retry_after_ms}.
+        Returns: {ok, vhd_path, disk_count} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
         disk_count is null if the post-add read failed (the disk is attached
         either way).
         """
@@ -1494,7 +1497,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_name: Name of the VM
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, iso_path, attached} or {ok: false, error, error_class, retryable, retry_after_ms}.
+        Returns: {ok, iso_path, attached} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
         attached is null if the post-attach read failed (the ISO is attached
         either way).
         """
@@ -1510,7 +1513,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, removed: [...]} or {ok: false, error, error_class, retryable, retry_after_ms}.
+        Returns: {ok, removed: [...]} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
         """
         return _run_guest_tool(
             "hyperv_vm_media_detach", vm_name, "media",
@@ -1557,7 +1560,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_name: Name of the VM
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, first_boot} or {ok: false, error, error_class, retryable, retry_after_ms}.
+        Returns: {ok, first_boot} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
         """
         return _run_guest_tool(
             "hyperv_vm_firmware_set_boot_order", vm_name, "vm_provision",
@@ -1578,7 +1581,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                      a schema error; it never silently defaults to disable)
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, tpm_enabled, vm_name} or {ok: false, error, error_class, retryable, retry_after_ms}.
+        Returns: {ok, tpm_enabled, vm_name} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
         """
         return _run_guest_tool(
             "hyperv_vm_tpm_set", vm_name, "vm_provision",
@@ -1675,7 +1678,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
                   observed_horizontal, observed_vertical,
                   effective_after_restart, vm_name} (state added on the
                   restart path) or the failure envelope {ok: false, error,
-                  error_class, retryable, retry_after_ms}.
+                  error_class, retryable, retry_after_ms} (+ holder on busy).
         """
         return _run_guest_tool(
             "hyperv_vm_set_resolution", vm_name,
@@ -1694,7 +1697,7 @@ def _register_tools(cfg: Config, mcp: FastMCP) -> None:
             vm_name: Name of the VM
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, switch_name} or {ok: false, error, error_class, retryable, retry_after_ms}.
+        Returns: {ok, switch_name} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
         """
         return _run_guest_tool(
             "hyperv_vm_network_set", vm_name, "media",

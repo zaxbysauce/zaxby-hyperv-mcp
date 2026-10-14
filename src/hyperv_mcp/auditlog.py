@@ -25,7 +25,7 @@ from typing import Literal
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 
-from . import credentials
+from . import credentials, vmlocks
 from .config import Config
 
 _lock = threading.Lock()
@@ -157,14 +157,26 @@ class operation:  # noqa: N801 - context manager reads like a decorator
         self.relay_id = relay_id
         self.agent_id: str | None = None
         self.request_id: str = ""
+        self._tool_token: object | None = None
 
     def __enter__(self) -> operation:
         self.start = time.monotonic()
         self.agent_id = current_agent_id()
         self.request_id = uuid.uuid4().hex
+        # Issue #14: carry the tool name so a VMBusy raised anywhere inside
+        # this operation can name the holder without signature plumbing.
+        # The token is per-instance so nested operations reset correctly.
+        self._tool_token = vmlocks._current_tool.set(self.tool)
         return self
 
     def __exit__(self, exc_type, exc, tb) -> Literal[False]:
+        # Reset before anything that can raise (issue #14 plan): a classify
+        # or log failure must never leak the tool ContextVar into the next
+        # task on this thread.
+        token = getattr(self, "_tool_token", None)
+        if token is not None:
+            vmlocks._current_tool.reset(token)
+            self._tool_token = None
         duration_ms = int((time.monotonic() - self.start) * 1000)
         if exc is not None:
             from . import errors  # late import: errors imports policy/media modules

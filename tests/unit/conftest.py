@@ -117,6 +117,7 @@ def _restore_bootstrap_module_globals():
     from hyperv_mcp import credentials as _c
     from hyperv_mcp import pswindows as _pw
     from hyperv_mcp import server as _srv
+    from hyperv_mcp import vmlocks as _vl
 
     saved = {
         ("auditlog", "_config"): getattr(_a, "_config", None),
@@ -125,6 +126,10 @@ def _restore_bootstrap_module_globals():
         ("pswindows", "_redact"): getattr(_pw, "_redact", None),
         ("server", "_bootstrapped"): getattr(_srv, "_bootstrapped", False),
         ("server", "CFG"): getattr(_srv, "CFG", None),
+        # bootstrap() also wires vmlocks' default bounded wait; without this
+        # a test reaching bootstrap leaks its vm_lock_wait_s into the rest of
+        # the session (review CLEAN-note on PR #58).
+        ("vmlocks", "_DEFAULT_WAIT_S"): getattr(_vl, "_DEFAULT_WAIT_S", 30.0),
     }
     yield
     _a._config = saved[("auditlog", "_config")]
@@ -133,4 +138,5 @@ def _restore_bootstrap_module_globals():
     _pw._redact = saved[("pswindows", "_redact")]
     _srv._bootstrapped = saved[("server", "_bootstrapped")]
     _srv.CFG = saved[("server", "CFG")]
+    _vl._DEFAULT_WAIT_S = saved[("vmlocks", "_DEFAULT_WAIT_S")]
 

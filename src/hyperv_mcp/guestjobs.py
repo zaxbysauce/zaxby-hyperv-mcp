@@ -49,7 +49,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import pswindows, vmident
+from . import pswindows, vmident, vmlocks
 from .config import Config
 from .credentials import CredentialSet
 from .diagnostics import run_guest_inner
@@ -405,6 +405,7 @@ def job_start(
         wrapper = _wrapper_script(command, args, cwd)
         outcome = run_guest_inner(
             cfg, ref.id, _start_script(job_id, wrapper), cred, timeout_ms=timeout_ms,
+            mode="read",
         )
         pid = int(outcome.get("pid") or 0)
     except BaseException:
@@ -469,7 +470,7 @@ def job_status(cfg: Config, job_id: str, *, owner: str | None = None) -> dict:
     outcome = run_guest_inner(
         cfg, entry["vm_id"],
         _status_script(entry["pid"], entry["exit_path"], entry.get("start_time_ticks")),
-        cred,
+        cred, mode="read",
     )
     return {
         "ok": True,
@@ -501,7 +502,9 @@ def job_output(cfg: Config, job_id: str, *, tail_bytes: int = 65536,
             result[f"{key}_truncated"] = False
             result[f"{key}_encoding"] = "utf-8"
             continue
-        outcome = run_guest_inner(cfg, entry["vm_id"], _output_script(path, tail_bytes), cred)
+        outcome = run_guest_inner(
+            cfg, entry["vm_id"], _output_script(path, tail_bytes), cred, mode="read",
+        )
         text, encoding = _decode_stream(
             str(outcome.get("head_hex") or ""), str(outcome.get("tail_b64") or ""),
         )
@@ -550,8 +553,14 @@ def job_stop(cfg: Config, job_id: str, *, owner: str | None = None) -> dict:
         outcome = run_guest_inner(
             cfg, entry["vm_id"],
             _stop_script(entry["pid"], entry["job_dir"], entry.get("start_time_ticks")),
-            cred,
+            cred, mode="read",
         )
+    except vmlocks.VMBusy:
+        # Feedback PRR-002: a lock-contention expiry must surface as the
+        # server's busy envelope (error_class=busy + holder), not be
+        # rewritten to a non-retryable transport result after waiting the
+        # full bounded window. Re-raise; the tool wrapper envelopes it.
+        raise
     except Exception as exc:
         # Same documented key set as a successful stop plus the error pair,
         # so the 7-key contract holds on the error path too (PRR-004); the

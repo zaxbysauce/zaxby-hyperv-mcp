@@ -94,7 +94,20 @@ def test_no_name_keyed_vm_locks(path):
             continue
         if not node.args:
             continue
-        source = _lock_key_source(node.args[0])
+        arg0 = node.args[0]
+        # Issue #14 console dual-key: a tuple whose FIRST element is a
+        # recognized resolved identity (the rest are constant suffixes like
+        # "console") is still identity-keyed, not name-keyed.
+        if isinstance(arg0, ast.Tuple) and arg0.elts:
+            key_src = _lock_key_source(arg0.elts[0])
+            if key_src is not None and all(
+                isinstance(e, ast.Constant) for e in arg0.elts[1:]
+            ) and any(
+                key_src == allowed or key_src.startswith(allowed + "[")
+                for allowed in _ALLOWED_KEY_EXPRS
+            ):
+                continue
+        source = _lock_key_source(arg0)
         if source is not None and any(
             source == allowed or source.startswith(allowed + "[")
             for allowed in _ALLOWED_KEY_EXPRS

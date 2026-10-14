@@ -423,9 +423,10 @@ def test_c8_zero_spawns(monkeypatch, unrestricted_cfg):
     real_lock = vmlocks.vm_lock
 
     @contextlib.contextmanager
-    def recording_lock(key):
+    def recording_lock(key, *args, **kwargs):
+        # Issue #14: vm_lock gained mode=/wait_s=; record and pass through.
         locked.append(key)
-        with real_lock(key):
+        with real_lock(key, *args, **kwargs):
             yield
 
     monkeypatch.setattr(vmlocks, "vm_lock", recording_lock)
@@ -442,7 +443,12 @@ def test_c8_zero_spawns(monkeypatch, unrestricted_cfg):
     assert console.type_text(unrestricted_cfg, "vm1", "hello console")["ok"] is True
 
     assert stub.scripts == []
-    assert any(key.casefold() == GUID for key in locked)
+    # Feedback PRR-020: _input_lock also records the (guid, "console")
+    # tuple — normalize before comparing instead of relying on any()
+    # short-circuiting past it.
+    assert any(
+        (k[0] if isinstance(k, tuple) else k).casefold() == GUID for k in locked
+    )
     # the typed text and the move+click actually reached the WMI methods
     typed = [m for m in svc.methods if m[1] == "TypeText"]
     assert typed and typed[-1][2].get("AsciiText") == "hello console"

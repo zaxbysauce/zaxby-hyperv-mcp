@@ -141,6 +141,10 @@ class Config:
     # file was read).
     config_path: str = ""
     config_sha256: str = hashlib.sha256(b"").hexdigest()
+    # Issue #14 (ENH-02): bounded per-VM lock wait. 0 restores the pre-#14
+    # fail-fast. Appended last so every pre-existing positional construction
+    # keeps its argument order.
+    vm_lock_wait_s: int = 30
 
     # -- loading ---------------------------------------------------------
 
@@ -207,6 +211,10 @@ class Config:
             raise ConfigError("max_output_bytes must be >= 1024")
         if self.ps_timeout_s < 5:
             raise ConfigError("ps_timeout_s must be >= 5")
+        if not isinstance(self.vm_lock_wait_s, int) or isinstance(self.vm_lock_wait_s, bool):
+            raise ConfigError("vm_lock_wait_s must be an integer in 0..600")
+        if not 0 <= self.vm_lock_wait_s <= 600:
+            raise ConfigError("vm_lock_wait_s must be an integer in 0..600")
         # child_env() strips the token_env-named variable from every spawned
         # child; naming a functional variable would break that child (bare-name
         # resolution, PowerShell internals), so reject it at load time.
@@ -407,6 +415,7 @@ Config._FIELD_MAP = {  # type: ignore[attr-defined]
     "host_powershell_path": lambda c, v: c._set_str_opt("host_powershell_path", v),
     "verify_sha256": lambda c, v: c._set_bool("verify_sha256", v),
     "ps_timeout_s": lambda c, v: c._set_int("ps_timeout_s", v),
+    "vm_lock_wait_s": lambda c, v: c._set_int("vm_lock_wait_s", v),
     "hyperv": lambda c, v: c._set_hyperv(v),
     "http": lambda c, v: c._set_http(v),
 }

@@ -58,6 +58,8 @@ import math
 import os
 import re
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -67,6 +69,17 @@ from . import policy, pswindows, vmident, vmlocks, wmiconsole
 from .config import Config
 
 _WMI_NS = "root\\virtualization\\v2"
+
+
+@contextmanager
+def _input_lock(ref: vmident.VMRef) -> Iterator[None]:
+    """Console input lock scope (issue #14): READ on the VM key so guest
+    work proceeds during typing, plus WRITE on the second (vm, "console")
+    key so two agents can never interleave keystrokes. VM key is always
+    outermost — no other site takes the console key, so no ordering cycle.
+    """
+    with vmlocks.vm_lock(ref.id, mode="read"), vmlocks.vm_lock((ref.id, "console")):
+        yield
 _PREFIX_LEN = 4
 
 # PS/2 scan-code set 1: (make, break) without the 0xE0 prefix. Keys in
@@ -729,7 +742,7 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
         calls = 0
         phase_dicts: list[dict] = []
         try:
-            with vmlocks.vm_lock(ref.id):
+            with _input_lock(ref):
                 for i, chunk in enumerate(chunks):
                     _r, t = be.type_text(ref.id, chunk)
                     phase_dicts.append(t)
@@ -747,7 +760,7 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
     guid = ref.id
     chunks = [text[i:i + 512] for i in range(0, len(text), 512)]
     calls = 0
-    with vmlocks.vm_lock(ref.id):
+    with _input_lock(ref):
         for i, chunk in enumerate(chunks):
             # Text rides stdin as UTF-8 base64 — never in the script, argv, or
             # error records (CLIXML errors quote script lines).
@@ -855,7 +868,7 @@ def _send_scancodes_locked(
         sent = 0
         phase_dicts: list[dict] = []
         try:
-            with vmlocks.vm_lock(ref.id):
+            with _input_lock(ref):
                 for i, chunk in enumerate(chunks):
                     _r, t = be.type_scancodes(ref.id, chunk)
                     phase_dicts.append(t)
@@ -869,7 +882,7 @@ def _send_scancodes_locked(
             "vm_name": ref.name, "timings": _wmi_timings(connect_ms, *phase_dicts),
         }
     sent = 0
-    with vmlocks.vm_lock(ref.id):
+    with _input_lock(ref):
         for i, chunk in enumerate(chunks):
             arr = ",".join(str(c) for c in chunk)
             call = (
@@ -905,7 +918,7 @@ def mouse_move(
     be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
     if be is not None and ref is not None:
         try:
-            with vmlocks.vm_lock(ref.id):
+            with _input_lock(ref):
                 head, t_head = be.head_resolution(ref.id)
                 hx, hy = _scale_to_head(x, y, frame_width, frame_height, head)
                 _r, t = be.mouse_move(ref.id, hx, hy)
@@ -936,7 +949,7 @@ def click(
     be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
     if be is not None and ref is not None:
         try:
-            with vmlocks.vm_lock(ref.id):
+            with _input_lock(ref):
                 extra: dict = {}
                 if x or y:
                     head, t_head = be.head_resolution(ref.id)
@@ -988,7 +1001,7 @@ def mouse_button(
     be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
     if be is not None and ref is not None:
         try:
-            with vmlocks.vm_lock(ref.id):
+            with _input_lock(ref):
                 _r, t = be.mouse_button(ref.id, button, is_down)
         except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
             raise ConsoleError(str(exc)) from None
@@ -1011,7 +1024,7 @@ def scroll(cfg: Config, vm_name: str = "", delta: int = 0, vm_id: str = "") -> d
     be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
     if be is not None and ref is not None:
         try:
-            with vmlocks.vm_lock(ref.id):
+            with _input_lock(ref):
                 _r, t = be.mouse_scroll(ref.id, delta)
         except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
             raise ConsoleError(str(exc)) from None
@@ -1049,7 +1062,7 @@ def _mouse_op(
         .replace("%GUID%", ref.id)
         .replace("%CALL%", call)
     )
-    with vmlocks.vm_lock(ref.id):
+    with _input_lock(ref):
         result = _run(cfg, script.strip(), timeout_s=90, timing=timing)
     _check_rc(result, f"console mouse {detail}")
     out = {"ok": True, "operation": detail, "vm_name": ref.name}

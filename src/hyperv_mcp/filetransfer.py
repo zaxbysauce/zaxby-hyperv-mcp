@@ -702,7 +702,7 @@ def guest_put(
         cfg, cred, ref.id, lp, rp, staged,
         fragment, assert_block, do_verify,
     ) if pswindows.hyperv_host(cfg) else (None, None)
-    with vmlocks.vm_lock(ref.id):
+    with vmlocks.vm_lock(ref.id, mode="read"):
         result = _run_transfer(
             cfg, ref.id, body, cred,
             composed_script=remote_script, composed_stdin=remote_stdin,
@@ -805,7 +805,7 @@ def guest_get(
         cfg, cred, ref.id, rp, lp, staged,
         assert_block, do_verify,
     ) if pswindows.hyperv_host(cfg) else (None, None)
-    with vmlocks.vm_lock(ref.id):
+    with vmlocks.vm_lock(ref.id, mode="read"):
         try:
             result = _run_transfer(
                 cfg, ref.id, body, cred,
@@ -864,7 +864,7 @@ $r = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptB
 }} -ArgumentList {pswindows.ps_quote(remote)}, {int(max_bytes)}
 $r | ConvertTo-Json -Compress
 """
-    with vmlocks.vm_lock(ref.id):
+    with vmlocks.vm_lock(ref.id, mode="read"):
         result = _run(
             cfg, body.strip(), timeout_s=120, stdin_b64=pswindows.utf8_b64(cred.password)
         )
@@ -920,7 +920,7 @@ $items = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -Scr
 }} -ArgumentList {pswindows.ps_quote(remote)}
 if ($items) {{ @($items) | ConvertTo-Json -Compress }} else {{ '[]' }}
 """
-    with vmlocks.vm_lock(ref.id):
+    with vmlocks.vm_lock(ref.id, mode="read"):
         result = _run(
             cfg, body.strip(), timeout_s=60, stdin_b64=pswindows.utf8_b64(cred.password)
         )

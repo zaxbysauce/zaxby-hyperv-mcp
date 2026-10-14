@@ -34,9 +34,10 @@ def _recording_lock(recorder: list):
     real_lock = vmlocks.vm_lock
 
     @contextlib.contextmanager
-    def wrapped(key):
+    def wrapped(key, *args, **kwargs):
+        # Issue #14: vm_lock gained mode=/wait_s=; record and pass through.
         recorder.append(key)
-        with real_lock(key):
+        with real_lock(key, *args, **kwargs):
             yield
 
     return wrapped
@@ -308,7 +309,12 @@ def test_f1_mouse_ops_hold_vm_lock(monkeypatch, unrestricted_cfg):
     console.mouse_button(unrestricted_cfg, "vm1", 1, True)
     console.scroll(unrestricted_cfg, "vm1", 1)
 
-    mouse_locks = [k for k in locked if k.casefold() == GUID]
+    # Issue #14: console input additionally locks the (guid, "console")
+    # tuple key; compare on the VM-key element only.
+    def _vm_key(k):
+        return k[0] if isinstance(k, tuple) else k
+
+    mouse_locks = [k for k in locked if _vm_key(k).casefold() == GUID]
     assert len(mouse_locks) >= 5, locked
 
 
@@ -455,14 +461,19 @@ def test_f5_display_info_reports_absent_devices(monkeypatch, unrestricted_cfg):
 def test_frozen_acceptance_file_intact():
     """PRR-023: the byte-locked acceptance file's freeze is machine-checked
     in-repo (not just trace process). If the trace protocol SANCTIONED an
-    amend of that file, update this hash with the amend."""
+    amend of that file, update this hash with the amend.
+
+    Hash updated by issue #14 (trace issue-14-vm-rw-locks): vm_lock gained
+    mode=/wait_s= kwargs, so the recording_lock spy in test_wmiconsole.py
+    was amended to pass them through (kwargs-only signature change; the
+    test's assertions are untouched)."""
     import subprocess
 
     out = subprocess.run(
         ["git", "hash-object", "tests/unit/test_wmiconsole.py"],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
-    assert out == "638f10c477479c0aae8b6577541730244eb070c3", out
+    assert out == "181f7a4e6a9d4ae9b443ef10f89b84c33c966d02", out
 
 
 def test_capture_guard_no_image_data(monkeypatch, unrestricted_cfg):

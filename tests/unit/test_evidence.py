@@ -130,7 +130,7 @@ def test_ui_tree_with_credentials_merges_tree(fake_screenshot, monkeypatch):
     cfg = Config(unrestricted=True)
     captured = {}
 
-    def fake_run(cfg_, vm, inner, cred_, timeout_ms=60000):
+    def fake_run(cfg_, vm, inner, cred_, timeout_ms=60000, mode="write"):
         captured["script"] = inner
         return {"elements": 7, "truncated": False,
                 "tree": {"name": "Desktop", "control_type": "Pane", "children": []}}
@@ -169,7 +169,7 @@ def test_bounds_and_depth_clamped(fake_screenshot, monkeypatch):
     cfg = Config(unrestricted=True)
     captured = {}
 
-    def fake_run(cfg_, vm, inner, cred_, timeout_ms=60000):
+    def fake_run(cfg_, vm, inner, cred_, timeout_ms=60000, mode="write"):
         captured["script"] = inner
         return {"elements": 1, "truncated": True, "tree": {}}
 

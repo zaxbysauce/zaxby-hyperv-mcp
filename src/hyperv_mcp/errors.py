@@ -34,10 +34,12 @@ __all__ = [
     "success_result",
 ]
 
-# Fixed guidance until [Workstream C] PR 1 replaces it with holder-derived
-# retry_after_ms. `timeout` is deliberately NOT retryable for guest
-# execution: the host killed its process tree but the guest-side child may
-# still be running (README "Timeout semantics").
+# Fixed guidance until FND-14 (Workstream A PR 5 scope) derives
+# retry_after_ms from the holder. Since [Workstream C] PR 1 (issue #14) the
+# busy envelope additionally carries `holder` {tool, mode, since, held_ms},
+# so a future derivation has the data it needs. `timeout` is deliberately
+# NOT retryable for guest execution: the host killed its process tree but
+# the guest-side child may still be running (README "Timeout semantics").
 BUSY_RETRY_MS = 2000
 
 
@@ -78,17 +80,33 @@ def _redact(text: str) -> str:
     return pswindows.redact(text)
 
 
+def _holder_field(exc: BaseException) -> dict[str, Any] | None:
+    """Holder metadata from a VMBusy (issue #14), redacted like the error
+    string: tool names pass through the filter, numeric fields pass as-is."""
+    holder = getattr(exc, "holder", None)
+    if not isinstance(holder, dict):
+        return None
+    return {
+        k: (_redact(str(v)) if isinstance(v, str) else v)
+        for k, v in holder.items()
+    }
+
+
 def envelope(exc: BaseException) -> dict[str, Any]:
     """Build the failure envelope for a raised exception."""
     error_class = classify(exc)
     retryable, retry_after_ms = retry_fields(error_class)
-    return {
+    out: dict[str, Any] = {
         "ok": False,
         "error": _redact(str(exc)),
         "error_class": error_class,
         "retryable": retryable,
         "retry_after_ms": retry_after_ms,
     }
+    holder = _holder_field(exc)
+    if holder is not None:
+        out["holder"] = holder
+    return out
 
 
 def enrich_failure(env: dict[str, Any]) -> dict[str, Any]:
@@ -105,6 +123,13 @@ def enrich_failure(env: dict[str, Any]) -> dict[str, Any]:
     retryable, retry_after_ms = retry_fields(error_class)
     out["retryable"] = retryable
     out["retry_after_ms"] = retry_after_ms
+    # Parity with envelope(): a module-built busy dict that carries holder
+    # metadata keeps it (defensive; modules currently don't set it).
+    if isinstance(out.get("holder"), dict):
+        out["holder"] = {
+            k: (_redact(str(v)) if isinstance(v, str) else v)
+            for k, v in out["holder"].items()
+        }
     return out
 
 

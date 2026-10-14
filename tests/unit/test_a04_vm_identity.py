@@ -16,7 +16,7 @@ import threading
 import pytest
 
 import hyperv_mcp.server as server_module
-from hyperv_mcp import guestexec, lifecycle, media, pswindows
+from hyperv_mcp import guestexec, lifecycle, media, pswindows, vmlocks
 from hyperv_mcp.config import Config
 from hyperv_mcp.vmlocks import VMBusy
 
@@ -106,6 +106,10 @@ def test_lock_follows_guid_across_rename(monkeypatch, unrestricted_cfg):
         return fake(script, **kwargs)
 
     monkeypatch.setattr(pswindows, "run_ps", blocking_run_ps)
+    # Issue #14: conflicting acquires now wait up to vm_lock_wait_s before
+    # raising VMBusy; shrink the default so this exclusion probe stays fast
+    # (the exclusion semantics under test are unchanged).
+    monkeypatch.setattr(vmlocks, "_DEFAULT_WAIT_S", 0.3)
     outcome = {}
 
     def hold_start_vm():

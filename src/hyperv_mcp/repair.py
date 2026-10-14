@@ -246,7 +246,12 @@ def repair_guest_access(
                 if item["action"] == "rewrite_stale_ssh_bindings":
                     backup_path = str(outcome.get("backup", ""))
             except Exception as exc:
+                from . import errors  # late import: errors pulls the policy tree
                 change["error"] = pswindows.redact(str(exc))
+                # Feedback PRR-004: classify so a lock expiry reports
+                # "busy" (with the server envelope's holder upstream)
+                # instead of an anonymous failure string.
+                change["error_class"] = errors.classify(exc)
         changes.append(change)
 
     verify_report = diagnostics.diagnose_report(cfg, ref.id, ref.name, cred, 90000)
