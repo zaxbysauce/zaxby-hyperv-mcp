@@ -243,3 +243,57 @@ def test_ac9_calltoolresult_is_mcp_types_and_success(fresh_server, monkeypatch):
     if is_error is None:
         is_error = getattr(result, "isError", None)
     assert not is_error, f"the pinned vehicle must succeed, got {result!r}"
+
+
+def test_cancelled_while_parked_on_the_vm_lock_settles_promptly(tmp_path, fresh_server, monkeypatch):
+    """PRR-005 pin: a call cancelled while QUEUED on the per-VM write lock
+    settles within one cancellation-observation slice, not at the lock-wait
+    expiry. The frozen checks and the transport test only cancel calls that
+    are already inside a PowerShell leg; this pins the parked path the
+    vmlocks slice-wait fix added."""
+    import anyio
+
+    doc = {"unrestricted": True, "vm_lock_wait_s": 30}
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mod = fresh_server({"HYPERV_MCP_CONFIG": str(p)})
+    mcp = mod.get_mcp()
+
+    def fake_run_ps(script, **kwargs):
+        # The by-name resolver leg must succeed (a GUID) so the call reaches
+        # the write lock; the stop leg then holds the lock for 3 s.
+        if script.rstrip().endswith("$vmTarget"):
+            time.sleep(0.1)
+            return PSResult(stdout=GUID, returncode=0)
+        time.sleep(3.0)
+        return PSResult(stdout="", returncode=0)
+
+    monkeypatch.setattr(pswindows, "run_ps", fake_run_ps)
+
+    async def main():
+        # A resolves, takes the write lock and holds it across its 3 s leg.
+        a = asyncio.create_task(
+            mcp.call_tool(
+                "hyperv_stop_vm",
+                {"vm_name": "c03-vm", "method": "shutdown", "confirm": True},
+            )
+        )
+        await anyio.sleep(0.3)
+        # B resolves and parks on the same VM's write lock; cancel it
+        # mid-wait (A still holds for ~2.8 s more).
+        b_started = time.monotonic()
+        with anyio.move_on_after(0.4):
+            await mcp.call_tool(
+                "hyperv_stop_vm",
+                {"vm_name": "c03-vm", "method": "shutdown", "confirm": True},
+            )
+        b_settled = time.monotonic() - b_started
+        await a
+        return b_settled
+
+    b_settled = asyncio.run(main())
+    assert b_settled < 2.0, (
+        f"a call cancelled while parked on the VM lock settled after "
+        f"{b_settled:.2f}s; without the slice-wait cancellation poll it "
+        "sits out the holder's leg plus its own"
+    )
