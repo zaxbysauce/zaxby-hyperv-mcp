@@ -10,16 +10,23 @@ holds no locks or registries of its own — it forwards MCP messages unchanged
 in both directions, authenticated with the agent's own token.
 
 Failure contract (frozen by tests/unit/test_b03_stdio_proxy.py): a pending
-request never waits forever — an unreachable controller (connection refused),
-a rejected token (HTTP 401/403), or a mid-session disconnect turns into a
-JSON-RPC error (code -32000) for each outstanding request id, names the token
-environment variable on stderr (rejections only), never echoes the token, and
-the proxy exits non-zero. Connection and rejection failures surface as a
-RAISED exception group when the upstream client context unwinds (probe-
-verified: post failures cancel the transport task group and re-raise at its
-boundary), so the emit path is driven from that raised group as well as from
-exception items on the upstream read stream and from failures inside the
-client->upstream reader task itself.
+request never waits forever — an unreachable controller (connection refused)
+or a mid-session disconnect turns into a JSON-RPC error (code -32000) for
+each outstanding request id, names the token environment variable on stderr
+(rejections only), never echoes the token, and the proxy exits non-zero.
+Connection failures surface as a RAISED exception group when the upstream
+client context unwinds (probe-verified: post failures cancel the transport
+task group and re-raise at its boundary), so the emit path is driven from
+that raised group as well as from exception items on the upstream read
+stream and from failures inside the client->upstream reader task itself.
+
+A REJECTED token (HTTP 401/403) no longer surfaces as a status-bearing
+exception: mcp 2.x collapses any non-2xx response into a generic JSON-RPC
+error delivered on the read stream, which the proxy forwards to the client
+(the code is the SDK's INTERNAL_ERROR, not -32000) and annotates with a
+one-line stderr hint naming the token environment variable. The status-based
+classification is not recoverable at this layer; the hint is the operator
+signal. See README "Shared controller" for the user-facing wording.
 
 Tokens come only from the environment: the variable named by
 `http.token_env`, or — when `http.agents` is configured — the single set
@@ -451,25 +458,34 @@ def _error_reply(request_id, note: str) -> SessionMessage:
 
 
 def _note_upstream_error(root, token_env_name: str, noted: list) -> None:
-    """Name the token environment variable when the controller answers a
-    request with a JSON-RPC error.
+    """Name the token environment variable when the controller answers one
+    of OUR requests with a JSON-RPC error.
 
     mcp 1.x surfaced a controller rejection (e.g. HTTP 401) as a transport
     exception, so the proxy could classify it by status. mcp 2.x collapses
     any non-2xx response into a generic JSON-RPC error delivered on the read
-    stream, so the status is no longer observable here; an error answer to
-    one of our requests is the observable signal, and the token env var is
-    the first thing an operator should check. Emitted once per session.
-    Never echoes token material."""
+    stream, so the status is no longer observable here; an error answer to a
+    request the proxy itself sent is the observable signal, and the token
+    env var is the first thing an operator should check. Emitted once per
+    session.
+
+    The remote error TEXT is deliberately not printed: it is
+    controller-controlled data with no redaction pass on this path (the
+    bearer token is not in the redaction registry), so echoing it would put
+    attacker-shapeable text — and potentially the token itself — into the
+    operator's stderr and the client's logs. Only the SDK's numeric error
+    code is printed. The caller fires this only for errors whose id the
+    proxy has outstanding, so unrelated stream noise cannot trigger it."""
     if noted:
         return
     noted.append(True)
     error = getattr(root, "error", None)
-    message = str(getattr(error, "message", "") or "")[:200]
+    code = getattr(error, "code", None)
     print(
         f"hyperv-mcp proxy: the controller answered a request with a "
-        f"JSON-RPC error ({message}); if this is an authentication failure, "
-        f"check the {token_env_name} environment variable, then retry.",
+        f"JSON-RPC error (code {code}); if this is an authentication "
+        f"failure, check the {token_env_name} environment variable, then "
+        f"retry. The full error was forwarded to the client.",
         file=sys.stderr,
     )
 
@@ -592,8 +608,13 @@ async def _run_proxy(
                                 raise _UpstreamClosed(str(item)) from item
                             root = _request_id_of(item)
                             if isinstance(root, (JSONRPCResponse, JSONRPCError)):
+                                # Only an error answering a request the proxy
+                                # itself sent is a signal about OUR session
+                                # (e.g. a rejected token); unrelated stream
+                                # noise must not trigger the operator note.
+                                answers_ours = root.id in outstanding
                                 outstanding.discard(root.id)
-                                if isinstance(root, JSONRPCError):
+                                if isinstance(root, JSONRPCError) and answers_ours:
                                     _note_upstream_error(
                                         root, token_env_name, noted_upstream_error
                                     )

@@ -14,6 +14,7 @@ import asyncio
 import importlib
 import json
 import threading
+import time
 
 import anyio
 import pytest
@@ -93,4 +94,52 @@ def test_tool_calls_run_inside_the_limiter(fresh_server, monkeypatch):
     assert seen_threads, "the tool body must have run"
     assert all(t != threading.get_ident() for t in seen_threads), (
         "a sync tool body must run on a worker thread, not the event loop"
+    )
+
+
+def test_tool_concurrency_is_bounded_by_the_limiter(fresh_server, monkeypatch, tmp_path):
+    """The installed bound actually bounds concurrent tool execution.
+
+    With max_host_powershell=2 the limiter is 4 tokens, so six concurrent
+    tool calls never run more than four PowerShell legs at once (and all
+    six still complete). A regression that leaves anyio's 40-token default
+    in place, or a dispatch that bypasses to_thread.run_sync, fails the
+    peak assertion — the token-count checks above cannot see either."""
+    doc = {"unrestricted": True, "max_host_powershell": 2}
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mod = fresh_server({"HYPERV_MCP_CONFIG": str(p)})
+    mcp = mod.get_mcp()
+
+    live = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def fake_run_ps(script, **kwargs):
+        nonlocal live, peak
+        with lock:
+            live += 1
+            peak = max(peak, live)
+        try:
+            time.sleep(0.5)
+            return pswindows.PSResult(stdout="", returncode=0)
+        finally:
+            with lock:
+                live -= 1
+
+    monkeypatch.setattr(pswindows, "run_ps", fake_run_ps)
+
+    async def main():
+        async with mcp.settings.lifespan(mcp):
+            assert _limiter_tokens() == 4
+            results = await asyncio.gather(
+                *[mcp.call_tool("hyperv_list_vms", {}) for _ in range(6)]
+            )
+        return results
+
+    results = asyncio.run(main())
+    assert len(results) == 6
+    assert peak == 4, (
+        f"the limiter must bound concurrent tool legs at 2 x max_host_powershell "
+        f"(= 4 here); observed peak {peak}"
     )

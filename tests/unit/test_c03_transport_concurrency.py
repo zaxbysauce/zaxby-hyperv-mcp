@@ -71,21 +71,30 @@ class _Server:
         self.thread = None
 
     def start(self):
-        importlib.reload(server_module)
-        server_module.configure_http_auth(_StaticTokenVerifier(TOKEN))
-        server_module.bootstrap({"HYPERV_MCP_UNRESTRICTED": "1"})
-        mcp = server_module.get_mcp()
-        self.server = uvicorn.Server(
-            uvicorn.Config(
-                mcp.streamable_http_app(),
-                host="127.0.0.1",
-                port=self.port,
-                log_level="warning",
+        try:
+            importlib.reload(server_module)
+            server_module.configure_http_auth(_StaticTokenVerifier(TOKEN))
+            server_module.bootstrap({"HYPERV_MCP_UNRESTRICTED": "1"})
+            mcp = server_module.get_mcp()
+            self.server = uvicorn.Server(
+                uvicorn.Config(
+                    mcp.streamable_http_app(),
+                    host="127.0.0.1",
+                    port=self.port,
+                    log_level="warning",
+                )
             )
-        )
-        self.thread = threading.Thread(target=self.server.run, daemon=True)
-        self.thread.start()
-        assert _wait_listening(self.port), "server did not listen"
+            self.thread = threading.Thread(target=self.server.run, daemon=True)
+            self.thread.start()
+            assert _wait_listening(self.port), "server did not listen"
+        except BaseException:
+            # A failed start must not leak the module-global verifier into
+            # later tests (conftest restores _bootstrapped/CFG but not
+            # _http_token_verifier).
+            server_module._http_token_verifier = None
+            server_module._bootstrapped = False
+            server_module.CFG = None
+            raise
         return self
 
     def stop(self):
@@ -216,7 +225,11 @@ def test_client_cancellation_reaches_the_worker_and_frees_the_lock(served_server
         "the server-side worker must observe the client's cancellation "
         "(the PowerShell leg dies through PR #61's check_cancelled hook)"
     )
-    assert follow_up_elapsed < 2.0, (
+    assert follow_up_elapsed < 3.0, (
         f"the per-VM lock must not be stranded by the cancelled call; "
         f"the follow-up took {follow_up_elapsed:.2f}s"
     )
+    # The follow-up is a full get_vm_info against the deterministic fake
+    # (resolver 0.2 s + info leg 1.5 s = a 1.7 s floor), so the bound leaves
+    # real headroom for the HTTP round trip on a loaded runner; a stranded
+    # lock shows up as the full bounded wait (30 s default), not as jitter.

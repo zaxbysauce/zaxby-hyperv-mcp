@@ -108,11 +108,12 @@ audit row names the calling agent; with the shared token alone, rows carry
 the shared principal (`local-cli`). Since 0.4.0 the controller no longer
 serializes tool calls (FND-01): every tool body runs on an anyio worker
 thread, so a second agent's conflicting call fast-fails with
-`error_class: "busy"` (carrying the holder's tool, mode and wait) instead of
-queueing behind the first — and a fast call no longer waits behind a slow
-one. Tool concurrency is bounded by a dedicated thread limiter sized at
-2x the host PowerShell cap (`max_host_powershell`), installed at server
-start on both transports.
+`error_class: "busy"` (carrying the holder's tool, mode and held_ms) instead
+of queueing behind the first — and a fast call no longer waits behind a slow
+one. Tool concurrency is bounded by the anyio thread limiter resized at
+server start to 2x the host PowerShell cap (`max_host_powershell`) on both
+transports (in-process embedders driving `call_tool` directly keep anyio's
+40-token default).
 
 - **Default (no flags):** proxy to the controller at `http.host`/`http.port`
   from your config (default `127.0.0.1:8787`). If nothing is listening
@@ -146,12 +147,17 @@ start on both transports.
 
 - **SDK major: mcp 2.x.** The package now requires `mcp>=2.3,<3` (was
   1.x) and the server object is an `mcp.server.mcpserver.MCPServer` (was
-  `FastMCP`). New transitive dependencies arrive with it (`httpx2`,
-  `mcp-types`, `opentelemetry-api`, and `pywin32` on Windows); the stdio
-  proxy's upstream HTTP client is now `httpx2` (the SDK's own HTTP stack).
+  `FastMCP`). New dependencies arrive with it: `httpx2` (also a direct
+  dependency — the stdio proxy's upstream HTTP client), plus the transitives
+  `mcp-types`, `opentelemetry-api`, and `pywin32` on Windows.
+- **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
+  reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
+  and the initialize handshake's `serverInfo.version` now reports this
+  package's version (0.4.0) instead of the SDK's.
 - **In-process embedders see the 2.x call shape.** `call_tool()` returns a
   `CallToolResult` (`.content`, `.structured_content`, `.is_error`) instead
-  of the 1.x content list, and `list_tools()` exposes each tool's schema as
+  of the 1.x `(content_list, structured)` tuple, and `list_tools()` exposes
+  each tool's schema as
   `input_schema` (was `inputSchema`). Tool NAMES, parameters, docstrings,
   `confirm` gating and the failure envelope are unchanged. Embedders that
   drive `hyperv_mcp.server.get_mcp()` in process should port to the 2.x
@@ -162,11 +168,18 @@ start on both transports.
 - **Concurrency is real.** One server process now runs tool calls
   concurrently (bounded by the 2x-`max_host_powershell` thread limiter), the
   event loop stays responsive during long calls, and a cancelled request
-  kills its PowerShell tree and releases its VM lock within about a second.
+  kills its PowerShell tree and releases its VM lock promptly (the unit
+  checks pin 1.5 s; the real-host integration check allows 5 s for the tree
+  to be gone).
 
-Failure behavior: if the controller is unreachable or rejects the token, a
-pending request is answered with a JSON-RPC error (code -32000) and the
-proxy exits non-zero. There is **no silent fallback** to in-process serving.
+Failure behavior: if the controller is unreachable, a pending request is
+answered with a JSON-RPC error (code -32000) and the proxy exits non-zero.
+If the controller REJECTS the token, the SDK (mcp 2.x) collapses the non-2xx
+response into a generic JSON-RPC error that is forwarded to the client
+(typically code -32603, not -32000) and the proxy logs a one-line hint
+naming the token environment variable; the proxy no longer classifies the
+rejection by HTTP status, because 2.x does not surface the status to the
+transport consumer. There is **no silent fallback** to in-process serving.
 Cleartext `http://` is accepted for loopback controller addresses only.
 
 The proxy's token comes from the environment variable named by
@@ -1199,9 +1212,10 @@ in its safe default state. Provide `HYPERV_MCP_CONFIG` (see
 **`MCP module not found`** — reinstall so `mcp` is pulled in:
 `pip install git+https://github.com/zaxbysauce/zaxby-hyperv-mcp.git`.
 
-**Dependency pin** — this fork pins `mcp>=1.30.0,<2`; the server uses the mcp
-v1 `FastMCP` API, which mcp 2.x renamed, and relies on CallToolResult
-passthrough behavior guaranteed from mcp 1.30.
+**Dependency pin** — this fork pins `mcp>=2.3,<3`; the server uses the mcp
+2.x `MCPServer` API (the v1 `FastMCP` name was removed in 2.x) and relies on
+CallToolResult passthrough behavior. See the 0.4.0 breaking-changes section
+for the in-process embedder surface.
 
 ---
 

@@ -63,8 +63,17 @@ def _descendant_pids(root_pid: int, exe_name: str) -> list[int]:
     own (a PowerShell-based walk would be its own false positive) and needs
     no psutil."""
     kernel32 = ctypes.windll.kernel32
+    # Declare the 64-bit handle types explicitly: ctypes defaults a HANDLE
+    # return to c_int, which truncates on 64-bit Windows and makes the
+    # INVALID_HANDLE_VALUE sentinel below unmatchable (a failed snapshot
+    # would then yield an empty walk and a vacuous oracle).
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.CreateToolhelp32Snapshot.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.DWORD]
+    kernel32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+    kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PROCESSENTRY32W)]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
-    if snapshot == _INVALID_HANDLE_VALUE:
+    if not snapshot or snapshot == _INVALID_HANDLE_VALUE:
         raise RuntimeError("CreateToolhelp32Snapshot failed")
     rows: dict[int, tuple[str, int]] = {}
     entry = _PROCESSENTRY32W()

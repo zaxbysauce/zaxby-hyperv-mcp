@@ -51,6 +51,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 
+import anyio
+
 #: Tool name of the enclosing `auditlog.operation`, set/reset by its
 #: __enter__/__exit__ so a VMBusy raised anywhere inside a tool call can
 #: name the holding tool without threading it through every signature.
@@ -142,6 +144,20 @@ def _busy(key: object, holder: dict | None) -> VMBusy:
     )
 
 
+_POLL_SLICE_S = 0.2  # cancellation observation window while parked on the lock
+
+
+def _check_lock_cancellation() -> None:
+    """Observe anyio host-task cancellation from inside a worker thread
+    parked on the lock (same contract as pswindows._check_ps_cancellation:
+    the cancellation exception is raised only in the worker-thread dispatch
+    shape mcp 2.x uses; everywhere else it is a swallowed RuntimeError)."""
+    try:
+        anyio.from_thread.check_cancelled()
+    except RuntimeError:
+        pass
+
+
 class _RWLock:
     """Writer-preferring read/write lock with bounded waits.
 
@@ -209,14 +225,24 @@ class _RWLock:
 
     def _wait_tick(self, deadline: float | None) -> bool:
         """Wait for the CV until the predicate may have changed; return
-        False when the bounded window has expired. Caller holds the CV."""
+        False when the bounded window has expired. Caller holds the CV.
+
+        The wait runs in cancellation-observation slices: mcp 2.x dispatches
+        tool bodies on anyio worker threads and shields the host task for the
+        thread's lifetime, so a call cancelled while parked here would
+        otherwise sit out the whole bounded window (default 30 s, up to
+        600 s) holding its tool thread and the tool-limiter token. Anywhere
+        that is not an anyio worker thread (plain threads, the event-loop
+        thread, CLI callers) the check raises RuntimeError, which is
+        swallowed, so non-worker callers keep the pre-poll behavior."""
+        _check_lock_cancellation()
         if deadline is None:
-            self._cv.wait()
+            self._cv.wait(_POLL_SLICE_S)
             return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
-        self._cv.wait(remaining)
+        self._cv.wait(min(remaining, _POLL_SLICE_S))
         return True
 
     def release(self, tid: int) -> None:

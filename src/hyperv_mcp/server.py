@@ -28,6 +28,7 @@ import dataclasses
 import importlib.metadata
 import io
 import json
+import logging
 import os
 import re
 import subprocess
@@ -85,6 +86,8 @@ _bootstrapped = False
 _compat_warning_shown = False
 CFG: Config | None = None
 
+logger = logging.getLogger(__name__)
+
 
 def configure_http_auth(token_verifier) -> None:
     """Install a bearer-token verifier BEFORE bootstrap().
@@ -136,19 +139,28 @@ def _make_tool_limiter_lifespan(cap: int):
     (40 tokens, scoped to the running event loop and shared with anything
     else using to_thread). Resize that default limiter to a dedicated bound
     above the host PowerShell slot pool (2 x max_host_powershell, default
-    16) at server start: a tool thread queued on a PowerShell slot holds a limiter token,
-    so PS-heavy saturation delays — it cannot deadlock, because slots are
-    released when their child completes and no thread waits on another
-    thread — and PS-free tools keep admission instead of inheriting anyio's
-    global default. Entered once per server run on both transports (stdio
-    and streamable-http), so the bound holds whichever entry point serves.
+    16) at server start: a tool thread queued on a PowerShell slot holds a
+    limiter token, so PS-heavy saturation delays — it cannot deadlock,
+    because slots are released when their child completes and no thread
+    waits on another thread — and PS-free tools keep admission instead of
+    inheriting anyio's global default. The sizing covers the slot queue and
+    the VM-lock queue's single holder; it does not reserve a class for
+    PS-free tools, so a fully lock-queued pool can still delay them (tracked
+    as a follow-up). Entered once per server run on both transports (stdio
+    and streamable-http); in-process embedders driving `call_tool` directly
+    never enter it and keep anyio's 40-token default. The bound is not
+    restored on exit — within one event loop the shrunken value persists for
+    co-tenant to_thread users.
     """
 
     @asynccontextmanager
     async def _tool_limiter_lifespan(_server: MCPServer):
         limiter = anyio.to_thread.current_default_thread_limiter()
         limiter.total_tokens = 2 * cap
-        yield
+        # The SDK's default lifespan yields {}; replacing it with a bare
+        # yield would make request_context.lifespan_context None for any
+        # embedder that subscripts it.
+        yield {}
 
     return _tool_limiter_lifespan
 
@@ -377,15 +389,17 @@ def _server_info_payload(cfg: Config) -> dict[str, Any]:
 def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     """Register the full tool surface.
 
-    Guest tools are registered TWICE under the same name: when
-    allow_inline_credentials is set, the variant that accepts inline
-    username/password parameters; otherwise the base variant. The tool
-    surface (names, parameters, docstrings) is identical across credential
-    modes apart from those two parameters — pinned by test_server.py's
-    inventory checks. mcp 2.x's typed @tool decorator returns the function
-    it decorates, so the conditional redefinition of each shared name is
-    flagged by mypy as an incompatible redefinition; the ignores on the
-    base-variant definitions below are intentional.
+    Guest tools are defined in two mutually exclusive variants under the
+    same source name: when allow_inline_credentials is set, the variant that
+    accepts inline username/password parameters; otherwise the base variant.
+    Exactly one variant registers per name (the branches are exclusive), so
+    the runtime tool surface (names, parameters, docstrings) is identical
+    across credential modes apart from those two parameters — pinned by
+    test_server.py's inventory checks. mcp 2.x's typed @tool decorator
+    returns the function it decorates, so the source-level conditional
+    redefinition of each shared name is flagged by mypy as an incompatible
+    redefinition; the ignores on the base-variant definitions below are
+    intentional.
     """
     creds_allowed = cfg.allow_inline_credentials
 
@@ -2300,12 +2314,18 @@ def _harden_tools(mcp: MCPServer) -> None:
             except UrlElicitationRequiredError:
                 raise
             except Exception as exc:
-                # 2.x Tool.run wraps the pydantic ValidationError (a
-                # ValueError) for a declared-but-mistyped argument into
-                # ToolError before any tool body runs. Classify via the
-                # cause so the envelope says "invalid", not "transport".
-                classify_exc = exc.__cause__ if isinstance(exc.__cause__, ValueError) else exc
-                env = errors.envelope(classify_exc)
+                # 2.x Tool.run wraps both failure shapes into a ToolError /
+                # UnexpectedToolError whose OWN text drops the original: the
+                # pydantic ValidationError for a declared-but-mistyped
+                # argument, and any tool-body crash. Classify the CAUSE so
+                # validation failures say "invalid" and crashes carry the
+                # real message (1.x ToolError parity).
+                cause = exc.__cause__
+                if cause is not None and not isinstance(cause, ValueError):
+                    # A crash also never reaches the SDK's own crash logger
+                    # once this guard returns an envelope, so log it here.
+                    logger.exception("tool %s raised an unexpected exception", name)
+                env = errors.envelope(cause if cause is not None else exc)
                 return _audited_rejection(name, arguments, env)
 
         guard._unknown_arg_guard = True  # type: ignore[attr-defined]

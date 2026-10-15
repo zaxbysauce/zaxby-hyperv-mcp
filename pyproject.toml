@@ -33,8 +33,10 @@ dependencies = [
     # transitive via mcp), and the 3.10 exception-group backport that
     # stdio_proxy imports on the supported floor (PRR-018). mcp 2.x carries
     # its HTTP stack in the httpx2 fork (issue #16): the proxy's upstream
-    # client must be the same library the SDK itself speaks.
-    "anyio>=4.5",
+    # client must be the same library the SDK itself speaks. The anyio floor
+    # tracks the SDK's own requirement (mcp 2.x requires anyio>=4.9); the
+    # repo relies on the to_thread default-limiter API, stable well below it.
+    "anyio>=4.9",
     "httpx2>=2.10",
     'exceptiongroup>=1.0.2; python_version < "3.11"',
 ]
@@ -50,7 +52,10 @@ hyperv-mcp-http = "hyperv_mcp.http_entry:main"
 
 [project.optional-dependencies]
 wmi = [
-    "pywin32>=306; platform_system == 'Windows'",
+    # Redundant since mcp 2.x: the SDK requires pywin32>=311 on win32
+    # unconditionally, so every Windows install already carries it. Kept
+    # for explicit non-SDK installs.
+    "pywin32>=311; platform_system == 'Windows'",
 ]
 dev = [
     "pytest>=8",
