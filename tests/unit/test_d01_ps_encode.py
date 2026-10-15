@@ -44,16 +44,9 @@ from hyperv_mcp import pswindows
 GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
 HEAD_RES = '{"horizontal": 1024, "vertical": 768}'
 
-
-def _thumbnail(width: int, height: int) -> bytes:
-    """4-byte opaque prefix + width*height little-endian RGB565 pixels."""
-    pixels = bytearray()
-    for y in range(height):
-        for x in range(width):
-            v = ((x * 31 % 32) << 11) | ((y * 15 % 64) << 5) | (x * 7 % 32)
-            pixels.append(v & 0xFF)
-            pixels.append((v >> 8) & 0xFF)
-    return b"\x00\x00\x96\x04" + bytes(pixels)
+# The payload builder is shared with the frozen acceptance-check file rather
+# than copied a third time (PRR-016).
+from test_d01_screenshot_decode import _thumbnail  # noqa: E402
 
 
 class _ResponseQueue:
@@ -231,13 +224,36 @@ def test_frame_is_a_pil_image():
     frame = console_module._decode_frame(raw, 4, 3)
 
     assert isinstance(frame, Image.Image)
-    assert isinstance(frame.image, Image.Image) if hasattr(frame, "image") else True
     assert frame.size == (4, 3)
     assert frame.mode == "RGB"
     with frame as opened:
         assert isinstance(opened, Image.Image)
     assert isinstance(frame.__array_interface__, dict)
     assert frame.getpixel((0, 0)) == (164, 170, 213)
+
+
+def test_frame_survives_copy_deepcopy_and_pickle():
+    """A frame's class and its encoding survive the copy protocols.
+
+    `PIL.Image.__copy__` returns a plain `Image`, which would silently drop both
+    the class and `png`, so the frame rebuilds through its encoding instead.
+    """
+    import copy
+    import pickle
+
+    raw = b"\x00\x00\x96\x04" + b"\x5a\xa5" * 12
+    frame = console_module._decode_frame(raw, 4, 3)
+
+    for label, clone in (
+        ("copy", copy.copy(frame)),
+        ("deepcopy", copy.deepcopy(frame)),
+        ("pickle", pickle.loads(pickle.dumps(frame))),
+    ):
+        assert isinstance(clone, console_module.Frame), (
+            f"{label} returned {type(clone).__name__}, not a Frame"
+        )
+        assert clone.png == frame.png, f"{label} lost the PNG encoding"
+        assert clone.size == (4, 3) and clone.mode == "RGB", f"{label} lost the pixels"
 
 
 def test_console_frame_is_a_public_nameable_type():

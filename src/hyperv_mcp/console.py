@@ -423,6 +423,23 @@ class Frame(PILImage.Image):
         frame._png = _encode_png(img)
         return frame
 
+    @classmethod
+    def from_png(cls, png: bytes) -> Frame:
+        """Rebuild a frame from its PNG encoding.
+
+        The encoding IS the frame, so a copy, a deepcopy and a pickle all
+        round-trip through here and keep the class and `png` intact.
+        """
+        return cls.from_image(PILImage.open(io.BytesIO(png)))
+
+    def __copy__(self) -> Frame:
+        # PIL.Image.__copy__ returns a plain Image, which would silently drop
+        # both the class and `png`. Rebuild through the encoding instead.
+        return Frame.from_png(self._png)
+
+    def __reduce__(self):
+        return (_rebuild_frame, (self._png,))
+
     @property
     def png(self) -> bytes:
         return self._png
@@ -433,6 +450,11 @@ class Frame(PILImage.Image):
             "Frame.png is read-only: it is the single encoding of this frame's "
             "pixels. Mutate the image and re-save it instead."
         )
+
+
+def _rebuild_frame(png: bytes) -> Frame:
+    """Module-level rebuild target so a Frame pickles."""
+    return Frame.from_png(png)
 
 
 def _encode_png(img: PILImage.Image) -> bytes:
