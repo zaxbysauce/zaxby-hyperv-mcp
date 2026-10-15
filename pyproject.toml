@@ -108,6 +108,12 @@ ignore = ["E501"]
 # in the all-65,536-values equivalence check (B905 — both operands are built to
 # the same length by construction) cannot be edited out without breaking the
 # freeze. The assertions are unchanged; only the linter is told to look away.
+#
+# Removing these entries requires a sanctioned AMEND of the frozen file: append
+# a CHECK_WRONG row to repro/checkpoint.manifest for every (path, check-id)
+# pair whose bytes change, re-run the full RED/GREEN replay, regenerate the
+# anchor receipt and re-publish it. Tracked as issue #75; issue #76 amends the
+# same frozen file and should be amended in the same pass.
 "tests/unit/test_d01_screenshot_decode.py" = ["I001", "F401", "B905"]
 
 [tool.mypy]

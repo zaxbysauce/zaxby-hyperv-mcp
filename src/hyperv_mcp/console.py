@@ -409,6 +409,14 @@ class Frame(PILImage.Image):
     so a caller that mutates the image and then re-saves it gets different
     bytes, which is what the frame-invariant tests pin.
 
+    Memory: because `"BGR;16"` is not one of Pillow's mappable raw modes, the
+    decode materialises a `width*height*3` raster, and a frame retains it
+    alongside its PNG for the frame's lifetime. That is a bounded increase over
+    the lazy `PILImage.open` this replaced — dimensions are clamped to
+    160..4096 at every entry point and at most two frames are retained per
+    `capture_sequence`, so the worst case is roughly 50 MB per held frame at the
+    ceiling. Making the raster lazy is tracked separately.
+
     Build one with `Frame.from_image`, not by calling the constructor: the
     class deliberately does not override `PIL.Image.Image.__init__`.
     """
