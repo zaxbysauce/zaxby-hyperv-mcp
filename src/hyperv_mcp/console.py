@@ -82,6 +82,10 @@ def _input_lock(ref: vmident.VMRef) -> Iterator[None]:
         yield
 _PREFIX_LEN = 4
 
+# Frame is the public return type of the image-producing operations, so it is
+# nameable by downstream consumers rather than an underscore-private detail.
+__all__ = ["ConsoleError", "Frame"]
+
 # PS/2 scan-code set 1: (make, break) without the 0xE0 prefix. Keys in
 # _EXTENDED_KEYS are emitted with 0xE0 before make and before break.
 _KEY_SCANCODES: dict[str, tuple[int, int]] = {
@@ -383,8 +387,105 @@ def _run(
 def _decode_rgb565(raw: bytes, width: int, height: int) -> bytes:
     """Decode a thumbnail payload (4-byte opaque prefix + RGB565) to PNG.
 
-    Raises ConsoleError on any length/structure mismatch — never returns a
-    corrupt image.
+    Retained for callers that want the encoded bytes. Raises ConsoleError on any
+    length/structure mismatch — never returns a corrupt image.
+    """
+    return _decode_frame(raw, width, height).png
+
+
+class Frame(PILImage.Image):
+    """A decoded console frame together with the single PNG encoding made for it.
+
+    Every returned image used to cost two PNG encodes: one inside the decode and
+    one in the server layer that re-opened those bytes. `png` is that one
+    encoding, so the server reuses the bytes instead of encoding again and
+    `save_path` writes exactly the bytes the caller receives.
+
+    A frame IS a `PIL.Image.Image`, not a wrapper around one: it is built by
+    copying the decoded image's state onto this class, so `isinstance` checks,
+    the context-manager protocol, numpy interop and every read method behave
+    exactly as they did on the return value this replaced. `png` is read-only —
+    reassigning it is refused — and is the encoding of the frame's own pixels,
+    so a caller that mutates the image and then re-saves it gets different
+    bytes, which is what the frame-invariant tests pin.
+
+    Memory: because `"BGR;16"` is not one of Pillow's mappable raw modes, the
+    decode materialises a `width*height*3` raster, and a frame retains it
+    alongside its PNG for the frame's lifetime. That is a bounded increase over
+    the lazy `PILImage.open` this replaced — dimensions are clamped to
+    160..4096 at every entry point and at most two frames are retained per
+    `capture_sequence`, so the worst case is roughly 50 MB per held frame at the
+    ceiling. Making the raster lazy is tracked separately.
+
+    Build one with `Frame.from_image`, not by calling the constructor: the
+    class deliberately does not override `PIL.Image.Image.__init__`.
+    """
+
+    _png: bytes
+
+    @classmethod
+    def from_image(cls, img: PILImage.Image) -> Frame:
+        """Wrap an already-decoded image, encoding it to PNG exactly once."""
+        frame = cls.__new__(cls)
+        frame.__dict__.update(img.__dict__)
+        frame._png = _encode_png(img)
+        return frame
+
+    @classmethod
+    def from_png(cls, png: bytes) -> Frame:
+        """Rebuild a frame from its PNG encoding.
+
+        The encoding IS the frame, so a copy, a deepcopy and a pickle all
+        round-trip through here and keep the class and `png` intact.
+        """
+        return cls.from_image(PILImage.open(io.BytesIO(png)))
+
+    def __copy__(self) -> Frame:
+        # PIL.Image.__copy__ returns a plain Image, which would silently drop
+        # both the class and `png`. Rebuild through the encoding instead.
+        return Frame.from_png(self._png)
+
+    def __reduce__(self):
+        return (_rebuild_frame, (self._png,))
+
+    @property
+    def png(self) -> bytes:
+        return self._png
+
+    @png.setter
+    def png(self, value: bytes) -> None:
+        raise AttributeError(
+            "Frame.png is read-only: it is the single encoding of this frame's "
+            "pixels. Mutate the image and re-save it instead."
+        )
+
+
+def _rebuild_frame(png: bytes) -> Frame:
+    """Module-level rebuild target so a Frame pickles."""
+    return Frame.from_png(png)
+
+
+def _encode_png(img: PILImage.Image) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _decode_frame(raw: bytes, width: int, height: int) -> Frame:
+    """Decode a thumbnail payload to a frame carrying its single PNG encoding."""
+    return Frame.from_image(_decode_rgb565_image(raw, width, height))
+
+
+def _decode_rgb565_image(raw: bytes, width: int, height: int) -> PILImage.Image:
+    """Decode a thumbnail payload (4-byte opaque prefix + RGB565) to a PIL image.
+
+    Pillow's native raw decoder does the conversion in C. The output is
+    byte-identical to the per-pixel loop this replaced for all 65,536 RGB565
+    values, at roughly a hundredth of the cost.
+
+    The length and structure checks run first and raise ConsoleError, because
+    `frombuffer` reports a short buffer differently and the payload contract is a
+    structured error, never an image.
     """
     expected = width * height * 2 + _PREFIX_LEN
     if len(raw) < _PREFIX_LEN:
@@ -396,23 +497,9 @@ def _decode_rgb565(raw: bytes, width: int, height: int) -> bytes:
             f"thumbnail payload length mismatch: got {len(raw)} bytes, "
             f"expected {expected} ({width}x{height} RGB565 + {_PREFIX_LEN}-byte prefix)"
         )
-    pixels = raw[_PREFIX_LEN:]
-    img = PILImage.new("RGB", (width, height))
-    px = img.load()
-    assert px is not None  # RGB images always expose a pixel accessor
-    for i in range(0, len(pixels) - 1, 2):
-        v = pixels[i] | (pixels[i + 1] << 8)
-        r5 = (v >> 11) & 0x1F
-        g6 = (v >> 5) & 0x3F
-        b5 = v & 0x1F
-        px[(i // 2) % width, (i // 2) // width] = (
-            (r5 * 255) // 31,
-            (g6 * 255) // 63,
-            (b5 * 255) // 31,
-        )
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+    return PILImage.frombuffer(
+        "RGB", (width, height), raw[_PREFIX_LEN:], "raw", "BGR;16", 0, 1
+    )
 
 
 def _frame_hash(raw: bytes) -> str:
@@ -539,8 +626,8 @@ def screenshot(
     height: int = 768,
     save_path: str = "",
     vm_id: str = "",
-) -> tuple[PILImage.Image, dict]:
-    """Capture the console; returns (PIL image, metadata). Caller wraps in
+) -> tuple[Frame, dict]:
+    """Capture the console; returns (frame, metadata). Caller wraps in
     MCP image content. Raises on failure (uniform list-form success shape)."""
     if not (160 <= width <= 4096 and 160 <= height <= 4096):
         raise ValueError("width/height must be within 160..4096")
@@ -578,8 +665,7 @@ def screenshot(
             fallback_used = f"{chain[0][0]}x{chain[0][1]}: {exc}"
     assert raw is not None
     prefix_hex = raw[:_PREFIX_LEN].hex()
-    png = _decode_rgb565(raw, actual_w, actual_h)
-    img = PILImage.open(io.BytesIO(png))
+    frame = _decode_frame(raw, actual_w, actual_h)
     meta = {
         "vm_name": ref.name,
         "vm_id": guid,
@@ -604,9 +690,9 @@ def screenshot(
         if parent:
             os.makedirs(parent, exist_ok=True)
         with open(save_path, "wb") as fh:
-            fh.write(png)
+            fh.write(frame.png)
         meta["saved_path"] = save_path
-    return img, meta
+    return frame, meta
 
 
 def _screenshot_wmi(
@@ -617,7 +703,7 @@ def _screenshot_wmi(
     width: int,
     height: int,
     save_path: str,
-) -> tuple[PILImage.Image, dict]:
+) -> tuple[Frame, dict]:
     """Screenshot over the in-process WMI backend: same metadata contract
     as the PowerShell path (the capture chain keeps its pre-existing
     per-size retry — same operation, next size)."""
@@ -645,8 +731,7 @@ def _screenshot_wmi(
                 fallback_used = f"{chain[0][0]}x{chain[0][1]}: {exc}"
         assert raw is not None
         prefix_hex = raw[:_PREFIX_LEN].hex()
-        png = _decode_rgb565(raw, actual_w, actual_h)
-        img = PILImage.open(io.BytesIO(png))
+        frame = _decode_frame(raw, actual_w, actual_h)
         meta = {
             "vm_name": ref.name,
             "vm_id": ref.id,
@@ -671,9 +756,9 @@ def _screenshot_wmi(
             if parent:
                 os.makedirs(parent, exist_ok=True)
             with open(save_path, "wb") as fh:
-                fh.write(png)
+                fh.write(frame.png)
             meta["saved_path"] = save_path
-        return img, meta
+        return frame, meta
     except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
         raise ConsoleError(str(exc)) from None
 
@@ -1145,9 +1230,7 @@ def wait_frame_change(
         out["frame_hash"] = last_hash
     if frame_b64:
         raw = base64.b64decode(frame_b64)
-        png = _decode_rgb565(raw, width, height)
-        img = PILImage.open(io.BytesIO(png))
-        out["image"] = img
+        out["image"] = _decode_frame(raw, width, height)
         out["frame_hash"] = _frame_hash(raw)
     return out
 
@@ -1203,8 +1286,7 @@ def _wait_frame_change_wmi(
     if last_hash:
         out["frame_hash"] = last_hash
     if stop_reason == "changed" and raw is not None:
-        png = _decode_rgb565(raw, width, height)
-        out["image"] = PILImage.open(io.BytesIO(png))
+        out["image"] = _decode_frame(raw, width, height)
         out["frame_hash"] = _frame_hash(raw)
     return out
 
@@ -1242,8 +1324,7 @@ def capture_sequence(
             "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
         })
         if i == 0 or i == count - 1:
-            png = _decode_rgb565(raw, width, height)
-            images.append(PILImage.open(io.BytesIO(png)))
+            images.append(_decode_frame(raw, width, height))
         prev_raw = raw
         if i < count - 1:
             time.sleep(interval_s)
@@ -1287,8 +1368,7 @@ def _capture_sequence_wmi(
                 "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             })
             if i == 0 or i == count - 1:
-                png = _decode_rgb565(raw, width, height)
-                images.append(PILImage.open(io.BytesIO(png)))
+                images.append(_decode_frame(raw, width, height))
             prev_raw = raw
             if i < count - 1:
                 time.sleep(interval_s)

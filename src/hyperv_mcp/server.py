@@ -26,7 +26,6 @@ and runtime provenance (PowerShell probe, config digest, git revision).
 import argparse
 import dataclasses
 import importlib.metadata
-import io
 import json
 import logging
 import os
@@ -414,13 +413,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def _image_meta_content(result: dict) -> list:
         """evidence.capture_evidence result -> [ImageContent, TextContent].
 
-        Mirrors the console screenshot idiom: the PIL image is encoded to
-        PNG here and the metadata dict ships as the text sidecar.
+        The console layer already encoded this frame exactly once; those bytes
+        are reused here rather than encoded again, and the metadata dict ships
+        as the text sidecar.
         """
-        buf = io.BytesIO()
-        result["image"].save(buf, format="PNG")
         return [
-            Image(data=buf.getvalue(), format="png").to_image_content(),
+            Image(data=result["image"].png, format="png").to_image_content(),
             result["meta"],
         ]
 
@@ -1201,13 +1199,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 # PRR-004: by-id adoption from the console module's metadata.
                 if not vm_name and meta.get("vm_name"):
                     op.vm_name = str(meta["vm_name"])
-                buf = io.BytesIO()
-                img.save(buf, format="PNG")
                 # ImageContent is a pydantic model; the raw SDK Image
                 # wrapper is not and breaks serialization across the mcp
-                # versions in the CI matrix.
+                # versions in the CI matrix. The frame's single PNG encoding
+                # is reused instead of encoding the image a second time.
                 return errors.success_result(
-                    [Image(data=buf.getvalue(), format="png").to_image_content(), meta]
+                    [Image(data=img.png, format="png").to_image_content(), meta]
                 )
         except UrlElicitationRequiredError:
             raise
@@ -1405,10 +1402,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 if not vm_name and meta.get("vm_name"):
                     op.vm_name = str(meta["vm_name"])
                 if "image" in out:
-                    buf = io.BytesIO()
-                    out["image"].save(buf, format="PNG")
                     return errors.success_result(
-                        [Image(data=buf.getvalue(), format="png").to_image_content(), meta]
+                        [Image(data=out["image"].png, format="png").to_image_content(), meta]
                     )
                 return errors.success_result([meta])
         except UrlElicitationRequiredError:
@@ -1439,11 +1434,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 if not vm_name and meta.get("vm_name"):
                     op.vm_name = str(meta["vm_name"])
                 parts: list = []
-                imgs = list(out["images"])
-                for img in imgs:
-                    buf = io.BytesIO()
-                    img.save(buf, format="PNG")
-                    parts.append(Image(data=buf.getvalue(), format="png").to_image_content())
+                for frame in out["images"]:
+                    parts.append(
+                        Image(data=frame.png, format="png").to_image_content()
+                    )
                 parts.append(meta)
                 return errors.success_result(parts)
         except UrlElicitationRequiredError:
