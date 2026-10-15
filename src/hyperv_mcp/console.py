@@ -82,6 +82,10 @@ def _input_lock(ref: vmident.VMRef) -> Iterator[None]:
         yield
 _PREFIX_LEN = 4
 
+# Frame is the public return type of the image-producing operations, so it is
+# nameable by downstream consumers rather than an underscore-private detail.
+__all__ = ["ConsoleError", "Frame"]
+
 # PS/2 scan-code set 1: (make, break) without the 0xE0 prefix. Keys in
 # _EXTENDED_KEYS are emitted with 0xE0 before make and before break.
 _KEY_SCANCODES: dict[str, tuple[int, int]] = {
@@ -389,43 +393,46 @@ def _decode_rgb565(raw: bytes, width: int, height: int) -> bytes:
     return _decode_frame(raw, width, height).png
 
 
-class _Frame:
+class Frame(PILImage.Image):
     """A decoded console frame together with the single PNG encoding made for it.
 
     Every returned image used to cost two PNG encodes: one inside the decode and
-    one in the server layer that re-opened those bytes. Carrying both halves of
-    that pair lets the server reuse the bytes instead of encoding again, and lets
-    `save_path` write exactly the bytes the caller receives.
+    one in the server layer that re-opened those bytes. `png` is that one
+    encoding, so the server reuses the bytes instead of encoding again and
+    `save_path` writes exactly the bytes the caller receives.
 
-    The `image`/`size`/`mode` surface existing consumers read is proxied and any
-    other attribute is delegated to the underlying PIL image, so a frame behaves
-    like the image it replaced.
+    A frame IS a `PIL.Image.Image`, not a wrapper around one: it is built by
+    copying the decoded image's state onto this class, so `isinstance` checks,
+    the context-manager protocol, numpy interop and every read method behave
+    exactly as they did on the return value this replaced. `png` is read-only —
+    reassigning it is refused — and is the encoding of the frame's own pixels,
+    so a caller that mutates the image and then re-saves it gets different
+    bytes, which is what the frame-invariant tests pin.
+
+    Build one with `Frame.from_image`, not by calling the constructor: the
+    class deliberately does not override `PIL.Image.Image.__init__`.
     """
 
-    __slots__ = ("image", "png")
+    _png: bytes
 
-    def __init__(self, image: PILImage.Image, png: bytes) -> None:
-        self.image = image
-        self.png = png
+    @classmethod
+    def from_image(cls, img: PILImage.Image) -> Frame:
+        """Wrap an already-decoded image, encoding it to PNG exactly once."""
+        frame = cls.__new__(cls)
+        frame.__dict__.update(img.__dict__)
+        frame._png = _encode_png(img)
+        return frame
 
     @property
-    def size(self) -> tuple[int, int]:
-        return self.image.size
+    def png(self) -> bytes:
+        return self._png
 
-    @property
-    def mode(self) -> str:
-        return self.image.mode
-
-    def __getattr__(self, name: str) -> Any:
-        # Only reached when normal lookup fails, so image/png/size/mode never
-        # recurse. Two refusals keep the delegate from lying about this object:
-        # `image` stops an incompletely constructed frame from chasing its own
-        # tail, and dunders stay unproxied so a protocol that finds one here
-        # (copy, pickle, a context manager) cannot be handed the PIL image's
-        # implementation with a _Frame as its receiver.
-        if name == "image" or (name.startswith("__") and name.endswith("__")):
-            raise AttributeError(name)
-        return getattr(self.image, name)
+    @png.setter
+    def png(self, value: bytes) -> None:
+        raise AttributeError(
+            "Frame.png is read-only: it is the single encoding of this frame's "
+            "pixels. Mutate the image and re-save it instead."
+        )
 
 
 def _encode_png(img: PILImage.Image) -> bytes:
@@ -434,10 +441,9 @@ def _encode_png(img: PILImage.Image) -> bytes:
     return buf.getvalue()
 
 
-def _decode_frame(raw: bytes, width: int, height: int) -> _Frame:
+def _decode_frame(raw: bytes, width: int, height: int) -> Frame:
     """Decode a thumbnail payload to a frame carrying its single PNG encoding."""
-    img = _decode_rgb565_image(raw, width, height)
-    return _Frame(img, _encode_png(img))
+    return Frame.from_image(_decode_rgb565_image(raw, width, height))
 
 
 def _decode_rgb565_image(raw: bytes, width: int, height: int) -> PILImage.Image:
@@ -590,7 +596,7 @@ def screenshot(
     height: int = 768,
     save_path: str = "",
     vm_id: str = "",
-) -> tuple[_Frame, dict]:
+) -> tuple[Frame, dict]:
     """Capture the console; returns (frame, metadata). Caller wraps in
     MCP image content. Raises on failure (uniform list-form success shape)."""
     if not (160 <= width <= 4096 and 160 <= height <= 4096):
@@ -667,7 +673,7 @@ def _screenshot_wmi(
     width: int,
     height: int,
     save_path: str,
-) -> tuple[_Frame, dict]:
+) -> tuple[Frame, dict]:
     """Screenshot over the in-process WMI backend: same metadata contract
     as the PowerShell path (the capture chain keeps its pre-existing
     per-size retry — same operation, next size)."""

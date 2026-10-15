@@ -25,6 +25,34 @@ def _ps_transport_default(monkeypatch):
 
 
 @pytest.fixture()
+def png_encode_counter(monkeypatch):
+    """Count PNG encodes (issue #17, PRR-016).
+
+    The single oracle the "one PNG encode per returned image" invariant rests
+    on. It lives here rather than being copied into each test file so there is
+    one implementation to maintain. `Image.init()` runs first: without it the
+    SAVE registry does not exist yet and a patch made earlier is overwritten by
+    plugin registration, which would make the counter read zero and every
+    encode-count assertion vacuous.
+
+    `tests/unit/test_d01_screenshot_decode.py` keeps its own byte-locked copy
+    because that file is frozen by the issue-tracer red checkpoint.
+    """
+    from PIL import Image
+
+    Image.init()
+    original = Image.SAVE["PNG"]
+    box = {"encodes": 0}
+
+    def counting_encode(fp, *args, **kwargs):
+        box["encodes"] += 1
+        return original(fp, *args, **kwargs)
+
+    monkeypatch.setitem(Image.SAVE, "PNG", counting_encode)
+    return box
+
+
+@pytest.fixture()
 def deny_all_cfg() -> Config:
     return Config()
 

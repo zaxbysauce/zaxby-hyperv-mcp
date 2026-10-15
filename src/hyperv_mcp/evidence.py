@@ -94,11 +94,12 @@ def capture_evidence(
     module's resolve and the screenshot can never fork the bundle's
     identity (PRR-006), and the whole bundle acts on one identity.
 
-    Returns {ok, image: <console frame>, meta: <screenshot meta extended with
+    Returns {ok, image: <console.Frame>, meta: <screenshot meta extended with
     ui_tree>} mirroring console.screenshot's (image, meta) tuple contract; the
-    image is the console module's frame holder, which carries the decoded image
-    and the single PNG encoding made for it and proxies the PIL surface. The
-    server layer converts to [ImageContent, TextContent].
+    image is a console.Frame — a PIL.Image.Image subclass carrying the decoded
+    pixels and the single PNG encoding made for them, which the server layer
+    reuses rather than encoding again. The server layer converts to
+    [ImageContent, TextContent].
     """
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     tree_cred: CredentialSet | None = None
