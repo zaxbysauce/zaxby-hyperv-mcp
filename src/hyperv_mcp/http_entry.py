@@ -1,4 +1,4 @@
-"""Run the hyperv-mcp FastMCP server over streamable-http (hardened).
+"""Run the hyperv-mcp MCPServer over streamable-http (hardened).
 
 Adopted from 0xntpower/hyperv-mcp commit 08a721f2 (elevated launcher idea),
 with hardening: a bearer token is REQUIRED by default, the default bind is
@@ -6,7 +6,7 @@ loopback-only, and the effective policy + credential configuration is printed
 at startup.
 
 A stdio MCP server inherits its client's token, so it can never hold more
-privilege than the client. Running the same FastMCP object over
+privilege than the client. Running the same MCPServer object over
 streamable-http decouples the two: launch this once from a shell whose token
 can drive Hyper-V (Hyper-V Administrators membership — preferred, no UAC —
 or an elevated shell), and point clients at the endpoint.
@@ -430,10 +430,11 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     mcp = get_mcp()
-    mcp.settings.host = host
-    mcp.settings.port = port
     try:
-        mcp.run(transport="streamable-http")
+        # mcp 2.x moved the transport bind off `settings` (the Settings
+        # model no longer carries host/port) and onto run(): the kwargs
+        # flow to run_streamable_http_async(host=, port=).
+        mcp.run(transport="streamable-http", host=host, port=port)
     except SystemExit as exc:
         # uvicorn converts a bind OSError into SystemExit(STARTUP_FAILURE)
         # before the OSError handler below can see it.

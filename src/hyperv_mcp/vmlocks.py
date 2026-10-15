@@ -1,18 +1,17 @@
 """Per-VM scoped read/write locks with bounded waits and holder metadata.
 
-When the server dispatches tool calls concurrently WITHIN one process (an
-SDK- or config-dependent property — current sync tools mostly run inline on
-the event loop), a checkpoint restore racing a guest execution on the same
-VM is exactly the kind of interference this prevents; the lock is the
-arbitration point for that in-process concurrency whenever it occurs. The
+The server dispatches tool calls concurrently WITHIN one process: mcp 2.x
+runs every sync tool body on a worker thread, so a checkpoint restore racing
+a guest execution on the same VM is exactly the kind of interference this
+lock prevents; the lock is the arbitration point for that concurrency. The
 lock covers ONE process only: it is a module-dict entry, so two separately
 spawned `hyperv-mcp` servers never exclude each other — which is why the
 default deployment proxies every client to the ONE shared controller (see
 stdio_proxy / README "Shared controller"), putting every agent's calls into
 this lock's process. Within that process the path applies across agents;
-observable cross-agent VMBusy lands once the controller stops serializing
-sync tool calls (FND-01, Workstream C PR 3 / issue #16) — until then a
-second agent's call queues behind the first instead of fast-failing.
+cross-agent VMBusy is observable and fast-fails (with holder metadata)
+instead of queueing — the serialization that used to hide it ended with
+FND-01's fix (Workstream C PR 3 / issue #16).
 
 Each VM key maps to a writer-preferring read/write lock (issue #14,
 FND-02/ENH-02): read-scope legs — guest probes, job start/status/output/
@@ -51,6 +50,8 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+
+import anyio
 
 #: Tool name of the enclosing `auditlog.operation`, set/reset by its
 #: __enter__/__exit__ so a VMBusy raised anywhere inside a tool call can
@@ -143,6 +144,20 @@ def _busy(key: object, holder: dict | None) -> VMBusy:
     )
 
 
+_POLL_SLICE_S = 0.2  # cancellation observation window while parked on the lock
+
+
+def _check_lock_cancellation() -> None:
+    """Observe anyio host-task cancellation from inside a worker thread
+    parked on the lock (same contract as pswindows._check_ps_cancellation:
+    the cancellation exception is raised only in the worker-thread dispatch
+    shape mcp 2.x uses; everywhere else it is a swallowed RuntimeError)."""
+    try:
+        anyio.from_thread.check_cancelled()
+    except RuntimeError:
+        pass
+
+
 class _RWLock:
     """Writer-preferring read/write lock with bounded waits.
 
@@ -210,14 +225,24 @@ class _RWLock:
 
     def _wait_tick(self, deadline: float | None) -> bool:
         """Wait for the CV until the predicate may have changed; return
-        False when the bounded window has expired. Caller holds the CV."""
+        False when the bounded window has expired. Caller holds the CV.
+
+        The wait runs in cancellation-observation slices: mcp 2.x dispatches
+        tool bodies on anyio worker threads and shields the host task for the
+        thread's lifetime, so a call cancelled while parked here would
+        otherwise sit out the whole bounded window (default 30 s, up to
+        600 s) holding its tool thread and the tool-limiter token. Anywhere
+        that is not an anyio worker thread (plain threads, the event-loop
+        thread, CLI callers) the check raises RuntimeError, which is
+        swallowed, so non-worker callers keep the pre-poll behavior."""
+        _check_lock_cancellation()
         if deadline is None:
-            self._cv.wait()
+            self._cv.wait(_POLL_SLICE_S)
             return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
-        self._cv.wait(remaining)
+        self._cv.wait(min(remaining, _POLL_SLICE_S))
         return True
 
     def release(self, tid: int) -> None:

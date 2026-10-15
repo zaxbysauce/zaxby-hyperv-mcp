@@ -29,7 +29,8 @@ import importlib
 import json
 
 import pytest
-from mcp.shared.memory import create_connected_server_and_client_session
+from mcp import ClientSession
+from mcp.client._memory import InMemoryTransport
 
 import hyperv_mcp.server as server_module
 from hyperv_mcp.console import ConsoleError
@@ -86,6 +87,12 @@ def _no_guest_creds(monkeypatch) -> None:
         "HYPERV_GUEST_VICTIM_USERNAME", "HYPERV_GUEST_VICTIM_PASSWORD",
     ):
         monkeypatch.delenv(var, raising=False)
+
+
+def _tool_schema(tool) -> dict:
+    """The tool's input schema across SDK generations (mcp 1.x: inputSchema,
+    2.x: input_schema)."""
+    return getattr(tool, "input_schema", None) or tool.inputSchema
 
 
 def _content_blocks(result):
@@ -260,7 +267,7 @@ def test_every_tool_returns_envelope_under_deny_all(fresh_server, tmp_path, monk
     raised = []
     failures = []
     for tool in asyncio.run(mcp.list_tools()):
-        args = _minimal_args(tool.inputSchema)
+        args = _minimal_args(_tool_schema(tool))
         try:
             result = asyncio.run(mcp.call_tool(tool.name, args))
         except Exception as exc:  # the census must never raise, whatever the class
@@ -320,18 +327,27 @@ def test_failure_sets_is_error(fresh_server, tmp_path, monkeypatch):
     mcp = mod.get_mcp()
 
     async def _call():
-        async with create_connected_server_and_client_session(mcp) as client:
-            return await client.call_tool(
-                "hyperv_guest_job_status", {"job_id": "no-such-job"}
-            )
+        async with InMemoryTransport(mcp) as streams:
+            async with ClientSession(*streams) as client:
+                await client.initialize()
+                return await client.call_tool(
+                    "hyperv_guest_job_status", {"job_id": "no-such-job"}
+                )
 
     result = asyncio.run(_call())
-    assert result.isError is True
+    # mcp 1.x client results expose isError; 2.x exposes is_error.
+    is_error = getattr(result, "is_error", None)
+    if is_error is None:
+        is_error = getattr(result, "isError", None)
+    assert is_error is True
     text_blocks = [c for c in result.content if getattr(c, "type", "") == "text"]
     assert text_blocks, "expected a text envelope block"
     env = json.loads(text_blocks[0].text)
     assert env["ok"] is False
-    assert result.structuredContent == env
+    structured = getattr(result, "structured_content", None)
+    if structured is None:
+        structured = getattr(result, "structuredContent", None)
+    assert structured == env
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +376,6 @@ def test_unknown_argument_rejected(fresh_server, tmp_path, monkeypatch):
     assert len(calls) == 0, "the tool body ran despite an unknown argument"
 
     for tool in asyncio.run(mcp.list_tools()):
-        assert tool.inputSchema.get("additionalProperties") is False, (
-            f"{tool.name}: inputSchema must set additionalProperties: false"
+        assert _tool_schema(tool).get("additionalProperties") is False, (
+            f"{tool.name}: input schema must set additionalProperties: false"
         )

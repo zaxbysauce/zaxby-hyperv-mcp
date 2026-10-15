@@ -126,10 +126,20 @@ def test_credentialed_leg_from_pwsh7_parent(running_vm, monkeypatch):
         mod.bootstrap({})
         mcp = mod.get_mcp()
         raw = asyncio.run(mcp.call_tool("hyperv_server_info", {}))
-        content = raw[0] if isinstance(raw, tuple) else raw
+        # Content blocks from any call_tool return shape (1.x tuple/list,
+        # 2.x CallToolResult). Defined locally: tests/ is not a package, so
+        # `from tests.unit.conftest import ...` only resolves when the repo
+        # root happens to be on sys.path (`python -m pytest`), not under the
+        # documented bare `pytest tests/integration`.
+        def _content_blocks(result):
+            content = result[0] if isinstance(result, tuple) else result
+            if not isinstance(content, list) and hasattr(content, "content"):
+                content = content.content
+            return content if isinstance(content, list) else [content]
+
         response_text = "".join(
             getattr(block, "text", "")
-            for block in content
+            for block in _content_blocks(raw)
             if getattr(block, "type", "") == "text"
         )
         payload = json.loads(response_text)

@@ -15,13 +15,25 @@ class _FakeSettings:
 
 
 class _FakeMcp:
+    """Records the transport and, across SDK generations, the bind target:
+    mcp 1.x configured the bind through settings (http_entry assigned
+    settings.host/port before run); 2.x passes host/port to run(**kwargs)."""
+
     def __init__(self):
         self.settings = _FakeSettings()
         self.run_calls = []
+        self.run_kwargs = []
 
-    def run(self, transport="stdio"):
+    def run(self, transport="stdio", **kwargs):
         self.run_calls.append(transport)
+        self.run_kwargs.append(kwargs)
         return 0
+
+    def bind_port(self):
+        for kwargs in reversed(self.run_kwargs):
+            if "port" in kwargs:
+                return kwargs["port"]
+        return self.settings.port
 
 
 @pytest.fixture()
@@ -44,7 +56,7 @@ def test_custom_token_env_honored(tmp_path, monkeypatch, fake_server, capsys):
     rc = http_entry.main([])
     assert rc == 0
     assert fake_server.run_calls == ["streamable-http"]
-    assert fake_server.settings.port == 8844
+    assert fake_server.bind_port() == 8844
 
 
 def test_default_token_env_missing_refuses(tmp_path, monkeypatch, fake_server, capsys):

@@ -105,12 +105,15 @@ def test_c1_tool_inventory():
         assert "hyperv_vm_set_resolution" in names, "missing tool hyperv_vm_set_resolution"
         assert "hyperv_vm_get_video" in names, "missing tool hyperv_vm_get_video"
         assert len(names) == 57, f"tool inventory is {len(names)}, expected 57"
+        def _schema(t):
+            return getattr(t, "input_schema", None) or t.inputSchema
+
         by_name = {t.name: t for t in tools}
         for name in ("hyperv_vm_set_resolution", "hyperv_vm_get_video"):
-            props = by_name[name].inputSchema.get("properties", {})
+            props = _schema(by_name[name]).get("properties", {})
             assert {"vm_name", "vm_id"} <= set(props), f"{name}: vm_name/vm_id params"
-        set_props = by_name["hyperv_vm_set_resolution"].inputSchema.get("properties", {})
-        get_props = by_name["hyperv_vm_get_video"].inputSchema.get("properties", {})
+        set_props = _schema(by_name["hyperv_vm_set_resolution"]).get("properties", {})
+        get_props = _schema(by_name["hyperv_vm_get_video"]).get("properties", {})
         assert "confirm" in set_props, "hyperv_vm_set_resolution must take confirm"
         assert "confirm" not in get_props, "hyperv_vm_get_video is read-only: no confirm"
     finally:

@@ -10,16 +10,23 @@ holds no locks or registries of its own — it forwards MCP messages unchanged
 in both directions, authenticated with the agent's own token.
 
 Failure contract (frozen by tests/unit/test_b03_stdio_proxy.py): a pending
-request never waits forever — an unreachable controller (connection refused),
-a rejected token (HTTP 401/403), or a mid-session disconnect turns into a
-JSON-RPC error (code -32000) for each outstanding request id, names the token
-environment variable on stderr (rejections only), never echoes the token, and
-the proxy exits non-zero. Connection and rejection failures surface as a
-RAISED exception group when the upstream client context unwinds (probe-
-verified: post failures cancel the transport task group and re-raise at its
-boundary), so the emit path is driven from that raised group as well as from
-exception items on the upstream read stream and from failures inside the
-client->upstream reader task itself.
+request never waits forever — an unreachable controller (connection refused)
+or a mid-session disconnect turns into a JSON-RPC error (code -32000) for
+each outstanding request id, names the token environment variable on stderr
+(rejections only), never echoes the token, and the proxy exits non-zero.
+Connection failures surface as a RAISED exception group when the upstream
+client context unwinds (probe-verified: post failures cancel the transport
+task group and re-raise at its boundary), so the emit path is driven from
+that raised group as well as from exception items on the upstream read
+stream and from failures inside the client->upstream reader task itself.
+
+A REJECTED token (HTTP 401/403) no longer surfaces as a status-bearing
+exception: mcp 2.x collapses any non-2xx response into a generic JSON-RPC
+error delivered on the read stream, which the proxy forwards to the client
+(the code is the SDK's INTERNAL_ERROR, not -32000) and annotates with a
+one-line stderr hint naming the token environment variable. The status-based
+classification is not recoverable at this layer; the hint is the operator
+signal. See README "Shared controller" for the user-facing wording.
 
 Tokens come only from the environment: the variable named by
 `http.token_env`, or — when `http.agents` is configured — the single set
@@ -43,14 +50,13 @@ import time
 from urllib.parse import urlparse
 
 import anyio
-import httpx
+import httpx2
 from mcp.client.streamable_http import streamable_http_client
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp.types import (
     ErrorData,
     JSONRPCError,
-    JSONRPCMessage,
     JSONRPCRequest,
     JSONRPCResponse,
 )
@@ -430,19 +436,57 @@ def _controller_log_path(port: int) -> str:
 
 
 def _request_id_of(message: SessionMessage):
-    root = getattr(getattr(message, "message", None), "root", None)
-    return root
+    """The JSON-RPC message a SessionMessage carries, across SDK shapes.
+
+    mcp 1.x wrapped every message in a JSONRPCMessage union model whose
+    `.root` held the concrete request/response/error. mcp 2.x made
+    JSONRPCMessage a plain type union and its transports carry the concrete
+    message directly, so the wrapper level is gone (issue #16)."""
+    inner = getattr(message, "message", None)
+    return getattr(inner, "root", None) or inner
 
 
 def _error_reply(request_id, note: str) -> SessionMessage:
+    # 2.x JSONRPCMessage is a plain union: the concrete error IS the message.
     return SessionMessage(
-        message=JSONRPCMessage(
-            root=JSONRPCError(
-                jsonrpc="2.0",
-                id=request_id,
-                error=ErrorData(code=PROXY_ERROR_CODE, message=note),
-            )
+        message=JSONRPCError(
+            jsonrpc="2.0",
+            id=request_id,
+            error=ErrorData(code=PROXY_ERROR_CODE, message=note),
         )
+    )
+
+
+def _note_upstream_error(root, token_env_name: str, noted: list) -> None:
+    """Name the token environment variable when the controller answers one
+    of OUR requests with a JSON-RPC error.
+
+    mcp 1.x surfaced a controller rejection (e.g. HTTP 401) as a transport
+    exception, so the proxy could classify it by status. mcp 2.x collapses
+    any non-2xx response into a generic JSON-RPC error delivered on the read
+    stream, so the status is no longer observable here; an error answer to a
+    request the proxy itself sent is the observable signal, and the token
+    env var is the first thing an operator should check. Emitted once per
+    session.
+
+    The remote error TEXT is deliberately not printed: it is
+    controller-controlled data with no redaction pass on this path (the
+    bearer token is not in the redaction registry), so echoing it would put
+    attacker-shapeable text — and potentially the token itself — into the
+    operator's stderr and the client's logs. Only the SDK's numeric error
+    code is printed. The caller fires this only for errors whose id the
+    proxy has outstanding, so unrelated stream noise cannot trigger it."""
+    if noted:
+        return
+    noted.append(True)
+    error = getattr(root, "error", None)
+    code = getattr(error, "code", None)
+    print(
+        f"hyperv-mcp proxy: the controller answered a request with a "
+        f"JSON-RPC error (code {code}); if this is an authentication "
+        f"failure, check the {token_env_name} environment variable, then "
+        f"retry. The full error was forwarded to the client.",
+        file=sys.stderr,
     )
 
 
@@ -493,7 +537,7 @@ async def _run_proxy(
     token_env_name: str,
 ) -> int:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-    timeout = httpx.Timeout(
+    timeout = httpx2.Timeout(
         UPSTREAM_CONNECT_TIMEOUT_S, read=None, write=UPSTREAM_WRITE_TIMEOUT_S, pool=5.0
     )
     outstanding: set = set()
@@ -503,6 +547,7 @@ async def _run_proxy(
     # order once the upstream write stream exists.
     buffered: list[SessionMessage] = []
     upstream: list = []  # [write_stream] once connected
+    noted_upstream_error: list = []  # once-per-session stderr note
 
     async with stdio_server() as (client_read, client_write):
 
@@ -545,10 +590,15 @@ async def _run_proxy(
         async with anyio.create_task_group() as tg:
             tg.start_soon(read_client)
             try:
-                async with httpx.AsyncClient(headers=headers, timeout=timeout) as hc:
+                # httpx2 is the SDK's own HTTP stack (mcp 2.x); its client is
+                # what streamable_http_client speaks.
+                async with httpx2.AsyncClient(headers=headers, timeout=timeout) as hc:
+                    # mcp 2.x yields (read_stream, write_stream); 1.x yielded
+                    # a third value (the session-id getter), which the SDK
+                    # removed with the session-id transport change (issue #16).
                     async with streamable_http_client(
                         url, http_client=hc
-                    ) as (upstream_read, upstream_write, _get_session_id_unused):
+                    ) as (upstream_read, upstream_write):
                         upstream.append(upstream_write)
                         for message in buffered:
                             await upstream_write.send(message)
@@ -558,7 +608,16 @@ async def _run_proxy(
                                 raise _UpstreamClosed(str(item)) from item
                             root = _request_id_of(item)
                             if isinstance(root, (JSONRPCResponse, JSONRPCError)):
+                                # Only an error answering a request the proxy
+                                # itself sent is a signal about OUR session
+                                # (e.g. a rejected token); unrelated stream
+                                # noise must not trigger the operator note.
+                                answers_ours = root.id in outstanding
                                 outstanding.discard(root.id)
+                                if isinstance(root, JSONRPCError) and answers_ours:
+                                    _note_upstream_error(
+                                        root, token_env_name, noted_upstream_error
+                                    )
                             await client_write.send(item)
                         raise _UpstreamClosed("controller closed the session stream")
             except BaseExceptionGroupType as eg:

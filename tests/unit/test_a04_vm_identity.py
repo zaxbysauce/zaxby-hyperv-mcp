@@ -157,7 +157,8 @@ def test_every_vm_tool_accepts_vm_id(fresh_server):
     exactly one of vm_name/vm_id required (neither is schema-required)."""
     mod = fresh_server({})
     tools = asyncio.run(mod.get_mcp().list_tools())
-    schemas = {t.name: t.inputSchema for t in tools}
+    # mcp 1.x Tool exposes inputSchema; 2.x exposes input_schema.
+    schemas = {t.name: (getattr(t, "input_schema", None) or t.inputSchema) for t in tools}
     missing = sorted(
         name
         for name, schema in schemas.items()

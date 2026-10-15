@@ -1,8 +1,8 @@
 """Image-content contract test: the screenshot tool must return real MCP
-ImageContent through FastMCP's conversion path (not base64-in-text).
+ImageContent through the SDK's conversion path (not base64-in-text).
 
 Critic-round-1 item 10: a regression to dict{png_b64} would pass every
-mocked test — this test invokes the registered tool through FastMCP.
+mocked test — this test invokes the registered tool through the SDK.
 """
 
 import base64
@@ -86,7 +86,7 @@ def test_screenshot_returns_image_content(monkeypatch, fresh_server):
     assert image_blocks, f"no image content in {[type(c).__name__ for c in content]}"
     block = image_blocks[0]
     assert isinstance(block, ImageContent)
-    assert block.mimeType == "image/png"
+    assert (getattr(block, "mime_type", None) or block.mimeType) == "image/png"
     # the image decodes to the requested dimensions
     img = Image.open(io.BytesIO(base64.b64decode(block.data)))
     assert img.size == (320, 240)
@@ -121,7 +121,8 @@ def test_wait_frame_change_changed_returns_image_content(monkeypatch, fresh_serv
 
     content = _blocks(result)
     image_blocks = [c for c in content if getattr(c, "type", "") == "image"]
-    assert image_blocks and image_blocks[0].mimeType == "image/png"
+    block = image_blocks[0]
+    assert (getattr(block, "mime_type", None) or block.mimeType) == "image/png"
 
 
 def test_deadline_wait_returns_no_image_block(monkeypatch, fresh_server):
@@ -144,7 +145,7 @@ def test_deadline_wait_returns_no_image_block(monkeypatch, fresh_server):
 
 
 def test_tools_never_return_raw_image_objects(monkeypatch, fresh_server):
-    """Tool functions must return mcp.types ImageContent, never the FastMCP
+    """Tool functions must return mcp.types ImageContent, never the SDK
     Image wrapper. On Python 3.10, `-> Any` builds a wrapped output model and
     convert_result model_dumps the raw return — a raw Image raises
     PydanticSerializationError there. Python 3.11+ skips that path, so CI's
@@ -152,7 +153,7 @@ def test_tools_never_return_raw_image_objects(monkeypatch, fresh_server):
     """
     import asyncio
 
-    from mcp.server.fastmcp.utilities.types import Image as FastMCPImage
+    from mcp.server.mcpserver.utilities.types import Image as SdkImage
 
     _mock_capture(monkeypatch, 320, 240)
     mcp = fresh_server.get_mcp()
@@ -165,7 +166,7 @@ def test_tools_never_return_raw_image_objects(monkeypatch, fresh_server):
 
     raw = _blocks(raw)
     assert isinstance(raw, list)
-    assert not [v for v in raw if isinstance(v, FastMCPImage)]
+    assert not [v for v in raw if isinstance(v, SdkImage)]
     assert [v for v in raw if isinstance(v, ImageContent)]
 
 
@@ -176,7 +177,7 @@ def test_wrapped_any_output_model_dumps_image_content():
     """
     from typing import Any
 
-    from mcp.server.fastmcp.utilities.func_metadata import ArgModelBase, FuncMetadata
+    from mcp.server.mcpserver.utilities.func_metadata import ArgModelBase, FuncMetadata
     from pydantic import create_model
 
     wrapped = create_model("toolOutput", result=(Any, ...))
@@ -187,6 +188,13 @@ def test_wrapped_any_output_model_dumps_image_content():
         wrap_output=True,
     )
     block = ImageContent(type="image", data="eA==", mimeType="image/png")
-    unstructured, structured = md.convert_result([block, {"frame_hash": "abc"}])
+    # mcp 1.x convert_result returned (unstructured, structured); 2.x returns
+    # a CallToolResult carrying both.
+    converted = md.convert_result([block, {"frame_hash": "abc"}])
+    if isinstance(converted, tuple):
+        unstructured, structured = converted
+    else:
+        unstructured = converted.content
+        structured = converted.structured_content
     assert [c.type for c in unstructured] == ["image", "text"]
     assert structured["result"][1]["frame_hash"] == "abc"
