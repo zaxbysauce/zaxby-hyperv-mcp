@@ -383,8 +383,73 @@ def _run(
 def _decode_rgb565(raw: bytes, width: int, height: int) -> bytes:
     """Decode a thumbnail payload (4-byte opaque prefix + RGB565) to PNG.
 
-    Raises ConsoleError on any length/structure mismatch — never returns a
-    corrupt image.
+    Retained for callers that want the encoded bytes. Raises ConsoleError on any
+    length/structure mismatch — never returns a corrupt image.
+    """
+    return _decode_frame(raw, width, height).png
+
+
+class _Frame:
+    """A decoded console frame together with the single PNG encoding made for it.
+
+    Every returned image used to cost two PNG encodes: one inside the decode and
+    one in the server layer that re-opened those bytes. Carrying both halves of
+    that pair lets the server reuse the bytes instead of encoding again, and lets
+    `save_path` write exactly the bytes the caller receives.
+
+    The `image`/`size`/`mode` surface existing consumers read is proxied and any
+    other attribute is delegated to the underlying PIL image, so a frame behaves
+    like the image it replaced.
+    """
+
+    __slots__ = ("image", "png")
+
+    def __init__(self, image: PILImage.Image, png: bytes) -> None:
+        self.image = image
+        self.png = png
+
+    @property
+    def size(self) -> tuple[int, int]:
+        return self.image.size
+
+    @property
+    def mode(self) -> str:
+        return self.image.mode
+
+    def __getattr__(self, name: str) -> Any:
+        # Only reached when normal lookup fails, so image/png/size/mode never
+        # recurse. Two refusals keep the delegate from lying about this object:
+        # `image` stops an incompletely constructed frame from chasing its own
+        # tail, and dunders stay unproxied so a protocol that finds one here
+        # (copy, pickle, a context manager) cannot be handed the PIL image's
+        # implementation with a _Frame as its receiver.
+        if name == "image" or (name.startswith("__") and name.endswith("__")):
+            raise AttributeError(name)
+        return getattr(self.image, name)
+
+
+def _encode_png(img: PILImage.Image) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _decode_frame(raw: bytes, width: int, height: int) -> _Frame:
+    """Decode a thumbnail payload to a frame carrying its single PNG encoding."""
+    img = _decode_rgb565_image(raw, width, height)
+    return _Frame(img, _encode_png(img))
+
+
+def _decode_rgb565_image(raw: bytes, width: int, height: int) -> PILImage.Image:
+    """Decode a thumbnail payload (4-byte opaque prefix + RGB565) to a PIL image.
+
+    Pillow's native raw decoder does the conversion in C. The output is
+    byte-identical to the per-pixel loop this replaced for all 65,536 RGB565
+    values, at roughly a hundredth of the cost.
+
+    The length and structure checks run first and raise ConsoleError, because
+    `frombuffer` reports a short buffer differently and the payload contract is a
+    structured error, never an image.
     """
     expected = width * height * 2 + _PREFIX_LEN
     if len(raw) < _PREFIX_LEN:
@@ -396,23 +461,9 @@ def _decode_rgb565(raw: bytes, width: int, height: int) -> bytes:
             f"thumbnail payload length mismatch: got {len(raw)} bytes, "
             f"expected {expected} ({width}x{height} RGB565 + {_PREFIX_LEN}-byte prefix)"
         )
-    pixels = raw[_PREFIX_LEN:]
-    img = PILImage.new("RGB", (width, height))
-    px = img.load()
-    assert px is not None  # RGB images always expose a pixel accessor
-    for i in range(0, len(pixels) - 1, 2):
-        v = pixels[i] | (pixels[i + 1] << 8)
-        r5 = (v >> 11) & 0x1F
-        g6 = (v >> 5) & 0x3F
-        b5 = v & 0x1F
-        px[(i // 2) % width, (i // 2) // width] = (
-            (r5 * 255) // 31,
-            (g6 * 255) // 63,
-            (b5 * 255) // 31,
-        )
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+    return PILImage.frombuffer(
+        "RGB", (width, height), raw[_PREFIX_LEN:], "raw", "BGR;16", 0, 1
+    )
 
 
 def _frame_hash(raw: bytes) -> str:
@@ -539,8 +590,8 @@ def screenshot(
     height: int = 768,
     save_path: str = "",
     vm_id: str = "",
-) -> tuple[PILImage.Image, dict]:
-    """Capture the console; returns (PIL image, metadata). Caller wraps in
+) -> tuple[_Frame, dict]:
+    """Capture the console; returns (frame, metadata). Caller wraps in
     MCP image content. Raises on failure (uniform list-form success shape)."""
     if not (160 <= width <= 4096 and 160 <= height <= 4096):
         raise ValueError("width/height must be within 160..4096")
@@ -578,8 +629,7 @@ def screenshot(
             fallback_used = f"{chain[0][0]}x{chain[0][1]}: {exc}"
     assert raw is not None
     prefix_hex = raw[:_PREFIX_LEN].hex()
-    png = _decode_rgb565(raw, actual_w, actual_h)
-    img = PILImage.open(io.BytesIO(png))
+    frame = _decode_frame(raw, actual_w, actual_h)
     meta = {
         "vm_name": ref.name,
         "vm_id": guid,
@@ -604,9 +654,9 @@ def screenshot(
         if parent:
             os.makedirs(parent, exist_ok=True)
         with open(save_path, "wb") as fh:
-            fh.write(png)
+            fh.write(frame.png)
         meta["saved_path"] = save_path
-    return img, meta
+    return frame, meta
 
 
 def _screenshot_wmi(
@@ -617,7 +667,7 @@ def _screenshot_wmi(
     width: int,
     height: int,
     save_path: str,
-) -> tuple[PILImage.Image, dict]:
+) -> tuple[_Frame, dict]:
     """Screenshot over the in-process WMI backend: same metadata contract
     as the PowerShell path (the capture chain keeps its pre-existing
     per-size retry — same operation, next size)."""
@@ -645,8 +695,7 @@ def _screenshot_wmi(
                 fallback_used = f"{chain[0][0]}x{chain[0][1]}: {exc}"
         assert raw is not None
         prefix_hex = raw[:_PREFIX_LEN].hex()
-        png = _decode_rgb565(raw, actual_w, actual_h)
-        img = PILImage.open(io.BytesIO(png))
+        frame = _decode_frame(raw, actual_w, actual_h)
         meta = {
             "vm_name": ref.name,
             "vm_id": ref.id,
@@ -671,9 +720,9 @@ def _screenshot_wmi(
             if parent:
                 os.makedirs(parent, exist_ok=True)
             with open(save_path, "wb") as fh:
-                fh.write(png)
+                fh.write(frame.png)
             meta["saved_path"] = save_path
-        return img, meta
+        return frame, meta
     except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
         raise ConsoleError(str(exc)) from None
 
@@ -1145,9 +1194,7 @@ def wait_frame_change(
         out["frame_hash"] = last_hash
     if frame_b64:
         raw = base64.b64decode(frame_b64)
-        png = _decode_rgb565(raw, width, height)
-        img = PILImage.open(io.BytesIO(png))
-        out["image"] = img
+        out["image"] = _decode_frame(raw, width, height)
         out["frame_hash"] = _frame_hash(raw)
     return out
 
@@ -1203,8 +1250,7 @@ def _wait_frame_change_wmi(
     if last_hash:
         out["frame_hash"] = last_hash
     if stop_reason == "changed" and raw is not None:
-        png = _decode_rgb565(raw, width, height)
-        out["image"] = PILImage.open(io.BytesIO(png))
+        out["image"] = _decode_frame(raw, width, height)
         out["frame_hash"] = _frame_hash(raw)
     return out
 
@@ -1242,8 +1288,7 @@ def capture_sequence(
             "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
         })
         if i == 0 or i == count - 1:
-            png = _decode_rgb565(raw, width, height)
-            images.append(PILImage.open(io.BytesIO(png)))
+            images.append(_decode_frame(raw, width, height))
         prev_raw = raw
         if i < count - 1:
             time.sleep(interval_s)
@@ -1287,8 +1332,7 @@ def _capture_sequence_wmi(
                 "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             })
             if i == 0 or i == count - 1:
-                png = _decode_rgb565(raw, width, height)
-                images.append(PILImage.open(io.BytesIO(png)))
+                images.append(_decode_frame(raw, width, height))
             prev_raw = raw
             if i < count - 1:
                 time.sleep(interval_s)

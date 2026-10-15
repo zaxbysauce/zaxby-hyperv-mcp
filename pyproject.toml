@@ -101,6 +101,14 @@ ignore = ["E501"]
 # are frozen by the trace protocol, so its author-era import order cannot be
 # re-sorted by the linter.
 "tests/unit/test_b01_agent_identity.py" = ["I001"]
+# Same rule for the issue-#17 red checkpoint (manifest blob ee03b42b...). The
+# check file's bytes are frozen by the trace protocol, so the author-era import
+# order (I001), the unused `io` import it carried while the decode still
+# returned PNG bytes (F401), and the `zip` over two equal-length byte strings
+# in the all-65,536-values equivalence check (B905 — both operands are built to
+# the same length by construction) cannot be edited out without breaking the
+# freeze. The assertions are unchanged; only the linter is told to look away.
+"tests/unit/test_d01_screenshot_decode.py" = ["I001", "F401", "B905"]
 
 [tool.mypy]
 python_version = "3.10"
