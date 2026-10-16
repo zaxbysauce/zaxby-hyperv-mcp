@@ -80,6 +80,18 @@ def _guid_leg():
     return _ok(GUID)
 
 
+def _folded_screenshot(payload: bytes, w: int, h: int):
+    """One folded capture: VMID/HEAD/SIZES/USED metadata ahead of the payload
+    JSON (issue #18: the whole capture runs in one process)."""
+    return _ok(
+        "VMID=" + GUID + "\n"
+        + "HEAD=1024x768" + "\n"
+        + "SIZES=" + str(w) + "x" + str(h) + "\n"
+        + "USED=" + str(w) + "x" + str(h) + "\n"
+        + _capture_leg(payload).stdout
+    )
+
+
 def _head_leg():
     return _ok(HEAD_RES)
 
@@ -193,7 +205,7 @@ def test_screenshot_tool_encodes_png_once(monkeypatch, encode_counter, tool_serv
     the tool encodes again), GREEN after the fix. One PNG encode per returned image."""
     payload = _thumbnail(320, 240)
     monkeypatch.setattr(pswindows, "run_ps", _ResponseQueue([
-        _guid_leg(), _head_leg(), _capture_leg(payload),
+        _folded_screenshot(payload, 320, 240),
     ]))
     encode_counter["encodes"] = 0
 
@@ -219,7 +231,7 @@ def test_wait_frame_change_tool_encodes_png_once(monkeypatch, encode_counter, to
     payload = b"\x00\x00\x00\x00" + b"\x00\x00" * (width * height)
     frame_line = "STOP=changed POLLS=2 HASH=" + "a" * 64 + "\nFRAME=" + base64.b64encode(payload).decode()
     monkeypatch.setattr(pswindows, "run_ps", _ResponseQueue([
-        _guid_leg(), _ok(frame_line),
+        _ok(frame_line),
     ]))
     encode_counter["encodes"] = 0
 
@@ -250,7 +262,7 @@ def test_capture_sequence_tool_encodes_each_returned_png_once(monkeypatch, encod
     width, height = 320, 240
     payload = _thumbnail(width, height)
     monkeypatch.setattr(pswindows, "run_ps", _ResponseQueue(
-        [_guid_leg()] + [_capture_leg(payload) for _ in range(3)]
+        [_capture_leg(payload) for _ in range(3)]
     ))
     encode_counter["encodes"] = 0
 
@@ -279,7 +291,9 @@ def test_capture_evidence_tool_encodes_png_once(monkeypatch, encode_counter, too
     resolution, and the capture."""
     payload = _thumbnail(320, 240)
     monkeypatch.setattr(pswindows, "run_ps", _ResponseQueue([
-        _guid_leg(), _guid_leg(), _head_leg(), _capture_leg(payload),
+        _guid_leg(),          # evidence's own by-name resolve
+        _ok("test-vm-1"),     # console's by-id resolve (policy on the real name)
+        _folded_screenshot(payload, 320, 240),
     ]))
     encode_counter["encodes"] = 0
 

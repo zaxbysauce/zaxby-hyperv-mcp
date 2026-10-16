@@ -109,7 +109,13 @@ def test_ps_screenshot_save_path_bytes_match_returned(monkeypatch, tool_server, 
     w, h = 320, 240
     payload = _thumbnail(w, h)
     monkeypatch.setattr(pswindows, "run_ps", _ResponseQueue([
-        _ok(GUID), _ok(HEAD_RES), _capture_leg(payload),
+        _ok(
+            "VMID=" + GUID + "\n"
+            + "HEAD=1024x768" + "\n"
+            + "SIZES=320x240" + "\n"
+            + "USED=320x240" + "\n"
+            + _capture_leg(payload).stdout
+        ),
     ]))
     dest = tmp_path / "shots" / "frame.png"
 
@@ -137,7 +143,13 @@ def test_ps_screenshot_save_path_write_is_png_not_raw_payload(monkeypatch, tool_
     w, h = 320, 240
     payload = _thumbnail(w, h)
     monkeypatch.setattr(pswindows, "run_ps", _ResponseQueue([
-        _ok(GUID), _ok(HEAD_RES), _capture_leg(payload),
+        _ok(
+            "VMID=" + GUID + "\n"
+            + "HEAD=1024x768" + "\n"
+            + "SIZES=320x240" + "\n"
+            + "USED=320x240" + "\n"
+            + _capture_leg(payload).stdout
+        ),
     ]))
     dest = tmp_path / "frame.png"
 

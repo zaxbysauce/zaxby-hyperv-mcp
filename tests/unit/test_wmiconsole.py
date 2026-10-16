@@ -77,17 +77,64 @@ class PSStub:
 
     def __call__(self, script: str, **kwargs) -> pswindows.PSResult:
         self.scripts.append(script)
-        if "ElementName" in script and "$vmTarget" in script:
+        # The bare $vmTarget EMIT (not resolver presence): issue #18's folded
+        # scripts also mention $vmTarget and must not be served the GUID.
+        if script.rstrip().endswith("$vmTarget"):
             return pswindows.PSResult(stdout=GUID, returncode=0)
         if "GetVirtualSystemThumbnailImage" in script:
             width = re.search(r"WidthPixels\s*=\s*(\d+)", script)
             height = re.search(r"HeightPixels\s*=\s*(\d+)", script)
             w = int(width.group(1)) if width else 640
             h = int(height.group(1)) if height else 480
+            if "$sizes" in script:
+                seed = re.search(r"\$sizes = @\([,(@]*(\d+),(\d+)\)", script)
+                if seed:
+                    w, h = int(seed.group(1)), int(seed.group(2))
             payload = b"\x00\x00\x00\x00" + b"\x5a\xa5" * (w * h)
             encoded = base64.b64encode(payload).decode("ascii")
-            return pswindows.PSResult(stdout=json.dumps(
-                {"returnValue": 0, "imageDataB64": encoded}), returncode=0)
+            body = json.dumps({"returnValue": 0, "imageDataB64": encoded})
+            if "$sizes" in script:
+                # folded capture (issue #18): metadata ahead of the payload
+                return pswindows.PSResult(
+                    stdout="VMID=" + GUID + "\n" + "HEAD=320x240" + "\n"
+                    + "SIZES=" + str(w) + "x" + str(h) + "\n"
+                    + "USED=" + str(w) + "x" + str(h) + "\n" + body,
+                    returncode=0,
+                )
+            return pswindows.PSResult(stdout=body, returncode=0)
+        if "SetAbsolutePosition" in script:
+            # folded positional mouse (issue #18): the script computes the
+            # head-space position itself; the stub mirrors it with the same
+            # 320x240 head the other branches advertise.
+            x = y = fw = fh = 0
+            for line in script.splitlines():
+                ls = line.strip()
+                for name in ("$x", "$y", "$fw", "$fh"):
+                    if ls.startswith(name + " ="):
+                        raw = ls.split("=", 1)[1].strip()
+                        if raw.lstrip("-").isdigit():
+                            val = int(raw)
+                            if name == "$x":
+                                x = val
+                            elif name == "$y":
+                                y = val
+                            elif name == "$fw":
+                                fw = val
+                            else:
+                                fh = val
+            if x or y:
+                if fw or fh:
+                    hx = round(x * 320 / fw) if fw else x
+                    hy = round(y * 240 / fh) if fh else y
+                else:
+                    hx, hy = x, y
+                hx = max(0, min(hx, 319))
+                hy = max(0, min(hy, 239))
+                return pswindows.PSResult(
+                    stdout="HEADX=" + str(hx) + "\n" + "HEADY=" + str(hy)
+                    + "\n" + "RC=0",
+                    returncode=0,
+                )
         if "Msvm_VideoHead" in script:
             return pswindows.PSResult(
                 stdout='{"horizontal": 320, "vertical": 240}', returncode=0)

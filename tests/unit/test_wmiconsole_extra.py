@@ -466,14 +466,22 @@ def test_frozen_acceptance_file_intact():
     Hash updated by issue #14 (trace issue-14-vm-rw-locks): vm_lock gained
     mode=/wait_s= kwargs, so the recording_lock spy in test_wmiconsole.py
     was amended to pass them through (kwargs-only signature change; the
-    test's assertions are untouched)."""
+    test's assertions are untouched).
+
+    Hash updated again by issue #18 (trace 18-console-one-ps-process-per-call):
+    the folded single-process transport resolves the VM INSIDE the op script,
+    so PSStub's resolver predicate moved from "ElementName + $vmTarget present"
+    to the bare $vmTarget EMIT (a folded script mentions $vmTarget and must not
+    be served the GUID), and PSStub gained the folded capture/display/mouse
+    response branches. Assertions untouched; the amendment is the plan-critic
+    -sanctioned refit of the multi-spawn stub protocol."""
     import subprocess
 
     out = subprocess.run(
         ["git", "hash-object", "tests/unit/test_wmiconsole.py"],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
-    assert out == "181f7a4e6a9d4ae9b443ef10f89b84c33c966d02", out
+    assert out == "f4e5d21e57c1489f6ed05284d086b496d51b658c", out
 
 
 def test_capture_guard_no_image_data(monkeypatch, unrestricted_cfg):

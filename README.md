@@ -1017,7 +1017,17 @@ automatically per call:
   used automatically when pywin32 is absent, the WMI namespace cannot be
   reached (including a remote host whose DCOM endpoint is unavailable —
   the WS-Man hop then composes exactly as before), or the target VM is not
-  present in the WMI plane.
+  present in the WMI plane. Each call folds every leg into one script: the
+  prelude binds `$vmTarget` (the fail-closed name resolver embedded for
+  by-name callers, the validated GUID preamble for by-id callers), and the
+  script then looks up the devices/head and runs the operation. Chunked
+  keyboard input keeps its chunks and pacing inside that process (typed text
+  rides stdin as base64 lines), the screenshot fallback chain loops its
+  de-duplicated size list inside it, and the mouse is selected with a
+  `SystemName` key filter — with an `Msvm_Ps2Mouse` fallback for button,
+  scroll and click-at-current-position on VMs that expose no synthetic mouse
+  (positional ops report the structured error: absolute positioning has no
+  PS/2 equivalent).
 
 Fallback happens only at connect/selection time: a WMI **method** failure
 (non-zero `ReturnValue`, bad payload, raw COM failure) — or a backend
@@ -1025,8 +1035,11 @@ unavailability raised mid-operation — is a structured error and is never
 retried through PowerShell, so console input can never double-send. Every
 SUCCESSFUL result carries a per-call `timings` breakdown (failure
 envelopes carry the standard error shape without timings):
-`{"transport": "powershell", "spawn_ms": [12.5, 380.1]}` (one float per
-`powershell.exe` spawn, the identity-resolution leg included) or
+`{"transport": "powershell", "spawn_ms": [402.6]}` (one float per
+`powershell.exe` spawn — since issue #18 each call is ONE process whose script
+resolves the VM, looks up the devices/head and runs the operation; a call
+addressed by `vm_id` keeps a separate resolution leg first, because policy must
+run on the GUID's resolved name before any guest mutation) or
 `{"transport": "wmi", "connect_ms": 0.0, "rebind_ms": 0.8,
 "method_ms": 31.2}`. On the WMI path `connect_ms` is the measured
 backend lookup (near-zero on a warm cache — one real DCOM connect per host

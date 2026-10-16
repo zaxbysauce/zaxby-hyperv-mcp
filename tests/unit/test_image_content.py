@@ -38,12 +38,15 @@ def fresh_server():
 
 def _mock_capture(monkeypatch, w, h):
     payload = _raw_thumbnail(w, h)
-    head_res = '{"horizontal": 1024, "vertical": 768}'
+    # One folded process: VMID/HEAD/SIZES/USED metadata ahead of the payload.
     responses = [
-        pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),  # guid
-        pswindows.PSResult(stdout=head_res, returncode=0),  # head resolution
         pswindows.PSResult(
-            stdout=persona_json(payload), returncode=0),  # capture
+            stdout="VMID=e953c649-dcab-438d-9a54-3af74a82b624" + "\n" +
+                   "HEAD=1024x768" + "\n" +
+                   "SIZES=" + str(w) + "x" + str(h) + "\n" +
+                   "USED=" + str(w) + "x" + str(h) + "\n" +
+                   persona_json(payload),
+            returncode=0),
     ]
     fake = FakeCapture(responses)
     monkeypatch.setattr(pswindows, "run_ps", fake)
@@ -108,9 +111,7 @@ def test_wait_frame_change_changed_returns_image_content(monkeypatch, fresh_serv
         ),
         returncode=0,
     )])
-    # first run_ps call is the guid resolution
-    fake.responses.insert(0, pswindows.PSResult(
-        stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0))
+    # one folded poll-loop process (the GUID rides inside it)
     monkeypatch.setattr(pswindows, "run_ps", fake)
     mcp = fresh_server.get_mcp()
     result = asyncio.run(mcp.call_tool(
@@ -129,7 +130,6 @@ def test_deadline_wait_returns_no_image_block(monkeypatch, fresh_server):
     import asyncio
 
     fake = FakeCapture([
-        pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
         pswindows.PSResult(stdout="STOP=deadline POLLS=10 HASH=abc", returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
