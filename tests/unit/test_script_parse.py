@@ -8,11 +8,12 @@ which reports syntax errors WITHOUT executing anything — no Hyper-V, no VM
 side effects.
 """
 
+import base64
 import json
 
 import pytest
 
-from hyperv_mcp import console, filetransfer, guestexec, lifecycle, media, pswindows
+from hyperv_mcp import console, filetransfer, guestexec, lifecycle, media, pswindows, vmident
 from hyperv_mcp.config import Config
 from hyperv_mcp.credentials import CredentialSet
 
@@ -291,7 +292,9 @@ def test_parse_console_capture(monkeypatch, parsed_ps):
     rec = Recorder()
     monkeypatch.setattr(pswindows, "run_ps", rec)
     try:
-        console._capture_raw(UNRESTRICTED, "guid-1", 640, 480)
+        # the real by-name resolver prelude, not a placeholder: the parse lane
+        # must validate the text production actually prepends to this script
+        console._capture_raw(UNRESTRICTED, vmident.resolver_prelude("vm1"), 640, 480)
     except Exception:
         pass
     assert rec.scripts, "capture produced no script"
@@ -306,11 +309,44 @@ def test_parse_console_capture_all_fallback_sizes(monkeypatch, parsed_ps):
         rec = Recorder()
         monkeypatch.setattr(pswindows, "run_ps", rec)
         try:
-            console._capture_raw(UNRESTRICTED, "guid-1", w, h)
+            console._capture_raw(UNRESTRICTED, vmident.resolver_prelude("vm1"), w, h)
         except Exception:
             pass
         for script in rec.scripts:
             assert _parse_errors(script) == []
+
+
+def test_parse_console_screenshot_folded_chain(monkeypatch, parsed_ps):
+    """The folded screenshot template — the in-script size chain, the largest
+    console script — must parse. The parse lane only ever drove _capture_raw
+    (a single-size capture), so console.screenshot's chain loop had zero
+    PS-parse coverage."""
+    class _FoldedScreenshot:
+        def __init__(self):
+            self.scripts: list[str] = []
+
+        def __call__(self, script, **kwargs):
+            self.scripts.append(script)
+            raw = b"\x00" * (640 * 480 * 2 + 4)
+            body = json.dumps({
+                "returnValue": 0,
+                "imageDataB64": base64.b64encode(raw).decode(),
+            })
+            return pswindows.PSResult(
+                stdout="VMID=" + VM_GUID + "\nHEAD=1024x768\nSIZES=640x480\n"
+                       "USED=640x480\n" + body,
+                returncode=0,
+            )
+
+    stub = _FoldedScreenshot()
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    console.screenshot(UNRESTRICTED, "vm1", 640, 480)
+    assert stub.scripts, "screenshot produced no script"
+    assert any("$sizes" in s for s in stub.scripts), (
+        "the folded screenshot's size chain was never generated"
+    )
+    for script in stub.scripts:
+        assert _parse_errors(script) == []
 
 
 def test_parse_console_keyboard_type_text(monkeypatch, parsed_ps):

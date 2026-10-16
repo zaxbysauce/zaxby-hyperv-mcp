@@ -426,11 +426,23 @@ def test_mouse_ops_reject_non_positive_frame_dims(unrestricted, fw, fh):
         console.click(unrestricted, "vm1", 10, 10, frame_width=fw, frame_height=fh)
 
 
-def test_mouse_ops_accept_zero_frame_dims_as_head_space(unrestricted):
-    """frame dims of 0/0 mean 'coordinates are head space' — not an error."""
-    # no spawn happens for these (policy passes, then the op runs against the
-    # transport); the point is that 0/0 is NOT rejected by the positivity gate
-    assert console._scale_to_head(10, 10, 0, 0, (1024, 768)) == (10, 10)
+def test_mouse_ops_accept_zero_frame_dims_as_head_space(monkeypatch, unrestricted):
+    """frame dims of 0/0 mean 'coordinates are head space' — not an error. The
+    op must reach the transport (not raise at the positivity gate) and take the
+    in-script head-space branch: the emitted script declares $fw = 0/$fh = 0
+    and the reported position is the coordinate itself (head-clamped)."""
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = console.mouse_move(unrestricted, "vm1", 500, 300)
+    assert out["head_x"] == 500 and out["head_y"] == 300
+    script = fake.scripts[-1]
+    assert "$fw = 0" in script and "$fh = 0" in script, (
+        "the emitted script must take the head-space branch for 0/0 frame dims"
+    )
+    assert "SetAbsolutePosition" in script
+    out = console.click(unrestricted, "vm1", 500, 300)
+    assert out["head_x"] == 500 and out["head_y"] == 300
+    assert "$fw = 0" in fake.scripts[-1]
 
 
 def test_mouse_move_head_missing_is_structured_error(monkeypatch, unrestricted):

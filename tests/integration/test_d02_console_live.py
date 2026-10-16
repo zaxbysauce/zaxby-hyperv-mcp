@@ -1,5 +1,6 @@
 """Real-Hyper-V integration tests for issue #18 (Workstream D PR 2): every
-console call starts ONE PowerShell process, and the mouse lookup is
+console call starts ONE PowerShell process (capture_sequence is the one
+exception — it runs one folded process per frame), and the mouse lookup is
 SystemName-scoped.
 
 Opt-in like every file here (see tests/integration/conftest.py): the suite
@@ -19,7 +20,7 @@ import pytest
 
 pytestmark = [pytest.mark.hyperv_real]
 
-from hyperv_mcp import console, pswindows, wmiconsole  # noqa: E402
+from hyperv_mcp import console, guestexec, pswindows, wmiconsole  # noqa: E402
 from hyperv_mcp.config import Config  # noqa: E402
 
 
@@ -92,13 +93,35 @@ def test_console_ops_single_spawn_live(it, ps_transport):
     )
 
 
+def _gen1_vm_or_skip(cfg, name):
+    """Resolve the named Gen1 VM or SKIP: a stale name must skip this file
+    rather than fail it, and a VM that is not Generation 1 cannot exercise the
+    PS/2 fallback (it would expose a synthetic mouse)."""
+    try:
+        ref = console.vmident.resolve(cfg, name)
+    except Exception as exc:  # noqa: BLE001 - any resolution failure is a skip
+        pytest.skip(f"HYPERV_MCP_TEST_VM_GEN1 names '{name}', which does not resolve: {exc}")
+    script = (
+        guestexec.vm_target_preamble(ref.id)
+        + "\n(Get-VM -Id $vmTarget -ErrorAction Stop).Generation.ToString()\n"
+    )
+    result = pswindows.run_ps(script, timeout_s=60)
+    generation = result.stdout.strip()
+    if result.returncode != 0 or not generation.isdigit():
+        pytest.skip(f"cannot read the generation of '{name}': {result.stderr[:120]}")
+    if generation != "1":
+        pytest.skip(f"'{name}' is Generation {generation}, not 1")
+    return ref
+
+
 def test_ps2_mouse_fallback_live(it, ps_transport):
     """AC14: a VM whose WMI model exposes no Msvm_SyntheticMouse but has an
     Msvm_Ps2Mouse (Gen1 without integration services) serves button, scroll and
     click-at-current-position through the PS/2 device, while positional calls
     report the structured error instead of acting.
 
-    Selected by HYPERV_MCP_TEST_VM_GEN1; skipped when it names no VM."""
+    Selected by HYPERV_MCP_TEST_VM_GEN1; skipped when it names no VM, names a VM
+    that does not resolve, or names a VM that is not Generation 1."""
     import os
 
     gen1 = os.environ.get("HYPERV_MCP_TEST_VM_GEN1", "").strip()
@@ -107,6 +130,7 @@ def test_ps2_mouse_fallback_live(it, ps_transport):
 
     cfg = _cfg()
     pswindows.init(cfg)
+    ref = _gen1_vm_or_skip(cfg, gen1)
 
     before = ps_transport.count
     out = console.mouse_button(cfg, gen1, 1, True)
@@ -129,3 +153,17 @@ def test_ps2_mouse_fallback_live(it, ps_transport):
         console.mouse_move(cfg, gen1, 10, 10)
     with pytest.raises(console.ConsoleError, match="no synthetic mouse"):
         console.click(cfg, gen1, 10, 10)
+
+    # the PS/2 fallback's SystemName filter is valid WQL on this build and
+    # returns exactly one device for the VM (the Gen2 test's synthetic-mouse
+    # assertion, for the fallback device)
+    result = pswindows.run_ps(
+        "$m = Get-CimInstance -Namespace 'root\\virtualization\\v2' "
+        "-ClassName Msvm_Ps2Mouse -Filter \"SystemName='" + ref.id + "'\"\n"
+        "@($m).Count\n",
+        timeout_s=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1", (
+        f"SystemName filter returned {result.stdout.strip()!r} PS/2 devices"
+    )
