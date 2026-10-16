@@ -19,15 +19,19 @@ resolution, the device/head lookups and the operation into ONE script per
 call. The prelude binds ``$vmTarget`` — the PR #4 resolver embedded for
 by-name callers, the validated GUID preamble for by-id callers — and the
 script emits its metadata (``VMID=``, ``HEAD=``, ``SIZES=``/``USED=``,
-``HEADX=``/``HEADY=``) as KEY=value stdout lines ahead of the payload JSON.
-Chunked keyboard input loops inside the script (typed text rides stdin as
-base64 lines; scancodes ride in the script), the screenshot fallback chain
-loops its de-duplicated size list in the script, and the mouse lookup is
-scoped to the VM with a ``SystemName`` key filter with an ``Msvm_Ps2Mouse``
-fallback for non-positional operations. A by-id call resolves host-side
-first, because policy must run on the GUID's resolved name before any guest
-mutation — so by-id starts two processes (resolve + folded op) and by-name
-starts exactly one.
+``ATTEMPTED=``, ``HEADX=``/``HEADY=``, ``RC=``/``CHUNK=``,
+``STOP=``/``POLLS=``/``HASH=``, ``FRAME=``) as KEY=value stdout lines ahead
+of the payload JSON. Chunked keyboard input loops inside the script (typed
+text rides stdin as base64 lines; scancodes ride in the script), the
+screenshot fallback chain loops its de-duplicated size list in the script,
+and the mouse lookup is scoped to the VM with a ``SystemName`` key filter
+with an ``Msvm_Ps2Mouse`` fallback for non-positional operations. A by-id
+call resolves host-side first, because policy must run on the GUID's
+resolved name before any guest mutation — so by-id starts two processes
+(resolve + folded op) and by-name starts exactly one. The one exception is
+``capture_sequence``: it has no payload to carry between frames, so each
+frame is its own self-contained folded process (``count`` processes by
+name, ``count + 1`` by id).
 
 All operations target root\\virtualization\\v2 WMI objects — independent of
 VMConnect windows, the host foreground window, guest login, and guest
@@ -94,8 +98,18 @@ _WMI_NS = "root\\virtualization\\v2"
 def _input_lock(ref: vmident.VMRef) -> Iterator[None]:
     """Console input lock scope (issue #14): READ on the VM key so guest
     work proceeds during typing, plus WRITE on the second (vm, "console")
-    key so two agents can never interleave keystrokes. VM key is always
+    key so two agents cannot interleave keystrokes. VM key is always
     outermost — no other site takes the console key, so no ordering cycle.
+
+    Both keys are derived from ``ref.id``, which is the resolved GUID on the
+    WMI transport and on the by-id PowerShell path — but the caller-supplied
+    NAME on the by-name PowerShell path, where issue #18's fold resolves the
+    VM inside the op script and the GUID is not known host-side before the
+    spawn. Exclusion therefore holds between calls that address the VM the
+    same way; it does NOT span name-vs-GUID addressing, nor a by-name console
+    call against a write-scope op (which always resolves first and keys on
+    the GUID). That residual is disclosed in vmident and tracked in issue
+    #77.
     """
     with vmlocks.vm_lock(ref.id, mode="read"), vmlocks.vm_lock((ref.id, "console")):
         yield
@@ -219,6 +233,15 @@ _KEYBOARD_LOOKUP = (
     "if (-not $kb) { throw 'no keyboard device associated with the VM' }\n"
 )
 
+# The OBSERVING variant (get_display_info): absence is data, not an error — the
+# base script and the WMI transport both report keyboard_present=false, and a
+# stopped VM (which is exactly what this tool inspects) carries no keyboard
+# association, so the throwing input-op guard must not be folded in here.
+_KEYBOARD_LOOKUP_SOFT = (
+    "$kb = Get-CimAssociatedInstance -InputObject $vm -ResultClassName Msvm_Keyboard "
+    "| Select-Object -First 1\n"
+)
+
 # The synthetic mouse is selected with a SystemName key filter (FND-16): the
 # per-device association scan this replaces was O(#mice on host) WMI calls.
 _MOUSE_SYNTHETIC = (
@@ -281,8 +304,15 @@ def _folded_mouse_positional_script(
         "absolute positioning is unavailable (the PS/2 fallback supports button, "
         "scroll and click-at-current-position only)' }",
         _HEAD_LOOKUP,
-        "if (-not $vh) { throw 'display head resolution unavailable: pass "
-        "frame_width/frame_height equal to the display resolution to skip scaling' }",
+        # The guard rejects a head that reports no resolution as well as a head
+        # that is absent: wmiconsole.head_resolution, _scale_to_head and
+        # _parse_head all treat a zero-resolution head as unavailable, and the
+        # in-script clamp would otherwise collapse a 0/null resolution to (0,0)
+        # and position at the origin instead of erroring.
+        "if ((-not $vh) -or (-not $vh.CurrentHorizontalResolution) "
+        "-or (-not $vh.CurrentVerticalResolution)) { throw 'display head "
+        "resolution unavailable: pass frame_width/frame_height equal to the "
+        "display resolution to skip scaling' }",
         _SCALE_TO_HEAD
         .replace("%X", str(x)).replace("%Y", str(y))
         .replace("%FW", str(frame_w)).replace("%FH", str(frame_h)),
@@ -502,9 +532,14 @@ def _parse_size(meta: dict[str, str], key: str) -> tuple[int, int] | None:
         return None
     try:
         w, h = raw.split("x", 1)
-        return int(w), int(h)
+        wi, hi = int(w), int(h)
     except ValueError:
         return None
+    # A zero or negative dimension is as unusable as a malformed one: it would
+    # decode a 0-byte (or negative-length) frame and mis-name the length
+    # expectation, so the caller falls back exactly as it does when the line is
+    # absent (the payload-length check then reports the real mismatch).
+    return (wi, hi) if wi > 0 and hi > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -886,7 +921,8 @@ def screenshot(
     expected = actual_w * actual_h * 2 + _PREFIX_LEN
     if len(raw) != expected:
         raise ConsoleError(
-            f"thumbnail payload length mismatch: got {len(raw)}, expected {expected}"
+            f"thumbnail payload length mismatch: got {len(raw)}, expected {expected} "
+            f"for the {actual_w}x{actual_h} frame"
         )
     fallback_used = ""
     if used != (width, height):
@@ -1022,7 +1058,7 @@ def get_display_info(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
         prelude,
         _VM_LOOKUP,
         _HEAD_LOOKUP,
-        _KEYBOARD_LOOKUP,
+        _KEYBOARD_LOOKUP_SOFT,
         _MOUSE_SYNTHETIC,
         "$mouse = $m | Select-Object -First 1\n",
         "Write-Output ('VMID=' + $vmTarget)\n",
