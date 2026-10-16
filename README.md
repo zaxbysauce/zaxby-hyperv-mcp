@@ -582,7 +582,13 @@ the caller can see what holds the VM and for how long. Waiting writers are
 admitted before newly arriving readers, so polling reads cannot starve a
 checkpoint restore. Console input runs under a read lock on the VM key
 (guest work proceeds during typing) plus a write lock on a second per-VM
-key, so two agents cannot interleave keystrokes.
+key, so two agents cannot interleave keystrokes. One residual on the
+by-name PowerShell transport (issue #18): the folded op script resolves the
+VM inside the process, so a by-name console call keys its locks on the
+caller-supplied name rather than the resolved GUID — exclusion holds
+between calls that address the VM the same way, but not across
+name-vs-`vm_id` addressing, nor against a write-scope op, which always
+resolves first and keys on the GUID (tracked in issue #77).
 
 Host PowerShell itself is bounded host-wide (issue #15): every tool leg,
 relay request, and every server process that shares the slot directory
@@ -674,7 +680,11 @@ detailed contract is documented under "Behavior changes" below.
 Every tool that takes `vm_name` also takes an optional `vm_id` (the VM's CIM
 GUID); at least one of `vm_name`/`vm_id` is required (both may be given when
 they refer to the same VM). VMs are resolved by GUID end to
-end: operations lock on the resolved GUID (stable across renames),
+end: operations lock on the resolved GUID (stable across renames;
+the one exception is a by-name console call on the PowerShell
+transport, which locks on the caller-supplied name because issue #18's
+fold resolves the VM inside the op script — see the concurrency note
+above),
 `hyperv_list_vms` and `hyperv_get_vm_info` report each VM's `id`, and a name
 that matches more than one VM fails closed with an error listing every
 candidate as `name=guid` so the call can be retried with `vm_id`. When both
@@ -1039,7 +1049,9 @@ envelopes carry the standard error shape without timings):
 `powershell.exe` spawn — since issue #18 each call is ONE process whose script
 resolves the VM, looks up the devices/head and runs the operation; a call
 addressed by `vm_id` keeps a separate resolution leg first, because policy must
-run on the GUID's resolved name before any guest mutation) or
+run on the GUID's resolved name before any guest mutation. `capture_sequence`
+is the exception: it carries no payload between frames, so each frame is its
+own folded process — `count` floats by name, `count + 1` by `vm_id`) or
 `{"transport": "wmi", "connect_ms": 0.0, "rebind_ms": 0.8,
 "method_ms": 31.2}`. On the WMI path `connect_ms` is the measured
 backend lookup (near-zero on a warm cache — one real DCOM connect per host
