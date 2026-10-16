@@ -30,6 +30,7 @@ import pytest
 
 from hyperv_mcp import console, pswindows
 from hyperv_mcp.config import Config
+from hyperv_mcp.console import ConsoleError
 
 GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
 
@@ -131,12 +132,60 @@ def test_click_with_coordinates_emits_head_position(monkeypatch, unrestricted_cf
 def test_non_positional_mouse_script_emits_rc_and_fallback(monkeypatch, unrestricted_cfg):
     script = _script_for(monkeypatch, lambda: console.mouse_button(unrestricted_cfg, "vm1", 1, True))
     assert "Write-Output ('RC=' + $r.ReturnValue)" in script, "no RC= emission"
-    assert "Msvm_Ps2Mouse" in script, "no PS/2 fallback branch"
+    assert "ClassName Msvm_Ps2Mouse " in script, "no PS/2 fallback branch"
     assert "SystemName='$vmTarget'" in script, "the fallback is not scoped to this VM"
     # the message covers BOTH device classes now that PS/2 is tried: pin the
     # generic text the renamed branch emits (the synthetic-specific wording
     # survives only in the positional script, which has no PS/2 equivalent)
     assert "throw 'no mouse device associated with the VM'" in script
+
+
+def test_positional_mouse_head_guard_rejects_a_zero_resolution(monkeypatch, unrestricted_cfg):
+    """PRR-003's fix: the guard must reject a head that REPORTS no resolution,
+    not only an absent head object — a 0/null resolution would clamp to (0,0)
+    and position at the origin, where wmiconsole.head_resolution, _scale_to_head
+    and _parse_head all treat that state as unavailable."""
+    script = _script_for(monkeypatch, lambda: console.mouse_move(unrestricted_cfg, "vm1", 10, 10))
+    guard = "display head resolution unavailable"
+    assert guard in script
+    # pin the GUARD's own resolution tests (not the scaling block's reads of the
+    # same properties, which a bare property-name substring would also match)
+    assert "(-not $vh.CurrentHorizontalResolution)" in script, (
+        "the head guard tests object truthiness only; a zero-resolution head "
+        "would scale to (0,0) and click the origin"
+    )
+    assert "(-not $vh.CurrentVerticalResolution)" in script
+    assert script.index("(-not $vh.CurrentHorizontalResolution)") < script.index("SetAbsolutePosition"), (
+        "the resolution guard must precede any positioning call"
+    )
+
+
+# ---------------------------------------------------------------------------
+# USED= parsing (PRR-030's fix): a non-positive dimension is as unusable as a
+# malformed one, and the length message must name the frame it was computed from
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw", ["", "0x0", "-5x10", "abc", "10x", "x10", "10xabc"])
+def test_parse_size_rejects_unusable_dimensions(raw):
+    assert console._parse_size({"USED": raw}, "USED") is None, f"USED={raw!r} must parse as absent"
+    assert console._parse_size({}, "USED") is None
+
+
+def test_screenshot_length_message_names_the_frame(monkeypatch, unrestricted_cfg):
+    """A wrong-length payload's error must name the frame size the expectation
+    was computed from, so a caller can tell which size the payload came from."""
+    w, h = 1024, 768
+    payload = b"\x00" * (640 * 480 * 2 + 4)  # a 640x480 payload under a 1024x768 USED
+    body = json.dumps({"returnValue": 0, "imageDataB64": base64.b64encode(payload).decode()})
+    fake = pswindows.PSResult(
+        stdout="VMID=" + GUID + "\nHEAD=1024x768\nSIZES=" + str(w) + "x" + str(h)
+               + "\nUSED=" + str(w) + "x" + str(h) + "\n" + body,
+        returncode=0,
+    )
+    monkeypatch.setattr(pswindows, "run_ps", lambda *a, **k: fake)
+    with pytest.raises(ConsoleError) as excinfo:
+        console.screenshot(unrestricted_cfg, "vm1")
+    assert "for the 1024x768 frame" in str(excinfo.value)
 
 
 def test_positional_mouse_script_names_the_missing_synthetic_mouse(monkeypatch, unrestricted_cfg):
@@ -314,15 +363,18 @@ def _executed_scale(script: str, head: tuple[int, int]) -> tuple[int, int]:
     return int(m.group(1)), int(m.group(2))
 
 
-# (x, y, frame_w, frame_h) cases: identity, downscale, upscale, banker's-rounding
-# parity (1.5 and 2.5 both round half-to-even in Python and [math]::Round), and
-# an out-of-frame clamp.
+# (x, y, frame_w, frame_h) cases against the fixed (1024, 768) head: identity,
+# downscale, upscale, the two banker's-rounding MIDPOINTS that discriminate
+# (0.5 and 2.5 both round DOWN to even in Python's round() and in
+# [math]::Round's default ToEven, while [MidpointRounding]::AwayFromZero would
+# round them up — 1.5 is deliberately absent: it rounds to 2 either way), and an
+# out-of-frame clamp.
 _SCALE_CASES = [
     (100, 50, 1024, 768),
     (320, 240, 640, 480),
     (160, 120, 320, 240),
-    (3, 5, 10, 10),
-    (5, 5, 10, 10),
+    (1, 1, 2048, 1536),     # 0.5 midpoint -> 0
+    (5, 5, 2048, 1536),     # 2.5 midpoint -> 2
     (9999, 9999, 640, 480),
 ]
 
@@ -338,6 +390,23 @@ def test_emitted_scaling_matches_the_python_reference(monkeypatch, unrestricted_
         lambda: console.mouse_move(unrestricted_cfg, "vm1", x, y, frame_width=fw, frame_height=fh),
     )
     assert _executed_scale(script, head) == console._scale_to_head(x, y, fw, fh, head)
+
+
+def test_emitted_scaling_midpoints_round_to_even(monkeypatch, unrestricted_cfg):
+    """The two discriminating midpoints must round to EVEN, not away from zero:
+    a [MidpointRounding]::AwayFromZero regression would return 1 and 3 here.
+    Both the reference and the emitted arithmetic are checked, so the case
+    fails if either side changes rounding mode."""
+    head = (1024, 768)
+    assert console._scale_to_head(1, 1, 2048, 1536, head) == (0, 0)
+    assert console._scale_to_head(5, 5, 2048, 1536, head) == (2, 2)
+    script = _script_for(
+        monkeypatch,
+        lambda: console.mouse_move(unrestricted_cfg, "vm1", 5, 5, frame_width=2048, frame_height=1536),
+    )
+    assert _executed_scale(script, head) == (2, 2), (
+        "the emitted arithmetic must round the 2.5 midpoint to even (2), not away from zero (3)"
+    )
 
 
 def test_emitted_scaling_head_space_branch_matches_reference(monkeypatch, unrestricted_cfg):
