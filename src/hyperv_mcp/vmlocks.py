@@ -34,7 +34,13 @@ namespaces, so no client-supplied name can alias a tuple key. vm_create
 locks on the not-yet-existing VM's name, which the duplicate-name guard
 keeps unique. Console input takes READ on the VM key plus a WRITE on the
 second key `(vm_id, "console")` so two agents cannot interleave
-keystrokes while guest work on the VM key proceeds. Known residual: between `New-VM`
+keystrokes while guest work on the VM key proceeds — with one residual on
+the by-name PowerShell transport, where issue #18's fold resolves the VM
+inside the op script and the console key is therefore the caller-supplied
+name: exclusion holds between calls that address the VM the same way, but
+not across name-vs-GUID addressing, nor against a write-scope op (which
+always resolves first and keys on the GUID). That residual is disclosed in
+vmident and tracked in issue #77. Known residual: between `New-VM`
 committing inside vm_create's script and that script finishing, the new
 VM is GUID-resolvable while the create still holds only the name key, so
 a concurrent GUID-keyed operation can overlap the (sub-second,

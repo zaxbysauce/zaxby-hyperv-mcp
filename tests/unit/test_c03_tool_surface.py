@@ -181,9 +181,13 @@ def test_ac11_screenshot_returns_image_content(monkeypatch, fresh_server):
     )
     fake = FakeScriptedPS(
         [
-            PSResult(stdout=GUID, returncode=0),  # guid resolution
-            PSResult(stdout='{"horizontal": 1024, "vertical": 768}', returncode=0),
-            PSResult(stdout=persona, returncode=0),  # capture
+            # one folded capture (issue #18): metadata ahead of the payload
+            PSResult(
+                stdout="VMID=" + GUID + "\n"
+                + "HEAD=1024x768" + "\n" + "SIZES=320x240" + "\n"
+                + "USED=320x240" + "\n" + persona,
+                returncode=0,
+            ),
         ]
     )
     monkeypatch.setattr(pswindows, "run_ps", fake)

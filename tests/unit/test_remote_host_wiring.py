@@ -46,13 +46,20 @@ class FakePS:
             item = self.responses.pop(0)
         elif "GetVirtualSystemThumbnailImage" in script:
             payload = b"\x00\x00\x00\x00" + b"\x00\x00" * (640 * 480)
-            item = pswindows.PSResult(
-                stdout=json.dumps({
-                    "returnValue": 0,
-                    "imageDataB64": base64.b64encode(payload).decode(),
-                }),
-                returncode=0,
-            )
+            body = json.dumps({
+                "returnValue": 0,
+                "imageDataB64": base64.b64encode(payload).decode(),
+            })
+            if "$sizes" in script:
+                # folded capture (issue #18): metadata ahead of the payload
+                item = pswindows.PSResult(
+                    stdout="VMID=e953c649-dcab-438d-9a54-3af74a82b624" + "\n"
+                           + "HEAD=1024x768" + "\n" + "SIZES=640x480" + "\n"
+                           + "USED=640x480" + "\n" + body,
+                    returncode=0,
+                )
+            else:
+                item = pswindows.PSResult(stdout=body, returncode=0)
         elif "Msvm_VideoHead" in script:
             item = pswindows.PSResult(
                 stdout='{"horizontal": 1024, "vertical": 768}', returncode=0)

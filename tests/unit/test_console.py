@@ -2,6 +2,7 @@
 
 import base64
 import json
+import re
 
 import pytest
 
@@ -15,10 +16,68 @@ from hyperv_mcp.console import (
 )
 from hyperv_mcp.policy import PolicyDenied
 
+GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
+
+
+def _folded_size(script: str) -> tuple[int, int]:
+    """The requested size of a folded capture script (its $sizes seed)."""
+    w = h = 0
+    for line in script.splitlines():
+        ls = line.strip()
+        if ls.startswith("WidthPixels"):
+            raw = ls.split("=", 1)[1].strip()
+            if raw.isdigit():
+                w = int(raw)
+        elif ls.startswith("HeightPixels"):
+            raw = ls.split("=", 1)[1].strip()
+            if raw.isdigit():
+                h = int(raw)
+    if not (w and h):
+        m = re.search(r"\$sizes = @\([,(@]*(\d+),(\d+)\)", script)
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+    return w, h
+
+
+def _folded_position(script: str) -> tuple[int, int] | None:
+    """The head-space position a folded positional-mouse script computes (the
+    in-script replica of console._scale_to_head)."""
+    x = y = fw = fh = 0
+    for line in script.splitlines():
+        ls = line.strip()
+        for name in ("$x", "$y", "$fw", "$fh"):
+            if ls.startswith(name + " ="):
+                raw = ls.split("=", 1)[1].strip()
+                if raw.lstrip("-").isdigit():
+                    val = int(raw)
+                    if name == "$x":
+                        x = val
+                    elif name == "$y":
+                        y = val
+                    elif name == "$fw":
+                        fw = val
+                    else:
+                        fh = val
+    if x == 0 and y == 0:
+        return None
+    head = (1024, 768)
+    if fw or fh:
+        hx = round(x * head[0] / fw) if fw else x
+        hy = round(y * head[1] / fh) if fh else y
+    else:
+        hx, hy = x, y
+    return max(0, min(hx, head[0] - 1)), max(0, min(hy, head[1] - 1))
+
 
 class FakePS:
     """Adaptive stub: serves queued responses first, then sane defaults keyed
-    by the script's purpose (guid lookup, capture, head res, success call)."""
+    by the script's purpose (guid lookup, capture, head res, success call).
+
+    Issue #18 folded every leg into one script, so the defaults answer the
+    folded protocol too: a folded capture emits VMID/HEAD/SIZES/USED ahead of
+    the payload JSON, a folded display-info emits VMID ahead of the snake_case
+    JSON, and a folded positional-mouse op emits HEADX/HEADY.
+    """
 
     def __init__(self, responses=()):
         self.scripts = []
@@ -34,19 +93,38 @@ class FakePS:
             # Discriminating on the bare $vmTarget EMIT (not just resolver
             # presence): resolver-only scripts assign silently and must NOT
             # yield the GUID, matching the real stdout contract.
-            item = pswindows.PSResult(
-                stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0)
+            item = pswindows.PSResult(stdout=GUID, returncode=0)
         elif "GetVirtualSystemThumbnailImage" in script:
-            w, h = 640, 480
-            if "WidthPixels  = 320" in script or "WidthPixels = 320" in script:
-                w, h = 320, 240
+            w, h = _folded_size(script)
             payload = b"\x00\x00\x00\x00" + b"\x00\x00" * (w * h)
-            item = pswindows.PSResult(
-                stdout=json.dumps({
-                    "returnValue": 0,
-                    "imageDataB64": base64.b64encode(payload).decode(),
-                }),
-                returncode=0)
+            body = json.dumps({
+                "returnValue": 0,
+                "imageDataB64": base64.b64encode(payload).decode(),
+            })
+            if "$sizes" in script:
+                # folded screenshot: metadata lines ahead of the payload JSON
+                item = pswindows.PSResult(
+                    stdout="VMID=" + GUID + "\nHEAD=1024x768\nSIZES="
+                           + str(w) + "x" + str(h) + "\nUSED=" + str(w) + "x"
+                           + str(h) + "\n" + body,
+                    returncode=0)
+            else:
+                item = pswindows.PSResult(stdout=body, returncode=0)
+        elif "EnabledState" in script:
+            body = json.dumps({
+                "enabled_state": 2, "head_horizontal": 1024, "head_vertical": 768,
+                "keyboard_present": True, "keyboard_enabled": 2,
+                "mouse_present": True, "mouse_enabled": 2,
+            })
+            item = pswindows.PSResult(stdout="VMID=" + GUID + "\n" + body, returncode=0)
+        elif "SetAbsolutePosition" in script:
+            pos = _folded_position(script)
+            lines = []
+            if pos is not None:
+                lines.append("HEADX=" + str(pos[0]))
+                lines.append("HEADY=" + str(pos[1]))
+            lines.append("RC=0")
+            item = pswindows.PSResult(stdout="\n".join(lines), returncode=0)
         elif "Msvm_VideoHead" in script:
             item = pswindows.PSResult(
                 stdout='{"horizontal": 1024, "vertical": 768}', returncode=0)
@@ -261,10 +339,15 @@ def test_type_text_chunks_long_input(monkeypatch, unrestricted):
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = console.type_text(unrestricted, "vm1", text)
     assert out["chunks"] == 3 and out["chars"] == 1200
-    stdin_lens = [len(kw["stdin_b64"]) for kw in fake.kwargs if "stdin_b64" in kw]
-    assert len(stdin_lens) == 3
+    # one folded process carries every chunk as one base64 stdin line
+    stdin_payloads = [kw["stdin_b64"] for kw in fake.kwargs if "stdin_b64" in kw]
+    assert len(stdin_payloads) == 1
+    lines = [ln for ln in stdin_payloads[0].split("\n") if ln.strip()]
+    assert len(lines) == 3
     # base64 inflates 512 chars to ~684 chars; bound accordingly
-    assert all(n <= 700 for n in stdin_lens)
+    assert all(len(ln) <= 700 for ln in lines)
+    assert base64.b64decode(lines[0]).decode() == "a" * 512
+    assert text not in fake.scripts[-1]
 
 
 def test_type_text_empty_rejected(unrestricted):
@@ -304,7 +387,12 @@ def test_press_key_sends_make_break_via_keyboard_association(monkeypatch, unrest
     script = fake.scripts[-1]
     assert "Msvm_Keyboard" in script
     assert "TypeScancodes" in script
-    assert "[byte[]](28,156)" in script
+    # the make/break pair rides the in-script code array; the loop slices its
+    # 64-code window per chunk (a nested array-of-arrays flattens in PS 5.1
+    # for a single chunk and would send one byte)
+    assert "$chunks = @(28,156)" in script
+    assert "[byte[]]$chunks[$lo..$hi]" in script
+    assert "[Console]::In.ReadLine()" not in script
 
 
 # ---------------------------------------------------------------------------
@@ -312,20 +400,79 @@ def test_press_key_sends_make_break_via_keyboard_association(monkeypatch, unrest
 # ---------------------------------------------------------------------------
 
 def test_nonzero_wmi_returnvalue_maps_to_error(monkeypatch, unrestricted):
-    fake = FakePS([pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
-        pswindows.PSResult(returncode=1, stderr="TypeScancodes failed with ReturnValue=5")])
+    fake = FakePS([pswindows.PSResult(
+        returncode=1, stderr="TypeScancodes failed with ReturnValue=5")])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     with pytest.raises(ConsoleError, match="ReturnValue=5"):
         console.press_key(unrestricted, "vm1", "enter")
 
 
 def test_missing_mouse_device_is_structured_error(monkeypatch, unrestricted):
-    fake = FakePS([pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
-        pswindows.PSResult(stdout='{"horizontal": 1024, "vertical": 768}', returncode=0),
-        pswindows.PSResult(returncode=1, stderr="no synthetic mouse device associated with the VM")])
+    fake = FakePS([pswindows.PSResult(
+        returncode=1, stderr="no synthetic mouse device associated with the VM")])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     with pytest.raises(ConsoleError, match="no synthetic mouse"):
         console.mouse_move(unrestricted, "vm1", 5, 5)
+
+
+@pytest.mark.parametrize("fw,fh", [(0, 240), (320, 0), (-1, 240), (320, -1)])
+def test_mouse_ops_reject_non_positive_frame_dims(unrestricted, fw, fh):
+    """A half-given or negative frame dim is a ValueError before any spawn —
+    the PowerShell path must not silently treat it as head space (a negative
+    dim would scale to 0 and click the origin)."""
+    with pytest.raises(ValueError, match="must be positive"):
+        console.mouse_move(unrestricted, "vm1", 10, 10, frame_width=fw, frame_height=fh)
+    with pytest.raises(ValueError, match="must be positive"):
+        console.click(unrestricted, "vm1", 10, 10, frame_width=fw, frame_height=fh)
+
+
+def test_mouse_ops_accept_zero_frame_dims_as_head_space(monkeypatch, unrestricted):
+    """frame dims of 0/0 mean 'coordinates are head space' — not an error. The
+    op must reach the transport (not raise at the positivity gate) and take the
+    in-script head-space branch: the emitted script declares $fw = 0/$fh = 0
+    and the reported position is the coordinate itself (head-clamped)."""
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = console.mouse_move(unrestricted, "vm1", 500, 300)
+    assert out["head_x"] == 500 and out["head_y"] == 300
+    script = fake.scripts[-1]
+    assert "$fw = 0" in script and "$fh = 0" in script, (
+        "the emitted script must take the head-space branch for 0/0 frame dims"
+    )
+    assert "SetAbsolutePosition" in script
+    out = console.click(unrestricted, "vm1", 500, 300)
+    assert out["head_x"] == 500 and out["head_y"] == 300
+    assert "$fw = 0" in fake.scripts[-1]
+
+
+def test_mouse_move_head_missing_is_structured_error(monkeypatch, unrestricted):
+    """AC18's behavioral half: when the in-script head lookup fails the
+    positional op surfaces the structured error and never clicks blind (the
+    script's guard throws before any positioning call)."""
+    fake = FakePS([pswindows.PSResult(
+        returncode=1,
+        stderr="display head resolution unavailable: pass frame_width/frame_height "
+               "equal to the display resolution to skip scaling",
+    )])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(ConsoleError, match="display head resolution unavailable"):
+        console.mouse_move(unrestricted, "vm1", 10, 10)
+
+
+def test_by_id_console_input_policy_denied_before_op(monkeypatch):
+    """A by-id console op whose resolved name is outside allowed_vm_patterns is
+    refused after the resolve leg and BEFORE the op spawn — the resolve leg is
+    the policy gate (the folded op script must never start)."""
+    cfg = Config(allowed_vm_patterns=["test-*"])
+    cfg.destructive.console_input = True
+    guid = "e953c649-dcab-438d-9a54-3af74a82b624"
+    fake = FakePS([pswindows.PSResult(stdout="prod-vm", returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(PolicyDenied):
+        console.press_key(cfg, vm_id=guid, key="enter")
+    assert len(fake.scripts) == 1, (
+        "the by-id resolve leg is the policy gate; the op script must not spawn"
+    )
 
 
 def test_malformed_capture_json_is_structured(monkeypatch, unrestricted):
@@ -357,8 +504,7 @@ def test_wait_frame_change_validates_bounds(unrestricted):
 
 
 def test_wait_frame_change_max_polls_derived_from_timeout(monkeypatch, unrestricted):
-    fake = FakePS([pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
-        pswindows.PSResult(stdout="STOP=deadline POLLS=10 HASH=abc", returncode=0)])
+    fake = FakePS([pswindows.PSResult(stdout="STOP=deadline POLLS=10 HASH=abc", returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = console.wait_frame_change(unrestricted, "vm1", timeout_s=20, interval_s=2)
     # derived: 20/2 = 10 polls, run_ps timeout = deadline + 15
@@ -372,7 +518,7 @@ def test_wait_frame_change_changed_returns_image(monkeypatch, unrestricted):
     pixels = b"\x00" * (w * h * 2)
     payload = b"\x00\x00\x00\x00" + pixels
     frame_b64 = b64mod.b64encode(payload).decode()
-    fake = FakePS([pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0), pswindows.PSResult(
+    fake = FakePS([pswindows.PSResult(
         stdout=f"STOP=changed POLLS=3 HASH=abc\nFRAME={frame_b64}", returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = console.wait_frame_change(unrestricted, "vm1", baseline_hash="a" * 64, width=w, height=h)
@@ -382,8 +528,7 @@ def test_wait_frame_change_changed_returns_image(monkeypatch, unrestricted):
 
 
 def test_wait_frame_change_deadline_has_no_image(monkeypatch, unrestricted):
-    fake = FakePS([pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
-        pswindows.PSResult(stdout="STOP=deadline POLLS=10 HASH=abc", returncode=0)])
+    fake = FakePS([pswindows.PSResult(stdout="STOP=deadline POLLS=10 HASH=abc", returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = console.wait_frame_change(unrestricted, "vm1", timeout_s=20, interval_s=2)
     assert "image" not in out and out["changed"] is False
@@ -395,7 +540,7 @@ def test_capture_sequence_diff_metrics(monkeypatch, unrestricted):
     p1 = b"\x00\x00\x00\x00" + b"\x00\x00" * (w * h)
     p2 = b"\x00\x00\x00\x00" + b"\xFF\xFF" + b"\x00\x00" * (w * h - 1)
     payloads = [p1, p2, p2]
-    fake = FakePS([pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0)] + [
+    fake = FakePS([
         pswindows.PSResult(stdout=json.dumps(
             {"returnValue": 0, "imageDataB64": b64mod.b64encode(p).decode()}), returncode=0)
         for p in payloads
@@ -414,12 +559,12 @@ def test_capture_sequence_diff_metrics(monkeypatch, unrestricted):
 def test_screenshot_save_path_writes_and_creates_parent(monkeypatch, tmp_path):
     cfg = Config(unrestricted=True, host_write_roots=[str(tmp_path)])
     dest = tmp_path / "shots" / "sub" / "frame.png"
-    fake = FakePS()  # adaptive: guid, head, capture (lands on 640x480 fallback)
+    fake = FakePS()  # adaptive: the folded capture succeeds at the request size
     monkeypatch.setattr(pswindows, "run_ps", fake)
     img, meta = console.screenshot(cfg, "vm1", save_path=str(dest))
     assert meta["saved_path"] == str(dest)
     assert dest.is_file() and dest.stat().st_size > 8
-    assert img.size == (640, 480)
+    assert img.size == (1024, 768)  # the fallback landing has its own test below
 
 
 def test_screenshot_save_path_denied_outside_write_roots(monkeypatch, tmp_path):
@@ -436,15 +581,12 @@ def test_screenshot_fallback_chain_recovers(monkeypatch, unrestricted):
     """Requested size fails -> chain falls through to 640x480 (TI-4)."""
     w, h = 640, 480
     payload = b"\x00\x00\x00\x00" + b"\x00\x00" * (w * h)
-    ok = pswindows.PSResult(stdout=json.dumps(
-        {"returnValue": 0, "imageDataB64": base64.b64encode(payload).decode()}),
-        returncode=0)
-    fake = FakePS([
-        pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
-        pswindows.PSResult(stdout='{"horizontal": 1024, "vertical": 768}', returncode=0),
-        pswindows.PSResult(returncode=1, stderr="capture boom"),  # 1024x768 fails
-        ok,                                                       # 640x480 succeeds
-    ])
+    body = json.dumps({"returnValue": 0, "imageDataB64": base64.b64encode(payload).decode()})
+    fake = FakePS([pswindows.PSResult(
+        stdout="VMID=e953c649-dcab-438d-9a54-3af74a82b624" + "\n" +
+               "HEAD=1024x768" + "\n" +
+               "SIZES=1024x768,640x480" + "\n" + "USED=640x480" + "\n" + body,
+        returncode=0)])  # the folded chain: 1024x768 fails, 640x480 succeeds
     monkeypatch.setattr(pswindows, "run_ps", fake)
     img, meta = console.screenshot(unrestricted, "vm1")
     assert img.size == (640, 480)
@@ -474,7 +616,6 @@ def test_wait_frame_change_hash_roundtrips_as_baseline(monkeypatch, unrestricted
     payload = b"\x00\x00\x00\x00" + b"\x5a\xa5" * (w * h)
     expected = hashlib.sha256(payload).hexdigest()
     fake = FakePS([
-        pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
         pswindows.PSResult(stdout=f"STOP=deadline POLLS=4 HASH={expected}", returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
@@ -484,10 +625,7 @@ def test_wait_frame_change_hash_roundtrips_as_baseline(monkeypatch, unrestricted
     changed = pswindows.PSResult(
         stdout=f"STOP=changed POLLS=1 HASH={'f' * 64}\n"
                f"FRAME={base64.b64encode(payload).decode()}", returncode=0)
-    fake2 = FakePS([
-        pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
-        changed,
-    ])
+    fake2 = FakePS([changed])
     monkeypatch.setattr(pswindows, "run_ps", fake2)
     out2 = console.wait_frame_change(
         unrestricted, "vm1", baseline_hash=out["frame_hash"], width=w, height=h)
@@ -496,9 +634,8 @@ def test_wait_frame_change_hash_roundtrips_as_baseline(monkeypatch, unrestricted
 
 
 def test_display_info_emits_snake_case_enabled_state(monkeypatch, unrestricted):
-    fake = FakePS([
-        pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
-        pswindows.PSResult(stdout=json.dumps({
+    fake = FakePS([pswindows.PSResult(
+        stdout="VMID=e953c649-dcab-438d-9a54-3af74a82b624" + "\n" + json.dumps({
             "enabled_state": 2, "head_horizontal": 1024, "head_vertical": 768,
             "keyboard_present": True, "keyboard_enabled": None,
             "mouse_present": False, "mouse_enabled": None}), returncode=0),
@@ -514,9 +651,8 @@ def test_display_info_emits_snake_case_enabled_state(monkeypatch, unrestricted):
 # ---------------------------------------------------------------------------
 
 def test_click_with_coordinates_positions_first(monkeypatch, unrestricted):
-    fake = FakePS([pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
-        pswindows.PSResult(stdout='{"horizontal": 1024, "vertical": 768}', returncode=0),
-        pswindows.PSResult(stdout="RC=0 DOWN=1", returncode=0)])
+    fake = FakePS([pswindows.PSResult(stdout="HEADX=512" + "\n" +
+        "HEADY=384" + "\n" + "RC=0", returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = console.click(unrestricted, "vm1", 160, 120, frame_width=320, frame_height=240)
     assert out["head_x"] == 512 and out["head_y"] == 384  # scaled to head space

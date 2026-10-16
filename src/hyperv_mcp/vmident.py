@@ -15,6 +15,14 @@ Ordering contract (issue #8):
     read-only `Get-VM -Id` leg resolves the real name, and policy runs on
     that resolved name; when a name was also supplied it must match the
     resolved one, else the call is invalid.
+
+Lock-identity scope (issue #18): the GUID-keyed lock invariant below holds for
+operations that resolve their target HERE, host-side. The console's folded
+single-process transport resolves by-name callers INSIDE the one script it
+spawns, so its console-input lock key is the caller-supplied name on that path
+(the only identity available before the process); the by-id path keeps this
+module's resolve leg and locks on the GUID. The residual cross-form exclusion
+gap is tracked as a follow-up issue.
 """
 
 from __future__ import annotations
@@ -29,9 +37,12 @@ _MAX_NAME_LEN = 260
 
 @dataclass(frozen=True)
 class VMRef:
-    """A resolved VM identity. `id` is the lowercase CIM GUID (the lock key
-    and script `$vmTarget` value); `name` is the ElementName it resolves to
-    (policy target and audit display)."""
+    """A resolved VM identity. `id` is the lowercase CIM GUID (the lock key and
+    script `$vmTarget` value) for operations that resolve through this module;
+    on the console's folded by-name path (issue #18) it carries the
+    caller-supplied name as the lock key because the GUID is only known after
+    the single process runs. `name` is the ElementName it resolves to (policy
+    target and audit display)."""
 
     id: str
     name: str
@@ -43,6 +54,27 @@ def _checked_caller_name(vm_name: str) -> str:
     if len(vm_name) > _MAX_NAME_LEN:
         raise ValueError(f"vm_name exceeds {_MAX_NAME_LEN} characters")
     return vm_name
+
+
+def checked_caller_name(vm_name: str) -> str:
+    """The caller-name gate WITHOUT a spawn (issue #18).
+
+    Exposed for callers that resolve the VM inside their own script (console's
+    folded single-process transport): they cannot run resolve()'s PowerShell
+    leg, but they still need its fail-fast input errors before anything starts.
+    """
+    return _checked_caller_name(vm_name)
+
+
+def resolver_prelude(vm_name: str) -> str:
+    """The PR #4 name resolver as an embedded script prelude (issue #18).
+
+    The console's folded single-process transport resolves by-name callers
+    INSIDE the one script it spawns, so the resolver EMISSION moves here — the
+    resolver itself is unchanged and still lives in exactly one module (the
+    pinned guardrail counts this call site, not the consumer).
+    """
+    return guestexec.psdirect_vm_target(vm_name)
 
 
 def _run(cfg: Config, script: str):

@@ -14,6 +14,25 @@ transport additionally has no per-call COM timeout — a hung provider
 blocks that VM's operations until it returns, where the PowerShell
 transport's child process is killed at its timeout.
 
+One process per call (issue #18): the PowerShell transport folds the VM
+resolution, the device/head lookups and the operation into ONE script per
+call. The prelude binds ``$vmTarget`` — the PR #4 resolver embedded for
+by-name callers, the validated GUID preamble for by-id callers — and the
+script emits its metadata (``VMID=``, ``HEAD=``, ``SIZES=``/``USED=``,
+``ATTEMPTED=``, ``HEADX=``/``HEADY=``, ``RC=``/``CHUNK=``,
+``STOP=``/``POLLS=``/``HASH=``, ``FRAME=``) as KEY=value stdout lines ahead
+of the payload JSON. Chunked keyboard input loops inside the script (typed
+text rides stdin as base64 lines; scancodes ride in the script), the
+screenshot fallback chain loops its de-duplicated size list in the script,
+and the mouse lookup is scoped to the VM with a ``SystemName`` key filter
+with an ``Msvm_Ps2Mouse`` fallback for non-positional operations. A by-id
+call resolves host-side first, because policy must run on the GUID's
+resolved name before any guest mutation — so by-id starts two processes
+(resolve + folded op) and by-name starts exactly one. The one exception is
+``capture_sequence``: it has no payload to carry between frames, so each
+frame is its own self-contained folded process (``count`` processes by
+name, ``count + 1`` by id).
+
 All operations target root\\virtualization\\v2 WMI objects — independent of
 VMConnect windows, the host foreground window, guest login, and guest
 networking. Verified against the live host (see tasks/console-controller
@@ -28,19 +47,23 @@ probes):
   - Keyboard: Msvm_Keyboard associated to the VM (association works directly).
     TypeText(AsciiText), TypeKey(KeyCode:UInt32), TypeScancodes(UInt8Array),
     PressKey/ReleaseKey(KeyCode:UInt32), TypeCtrlAltDel.
-  - Mouse: instances must be enumerated from Msvm_SyntheticMouse directly and
-    associated to Msvm_ComputerSystem for the VM match — the
-    Get-CimAssociatedInstance -ResultClassName CIM_PointingDevice query
-    returns a base-typed object whose derived methods (SetAbsolutePosition,
-    ClickButton, ...) are NOT invokable. Methods:
+  - Mouse: Msvm_SyntheticMouse selected by its SystemName key (a
+    CIM_LogicalDevice key whose value is the VM's Msvm_ComputerSystem Name) —
+    a direct class query keeps the derived type, whose methods
     SetAbsolutePosition(HorizontalPosition:SInt32, VerticalPosition:SInt32),
     ClickButton(ButtonIndex:UInt32), SetButtonState(ButtonIndex, IsDown),
-    GetButtonState(ButtonIndex), SetScrollPosition(ScrollPositionDelta).
+    GetButtonState(ButtonIndex), SetScrollPosition(ScrollPositionDelta) are
+    invokable. A VM without a synthetic mouse (Gen1 without integration
+    services) falls back to Msvm_Ps2Mouse for button, scroll and
+    click-at-current-position; absolute positioning has no PS/2 equivalent, so
+    positional ops report the structured error instead of acting.
   - Coordinate mapping: the thumbnail is a scaled snapshot of the display
     head; mouse coordinates are in head space (Msvm_VideoHead
     CurrentHorizontal/VerticalResolution). Frame-space inputs are scaled by
-    head/frame; when neither frame dims nor head resolution are available the
-    tools error instead of clicking somewhere unverified.
+    head/frame — in the PowerShell script, with the same rounding and
+    clamping as the Python reference _scale_to_head — and when neither frame
+    dims nor head resolution are available the tools error instead of
+    clicking somewhere unverified.
 
 WinPE / MDT note: screenshots and input work from firmware through WinPE —
 PowerShell Direct is unavailable there by design. Tool results return IMAGES
@@ -65,7 +88,7 @@ from typing import Any
 
 from PIL import Image as PILImage
 
-from . import policy, pswindows, vmident, vmlocks, wmiconsole
+from . import guestexec, policy, pswindows, vmident, vmlocks, wmiconsole
 from .config import Config
 
 _WMI_NS = "root\\virtualization\\v2"
@@ -75,8 +98,18 @@ _WMI_NS = "root\\virtualization\\v2"
 def _input_lock(ref: vmident.VMRef) -> Iterator[None]:
     """Console input lock scope (issue #14): READ on the VM key so guest
     work proceeds during typing, plus WRITE on the second (vm, "console")
-    key so two agents can never interleave keystrokes. VM key is always
+    key so two agents cannot interleave keystrokes. VM key is always
     outermost — no other site takes the console key, so no ordering cycle.
+
+    Both keys are derived from ``ref.id``, which is the resolved GUID on the
+    WMI transport and on the by-id PowerShell path — but the caller-supplied
+    NAME on the by-name PowerShell path, where issue #18's fold resolves the
+    VM inside the op script and the GUID is not known host-side before the
+    spawn. Exclusion therefore holds between calls that address the VM the
+    same way; it does NOT span name-vs-GUID addressing, nor a by-name console
+    call against a write-scope op (which always resolves first and keys on
+    the GUID). That residual is disclosed in vmident and tracked in issue
+    #77.
     """
     with vmlocks.vm_lock(ref.id, mode="read"), vmlocks.vm_lock((ref.id, "console")):
         yield
@@ -157,121 +190,356 @@ class ConsoleError(RuntimeError):
 # script fragments (all single-purpose, parse-tested)
 # ---------------------------------------------------------------------------
 
-def _vm_lookup_script(guid: str) -> str:
-    return (
-        "$vm = Get-CimInstance -Namespace '" + _WMI_NS + "' -ClassName Msvm_ComputerSystem "
-        "-Filter \"Name='" + guid.lower() + "'\"\n"
-        "if (-not $vm) { throw 'VM not found in WMI namespace (is it running?)' }\n"
-        "Write-Output ('VMSTATE=' + $vm.EnabledState)\n"
-    )
+# ---------------------------------------------------------------------------
+# folded single-process script construction (issue #18)
+#
+# Every console call used to resolve the VM GUID, then the display head, then
+# the device, each in its own powershell.exe (2-6 cold PowerShell 5.1 starts
+# per call). Each op now builds ONE script: a prelude binds $vmTarget (the PR
+# #4 resolver embedded by name, or the validated GUID preamble by id), one
+# in-process WMI lookup fetches $vm, and the operation runs — chunked input
+# and the screenshot fallback chain loop inside the script.
+# ---------------------------------------------------------------------------
+
+def _vm_prelude(cfg: Config, vm_name: str, vm_id: str, timing: _PsTiming) -> tuple[str, vmident.VMRef]:
+    """(prelude, ref): the script lines binding $vmTarget, plus the ref the
+    caller needs (the console-input lock key and the result's display name).
+
+    By id: vmident.resolve runs first (one spawn) so policy.vm_allowed sees the
+    GUID's resolved name BEFORE any guest mutation (issue #8's contract), then
+    the preamble binds the validated GUID directly. By name: the caller-name
+    validation and policy.vm_allowed run host-side with no spawn (a denied name
+    still starts nothing), the PR #4 resolver is embedded unchanged, and the
+    GUID arrives on stdout when the process runs — so the ref carries the
+    caller-supplied name as its lock key.
+    """
+    if vm_id:
+        ref = _resolve_ps(cfg, vm_name, vm_id, timing)
+        return guestexec.vm_target_preamble(ref.id), ref
+    vmident.checked_caller_name(vm_name)
+    policy.vm_allowed(cfg, vm_name)
+    return vmident.resolver_prelude(vm_name), vmident.VMRef(id=vm_name, name=vm_name)
 
 
-_CAPTURE_SCRIPT_TMPL = """
-$vm = Get-CimInstance -Namespace '%NS%' -ClassName Msvm_ComputerSystem -Filter "Name='%GUID%'"
-if (-not $vm) { throw 'VM not found in WMI namespace (is it running?)' }
-$svc = Get-CimInstance -Namespace '%NS%' -ClassName Msvm_VirtualSystemManagementService
-$r = Invoke-CimMethod -InputObject $svc -MethodName GetVirtualSystemThumbnailImage -ErrorAction Stop -Arguments @{
-    TargetSystem = $vm
-    WidthPixels  = %W
-    HeightPixels = %H
-}
-if ($r.ReturnValue -ne 0) { throw ('GetVirtualSystemThumbnailImage failed with ReturnValue=' + $r.ReturnValue) }
-[PSCustomObject]@{
-    returnValue = $r.ReturnValue
-    imageDataB64 = [Convert]::ToBase64String($r.ImageData)
-} | ConvertTo-Json -Compress
-"""
+_VM_LOOKUP = (
+    "$vm = Get-CimInstance -Namespace '" + _WMI_NS + "' -ClassName Msvm_ComputerSystem "
+    "-Filter \"Name='$vmTarget'\"\n"
+    "if (-not $vm) { throw 'VM not found in WMI namespace (is it running?)' }\n"
+)
 
-_KEYBOARD_SCRIPT_TMPL = """
-$vm = Get-CimInstance -Namespace '%NS%' -ClassName Msvm_ComputerSystem -Filter "Name='%GUID%'"
-$kb = Get-CimAssociatedInstance -InputObject $vm -ResultClassName Msvm_Keyboard | Select-Object -First 1
-if (-not $kb) { throw 'no keyboard device associated with the VM' }
-%CALL%
-"""
+_KEYBOARD_LOOKUP = (
+    "$kb = Get-CimAssociatedInstance -InputObject $vm -ResultClassName Msvm_Keyboard "
+    "| Select-Object -First 1\n"
+    "if (-not $kb) { throw 'no keyboard device associated with the VM' }\n"
+)
 
-_MOUSE_FOR_VM_SCRIPT = """
-$vm = Get-CimInstance -Namespace '%NS%' -ClassName Msvm_ComputerSystem -Filter "Name='%GUID%'"
-if (-not $vm) { throw 'VM not found in WMI namespace (is it running?)' }
-$mice = Get-CimInstance -Namespace '%NS%' -ClassName Msvm_SyntheticMouse
-foreach ($m in $mice) {
-    $owner = Get-CimAssociatedInstance -InputObject $m -ResultClassName Msvm_ComputerSystem | Select-Object -First 1
-    if ($owner -and $owner.Name -eq $vm.Name) {
-        Write-Output ('MOUSEFOUND=' + $m.Name)
-        break
-    }
-    $m = $null
-}
-if (-not $m) { throw 'no synthetic mouse device associated with the VM' }
-%CALL%
-"""
+# The OBSERVING variant (get_display_info): absence is data, not an error — the
+# base script and the WMI transport both report keyboard_present=false, and a
+# stopped VM (which is exactly what this tool inspects) carries no keyboard
+# association, so the throwing input-op guard must not be folded in here.
+_KEYBOARD_LOOKUP_SOFT = (
+    "$kb = Get-CimAssociatedInstance -InputObject $vm -ResultClassName Msvm_Keyboard "
+    "| Select-Object -First 1\n"
+)
 
-_HEAD_RES_SCRIPT = """
-$vm = Get-CimInstance -Namespace '%NS%' -ClassName Msvm_ComputerSystem -Filter "Name='%GUID%'"
-$vh = Get-CimAssociatedInstance -InputObject $vm -ResultClassName Msvm_VideoHead | Select-Object -First 1
-if (-not $vh) { throw 'no video head associated with the VM' }
-[PSCustomObject]@{
-    horizontal = $vh.CurrentHorizontalResolution
-    vertical = $vh.CurrentVerticalResolution
-} | ConvertTo-Json -Compress
-"""
+# The synthetic mouse is selected with a SystemName key filter (FND-16): the
+# per-device association scan this replaces was O(#mice on host) WMI calls.
+_MOUSE_SYNTHETIC = (
+    "$m = Get-CimInstance -Namespace '" + _WMI_NS + "' -ClassName Msvm_SyntheticMouse "
+    "-Filter \"SystemName='$vmTarget'\"\n"
+)
 
-_DISPLAY_INFO_SCRIPT = """
-$vm = Get-CimInstance -Namespace '%NS%' -ClassName Msvm_ComputerSystem -Filter "Name='%GUID%'"
-$vh = Get-CimAssociatedInstance -InputObject $vm -ResultClassName Msvm_VideoHead | Select-Object -First 1
-$kb = Get-CimAssociatedInstance -InputObject $vm -ResultClassName Msvm_Keyboard | Select-Object -First 1
-$mice = Get-CimInstance -Namespace '%NS%' -ClassName Msvm_SyntheticMouse
-$mouse = $null
-foreach ($m in $mice) {
-    $owner = Get-CimAssociatedInstance -InputObject $m -ResultClassName Msvm_ComputerSystem | Select-Object -First 1
-    if ($owner -and $owner.Name -eq $vm.Name) { $mouse = $m; break }
-}
-[PSCustomObject]@{
-    enabled_state = $vm.EnabledState
-    head_horizontal = if ($vh) { $vh.CurrentHorizontalResolution } else { $null }
-    head_vertical = if ($vh) { $vh.CurrentVerticalResolution } else { $null }
-    keyboard_present = [bool]$kb
-    keyboard_enabled = if ($kb) { $kb.EnabledState } else { $null }
-    mouse_present = [bool]$mouse
-    mouse_enabled = if ($mouse) { $mouse.EnabledState } else { $null }
-} | ConvertTo-Json -Compress
-"""
+# PS/2 fallback (AC14): Msvm_Ps2Mouse supports SetButtonState, SetScrollPosition
+# and ClickButton but NOT SetAbsolutePosition, so it serves non-positional ops
+# only — positional ops raise the structured error instead of acting.
+_MOUSE_PS2 = (
+    "$m = Get-CimInstance -Namespace '" + _WMI_NS + "' -ClassName Msvm_Ps2Mouse "
+    "-Filter \"SystemName='$vmTarget'\"\n"
+)
 
-# Poll loop: bounded by max_polls. When %BASELINE% is empty the FIRST polled
+_HEAD_LOOKUP = (
+    "$vh = Get-CimAssociatedInstance -InputObject $vm -ResultClassName Msvm_VideoHead "
+    "| Select-Object -First 1\n"
+)
+
+# In-script replication of _scale_to_head (issue #18): the head resolution is
+# only known inside the script, so the frame->head scaling runs there. Python
+# round() and [math]::Round both round half to even, and the grouping below is
+# the same expression order, so the results are bit-identical to the Python
+# reference (AC16 keeps _scale_to_head as that reference).
+_SCALE_TO_HEAD = (
+    "$x = %X\n"
+    "$y = %Y\n"
+    "$fw = %FW\n"
+    "$fh = %FH\n"
+    "$hw = $vh.CurrentHorizontalResolution\n"
+    "$hh = $vh.CurrentVerticalResolution\n"
+    "if ($fw -or $fh) {\n"
+    "    $hx = [math]::Round($x * $hw / $fw)\n"
+    "    $hy = [math]::Round($y * $hh / $fh)\n"
+    "} else {\n"
+    "    $hx = $x\n"
+    "    $hy = $y\n"
+    "}\n"
+    "$hx = [math]::Max(0, [math]::Min($hx, $hw - 1))\n"
+    "$hy = [math]::Max(0, [math]::Min($hy, $hh - 1))\n"
+)
+
+
+def _folded_mouse_positional_script(
+    prelude: str, x: int, y: int, frame_w: int, frame_h: int,
+    click: bool, button: int,
+) -> str:
+    """One positional mouse op (mouse_move, click with coordinates) in one
+    process. The synthetic mouse is REQUIRED — absolute positioning has no PS/2
+    equivalent, so its absence raises the structured error instead of acting.
+    The head is looked up in-script and its absence throws rather than clicking
+    blind, and _scale_to_head's arithmetic runs here with the same grouping as
+    the Python reference."""
+    parts = [
+        prelude,
+        _VM_LOOKUP,
+        _MOUSE_SYNTHETIC,
+        "if (-not $m) { throw 'no synthetic mouse device associated with the VM; "
+        "absolute positioning is unavailable (the PS/2 fallback supports button, "
+        "scroll and click-at-current-position only)' }",
+        _HEAD_LOOKUP,
+        # The guard rejects a head that reports no resolution as well as a head
+        # that is absent: wmiconsole.head_resolution, _scale_to_head and
+        # _parse_head all treat a zero-resolution head as unavailable, and the
+        # in-script clamp would otherwise collapse a 0/null resolution to (0,0)
+        # and position at the origin instead of erroring.
+        "if ((-not $vh) -or (-not $vh.CurrentHorizontalResolution) "
+        "-or (-not $vh.CurrentVerticalResolution)) { throw 'display head "
+        "resolution unavailable: pass frame_width/frame_height equal to the "
+        "display resolution to skip scaling' }",
+        _SCALE_TO_HEAD
+        .replace("%X", str(x)).replace("%Y", str(y))
+        .replace("%FW", str(frame_w)).replace("%FH", str(frame_h)),
+        "$r0 = Invoke-CimMethod -InputObject $m -MethodName SetAbsolutePosition "
+        "-ErrorAction Stop -Arguments @{ HorizontalPosition = $hx; VerticalPosition = $hy }",
+        "if ($r0.ReturnValue -ne 0) { throw ('SetAbsolutePosition failed with "
+        "ReturnValue=' + $r0.ReturnValue) }",
+    ]
+    if click:
+        parts += [
+            "$r = Invoke-CimMethod -InputObject $m -MethodName ClickButton "
+            "-ErrorAction Stop -Arguments @{ ButtonIndex = " + str(button) + " }",
+            "if ($r.ReturnValue -ne 0) { throw ('ClickButton failed with "
+            "ReturnValue=' + $r.ReturnValue) }",
+            "Write-Output ('RC=' + $r.ReturnValue)",
+        ]
+    parts += [
+        "Write-Output ('HEADX=' + $hx)",
+        "Write-Output ('HEADY=' + $hy)",
+    ]
+    return "\n".join(parts)
+
+
+def _require_int(meta: dict[str, str], key: str, ctx: str) -> int:
+    raw = meta.get(key, "")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise ConsoleError(f"console {ctx}: missing {key} in the folded result") from None
+
+
+def _folded_screenshot_script(prelude: str, width: int, height: int) -> str:
+    """One script for the whole capture: the de-duplicated size chain
+    (requested -> head native if different -> 640x480 -> 320x240) is built and
+    looped in-process, never attempting a size twice; metadata rides stdout
+    ahead of the payload JSON."""
+    return "\n".join([
+        prelude,
+        _VM_LOOKUP,
+        "$svc = Get-CimInstance -Namespace '" + _WMI_NS + "' "
+        "-ClassName Msvm_VirtualSystemManagementService\n",
+        _HEAD_LOOKUP,
+        "if ($vh) { Write-Output ('HEAD=' + $vh.CurrentHorizontalResolution + 'x' "
+        "+ $vh.CurrentVerticalResolution) }\n",
+        "Write-Output ('VMID=' + $vmTarget)\n",
+        "$sizes = @(,(" + str(width) + "," + str(height) + "))\n",
+        "if ($vh) {\n",
+        "    $hh = $vh.CurrentHorizontalResolution\n",
+        "    $vv = $vh.CurrentVerticalResolution\n",
+        "    $dup = $false\n",
+        "    foreach ($s in $sizes) { if ($s[0] -eq $hh -and $s[1] -eq $vv) { $dup = $true } }\n",
+        "    if (-not $dup) { $sizes += ,($hh,$vv) }\n",
+        "}\n",
+        "$sizes += ,(640,480)\n",
+        "$sizes += ,(320,240)\n",
+        "$seen = @{}\n",
+        "$attempted = @()\n",
+        "$used = $null\n",
+        "$payload = $null\n",
+        "$lastError = ''\n",
+        "foreach ($s in $sizes) {\n",
+        "    $key = '' + $s[0] + 'x' + $s[1]\n",
+        "    if ($seen.ContainsKey($key)) { continue }\n",
+        "    $seen[$key] = $true\n",
+        "    $attempted += $key\n",
+        "    try {\n",
+        "        $r = Invoke-CimMethod -InputObject $svc -MethodName GetVirtualSystemThumbnailImage "
+        "-ErrorAction Stop -Arguments @{\n",
+        "            TargetSystem = $vm\n",
+        "            WidthPixels  = $s[0]\n",
+        "            HeightPixels = $s[1]\n",
+        "        }\n",
+        "        if ($r.ReturnValue -ne 0) { throw ('GetVirtualSystemThumbnailImage failed "
+        "with ReturnValue=' + $r.ReturnValue) }\n",
+        "        $used = $key\n",
+        "        $payload = $r.ImageData\n",
+        "        break\n",
+        "    } catch {\n",
+        "        $lastError = $_.Exception.Message\n",
+        "    }\n",
+        "}\n",
+        "if ($used -eq $null) {\n",
+        "    Write-Output ('ATTEMPTED=' + ($attempted -join ','))\n",
+        "    throw $lastError\n",
+        "}\n",
+        "Write-Output ('SIZES=' + ($attempted -join ','))\n",
+        "Write-Output ('USED=' + $used)\n",
+        "[PSCustomObject]@{\n",
+        "    returnValue = 0\n",
+        "    imageDataB64 = [Convert]::ToBase64String($payload)\n",
+        "} | ConvertTo-Json -Compress\n",
+    ])
+
+
+def _folded_capture_script(prelude: str, width: int, height: int) -> str:
+    """One self-contained capture at a single size (capture_sequence's per-frame
+    script: each frame resolves the VM itself, so no separate GUID process)."""
+    return "\n".join([
+        prelude,
+        _VM_LOOKUP,
+        "$svc = Get-CimInstance -Namespace '" + _WMI_NS + "' "
+        "-ClassName Msvm_VirtualSystemManagementService\n",
+        "$r = Invoke-CimMethod -InputObject $svc -MethodName GetVirtualSystemThumbnailImage "
+        "-ErrorAction Stop -Arguments @{\n",
+        "    TargetSystem = $vm\n",
+        "    WidthPixels  = " + str(width) + "\n",
+        "    HeightPixels = " + str(height) + "\n",
+        "}\n",
+        "if ($r.ReturnValue -ne 0) { throw ('GetVirtualSystemThumbnailImage failed "
+        "with ReturnValue=' + $r.ReturnValue) }\n",
+        "[PSCustomObject]@{\n",
+        "    returnValue = $r.ReturnValue\n",
+        "    imageDataB64 = [Convert]::ToBase64String($r.ImageData)\n",
+        "} | ConvertTo-Json -Compress\n",
+    ])
+
+
+# Poll loop: bounded by max_polls. When the baseline is empty the FIRST polled
 # frame becomes the baseline (first-poll-is-baseline semantics); change is
 # reported only when a later poll's hash differs from that baseline. HASH is
 # always the full lowercase-hex sha256 of the raw payload — byte-identical to
 # the host-side _frame_hash, so a returned frame_hash round-trips as a
 # baseline_hash for cross-call change detection.
-_WAIT_FRAME_SCRIPT_TMPL = """
-$vm = Get-CimInstance -Namespace '%NS%' -ClassName Msvm_ComputerSystem -Filter "Name='%GUID%'"
-if (-not $vm) { throw 'VM not found in WMI namespace (is it running?)' }
-$svc = Get-CimInstance -Namespace '%NS%' -ClassName Msvm_VirtualSystemManagementService
-$deadline = (Get-Date).AddSeconds(%TIMEOUT_S%)
-$polls = 0
-$baseline = '%BASELINE%'
-$lastHash = ''
-$sha = New-Object Security.Cryptography.SHA256Managed
-while ($polls -lt %MAX_POLLS%) {
-    if ((Get-Date) -ge $deadline) { Write-Output ('STOP=deadline POLLS=' + $polls + ' HASH=' + $lastHash); break }
-    $r = Invoke-CimMethod -InputObject $svc -MethodName GetVirtualSystemThumbnailImage -ErrorAction Stop -Arguments @{
-        TargetSystem = $vm
-        WidthPixels  = %W%
-        HeightPixels = %H%
-    }
-    if ($r.ReturnValue -ne 0) { throw ('GetVirtualSystemThumbnailImage failed with ReturnValue=' + $r.ReturnValue) }
-    $polls++
-    $hash = ([System.BitConverter]::ToString($sha.ComputeHash($r.ImageData)) -replace '-','').ToLowerInvariant()
-    $lastHash = $hash
-    if ($baseline -eq '') { $baseline = $hash }
-    if ($hash -ne $baseline) {
-        Write-Output ('STOP=changed POLLS=' + $polls + ' HASH=' + $hash)
-        Write-Output ('FRAME=' + [Convert]::ToBase64String($r.ImageData))
-        break
-    }
-    if ($polls -ge %MAX_POLLS% -or (Get-Date) -ge $deadline) { Write-Output ('STOP=deadline POLLS=' + $polls + ' HASH=' + $hash); break }
-    Start-Sleep -Milliseconds %INTERVAL_MS%
-}
-"""
+def _folded_wait_frame_script(
+    prelude: str, baseline_hash: str, width: int, height: int,
+    timeout_s: int, interval_s: int,
+) -> str:
+    max_polls = math.ceil(timeout_s / interval_s)
+    return "\n".join([
+        prelude,
+        _VM_LOOKUP,
+        "$svc = Get-CimInstance -Namespace '" + _WMI_NS + "' "
+        "-ClassName Msvm_VirtualSystemManagementService\n",
+        "$deadline = (Get-Date).AddSeconds(" + str(int(timeout_s)) + ")\n",
+        "$polls = 0\n",
+        "$baseline = '" + baseline_hash + "'\n",
+        "$lastHash = ''\n",
+        "$sha = New-Object Security.Cryptography.SHA256Managed\n",
+        "while ($polls -lt " + str(max_polls) + ") {\n",
+        "    if ((Get-Date) -ge $deadline) { Write-Output ('STOP=deadline POLLS=' + $polls + ' HASH=' + $lastHash); break }\n",
+        "    $r = Invoke-CimMethod -InputObject $svc -MethodName GetVirtualSystemThumbnailImage -ErrorAction Stop -Arguments @{\n",
+        "        TargetSystem = $vm\n",
+        "        WidthPixels  = " + str(width) + "\n",
+        "        HeightPixels = " + str(height) + "\n",
+        "    }\n",
+        "    if ($r.ReturnValue -ne 0) { throw ('GetVirtualSystemThumbnailImage failed with ReturnValue=' + $r.ReturnValue) }\n",
+        "    $polls++\n",
+        "    $hash = ([System.BitConverter]::ToString($sha.ComputeHash($r.ImageData)) -replace '-','').ToLowerInvariant()\n",
+        "    $lastHash = $hash\n",
+        "    if ($baseline -eq '') { $baseline = $hash }\n",
+        "    if ($hash -ne $baseline) {\n",
+        "        Write-Output ('STOP=changed POLLS=' + $polls + ' HASH=' + $hash)\n",
+        "        Write-Output ('FRAME=' + [Convert]::ToBase64String($r.ImageData))\n",
+        "        break\n",
+        "    }\n",
+        "    if ($polls -ge " + str(max_polls) + " -or (Get-Date) -ge $deadline) { Write-Output ('STOP=deadline POLLS=' + $polls + ' HASH=' + $hash); break }\n",
+        "    Start-Sleep -Milliseconds " + str(interval_s * 1000) + "\n",
+        "}\n",
+    ])
+
+
+# ---------------------------------------------------------------------------
+# folded-protocol stdout parsing
+# ---------------------------------------------------------------------------
+
+def _meta_lines(result: pswindows.PSResult) -> tuple[dict[str, str], str]:
+    """(tagged metadata, payload line) from a folded script's stdout.
+
+    The folded scripts emit KEY=value metadata lines (VMID=, HEAD=, SIZES=,
+    USED=, HEADX=, HEADY=, RC=) and, where the op returns a payload, the
+    payload/op JSON as the final stdout line. Metadata lines are recognized by
+    shape, so an op whose whole stdout is metadata (the mouse ops) keeps all of
+    it; a response with no payload line at all is a structured error for the
+    ops that need one, exactly as a malformed capture JSON is.
+    """
+    meta: dict[str, str] = {}
+    payload = ""
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        key, sep, value = line.partition("=")
+        if sep and re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+            meta[key] = value.strip()
+        else:
+            payload = line
+    return meta, payload
+
+
+def _parse_guid(meta: dict[str, str], vm_name: str) -> str:
+    """The script-resolved GUID, re-validated through the same shape gate a
+    host-resolved GUID passes (review PRR-028)."""
+    guid = meta.get("VMID", "")
+    if not guid:
+        raise ConsoleError(f"VM '{vm_name}' resolved to an empty Id")
+    try:
+        return guestexec.validate_vm_guid(guid).lower()
+    except ValueError as exc:
+        raise ConsoleError(f"VM '{vm_name}' resolved to an invalid Id: {exc}") from None
+
+
+def _parse_head(meta: dict[str, str]) -> tuple[int, int] | None:
+    raw = meta.get("HEAD", "")
+    if not raw or "x" not in raw:
+        return None
+    try:
+        h, v = raw.split("x", 1)
+        hi, vi = int(h), int(v)
+    except ValueError:
+        return None
+    return (hi, vi) if hi > 0 and vi > 0 else None
+
+
+def _parse_size(meta: dict[str, str], key: str) -> tuple[int, int] | None:
+    raw = meta.get(key, "")
+    if not raw or "x" not in raw:
+        return None
+    try:
+        w, h = raw.split("x", 1)
+        wi, hi = int(w), int(h)
+    except ValueError:
+        return None
+    # A zero or negative dimension is as unusable as a malformed one: it would
+    # decode a 0-byte (or negative-length) frame and mis-name the length
+    # expectation, so the caller falls back exactly as it does when the line is
+    # absent (the payload-length check then reports the real mismatch).
+    return (wi, hi) if wi > 0 and hi > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -365,14 +633,23 @@ def _run(
     *,
     timeout_s: float | None = None,
     stdin_b64: str | None = None,
+    payload_lines: int = 0,
     timing: _PsTiming | None = None,
 ):
     """console's PowerShell choke (issue #43): composes the remote hop from
     the CALLER's cfg before spawning; identity in local mode. The optional
-    timing accumulator records one entry per spawn (issue #45)."""
+    timing accumulator records one entry per spawn (issue #45).
+
+    payload_lines is the number of stdin payload lines the script reads (issue
+    #18: one folded process carries every chunk's base64 line). In remote mode
+    the composer emits one $__pN read per line and forwards the values as
+    scriptblock parameters; in local mode the script reads them itself.
+    """
+    if payload_lines and stdin_b64 is None:
+        raise ValueError("payload_lines > 0 requires stdin_b64")
     script, stdin = pswindows.compose_remote(
         cfg, script,
-        payload_lines=1 if stdin_b64 is not None else 0,
+        payload_lines=payload_lines,
         stdin_b64=stdin_b64,
     )
     if stdin is None:
@@ -507,18 +784,16 @@ def _frame_hash(raw: bytes) -> str:
 
 
 def _capture_raw(
-    cfg: Config, guid: str, width: int, height: int, timing: _PsTiming | None = None
+    cfg: Config, prelude: str, width: int, height: int, timing: _PsTiming | None = None
 ) -> bytes:
-    script = (
-        _CAPTURE_SCRIPT_TMPL.replace("%NS%", _WMI_NS)
-        .replace("%GUID%", guid.lower())
-        .replace("%W", str(width))
-        .replace("%H", str(height))
-    )
-    result = _run(cfg, script.strip(), timeout_s=90, timing=timing)
+    """One self-contained capture: the prelude binds $vmTarget (the PR #4
+    resolver by name or the GUID preamble by id), so a by-name frame resolves
+    inside its own process and no separate GUID spawn is needed."""
+    script = _folded_capture_script(prelude, width, height)
+    result = _run(cfg, script, timeout_s=90, timing=timing)
     _check_rc(result, "console screenshot")
     try:
-        data = json.loads(result.stdout)
+        data = json.loads(result.stdout.strip().splitlines()[-1])
         payload = base64.b64decode(data["imageDataB64"], validate=True)
     except (json.JSONDecodeError, KeyError, binascii.Error, ValueError) as exc:
         raise ConsoleError(f"screenshot result parse failed: {exc}") from None
@@ -528,23 +803,6 @@ def _capture_raw(
             f"thumbnail payload length mismatch: got {len(payload)}, expected {expected}"
         )
     return payload
-
-
-def _head_resolution(
-    cfg: Config, guid: str, timing: _PsTiming | None = None
-) -> tuple[int, int] | None:
-    script = _HEAD_RES_SCRIPT.replace("%NS%", _WMI_NS).replace("%GUID%", guid.lower())
-    result = _run(cfg, script.strip(), timeout_s=60, timing=timing)
-    if result.returncode != 0:
-        return None
-    try:
-        data = json.loads(result.stdout)
-        h, v = int(data["horizontal"]), int(data["vertical"])
-    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-        return None
-    if h <= 0 or v <= 0:
-        return None
-    return h, v
 
 
 def _scale_to_head(
@@ -642,28 +900,33 @@ def screenshot(
         assert ref is not None
         return _screenshot_wmi(cfg, be, connect_ms, ref, width, height, save_path)
     timing = _PsTiming()
-    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
-    guid = ref.id
-    head = _head_resolution(cfg, guid, timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
+    # One process for the whole capture: the chain (requested -> head native if
+    # different -> 640x480 -> 320x240, duplicates removed) is built and looped
+    # inside the script. The host timeout is the sum of the per-size budgets the
+    # base allowed (four entries after de-duplication).
+    script = _folded_screenshot_script(prelude, width, height)
+    result = _run(cfg, script, timeout_s=90 * 4, timing=timing)
+    _check_rc(result, "console screenshot")
+    meta_lines, payload_line = _meta_lines(result)
+    guid = _parse_guid(meta_lines, vm_name or ref.name)
+    head = _parse_head(meta_lines)
+    used = _parse_size(meta_lines, "USED") or (width, height)
+    try:
+        data = json.loads(payload_line)
+        raw = base64.b64decode(data["imageDataB64"], validate=True)
+    except (json.JSONDecodeError, KeyError, binascii.Error, ValueError) as exc:
+        raise ConsoleError(f"screenshot result parse failed: {exc}") from None
+    actual_w, actual_h = used
+    expected = actual_w * actual_h * 2 + _PREFIX_LEN
+    if len(raw) != expected:
+        raise ConsoleError(
+            f"thumbnail payload length mismatch: got {len(raw)}, expected {expected} "
+            f"for the {actual_w}x{actual_h} frame"
+        )
     fallback_used = ""
-    raw: bytes | None = None
-    actual_w, actual_h = width, height
-    chain: list[tuple[int, int]] = [(width, height)]
-    if head and (width, height) != head:
-        chain.append(head)
-    chain.extend([(640, 480), (320, 240)])
-    for w, h in chain:
-        try:
-            raw = _capture_raw(cfg, guid, w, h, timing)
-            actual_w, actual_h = w, h
-            if (w, h) != chain[0]:
-                fallback_used = f"{chain[0][0]}x{chain[0][1]} failed; captured at {w}x{h}"
-            break
-        except ConsoleError as exc:
-            if (w, h) == chain[-1]:
-                raise
-            fallback_used = f"{chain[0][0]}x{chain[0][1]}: {exc}"
-    assert raw is not None
+    if used != (width, height):
+        fallback_used = f"{width}x{height} failed; captured at {used[0]}x{used[1]}"
     prefix_hex = raw[:_PREFIX_LEN].hex()
     frame = _decode_frame(raw, actual_w, actual_h)
     meta = {
@@ -790,15 +1053,34 @@ def get_display_info(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
             "timings": _wmi_timings(connect_ms, t),
         }
     timing = _PsTiming()
-    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
-    script = _DISPLAY_INFO_SCRIPT.replace("%NS%", _WMI_NS).replace("%GUID%", ref.id)
-    result = _run(cfg, script.strip(), timeout_s=60, timing=timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
+    script = "\n".join([
+        prelude,
+        _VM_LOOKUP,
+        _HEAD_LOOKUP,
+        _KEYBOARD_LOOKUP_SOFT,
+        _MOUSE_SYNTHETIC,
+        "$mouse = $m | Select-Object -First 1\n",
+        "Write-Output ('VMID=' + $vmTarget)\n",
+        "[PSCustomObject]@{\n",
+        "    enabled_state = $vm.EnabledState\n",
+        "    head_horizontal = if ($vh) { $vh.CurrentHorizontalResolution } else { $null }\n",
+        "    head_vertical = if ($vh) { $vh.CurrentVerticalResolution } else { $null }\n",
+        "    keyboard_present = [bool]$kb\n",
+        "    keyboard_enabled = if ($kb) { $kb.EnabledState } else { $null }\n",
+        "    mouse_present = [bool]$mouse\n",
+        "    mouse_enabled = if ($mouse) { $mouse.EnabledState } else { $null }\n",
+        "} | ConvertTo-Json -Compress\n",
+    ])
+    result = _run(cfg, script, timeout_s=60, timing=timing)
     _check_rc(result, "console display info")
+    meta_lines, payload_line = _meta_lines(result)
+    guid = _parse_guid(meta_lines, vm_name or ref.name)
     try:
-        data = json.loads(result.stdout)
+        data = json.loads(payload_line)
     except json.JSONDecodeError as exc:
         raise ConsoleError(f"display info parse failed: {exc}") from None
-    data["vm_id"] = ref.id
+    data["vm_id"] = guid
     data["guest_channel"] = "ps_direct_unverified"
     data["guest_channel_note"] = (
         "console input works from firmware/WinPE; PowerShell Direct requires a "
@@ -841,44 +1123,56 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
             "timings": _wmi_timings(connect_ms, *phase_dicts),
         }
     timing = _PsTiming()
-    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
-    guid = ref.id
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
     chunks = [text[i:i + 512] for i in range(0, len(text), 512)]
-    calls = 0
+    # Text rides stdin as UTF-8 base64 — never in the script, argv, or error
+    # records (CLIXML errors quote script lines). Every chunk is one stdin line
+    # and the loop reads one line per iteration.
+    # Remote mode: the composer's preamble read the lines and forwarded them as
+    # scriptblock parameters ($__p0.., collected into $payloads) because a remote
+    # block cannot read local stdin; local mode keeps the inline read.
+    if pswindows.hyperv_host(cfg):
+        read_expr = "$payloads[$i]"
+        payload_init = (
+            "$payloads = @("
+            + ", ".join(f"$__p{i}" for i in range(len(chunks)))
+            + ")\n"
+        )
+    else:
+        read_expr = "[Console]::In.ReadLine()"
+        payload_init = ""
+    call = (
+        "$text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("
+        + read_expr + "))\n"
+        "    $r = Invoke-CimMethod -InputObject $kb -MethodName TypeText "
+        "-ErrorAction Stop -Arguments @{ AsciiText = $text }\n"
+        "    if ($r.ReturnValue -ne 0) { throw ('TypeText failed with ReturnValue=' "
+        "+ $r.ReturnValue + ' at chunk ' + ($i+1) + '/' + $n) }\n"
+        "    Write-Output ('RC=' + $r.ReturnValue + ' CHUNK=' + ($i+1) + '/' + $n)\n"
+        "    if ($i -lt $n - 1) { Start-Sleep -Milliseconds 50 }\n"
+    )
+    script = "\n".join([
+        prelude,
+        _VM_LOOKUP,
+        _KEYBOARD_LOOKUP,
+        payload_init,
+        "$n = " + str(len(chunks)),
+        "for ($i = 0; $i -lt $n; $i++) {",
+        call,
+        "}",
+    ])
     with _input_lock(ref):
-        for i, chunk in enumerate(chunks):
-            # Text rides stdin as UTF-8 base64 — never in the script, argv, or
-            # error records (CLIXML errors quote script lines).
-            # Remote mode: the composer's local preamble read the line and
-            # forwarded it as scriptblock parameter $__p0 (a remote block
-            # cannot read local stdin); local mode keeps the inline read
-            # byte-identical to the historic emission.
-            read_expr = (
-                "[Convert]::FromBase64String($__p0)"
-                if pswindows.hyperv_host(cfg) else
-                "[Convert]::FromBase64String([Console]::In.ReadLine())"
-            )
-            call = (
-                "$text = [System.Text.Encoding]::UTF8.GetString("
-                + read_expr + ")\n"
-                "$r = Invoke-CimMethod -InputObject $kb -MethodName TypeText "
-                "-ErrorAction Stop -Arguments @{ AsciiText = $text }\n"
-                "if ($r.ReturnValue -ne 0) { throw ('TypeText failed with ReturnValue=' + $r.ReturnValue) }\n"
-                "Write-Output ('RC=' + $r.ReturnValue + ' CHUNK=' + %I + '/' + %N)\n"
-            ).replace("%I", str(i + 1)).replace("%N", str(len(chunks)))
-            script = _KEYBOARD_SCRIPT_TMPL.replace("%NS%", _WMI_NS).replace(
-                "%GUID%", guid.lower()
-            ).replace("%CALL%", call)
-            result = _run(cfg,
-                script.strip(), timeout_s=90, stdin_b64=pswindows.utf8_b64(chunk),
-                timing=timing,
-            )
-            _check_rc(result, f"console type_text chunk {i + 1}/{len(chunks)}")
-            calls += 1
-            if i < len(chunks) - 1:
-                time.sleep(0.05)
+        result = _run(
+            cfg,
+            script,
+            timeout_s=90,
+            stdin_b64="\n".join(pswindows.utf8_b64(chunk) for chunk in chunks),
+            payload_lines=len(chunks),
+            timing=timing,
+        )
+    _check_rc(result, "console type_text")
     return {
-        "ok": True, "chunks": calls, "chars": len(text), "vm_name": ref.name,
+        "ok": True, "chunks": len(chunks), "chars": len(text), "vm_name": ref.name,
         "timings": _ps_timings(timing),
     }
 
@@ -906,9 +1200,9 @@ def press_key(
         codes = _scancodes_for_combo([key] + list(modifiers or []))
         return _send_scancodes_locked(cfg, ref, codes, be=be, connect_ms=connect_ms)
     timing = _PsTiming()
-    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
     codes = _scancodes_for_combo([key] + list(modifiers or []))
-    return _send_scancodes_locked(cfg, ref, codes, timing=timing)
+    return _send_scancodes_locked(cfg, ref, codes, timing=timing, prelude=prelude)
 
 
 def key_combo(cfg: Config, vm_name: str = "", keys: list[str] | None = None, vm_id: str = "") -> dict:
@@ -920,9 +1214,9 @@ def key_combo(cfg: Config, vm_name: str = "", keys: list[str] | None = None, vm_
         codes = _scancodes_for_combo(keys)
         return _send_scancodes_locked(cfg, ref, codes, be=be, connect_ms=connect_ms)
     timing = _PsTiming()
-    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
     codes = _scancodes_for_combo(keys)
-    return _send_scancodes_locked(cfg, ref, codes, timing=timing)
+    return _send_scancodes_locked(cfg, ref, codes, timing=timing, prelude=prelude)
 
 
 def type_scancodes(cfg: Config, vm_name: str = "", scancodes: list[int] | None = None, vm_id: str = "") -> dict:
@@ -936,8 +1230,8 @@ def type_scancodes(cfg: Config, vm_name: str = "", scancodes: list[int] | None =
     if be is not None and ref is not None:
         return _send_scancodes_locked(cfg, ref, list(scancodes), be=be, connect_ms=connect_ms)
     timing = _PsTiming()
-    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
-    return _send_scancodes_locked(cfg, ref, list(scancodes), timing=timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
+    return _send_scancodes_locked(cfg, ref, list(scancodes), timing=timing, prelude=prelude)
 
 
 def _send_scancodes_locked(
@@ -947,6 +1241,7 @@ def _send_scancodes_locked(
     be=None,
     connect_ms: float = 0.0,
     timing: _PsTiming | None = None,
+    prelude: str | None = None,
 ) -> dict:
     chunks = [codes[i:i + 64] for i in range(0, len(codes), 64)]
     if be is not None:
@@ -966,24 +1261,36 @@ def _send_scancodes_locked(
             "ok": True, "scancodes_sent": sent, "chunks": len(chunks),
             "vm_name": ref.name, "timings": _wmi_timings(connect_ms, *phase_dicts),
         }
-    sent = 0
+    assert prelude is not None, "the PowerShell path requires the $vmTarget prelude"
+    # Scancodes ride IN the script as ONE flat code array and the loop slices
+    # its 64-code window per chunk (a nested array-of-arrays is not safe here:
+    # PS 5.1 flattens @(@(a,b)) for a single chunk, which would send one byte).
+    # Unlike typed text they carry no stdin read, which keeps the pinned
+    # ReadLine census at exactly one emission inside type_text.
+    call = "\n".join([
+        "$lo = $i * 64",
+        "    $hi = [math]::Min($lo + 63, $chunks.Count - 1)",
+        "    $r = Invoke-CimMethod -InputObject $kb -MethodName TypeScancodes "
+        "-ErrorAction Stop -Arguments @{ ScanCodes = [byte[]]$chunks[$lo..$hi] }",
+        "    if ($r.ReturnValue -ne 0) { throw ('TypeScancodes failed with ReturnValue=' "
+        "+ $r.ReturnValue + ' at chunk ' + ($i+1) + '/' + $n) }",
+        "    Write-Output ('RC=' + $r.ReturnValue + ' CHUNK=' + ($i+1) + '/' + $n)",
+        "    if ($i -lt $n - 1) { Start-Sleep -Milliseconds 20 }",
+    ]) + "\n"
+    script = "\n".join([
+        prelude,
+        _VM_LOOKUP,
+        _KEYBOARD_LOOKUP,
+        "$chunks = @(" + ",".join(str(c) for c in codes) + ")",
+        "$n = " + str(len(chunks)),
+        "for ($i = 0; $i -lt $n; $i++) {",
+        call,
+        "}",
+    ])
     with _input_lock(ref):
-        for i, chunk in enumerate(chunks):
-            arr = ",".join(str(c) for c in chunk)
-            call = (
-                "$r = Invoke-CimMethod -InputObject $kb -MethodName TypeScancodes "
-                "-ErrorAction Stop -Arguments @{ ScanCodes = [byte[]](" + arr + ") }\n"
-                "if ($r.ReturnValue -ne 0) { throw ('TypeScancodes failed with ReturnValue=' + $r.ReturnValue) }\n"
-                "Write-Output ('RC=' + $r.ReturnValue + ' CHUNK=' + %I + '/' + %N)\n"
-            ).replace("%I", str(i + 1)).replace("%N", str(len(chunks)))
-            script = _KEYBOARD_SCRIPT_TMPL.replace("%NS%", _WMI_NS).replace(
-                "%GUID%", ref.id
-            ).replace("%CALL%", call)
-            result = _run(cfg, script.strip(), timeout_s=90, timing=timing)
-            _check_rc(result, f"console scancodes chunk {i + 1}/{len(chunks)}")
-            sent += len(chunk)
-            if i < len(chunks) - 1:
-                time.sleep(0.02)  # pacing: let the Hyper-V input buffer drain
+        result = _run(cfg, script, timeout_s=90, timing=timing)
+    _check_rc(result, "console scancodes")
+    sent = sum(len(chunk) for chunk in chunks)
     out = {"ok": True, "scancodes_sent": sent, "chunks": len(chunks), "vm_name": ref.name}
     if timing is not None:
         out["timings"] = _ps_timings(timing)
@@ -999,6 +1306,8 @@ def mouse_move(
     # policy/spawn so the invalid call costs nothing.
     if x is None or y is None:
         raise ValueError("x and y are required")
+    if (frame_width or frame_height) and (frame_width <= 0 or frame_height <= 0):
+        raise ValueError("frame_width/frame_height must be positive when given")
     policy.require_category(cfg, "console_input", f"move mouse on '{vm_name}' console")
     be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
     if be is not None and ref is not None:
@@ -1015,13 +1324,21 @@ def mouse_move(
             "timings": _wmi_timings(connect_ms, t_head, t),
         }
     timing = _PsTiming()
-    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
-    head = _head_resolution(cfg, ref.id, timing)
-    hx, hy = _scale_to_head(x, y, frame_width, frame_height, head)
-    return _mouse_op(cfg, ref, f"move to ({hx},{hy})",
-                     "SetAbsolutePosition",
-                     f"@{{ HorizontalPosition = {hx}; VerticalPosition = {hy} }}",
-                     extra={"head_x": hx, "head_y": hy}, timing=timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
+    script = _folded_mouse_positional_script(
+        prelude, x, y, frame_width, frame_height, click=False, button=1
+    )
+    with _input_lock(ref):
+        result = _run(cfg, script, timeout_s=90, timing=timing)
+    _check_rc(result, "console mouse move")
+    meta_lines, _payload = _meta_lines(result)
+    hx = _require_int(meta_lines, "HEADX", "mouse move")
+    hy = _require_int(meta_lines, "HEADY", "mouse move")
+    return {
+        "ok": True, "operation": f"move to ({hx},{hy})", "vm_name": ref.name,
+        "head_x": hx, "head_y": hy,
+        "timings": _ps_timings(timing),
+    }
 
 
 def click(
@@ -1031,6 +1348,8 @@ def click(
     policy.require_category(cfg, "console_input", f"click on '{vm_name}' console")
     if button not in (1, 2):
         raise ValueError("button must be 1 (left) or 2 (right)")
+    if (frame_width or frame_height) and (frame_width <= 0 or frame_height <= 0):
+        raise ValueError("frame_width/frame_height must be positive when given")
     be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
     if be is not None and ref is not None:
         try:
@@ -1051,30 +1370,30 @@ def click(
             "timings": _wmi_timings(connect_ms, t_head, t), **extra,
         }
     timing = _PsTiming()
-    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
-    head = _head_resolution(cfg, ref.id, timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
     if x or y:
-        hx, hy = _scale_to_head(x, y, frame_width, frame_height, head)
-        move_call = (
-            "$r0 = Invoke-CimMethod -InputObject $m -MethodName SetAbsolutePosition "
-            "-ErrorAction Stop -Arguments @{ HorizontalPosition = " + str(hx) +
-            "; VerticalPosition = " + str(hy) + " }\n"
-            "    if ($r0.ReturnValue -ne 0) { throw ('SetAbsolutePosition failed with ReturnValue=' + $r0.ReturnValue) }\n"
-            "    "
+        script = _folded_mouse_positional_script(
+            prelude, x, y, frame_width, frame_height, click=True, button=button
         )
-        extra = {"head_x": hx, "head_y": hy}
-    else:
-        move_call = ""
-        extra = {}
+        with _input_lock(ref):
+            result = _run(cfg, script, timeout_s=90, timing=timing)
+        _check_rc(result, "console mouse click")
+        meta_lines, _payload = _meta_lines(result)
+        hx = _require_int(meta_lines, "HEADX", "click")
+        hy = _require_int(meta_lines, "HEADY", "click")
+        return {
+            "ok": True, "operation": f"click button {button}", "vm_name": ref.name,
+            "head_x": hx, "head_y": hy,
+            "timings": _ps_timings(timing),
+        }
+    # x=0,y=0 means 'click at current position' — no positioning leg at all.
     call = (
-        move_call
-        + "$r = Invoke-CimMethod -InputObject $m -MethodName ClickButton "
+        "$r = Invoke-CimMethod -InputObject $m -MethodName ClickButton "
         + "-ErrorAction Stop -Arguments @{ ButtonIndex = " + str(button) + " }\n"
-        + "    if ($r.ReturnValue -ne 0) { throw ('ClickButton failed with ReturnValue=' + $r.ReturnValue) }\n"
-        + "    Write-Output ('RC=' + $r.ReturnValue)\n"
+        + "if ($r.ReturnValue -ne 0) { throw ('ClickButton failed with ReturnValue=' + $r.ReturnValue) }\n"
+        + "Write-Output ('RC=' + $r.ReturnValue)\n"
     )
-    out = _mouse_op(cfg, ref, f"click button {button}", call=call, extra=extra, timing=timing)
-    return out
+    return _mouse_op(cfg, ref, f"click button {button}", prelude, call=call, timing=timing)
 
 
 def mouse_button(
@@ -1095,9 +1414,10 @@ def mouse_button(
             "vm_name": ref.name, "timings": _wmi_timings(connect_ms, t),
         }
     timing = _PsTiming()
-    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
     return _mouse_op(
         cfg, ref, f"button {button} {'down' if is_down else 'up'}",
+        prelude,
         "SetButtonState",
         f"@{{ ButtonIndex = {button}; IsDown = ${'true' if is_down else 'false'} }}",
         timing=timing,
@@ -1118,8 +1438,8 @@ def scroll(cfg: Config, vm_name: str = "", delta: int = 0, vm_id: str = "") -> d
             "timings": _wmi_timings(connect_ms, t),
         }
     timing = _PsTiming()
-    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
-    return _mouse_op(cfg, ref, f"scroll {delta}",
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
+    return _mouse_op(cfg, ref, f"scroll {delta}", prelude,
                      "SetScrollPosition", f"@{{ ScrollPositionDelta = {int(delta)} }}",
                      timing=timing)
 
@@ -1128,27 +1448,35 @@ def _mouse_op(
     cfg: Config,
     ref: vmident.VMRef,
     detail: str,
+    prelude: str,
     method: str | None = None,
     args_literal: str = "",
     call: str | None = None,
     extra: dict | None = None,
     timing: _PsTiming | None = None,
 ) -> dict:
+    """One non-positional mouse op in one process: the synthetic mouse, or
+    the PS/2 fallback under the same SystemName filter (AC14)."""
     if call is None:
         assert method is not None
         call = (
             "$r = Invoke-CimMethod -InputObject $m -MethodName " + method + " "
             "-ErrorAction Stop -Arguments " + args_literal + "\n"
-            "    if ($r.ReturnValue -ne 0) { throw ('" + method + " failed with ReturnValue=' + $r.ReturnValue) }\n"
-            "    Write-Output ('RC=' + $r.ReturnValue)\n"
+            "if ($r.ReturnValue -ne 0) { throw ('" + method + " failed with ReturnValue=' + $r.ReturnValue) }\n"
+            "Write-Output ('RC=' + $r.ReturnValue)\n"
         )
-    script = (
-        _MOUSE_FOR_VM_SCRIPT.replace("%NS%", _WMI_NS)
-        .replace("%GUID%", ref.id)
-        .replace("%CALL%", call)
-    )
+    script = "\n".join([
+        prelude,
+        _VM_LOOKUP,
+        _MOUSE_SYNTHETIC,
+        "if (-not $m) {\n",
+        _MOUSE_PS2,
+        "    if (-not $m) { throw 'no mouse device associated with the VM' }\n",
+        "}\n",
+        call,
+    ])
     with _input_lock(ref):
-        result = _run(cfg, script.strip(), timeout_s=90, timing=timing)
+        result = _run(cfg, script, timeout_s=90, timing=timing)
     _check_rc(result, f"console mouse {detail}")
     out = {"ok": True, "operation": detail, "vm_name": ref.name}
     if extra:
@@ -1182,23 +1510,15 @@ def wait_frame_change(
             be, connect_ms, ref_wmi, baseline_hash, width, height, timeout_s, interval_s
         )
     timing = _PsTiming()
-    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
     # On the WMI transport the deadline is enforced BETWEEN polls (a single
     # in-flight COM capture is not interruptible; the PowerShell transport's
     # child process is killed at timeout_s + 15). See README console-transport.
-    max_polls = math.ceil(timeout_s / interval_s)
-    script = (
-        _WAIT_FRAME_SCRIPT_TMPL.replace("%NS%", _WMI_NS)
-        .replace("%GUID%", ref.id)
-        .replace("%TIMEOUT_S%", str(int(timeout_s)))
-        .replace("%MAX_POLLS%", str(max_polls))
-        .replace("%W%", str(width))
-        .replace("%H%", str(height))
-        .replace("%INTERVAL_MS%", str(interval_s * 1000))
-        .replace("%BASELINE%", baseline_hash)
+    script = _folded_wait_frame_script(
+        prelude, baseline_hash, width, height, timeout_s, interval_s
     )
     started = time.monotonic()
-    result = _run(cfg, script.strip(), timeout_s=int(timeout_s) + 15, timing=timing)
+    result = _run(cfg, script, timeout_s=int(timeout_s) + 15, timing=timing)
     elapsed_ms = int((time.monotonic() - started) * 1000)
     _check_rc(result, "console wait_frame_change")
 
@@ -1305,14 +1625,15 @@ def capture_sequence(
     if be is not None and ref_wmi is not None:
         return _capture_sequence_wmi(be, connect_ms, ref_wmi, count, interval_s, width, height)
     timing = _PsTiming()
-    ref = _resolve_ps(cfg, vm_name, vm_id, timing)
-    guid = ref.id
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
     frames: list[dict] = []
     images: list = []
     prev_raw: bytes | None = None
     started = time.monotonic()
     for i in range(count):
-        raw = _capture_raw(cfg, guid, width, height, timing)
+        # Each frame is its own self-contained process (the prelude resolves the
+        # VM), so there is no separate GUID process — at most one per frame.
+        raw = _capture_raw(cfg, prelude, width, height, timing)
         h = _frame_hash(raw)
         changed_bytes = (
             sum(1 for a, b in zip(prev_raw, raw, strict=True) if a != b) if prev_raw is not None else 0
