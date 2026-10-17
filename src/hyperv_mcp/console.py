@@ -803,12 +803,6 @@ def _normalise_format(mime: str) -> str:
     return key
 
 
-def _encode_png(img: PILImage.Image) -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
-
 def _decode_frame(raw: bytes, width: int, height: int) -> Frame:
     """Decode a thumbnail payload to a frame carrying its single PNG encoding."""
     return Frame.from_image(_decode_rgb565_image(raw, width, height))
@@ -982,7 +976,9 @@ def _finish_screenshot(
     like with like whatever output options the caller picked.
 
     Returns `(None, meta)` with `unchanged: true` when `if_changed_from` matches;
-    in that case no decode, no encode and no file write happen.
+    in that case no decode, no encode and no file write happen, and the metadata
+    still carries the captured `width`/`height` so the caller knows what the
+    unchanged frame WAS.
     """
     mime, resolved_quality, resolved_scale, crop_box = _resolve_output_options(
         fmt, quality, scale, crop, actual_w, actual_h
@@ -991,6 +987,8 @@ def _finish_screenshot(
     meta = dict(common)
     meta["frame_hash"] = frame_hash
     meta["prefix_hex"] = raw[:_PREFIX_LEN].hex()
+    meta["width"] = actual_w
+    meta["height"] = actual_h
 
     if if_changed_from:
         if not re.fullmatch(r"[0-9a-f]{64}", if_changed_from):
@@ -1000,13 +998,13 @@ def _finish_screenshot(
         if if_changed_from == frame_hash:
             return None, {**meta, "unchanged": True}
 
-    frame = _decode_frame(raw, actual_w, actual_h)
+    # Decode to a bare image, shape it, then encode exactly once: routing the
+    # shaped path through _decode_frame would encode a PNG that is immediately
+    # discarded, which is the second encode issue #17 removed.
+    img = _decode_rgb565_image(raw, actual_w, actual_h)
     if crop_box is not None or resolved_scale is not None:
-        frame = Frame.from_image(
-            _shape_frame(frame, resolved_scale, crop_box), mime, resolved_quality
-        )
-    elif mime != "image/png":
-        frame = Frame.from_image(frame, mime, resolved_quality)
+        img = _shape_frame(img, resolved_scale, crop_box)
+    frame = Frame.from_image(img, mime, resolved_quality)
 
     width, height = frame.size
     meta["width"] = width
