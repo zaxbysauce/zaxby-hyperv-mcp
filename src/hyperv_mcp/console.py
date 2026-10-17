@@ -719,12 +719,15 @@ class Frame(PILImage.Image):
 
     @classmethod
     def from_png(cls, png: bytes) -> Frame:
-        """Rebuild a frame from its PNG encoding.
+        """Rebuild a frame from a PNG encoding.
 
-        The encoding IS the frame, so a copy, a deepcopy and a pickle all
-        round-trip through here and keep the class and `png` intact.
+        `_rebuild_frame` handles the general case (any format), so the internal
+        copy/deepcopy/pickle path no longer routes through here; this remains
+        the explicit PNG entry point for a caller holding PNG bytes. Note that
+        rebuilding re-encodes, so it is not a byte-identity guarantee for a
+        frame that was created in another format.
         """
-        return cls.from_image(PILImage.open(io.BytesIO(png)))
+        return cls.from_image(PILImage.open(io.BytesIO(png)), "image/png")
 
     def __copy__(self) -> Frame:
         # PIL.Image.__copy__ returns a plain Image, which would silently drop
