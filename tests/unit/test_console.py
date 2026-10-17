@@ -608,19 +608,24 @@ def test_dimension_bounds_rejected_everywhere(unrestricted):
 # ---------------------------------------------------------------------------
 
 def test_wait_frame_change_hash_roundtrips_as_baseline(monkeypatch, unrestricted):
-    """The HASH= value must be full lowercase-hex sha256 — byte-identical to
-    _frame_hash — so it passes baseline_hash validation and can be chained."""
+    """The HASH= value must be full lowercase-hex sha256 of the PIXEL payload
+    (after the opaque 4-byte prefix) — byte-identical to _frame_hash — so it
+    passes baseline_hash validation and can be chained (issue #19: the poll
+    loop and the host hash the same pixel-only domain)."""
     import hashlib
 
     w, h = 320, 240
     payload = b"\x00\x00\x00\x00" + b"\x5a\xa5" * (w * h)
-    expected = hashlib.sha256(payload).hexdigest()
+    expected = hashlib.sha256(payload[4:]).hexdigest()
     fake = FakePS([
         pswindows.PSResult(stdout=f"STOP=deadline POLLS=4 HASH={expected}", returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = console.wait_frame_change(unrestricted, "vm1", width=w, height=h)
-    assert out["frame_hash"] == expected
+    assert out["frame_hash"] == expected, (
+        "AC11b: the host frame_hash must be the SHA-256 of the pixel payload "
+        "after the opaque 4-byte prefix, matching the poll loop's HASH="
+    )
     # the deadline-path hash must now be ACCEPTED as a baseline
     changed = pswindows.PSResult(
         stdout=f"STOP=changed POLLS=1 HASH={'f' * 64}\n"
@@ -630,7 +635,10 @@ def test_wait_frame_change_hash_roundtrips_as_baseline(monkeypatch, unrestricted
     out2 = console.wait_frame_change(
         unrestricted, "vm1", baseline_hash=out["frame_hash"], width=w, height=h)
     assert out2["stop_reason"] == "changed"
-    assert out2["frame_hash"] == expected  # host/PS hash formats agree
+    assert out2["frame_hash"] == expected, (  # host/PS hash formats agree
+        "AC11b: the chained baseline must round-trip: the recomputed host "
+        "frame_hash must equal the poll loop's HASH= value"
+    )
 
 
 def test_display_info_emits_snake_case_enabled_state(monkeypatch, unrestricted):

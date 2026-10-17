@@ -84,6 +84,11 @@ def capture_evidence(
     ui_tree_max_elements: int = 200,
     cred: CredentialSet | None = None,
     vm_id: str = "",
+    fmt: str = "",
+    quality=None,
+    scale=None,
+    crop=None,
+    if_changed_from: str = "",
 ) -> dict:
     """Screenshot + evidence metadata, optionally with a guest UIA tree.
 
@@ -97,9 +102,15 @@ def capture_evidence(
     Returns {ok, image: <console.Frame>, meta: <screenshot meta extended with
     ui_tree>} mirroring console.screenshot's (image, meta) tuple contract; the
     image is a console.Frame — a PIL.Image.Image subclass carrying the decoded
-    pixels and the single PNG encoding made for them, which the server layer
+    pixels and the single encoding made for them, which the server layer
     reuses rather than encoding again. The server layer converts to
     [ImageContent, TextContent].
+
+    `image` is None when `if_changed_from` matches the current capture: the
+    frame is unchanged, so nothing is decoded, encoded or written, and `meta`
+    carries `unchanged: true`. The output options (`fmt`, `quality`, `scale`,
+    `crop`) are the same ones console.screenshot validates, so an unsupported
+    value is refused here too rather than silently ignored.
     """
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     tree_cred: CredentialSet | None = None
@@ -112,7 +123,9 @@ def capture_evidence(
         tree_cred = cred
 
     image, meta = console.screenshot(
-        cfg, width=width, height=height, save_path=save_path, vm_id=ref.id
+        cfg, width=width, height=height, save_path=save_path, vm_id=ref.id,
+        fmt=fmt, quality=quality, scale=scale, crop=crop,
+        if_changed_from=if_changed_from,
     )
     ui: dict[str, Any] = {"requested": ui_tree}
     if tree_cred is not None:

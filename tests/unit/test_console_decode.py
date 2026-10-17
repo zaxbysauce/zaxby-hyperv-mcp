@@ -85,5 +85,14 @@ def test_frame_hash_stable_and_discriminating():
     raw_b = _encode_buffer([(255, 255, 255)] * (W * H))
     assert _frame_hash(raw_a) == _frame_hash(raw_a)
     assert _frame_hash(raw_a) != _frame_hash(raw_b)
-    # prefix participates in the hash (raw capture identity)
-    assert _frame_hash(raw_a) != _frame_hash(raw_a[:4] + b"\x01\x02\x03\x04" + raw_a[4:])
+    # The 4-byte prefix is opaque and OUTSIDE the frame identity (issue #19):
+    # REPLACING only the prefix must leave the hash unchanged (the hash covers
+    # the pixel payload), while a changed pixel must change it. The old
+    # insertion-form operand (4 bytes longer) discriminated nothing.
+    assert _frame_hash(raw_a) == _frame_hash(b"\xDE\xAD\xBE\xEF" + raw_a[4:]), (
+        "AC19: replacing only the opaque 4-byte prefix must leave frame_hash "
+        "unchanged — the hash covers the pixel payload, not the prefix"
+    )
+    assert _frame_hash(raw_a) != _frame_hash(
+        _encode_buffer([(255, 255, 255)] + [(0, 0, 0)] * (W * H - 1))
+    ), "AC19: a changed pixel must change frame_hash"

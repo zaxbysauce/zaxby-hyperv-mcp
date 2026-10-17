@@ -150,6 +150,15 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
   `FastMCP`). New dependencies arrive with it: `httpx2` (also a direct
   dependency — the stdio proxy's upstream HTTP client), plus the transitives
   `mcp-types`, `opentelemetry-api`, and `pywin32` on Windows.
+- **`frame_hash` covers the pixel payload only.** `frame_hash` is the SHA-256
+  of the thumbnail's PIXEL bytes — the payload after the 4-byte opaque prefix —
+  not of the whole payload. The prefix is outside the frame identity, so an
+  unchanged screen now produces one hash even if the prefix drifts between
+  captures. This changes the VALUE of every `frame_hash`, so a `baseline_hash`
+  or `if_changed_from` recorded by an earlier version no longer matches: take a
+  fresh capture and chain from that. The host and the in-guest `wait_frame_change`
+  poll loop hash the same slice with the same lowercase-hex encoding, so a
+  returned `frame_hash` still round-trips as a `baseline_hash`.
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
@@ -979,7 +988,7 @@ guest 404 arrives as 404 with the relay error envelope); a request racing
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_capture_evidence` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `ui_tree=false`, `ui_tree_depth=3`, `ui_tree_max_elements=200` | `[ImageContent, TextContent(meta)]` |
+| `hyperv_capture_evidence` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `ui_tree=false`, `ui_tree_depth=3`, `ui_tree_max_elements=200`, `format?`, `quality?`, `scale?`, `crop?`, `if_changed_from?` | `[ImageContent, TextContent(meta)]` — metadata alone when `if_changed_from` matches |
 
 One call pairing the console screenshot with `captured_at` (UTC ISO-8601),
 `vm_id`, capture dimensions, `frame_hash`, and — when `ui_tree=true` — a
@@ -995,7 +1004,7 @@ screenshot still ships.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_console_screenshot` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?` | MCP ImageContent(image/png) + metadata text (vm_id, frame_hash, head res, scale note, fallback_used, captured_at) |
+| `hyperv_console_screenshot` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `format?` (png\|jpeg/jpg\|webp), `quality?` (1..100), `scale?` (0,1], `crop?` ([left,top,right,bottom]), `if_changed_from?` (frame_hash) | MCP ImageContent + metadata text (vm_id, frame_hash, head res, scale note, fallback_used, captured_at) — metadata alone when `if_changed_from` matches |
 | `hyperv_console_get_display_info` | `vm_name` or `vm_id` | `{ok, enabled_state, head_horizontal, head_vertical, keyboard_present, keyboard_enabled, mouse_present, mouse_enabled, guest_channel, guest_channel_note, vm_id}` |
 | `hyperv_console_type_text` | `vm_name` or `vm_id`, `text` (ASCII) | `{ok, chunks, chars}` |
 | `hyperv_console_press_key` | `vm_name` or `vm_id`, `key`, `modifiers[]` | `{ok, scancodes_sent, chunks}` |
@@ -1008,7 +1017,7 @@ screenshot still ships.
 | `hyperv_console_wait_frame_change` | `vm_name` or `vm_id`, `baseline_hash=""`, `width=640`, `height=480`, `timeout_s=60`, `interval_s=2` | list[ImageContent(image/png), TextContent({stop_reason: changed\|deadline, polls, elapsed_ms, frame_hash})] or deadline dict |
 | `hyperv_console_capture_sequence` | `vm_name` or `vm_id`, `count=3`, `interval_s=2`, `width=640`, `height=480` | [first Image, last Image (a single Image when count==1), meta_text(frames[] with per-frame hash + changed_bytes_vs_previous)] |
 
-Console notes: text rides the stdin channel (never in argv/script/errors); non-ASCII input must use type_scancodes; mouse coordinates are in the space of the observed image — pass `frame_width`/`frame_height` matching your screenshot dimensions to scale to head space, or omit them to use head coordinates directly; `wait_frame_change` with `baseline_hash=""` treats the first polled frame as the baseline, and a returned `frame_hash` can be passed back as `baseline_hash` to detect changes across calls (both are the full lowercase-hex sha256 of the raw frame payload); WinPE errors and wizard screens are returned as images for visual interpretation (no OCR is performed).
+Console notes: text rides the stdin channel (never in argv/script/errors); non-ASCII input must use type_scancodes; mouse coordinates are in the space of the observed image — pass `frame_width`/`frame_height` matching your screenshot dimensions to scale to head space, or omit them to use head coordinates directly; `wait_frame_change` with `baseline_hash=""` treats the first polled frame as the baseline, and a returned `frame_hash` can be passed back as `baseline_hash` to detect changes across calls (both are the full lowercase-hex sha256 of the PIXEL payload, i.e. the thumbnail bytes after the 4-byte opaque prefix — see the 0.4.0 breaking change below); WinPE errors and wizard screens are returned as images for visual interpretation (no OCR is performed).
 
 #### Console transport: in-process WMI or PowerShell (issue #45)
 
