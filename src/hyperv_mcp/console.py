@@ -89,6 +89,7 @@ from typing import Any
 from PIL import Image as PILImage
 
 from . import guestexec, policy, pswindows, vmident, vmlocks, wmiconsole
+from . import timing as timing_mod
 from .config import Config
 
 _WMI_NS = "root\\virtualization\\v2"
@@ -582,6 +583,39 @@ def _wmi_timings(connect_ms: float, *phase_dicts: dict) -> dict:
     }
 
 
+def _meta_timing(t0: float, ps_timing: _PsTiming | None, *, wmi: bool = False) -> dict:
+    """The per-call `timing` block for an image tool's metadata (issue #20).
+
+    Prefers the active audit operation's collector, which is the value the
+    server records. With no collector (a direct module call — the
+    consolebench operator CLI drives console.screenshot that way), the block is
+    derived from the op's own accumulators so it is never a fabricated zero.
+
+    `t0` is `time.monotonic()` taken at the op's entry, before transport
+    selection; it is unused when a collector is active, because the collector's
+    own `total_ms` wins.
+
+    On the in-process WMI path no PowerShell process is started at all, so
+    `ps_spawns`/`ps_ms` are honestly zero rather than defaults.
+    """
+    collector = timing_mod.current()
+    if collector is not None:
+        return collector.snapshot()
+    total_ms = int((time.monotonic() - t0) * 1000)
+    if wmi:
+        return {**timing_mod.zeroed(), "total_ms": total_ms}
+    spawns = list(ps_timing.spawn_ms) if ps_timing is not None else []
+    return {
+        "lock_wait_ms": 0,
+        "ps_ms": int(sum(spawns)),
+        "ps_spawns": len(spawns),
+        "total_ms": total_ms,
+        "ps_startup_ms": None,
+        "psdirect_session_ms": None,
+        "guest_ms": None,
+    }
+
+
 def _try_backend(cfg: Config) -> tuple[Any | None, float]:
     """(backend, connect_ms) when the in-process WMI transport can serve
     this call, (None, 0.0) otherwise.
@@ -889,6 +923,7 @@ def screenshot(
     MCP image content. Raises on failure (uniform list-form success shape)."""
     if not (160 <= width <= 4096 and 160 <= height <= 4096):
         raise ValueError("width/height must be within 160..4096")
+    t0 = time.monotonic()
     be, connect_ms = _try_backend(cfg)
     ref: vmident.VMRef | None = None
     if be is not None:
@@ -898,7 +933,7 @@ def screenshot(
             be = None
     if be is not None:
         assert ref is not None
-        return _screenshot_wmi(cfg, be, connect_ms, ref, width, height, save_path)
+        return _screenshot_wmi(cfg, be, connect_ms, ref, width, height, save_path, t0)
     timing = _PsTiming()
     prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
     # One process for the whole capture: the chain (requested -> head native if
@@ -946,6 +981,7 @@ def screenshot(
         "capture_method": "GetVirtualSystemThumbnailImage (WMI root\\virtualization\\v2)",
         "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
         "timings": _ps_timings(timing),
+        "timing": _meta_timing(t0, timing),
     }
     if save_path:
         policy.check_host_write(cfg, save_path)
@@ -966,6 +1002,7 @@ def _screenshot_wmi(
     width: int,
     height: int,
     save_path: str,
+    t0: float = 0.0,
 ) -> tuple[Frame, dict]:
     """Screenshot over the in-process WMI backend: same metadata contract
     as the PowerShell path (the capture chain keeps its pre-existing
@@ -1012,6 +1049,7 @@ def _screenshot_wmi(
             "capture_method": "GetVirtualSystemThumbnailImage (in-process WMI, issue #45)",
             "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "timings": _wmi_timings(connect_ms, *phase_dicts),
+            "timing": _meta_timing(t0, None, wmi=True),
         }
         if save_path:
             policy.check_host_write(cfg, save_path)

@@ -27,11 +27,12 @@ import sys
 import threading
 import time
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import anyio
 
+from . import timing
 from .config import Config, HttpPolicy
 
 if os.name == "nt":
@@ -94,6 +95,21 @@ class PSResult:
     returncode: int | None = None
     timed_out: bool = False
     duration_ms: int = 0
+    # Timing markers a script emitted, parsed off its stdout by run_ps. Kept out
+    # of __eq__ and repr so existing comparisons and error messages are
+    # byte-stable.
+    timing: dict | None = field(default=None, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Every PSResult this process builds feeds the active call's spawn
+        # accounting, so a stubbed or directly-invoked run_ps is counted
+        # exactly like a real spawn. Doing it here rather than inside run_ps
+        # is what makes the accounting visible to tests that replace run_ps
+        # wholesale, and it also covers vmident's resolve legs, whose results
+        # are discarded everywhere above this layer.
+        collector = timing.current()
+        if collector is not None:
+            collector.add_spawn(self.duration_ms, self.timing)
 
     def ok(self) -> bool:
         return not self.timed_out and self.returncode == 0
@@ -690,12 +706,19 @@ def run_ps(
         _release_ps_slot(slot)
 
     duration_ms = int((time.monotonic() - start) * 1000)
+    # The timing marker is split off BEFORE redaction and before .strip(), so a
+    # marker line can never reach a tool's stdout (an unparseable or hostile
+    # one is removed just as unconditionally as a valid one) and never reaches
+    # the redaction filter. PSResult.__post_init__ then feeds the parsed values
+    # to the active collector.
+    stdout_text, markers = timing.parse_marker(out_b.decode("utf-8", "replace"))
     result = PSResult(
-        stdout=redact(out_b.decode("utf-8", "replace")).strip(),
+        stdout=redact(stdout_text).strip(),
         stderr=redact(_decode_clixml(err_b.decode("utf-8", "replace"))).strip(),
         returncode=None if timed_out else proc.returncode,
         timed_out=timed_out,
         duration_ms=duration_ms,
+        timing=markers,
     )
     return result
 
