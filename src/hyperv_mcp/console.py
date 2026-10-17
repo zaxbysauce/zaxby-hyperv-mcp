@@ -87,6 +87,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from PIL import Image as PILImage
+from PIL import features as _PILFeatures
 
 from . import guestexec, policy, pswindows, vmident, vmlocks, wmiconsole
 from .config import Config
@@ -433,9 +434,10 @@ def _folded_capture_script(prelude: str, width: int, height: int) -> str:
 # Poll loop: bounded by max_polls. When the baseline is empty the FIRST polled
 # frame becomes the baseline (first-poll-is-baseline semantics); change is
 # reported only when a later poll's hash differs from that baseline. HASH is
-# always the full lowercase-hex sha256 of the raw payload — byte-identical to
-# the host-side _frame_hash, so a returned frame_hash round-trips as a
-# baseline_hash for cross-call change detection.
+# always the full lowercase-hex sha256 of the PIXEL payload (the ImageData bytes
+# after the 4-byte opaque prefix) — byte-identical to the host-side _frame_hash,
+# so a returned frame_hash round-trips as a baseline_hash for cross-call change
+# detection.
 def _folded_wait_frame_script(
     prelude: str, baseline_hash: str, width: int, height: int,
     timeout_s: int, interval_s: int,
@@ -460,7 +462,7 @@ def _folded_wait_frame_script(
         "    }\n",
         "    if ($r.ReturnValue -ne 0) { throw ('GetVirtualSystemThumbnailImage failed with ReturnValue=' + $r.ReturnValue) }\n",
         "    $polls++\n",
-        "    $hash = ([System.BitConverter]::ToString($sha.ComputeHash($r.ImageData)) -replace '-','').ToLowerInvariant()\n",
+        "    $hash = ([System.BitConverter]::ToString($sha.ComputeHash($r.ImageData, 4, $r.ImageData.Length - 4)) -replace '-','').ToLowerInvariant()\n",
         "    $lastHash = $hash\n",
         "    if ($baseline -eq '') { $baseline = $hash }\n",
         "    if ($hash -ne $baseline) {\n",
@@ -674,9 +676,10 @@ class Frame(PILImage.Image):
     """A decoded console frame together with the single PNG encoding made for it.
 
     Every returned image used to cost two PNG encodes: one inside the decode and
-    one in the server layer that re-opened those bytes. `png` is that one
+    one in the server layer that re-opened those bytes. `encoded` is that one
     encoding, so the server reuses the bytes instead of encoding again and
-    `save_path` writes exactly the bytes the caller receives.
+    `save_path` writes exactly the bytes the caller receives. `mime` names the
+    format it was made in; `png` remains the PNG-only view and is read-only.
 
     A frame IS a `PIL.Image.Image`, not a wrapper around one: it is built by
     copying the decoded image's state onto this class, so `isinstance` checks,
@@ -688,8 +691,8 @@ class Frame(PILImage.Image):
 
     Memory: because `"BGR;16"` is not one of Pillow's mappable raw modes, the
     decode materialises a `width*height*3` raster, and a frame retains it
-    alongside its PNG for the frame's lifetime. That is a bounded increase over
-    the lazy `PILImage.open` this replaced — dimensions are clamped to
+    alongside its encoding for the frame's lifetime. That is a bounded increase
+    over the lazy `PILImage.open` this replaced — dimensions are clamped to
     160..4096 at every entry point and at most two frames are retained per
     `capture_sequence`, so the worst case is roughly 50 MB per held frame at the
     ceiling. Making the raster lazy is tracked separately.
@@ -699,13 +702,19 @@ class Frame(PILImage.Image):
     """
 
     _png: bytes
+    _encoded: bytes
+    _mime: str
 
     @classmethod
-    def from_image(cls, img: PILImage.Image) -> Frame:
-        """Wrap an already-decoded image, encoding it to PNG exactly once."""
+    def from_image(
+        cls, img: PILImage.Image, mime: str = "image/png", quality: int | None = None
+    ) -> Frame:
+        """Wrap an already-decoded image, encoding it exactly once."""
         frame = cls.__new__(cls)
         frame.__dict__.update(img.__dict__)
-        frame._png = _encode_png(img)
+        frame._encoded = _encode(img, mime, quality)
+        frame._mime = mime
+        frame._png = frame._encoded if mime == "image/png" else b""
         return frame
 
     @classmethod
@@ -719,14 +728,30 @@ class Frame(PILImage.Image):
 
     def __copy__(self) -> Frame:
         # PIL.Image.__copy__ returns a plain Image, which would silently drop
-        # both the class and `png`. Rebuild through the encoding instead.
-        return Frame.from_png(self._png)
+        # both the class and the encoding. Rebuild through the encoding instead.
+        return _rebuild_frame(self._encoded, self._mime)
 
     def __reduce__(self):
-        return (_rebuild_frame, (self._png,))
+        return (_rebuild_frame, (self._encoded, self._mime))
+
+    @property
+    def encoded(self) -> bytes:
+        """The one encoding made for this frame, in the frame's own format."""
+        return self._encoded
+
+    @property
+    def mime(self) -> str:
+        """The MIME type of `encoded` (image/png, image/jpeg or image/webp)."""
+        return self._mime
 
     @property
     def png(self) -> bytes:
+        if self._mime != "image/png":
+            raise AttributeError(
+                f"Frame.png is only available for a PNG frame; this frame is "
+                f"{self._mime}. Use Frame.encoded — encoding it a second time "
+                f"as PNG would break the one-encode-per-image invariant."
+            )
         return self._png
 
     @png.setter
@@ -737,9 +762,45 @@ class Frame(PILImage.Image):
         )
 
 
-def _rebuild_frame(png: bytes) -> Frame:
-    """Module-level rebuild target so a Frame pickles."""
-    return Frame.from_png(png)
+def _rebuild_frame(encoded: bytes, mime: str) -> Frame:
+    """Module-level rebuild target so a Frame pickles in its own format."""
+    return Frame.from_image(PILImage.open(io.BytesIO(encoded)), mime)
+
+
+# Output formats: caller-facing name -> (Pillow save format, MIME type). "jpg"
+# is an alias for "jpeg" because mcp's Image._get_mime_type derives the MIME
+# type as f"image/{format.lower()}", which would otherwise publish the
+# non-standard "image/jpg".
+_OUTPUT_FORMATS: dict[str, tuple[str, str]] = {
+    "png": ("PNG", "image/png"),
+    "jpeg": ("JPEG", "image/jpeg"),
+    "jpg": ("JPEG", "image/jpeg"),
+    "webp": ("WEBP", "image/webp"),
+}
+
+
+def _encode(img: PILImage.Image, mime: str, quality: int | None = None) -> bytes:
+    """Encode a decoded image once, in the format `mime` names.
+
+    `quality` applies to the lossy formats only; PNG has no quality axis, so it
+    is accepted and ignored there. A Pillow build without WebP support is a
+    caller error, not a crash: the caller validates the format first.
+    """
+    pil_format = _OUTPUT_FORMATS[_normalise_format(mime)][0]
+    buf = io.BytesIO()
+    if pil_format == "PNG" or quality is None:
+        img.save(buf, format=pil_format)
+    else:
+        img.save(buf, format=pil_format, quality=quality)
+    return buf.getvalue()
+
+
+def _normalise_format(mime: str) -> str:
+    """Canonical key for a caller-supplied format/MIME name."""
+    key = str(mime or "").strip().lower()
+    if key.startswith("image/"):
+        key = key[len("image/"):]
+    return key
 
 
 def _encode_png(img: PILImage.Image) -> bytes:
@@ -780,7 +841,199 @@ def _decode_rgb565_image(raw: bytes, width: int, height: int) -> PILImage.Image:
 
 
 def _frame_hash(raw: bytes) -> str:
-    return hashlib.sha256(raw).hexdigest()
+    """SHA-256 of the PIXEL payload — the thumbnail bytes after the opaque
+    4-byte prefix, which is exactly the domain `_decode_rgb565_image` decodes.
+
+    Hashing the whole payload used to make an unchanged screen hash differently
+    whenever the opaque prefix drifted, so a stored `baseline_hash` could stop
+    matching a frame the agent already had. The prefix is outside the frame
+    identity, so it is outside the hash. The in-guest poll loop hashes the same
+    slice (`ComputeHash($r.ImageData, 4, ...)`) with the same canonical
+    lowercase-hex encoding, so the two stay byte-identical.
+    """
+    return hashlib.sha256(raw[_PREFIX_LEN:]).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# output options (issue #19): format, quality, scale, crop, if_changed_from
+#
+# The caller's intent used to have nowhere to go: the tool declared no shaping
+# parameter and the encode site hardcoded a whole-frame PNG. These options let
+# the caller ask for a smaller payload, a region, or "only if it changed", and
+# every one of them is validated here so an unsupported value is refused as
+# `invalid` instead of being silently ignored.
+# ---------------------------------------------------------------------------
+
+def _resolve_output_options(
+    fmt: str,
+    quality,
+    scale,
+    crop,
+    frame_w: int,
+    frame_h: int,
+) -> tuple[str, int | None, float | None, tuple[int, int, int, int] | None]:
+    """Validate and normalise the output options.
+
+    Returns `(mime, quality, scale, crop_box)`. Raises `ValueError` — which
+    `errors.classify` maps to `error_class: "invalid"` — for an unsupported
+    format, a `quality` outside 1..100, a `scale` outside (0, 1], or a crop box
+    that is empty or outside the frame. Nothing falls back silently: a rejected
+    option never produces a differently-shaped image.
+
+    The crop box is validated against the ACTUAL captured dimensions, because
+    the fallback chain can hand back a size other than the one requested.
+    """
+    key = _normalise_format(fmt)
+    if not key:
+        mime = "image/png"
+    elif key in _OUTPUT_FORMATS:
+        mime = _OUTPUT_FORMATS[key][1]
+        if mime == "image/webp" and not _PILFeatures.check("webp"):
+            raise ValueError(
+                "format 'webp' is not supported by this Pillow build "
+                "(PIL.features.check('webp') is False)"
+            )
+    else:
+        supported = ", ".join(sorted({v[1] for v in _OUTPUT_FORMATS.values()}))
+        raise ValueError(
+            f"unsupported format {str(fmt)!r}; supported formats: {supported}"
+        )
+
+    if quality is None:
+        resolved_quality: int | None = None
+    else:
+        # bool is an int subclass; reject it explicitly so True cannot pass as 1.
+        if isinstance(quality, bool) or not isinstance(quality, int):
+            raise ValueError(f"quality must be an integer 1..100, got {quality!r}")
+        if not (1 <= quality <= 100):
+            raise ValueError(f"quality must be within 1..100, got {quality}")
+        resolved_quality = quality
+
+    if scale is None:
+        resolved_scale: float | None = None
+    else:
+        if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+            raise ValueError(f"scale must be a number in (0, 1], got {scale!r}")
+        if not (0 < float(scale) <= 1):
+            raise ValueError(f"scale must be within (0, 1], got {scale}")
+        resolved_scale = float(scale)
+
+    if crop is None:
+        resolved_crop: tuple[int, int, int, int] | None = None
+    else:
+        try:
+            box = tuple(crop)  # type: ignore[arg-type]
+        except TypeError:
+            raise ValueError(
+                f"crop must be a 4-element [left, top, right, bottom] box, got {crop!r}"
+            ) from None
+        if len(box) != 4 or any(
+            isinstance(v, bool) or not isinstance(v, int) for v in box
+        ):
+            raise ValueError(
+                f"crop must be four integers [left, top, right, bottom], got {crop!r}"
+            )
+        left, top, right, bottom = (int(v) for v in box)
+        if not (0 <= left < right <= frame_w and 0 <= top < bottom <= frame_h):
+            raise ValueError(
+                f"crop box [{left}, {top}, {right}, {bottom}] is empty or outside "
+                f"the {frame_w}x{frame_h} frame"
+            )
+        resolved_crop = (left, top, right, bottom)
+
+    return mime, resolved_quality, resolved_scale, resolved_crop
+
+
+def _shape_frame(
+    img: PILImage.Image, scale, crop
+) -> PILImage.Image:
+    """Crop then scale a decoded image. Crop is in captured-frame pixels, so it
+    runs first and `scale` then applies to the cropped result. `scale` of
+    exactly 1.0 is a no-op, and the scaled dimension is never below one pixel."""
+    if crop is not None:
+        img = img.crop(crop)
+    if scale is not None and scale != 1.0:
+        w, h = img.size
+        img = img.resize(
+            (max(1, round(w * scale)), max(1, round(h * scale))),
+            PILImage.Resampling.BOX,
+        )
+    return img
+
+
+def _finish_screenshot(
+    cfg: Config,
+    raw: bytes,
+    actual_w: int,
+    actual_h: int,
+    save_path: str,
+    fmt: str,
+    quality,
+    scale,
+    crop,
+    if_changed_from: str,
+    common: dict,
+) -> tuple[Frame | None, dict]:
+    """Hash, optionally short-circuit, then decode/crop/scale/encode once.
+
+    Shared by both transports so the PowerShell and WMI legs cannot drift on
+    the metadata contract. `frame_hash` is computed from the RAW capture — before
+    crop, scale or format — so `if_changed_from` and `wait_frame_change` compare
+    like with like whatever output options the caller picked.
+
+    Returns `(None, meta)` with `unchanged: true` when `if_changed_from` matches;
+    in that case no decode, no encode and no file write happen.
+    """
+    mime, resolved_quality, resolved_scale, crop_box = _resolve_output_options(
+        fmt, quality, scale, crop, actual_w, actual_h
+    )
+    frame_hash = _frame_hash(raw)
+    meta = dict(common)
+    meta["frame_hash"] = frame_hash
+    meta["prefix_hex"] = raw[:_PREFIX_LEN].hex()
+
+    if if_changed_from:
+        if not re.fullmatch(r"[0-9a-f]{64}", if_changed_from):
+            raise ValueError(
+                "if_changed_from must be an empty string or a 64-char hex sha256"
+            )
+        if if_changed_from == frame_hash:
+            return None, {**meta, "unchanged": True}
+
+    frame = _decode_frame(raw, actual_w, actual_h)
+    if crop_box is not None or resolved_scale is not None:
+        frame = Frame.from_image(
+            _shape_frame(frame, resolved_scale, crop_box), mime, resolved_quality
+        )
+    elif mime != "image/png":
+        frame = Frame.from_image(frame, mime, resolved_quality)
+
+    width, height = frame.size
+    meta["width"] = width
+    meta["height"] = height
+    if fmt:
+        meta["format"] = mime
+    if resolved_scale is not None:
+        meta["scale"] = resolved_scale
+    if crop_box is not None:
+        meta["crop"] = list(crop_box)
+    if crop_box is not None or resolved_scale is not None:
+        meta["scale_note"] = (
+            "the returned image is cropped and/or scaled: its coordinates are NOT "
+            "head-space coordinates. Pass frame_width/frame_height matching the "
+            "returned dimensions to mouse tools, or omit them to use head "
+            "coordinates directly."
+        )
+    if save_path:
+        policy.check_host_write(cfg, save_path)
+        parent = os.path.dirname(save_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(save_path, "wb") as fh:
+            fh.write(frame.encoded)
+        meta["saved_path"] = save_path
+        meta["saved_format"] = mime
+    return frame, meta
 
 
 def _capture_raw(
@@ -884,9 +1137,19 @@ def screenshot(
     height: int = 768,
     save_path: str = "",
     vm_id: str = "",
-) -> tuple[Frame, dict]:
+    fmt: str = "",
+    quality=None,
+    scale=None,
+    crop=None,
+    if_changed_from: str = "",
+) -> tuple[Frame | None, dict]:
     """Capture the console; returns (frame, metadata). Caller wraps in
-    MCP image content. Raises on failure (uniform list-form success shape)."""
+    MCP image content. Raises on failure (uniform list-form success shape).
+
+    `fmt`, `quality`, `scale` and `crop` shape the returned image; `frame` is
+    `None` with `unchanged: true` in the metadata when `if_changed_from` matches
+    the current capture, in which case no image is decoded, encoded or written.
+    """
     if not (160 <= width <= 4096 and 160 <= height <= 4096):
         raise ValueError("width/height must be within 160..4096")
     be, connect_ms = _try_backend(cfg)
@@ -898,7 +1161,10 @@ def screenshot(
             be = None
     if be is not None:
         assert ref is not None
-        return _screenshot_wmi(cfg, be, connect_ms, ref, width, height, save_path)
+        return _screenshot_wmi(
+            cfg, be, connect_ms, ref, width, height, save_path,
+            fmt, quality, scale, crop, if_changed_from,
+        )
     timing = _PsTiming()
     prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
     # One process for the whole capture: the chain (requested -> head native if
@@ -927,15 +1193,9 @@ def screenshot(
     fallback_used = ""
     if used != (width, height):
         fallback_used = f"{width}x{height} failed; captured at {used[0]}x{used[1]}"
-    prefix_hex = raw[:_PREFIX_LEN].hex()
-    frame = _decode_frame(raw, actual_w, actual_h)
-    meta = {
+    common = {
         "vm_name": ref.name,
         "vm_id": guid,
-        "width": actual_w,
-        "height": actual_h,
-        "frame_hash": _frame_hash(raw),
-        "prefix_hex": prefix_hex,
         "fallback_used": fallback_used,
         "head_resolution": {"horizontal": head[0], "vertical": head[1]} if head else None,
         "scale_note": (
@@ -947,15 +1207,10 @@ def screenshot(
         "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
         "timings": _ps_timings(timing),
     }
-    if save_path:
-        policy.check_host_write(cfg, save_path)
-        parent = os.path.dirname(save_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(save_path, "wb") as fh:
-            fh.write(frame.png)
-        meta["saved_path"] = save_path
-    return frame, meta
+    return _finish_screenshot(
+        cfg, raw, actual_w, actual_h, save_path, fmt, quality, scale, crop,
+        if_changed_from, common,
+    )
 
 
 def _screenshot_wmi(
@@ -966,7 +1221,12 @@ def _screenshot_wmi(
     width: int,
     height: int,
     save_path: str,
-) -> tuple[Frame, dict]:
+    fmt: str = "",
+    quality=None,
+    scale=None,
+    crop=None,
+    if_changed_from: str = "",
+) -> tuple[Frame | None, dict]:
     """Screenshot over the in-process WMI backend: same metadata contract
     as the PowerShell path (the capture chain keeps its pre-existing
     per-size retry — same operation, next size)."""
@@ -993,15 +1253,9 @@ def _screenshot_wmi(
                     raise ConsoleError(str(exc)) from None
                 fallback_used = f"{chain[0][0]}x{chain[0][1]}: {exc}"
         assert raw is not None
-        prefix_hex = raw[:_PREFIX_LEN].hex()
-        frame = _decode_frame(raw, actual_w, actual_h)
-        meta = {
+        common = {
             "vm_name": ref.name,
             "vm_id": ref.id,
-            "width": actual_w,
-            "height": actual_h,
-            "frame_hash": _frame_hash(raw),
-            "prefix_hex": prefix_hex,
             "fallback_used": fallback_used,
             "head_resolution": {"horizontal": head[0], "vertical": head[1]} if head else None,
             "scale_note": (
@@ -1013,15 +1267,10 @@ def _screenshot_wmi(
             "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "timings": _wmi_timings(connect_ms, *phase_dicts),
         }
-        if save_path:
-            policy.check_host_write(cfg, save_path)
-            parent = os.path.dirname(save_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(save_path, "wb") as fh:
-                fh.write(frame.png)
-            meta["saved_path"] = save_path
-        return frame, meta
+        return _finish_screenshot(
+            cfg, raw, actual_w, actual_h, save_path, fmt, quality, scale, crop,
+            if_changed_from, common,
+        )
     except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
         raise ConsoleError(str(exc)) from None
 

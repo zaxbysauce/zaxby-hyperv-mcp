@@ -48,7 +48,8 @@ VM_GUID = "e953c649-1234-5678-9abc-def012345678"
 def fake_screenshot(monkeypatch):
     captured = {}
 
-    def _capture(cfg, vm_name="", width=1024, height=768, save_path="", vm_id=""):
+    def _capture(cfg, vm_name="", width=1024, height=768, save_path="", vm_id="",
+                 fmt="", quality=None, scale=None, crop=None, if_changed_from=""):
         captured["vm_name"] = vm_name
         captured["vm_id"] = vm_id
         return FakeImage(), _base_meta()
@@ -110,7 +111,8 @@ def test_single_resolve_contract_guid_only_screenshot_leg(monkeypatch):
         calls.append(script)
         return pswindows.PSResult(stdout=VM_GUID, returncode=0)
 
-    def _capture(cfg_, vm_name="", width=1024, height=768, save_path="", vm_id=""):
+    def _capture(cfg_, vm_name="", width=1024, height=768, save_path="", vm_id="",
+                 fmt="", quality=None, scale=None, crop=None, if_changed_from=""):
         captured["vm_name"] = vm_name
         captured["vm_id"] = vm_id
         return FakeImage(), _base_meta()
