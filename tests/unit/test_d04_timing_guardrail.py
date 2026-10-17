@@ -17,6 +17,9 @@ pins.
 from __future__ import annotations
 
 import json
+import threading
+import time
+from pathlib import Path
 
 import pytest
 
@@ -128,4 +131,158 @@ def test_no_collector_leaks_after_a_failure(tmp_path):
     rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     assert rows[-1]["timing"]["ps_spawns"] == 1, (
         "the operation after a failed sink write inherited a leaked collector"
+    )
+
+
+def test_lock_wait_is_recorded_on_contention():
+    """The lock-wait instrumentation, pinned directly.
+
+    No frozen check asserts a NON-ZERO lock_wait_ms: AC4 asserts the
+    uncontended case is 0, which a collector that never records a wait also
+    satisfies. This is the other half — a waiter that really parked must see
+    its wait in its own collector, and a busy failure must carry it on the
+    exception so a failed acquire is measured too.
+    """
+    from hyperv_mcp import vmlocks
+
+    key = "d04-lockwait-vm"
+    outcome: dict = {}
+
+    def waiter() -> None:
+        token = timing.start()
+        try:
+            with vmlocks.vm_lock(key, "write", wait_s=10):
+                outcome["acquired"] = True
+        except vmlocks.VMBusy as exc:
+            outcome["busy"] = True
+            outcome["waited_ms"] = exc.waited_ms
+        finally:
+            outcome["timing"] = timing.finish(token)
+
+    with vmlocks.vm_lock(key, "write", wait_s=10):
+        thread = threading.Thread(target=waiter, name="d04-lockwait-waiter")
+        thread.start()
+        time.sleep(0.3)  # let the waiter park on the Condition
+        assert thread.is_alive(), "the waiter should still be blocked"
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the waiter did not finish"
+    assert outcome.get("acquired") is True, f"the waiter never acquired: {outcome}"
+    assert outcome["timing"]["lock_wait_ms"] > 0, (
+        f"a waiter that parked 0.3 s recorded lock_wait_ms="
+        f"{outcome['timing']['lock_wait_ms']}: the wait is not being fed"
+    )
+
+
+def test_busy_failure_carries_the_wait_it_actually_waited():
+    """A waiter that times out must report the wait it really sat out, not 0 —
+    including the holder-drained branch, which is reached from inside the wait
+    loop after the bounded window expired."""
+    from hyperv_mcp import vmlocks
+
+    key = "d04-busywait-vm"
+    with vmlocks.vm_lock(key, "write", wait_s=10):
+        token = timing.start()
+        try:
+            with pytest.raises(vmlocks.VMBusy) as excinfo:
+                with vmlocks.vm_lock(key, "write", wait_s=0):
+                    pass
+        finally:
+            snapshot = timing.finish(token)
+    # wait_s=0 fails fast, so 0 is the honest answer here; the point is that the
+    # value comes from the measurement rather than from a hardcoded default.
+    assert excinfo.value.waited_ms == snapshot["lock_wait_ms"]
+    assert snapshot["lock_wait_ms"] >= 0
+
+
+def test_host_script_emits_the_timing_marker():
+    """The marker emitter, pinned directly.
+
+    AC5 injects the marker at the child-stdout level, so it passes whether or
+    not any script ever emits one. Without an emitter the three guest-timing
+    keys are structurally null in production and Workstream D PR 5's
+    before/after baseline measures nothing — which is the no-unwired-code
+    clause, so it gets a check of its own.
+    """
+    from hyperv_mcp import guestexec
+    from hyperv_mcp.credentials import CredentialSet
+
+    script = guestexec._host_script(
+        "11111111-2222-3333-4444-555555555555",
+        "Write-Output hi",
+        CredentialSet(username="u", password="p"),
+        elevated=False,
+    )
+    marker_lines = [
+        line for line in script.splitlines() if "__MCP_TIMING=" in line
+    ]
+    assert marker_lines, "the guest host script no longer emits a timing marker"
+    # Exactly one, and it is the LAST line: run_ps splits the trailing marker
+    # off stdout, and _run_inner json.loads what remains.
+    assert len(marker_lines) == 1, f"expected one marker line, got {len(marker_lines)}"
+    assert script.strip().splitlines()[-1].strip().startswith('"__MCP_TIMING="'), (
+        "the marker must be the script's last line"
+    )
+    for key in ("ps_startup_ms", "psdirect_session_ms", "guest_ms"):
+        assert key in marker_lines[0], f"the marker omits {key}"
+    # The guest envelope must carry the measured guest duration, which the
+    # marker line reads back as guest_ms.
+    assert "duration_ms=$__mcpGuest.ElapsedMilliseconds" in script, (
+        "the guest PSCustomObject no longer reports its own duration"
+    )
+    # The marker payload shape must be one the parser accepts.
+    payload = '{"ps_startup_ms":11,"psdirect_session_ms":22,"guest_ms":33}'
+    cleaned, markers = timing.parse_marker(
+        "json-line" + chr(10) + "__MCP_TIMING=" + payload + chr(10)
+    )
+    assert markers == {
+        "ps_startup_ms": 11, "psdirect_session_ms": 22, "guest_ms": 33,
+    }
+    assert cleaned == "json-line"
+
+
+def test_host_script_marker_survives_the_real_powershell_parse_lane():
+    """The emitted script must still parse under real PowerShell 5.1.
+
+    Brace-escaping and newline-join bugs in an f-string template are exactly
+    what this lane exists to catch: a single unescaped brace silently becomes a
+    replacement field and corrupts the emitted script, and two statements
+    merged onto one line are a PS parse error. Skips where PowerShell is
+    unavailable (CI's Linux leg), matching the repo's other parse lanes.
+    """
+    import shutil
+
+    if shutil.which("powershell") is None and not Path(
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    ).exists():
+        pytest.skip("Windows PowerShell 5.1 is not available on this host")
+
+    import subprocess
+
+    from hyperv_mcp import guestexec, pswindows
+    from hyperv_mcp.credentials import CredentialSet
+
+    script = guestexec._host_script(
+        "11111111-2222-3333-4444-555555555555",
+        "Write-Output hi",
+        CredentialSet(username="u", password="p"),
+        elevated=False,
+    )
+    encoded = pswindows.encode_command(pswindows._PS_PIN + script)
+    probe = (
+        "$ErrorActionPreference='Stop'; "
+        "$null = [System.Management.Automation.Language.Parser]::ParseInput("
+        f"'{encoded}', [ref]$null, [ref]$null); "
+        "Write-Output 'PARSE-OK'"
+    )
+    proc = subprocess.run(
+        [
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "-NonInteractive", "-NoProfile", "-Command", probe,
+        ],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert "PARSE-OK" in proc.stdout, (
+        "the emitted guest host script does not parse under PowerShell 5.1"
+        + chr(10) + "stdout: " + proc.stdout[-1500:]
+        + chr(10) + "stderr: " + proc.stderr[-1500:]
     )
