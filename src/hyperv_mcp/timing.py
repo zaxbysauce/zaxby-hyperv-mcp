@@ -172,9 +172,11 @@ def parse_marker(text: str) -> tuple[str, dict | None]:
     `\n`, so such a password is accepted and registered. Splitting narrowly
     keeps the caller's bytes intact for the redactor to see.
 
-    The rejoin uses the caller's own terminator, so stdout that arrived CRLF
-    leaves CRLF: the only bytes removed are the marker lines themselves, and
-    nothing else about the caller's stdout changes.
+    Every surviving line keeps its OWN terminator, so stdout that arrived CRLF
+    leaves CRLF and stdout that arrived LF leaves LF, even when the two are
+    mixed: the only bytes removed are the marker lines themselves, plus the
+    terminator that ended a trailing marker. Nothing else about the caller's
+    stdout changes.
 
     Line starts are found on BOTH terminators independently, because a caller's
     stdout can legitimately mix them. Choosing one separator for the whole text
@@ -190,31 +192,31 @@ def parse_marker(text: str) -> tuple[str, dict | None]:
     # `splitlines()` would not have produced. It is not a line.
     if len(parts) >= 3 and parts[-1] == "":
         parts.pop()
+    content = list(range(0, len(parts), 2))
+    last_content = content[-1] if content else -1
     found = False
     markers: dict | None = None
-    out: list[str] = []
-    for i in range(0, len(parts), 2):
+    out: list[list[str]] = []
+    for i in content:
         line = parts[i]
-        # The terminator that PRECEDED this line is parts[i-1]; that is the
-        # caller's own line ending for it, so it is preserved verbatim.
-        preceding = parts[i - 1] if i >= 2 else ""
+        # The terminator that followed THIS line: the caller's own line ending
+        # for it, preserved verbatim so nothing else about stdout changes.
+        own = parts[i + 1] if i + 1 < len(parts) else ""
         if line.strip().startswith(MARKER_PREFIX):
             # Every marker line is dropped. The LAST one in the file supplies
             # the values, matching the pre-fix backward scan, so a duplicate
             # marker cannot make an earlier vaguer measurement win.
             found = True
             markers = _accept(line.strip()[len(MARKER_PREFIX):])
+            if i == last_content and out:
+                # A trailing marker takes its own terminator AND the previous
+                # survivor's, so the result carries no dangling line ending.
+                out[-1][1] = ""
             continue
-        if out:
-            # After a dropped marker the previous line's own terminator is
-            # gone, so fall back to the terminator that preceded THIS line —
-            # two survivors separated only by markers stay separated by a real
-            # original terminator instead of being fused.
-            out.append(preceding or "\n")
-        out.append(line)
+        out.append([line, own])
     if not found:
         return text, None
-    return "".join(out), markers
+    return "".join(line + sep for line, sep in out), markers
 
 
 def _accept(payload: str) -> dict:

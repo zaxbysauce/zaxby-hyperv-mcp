@@ -713,12 +713,15 @@ def test_the_marker_arithmetic_runs_in_real_powershell():
         "__MCP_TIMING= marker line"
     )
     script = (
-        "$born = [Diagnostics.Process]::GetCurrentProcess().StartTime\n"
-        "$bornMs = [int]((Get-Date) - $born).TotalMilliseconds\n"
-        "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+        # Known constants for the two host-side values the shipped marker
+        # expression reads ($__mcpBornMs, $__mcpSessionMs), so they are pinned
+        # exactly rather than merely non-negative: a wrong expression (a cast of
+        # the wrong variable, an arbitrary constant) has to produce THESE
+        # numbers.
+        "$__mcpBornMs = 555\n"
+        "$__mcpSessionMs = 777\n"
         "$r = [PSCustomObject]@{ exit_code = 0; stdout = 'stub'; stderr = ''; "
         "duration_ms = 4242 }\n"
-        "$sessionMs = $sw.ElapsedMilliseconds\n"
         # The SHIPPED lines, verbatim: the guest-duration computation and the
         # marker expression.
         + guest_ms_lines[-1].strip() + "\n"
@@ -743,12 +746,18 @@ def test_the_marker_arithmetic_runs_in_real_powershell():
     assert markers is not None and markers.get("guest_ms") == 4242, (
         f"the executed marker must round-trip through parse_marker; got {markers}"
     )
-    assert (markers.get("ps_startup_ms") or 0) >= 0, (
-        f"the executed marker must carry a non-negative ps_startup_ms; got {markers}"
+    assert markers.get("psdirect_session_ms") == 777, (
+        f"the executed psdirect_session_ms must be the value the shipped "
+        f"expression computed (777), not an arbitrary non-negative number; got "
+        f"{markers}"
     )
-    assert (markers.get("psdirect_session_ms") or 0) >= 0, (
-        f"the executed marker must carry a non-negative psdirect_session_ms; "
-        f"got {markers}"
+    assert markers.get("ps_startup_ms") == 555, (
+        f"the executed ps_startup_ms must be the value the shipped expression "
+        f"computed (555), not an arbitrary non-negative number; got {markers}"
+    )
+    assert isinstance(markers.get("ps_startup_ms"), int), (
+        f"ps_startup_ms must be an int, not a string or a float; got "
+        f"{markers.get('ps_startup_ms')!r}"
     )
 
 
@@ -853,9 +862,16 @@ def test_an_uncontended_acquire_reports_zero_lock_wait(monkeypatch):
 def test_audited_rejection_resets_the_collector_even_when_the_sink_fails(
     monkeypatch, fresh_server
 ):
-    """PRR-046: `_audited_rejection`'s `finally` was untested, so a sink failure
-    on the rejection path could leak a collector into the next operation on the
-    same thread. The mutant this kills: dropping the `finally` reset."""
+    """PRR-046: a rejected call must not leak a collector into the next
+    operation on the same thread.
+
+    Scope, stated honestly: this check pins the OBSERVABLE property — no
+    collector survives a rejected call, and the next call reports its own
+    numbers. It does NOT reach `server._audited_rejection`'s `finally` reset,
+    because the out-of-roots denial raises inside the tool body and is caught
+    there; that arm fires only when `guestjobs.peek_vm_name` raises, which no
+    shipped tool shape does. The `finally` reset therefore remains unexercised,
+    and the original finding's specific claim is disclosed rather than closed."""
     payload = _raw_thumbnail(320, 240)
     # Two LAZY responses: the rejected call captures and is then denied by the
     # save_path policy, and the follow-up call captures successfully.
@@ -1015,19 +1031,126 @@ def test_the_agent_threads_are_daemon(monkeypatch):
         )
 
 
-def test_the_agent_join_budget_is_one_shared_deadline():
+def test_the_agent_join_budget_is_one_shared_deadline(monkeypatch):
     """PRR-033: the join was a single serial `t.join(timeout=600)`, so a run of
     8 agents was capped by 8 x 600 s of serial waiting. The budget must be one
-    shared deadline. The mutant this kills: reverting to a per-thread join."""
-    import inspect
+    shared deadline.
 
-    source = inspect.getsource(soak_bench._run)
-    assert "_AGENT_JOIN_BUDGET_S" in source, (
-        "PRR-033: the join budget must be a named shared deadline"
+    This is a BEHAVIOURAL pin. A source-text assertion is the PRR-041 class:
+    the final critic's own probe restored the per-thread join while keeping the
+    substring in a trailing comment, and it survived. So the check drives the
+    real `_run` with a recording Thread whose `join` captures each timeout it
+    was given, and asserts the timeouts SHRINK toward one shared deadline
+    instead of each being the full budget. The mutant this kills: reverting to
+    a per-thread join."""
+    captured: list[float] = []
+    real_thread = threading.Thread
+
+    class _RecordingThread(real_thread):
+        def join(self, timeout=None):
+            captured.append(timeout)
+            # Spend real time so the shared deadline actually advances between
+            # joins; returning instantly would leave every budget untouched and
+            # the check could not tell a shared deadline from a per-thread one.
+            time.sleep(0.05)
+            return super().join(timeout=0)
+
+    release = threading.Event()
+
+    def _wedged(*args, **kwargs):
+        release.wait(timeout=30)
+
+    monkeypatch.setattr(soak_bench, "_agent_loop", _wedged)
+    monkeypatch.setattr(soak_bench.threading, "Thread", _RecordingThread)
+    monkeypatch.setattr(soak_bench, "_AGENT_JOIN_BUDGET_S", 10.0)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            soak_bench._run(3, 1, stub=soak_bench.SoakStub(), vm="test-vm-soak",
+                            mode="fake", audit_log=Path(tmp) / "a.jsonl")
+    finally:
+        release.set()
+
+    assert len(captured) == 3, (
+        f"three agents must each be joined; got {len(captured)} joins"
     )
-    assert "t.join(timeout=max(0.0, deadline - time.monotonic()))" in source, (
-        "PRR-033: each agent must join against the SHARED deadline, not its "
-        "own full budget"
+    # A shared deadline means the later joins get a SMALLER budget, because the
+    # earlier ones already spent part of it. A per-thread join gives every
+    # agent the same full budget.
+    assert captured[0] > captured[-1], (
+        f"PRR-033: the join budget must be one shared deadline, so later agents "
+        f"get less of it; got {captured}"
+    )
+    assert all(t is not None for t in captured), (
+        f"every join must be bounded; got {captured}"
+    )
+
+
+def test_the_emitted_row_carries_every_wiring_key(monkeypatch):
+    """PRR-029's row wiring: the keys `_run` adds AFTER `summarize` —
+    `agents`, `iterations`, `mode`, `vm`, `per_tool`, `guest_timing_median_ms`
+    and `hung_agents` — were unpinned on an emitted row. Deleting any of the
+    assignments left the whole suite green, so an advertised field could
+    regress silently. The mutant this kills: dropping any of those
+    assignments."""
+    import contextlib
+    import io
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        rc = soak_bench.main(["--fake", "--agents", "1", "--iterations", "1",
+                              "--json"])
+    assert rc == 0, f"the harness exited {rc}"
+    rows = [json.loads(line) for line in buffer.getvalue().splitlines()
+            if line.strip().startswith("{")]
+    assert len(rows) == 1, f"expected one row: {buffer.getvalue()!r}"
+    row = rows[0]
+
+    for key in ("agents", "iterations", "mode", "vm", "per_tool",
+                "guest_timing_median_ms"):
+        assert key in row, (
+            f"PRR-029: the emitted row must carry {key!r}; got {sorted(row)}"
+        )
+    assert row["mode"] == "fake" and row["vm"] == soak_bench.FAKE_VM, row
+    assert row["agents"] == 1 and row["iterations"] == 1, row
+    # per_tool must cover every tool the harness drives.
+    assert set(row["per_tool"]) == set(soak_bench.TOOLS), (
+        f"per_tool must cover every tool; got {sorted(row['per_tool'])}"
+    )
+    # The guest timing block carries the three marker keys, and a fake run
+    # produces none of them, so they read null rather than absent.
+    for key in ("ps_startup_ms", "psdirect_session_ms", "guest_ms"):
+        assert key in row["guest_timing_median_ms"], (
+            f"guest_timing_median_ms must carry {key!r}; got "
+            f"{sorted(row['guest_timing_median_ms'])}"
+        )
+
+
+def test_a_hung_agent_is_named_in_the_emitted_row(monkeypatch):
+    """PRR-029's `hung_agents` half: the field is only emitted when a thread
+    outlived the shared deadline, and nothing pinned it. The mutant this kills:
+    dropping the `if hung:` block."""
+    release = threading.Event()
+
+    def _wedged(*args, **kwargs):
+        release.wait(timeout=30)
+
+    monkeypatch.setattr(soak_bench, "_agent_loop", _wedged)
+    monkeypatch.setattr(soak_bench, "_AGENT_JOIN_BUDGET_S", 0.1)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            row = soak_bench._run(
+                1, 1, stub=soak_bench.SoakStub(), vm="test-vm-soak",
+                mode="fake", audit_log=Path(tmp) / "a.jsonl",
+            )
+    finally:
+        release.set()
+
+    assert row.get("hung_agents") == ["soak-agent-0"], (
+        f"PRR-029: a wedged agent must be named in the emitted row; got "
+        f"{row.get('hung_agents')!r}"
+    )
+    assert row["n"] == 0, (
+        f"a wedged agent produced no samples, so n must be 0; got {row['n']}"
     )
 
 
