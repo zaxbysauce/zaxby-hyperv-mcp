@@ -150,6 +150,32 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
   `FastMCP`). New dependencies arrive with it: `httpx2` (also a direct
   dependency — the stdio proxy's upstream HTTP client), plus the transitives
   `mcp-types`, `opentelemetry-api`, and `pywin32` on Windows.
+- **`frame_hash` covers the pixel payload only.** `frame_hash` is the SHA-256
+  of the thumbnail's PIXEL bytes — the payload after the 4-byte opaque prefix —
+  not of the whole payload. The prefix is outside the frame identity, so an
+  unchanged screen now produces one hash even if the prefix drifts between
+  captures. This changes the VALUE of every `frame_hash`, so a `baseline_hash`
+  or `if_changed_from` recorded by an earlier version no longer matches: take a
+  fresh capture and chain from that. Both hash values are 64 lowercase hex
+  characters, so the two domains are indistinguishable by shape — the tools
+  that consume a baseline return a `hash_domain` string
+  (`sha256/pixels-after-4-byte-prefix`) so a client can refuse a baseline
+  recorded in the other domain instead of reporting a fabricated change. The
+  host and the in-guest `wait_frame_change` poll loop hash the same slice with
+  the same lowercase-hex encoding, so a returned `frame_hash` still round-trips
+  as a `baseline_hash`.
+- **Console images are not always PNG any more, and `ImageContent.mimeType`
+  says so.** `hyperv_console_screenshot` and `hyperv_capture_evidence` accept
+  `format` (`png` — still the default — `jpeg`/`jpg`, or `webp`) and
+  `quality` (1..100, lossy formats only). A non-PNG request puts
+  `image/jpeg` or `image/webp` on the wire, where every earlier version
+  emitted `image/png` unconditionally, and the saved file's bytes are the
+  returned bytes in the requested format. `console.Frame` is a public exported
+  type, and its `.png` property — previously the only way to get the encoding —
+  now raises `AttributeError` for a non-PNG frame: use `.encoded` (the frame's
+  own format) and `.mime`/`.pil_format` to learn which. Copying, deep-copying
+  or pickling a frame reuses its existing encoding bytes rather than
+  re-encoding, so a copy of a JPEG frame is byte-identical to the original.
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
@@ -979,7 +1005,7 @@ guest 404 arrives as 404 with the relay error envelope); a request racing
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_capture_evidence` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `ui_tree=false`, `ui_tree_depth=3`, `ui_tree_max_elements=200` | `[ImageContent, TextContent(meta)]` |
+| `hyperv_capture_evidence` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `ui_tree=false`, `ui_tree_depth=3` (clamped 1..6), `ui_tree_max_elements=200` (clamped 1..500), `format?` (png\|jpeg/jpg\|webp), `quality?` (1..100), `scale?` (0,1], `crop?` ([left,top,right,bottom]), `if_changed_from?` (frame_hash) | `[ImageContent, TextContent(meta)]` — metadata alone when `if_changed_from` matches (the UI-tree leg is skipped too, and `meta.ui_tree` says why) |
 
 One call pairing the console screenshot with `captured_at` (UTC ISO-8601),
 `vm_id`, capture dimensions, `frame_hash`, and — when `ui_tree=true` — a
@@ -987,7 +1013,19 @@ bounded UIAutomation element tree from the guest (depth/element caps;
 requires guest credentials, which the screenshot alone does not). The UI
 tree is best-effort: a PowerShell Direct session may not see an interactive
 desktop, in which case `ui_tree.ok=false` carries the reason while the
-screenshot still ships.
+screenshot still ships. On an `unchanged: true` result the tree leg is
+skipped entirely (it is a credentialed 60 s PowerShell Direct session whose
+only purpose is to describe the frame just captured), and `ui_tree` reports
+`{requested: true, skipped: true, reason}`; a call with `ui_tree=false`
+still reports exactly `{requested: false}` whatever the frame did.
+
+**Output dimensions.** With no `scale` or `crop`, `width`/`height` in the
+metadata are the captured dimensions. With either applied they become the
+OUTPUT dimensions — post-crop, post-scale — which is what mouse tools need
+when they are given `frame_width`/`frame_height`. On an `unchanged: true`
+result they are the CAPTURED dimensions, because no output image exists to
+measure; `crop`, `scale`, `format` and `quality` are echoed there too, so an
+unchanged result is exactly as informative about the request as a changed one.
 
 ---
 
@@ -995,7 +1033,7 @@ screenshot still ships.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_console_screenshot` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?` | MCP ImageContent(image/png) + metadata text (vm_id, frame_hash, head res, scale note, fallback_used, captured_at) |
+| `hyperv_console_screenshot` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `format?` (png\|jpeg/jpg\|webp), `quality?` (1..100), `scale?` (0,1], `crop?` ([left,top,right,bottom]), `if_changed_from?` (frame_hash) | MCP ImageContent + metadata text (`vm_id`, `frame_hash`, `head_resolution`, `scale_note`, `fallback_used`, `capture_method`, `captured_at`, `timings`, `width`, `height`, `vm_name`, `prefix_hex`, plus `format`/`quality`/`scale`/`crop`/`saved_format` only when those options were supplied) — metadata alone when `if_changed_from` matches |
 | `hyperv_console_get_display_info` | `vm_name` or `vm_id` | `{ok, enabled_state, head_horizontal, head_vertical, keyboard_present, keyboard_enabled, mouse_present, mouse_enabled, guest_channel, guest_channel_note, vm_id}` |
 | `hyperv_console_type_text` | `vm_name` or `vm_id`, `text` (ASCII) | `{ok, chunks, chars}` |
 | `hyperv_console_press_key` | `vm_name` or `vm_id`, `key`, `modifiers[]` | `{ok, scancodes_sent, chunks}` |
@@ -1005,10 +1043,10 @@ screenshot still ships.
 | `hyperv_console_click` | `vm_name` or `vm_id`, `x?=0`, `y?=0`, `frame_width?=0`, `frame_height?=0`, `button=1` | `{ok, operation, head_x?, head_y?}` |
 | `hyperv_console_button` | `vm_name` or `vm_id`, `button`, `is_down` | `{ok, operation}` |
 | `hyperv_console_scroll` | `vm_name` or `vm_id`, `delta` | `{ok, operation}` |
-| `hyperv_console_wait_frame_change` | `vm_name` or `vm_id`, `baseline_hash=""`, `width=640`, `height=480`, `timeout_s=60`, `interval_s=2` | list[ImageContent(image/png), TextContent({stop_reason: changed\|deadline, polls, elapsed_ms, frame_hash})] or deadline dict |
+| `hyperv_console_wait_frame_change` | `vm_name` or `vm_id`, `baseline_hash=""`, `width=640`, `height=480`, `timeout_s=60`, `interval_s=2` | list[ImageContent(image/png), TextContent({stop_reason: changed\|deadline, polls, elapsed_ms, frame_hash, hash_domain})] or deadline dict |
 | `hyperv_console_capture_sequence` | `vm_name` or `vm_id`, `count=3`, `interval_s=2`, `width=640`, `height=480` | [first Image, last Image (a single Image when count==1), meta_text(frames[] with per-frame hash + changed_bytes_vs_previous)] |
 
-Console notes: text rides the stdin channel (never in argv/script/errors); non-ASCII input must use type_scancodes; mouse coordinates are in the space of the observed image — pass `frame_width`/`frame_height` matching your screenshot dimensions to scale to head space, or omit them to use head coordinates directly; `wait_frame_change` with `baseline_hash=""` treats the first polled frame as the baseline, and a returned `frame_hash` can be passed back as `baseline_hash` to detect changes across calls (both are the full lowercase-hex sha256 of the raw frame payload); WinPE errors and wizard screens are returned as images for visual interpretation (no OCR is performed).
+Console notes: text rides the stdin channel (never in argv/script/errors); non-ASCII input must use type_scancodes; mouse coordinates are in the space of the observed image — pass `frame_width`/`frame_height` matching your screenshot dimensions to scale to head space, or omit them to use head coordinates directly; `wait_frame_change` with `baseline_hash=""` treats the first polled frame as the baseline, and a returned `frame_hash` can be passed back as `baseline_hash` to detect changes across calls (both are the full lowercase-hex sha256 of the PIXEL payload, i.e. the thumbnail bytes after the 4-byte opaque prefix — see the 0.4.0 breaking change above; the tool also returns `hash_domain` so a client can refuse a baseline recorded in a different domain); `capture_sequence`'s `changed_bytes_vs_previous` counts PIXEL bytes, the same domain `frame_hash` covers; WinPE errors and wizard screens are returned as images for visual interpretation (no OCR is performed).
 
 #### Console transport: in-process WMI or PowerShell (issue #45)
 

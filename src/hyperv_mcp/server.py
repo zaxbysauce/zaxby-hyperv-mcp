@@ -415,10 +415,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         The console layer already encoded this frame exactly once; those bytes
         are reused here rather than encoded again, and the metadata dict ships
-        as the text sidecar.
+        as the text sidecar. `image` is None when if_changed_from matched, so
+        the unchanged frame ships as metadata alone — no image block.
         """
+        image = result["image"]
+        if image is None:
+            return [result["meta"]]
         return [
-            Image(data=result["image"].png, format="png").to_image_content(),
+            Image(data=image.encoded, format=image.pil_format).to_image_content(),
             result["meta"],
         ]
 
@@ -1172,11 +1176,13 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     @mcp.tool()
     def hyperv_console_screenshot(
         vm_name: str = "", width: int = 1024, height: int = 768, save_path: str = "",
-        vm_id: str = "",
+        vm_id: str = "", format: str = "", quality: int | None = None,
+        scale: float | None = None, crop: list[int] | None = None,
+        if_changed_from: str = "",
     ) -> CallToolResult:
         """Capture the VM console via Hyper-V WMI (works from firmware through
         WinPE; independent of VMConnect, host foreground, guest login/network).
-        Returns MCP image content (image/png) plus a metadata text block:
+        Returns MCP image content plus a metadata text block:
         vm_id, dimensions, frame_hash, head resolution and scale note,
         fallback_used, capture method. Fallback chain: requested → head
         native → 640x480 → 320x240. A corrupt/short payload is a structured
@@ -1187,24 +1193,44 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_id:    Optional VM GUID; exactly one of vm_name/vm_id must be given
             width:    requested snapshot width (160..4096)
             height:   requested snapshot height (160..4096)
-            save_path: optional host path to also save the PNG (host_write policy)
+            save_path: optional host path to also save the image (host_write policy);
+                      the bytes written are exactly the bytes returned
+            format:   png (default), jpeg/jpg, or webp; an unsupported format is
+                      refused as an invalid-input error, never silently ignored
+            quality:  1..100; applies to jpeg/webp only. An out-of-range value is
+                      refused whatever the format, including png — png has no
+                      quality axis, so an in-range value there is accepted and
+                      has no effect (it is echoed in the metadata as `quality`)
+            scale:    downscale factor in (0, 1] applied after crop; 1.0 is a
+                      no-op and leaves the frame byte-identical
+            crop:     [left, top, right, bottom] in captured-frame pixels
+            if_changed_from: a frame_hash from a previous capture, as 64 lowercase
+                      hex characters; when it equals the current capture's hash
+                      the tool returns metadata only (no image) and skips decode,
+                      encode and the file write — but still applies the save_path
+                      policy check, so an out-of-roots path is denied on both paths
 
-        Returns: [ImageContent(image/png), TextContent(json metadata)]
+        Returns: [ImageContent, TextContent(json metadata)] — the metadata alone
+        when if_changed_from matches (unchanged: true).
         """
         try:
             with _audit("hyperv_console_screenshot", vm_name, "read") as op:
                 img, meta = console.screenshot(
-                    _cfg(), vm_name, width, height, save_path, vm_id=vm_id
+                    _cfg(), vm_name, width, height, save_path, vm_id=vm_id,
+                    fmt=format, quality=quality, scale=scale, crop=crop,
+                    if_changed_from=if_changed_from,
                 )
                 # PRR-004: by-id adoption from the console module's metadata.
                 if not vm_name and meta.get("vm_name"):
                     op.vm_name = str(meta["vm_name"])
                 # ImageContent is a pydantic model; the raw SDK Image
                 # wrapper is not and breaks serialization across the mcp
-                # versions in the CI matrix. The frame's single PNG encoding
+                # versions in the CI matrix. The frame's single encoding
                 # is reused instead of encoding the image a second time.
+                if img is None:
+                    return errors.success_result([meta])
                 return errors.success_result(
-                    [Image(data=img.png, format="png").to_image_content(), meta]
+                    [Image(data=img.encoded, format=img.pil_format).to_image_content(), meta]
                 )
         except UrlElicitationRequiredError:
             raise
@@ -1915,7 +1941,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             save_path: str = "", ui_tree: bool = False,
             ui_tree_depth: int = 3, ui_tree_max_elements: int = 200,
             username: str = "", password: str = "",
-            vm_id: str = "",
+            vm_id: str = "", format: str = "", quality: int | None = None,
+            scale: float | None = None, crop: list[int] | None = None,
+            if_changed_from: str = "",
         ) -> CallToolResult:
             """Capture console evidence in one call: screenshot paired with
             captured_at, vm_id, dimensions and frame hash, plus an optional
@@ -1925,8 +1953,30 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+                width:  requested screenshot width in pixels (160..4096)
+                height: requested screenshot height in pixels (160..4096)
+                save_path: optional host path to also write the PNG/encoded image
+                ui_tree: also fetch a bounded guest UI element tree (needs credentials)
+                ui_tree_depth: tree walk depth, clamped to 1..6
+                ui_tree_max_elements: element cap, clamped to 1..500
+                username: guest username for the UI-tree leg (or set HYPERV_GUEST_USERNAME)
+                password: guest password for the UI-tree leg (or set HYPERV_GUEST_PASSWORD)
+                format:  png (default), jpeg/jpg, or webp; an unsupported format
+                         is refused as an invalid-input error
+                quality: 1..100; applies to jpeg/webp only. An out-of-range value
+                         is refused whatever the format, including png — png has
+                         no quality axis, so an in-range value there is accepted
+                         and has no effect
+                scale:   downscale factor in (0, 1] applied after crop
+                crop:    [left, top, right, bottom] in captured-frame pixels
+                if_changed_from: a frame_hash from a previous capture, as 64
+                         lowercase hex characters; when it equals the current
+                         capture's hash the tool returns metadata only and skips
+                         decode, encode, the file write AND the UI-tree leg
+                         (meta["ui_tree"] then reports why it was skipped)
 
-            Returns: [ImageContent, TextContent(metadata)] on success.
+            Returns: [ImageContent, TextContent(metadata)] on success — the
+            metadata alone when if_changed_from matches.
             """
             try:
                 with _audit("hyperv_capture_evidence", vm_name, "read"):
@@ -1935,7 +1985,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                         _cfg(), vm_name, width, height, save_path,
                         ui_tree=ui_tree, ui_tree_depth=ui_tree_depth,
                         ui_tree_max_elements=ui_tree_max_elements, cred=cred,
-                        vm_id=vm_id,
+                        vm_id=vm_id, fmt=format, quality=quality, scale=scale,
+                        crop=crop, if_changed_from=if_changed_from,
                     )
                     return errors.success_result(_image_meta_content(result))
             except UrlElicitationRequiredError:
@@ -2076,16 +2127,40 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_name: str = "", width: int = 1024, height: int = 768,
             save_path: str = "", ui_tree: bool = False,
             ui_tree_depth: int = 3, ui_tree_max_elements: int = 200,
-            vm_id: str = "",
+            vm_id: str = "", format: str = "", quality: int | None = None,
+            scale: float | None = None, crop: list[int] | None = None,
+            if_changed_from: str = "",
         ) -> CallToolResult:
             """Capture console evidence in one call: screenshot paired with
             captured_at, vm_id, dimensions and frame hash, plus an optional
             bounded guest UI element tree (requires guest credentials; the
             screenshot alone does not). Credentials from environment only.
 
-            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+                width:  requested screenshot width in pixels (160..4096)
+                height: requested screenshot height in pixels (160..4096)
+                save_path: optional host path to also write the encoded image
+                ui_tree: also fetch a bounded guest UI element tree (needs credentials)
+                ui_tree_depth: tree walk depth, clamped to 1..6
+                ui_tree_max_elements: element cap, clamped to 1..500
+                format:  png (default), jpeg/jpg, or webp; an unsupported format
+                         is refused as an invalid-input error
+                quality: 1..100; applies to jpeg/webp only. An out-of-range value
+                         is refused whatever the format, including png — png has
+                         no quality axis, so an in-range value there is accepted
+                         and has no effect
+                scale:   downscale factor in (0, 1] applied after crop
+                crop:    [left, top, right, bottom] in captured-frame pixels
+                if_changed_from: a frame_hash from a previous capture, as 64
+                         lowercase hex characters; when it equals the current
+                         capture's hash the tool returns metadata only and skips
+                         decode, encode, the file write AND the UI-tree leg
+                         (meta["ui_tree"] then reports why it was skipped)
 
-            Returns: [ImageContent, TextContent(metadata)] on success.
+            Returns: [ImageContent, TextContent(metadata)] on success — the
+            metadata alone when if_changed_from matches.
             """
             try:
                 with _audit("hyperv_capture_evidence", vm_name, "read"):
@@ -2094,7 +2169,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                         _cfg(), vm_name, width, height, save_path,
                         ui_tree=ui_tree, ui_tree_depth=ui_tree_depth,
                         ui_tree_max_elements=ui_tree_max_elements, cred=cred,
-                        vm_id=vm_id,
+                        vm_id=vm_id, fmt=format, quality=quality, scale=scale,
+                        crop=crop, if_changed_from=if_changed_from,
                     )
                     return errors.success_result(_image_meta_content(result))
             except UrlElicitationRequiredError:
