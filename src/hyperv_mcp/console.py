@@ -1210,8 +1210,15 @@ def _finish_screenshot(
                 f"directly."
             )
     if save_path:
-        policy.check_host_write(cfg, save_path)
-        parent = os.path.dirname(save_path)
+        # check_host_write returns the CANONICAL path it just validated — the
+        # realpath-resolved form, so every junction and symlink on the way has
+        # already been followed once. Writing to THAT instead of re-traversing
+        # the caller's string is what closes the check-then-use half of the
+        # TOCTOU: the bytes land on the path the policy actually judged, not on
+        # whatever the untrusted pathname resolves to a second time.
+        canonical = policy.check_host_write(cfg, save_path)
+        target = canonical.exists_prefix_resolved or save_path
+        parent = os.path.dirname(target)
         if parent:
             os.makedirs(parent, exist_ok=True)
         # Write to a UNIQUE sibling temp file and replace, so a mid-write
@@ -1220,11 +1227,11 @@ def _finish_screenshot(
         # two concurrent saves to the same path would otherwise open the same
         # ".mcp-partial" file and interleave their bytes; os.replace is atomic
         # on Windows, so the last writer wins with a complete image either way.
-        tmp_path = f"{save_path}.{os.getpid()}-{next(_save_counter)}.mcp-partial"
+        tmp_path = f"{target}.{os.getpid()}-{next(_save_counter)}.mcp-partial"
         try:
             with open(tmp_path, "wb") as fh:
                 fh.write(frame.encoded)
-            os.replace(tmp_path, save_path)
+            os.replace(tmp_path, target)
         except BaseException:
             try:
                 os.unlink(tmp_path)

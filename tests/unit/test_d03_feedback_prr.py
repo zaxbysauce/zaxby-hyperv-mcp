@@ -912,8 +912,6 @@ def test_capture_evidence_without_a_ui_request_is_unchanged_by_the_frame_state(
     set the caller never varied, which is the same changed/unchanged asymmetry
     this round exists to close, reintroduced inside `meta["ui_tree"]`. The
     mutant this kills: an unconditional `if meta.get("unchanged"):` branch."""
-    from hyperv_mcp import credentials as creds  # noqa: F401  (import keeps the module honest)
-
     _resolve_only_ps(monkeypatch)
 
     def fake_screenshot(cfg, vm_name="", width=1024, height=768, save_path="",
@@ -945,7 +943,7 @@ def test_capture_evidence_without_a_ui_request_is_unchanged_by_the_frame_state(
     assert unchanged["image"] is None
 
 
-def test_save_path_temp_name_is_unique_per_save(monkeypatch, unrestricted, tmp_path):
+def test_save_path_temp_name_is_unique_per_save(monkeypatch, fresh_server, tmp_path):
     """PRR-022: the atomic write's temp name carries the pid and a per-process
     counter, so two concurrent saves to the same path cannot open the same
     `.mcp-partial` file and interleave their bytes. The mutant this kills: a
@@ -954,16 +952,10 @@ def test_save_path_temp_name_is_unique_per_save(monkeypatch, unrestricted, tmp_p
     monkeypatch.setattr(pswindows, "run_ps",
                         FakeCapture([_folded_response(payload, 320, 240)] * 2))
     dest = tmp_path / "shots" / "frame.png"
-    cfg_doc = {
+    mod = fresh_server(config_doc={
         "allowed_vm_patterns": ["test-vm-*"],
         "host_write_roots": [str(tmp_path / "shots")],
-    }
-    import hyperv_mcp.server as sm
-
-    p = tmp_path / "unique-cfg.json"
-    p.write_text(json.dumps(cfg_doc), encoding="utf-8")
-    mod = importlib.reload(sm)
-    mod.bootstrap({"HYPERV_MCP_CONFIG": str(p)})
+    })
     mcp = mod.get_mcp()
 
     opened: list[str] = []
@@ -995,6 +987,74 @@ def test_save_path_temp_name_is_unique_per_save(monkeypatch, unrestricted, tmp_p
         f"concurrent writers interleave their bytes; both used {partials[0]}"
     )
     assert dest.exists() and dest.read_bytes(), "the final artifact must still exist"
+
+
+def test_save_path_write_targets_the_checked_path(monkeypatch, fresh_server, tmp_path):
+    """PRR-022's check-then-use half: `check_host_write` realpaths the path and
+    judges it, and the write must land on the path it JUDGED rather than on a
+    fresh traversal of the caller's string — otherwise a junction or symlink
+    swapped in between the two sends the image outside `host_write_roots`
+    while the policy verdict said allowed.
+
+    This is a SEAM test, deliberately. A real symlink cannot discriminate the
+    two shapes: the OS resolves the link at open time either way, so the
+    caller's string and the canonical path name the same file and both codes
+    write the same bytes. The only difference is the window between the check
+    and the write, and a window is not deterministically testable. So the
+    checker is stubbed to return a canonical path that DIFFERS from the
+    caller's string, and the assertion is about where the bytes land — which
+    is the contract, and which is what a later edit that reverts to writing
+    `save_path` would break.
+
+    The mutant this kills: discarding the canonical path the policy check
+    returns and writing to `save_path`.
+    """
+    from hyperv_mcp import policy as policy_mod
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    checked = allowed / "checked.png"
+    asked = allowed / "asked.png"
+
+    payload = _raw_thumbnail(320, 240)
+    monkeypatch.setattr(pswindows, "run_ps",
+                        FakeCapture([_folded_response(payload, 320, 240)]))
+    mod = fresh_server(config_doc={
+        "allowed_vm_patterns": ["test-vm-*"],
+        "host_write_roots": [str(allowed)],
+    })
+    mcp = mod.get_mcp()
+
+    real_check = policy_mod.check_host_write
+
+    def stubbed_check(cfg, path):
+        cp = real_check(cfg, path)
+        # CanonicalPath is frozen, so build the "judged" path rather than
+        # mutating the one the real check returned.
+        return policy_mod.CanonicalPath(
+            original=cp.original,
+            normalized=cp.normalized,
+            exists_prefix_resolved=str(checked),
+        )
+
+    monkeypatch.setattr(console.policy, "check_host_write", stubbed_check)
+
+    _, texts = _split(_call(mcp, "hyperv_console_screenshot", {
+        "vm_name": "test-vm-1", "width": 320, "height": 240,
+        "save_path": str(asked),
+    }))
+    meta = _meta(texts)
+    assert meta.get("saved_path") == str(asked), (
+        "saved_path must still report the path the caller asked for"
+    )
+    assert checked.exists() and checked.read_bytes(), (
+        "PRR-022: the bytes must land on the path the policy check JUDGED, not "
+        "on a fresh traversal of the caller's string"
+    )
+    assert not asked.exists(), (
+        "PRR-022: writing to the caller's string instead of the checked path "
+        "is the check-then-use half of the finding"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1059,7 +1119,14 @@ def test_poll_hash_byte_count_is_pinned_to_the_pixels(monkeypatch, unrestricted)
     and the real consequence is silent (host and poll loop disagree, so every
     `frame_hash` round-trips as a broken `baseline_hash`). The full expression
     is pinned here as well, from the console layer rather than the frozen pack,
-    so the two assertions cannot be edited in lockstep by mistake."""
+    so the two assertions cannot be edited in lockstep by mistake.
+
+    The EXPECTED-LENGTH formula is pinned too, because the final critic's own
+    probe changed `width * height * 2` to `width * height * 3` and it survived
+    the entire committed suite: every valid payload would trip the guard, so
+    `wait_frame_change` would be dead on both the success and the failure path,
+    and the only assertion — the substring `$pxLen -ne $pxWant` — still held.
+    """
     fake = FakeCapture([pswindows.PSResult(
         stdout="STOP=deadline POLLS=1 HASH=" + "b" * 64, returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
@@ -1075,4 +1142,49 @@ def test_poll_hash_byte_count_is_pinned_to_the_pixels(monkeypatch, unrestricted)
     assert script.count("ComputeHash(") == 1, (
         f"PRR-020b: the poll loop must hash exactly once per poll; "
         f"{script.count('ComputeHash(')} hash sites found"
+    )
+    assert "$pxWant = 4 + (320 * 240 * 2)" in script, (
+        "PRR-020b: the poll loop's expected payload length must be exactly "
+        "4 + width*height*2 — the prefix plus one RGB565 pixel per position. "
+        "A different formula makes every valid payload trip the guard (or a "
+        "truncated one pass it), and only a substring assertion would survive"
+    )
+
+
+def test_cropped_frame_note_does_not_claim_a_scale_that_was_not_applied(
+    monkeypatch, fresh_server
+):
+    """The reviewer's nit, pinned: the crop note used to say "and then scaled
+    to WxH" whenever `scale` was supplied, including `scale=1.0` which
+    `_shape_frame` treats as a no-op. The final critic's own probe reverted the
+    guard and it survived the whole committed suite, because no check exercised
+    crop together with an explicit `scale=1.0`. Both directions are pinned
+    here: a no-op scale must not appear in the note, and a real one must."""
+    payload = _raw_thumbnail(320, 240)
+    monkeypatch.setattr(pswindows, "run_ps",
+                        FakeCapture([_folded_response(payload, 320, 240)] * 2))
+    mod = fresh_server({"HYPERV_MCP_UNRESTRICTED": "1"})
+    mcp = mod.get_mcp()
+
+    _, texts = _split(_call(mcp, "hyperv_console_screenshot", {
+        "vm_name": "test-vm-1", "width": 320, "height": 240,
+        "crop": [10, 20, 110, 70], "scale": 1.0,
+    }))
+    noop = _meta(texts)["scale_note"]
+    assert "CROPPED" in noop, f"the crop must still be named: {noop!r}"
+    assert "[10, 20, 110, 70]" in noop, (
+        f"the note must still state the crop box; got {noop!r}"
+    )
+    assert "scaled to" not in noop, (
+        f"scale=1.0 is a no-op, so the crop note must not claim a resize; "
+        f"got {noop!r}"
+    )
+
+    _, texts = _split(_call(mcp, "hyperv_console_screenshot", {
+        "vm_name": "test-vm-1", "width": 320, "height": 240,
+        "crop": [10, 20, 110, 70], "scale": 0.5,
+    }))
+    real = _meta(texts)["scale_note"]
+    assert "scaled to 50x25" in real, (
+        f"a real scale must be named in the crop note; got {real!r}"
     )
