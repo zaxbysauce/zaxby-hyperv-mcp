@@ -384,7 +384,7 @@ def vm_lock(key: object, mode: str = "write", wait_s: float | None = None) -> It
     if not isinstance(wait_s, (int, float)) or isinstance(wait_s, bool):
         raise ValueError(f"vm_lock wait_s must be a number in 0..{_MAX_WAIT_S:g}, not {wait_s!r}")
     if not 0 <= float(wait_s) <= _MAX_WAIT_S:
-        raise ValueError(f"vm_lock wait_s must be a number in 0..{_MAX_WAIT_S:g}, not {wait_s!r}")
+        raise ValueError(f"vm_lock wait_s must be in 0..{_MAX_WAIT_S:g}, not {wait_s!r}")
     wait_s = float(wait_s)
     # Capture the OWNING thread id at entry: if the context manager is
     # finalized on another thread (ExitStack hand-off / GeneratorExit during

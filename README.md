@@ -326,6 +326,72 @@ Unknown keys are rejected at startup (typos must not disable a control).
 `"unrestricted": true` for disposable labs; unrestricted mode also forces a
 visible audit line per operation.
 
+#### Audit record schema
+
+One JSON object per audited operation, appended to `audit_log_path` (or one
+line per op on stderr when unset):
+
+```json
+{
+  "ts": "2026-10-17T15:25:35.721+00:00",
+  "tool": "hyperv_console_scroll",
+  "vm_name": "test-vm",
+  "category": "console_input",
+  "ok": true,
+  "duration_ms": 47,
+  "exit_code": null,
+  "error_class": "",
+  "agent_id": null,
+  "request_id": "31ee4c18f3be4a7c843902a37fb3996d",
+  "job_id": null,
+  "relay_id": null,
+  "timing": {
+    "lock_wait_ms": 0,
+    "ps_ms": 400,
+    "ps_spawns": 1,
+    "total_ms": 447,
+    "ps_startup_ms": 120,
+    "psdirect_session_ms": 340,
+    "guest_ms": 900
+  }
+}
+```
+
+`timing` is additive: `duration_ms` and every key above it keep their meaning,
+so existing log consumers are unaffected. `lock_wait_ms` is how long the call
+waited for the per-VM lock (0 when it never waited, and a real number on a
+`busy` failure that timed out). `ps_ms`/`ps_spawns` are the total duration and
+the count of `powershell.exe` children the call started. `total_ms` is the
+whole operation. The three guest keys are populated only when the guest host
+script emitted timing markers — null otherwise, which is the normal answer
+for console-only calls and for a fake transport. Values are numeric or null;
+nothing in `timing` ever carries script text, arguments or credentials.
+
+Console image tools return the same object as their `timing` metadata key.
+
+#### Soak benchmark
+
+`scripts/soak_bench.py` runs 1, 4 and 8 concurrent agents against the real tool
+layer and reports p50/p95/p99 plus busy and incorrect rates per agent count
+and per tool, and the median guest timing breakdown for `guest_run_ps`. Only
+read-only and console-input tools are used — no lifecycle or destructive call.
+
+```bash
+# CI-runnable: stubs run_ps, needs no Hyper-V
+python scripts/soak_bench.py --fake --agents 1,4,8 --iterations 5 --json
+
+# live: refuses to start unless all three variables are set and guest
+# credentials resolve, and only ever touches the named disposable VM
+HYPERV_MCP_INTEGRATION=1 HYPERV_MCP_SOAK=1 HYPERV_MCP_TEST_VM="Deployment Test 3" \
+    python scripts/soak_bench.py --agents 1,4,8 --iterations 20 --json
+```
+
+Fake and live mode share one code path: the only difference is whether
+`pswindows.run_ps` is stubbed, so policy, credential resolution and the audit
+operation behave identically in both. Percentiles reuse
+`hyperv_mcp.consolebench.pct` (nearest-rank), so the two cannot drift; no new
+runtime dependency.
+
 `host_powershell_path` limitation: the child environment handed to every
 spawn always carries a PowerShell 5.1-shaped `PSModulePath` (pwsh7 module
 directories stripped, the 5.1 system module directory appended). Pointing

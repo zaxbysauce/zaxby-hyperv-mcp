@@ -16,6 +16,7 @@ pins.
 
 from __future__ import annotations
 
+import base64
 import json
 import threading
 import time
@@ -174,24 +175,162 @@ def test_lock_wait_is_recorded_on_contention():
 
 
 def test_busy_failure_carries_the_wait_it_actually_waited():
-    """A waiter that times out must report the wait it really sat out, not 0 —
-    including the holder-drained branch, which is reached from inside the wait
-    loop after the bounded window expired."""
+    """A waiter that TIMES OUT must report the wait it really sat out, not 0.
+
+    This is the R1-5 defect in its own right: a busy failure's audit row used to
+    be able to report lock_wait_ms == 0 after a real bounded wait, because a
+    return value cannot escape a raise. The wait now rides the VMBusy.
+
+    The waiter is a DIFFERENT thread and waits on a real bounded window, so the
+    raise comes from inside the wait loop after the deadline expired — which is
+    the only shape that exercises the in-loop `waited_ms=waited_ms` hand-off. A
+    same-thread wait_s=0 re-entry hits the pre-loop fast-fail, where 0 is the
+    honest answer and the assertion would be tautological.
+    """
     from hyperv_mcp import vmlocks
 
     key = "d04-busywait-vm"
-    with vmlocks.vm_lock(key, "write", wait_s=10):
+    outcome: dict = {}
+
+    def waiter() -> None:
         token = timing.start()
         try:
-            with pytest.raises(vmlocks.VMBusy) as excinfo:
-                with vmlocks.vm_lock(key, "write", wait_s=0):
-                    pass
+            with vmlocks.vm_lock(key, "write", wait_s=0.3):
+                outcome["acquired"] = True
+        except vmlocks.VMBusy as exc:
+            outcome["waited_ms"] = exc.waited_ms
         finally:
-            snapshot = timing.finish(token)
-    # wait_s=0 fails fast, so 0 is the honest answer here; the point is that the
-    # value comes from the measurement rather than from a hardcoded default.
-    assert excinfo.value.waited_ms == snapshot["lock_wait_ms"]
-    assert snapshot["lock_wait_ms"] >= 0
+            outcome["timing"] = timing.finish(token)
+
+    with vmlocks.vm_lock(key, "write", wait_s=10):
+        thread = threading.Thread(target=waiter, name="d04-busywait-waiter")
+        thread.start()
+        thread.join(timeout=10)
+    assert not thread.is_alive(), "the waiter did not finish"
+    assert "acquired" not in outcome, (
+        f"the waiter acquired instead of timing out, so nothing was measured: "
+        f"{outcome}"
+    )
+    assert outcome["waited_ms"] >= 200, (
+        f"a waiter that sat out a 0.3 s bounded window reported "
+        f"waited_ms={outcome['waited_ms']}: the wait is not escaping the raise"
+    )
+    assert outcome["timing"]["lock_wait_ms"] >= 200, (
+        f"the busy waiter's own collector recorded "
+        f"lock_wait_ms={outcome['timing']['lock_wait_ms']}: the exception path "
+        f"is not feeding the collector"
+    )
+
+
+def test_reader_busy_failure_carries_its_wait():
+    """The reader path's in-loop raise, which is a DIFFERENT call site from the
+    writer path's. Both pass the same `waited_ms` local, so a mutant that drops
+    it at either site must be caught by a test that reaches THAT site."""
+    from hyperv_mcp import vmlocks
+
+    key = "d04-readerbusy-vm"
+    outcome: dict = {}
+
+    def reader() -> None:
+        token = timing.start()
+        try:
+            with vmlocks.vm_lock(key, "read", wait_s=0.3):
+                outcome["acquired"] = True
+        except vmlocks.VMBusy as exc:
+            outcome["waited_ms"] = exc.waited_ms
+        finally:
+            outcome["timing"] = timing.finish(token)
+
+    with vmlocks.vm_lock(key, "write", wait_s=10):
+        thread = threading.Thread(target=reader, name="d04-readerbusy")
+        thread.start()
+        thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert "acquired" not in outcome, f"the reader was admitted: {outcome}"
+    assert outcome["waited_ms"] >= 200, (
+        f"a reader that sat out a 0.3 s bounded window reported "
+        f"waited_ms={outcome['waited_ms']}"
+    )
+    assert outcome["timing"]["lock_wait_ms"] >= 200
+
+
+def test_screenshot_timing_fallback_without_a_collector(tmp_path, monkeypatch):
+    """The console metadata's no-collector fallback.
+
+    AC1 always runs with a collector active, so nothing in the frozen set reads
+    `meta["timing"]` on the direct-call path — and `consolebench`'s operator CLI
+    drives `console.screenshot` exactly that way. Without this test a fabricated
+    zero could ship on the very path the plan defended.
+    """
+    from hyperv_mcp import console, pswindows, wmiconsole
+    from hyperv_mcp.config import Config
+
+    monkeypatch.setattr(wmiconsole, "COM_AVAILABLE", False)
+    pswindows.init(Config(), lambda text: text)
+    payload = json.dumps(
+        {"returnValue": 0, "imageDataB64": base64.b64encode(bytes(160 * 160 * 2 + 4)).decode()}
+    )
+    script = chr(10).join([
+        "VMID=11111111-2222-3333-4444-555555555555",
+        "SIZES=160x160,640x480,320x240",
+        "USED=160x160",
+        payload,
+    ])
+    monkeypatch.setattr(
+        pswindows, "run_ps",
+        lambda *a, **kw: pswindows.PSResult(stdout=script, returncode=0, duration_ms=321),
+    )
+
+    cfg = Config(allowed_vm_patterns=["test-*"])
+    assert timing.current() is None, "a collector leaked into this test"
+    _frame, meta = console.screenshot(cfg, "test-vm", 160, 160)
+    block = meta["timing"]
+    assert block["ps_spawns"] >= 1, (
+        f"the no-collector fallback reported no spawns though run_ps served the "
+        f"capture: {block}"
+    )
+    assert block["ps_ms"] > 0, (
+        f"the no-collector fallback fabricated a zero ps_ms: {block}"
+    )
+    assert block["lock_wait_ms"] == 0
+    assert isinstance(block["total_ms"], int) and block["total_ms"] >= 0
+    for key in ("ps_startup_ms", "psdirect_session_ms", "guest_ms"):
+        assert block[key] is None, f"{key} should be null without a marker"
+
+
+def test_screenshot_timing_fallback_wmi_path_without_a_collector(monkeypatch):
+    """The WMI path's no-collector fallback: no PowerShell process starts, so
+    zero spawns is the truth there rather than a fabricated default, and
+    total_ms comes from the op's own clock."""
+    from hyperv_mcp import console, vmident, wmiconsole
+    from hyperv_mcp.config import Config
+
+    class _FakeBackend:
+        def resolve_vm(self, cfg, vm_name="", vm_id=""):
+            return vmident.VMRef(id="11111111-2222-3333-4444-555555555555", name="test-vm")
+
+        def head_resolution(self, vm_id):
+            return (1024, 768), {}
+
+        def capture(self, vm_id, w, h):
+            time.sleep(0.05)  # measurable, so total_ms cannot be a fabricated 0
+            return bytes(w * h * 2 + 4), {}
+
+    monkeypatch.setattr(wmiconsole, "COM_AVAILABLE", True)
+    monkeypatch.setattr(wmiconsole, "backend", lambda cfg: _FakeBackend())
+    cfg = Config(allowed_vm_patterns=["test-*"])
+    assert timing.current() is None
+    _frame, meta = console.screenshot(cfg, "test-vm", 160, 160)
+    block = meta["timing"]
+    assert block["ps_spawns"] == 0, (
+        f"the WMI path starts no PowerShell process, so zero is the truth: {block}"
+    )
+    assert block["ps_ms"] == 0
+    assert block["total_ms"] >= 40, (
+        f"the op took ~50 ms in the fake backend, so total_ms="
+        f"{block['total_ms']} means the fallback fabricated a value instead of "
+        f"measuring the op"
+    )
 
 
 def test_host_script_emits_the_timing_marker():

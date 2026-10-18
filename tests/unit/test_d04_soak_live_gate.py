@@ -112,6 +112,62 @@ def test_soak_bench_fake_mode_reports_non_null_percentiles():
     )
 
 
+def test_soak_bench_fake_mode_reports_a_rejection_only_run_as_such(monkeypatch):
+    """The other half of the ok-guarantee.
+
+    `test_soak_bench_fake_mode_reports_non_null_percentiles` proves a working
+    stub produces real percentiles. This proves the sampler READS the result
+    rather than assuming success: pointed at a config that denies every VM,
+    every sample must come back `ok: false` with a non-zero busy-or-incorrect
+    rate, so a harness that silently labelled rejections as successes cannot
+    pass. Without this, `ok = True` hardcoded in the sampler would survive."""
+    soak_bench = _import_soak_bench()
+    import contextlib
+    import importlib
+    import io
+    import tempfile
+
+    import hyperv_mcp.server as server_module
+
+    def denying_server(mode, audit_log):
+        """A server whose policy matches no VM name at all."""
+        cfg = audit_log.parent / "deny.json"
+        cfg.write_text(
+            json.dumps({"allowed_vm_patterns": ["nothing-matches-*"]}),
+            encoding="utf-8",
+        )
+        mod = importlib.reload(server_module)
+        mod.bootstrap({"HYPERV_MCP_CONFIG": str(cfg)})
+        return mod
+
+    monkeypatch.setattr(soak_bench, "_server_for", denying_server)
+    with tempfile.TemporaryDirectory():
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            rc = soak_bench.main(
+                ["--fake", "--agents", "1", "--iterations", "1", "--json"]
+            )
+    assert rc == 0, f"soak_bench --fake exited {rc}"
+    rows = [
+        json.loads(line)
+        for line in buffer.getvalue().splitlines()
+        if line.strip().startswith("{")
+    ]
+    assert len(rows) == 1, f"expected one row: {buffer.getvalue()!r}"
+    row = rows[0]
+    assert row["ok"] == 0, (
+        f"a deny-all config produced {row['ok']} successful sample(s): the "
+        f"sampler is not reading the result: {row}"
+    )
+    assert row["ok_rate"] == 0.0 and row["n"] > 0, (
+        f"a deny-all run must be visible as zero successes over a non-empty "
+        f"sample set: {row}"
+    )
+    assert row["p50_ms"] is None, (
+        f"a run with no ok sample reported percentiles: {row}"
+    )
+
+
 def test_guardrail_assertion_stays_strict():
     """The B01 audit-schema guardrail's *strictness*.
 
