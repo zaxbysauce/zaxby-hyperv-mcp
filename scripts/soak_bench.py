@@ -45,7 +45,11 @@ from contextvars import ContextVar
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_REPO_ROOT / "src"))
+if str(_REPO_ROOT / "src") not in sys.path:
+    # Idempotent: importing this module twice (a check that reloads it, or a
+    # second --fake run in one process) must not grow sys.path without bound
+    # (feedback PRR-045).
+    sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from hyperv_mcp import consolebench, pswindows  # noqa: E402
 
@@ -54,6 +58,13 @@ FAKE_GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
 FAKE_VM = "test-vm-soak"
 DEFAULT_AGENTS = "1,4,8"
 TOOLS = ("hyperv_console_screenshot", "hyperv_guest_run_ps", "hyperv_console_scroll")
+#: Per-agent join budget: the whole run is bounded by ONE deadline shared across
+#: the agents, so 8 agents are not capped by a single serial 600 s join.
+_AGENT_JOIN_BUDGET_S = 600.0
+#: Environment keys the fake mode injects and the teardown must restore
+#: (feedback PRR-011 / PRR-037).
+_SOAK_ENV_KEYS = ("HYPERV_MCP_CONFIG", "HYPERV_GUEST_USERNAME",
+                  "HYPERV_GUEST_PASSWORD")
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +264,15 @@ def _sample(tool: str, result, elapsed_ms: float, token: str) -> dict:
 
 
 def _server_for(mode: str, audit_log: Path | None):
-    """Bootstrap a real server for the run.
+    """Bootstrap a real server for the run, and return it with a TEARDOWN.
+
+    The teardown restores `auditlog._config` to whatever the process had before
+    the run. Without it, `auditlog._config` keeps pointing at the run's tmp
+    audit file after the TemporaryDirectory is gone, so a later direct
+    `auditlog.operation()` in the same process raises FileNotFoundError — a
+    latent landmine guarded only by the test suite's autouse restore fixture
+    (feedback PRR-011). Every shipped consumer restores it, so this harness must
+    too.
 
     Fake mode: a tmp config allowing ``test-*`` VMs and the console_input
     destructive category, with the audit sink at a tmp file, plus fake guest
@@ -267,7 +286,11 @@ def _server_for(mode: str, audit_log: Path | None):
     directly: a direct call has to plumb `cred=` by hand and a missing one
     raises before any work happens.
     """
+    import hyperv_mcp.auditlog as auditlog
     import hyperv_mcp.server as server_module
+
+    saved_config = auditlog._config
+    saved_env = {k: os.environ.get(k) for k in _SOAK_ENV_KEYS}
 
     if mode == "fake":
         doc = {
@@ -294,7 +317,20 @@ def _server_for(mode: str, audit_log: Path | None):
     # which deny every console_input call and make the whole run measure its own
     # rejections.
     mod.bootstrap({"HYPERV_MCP_CONFIG": str(cfg)})
-    return mod
+
+    def _teardown():
+        # Restore in the reverse order of the setup: the audit sink first (it
+        # is the one whose stale value survives the tmp dir), then the environ
+        # keys the fake mode injected, then the module reload.
+        auditlog._config = saved_config
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        importlib.reload(server_module)
+
+    return mod, _teardown
 
 
 def _agent_loop(mcp, stub, token: str, iterations: int, vm: str,
@@ -352,28 +388,44 @@ def _run(agents: int, iterations: int, *, stub, vm: str, mode: str,
     lock = threading.Lock()
     hung: list[str] = []
     try:
-        mod = _server_for(mode, audit_log)
+        teardown = None
+        mod, teardown = _server_for(mode, audit_log)
         mcp = mod.get_mcp()
         threads = [
             threading.Thread(
                 target=_agent_loop,
                 args=(mcp, stub, f"soak-token-{i}", iterations, vm, samples, lock),
                 name=f"soak-agent-{i}",
+                # daemon so a wedged tool call cannot block interpreter exit:
+                # CPython's threading._shutdown() joins non-daemon threads, so a
+                # hung agent would otherwise hang the process after main()
+                # returned 0 (feedback PRR-010).
+                daemon=True,
             )
             for i in range(agents)
         ]
         for t in threads:
             t.start()
+        # One deadline shared across the agents, so a run of 8 agents is not
+        # capped by a single serial join (feedback PRR-033).
+        deadline = time.monotonic() + _AGENT_JOIN_BUDGET_S
         for t in threads:
-            t.join(timeout=600)
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
         hung = [t.name for t in threads if t.is_alive()]
     finally:
+        # Restore the transport BEFORE anything that can observe a resumed
+        # thread. Restoring while a wedged thread was still inside a tool body
+        # let it resume against the REAL run_ps, so --fake mode spawned genuine
+        # host PowerShell into a TemporaryDirectory about to be deleted
+        # (feedback PRR-010). A daemon thread that never returns is the only
+        # shape left, and it holds no dependency on the restored globals.
         pswindows.run_ps = saved_run_ps
         if stub is not None:
             wmiconsole.COM_AVAILABLE = saved_com_available
-        import hyperv_mcp.server as server_module
-
-        importlib.reload(server_module)
+        # teardown stays None when _server_for itself raised, so the finally
+        # does not turn a setup failure into an UnboundLocalError.
+        if teardown is not None:
+            teardown()
     row = summarize(samples)
     row["agents"] = agents
     row["iterations"] = iterations

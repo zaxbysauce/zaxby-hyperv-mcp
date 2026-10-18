@@ -130,15 +130,27 @@ def test_soak_bench_fake_mode_reports_a_rejection_only_run_as_such(monkeypatch):
     import hyperv_mcp.server as server_module
 
     def denying_server(mode, audit_log):
-        """A server whose policy matches no VM name at all."""
+        """A server whose policy matches no VM name at all.
+
+        Returns the (module, teardown) pair `_run` unpacks; the teardown
+        restores the audit sink the way the real one does (feedback PRR-011).
+        """
+        import hyperv_mcp.auditlog as auditlog
+
         cfg = audit_log.parent / "deny.json"
         cfg.write_text(
             json.dumps({"allowed_vm_patterns": ["nothing-matches-*"]}),
             encoding="utf-8",
         )
+        saved_config = auditlog._config
         mod = importlib.reload(server_module)
         mod.bootstrap({"HYPERV_MCP_CONFIG": str(cfg)})
-        return mod
+
+        def _teardown():
+            auditlog._config = saved_config
+            importlib.reload(server_module)
+
+        return mod, _teardown
 
     monkeypatch.setattr(soak_bench, "_server_for", denying_server)
     with tempfile.TemporaryDirectory():

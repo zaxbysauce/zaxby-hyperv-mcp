@@ -235,7 +235,28 @@ class _RWLock:
             # slice: a per-slice accumulation loses the final slice on the
             # timeout path, so a busy failure could under-report its wait by one
             # 0.2 s poll window.
+            #
+            # The clock starts AFTER the bookkeeping above and stops BEFORE the
+            # mode branch's finally block, so an UNCONTENDED acquire measures
+            # nothing but the predicate check and reports exactly 0. Measuring
+            # the whole branch instead let the writer's finally bookkeeping
+            # (waiting_writers -= 1, notify_all) land inside the window, and 4
+            # of 20,000 uncontended acquires under a GIL-hogging thread
+            # reported a nonzero lock_wait_ms (max 16 ms) — which then reached
+            # audit rows and console metadata (feedback PRR-014).
             wait_started = time.monotonic()
+            contended = mode == "write" and (
+                self._writer is not None or self._readers
+            ) or (mode == "read" and (
+                self._writer is not None or self._waiting_writers > 0
+            ))
+            if not contended:
+                # Fast path: nothing to wait for, so nothing to measure.
+                if mode == "write":
+                    self._writer = (tid, _holder_dict(mode, time.time()))
+                else:
+                    self._readers[tid] = _holder_dict(mode, time.time())
+                return 0
             if mode == "write":
                 self._waiting_writers += 1
                 if self._pending_writer is None:

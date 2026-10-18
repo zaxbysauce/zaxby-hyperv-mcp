@@ -71,6 +71,11 @@ packages = ["src/hyperv_mcp"]
 [tool.hatch.build.targets.sdist]
 include = [
     "src/hyperv_mcp",
+    # scripts/soak_bench.py is the documented entry point for the soak
+    # benchmark (README "Soak benchmark"), so it ships in the sdist and the
+    # wheel. Omitting it made `python scripts/soak_bench.py` work only from a
+    # source checkout.
+    "scripts",
     "README.md",
     "LICENSE",
     "NOTICE",
