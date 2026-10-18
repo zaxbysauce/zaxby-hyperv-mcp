@@ -230,20 +230,25 @@ class _RWLock:
             if (self._writer is not None and self._writer[0] == tid) or tid in self._readers:
                 raise _busy(key, self._current_holder())
 
-            waited_ms = 0
             deadline = None if wait_s is None else time.monotonic() + max(0.0, wait_s)
+            # The wait is measured around the WHOLE loop, not per _wait_tick
+            # slice: a per-slice accumulation loses the final slice on the
+            # timeout path, so a busy failure could under-report its wait by one
+            # 0.2 s poll window.
+            wait_started = time.monotonic()
             if mode == "write":
                 self._waiting_writers += 1
                 if self._pending_writer is None:
                     self._pending_writer = _holder_dict(mode, time.time())
                 try:
                     while self._writer is not None or self._readers:
-                        slice_start = time.monotonic()
                         if not self._wait_tick(deadline):
                             raise _busy(
-                                key, self._current_holder(), waited_ms=waited_ms
+                                key, self._current_holder(),
+                                waited_ms=int(
+                                    (time.monotonic() - wait_started) * 1000
+                                ),
                             )
-                        waited_ms += int((time.monotonic() - slice_start) * 1000)
                     self._writer = (tid, _holder_dict(mode, time.time()))
                 finally:
                     self._waiting_writers -= 1
@@ -255,12 +260,15 @@ class _RWLock:
                     self._cv.notify_all()
             else:
                 while self._writer is not None or self._waiting_writers > 0:
-                    slice_start = time.monotonic()
                     if not self._wait_tick(deadline):
-                        raise _busy(key, self._current_holder(), waited_ms=waited_ms)
-                    waited_ms += int((time.monotonic() - slice_start) * 1000)
+                        raise _busy(
+                            key, self._current_holder(),
+                            waited_ms=int(
+                                (time.monotonic() - wait_started) * 1000
+                            ),
+                        )
                 self._readers[tid] = _holder_dict(mode, time.time())
-            return waited_ms
+            return int((time.monotonic() - wait_started) * 1000)
 
     def _wait_tick(self, deadline: float | None) -> bool:
         """Wait for the CV until the predicate may have changed; return

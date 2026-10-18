@@ -232,7 +232,13 @@ def _sample(tool: str, result, elapsed_ms: float, token: str) -> dict:
         return sample
     if tool == "hyperv_guest_run_ps":
         # The guest leg echoes the agent's own token; anything else is wrong.
-        sample["incorrect"] = envelope.get("stdout") != token
+        # The guest child's stdout keeps its trailing newline
+        # (ReadAllText is verbatim and _result_ok does not strip), so the
+        # comparison must strip too -- otherwise every CORRECT live echo
+        # is counted incorrect and a live AC9 run reports incorrect_rate
+        # 1.0 regardless of how the system behaves.
+        echoed = str(envelope.get("stdout") or "").strip()
+        sample["incorrect"] = echoed != token
     elif tool == "hyperv_console_screenshot":
         # A requested-size mismatch only sets fallback_used metadata; the
         # returned dimensions are what the caller asked for unless the capture

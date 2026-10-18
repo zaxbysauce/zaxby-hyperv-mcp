@@ -147,15 +147,18 @@ def parse_marker(text: str) -> tuple[str, dict | None]:
     the corresponding field reads `None`.
 
     Splitting uses `splitlines()` rather than `split("\\n")` because real
-    PowerShell emits CRLF while the checks inject LF.
+    PowerShell emits CRLF while the checks inject LF. The rejoin uses the
+    caller's own terminator, so stdout that arrived CRLF leaves CRLF: the only
+    bytes removed are the marker line itself, and nothing else about the
+    caller's stdout changes.
     """
-
+    separator = "\r\n" if "\r\n" in text else "\n"
     lines = text.splitlines()
     for index in range(len(lines) - 1, -1, -1):
         if lines[index].strip().startswith(MARKER_PREFIX):
             payload = lines[index].strip()[len(MARKER_PREFIX):]
             del lines[index]
-            return "\n".join(lines), _accept(payload)
+            return separator.join(lines), _accept(payload)
     return text, None
 
 
