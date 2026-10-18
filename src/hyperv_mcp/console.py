@@ -462,6 +462,13 @@ def _folded_wait_frame_script(
         "    }\n",
         "    if ($r.ReturnValue -ne 0) { throw ('GetVirtualSystemThumbnailImage failed with ReturnValue=' + $r.ReturnValue) }\n",
         "    $polls++\n",
+        # A short buffer makes the count negative, and ComputeHash's method
+        # error is NON-terminating: without this guard the exception is
+        # swallowed, $hash keeps its stale value, the loop polls to the
+        # deadline and the caller is told {ok: true, changed: false}. The
+        # in-process WMI leg length-checks; this leg must too.
+        "    $pxLen = 0; if ($r.ImageData -ne $null) { $pxLen = $r.ImageData.Length }\n",
+        "    if ($pxLen -lt 5) { throw ('thumbnail payload too short: ' + $pxLen + ' bytes; the opaque prefix alone is 4') }\n",
         "    $hash = ([System.BitConverter]::ToString($sha.ComputeHash($r.ImageData, 4, $r.ImageData.Length - 4)) -replace '-','').ToLowerInvariant()\n",
         "    $lastHash = $hash\n",
         "    if ($baseline -eq '') { $baseline = $hash }\n",
@@ -673,13 +680,15 @@ def _decode_rgb565(raw: bytes, width: int, height: int) -> bytes:
 
 
 class Frame(PILImage.Image):
-    """A decoded console frame together with the single PNG encoding made for it.
+    """A decoded console frame together with the single encoding made for it.
 
     Every returned image used to cost two PNG encodes: one inside the decode and
     one in the server layer that re-opened those bytes. `encoded` is that one
     encoding, so the server reuses the bytes instead of encoding again and
     `save_path` writes exactly the bytes the caller receives. `mime` names the
-    format it was made in; `png` remains the PNG-only view and is read-only.
+    format it was made in — `image/png` unless the caller asked for jpeg or
+    webp — and `png` remains the PNG-only view, read-only, available only when
+    the frame IS a PNG.
 
     A frame IS a `PIL.Image.Image`, not a wrapper around one: it is built by
     copying the decoded image's state onto this class, so `isinstance` checks,
@@ -704,6 +713,7 @@ class Frame(PILImage.Image):
     _png: bytes
     _encoded: bytes
     _mime: str
+    _quality: int | None
 
     @classmethod
     def from_image(
@@ -715,6 +725,7 @@ class Frame(PILImage.Image):
         frame._encoded = _encode(img, mime, quality)
         frame._mime = mime
         frame._png = frame._encoded if mime == "image/png" else b""
+        frame._quality = quality
         return frame
 
     @classmethod
@@ -731,11 +742,18 @@ class Frame(PILImage.Image):
 
     def __copy__(self) -> Frame:
         # PIL.Image.__copy__ returns a plain Image, which would silently drop
-        # both the class and the encoding. Rebuild through the encoding instead.
-        return _rebuild_frame(self._encoded, self._mime)
+        # both the class and the encoding. Clone the raster and carry the
+        # SAME encoding bytes across: a copy must not spend a second encode
+        # and must not hand back different bytes (bytes are immutable, so
+        # sharing them is safe).
+        dup = Frame.__new__(Frame)
+        dup.__dict__.update(self.__dict__)
+        self.load()
+        dup.im = self.im.copy()
+        return dup
 
     def __reduce__(self):
-        return (_rebuild_frame, (self._encoded, self._mime))
+        return (_rebuild_frame, (self._encoded, self._mime, self._quality))
 
     @property
     def encoded(self) -> bytes:
@@ -746,6 +764,23 @@ class Frame(PILImage.Image):
     def mime(self) -> str:
         """The MIME type of `encoded` (image/png, image/jpeg or image/webp)."""
         return self._mime
+
+    @property
+    def pil_format(self) -> str:
+        """The Pillow save-format name for this frame ("PNG"/"JPEG"/"WEBP") —
+        what `Image(data=..., format=...)` needs, derived from `mime` so the
+        caller never reaches into the format table itself.
+
+        An out-of-table mime is a code-level defect, so it raises ValueError
+        (which `errors.classify` reports as `invalid`) rather than the bare
+        KeyError that would otherwise surface as `error_class: "transport"`.
+        """
+        try:
+            return _OUTPUT_FORMATS[_normalise_format(self._mime)][0]
+        except KeyError:
+            raise ValueError(
+                f"no Pillow save format is registered for mime {self._mime!r}"
+            ) from None
 
     @property
     def png(self) -> bytes:
@@ -765,9 +800,26 @@ class Frame(PILImage.Image):
         )
 
 
-def _rebuild_frame(encoded: bytes, mime: str) -> Frame:
-    """Module-level rebuild target so a Frame pickles in its own format."""
-    return Frame.from_image(PILImage.open(io.BytesIO(encoded)), mime)
+def _rebuild_frame(encoded: bytes, mime: str, quality: int | None = None) -> Frame:
+    """Module-level rebuild target so a Frame pickles in its own format.
+
+    The encoding is decoded to recover a raster, but the encoding itself is
+    KEPT VERBATIM and becomes the frame's single encoding: a deepcopy or
+    pickle of a frame must not spend a second encode and must not hand back
+    different bytes. `quality` rides along so the rebuilt frame still knows
+    what it was made with. The image is loaded before its state is copied
+    onto the Frame, because a lazily-opened image's tile decoding depends on
+    its original subclass's `load_read`.
+    """
+    img = PILImage.open(io.BytesIO(encoded))
+    img.load()
+    frame = Frame.__new__(Frame)
+    frame.__dict__.update(img.__dict__)
+    frame._encoded = encoded
+    frame._mime = mime
+    frame._png = encoded if mime == "image/png" else b""
+    frame._quality = quality
+    return frame
 
 
 # Output formats: caller-facing name -> (Pillow save format, MIME type). "jpg"
@@ -851,6 +903,34 @@ def _frame_hash(raw: bytes) -> str:
     return hashlib.sha256(raw[_PREFIX_LEN:]).hexdigest()
 
 
+# The hash domain, stated so a consumer can tell a pixel-only hash from a
+# whole-payload one. Both are 64 lowercase hex characters, so the shapes are
+# indistinguishable: a `baseline_hash` recorded by a pre-0.4.0 build hashed
+# the whole payload and can therefore never match, and without this marker
+# that permanent mismatch is indistinguishable from a genuine screen change
+# (poll 1 reports `changed: true` with an image). Record it beside the
+# baseline and refuse a baseline from another domain.
+HASH_DOMAIN = "sha256/pixels-after-4-byte-prefix"
+
+
+def _changed_pixel_bytes(prev_raw: bytes | None, raw: bytes) -> int:
+    """How many PIXEL bytes differ from the previous capture.
+
+    Same domain as `frame_hash`: the payload after the 4-byte opaque prefix.
+    Diffing the whole payload would put two change signals in one `frames[]`
+    entry that disagree on exactly the prefix-drift input the pixel-only hash
+    exists to handle — an identical `frame_hash` alongside a nonzero byte
+    count, which reads as a contradiction to whoever is interpreting it.
+    """
+    if prev_raw is None:
+        return 0
+    return sum(
+        1
+        for a, b in zip(prev_raw[_PREFIX_LEN:], raw[_PREFIX_LEN:], strict=True)
+        if a != b
+    )
+
+
 # ---------------------------------------------------------------------------
 # output options (issue #19): format, quality, scale, crop, if_changed_from
 #
@@ -861,35 +941,41 @@ def _frame_hash(raw: bytes) -> str:
 # `invalid` instead of being silently ignored.
 # ---------------------------------------------------------------------------
 
-def _resolve_output_options(
-    fmt: str,
-    quality,
-    scale,
-    crop,
-    frame_w: int,
-    frame_h: int,
-) -> tuple[str, int | None, float | None, tuple[int, int, int, int] | None]:
-    """Validate and normalise the output options.
+def _validate_output_options(fmt: str, quality, scale) -> tuple[str, int | None, float | None]:
+    """The frame-INDEPENDENT half of option validation: format, quality, scale.
 
-    Returns `(mime, quality, scale, crop_box)`. Raises `ValueError` — which
-    `errors.classify` maps to `error_class: "invalid"` — for an unsupported
-    format, a `quality` outside 1..100, a `scale` outside (0, 1], or a crop box
-    that is empty or outside the frame. Nothing falls back silently: a rejected
-    option never produces a differently-shaped image.
-
-    The crop box is validated against the ACTUAL captured dimensions, because
-    the fallback chain can hand back a size other than the one requested.
+    Split out so `screenshot` can run it BEFORE the capture. A bad format,
+    quality or scale is a deterministic caller error, and charging a
+    PowerShell spawn — which holds a `max_host_powershell` slot, or the whole
+    WMI fallback chain — for it is avoidable. `crop` and the captured-
+    dimension checks stay in `_resolve_output_options`, which runs after the
+    capture because the fallback chain can hand back a size other than the one
+    requested.
     """
     key = _normalise_format(fmt)
-    if not key:
+    if not fmt:
+        # No format asked for: the PNG default, with no `format` echo key.
         mime = "image/png"
+    elif not key:
+        # A format the caller DID supply but that normalises away ("image/",
+        # "  ") is not a default — it is a value we would otherwise ignore
+        # while echoing "image/png" as if it had been honoured.
+        raise ValueError(
+            f"unsupported format {str(fmt)!r}; supported formats: "
+            f"{', '.join(sorted({v[1] for v in _OUTPUT_FORMATS.values()}))}"
+        )
     elif key in _OUTPUT_FORMATS:
         mime = _OUTPUT_FORMATS[key][1]
-        if mime == "image/webp" and not _PILFeatures.check("webp"):
-            raise ValueError(
-                "format 'webp' is not supported by this Pillow build "
-                "(PIL.features.check('webp') is False)"
-            )
+        # Both lossy formats are feature-detected: a Pillow built without
+        # libjpeg or WebP would otherwise reach img.save and raise OSError,
+        # which errors.classify reports as "transport" rather than the
+        # "invalid" this module promises for an unsupported value.
+        for feature, label in (("jpg", "jpeg"), ("webp", "webp")):
+            if mime.endswith(f"/{label}") and not _PILFeatures.check(feature):
+                raise ValueError(
+                    f"format {label!r} is not supported by this Pillow build "
+                    f"(PIL.features.check({feature!r}) is False)"
+                )
     else:
         supported = ", ".join(sorted({v[1] for v in _OUTPUT_FORMATS.values()}))
         raise ValueError(
@@ -914,6 +1000,46 @@ def _resolve_output_options(
         if not (0 < float(scale) <= 1):
             raise ValueError(f"scale must be within (0, 1], got {scale}")
         resolved_scale = float(scale)
+
+    return mime, resolved_quality, resolved_scale
+
+
+def _validate_if_changed_from(if_changed_from: str) -> None:
+    """The change-baseline is also frame-independent, so it fails fast too."""
+    if if_changed_from and not re.fullmatch(r"[0-9a-f]{64}", if_changed_from):
+        raise ValueError(
+            "if_changed_from must be an empty string or a 64-char hex sha256"
+        )
+
+
+def _resolve_output_options(
+    fmt: str,
+    quality,
+    scale,
+    crop,
+    frame_w: int,
+    frame_h: int,
+) -> tuple[str, int | None, float | None, tuple[int, int, int, int] | None]:
+    """Validate and normalise the output options.
+
+    Returns `(mime, quality, scale, crop_box)`. Raises `ValueError` — which
+    `errors.classify` maps to `error_class: "invalid"` — for an unsupported
+    format, a `quality` outside 1..100, a `scale` outside (0, 1], or a crop box
+    that is empty or outside the frame. Nothing falls back silently: a rejected
+    option never produces a differently-shaped image.
+
+    `quality` is range-checked whatever the format — an out-of-range value is
+    refused even for PNG — but it only has an effect on the lossy formats, so
+    an in-range `quality` on a PNG frame is accepted and does nothing. The
+    caller sees which options were applied because `_finish_screenshot` echoes
+    each one that was supplied.
+
+    The crop box is validated against the ACTUAL captured dimensions, because
+    the fallback chain can hand back a size other than the one requested.
+    """
+    mime, resolved_quality, resolved_scale = _validate_output_options(
+        fmt, quality, scale
+    )
 
     if crop is None:
         resolved_crop: tuple[int, int, int, int] | None = None
@@ -980,60 +1106,118 @@ def _finish_screenshot(
 
     Returns `(None, meta)` with `unchanged: true` when `if_changed_from` matches;
     in that case no decode, no encode and no file write happen, and the metadata
-    still carries the captured `width`/`height` so the caller knows what the
-    unchanged frame WAS.
+    still carries the captured `width`/`height` — labelled as the captured size,
+    since no output image exists to measure.
+
+    Every option-echo key (`format`, `quality`, `scale`, `crop`) is emitted
+    BEFORE the short-circuit and is gated on the caller having supplied that
+    option, so an `unchanged: true` result is exactly as informative about the
+    request as a changed one, and a request with no options produces the same
+    key set on both paths (issue #19's "no option means identical metadata
+    keys" constraint).
     """
     mime, resolved_quality, resolved_scale, crop_box = _resolve_output_options(
         fmt, quality, scale, crop, actual_w, actual_h
+    )
+    # `scale=1.0` is a no-op, so it is not a shaping request: a frame the
+    # caller asked to leave alone must come back byte-identical to the base.
+    shaped = crop_box is not None or (
+        resolved_scale is not None and resolved_scale != 1.0
     )
     frame_hash = _frame_hash(raw)
     meta = dict(common)
     meta["frame_hash"] = frame_hash
     meta["prefix_hex"] = raw[:_PREFIX_LEN].hex()
+    # `width`/`height` are the CAPTURED size here; the decode path below
+    # overwrites them with the output size. On the unchanged path they stay
+    # captured, because no output image exists.
     meta["width"] = actual_w
     meta["height"] = actual_h
+    if fmt:
+        meta["format"] = mime
+    if resolved_quality is not None:
+        meta["quality"] = resolved_quality
+    if resolved_scale is not None:
+        meta["scale"] = resolved_scale
+    if crop_box is not None:
+        meta["crop"] = list(crop_box)
 
     if if_changed_from:
-        if not re.fullmatch(r"[0-9a-f]{64}", if_changed_from):
-            raise ValueError(
-                "if_changed_from must be an empty string or a 64-char hex sha256"
-            )
+        _validate_if_changed_from(if_changed_from)
         if if_changed_from == frame_hash:
+            # The policy verdict must not depend on whether the frame
+            # changed: check_host_write is a pure allow/deny, so running it
+            # here costs nothing and keeps an out-of-roots save_path denied
+            # on BOTH paths instead of silently allowed on a match.
+            if save_path:
+                policy.check_host_write(cfg, save_path)
+                meta["save_path_skipped"] = (
+                    "unchanged: no image was encoded, so no file was written"
+                )
             return None, {**meta, "unchanged": True}
 
     # Decode to a bare image, shape it, then encode exactly once: routing the
     # shaped path through _decode_frame would encode a PNG that is immediately
     # discarded, which is the second encode issue #17 removed.
     img = _decode_rgb565_image(raw, actual_w, actual_h)
-    if crop_box is not None or resolved_scale is not None:
+    if shaped:
         img = _shape_frame(img, resolved_scale, crop_box)
     frame = Frame.from_image(img, mime, resolved_quality)
 
     width, height = frame.size
     meta["width"] = width
     meta["height"] = height
-    if fmt:
-        meta["format"] = mime
-    if resolved_scale is not None:
-        meta["scale"] = resolved_scale
-    if crop_box is not None:
-        meta["crop"] = list(crop_box)
-    if crop_box is not None or resolved_scale is not None:
-        meta["scale_note"] = (
-            "the returned image is cropped and/or scaled: its coordinates are NOT "
-            "head-space coordinates. Pass frame_width/frame_height matching the "
-            "returned dimensions to mouse tools, or omit them to use head "
-            "coordinates directly."
-        )
+    if shaped:
+        # Compose onto the transport's head-resolution hint instead of
+        # replacing it — the caller still needs to know how to reach head
+        # space, and this is what tells them they can no longer do so
+        # directly. `scale=1.0` is a no-op, so a frame byte-identical to the
+        # base must not gain the warning at all.
+        hint = meta.get("scale_note") or ""
+        if crop_box is not None:
+            # A crop offset has no head-space equivalent: _scale_to_head has
+            # no crop term and mouse_move/click take no offset parameter, so
+            # telling the caller to pass frame_width/frame_height here would
+            # send them to a wrong head coordinate with an ok:true result.
+            meta["scale_note"] = (
+                f"{hint} — this frame is CROPPED to "
+                f"[{crop_box[0]}, {crop_box[1]}, {crop_box[2]}, {crop_box[3]}] of the "
+                f"{actual_w}x{actual_h} capture and then scaled to {width}x{height}. "
+                f"Its pixel coordinates have NO head-space equivalent (there is no "
+                f"crop-offset parameter on the mouse tools), so do not pass them to "
+                f"mouse_move/click — take an uncropped frame for pointer work."
+            )
+        else:
+            meta["scale_note"] = (
+                f"{hint} — this frame is SCALED to {width}x{height}, so its pixel "
+                f"coordinates are NOT head-space coordinates. Pass "
+                f"frame_width/frame_height matching the returned dimensions to the "
+                f"mouse tools to scale them, or omit them to use head coordinates "
+                f"directly."
+            )
     if save_path:
         policy.check_host_write(cfg, save_path)
         parent = os.path.dirname(save_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(save_path, "wb") as fh:
-            fh.write(frame.encoded)
+        # Write to a sibling temp file and replace, so a mid-write failure
+        # cannot leave a truncated artifact where a complete one used to be.
+        tmp_path = f"{save_path}.mcp-partial"
+        try:
+            with open(tmp_path, "wb") as fh:
+                fh.write(frame.encoded)
+            os.replace(tmp_path, save_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         meta["saved_path"] = save_path
-        meta["saved_format"] = mime
+        # Only report a format the caller asked for: a default save writes a
+        # PNG and must not add a key the base never emitted.
+        if fmt:
+            meta["saved_format"] = mime
     return frame, meta
 
 
@@ -1153,6 +1337,11 @@ def screenshot(
     """
     if not (160 <= width <= 4096 and 160 <= height <= 4096):
         raise ValueError("width/height must be within 160..4096")
+    # Fail fast on everything that does not need the captured dimensions, so a
+    # deterministic caller error is refused as `invalid` before a PowerShell
+    # spawn takes a max_host_powershell slot (or the WMI chain runs).
+    _validate_output_options(fmt, quality, scale)
+    _validate_if_changed_from(if_changed_from)
     be, connect_ms = _try_backend(cfg)
     ref: vmident.VMRef | None = None
     if be is not None:
@@ -1794,6 +1983,7 @@ def wait_frame_change(
         "elapsed_ms": elapsed_ms,
         "width": width,
         "height": height,
+        "hash_domain": HASH_DOMAIN,
         "timings": _ps_timings(timing),
     }
     if last_hash:
@@ -1851,6 +2041,7 @@ def _wait_frame_change_wmi(
         "elapsed_ms": elapsed_ms,
         "width": width,
         "height": height,
+        "hash_domain": HASH_DOMAIN,
         "timings": _wmi_timings(connect_ms, *phase_dicts),
     }
     if last_hash:
@@ -1885,9 +2076,7 @@ def capture_sequence(
         # VM), so there is no separate GUID process — at most one per frame.
         raw = _capture_raw(cfg, prelude, width, height, timing)
         h = _frame_hash(raw)
-        changed_bytes = (
-            sum(1 for a, b in zip(prev_raw, raw, strict=True) if a != b) if prev_raw is not None else 0
-        )
+        changed_bytes = _changed_pixel_bytes(prev_raw, raw)
         frames.append({
             "index": i,
             "frame_hash": h,
@@ -1917,7 +2106,7 @@ def _capture_sequence_wmi(
 ) -> dict:
     """capture_sequence over the in-process WMI backend, preserving the
     per-frame bookkeeping contract (strict-zip changed-byte counts over
-    equal-length payloads, first-and-last-only images)."""
+    equal-length pixel slices, first-and-last-only images)."""
     frames: list[dict] = []
     images: list = []
     prev_raw: bytes | None = None
@@ -1928,10 +2117,7 @@ def _capture_sequence_wmi(
             raw, t = be.capture(ref.id, width, height)
             phase_dicts.append(t)
             h = _frame_hash(raw)
-            changed_bytes = (
-                sum(1 for a, b in zip(prev_raw, raw, strict=True) if a != b)
-                if prev_raw is not None else 0
-            )
+            changed_bytes = _changed_pixel_bytes(prev_raw, raw)
             frames.append({
                 "index": i,
                 "frame_hash": h,

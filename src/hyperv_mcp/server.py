@@ -421,11 +421,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         image = result["image"]
         if image is None:
             return [result["meta"]]
-        pil_format = console._OUTPUT_FORMATS[
-            console._normalise_format(image.mime)
-        ][0]
         return [
-            Image(data=image.encoded, format=pil_format).to_image_content(),
+            Image(data=image.encoded, format=image.pil_format).to_image_content(),
             result["meta"],
         ]
 
@@ -1200,12 +1197,18 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                       the bytes written are exactly the bytes returned
             format:   png (default), jpeg/jpg, or webp; an unsupported format is
                       refused as an invalid-input error, never silently ignored
-            quality:  1..100 for jpeg/webp (ignored for png)
-            scale:    downscale factor in (0, 1] applied after crop
+            quality:  1..100; applies to jpeg/webp only. An out-of-range value is
+                      refused whatever the format, including png — png has no
+                      quality axis, so an in-range value there is accepted and
+                      has no effect (it is echoed in the metadata as `quality`)
+            scale:    downscale factor in (0, 1] applied after crop; 1.0 is a
+                      no-op and leaves the frame byte-identical
             crop:     [left, top, right, bottom] in captured-frame pixels
-            if_changed_from: a frame_hash from a previous capture; when it equals
-                      the current capture's hash the tool returns metadata only
-                      (no image) and skips decode and encode
+            if_changed_from: a frame_hash from a previous capture, as 64 lowercase
+                      hex characters; when it equals the current capture's hash
+                      the tool returns metadata only (no image) and skips decode,
+                      encode and the file write — but still applies the save_path
+                      policy check, so an out-of-roots path is denied on both paths
 
         Returns: [ImageContent, TextContent(json metadata)] — the metadata alone
         when if_changed_from matches (unchanged: true).
@@ -1226,11 +1229,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 # is reused instead of encoding the image a second time.
                 if img is None:
                     return errors.success_result([meta])
-                pil_format = console._OUTPUT_FORMATS[
-                    console._normalise_format(img.mime)
-                ][0]
                 return errors.success_result(
-                    [Image(data=img.encoded, format=pil_format).to_image_content(), meta]
+                    [Image(data=img.encoded, format=img.pil_format).to_image_content(), meta]
                 )
         except UrlElicitationRequiredError:
             raise
@@ -1953,14 +1953,27 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+                width:  requested screenshot width in pixels (160..4096)
+                height: requested screenshot height in pixels (160..4096)
+                save_path: optional host path to also write the PNG/encoded image
+                ui_tree: also fetch a bounded guest UI element tree (needs credentials)
+                ui_tree_depth: tree walk depth, clamped to 1..6
+                ui_tree_max_elements: element cap, clamped to 1..500
+                username: guest username for the UI-tree leg (or set HYPERV_GUEST_USERNAME)
+                password: guest password for the UI-tree leg (or set HYPERV_GUEST_PASSWORD)
                 format:  png (default), jpeg/jpg, or webp; an unsupported format
                          is refused as an invalid-input error
-                quality: 1..100 for jpeg/webp (ignored for png)
+                quality: 1..100; applies to jpeg/webp only. An out-of-range value
+                         is refused whatever the format, including png — png has
+                         no quality axis, so an in-range value there is accepted
+                         and has no effect
                 scale:   downscale factor in (0, 1] applied after crop
                 crop:    [left, top, right, bottom] in captured-frame pixels
-                if_changed_from: a frame_hash from a previous capture; when it
-                         equals the current capture's hash the tool returns
-                         metadata only and skips decode and encode
+                if_changed_from: a frame_hash from a previous capture, as 64
+                         lowercase hex characters; when it equals the current
+                         capture's hash the tool returns metadata only and skips
+                         decode, encode, the file write AND the UI-tree leg
+                         (meta["ui_tree"] then reports why it was skipped)
 
             Returns: [ImageContent, TextContent(metadata)] on success — the
             metadata alone when if_changed_from matches.
@@ -2126,14 +2139,25 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+                width:  requested screenshot width in pixels (160..4096)
+                height: requested screenshot height in pixels (160..4096)
+                save_path: optional host path to also write the encoded image
+                ui_tree: also fetch a bounded guest UI element tree (needs credentials)
+                ui_tree_depth: tree walk depth, clamped to 1..6
+                ui_tree_max_elements: element cap, clamped to 1..500
                 format:  png (default), jpeg/jpg, or webp; an unsupported format
                          is refused as an invalid-input error
-                quality: 1..100 for jpeg/webp (ignored for png)
+                quality: 1..100; applies to jpeg/webp only. An out-of-range value
+                         is refused whatever the format, including png — png has
+                         no quality axis, so an in-range value there is accepted
+                         and has no effect
                 scale:   downscale factor in (0, 1] applied after crop
                 crop:    [left, top, right, bottom] in captured-frame pixels
-                if_changed_from: a frame_hash from a previous capture; when it
-                         equals the current capture's hash the tool returns
-                         metadata only and skips decode and encode
+                if_changed_from: a frame_hash from a previous capture, as 64
+                         lowercase hex characters; when it equals the current
+                         capture's hash the tool returns metadata only and skips
+                         decode, encode, the file write AND the UI-tree leg
+                         (meta["ui_tree"] then reports why it was skipped)
 
             Returns: [ImageContent, TextContent(metadata)] on success — the
             metadata alone when if_changed_from matches.

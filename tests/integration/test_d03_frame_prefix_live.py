@@ -21,6 +21,7 @@ import json
 import time
 
 import pytest
+from PIL import features
 
 pytestmark = [pytest.mark.hyperv_real]
 
@@ -82,17 +83,29 @@ def test_output_option_sizes_live(it, sdk):
     option (png default, jpeg q80, webp q80, png scale 0.5); each returned
     image's byte size and encode/wall time is printed. No assertion on which
     is smallest — format and scale are not a guaranteed win (a flat desktop
-    can make PNG smallest and LANCZOS downscaling can enlarge it)."""
+    can make PNG smallest and BOX downscaling can enlarge it).
+
+    PRR-021: the matrix used to assert only `len(images) == 1` and then print
+    the mime/size it had just measured, so a transport that dropped every
+    option and returned the default PNG still passed. The measurements are now
+    compared against what each row ASKED for — the mime, the requested scale's
+    effect on the dimensions, and the echoed options — and the webp row carries
+    the same `features.check("webp")` skip unit AC4 has, so a WebP-less Pillow
+    reports a skip instead of hard-failing.
+    """
     vm = it.vm
     options = [
-        ("png (default)", {}),
-        ("jpeg q80", {"format": "jpeg", "quality": 80}),
-        ("webp q80", {"format": "webp", "quality": 80}),
-        ("png scale 0.5", {"scale": 0.5}),
+        ("png (default)", {}, "image/png", (1024, 768)),
+        ("jpeg q80", {"format": "jpeg", "quality": 80}, "image/jpeg", (1024, 768)),
+        ("webp q80", {"format": "webp", "quality": 80}, "image/webp", (1024, 768)),
+        ("png scale 0.5", {"scale": 0.5}, "image/png", (512, 384)),
     ]
     print("\nAC12 output-option sizes: 1024x768 desktop")
-    print("option           |    bytes | wall_ms | mime         | timings")
-    for label, extra in options:
+    print("option           |    bytes | wall_ms | mime         | dims      | timings")
+    for label, extra, expected_mime, expected_dims in options:
+        if extra.get("format") == "webp" and not features.check("webp"):
+            print(f"{label:<16} | SKIPPED (this Pillow build has no WebP support)")
+            continue
         args = {"vm_name": vm, "width": 1024, "height": 768, **extra}
         started = time.monotonic()
         images, texts = _call_screenshot(sdk, args)
@@ -103,11 +116,24 @@ def test_output_option_sizes_live(it, sdk):
         )
         block = images[0]
         mime = getattr(block, "mimeType", None) or getattr(block, "mime_type", None)
+        assert mime == expected_mime, (
+            f"PRR-021 ({label}): the wire mimeType must be {expected_mime}, got "
+            f"{mime!r} — the option was dropped somewhere between the request "
+            f"and the response"
+        )
         size = len(base64.b64decode(block.data))
-        timings = "-"
-        if texts:
-            try:
-                timings = json.dumps(json.loads(texts[0].text).get("timings"))
-            except ValueError:
-                pass
-        print(f"{label:<16} | {size:>8} | {wall_ms:>7} | {mime:<12} | {timings}")
+        meta = json.loads(texts[0].text) if texts else {}
+        dims = (meta.get("width"), meta.get("height"))
+        assert dims == expected_dims, (
+            f"PRR-021 ({label}): the returned dimensions must be {expected_dims}, "
+            f"got {dims} — scale was not applied"
+        )
+        for key in ("format", "quality", "scale", "crop"):
+            if key in extra:
+                assert key in meta, (
+                    f"PRR-021 ({label}): the metadata must echo {key!r}; got "
+                    f"{sorted(meta)}"
+                )
+        timings = json.dumps(meta.get("timings"))
+        print(f"{label:<16} | {size:>8} | {wall_ms:>7} | {mime:<12} | "
+              f"{dims[0]}x{dims[1]:<6} | {timings}")

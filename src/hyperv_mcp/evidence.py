@@ -108,9 +108,15 @@ def capture_evidence(
 
     `image` is None when `if_changed_from` matches the current capture: the
     frame is unchanged, so nothing is decoded, encoded or written, and `meta`
-    carries `unchanged: true`. The output options (`fmt`, `quality`, `scale`,
-    `crop`) are the same ones console.screenshot validates, so an unsupported
-    value is refused here too rather than silently ignored.
+    carries `unchanged: true`. The UI-tree leg is skipped in that case too —
+    it is a credentialed 60 s PowerShell Direct session whose entire purpose is
+    to describe the frame that was just captured, and shipping its content
+    beside `unchanged: true` both spends the cost and discloses fresh guest
+    content for a frame the caller already has. `meta["ui_tree"]` then reports
+    `{requested, skipped: true, reason}` so the omission is visible rather
+    than silent. The output options (`fmt`, `quality`, `scale`, `crop`) are
+    the same ones console.screenshot validates, so an unsupported value is
+    refused here too rather than silently ignored.
     """
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     tree_cred: CredentialSet | None = None
@@ -128,7 +134,19 @@ def capture_evidence(
         if_changed_from=if_changed_from,
     )
     ui: dict[str, Any] = {"requested": ui_tree}
-    if tree_cred is not None:
+    if meta.get("unchanged"):
+        # The frame is unchanged, so the tree would describe a frame the
+        # caller already has a tree for. Skip the credentialed session and
+        # say so, rather than paying for it and merging its content in.
+        ui = {
+            "requested": ui_tree,
+            "skipped": True,
+            "reason": (
+                "unchanged: the UI tree describes the captured frame, and no "
+                "frame was captured this call"
+            ),
+        }
+    elif tree_cred is not None:
         try:
             outcome = run_guest_inner(
                 cfg, ref.id,

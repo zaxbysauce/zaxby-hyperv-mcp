@@ -367,7 +367,15 @@ def test_wait_script_hashes_pixels_after_prefix(monkeypatch):
     AFTER the opaque prefix — the literal ComputeHash($r.ImageData, 4, form —
     so the poll-loop hash stays byte-identical to the host-side _frame_hash.
     RED at the pre-fix base (the script hashes the whole $r.ImageData),
-    GREEN after the fix."""
+    GREEN after the fix.
+
+    The assertion pins the WHOLE expression, not a prefix of it. Review
+    PRR-020b: asserting only `ComputeHash($r.ImageData, 4,` let a mutant that
+    changed the byte count from `- 4` to `- 5` pass every check in the suite,
+    because a wrong count still produces a valid-looking digest. A length
+    guard is pinned too, because ComputeHash's error on a short buffer is
+    non-terminating and would otherwise be swallowed into a full-timeout
+    `changed: false` (review PRR-011)."""
     fake = FakeCapture([
         pswindows.PSResult(stdout="STOP=deadline POLLS=1 HASH=abc", returncode=0),
     ])
@@ -375,10 +383,17 @@ def test_wait_script_hashes_pixels_after_prefix(monkeypatch):
     console.wait_frame_change(Config(unrestricted=True), "vm1", width=320, height=240)
     assert fake.scripts, "AC11: wait_frame_change spawned no poll script"
     script = fake.scripts[0]
-    assert "ComputeHash($r.ImageData, 4," in script, (
-        "AC11: the poll loop must hash the pixels after the 4-byte prefix "
-        "(ComputeHash($r.ImageData, 4, ...)); it currently hashes the whole "
-        "$r.ImageData, disagreeing with the host-side pixel-only hash"
+    assert "ComputeHash($r.ImageData, 4, $r.ImageData.Length - 4)" in script, (
+        "AC11: the poll loop must hash the pixels after the 4-byte prefix, "
+        "counting exactly the pixels (ComputeHash($r.ImageData, 4, "
+        "$r.ImageData.Length - 4)); it currently hashes a different slice or "
+        "count, disagreeing with the host-side pixel-only hash"
+    )
+    assert "$pxLen -lt 5" in script and "throw" in script, (
+        "AC11: the poll loop must refuse a payload shorter than the 4-byte "
+        "prefix plus one pixel, so a short buffer surfaces as a structured "
+        "error instead of a swallowed non-terminating method error that polls "
+        "to the deadline and reports changed: false"
     )
 
 
