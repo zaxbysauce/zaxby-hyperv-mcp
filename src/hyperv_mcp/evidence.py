@@ -113,8 +113,10 @@ def capture_evidence(
     to describe the frame that was just captured, and shipping its content
     beside `unchanged: true` both spends the cost and discloses fresh guest
     content for a frame the caller already has. `meta["ui_tree"]` then reports
-    `{requested, skipped: true, reason}` so the omission is visible rather
-    than silent. The output options (`fmt`, `quality`, `scale`, `crop`) are
+    `{requested: true, skipped: true, reason}` so the omission is visible
+    rather than silent; a caller who passed `ui_tree=false` still gets exactly
+    `{requested: false}`, because the frame's change state is not its business.
+    The output options (`fmt`, `quality`, `scale`, `crop`) are
     the same ones console.screenshot validates, so an unsupported value is
     refused here too rather than silently ignored.
     """
@@ -134,16 +136,20 @@ def capture_evidence(
         if_changed_from=if_changed_from,
     )
     ui: dict[str, Any] = {"requested": ui_tree}
-    if meta.get("unchanged"):
+    if meta.get("unchanged") and ui_tree:
         # The frame is unchanged, so the tree would describe a frame the
         # caller already has a tree for. Skip the credentialed session and
         # say so, rather than paying for it and merging its content in.
+        # Gated on the REQUEST: a caller who asked for no tree must keep
+        # getting exactly {"requested": False} whatever the frame did, or
+        # the unchanged path changes a key set the caller never varied.
         ui = {
-            "requested": ui_tree,
+            "requested": True,
             "skipped": True,
             "reason": (
-                "unchanged: the UI tree describes the captured frame, and no "
-                "frame was captured this call"
+                "unchanged: the UI tree describes the frame this call captured, "
+                "and an unchanged frame produces no new output image — so there "
+                "is nothing new for the tree to describe"
             ),
         }
     elif tree_cred is not None:

@@ -389,11 +389,11 @@ def test_wait_script_hashes_pixels_after_prefix(monkeypatch):
         "$r.ImageData.Length - 4)); it currently hashes a different slice or "
         "count, disagreeing with the host-side pixel-only hash"
     )
-    assert "$pxLen -lt 5" in script and "throw" in script, (
-        "AC11: the poll loop must refuse a payload shorter than the 4-byte "
-        "prefix plus one pixel, so a short buffer surfaces as a structured "
-        "error instead of a swallowed non-terminating method error that polls "
-        "to the deadline and reports changed: false"
+    assert "$pxLen -ne $pxWant" in script and "throw" in script, (
+        "AC11: the poll loop must refuse a payload whose length is not exactly "
+        "4 + width*height*2, so a short or truncated buffer surfaces as a "
+        "structured error instead of a swallowed non-terminating method error "
+        "that polls to the deadline and reports changed: false (review PRR-011)"
     )
 
 

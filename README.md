@@ -1005,7 +1005,7 @@ guest 404 arrives as 404 with the relay error envelope); a request racing
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_capture_evidence` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `ui_tree=false`, `ui_tree_depth=3` (clamped 1..6), `ui_tree_max_elements=200` (clamped 1..500), `format?`, `quality?`, `scale?`, `crop?`, `if_changed_from?` | `[ImageContent, TextContent(meta)]` — metadata alone when `if_changed_from` matches (the UI-tree leg is skipped too, and `meta.ui_tree` says why) |
+| `hyperv_capture_evidence` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `ui_tree=false`, `ui_tree_depth=3` (clamped 1..6), `ui_tree_max_elements=200` (clamped 1..500), `format?` (png\|jpeg/jpg\|webp), `quality?` (1..100), `scale?` (0,1], `crop?` ([left,top,right,bottom]), `if_changed_from?` (frame_hash) | `[ImageContent, TextContent(meta)]` — metadata alone when `if_changed_from` matches (the UI-tree leg is skipped too, and `meta.ui_tree` says why) |
 
 One call pairing the console screenshot with `captured_at` (UTC ISO-8601),
 `vm_id`, capture dimensions, `frame_hash`, and — when `ui_tree=true` — a
@@ -1013,7 +1013,19 @@ bounded UIAutomation element tree from the guest (depth/element caps;
 requires guest credentials, which the screenshot alone does not). The UI
 tree is best-effort: a PowerShell Direct session may not see an interactive
 desktop, in which case `ui_tree.ok=false` carries the reason while the
-screenshot still ships.
+screenshot still ships. On an `unchanged: true` result the tree leg is
+skipped entirely (it is a credentialed 60 s PowerShell Direct session whose
+only purpose is to describe the frame just captured), and `ui_tree` reports
+`{requested: true, skipped: true, reason}`; a call with `ui_tree=false`
+still reports exactly `{requested: false}` whatever the frame did.
+
+**Output dimensions.** With no `scale` or `crop`, `width`/`height` in the
+metadata are the captured dimensions. With either applied they become the
+OUTPUT dimensions — post-crop, post-scale — which is what mouse tools need
+when they are given `frame_width`/`frame_height`. On an `unchanged: true`
+result they are the CAPTURED dimensions, because no output image exists to
+measure; `crop`, `scale`, `format` and `quality` are echoed there too, so an
+unchanged result is exactly as informative about the request as a changed one.
 
 ---
 

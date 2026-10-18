@@ -76,6 +76,7 @@ import base64
 import binascii
 import hashlib
 import io
+import itertools
 import json
 import math
 import os
@@ -115,6 +116,10 @@ def _input_lock(ref: vmident.VMRef) -> Iterator[None]:
     with vmlocks.vm_lock(ref.id, mode="read"), vmlocks.vm_lock((ref.id, "console")):
         yield
 _PREFIX_LEN = 4
+
+# Distinguishes the sibling temp files of two concurrent saves to the same
+# path within one process; os.getpid() separates the processes.
+_save_counter = itertools.count()
 
 # Frame is the public return type of the image-producing operations, so it is
 # nameable by downstream consumers rather than an underscore-private detail.
@@ -466,9 +471,13 @@ def _folded_wait_frame_script(
         # error is NON-terminating: without this guard the exception is
         # swallowed, $hash keeps its stale value, the loop polls to the
         # deadline and the caller is told {ok: true, changed: false}. The
-        # in-process WMI leg length-checks; this leg must too.
+        # in-process WMI leg checks the payload against the dimensions it
+        # asked for; this leg does the same, so a truncated payload is a
+        # structured error on both transports rather than a silently wrong
+        # digest.
         "    $pxLen = 0; if ($r.ImageData -ne $null) { $pxLen = $r.ImageData.Length }\n",
-        "    if ($pxLen -lt 5) { throw ('thumbnail payload too short: ' + $pxLen + ' bytes; the opaque prefix alone is 4') }\n",
+        "    $pxWant = 4 + (" + str(width) + " * " + str(height) + " * 2)\n",
+        "    if ($pxLen -ne $pxWant) { throw ('thumbnail payload length mismatch: got ' + $pxLen + ' bytes, expected ' + $pxWant) }\n",
         "    $hash = ([System.BitConverter]::ToString($sha.ComputeHash($r.ImageData, 4, $r.ImageData.Length - 4)) -replace '-','').ToLowerInvariant()\n",
         "    $lastHash = $hash\n",
         "    if ($baseline -eq '') { $baseline = $hash }\n",
@@ -1179,10 +1188,15 @@ def _finish_screenshot(
             # no crop term and mouse_move/click take no offset parameter, so
             # telling the caller to pass frame_width/frame_height here would
             # send them to a wrong head coordinate with an ok:true result.
+            shaped_to = (
+                f" and then scaled to {width}x{height}"
+                if resolved_scale is not None and resolved_scale != 1.0
+                else ""
+            )
             meta["scale_note"] = (
                 f"{hint} — this frame is CROPPED to "
                 f"[{crop_box[0]}, {crop_box[1]}, {crop_box[2]}, {crop_box[3]}] of the "
-                f"{actual_w}x{actual_h} capture and then scaled to {width}x{height}. "
+                f"{actual_w}x{actual_h} capture{shaped_to}. "
                 f"Its pixel coordinates have NO head-space equivalent (there is no "
                 f"crop-offset parameter on the mouse tools), so do not pass them to "
                 f"mouse_move/click — take an uncropped frame for pointer work."
@@ -1200,9 +1214,13 @@ def _finish_screenshot(
         parent = os.path.dirname(save_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        # Write to a sibling temp file and replace, so a mid-write failure
-        # cannot leave a truncated artifact where a complete one used to be.
-        tmp_path = f"{save_path}.mcp-partial"
+        # Write to a UNIQUE sibling temp file and replace, so a mid-write
+        # failure cannot leave a truncated artifact where a complete one used
+        # to be. The name carries the pid and a per-process counter because
+        # two concurrent saves to the same path would otherwise open the same
+        # ".mcp-partial" file and interleave their bytes; os.replace is atomic
+        # on Windows, so the last writer wins with a complete image either way.
+        tmp_path = f"{save_path}.{os.getpid()}-{next(_save_counter)}.mcp-partial"
         try:
             with open(tmp_path, "wb") as fh:
                 fh.write(frame.encoded)

@@ -13,6 +13,7 @@ subject. Nothing here reads a private symbol to build its expectation.
 
 import asyncio
 import base64
+import builtins
 import copy
 import importlib
 import json
@@ -900,6 +901,100 @@ def test_capture_evidence_skips_the_ui_leg_when_the_frame_is_unchanged(
     assert seen["vm_id"] == VM_GUID and seen["vm_name"] == "", (
         "the screenshot leg must still receive only the resolved GUID"
     )
+
+
+def test_capture_evidence_without_a_ui_request_is_unchanged_by_the_frame_state(
+    monkeypatch, unrestricted
+):
+    """PRR-012's other half: the skip must be gated on the REQUEST. A caller
+    who passed `ui_tree=false` must get exactly `{"requested": False}` whether
+    the frame changed or not — otherwise the frame's change state changes a key
+    set the caller never varied, which is the same changed/unchanged asymmetry
+    this round exists to close, reintroduced inside `meta["ui_tree"]`. The
+    mutant this kills: an unconditional `if meta.get("unchanged"):` branch."""
+    from hyperv_mcp import credentials as creds  # noqa: F401  (import keeps the module honest)
+
+    _resolve_only_ps(monkeypatch)
+
+    def fake_screenshot(cfg, vm_name="", width=1024, height=768, save_path="",
+                        vm_id="", fmt="", quality=None, scale=None, crop=None,
+                        if_changed_from=""):
+        if if_changed_from == "f" * 64:
+            return None, {**_base_meta(), "unchanged": True}
+        return Image.new("RGB", (8, 8), (1, 2, 3)), _base_meta()
+
+    monkeypatch.setattr(evidence.console, "screenshot", fake_screenshot)
+    monkeypatch.setattr(evidence, "run_guest_inner", _ExplodingUIA())
+
+    changed = evidence.capture_evidence(unrestricted, "test-vm-1", 320, 240)
+    unchanged = evidence.capture_evidence(
+        unrestricted, "test-vm-1", 320, 240, if_changed_from="f" * 64,
+    )
+
+    assert changed["meta"]["ui_tree"] == {"requested": False}, (
+        f"a changed frame with no UI request must report exactly "
+        f"{{'requested': False}}, got {changed['meta']['ui_tree']}"
+    )
+    assert unchanged["meta"]["ui_tree"] == {"requested": False}, (
+        f"PRR-012: an unchanged frame with no UI request must report the same "
+        f"shape as a changed one — the frame's change state is not the "
+        f"caller's business when they asked for no tree; got "
+        f"{unchanged['meta']['ui_tree']}"
+    )
+    assert unchanged["meta"].get("unchanged") is True
+    assert unchanged["image"] is None
+
+
+def test_save_path_temp_name_is_unique_per_save(monkeypatch, unrestricted, tmp_path):
+    """PRR-022: the atomic write's temp name carries the pid and a per-process
+    counter, so two concurrent saves to the same path cannot open the same
+    `.mcp-partial` file and interleave their bytes. The mutant this kills: a
+    fixed temp name."""
+    payload = _raw_thumbnail(320, 240)
+    monkeypatch.setattr(pswindows, "run_ps",
+                        FakeCapture([_folded_response(payload, 320, 240)] * 2))
+    dest = tmp_path / "shots" / "frame.png"
+    cfg_doc = {
+        "allowed_vm_patterns": ["test-vm-*"],
+        "host_write_roots": [str(tmp_path / "shots")],
+    }
+    import hyperv_mcp.server as sm
+
+    p = tmp_path / "unique-cfg.json"
+    p.write_text(json.dumps(cfg_doc), encoding="utf-8")
+    mod = importlib.reload(sm)
+    mod.bootstrap({"HYPERV_MCP_CONFIG": str(p)})
+    mcp = mod.get_mcp()
+
+    opened: list[str] = []
+    real_open = builtins.open
+
+    def recording_open(file, *args, **kwargs):
+        opened.append(str(file))
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", recording_open)
+    try:
+        _call(mcp, "hyperv_console_screenshot", {
+            "vm_name": "test-vm-1", "width": 320, "height": 240,
+            "save_path": str(dest),
+        })
+        _call(mcp, "hyperv_console_screenshot", {
+            "vm_name": "test-vm-1", "width": 320, "height": 240,
+            "save_path": str(dest),
+        })
+    finally:
+        monkeypatch.undo()
+
+    partials = [p for p in opened if p.endswith(".mcp-partial")]
+    assert len(partials) == 2, (
+        f"expected two partial writes, got {partials}"
+    )
+    assert partials[0] != partials[1], (
+        f"PRR-022: two saves to the same path must not share a temp file, or "
+        f"concurrent writers interleave their bytes; both used {partials[0]}"
+    )
+    assert dest.exists() and dest.read_bytes(), "the final artifact must still exist"
 
 
 # ---------------------------------------------------------------------------
