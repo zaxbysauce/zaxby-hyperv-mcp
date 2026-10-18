@@ -1185,7 +1185,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         WinPE; independent of VMConnect, host foreground, guest login/network).
         Returns MCP image content plus a metadata text block:
         vm_id, dimensions, frame_hash, head resolution and scale note,
-        fallback_used, capture method. Fallback chain: requested → head
+        fallback_used, capture method, and timing — the per-call cost
+        breakdown (lock_wait_ms, ps_ms, ps_spawns, total_ms; the guest-marker
+        trio ps_startup_ms/psdirect_session_ms/guest_ms stays null on console
+        tools, whose scripts emit no marker). Fallback chain: requested → head
         native → 640x480 → 320x240. A corrupt/short payload is a structured
         error, never a successful image.
 
@@ -1949,7 +1952,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             """Capture console evidence in one call: screenshot paired with
             captured_at, vm_id, dimensions and frame hash, plus an optional
             bounded guest UI element tree (requires guest credentials; the
-            screenshot alone does not).
+            screenshot alone does not). The metadata also carries the per-call
+            timing breakdown (lock_wait_ms, ps_ms, ps_spawns, total_ms;
+            guest-marker keys null unless a leg emitted a marker).
 
             Args:
                 vm_name: Name of the VM
@@ -2136,6 +2141,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             captured_at, vm_id, dimensions and frame hash, plus an optional
             bounded guest UI element tree (requires guest credentials; the
             screenshot alone does not). Credentials from environment only.
+            The metadata also carries the per-call timing breakdown
+            (lock_wait_ms, ps_ms, ps_spawns, total_ms; guest-marker keys null
+            unless a leg emitted a marker).
 
             Args:
                 vm_name: Name of the VM

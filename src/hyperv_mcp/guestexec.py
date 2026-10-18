@@ -269,15 +269,25 @@ def _host_script(vm_id: str, inner_script: str, cred: CredentialSet, elevated: b
     # see "Extra data" — and feeds the values to the active call's collector.
     # Emitter and stripper ship together for that reason.
     #
-    #   ps_startup_ms         host process start -> this script's first statement
+    #   ps_startup_ms         host process start -> this script's first
+    #                         statement. Honestly ordered (feedback PRR-017):
+    #                         that first statement runs AFTER the transport's
+    #                         _PS_PIN preamble ($ProgressPreference and
+    #                         [Console]::OutputEncoding — and, on a remote
+    #                         Hyper-V host, the WS-Man hop's own pins), so the
+    #                         number INCLUDES those pin statements and the
+    #                         EncodedCommand decode, not just bare startup.
     #   psdirect_session_ms   the Invoke-Command: PS Direct session setup plus
     #                         the guest round trip (what session reuse removes)
     #   guest_ms              the guest-side work, measured inside the scriptblock
     #
     # Every literal brace below is doubled because this is an f-string; see the
     # `}} -ArgumentList $enc` and `[PSCustomObject]@{{ ... }}` lines that were
-    # already doubled. All three values are cast to [int] so ConvertTo-Json
-    # emits a JSON integer and the int-only marker parser keeps them.
+    # already doubled. ps_startup_ms and psdirect_session_ms are cast to [int]
+    # so ConvertTo-Json emits JSON integers the int-only marker parser accepts.
+    # guest_ms is NOT cast from $null: a result object with no duration_ms
+    # emits JSON null (PRR-017), which the parser drops — the field reads as
+    # absent in the audit record, never as a fabricated "zero milliseconds".
     return f"""
 $__mcpBorn = [Diagnostics.Process]::GetCurrentProcess().StartTime
 $__mcpBornMs = [int]((Get-Date) - $__mcpBorn).TotalMilliseconds
@@ -296,7 +306,8 @@ $r = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptB
 }} -ArgumentList $enc
 $__mcpSessionMs = $__mcpSw.ElapsedMilliseconds
 $r | ConvertTo-Json -Compress -Depth 2
-"__MCP_TIMING=" + (@{{ ps_startup_ms=[int]$__mcpBornMs; psdirect_session_ms=[int]$__mcpSessionMs; guest_ms=[int]$r.duration_ms }} | ConvertTo-Json -Compress)
+$__mcpGuestMs = if ($null -ne $r.duration_ms) {{ [int]$r.duration_ms }} else {{ $null }}
+"__MCP_TIMING=" + (@{{ ps_startup_ms=[int]$__mcpBornMs; psdirect_session_ms=[int]$__mcpSessionMs; guest_ms=$__mcpGuestMs }} | ConvertTo-Json -Compress)
 """
 
 

@@ -132,3 +132,24 @@ def test_redaction_registry_scrubs_text():
 def test_short_secrets_not_registered():
     credentials.registry().register("ab")
     assert "ab" not in credentials.registry().all()
+
+
+def test_unregister_withdraws_only_the_named_secret():
+    """PRR-037's API half: the registry needed a way for harness teardown to
+    withdraw a secret the harness itself registered (the soak benchmark's
+    fake guest password), without un-redacting anything else. Unregistering
+    must remove exactly the named secret; unregistering an absent secret is
+    a no-op so teardown stays idempotent. The mutants this kills: an
+    unregister that clears the whole set, and one that is a silent no-op."""
+    reg = credentials._RedactionRegistry()
+    reg.register("soak-agent-pass")
+    reg.register("keep-real-secret")
+    reg.unregister("soak-agent-pass")
+    reg.unregister("never-was-registered")
+    assert reg.all() == ["keep-real-secret"], (
+        f"unregister must withdraw only the named secret; got {reg.all()}"
+    )
+    cleaned = reg.redact("soak-agent-pass and keep-real-secret")
+    assert cleaned == "soak-agent-pass and ***REDACTED***", (
+        f"a withdrawn secret stops being scrubbed; a kept one must not: {cleaned!r}"
+    )

@@ -584,7 +584,11 @@ def test_b01_guardrail_stays_green():
         cwd=str(root),
         capture_output=True,
         text=True,
-        timeout=300,
+        # 90 s, not 300 (PRR-042): the suite-wide budget is 120 s (pyproject
+        # timeout), so a 300 s child deadline was dead code — the parent test
+        # would be killed first and this timeout could never fire. The child
+        # deadline must sit strictly inside the parent's budget.
+        timeout=90,
     )
     assert proc.returncode == 0, (
         f"AC14: the B01 audit-schema guardrail regressed\n"

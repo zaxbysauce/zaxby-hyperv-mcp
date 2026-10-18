@@ -1,10 +1,14 @@
 """Structured, secret-safe audit logging for hyperv-mcp.
 
 One JSON object per operation: timestamp, tool, vm_name, category, ok,
-duration_ms, exit_code, error_class, plus the correlation keys added by
-issue #10 — agent_id (the authenticated caller's client_id, null on
+duration_ms, exit_code, error_class, timing, plus the correlation keys added
+by issue #10 — agent_id (the authenticated caller's client_id, null on
 stdio/anonymous), request_id (server-generated per audited call), and
-job_id/relay_id when the operation addressed a guest job or relay. Command
+job_id/relay_id when the operation addressed a guest job or relay. The
+timing object (issue #20) is the per-call cost breakdown: lock_wait_ms,
+ps_ms, ps_spawns and total_ms on every record, plus the guest-marker trio
+ps_startup_ms / psdirect_session_ms / guest_ms when a script emitted one
+(null otherwise — a missing measurement is absent, never zero). Command
 content, file content and credentials are NEVER logged; all string fields
 pass the redaction filter.
 
@@ -168,16 +172,31 @@ class operation:  # noqa: N801 - context manager reads like a decorator
 
     def __enter__(self) -> operation:
         # The collector is installed first and its token kept per-instance, so
-        # nested operations reset correctly and a raise anywhere below still
-        # resets it in __exit__.
+        # nested operations reset correctly. Python does NOT call __exit__
+        # when __enter__ itself raises, so the statements below that can
+        # raise (the agent-id resolution reads the live auth context) are
+        # wrapped: the except arm resets BOTH contextvars itself, or the
+        # collector would leak into the next operation on this thread
+        # (feedback PRR-013).
         self._timing_token = timing_mod.start()
-        self.start = time.monotonic()
-        self.agent_id = current_agent_id()
-        self.request_id = uuid.uuid4().hex
-        # Issue #14: carry the tool name so a VMBusy raised anywhere inside
-        # this operation can name the holder without signature plumbing.
-        # The token is per-instance so nested operations reset correctly.
-        self._tool_token = vmlocks._current_tool.set(self.tool)
+        try:
+            self.start = time.monotonic()
+            self.agent_id = current_agent_id()
+            self.request_id = uuid.uuid4().hex
+            # Issue #14: carry the tool name so a VMBusy raised anywhere inside
+            # this operation can name the holder without signature plumbing.
+            # The token is per-instance so nested operations reset correctly.
+            self._tool_token = vmlocks._current_tool.set(self.tool)
+        except BaseException:
+            tool_token = getattr(self, "_tool_token", None)
+            if tool_token is not None:
+                vmlocks._current_tool.reset(tool_token)
+                self._tool_token = None
+            timing_token = getattr(self, "_timing_token", None)
+            self._timing_token = None
+            if timing_token is not None:
+                timing_mod.finish(timing_token)  # resets the ContextVar
+            raise
         return self
 
     def __exit__(self, exc_type, exc, tb) -> Literal[False]:

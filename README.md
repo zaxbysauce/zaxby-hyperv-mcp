@@ -377,7 +377,7 @@ line per op on stderr when unset):
     "ps_spawns": 1,
     "total_ms": 1247,
     "ps_startup_ms": 120,
-    "psdirect_session_ms": 340,
+    "psdirect_session_ms": 1300,
     "guest_ms": 900
   }
 }
@@ -410,6 +410,10 @@ record for those two.
 layer and reports p50/p95/p99 plus busy and incorrect rates per agent count
 and per tool, and the median guest timing breakdown for `guest_run_ps`. Only
 read-only and console-input tools are used — no lifecycle or destructive call.
+The harness ships in the sdist (`scripts/` at the extraction root, so the
+`python scripts/soak_bench.py` invocations below work there and from a git
+checkout) and in the wheel (force-included as
+`<site-packages>/scripts/soak_bench.py` after `pip install`).
 
 ```bash
 # CI-runnable: stubs run_ps, needs no Hyper-V

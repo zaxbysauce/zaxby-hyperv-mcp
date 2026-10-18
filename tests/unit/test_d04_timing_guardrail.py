@@ -106,6 +106,24 @@ def test_failed_operation_still_reports_its_spawns(tmp_path):
     assert rows[-1]["timing"]["ps_ms"] == 55
 
 
+def _powershell_exe() -> str | None:
+    """The ONE Windows PowerShell 5.1 executable the execution lanes use.
+
+    Derived once and shared by BOTH the skip guard and the subprocess run
+    (feedback PRR-043): the old shape guarded on `shutil.which("powershell")`
+    while running the hardcoded System32 path, so a host where PATH and the
+    filesystem disagreed passed the guard and failed the run. Returns None
+    when neither a PATH hit nor the stock install exists.
+    """
+    import shutil
+
+    found = shutil.which("powershell")
+    if found:
+        return found
+    fallback = Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+    return str(fallback) if fallback.exists() else None
+
+
 def test_no_collector_leaks_after_a_failure(tmp_path):
     """A raising log_operation must not leak a collector into the next
     operation on this thread."""
@@ -132,6 +150,41 @@ def test_no_collector_leaks_after_a_failure(tmp_path):
     rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     assert rows[-1]["timing"]["ps_spawns"] == 1, (
         "the operation after a failed sink write inherited a leaked collector"
+    )
+
+
+def test_a_raising_enter_leaves_no_collector(monkeypatch, tmp_path):
+    """PRR-013: `__enter__` installed the timing collector FIRST and then ran
+    a statement that can raise (the agent-id resolution reads the live auth
+    context). Python does not call `__exit__` when `__enter__` raises, so the
+    collector leaked into the next operation on that thread. The mutant this
+    kills: reverting `__enter__` to install-then-hope (collector set first,
+    no reset on the raise path)."""
+    log = tmp_path / "guardrail-enter.jsonl"
+    auditlog.init(Config(audit_log_path=str(log)))
+    from hyperv_mcp import pswindows, vmlocks
+
+    def exploding_agent_id() -> str | None:
+        raise RuntimeError("auth context blew up mid-enter")
+
+    monkeypatch.setattr(auditlog, "current_agent_id", exploding_agent_id)
+    op = auditlog.operation(tool="d04-enter-boom", vm_name="v", category="read")
+    with pytest.raises(RuntimeError, match="auth context blew up"):
+        op.__enter__()
+    monkeypatch.undo()  # the follow-up operation must resolve agent ids again
+    assert timing.current() is None, (
+        "PRR-013: a raising __enter__ leaked the timing collector — __exit__ "
+        "never runs on that path"
+    )
+    assert vmlocks.current_tool() is None, (
+        "PRR-013: a raising __enter__ leaked the tool ContextVar too"
+    )
+    # And the next operation on this thread must measure only its own work.
+    with auditlog.operation(tool="d04-after-enter", vm_name="v", category="read"):
+        pswindows.PSResult(stdout="x", returncode=0, duration_ms=5)
+    rows = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert rows and rows[-1]["timing"]["ps_spawns"] == 1, (
+        "the operation after a failed __enter__ inherited a leaked collector"
     )
 
 
@@ -164,7 +217,24 @@ def test_lock_wait_is_recorded_on_contention():
         thread = threading.Thread(target=waiter, name="d04-lockwait-waiter")
         thread.start()
         time.sleep(0.3)  # let the waiter park on the Condition
-        assert thread.is_alive(), "the waiter should still be blocked"
+        # PRR-044: is_alive() alone cannot distinguish "blocked on the lock"
+        # from "not scheduled yet". Assert the CAUSE of the blocking: this
+        # thread still holds the write lock (the registry's writer slot names
+        # OUR thread id), the waiter has NOT acquired, and the waiter thread
+        # is alive — together, that waiter is parked on a lock that is
+        # genuinely held.
+        lock = vmlocks._locks[key.casefold()]
+        with lock._cv:
+            writer = lock._writer
+        assert writer is not None and writer[0] == threading.get_ident(), (
+            "the waiter can only be blocked if this thread still holds the "
+            "write lock"
+        )
+        assert "acquired" not in outcome, (
+            f"the waiter claims acquisition while the write lock is held: "
+            f"{outcome}"
+        )
+        assert thread.is_alive(), "the waiter thread died instead of parking"
     thread.join(timeout=10)
     assert not thread.is_alive(), "the waiter did not finish"
     assert outcome.get("acquired") is True, f"the waiter never acquired: {outcome}"
@@ -383,16 +453,13 @@ def test_host_script_marker_survives_the_real_powershell_parse_lane():
     """The emitted script must still parse under real PowerShell 5.1.
 
     Brace-escaping and newline-join bugs in an f-string template are exactly
-    what this lane exists to catch: a single unescaped brace silently becomes a
-    replacement field and corrupts the emitted script, and two statements
+    what this lane exists to catch: a single unescaped brace silently becomes
+    a replacement field and corrupts the emitted script, and two statements
     merged onto one line are a PS parse error. Skips where PowerShell is
     unavailable (CI's Linux leg), matching the repo's other parse lanes.
     """
-    import shutil
-
-    if shutil.which("powershell") is None and not Path(
-        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-    ).exists():
+    ps_exe = _powershell_exe()
+    if ps_exe is None:
         pytest.skip("Windows PowerShell 5.1 is not available on this host")
 
     import subprocess
@@ -415,7 +482,7 @@ def test_host_script_marker_survives_the_real_powershell_parse_lane():
     )
     proc = subprocess.run(
         [
-            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            ps_exe,
             "-NonInteractive", "-NoProfile", "-Command", probe,
         ],
         capture_output=True, text=True, timeout=120,
@@ -424,4 +491,57 @@ def test_host_script_marker_survives_the_real_powershell_parse_lane():
         "the emitted guest host script does not parse under PowerShell 5.1"
         + chr(10) + "stdout: " + proc.stdout[-1500:]
         + chr(10) + "stderr: " + proc.stderr[-1500:]
+    )
+
+
+def test_the_marker_emits_null_for_a_missing_guest_duration():
+    """PRR-017: the emission line cast `[int]$r.duration_ms`, and PowerShell
+    casts $null to 0 — so a guest result object with no duration_ms reported
+    "zero milliseconds of guest work" instead of an absent measurement. The
+    emission must produce JSON null, which the int-only marker parser drops,
+    so guest_ms reads None in the audit record. The mutant this kills:
+    reverting the emission to the bare [int] cast. Executed under real
+    PowerShell 5.1, driving the SHIPPED script's own emission block (the
+    null-guard assignment plus the marker line), not a hand-copied one."""
+    ps_exe = _powershell_exe()
+    if ps_exe is None:
+        pytest.skip("Windows PowerShell 5.1 is not available on this host")
+
+    import subprocess
+
+    from hyperv_mcp import guestexec
+    from hyperv_mcp.credentials import CredentialSet
+
+    script = guestexec._host_script(
+        "11111111-2222-3333-4444-555555555555",
+        "Write-Output hi",
+        CredentialSet(username="u", password="p"),
+        elevated=False,
+    )
+    lines = script.strip().splitlines()
+    block = lines[-2] + "\n" + lines[-1]
+    preamble = (
+        "$__mcpBornMs = 12; $__mcpSessionMs = 34\n"
+        "$r = [PSCustomObject]@{ exit_code = 0; stdout = 'x'; stderr = '' }\n"
+    )
+    proc = subprocess.run(
+        [ps_exe, "-NonInteractive", "-NoProfile", "-Command", preamble + block],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, (
+        "the null-guarded marker emission must run under real PowerShell 5.1"
+        + chr(10) + "stdout: " + proc.stdout[-1500:]
+        + chr(10) + "stderr: " + proc.stderr[-1500:]
+    )
+    _, markers = timing.parse_marker(proc.stdout)
+    assert markers is not None, f"no marker line was emitted: {proc.stdout!r}"
+    assert markers.get("guest_ms") is None, (
+        f"PRR-017: a missing guest duration must read as absent (None), not as "
+        f"zero milliseconds; got {markers}"
+    )
+    assert markers.get("ps_startup_ms") == 12, (
+        f"ps_startup_ms must survive the guard; got {markers}"
+    )
+    assert markers.get("psdirect_session_ms") == 34, (
+        f"psdirect_session_ms must survive the guard; got {markers}"
     )

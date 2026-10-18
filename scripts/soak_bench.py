@@ -51,7 +51,13 @@ if str(_REPO_ROOT / "src") not in sys.path:
     # (feedback PRR-045).
     sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from hyperv_mcp import consolebench, pswindows  # noqa: E402
+# `import x.y as z` rather than `from x import y`: when mypy checks this
+# file together with the package as one command-line target set (PRR-020:
+# `mypy src/hyperv_mcp scripts`), a target-crawled package does not expose
+# un-imported submodules as attributes, and the dotted form resolves the
+# submodule path directly instead.
+import hyperv_mcp.consolebench as consolebench  # noqa: E402
+import hyperv_mcp.pswindows as pswindows  # noqa: E402
 
 #: A stable stand-in GUID for the fake transport's resolution legs.
 FAKE_GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
@@ -65,6 +71,10 @@ _AGENT_JOIN_BUDGET_S = 600.0
 #: (feedback PRR-011 / PRR-037).
 _SOAK_ENV_KEYS = ("HYPERV_MCP_CONFIG", "HYPERV_GUEST_USERNAME",
                   "HYPERV_GUEST_PASSWORD")
+#: The fake guest password. Registered in the process-global redaction
+#: registry by every credential resolution during the run, so the teardown
+#: must WITHDRAW it again (PRR-037) — the registry is otherwise append-only.
+_FAKE_GUEST_PASSWORD = "soak-agent-pass"
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +273,7 @@ def _sample(tool: str, result, elapsed_ms: float, token: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _server_for(mode: str, audit_log: Path | None):
+def _server_for(mode: str, audit_log: Path):
     """Bootstrap a real server for the run, and return it with a TEARDOWN.
 
     The teardown restores `auditlog._config` to whatever the process had before
@@ -285,6 +295,10 @@ def _server_for(mode: str, audit_log: Path | None):
     live mode goes through `mcp.call_tool` rather than calling guestexec
     directly: a direct call has to plumb `cred=` by hand and a missing one
     raises before any work happens.
+
+    `audit_log` is required, not optional (PRR-036): both `_run_fake` and
+    `_run_live` always hand a path inside their TemporaryDirectory, so a
+    None-tolerant branch here was dead code.
     """
     import hyperv_mcp.auditlog as auditlog
     import hyperv_mcp.server as server_module
@@ -292,24 +306,22 @@ def _server_for(mode: str, audit_log: Path | None):
     saved_config = auditlog._config
     saved_env = {k: os.environ.get(k) for k in _SOAK_ENV_KEYS}
 
+    doc: dict[str, object]
     if mode == "fake":
         doc = {
             "allowed_vm_patterns": ["test-*"],
             "destructive": {"console_input": True},
         }
-        if audit_log is not None:
-            doc["audit_log_path"] = str(audit_log)
     else:
         doc = {"unrestricted": True}
-        if audit_log is not None:
-            doc["audit_log_path"] = str(audit_log)
-    tmp = audit_log.parent if audit_log is not None else Path(tempfile.mkdtemp())
+    doc["audit_log_path"] = str(audit_log)
+    tmp = audit_log.parent
     cfg = tmp / "soak-config.json"
     cfg.write_text(json.dumps(doc), encoding="utf-8")
     if mode == "fake":
         os.environ["HYPERV_MCP_CONFIG"] = str(cfg)
         os.environ["HYPERV_GUEST_USERNAME"] = "soak-agent"
-        os.environ["HYPERV_GUEST_PASSWORD"] = "soak-agent-pass"
+        os.environ["HYPERV_GUEST_PASSWORD"] = _FAKE_GUEST_PASSWORD
     mod = importlib.reload(server_module)
     # The config path must ride the environ handed to bootstrap, exactly as the
     # frozen acceptance checks do — bootstrap(environ) forwards it to
@@ -321,13 +333,22 @@ def _server_for(mode: str, audit_log: Path | None):
     def _teardown():
         # Restore in the reverse order of the setup: the audit sink first (it
         # is the one whose stale value survives the tmp dir), then the environ
-        # keys the fake mode injected, then the module reload.
+        # keys the fake mode injected, then the module reload. Fake mode also
+        # withdraws its fake password from the redaction registry (PRR-037):
+        # credential resolution registered it on every guest call, and the
+        # registry is process-global — without the withdrawal the fake
+        # password keeps scrubbing unrelated text in every later redaction
+        # this process performs.
         auditlog._config = saved_config
         for key, value in saved_env.items():
             if value is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        if mode == "fake":
+            import hyperv_mcp.credentials as credentials
+
+            credentials.registry().unregister(_FAKE_GUEST_PASSWORD)
         importlib.reload(server_module)
 
     return mod, _teardown
@@ -340,9 +361,14 @@ def _agent_loop(mcp, stub, token: str, iterations: int, vm: str,
 
     `stub` is None in live mode, where pswindows.run_ps is the real one. Both
     modes go through the SAME mcp.call_tool path, so policy, credential
-    resolution and the audit operation are identical in both -- the only
-    difference is whether the transport is stubbed. Anything measured below the
-    transport is therefore measured the same way in both modes.
+    resolution and the audit operation behave the same way in both. Three things
+    DO differ besides the stubbed transport: fake mode force-disables the
+    in-process WMI backend so every leg takes the PowerShell transport, swaps in
+    a `test-*` config with console_input enabled instead of `unrestricted`, and
+    injects a fake guest credential pair. A fake-mode run is therefore not
+    evidence about the production regime -- live mode is the one that measures
+    the real backend and the real lock contention. Anything measured below the
+    transport is still measured the same way in both modes.
     """
     if stub is not None:
         stub.adopt(token)
@@ -357,7 +383,11 @@ def _agent_loop(mcp, stub, token: str, iterations: int, vm: str,
             t0 = time.monotonic()
             try:
                 result = asyncio.run(mcp.call_tool(tool, args))
-            except Exception as exc:  # a crash is a sample too, not a hang
+            except BaseException as exc:  # a crash is a sample too, not a hang
+                # BaseException, not Exception (PRR-034): asyncio.CancelledError
+                # inherits from BaseException on 3.8+, so an `except Exception`
+                # let a cancelled agent thread escape the handler and its
+                # sample vanished instead of being recorded.
                 elapsed = (time.monotonic() - t0) * 1000.0
                 sample = {
                     "tool": tool, "ok": False, "ms": elapsed,
@@ -370,7 +400,7 @@ def _agent_loop(mcp, stub, token: str, iterations: int, vm: str,
 
 
 def _run(agents: int, iterations: int, *, stub, vm: str, mode: str,
-         audit_log: Path | None) -> dict:
+         audit_log: Path) -> dict:
     """The shared runner. `stub` is a SoakStub for --fake and None for live."""
     saved_run_ps = pswindows.run_ps
     if stub is not None:
@@ -432,8 +462,10 @@ def _run(agents: int, iterations: int, *, stub, vm: str, mode: str,
     row["mode"] = mode
     row["vm"] = vm
     row["per_tool"] = summarize_by_tool(samples)
-    if audit_log is not None:
-        row["guest_timing_median_ms"] = _guest_timing_median(audit_log)
+    # Unconditional: every caller passes a sink (PRR-036 removed the dead
+    # None branch), and _guest_timing_median itself answers nulls when the
+    # log is missing, empty or unreadable.
+    row["guest_timing_median_ms"] = _guest_timing_median(audit_log)
     if hung:
         row["hung_agents"] = hung
     return row
@@ -470,8 +502,17 @@ def _guest_timing_median(audit_log: Path) -> dict:
     out: dict[str, float | None] = {key: None for key in keys}
     if not audit_log.exists():
         return out
+    # The read itself is guarded (PRR-035): a missing, unreadable or
+    # non-decodable log must yield the "no guest timing" answer, not raise --
+    # a file that exists but cannot be read (permissions, a directory left at
+    # the path, non-UTF-8 bytes) is the same absence as far as the report is
+    # concerned.
+    try:
+        text = audit_log.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return out
     pools: dict[str, list[float]] = {key: [] for key in keys}
-    for line in audit_log.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         if not line.strip():
             continue
         try:

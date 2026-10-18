@@ -9,7 +9,11 @@ unreachable — the WS-Man hop composes exactly as before). A WMI METHOD
 failure (or a mid-op backend unavailability) is a structured error and is
 never retried through PowerShell so input can never double-send. Every
 SUCCESSFUL result reports a per-call ``timings`` breakdown (failure
-envelopes carry the standard error shape without timings); the WMI
+envelopes carry the standard error shape without timings), and the
+image-returning operations additionally carry the issue-#20 ``timing``
+block — ``lock_wait_ms``, ``ps_ms``, ``ps_spawns``, ``total_ms`` plus the
+three guest marker keys (``ps_startup_ms``, ``psdirect_session_ms``,
+``guest_ms``), null when no marker was emitted; the WMI
 transport additionally has no per-call COM timeout — a hung provider
 blocks that VM's operations until it returns, where the PowerShell
 transport's child process is killed at its timeout.
@@ -604,10 +608,14 @@ def _wmi_timings(connect_ms: float, *phase_dicts: dict) -> dict:
 def _meta_timing(t0: float, ps_timing: _PsTiming | None, *, wmi: bool = False) -> dict:
     """The per-call `timing` block for an image tool's metadata (issue #20).
 
-    Prefers the active audit operation's collector, which is the value the
-    server records. With no collector (a direct module call — the
-    consolebench operator CLI drives console.screenshot that way), the block is
-    derived from the op's own accumulators so it is never a fabricated zero.
+    Prefers the active audit operation's collector. That is the value the
+    server records ONLY IF this snapshot is taken at the operation's end: a
+    caller that runs further legs after it (evidence.capture_evidence's UI
+    tree) must re-snapshot from the collector, or its metadata disagrees with
+    the audit row for the same call (feedback PRR-007). With no collector (a
+    direct module call — the consolebench operator CLI drives
+    console.screenshot that way), the block is derived from the op's own
+    accumulators so it is never a fabricated zero.
 
     `t0` is `time.monotonic()` taken at the op's entry, before transport
     selection; it is unused when a collector is active, because the collector's

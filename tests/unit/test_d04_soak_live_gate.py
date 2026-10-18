@@ -181,18 +181,59 @@ def test_soak_bench_fake_mode_reports_a_rejection_only_run_as_such(monkeypatch):
 
 
 def test_guardrail_assertion_stays_strict():
-    """The B01 audit-schema guardrail's *strictness*.
+    """The B01 audit-schema guardrail's *strictness*, checked behaviourally
+    (feedback PRR-041).
 
     AC13 pins that `timing` is in `AUDIT_KEYS`, and C13 verifies the guardrail
     test still passes. Neither pins HOW it asserts: weakening
-    `assert set(row) == AUDIT_KEYS` to `<=` would keep both green while letting
-    a row silently lose a key. This pins the literal in the source.
+    `assert set(row) == AUDIT_KEYS` to `<=` would keep both green while
+    letting a row silently lose a key. The old version of this check pinned
+    the literal source substring — brittle to reformatting and satisfiable
+    by moving the string into a comment. This one parses the guardrail
+    module's AST, finds the key-set comparison, and EXECUTES the found
+    expression against a row that lost a key: the operator must be `==`, and
+    the guard's own comparison must answer False for the deficient row.
     """
+    import ast
+
     source = (REPO_ROOT / "tests" / "unit" / "test_b01_audit_correlation_guardrail.py")
     text = source.read_text(encoding="utf-8")
-    assert "set(row) == AUDIT_KEYS" in text, (
-        "the B01 audit-schema guardrail no longer asserts the exact key set; "
-        "a superset check would let a row lose a key undetected"
+    guard = None
+    for node in ast.walk(ast.parse(text)):
+        if not isinstance(node, ast.Compare):
+            continue
+        left = node.left
+        if not (isinstance(left, ast.Call) and isinstance(left.func, ast.Name)
+                and left.func.id == "set" and len(left.args) == 1):
+            continue
+        if any(isinstance(c, ast.Name) and c.id == "AUDIT_KEYS"
+               for c in node.comparators):
+            guard = node
+            break
+    assert guard is not None, (
+        "the B01 audit-schema guardrail no longer compares set(row) against "
+        "AUDIT_KEYS at all"
+    )
+    ops = [type(op).__name__ for op in guard.ops]
+    assert ops == ["Eq"], (
+        f"the audit-schema comparison is not strict set equality: {ops} — a "
+        "subset/superset check would let a row lose or gain a key undetected"
+    )
+    sys.path.insert(0, str(REPO_ROOT / "tests" / "unit"))
+    try:
+        import test_b01_audit_correlation_guardrail as b01
+    finally:
+        sys.path.remove(str(REPO_ROOT / "tests" / "unit"))
+    # Execute the FOUND comparison (not a lookalike) on a deficient row: the
+    # guard itself must reject a row that lost a key.
+    row_missing_key = {key: 0 for key in b01.AUDIT_KEYS if key != "timing"}
+    verdict = eval(
+        compile(ast.Expression(guard), "<b01-audit-schema-guard>", "eval"),
+        {"set": set, "row": row_missing_key, "AUDIT_KEYS": b01.AUDIT_KEYS},
+    )
+    assert verdict is False, (
+        "the audit-schema guardrail's own comparison admitted a row missing "
+        "the timing key — it is no longer strict"
     )
 
 
@@ -395,3 +436,82 @@ def test_soak_bench_guest_timing_median_is_null_without_markers():
         medians = soak_bench._guest_timing_median(log)
     assert medians == {"ps_startup_ms": None, "psdirect_session_ms": None,
                        "guest_ms": None}, medians
+
+
+def test_soak_bench_guest_timing_median_is_null_when_the_log_is_unreadable():
+    """PRR-035: `read_text` was unguarded, so an audit log that exists but
+    cannot be read (non-UTF-8 bytes, a directory left at the path, a
+    permissions failure) raised instead of answering "no guest timing". The
+    mutant this kills: removing the read guard."""
+    soak_bench = _import_soak_bench()
+    import tempfile
+
+    nulls = {"ps_startup_ms": None, "psdirect_session_ms": None,
+             "guest_ms": None}
+    with tempfile.TemporaryDirectory() as td:
+        broken = Path(td) / "broken.jsonl"
+        broken.write_bytes(b"\xff\xfe\x00 not utf-8 \xff")
+        assert soak_bench._guest_timing_median(broken) == nulls, (
+            "a non-decodable audit log must yield the no-guest-timing answer"
+        )
+        # A DIRECTORY at the path: exists() is True and read_text raises
+        # IsADirectoryError (an OSError) -- still nulls, not a raise.
+        assert soak_bench._guest_timing_median(Path(td)) == nulls, (
+            "an unreadable audit log path must yield the no-guest-timing answer"
+        )
+
+
+def test_a_cancelled_agent_call_is_recorded_as_a_sample():
+    """PRR-034: `_agent_loop`'s `except Exception` could not catch
+    asyncio.CancelledError (a BaseException since Python 3.8), so a
+    cancelled agent thread escaped the handler and its sample vanished
+    instead of being recorded. The mutant this kills: `except Exception` in
+    place of `except BaseException`."""
+    soak_bench = _import_soak_bench()
+    import asyncio
+    import threading
+
+    class CancellingMcp:
+        async def call_tool(self, tool, args):
+            raise asyncio.CancelledError()
+
+    samples: list[dict] = []
+    lock = threading.Lock()
+    soak_bench._agent_loop(CancellingMcp(), None, "tok", 1, "vm", samples, lock)
+    assert len(samples) == len(soak_bench.TOOLS), (
+        f"a cancelled call must still produce one sample per tool; got "
+        f"{samples}"
+    )
+    for sample in samples:
+        assert sample["ok"] is False and sample["error"] == "CancelledError", (
+            f"PRR-034: the cancellation was not recorded as a sample: {sample}"
+        )
+        assert sample["busy"] is False and sample["incorrect"] is False
+
+
+def test_a_fake_run_withdraws_its_fake_password_from_the_redaction_registry():
+    """PRR-037: fake mode's `soak-agent-pass` was registered in the
+    process-global, append-only redaction registry by every credential
+    resolution during the run, and the teardown never withdrew it -- so the
+    fake password kept scrubbing unrelated text in every later redaction
+    this process performed. The mutant this kills: dropping the unregister
+    call from the harness teardown."""
+    soak_bench = _import_soak_bench()
+    import contextlib
+    import io
+
+    from hyperv_mcp import credentials
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        rc = soak_bench.main(["--fake", "--agents", "1", "--iterations", "1"])
+    assert rc == 0, f"soak_bench --fake exited {rc}"
+    fake = soak_bench._FAKE_GUEST_PASSWORD
+    assert fake not in credentials.registry().all(), (
+        "PRR-037: the fake-mode password stayed in the process-global "
+        "redaction registry after the run"
+    )
+    assert credentials.redact(f"x {fake} x") == f"x {fake} x", (
+        "PRR-037: a later redaction still scrubs the fake password out of "
+        "unrelated text"
+    )

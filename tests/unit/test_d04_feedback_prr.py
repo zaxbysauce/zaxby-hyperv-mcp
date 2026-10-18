@@ -14,6 +14,7 @@ import importlib
 import json
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -21,7 +22,7 @@ from pathlib import Path
 import pytest
 
 import hyperv_mcp.server as server_module
-from hyperv_mcp import pswindows, timing
+from hyperv_mcp import evidence, pswindows, timing
 from hyperv_mcp.config import Config
 from hyperv_mcp.timing import MARKER_PREFIX
 
@@ -167,6 +168,28 @@ def test_mixed_crlf_and_lf_terminators_are_preserved():
     )
 
 
+def test_a_marker_after_a_bare_lf_in_crlf_stdout_is_still_removed():
+    """The reviewer's own probe. Splitting on ONE chosen separator fused a
+    bare-LF-terminated line with the marker line after it, so a marker preceded
+    by a bare LF in otherwise-CRLF stdout was never recognised: it leaked into
+    the caller's stdout and its timing was silently lost. Line starts must be
+    found on BOTH terminators independently. The mutant this kills: choosing
+    one separator for the whole text."""
+    text = "alpha\r\nbeta\n" + MARKER_PREFIX + '{"guest_ms": 1}\r\n'
+    cleaned, markers = timing.parse_marker(text)
+
+    assert cleaned == "alpha\r\nbeta", (
+        f"the marker line must be removed whatever terminator preceded it; "
+        f"got {cleaned!r}"
+    )
+    assert MARKER_PREFIX not in cleaned, (
+        "a surviving marker line would reach the caller's stdout"
+    )
+    assert markers == {"guest_ms": 1}, (
+        f"the marker must still be parsed; got {markers}"
+    )
+
+
 def test_every_marker_line_is_removed_not_only_the_last():
     """PRR-003: only the LAST marker line used to be removed, while the
     docstring promised an absolute guarantee. The mutant this kills: returning
@@ -209,15 +232,66 @@ def test_a_deeply_nested_marker_payload_is_refused_not_raised():
     )
 
 
-def test_an_oversized_marker_payload_is_refused_not_parsed():
-    """PRR-004's length half: a payload over the bound is refused rather than
-    parsed, so a hostile emitter cannot make the host spend unbounded work."""
-    big = "x" * (timing._MAX_MARKER_BYTES + 1)
-    cleaned, markers = timing.parse_marker(f"out\n{MARKER_PREFIX}{big}")
-    assert cleaned == "out" and markers is not None
-    assert all(v is None for v in markers.values()), (
-        f"an oversized payload must be refused, got {markers}"
+@pytest.mark.parametrize("depth", [1000, 1500, 2000])
+def test_a_deeply_nested_payload_under_the_length_bound_is_refused(depth):
+    """PRR-004's RECURSION half, under the LENGTH bound. The reviewer executed
+    `_accept('['*1000 + ']'*1000)` — 2000 bytes, well under
+    `_MAX_MARKER_BYTES` — and it raised RecursionError straight through into
+    `run_ps`, because `json.loads` raises RecursionError, which is NOT a
+    ValueError. The length guard alone does not cover it. The mutant this
+    kills: catching only ValueError again.
+
+    Only the depths that genuinely raise are listed. Depths below ~600 parse
+    cleanly (returning a list, which `_accept` refuses as a non-dict), so they
+    would pass either way — and a probe that cannot fail is not a pin."""
+    payload = "[" * depth + "]" * depth
+    assert len(payload) < timing._MAX_MARKER_BYTES, (
+        f"this probe must sit UNDER the length bound to test the recursion "
+        f"axis; depth {depth} is {len(payload)} bytes"
     )
+    cleaned, markers = timing.parse_marker(f"out\n{MARKER_PREFIX}{payload}")
+    assert cleaned == "out", "the marker line must still be removed"
+    assert markers == {}, (
+        f"PRR-004: a {depth}-deep payload must be refused, not raised; got "
+        f"{markers}"
+    )
+
+
+def test_an_oversized_but_parseable_payload_is_refused():
+    """PRR-004's LENGTH half, pinned by a payload that WOULD parse. An oversized
+    payload of garbage cannot discriminate the length guard from the recursion
+    guard — both refuse it — so this one is flat, well-formed and carries valid
+    keys, and only the length bound refuses it. The mutant this kills: removing
+    the length guard."""
+    payload = json.dumps({
+        "pad": "x" * (timing._MAX_MARKER_BYTES + 64),
+        "ps_startup_ms": 11,
+        "psdirect_session_ms": 22,
+        "guest_ms": 33,
+    })
+    assert len(payload) > timing._MAX_MARKER_BYTES
+    cleaned, markers = timing.parse_marker(f"out\n{MARKER_PREFIX}{payload}")
+    assert cleaned == "out", "the marker line must still be removed"
+    assert markers == {}, (
+        f"an oversized payload must be refused rather than parsed; got {markers}"
+    )
+
+
+def test_an_in_bound_payload_of_the_same_shape_is_still_accepted():
+    """The other half of the length pin: the bound must not reject a legitimate
+    marker. Same shape, under the bound — the values must survive."""
+    payload = json.dumps({
+        "pad": "x" * 64,
+        "ps_startup_ms": 11,
+        "psdirect_session_ms": 22,
+        "guest_ms": 33,
+    })
+    assert len(payload) < timing._MAX_MARKER_BYTES
+    cleaned, markers = timing.parse_marker(f"out\n{MARKER_PREFIX}{payload}")
+    assert cleaned == "out"
+    assert markers == {
+        "ps_startup_ms": 11, "psdirect_session_ms": 22, "guest_ms": 33,
+    }, f"an in-bound marker must be accepted; got {markers}"
 
 
 def test_a_huge_integer_in_the_marker_is_dropped():
@@ -401,9 +475,31 @@ def test_metadata_timing_agrees_with_the_audit_row(monkeypatch, fresh_server, tm
     })
     mcp = mod.get_mcp()
 
+    # ui_tree=True, so the credentialed UIA leg runs AFTER the screenshot leg
+    # snapshotted the collector. That is the shape where metadata and audit row
+    # disagreed; without it the extra leg never runs and the check cannot see
+    # the divergence.
+    from hyperv_mcp import credentials as _creds
+
+    def _fake_guest_leg(*args, **kwargs):
+        # A real PSResult so the collector counts this leg's spawn, exactly as
+        # the production leg does. Without it the leg is free and the metadata
+        # and the audit row agree trivially.
+        pswindows.PSResult(stdout="{}", returncode=0, duration_ms=7)
+        return {"elements": 1, "truncated": False, "tree": {"name": "root"}}
+
+    monkeypatch.setattr(evidence, "run_guest_inner", _fake_guest_leg)
+    monkeypatch.setattr(
+        _creds, "resolve_guest",
+        lambda: _creds.CredentialSet(username="u", password="p"),
+    )
     images, texts = _split(_call(mcp, "hyperv_capture_evidence", {
-        "vm_name": "test-vm-1", "width": 320, "height": 240,
+        "vm_name": "test-vm-1", "width": 320, "height": 240, "ui_tree": True,
     }))
+    assert len(images) == 1, "capture_evidence must still return an image"
+    assert _meta(texts)["ui_tree"].get("ok") is True, (
+        "the UI-tree leg must have run, or this check proves nothing about it"
+    )
     meta = _meta(texts)
     assert "timing" in meta, "the metadata must carry the timing block"
 
@@ -416,6 +512,12 @@ def test_metadata_timing_agrees_with_the_audit_row(monkeypatch, fresh_server, tm
             f"audit row's {audit_timing[key]!r} for the same call — the metadata "
             f"used to be snapshotted before the last leg ran"
         )
+    # And the UI-tree leg's own spawn must be in BOTH, not just the audit row:
+    # 3 legs before it (resolve, resolve, capture) plus its own.
+    assert audit_timing["ps_spawns"] == 4, (
+        f"PRR-007: the UI-tree leg spawns, so both sides must count 4; got "
+        f"{audit_timing}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -583,17 +685,44 @@ def test_the_marker_arithmetic_runs_in_real_powershell():
     child with no Hyper-V. This is the execution lane the repo's own
     PS-generation lesson requires. The mutant this kills: a wrong cast or a
     wrong offset in the emitted marker expression."""
+    # The SHIPPED marker expression, not a lookalike: the reviewer's own probe
+    # mutated guestexec's `$r.duration_ms` -> `$r.bogus_ms` and it survived,
+    # because this check ran a hand-written copy. Extract the marker line from
+    # the real emitter's output so the arithmetic under test IS the arithmetic
+    # that ships. The whole host script cannot run here (it needs a live VM),
+    # but the marker expression needs nothing but a `$r` in scope — which is
+    # exactly the no-Hyper-V execution lane the residual called for.
+    from hyperv_mcp import guestexec
+
+    shipped = guestexec._host_script(
+        "e953c649-dcab-438d-9a54-3af74a82b624",
+        "Write-Output 'stub'",
+        guestexec.CredentialSet(username="probe", password="probe-pass"),
+        False,
+    )
+    shipped_lines = shipped.splitlines()
+    marker_lines = [
+        line for line in shipped_lines
+        if "__MCP_TIMING=" in line and "ps_startup_ms" in line
+    ]
+    guest_ms_lines = [
+        line for line in shipped_lines if "$__mcpGuestMs =" in line
+    ]
+    assert marker_lines and guest_ms_lines, (
+        "the shipped host script must compute the guest duration and emit the "
+        "__MCP_TIMING= marker line"
+    )
     script = (
         "$born = [Diagnostics.Process]::GetCurrentProcess().StartTime\n"
         "$bornMs = [int]((Get-Date) - $born).TotalMilliseconds\n"
         "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
-        "$r = [PSCustomObject]@{ exit_code = 0; stdout = 'x'; stderr = ''; "
+        "$r = [PSCustomObject]@{ exit_code = 0; stdout = 'stub'; stderr = ''; "
         "duration_ms = 4242 }\n"
         "$sessionMs = $sw.ElapsedMilliseconds\n"
-        "$r | ConvertTo-Json -Compress -Depth 2\n"
-        "'__MCP_TIMING=' + (@{ ps_startup_ms = [int]$bornMs; "
-        "psdirect_session_ms = [int]$sessionMs; guest_ms = [int]$r.duration_ms } "
-        "| ConvertTo-Json -Compress)\n"
+        # The SHIPPED lines, verbatim: the guest-duration computation and the
+        # marker expression.
+        + guest_ms_lines[-1].strip() + "\n"
+        + marker_lines[-1].strip() + "\n"
     )
     # Run the DECODED script through a real powershell.exe child, the way
     # run_ps does: the encoded form is what crosses the process boundary, so
@@ -670,53 +799,51 @@ def test_add_lock_wait_accumulates_rather_than_replaces():
 # PRR-014 — the uncontended-acquire measurement window
 # ---------------------------------------------------------------------------
 
-def test_an_uncontended_acquire_reports_zero_lock_wait():
-    """PRR-014: the "uncontended acquire returns exactly 0" claim was false —
-    4 of 20,000 uncontended write acquires reported a nonzero `lock_wait_ms`
-    (max 16 ms) under a GIL-hogging thread, because `wait_started` precedes the
-    mode branch and the shared return runs after the write branch's `finally`
-    bookkeeping, all inside the measured window. The claim holds only via
-    `int()` truncation. The mutant this kills: widening the measured window
-    back around the uncontended path."""
-    from hyperv_mcp import vmlocks
+def test_an_uncontended_acquire_reports_zero_lock_wait(monkeypatch):
+    """PRR-014: the "uncontended acquire returns exactly 0" claim was false — 4
+    of 20,000 uncontended write acquires reported a nonzero `lock_wait_ms`
+    (max 16 ms) under a GIL-hogging thread, because the clock spanned the
+    writer's `finally` bookkeeping. The claim held only via `int()` truncation,
+    and the value feeds audit rows and console metadata.
 
-    with vmlocks.vm_lock("vm-probe-14", mode="write") as _held:
-        # Measure the value the COLLECTOR records -- that is what reaches audit
-        # rows and console metadata. Timing the whole context manager instead
-        # would include CM entry/exit overhead that lock_wait_ms never claims
-        # to cover, and would report a "defect" that ships nothing.
-        collector = timing.Collector()
-        token = timing._collector.set(collector)  # noqa: SLF001 — the seam
-        try:
-            hog = threading.Event()
+    The pin is DETERMINISTIC, not statistical. A GIL-contention probe measures a
+    sub-millisecond window that is sometimes zero and sometimes not, so it cannot
+    reliably kill the mutant. Instead `time.monotonic` is replaced with a counter
+    that advances a full second on every call: an acquire that MEASURES anything
+    then reports a huge number, and one that short-circuits before the clock
+    reports exactly 0. The mutant this kills: widening the measured window back
+    around the uncontended path."""
+    import hyperv_mcp.timing as timing
+    import hyperv_mcp.vmlocks as vmlocks
 
-            def _hog_gil():
-                while not hog.is_set():
-                    sum(range(1000))
+    ticks = iter(range(0, 10 ** 9, 1000))
 
-            threads = [threading.Thread(target=_hog_gil, daemon=True)
-                       for _ in range(4)]
-            for t in threads:
-                t.start()
-            try:
-                # 20,000 iterations: the reviewer's own reproduction found 4
-                # nonzero values in 20,000 uncontended acquires, so a smaller
-                # sample would not see the defect at all.
-                for _ in range(20000):
-                    with vmlocks.vm_lock("vm-probe-free", mode="write"):
-                        pass
-            finally:
-                hog.set()
-                for t in threads:
-                    t.join(timeout=2)
-        finally:
-            timing._collector.reset(token)  # noqa: SLF001
+    monkeypatch.setattr(vmlocks.time, "monotonic", lambda: next(ticks))
 
-        waited = collector.snapshot()["lock_wait_ms"]
-        assert waited == 0, (
-            f"PRR-014: 20,000 uncontended acquires under GIL contention must "
-            f"report exactly 0 ms of lock wait; got {waited}"
-        )
+    # Read the value the COLLECTOR records, which is what reaches audit rows
+    # and console metadata.
+    collector = timing.Collector()
+    token = timing._collector.set(collector)  # noqa: SLF001 — the seam
+    try:
+        with vmlocks.vm_lock("vm-probe-free", mode="write"):
+            pass
+        # A read-mode acquire must be zero too: the fast path covers both modes.
+        with vmlocks.vm_lock("vm-probe-free", mode="read"):
+            pass
+    finally:
+        timing._collector.reset(token)  # noqa: SLF001
+
+    assert collector.snapshot()["lock_wait_ms"] == 0, (
+        f"PRR-014: an uncontended acquire must report exactly 0 ms of lock "
+        f"wait; got {collector.snapshot()['lock_wait_ms']}"
+    )
+
+
+    # The CONTENDED path is pinned separately, by
+    # test_d04_timing_guardrail.py::test_lock_wait_is_recorded_on_contention,
+    # which drives a real cross-thread bounded timeout. It cannot be pinned here:
+    # the fake monotonic advances on CALLS, not on real time, so a parked waiter
+    # would burn its whole budget in a handful of calls.
 
 
 # ---------------------------------------------------------------------------
@@ -827,24 +954,65 @@ def test_the_example_audit_record_is_internally_consistent():
         assert ps_ms <= total, (
             f"PRR-008: ps_ms ({ps_ms}) cannot exceed total_ms ({total})"
         )
+    psdirect = _field("psdirect_session_ms")
+    guest = _field("guest_ms")
+    if psdirect is not None and guest is not None:
+        assert psdirect >= guest, (
+            f"PRR-008: psdirect_session_ms ({psdirect}) is the WHOLE PowerShell "
+            f"Direct session, so it cannot be smaller than guest_ms ({guest}) — "
+            f"the setup cost would be negative under the README's own formula "
+            f"(psdirect_session_ms - guest_ms)"
+        )
 
 
 # ---------------------------------------------------------------------------
 # PRR-010 / PRR-033 / PRR-045 / PRR-011 — harness lifecycle
 # ---------------------------------------------------------------------------
 
-def test_the_agent_threads_are_daemon():
+def test_the_agent_threads_are_daemon(monkeypatch):
     """PRR-010: a hung agent thread was not a daemon and was never stopped, so
     CPython's `threading._shutdown()` joined it at interpreter exit and a hung
-    tool call blocked process exit AFTER `main` had returned 0. The mutant this
-    kills: dropping `daemon=True` from the agent thread construction."""
-    import inspect
+    tool call blocked process exit AFTER `main` had returned 0.
 
-    source = inspect.getsource(soak_bench._run)
-    assert "daemon=True" in source, (
-        "PRR-010: the agent threads must be daemon threads, or a wedged tool "
-        "call blocks interpreter exit after main() returned 0"
-    )
+    This is a BEHAVIOURAL pin, not a source-text one. A source assertion is the
+    PRR-041 class: the reviewer's own probe removed the `daemon=True` kwarg
+    while keeping the literal in the adjacent comment, and it survived the
+    whole suite. So this check drives the real construction path and asserts
+    the attribute the runtime actually reads. The mutant this kills: dropping
+    `daemon=True` from the agent thread construction."""
+    captured: list[threading.Thread] = []
+    real_thread = threading.Thread
+
+    class _RecordingThread(real_thread):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            captured.append(self)
+
+    # Wedge the agent loop so the thread is still alive when we inspect it —
+    # exactly the shape that blocked interpreter exit.
+    release = threading.Event()
+
+    def _wedged(*args, **kwargs):
+        release.wait(timeout=30)
+
+    monkeypatch.setattr(soak_bench, "_agent_loop", _wedged)
+    monkeypatch.setattr(soak_bench.threading, "Thread", _RecordingThread)
+    monkeypatch.setattr(soak_bench, "_AGENT_JOIN_BUDGET_S", 0.2)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_log = Path(tmp) / "soak-audit.jsonl"
+            soak_bench._run(1, 1, stub=soak_bench.SoakStub(),
+                            vm="test-vm-soak", mode="fake",
+                            audit_log=audit_log)
+    finally:
+        release.set()
+
+    assert captured, "no agent thread was constructed"
+    for thread in captured:
+        assert thread.daemon is True, (
+            "PRR-010: an agent thread must be a daemon, or a wedged tool call "
+            "blocks interpreter exit after main() returned 0"
+        )
 
 
 def test_the_agent_join_budget_is_one_shared_deadline():

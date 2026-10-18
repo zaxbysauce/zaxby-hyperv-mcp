@@ -24,6 +24,7 @@ for anything else, and cannot be used to smuggle a secret past redaction.
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from contextvars import ContextVar, Token
@@ -42,6 +43,10 @@ _MAX_MARKER_BYTES = 4096
 #: millisecond count for every duration this process can observe, and the
 #: timing dict is the one record field inserted without the redaction wrapper.
 _MAX_MARKER_INT_BITS = 64
+#: Line terminators `parse_marker` splits on. CRLF and LF ONLY — never the
+#: Unicode line boundaries `str.splitlines()` also honours, because redaction
+#: runs after the marker is stripped and matches exact substrings.
+_LINE_SPLIT_RE = re.compile(r"(\r\n|\n)")
 
 _collector: ContextVar[Collector | None] = ContextVar("hyperv_mcp_timing", default=None)
 
@@ -170,31 +175,46 @@ def parse_marker(text: str) -> tuple[str, dict | None]:
     The rejoin uses the caller's own terminator, so stdout that arrived CRLF
     leaves CRLF: the only bytes removed are the marker lines themselves, and
     nothing else about the caller's stdout changes.
+
+    Line starts are found on BOTH terminators independently, because a caller's
+    stdout can legitimately mix them. Choosing one separator for the whole text
+    fused a bare-LF-terminated line with the marker line after it, so a marker
+    preceded by `\n` in otherwise-CRLF stdout was never recognised — it leaked
+    into the caller's stdout and its timing was silently lost.
     """
-    separator = "\r\n" if "\r\n" in text else "\n"
-    lines = text.split(separator)
-    # A trailing terminator leaves a final empty element that splitlines()
-    # would not have produced. It is the marker line's own terminator when the
-    # marker is last, so dropping it here means removing the marker line also
-    # removes its terminator — and nothing else about the caller's stdout
-    # changes.
-    if lines and lines[-1] == "":
-        lines.pop()
+    # Split on either terminator, keeping them: `re.split` with a capture group
+    # returns the separators too, so parts alternates content / separator /
+    # content / ... with each separator FOLLOWING its content.
+    parts = _LINE_SPLIT_RE.split(text)
+    # A trailing terminator leaves a final empty content element that
+    # `splitlines()` would not have produced. It is not a line.
+    if len(parts) >= 3 and parts[-1] == "":
+        parts.pop()
     found = False
     markers: dict | None = None
-    for index in range(len(lines) - 1, -1, -1):
-        if lines[index].strip().startswith(MARKER_PREFIX):
-            payload = lines[index].strip()[len(MARKER_PREFIX):]
-            del lines[index]
-            if not found:
-                # The first one found scanning backwards — i.e. the last in the
-                # file — supplies the values; any EARLIER marker line is still
-                # removed, so the guarantee is absolute rather than last-only.
-                found = True
-                markers = _accept(payload)
+    out: list[str] = []
+    for i in range(0, len(parts), 2):
+        line = parts[i]
+        # The terminator that PRECEDED this line is parts[i-1]; that is the
+        # caller's own line ending for it, so it is preserved verbatim.
+        preceding = parts[i - 1] if i >= 2 else ""
+        if line.strip().startswith(MARKER_PREFIX):
+            # Every marker line is dropped. The LAST one in the file supplies
+            # the values, matching the pre-fix backward scan, so a duplicate
+            # marker cannot make an earlier vaguer measurement win.
+            found = True
+            markers = _accept(line.strip()[len(MARKER_PREFIX):])
+            continue
+        if out:
+            # After a dropped marker the previous line's own terminator is
+            # gone, so fall back to the terminator that preceded THIS line —
+            # two survivors separated only by markers stay separated by a real
+            # original terminator instead of being fused.
+            out.append(preceding or "\n")
+        out.append(line)
     if not found:
         return text, None
-    return separator.join(lines), markers
+    return "".join(out), markers
 
 
 def _accept(payload: str) -> dict:
@@ -207,8 +227,10 @@ def _accept(payload: str) -> dict:
       parsed, so a hostile emitter cannot make the host spend unbounded work
       on it;
     - NESTING — `json.loads` on a deeply nested array raises `RecursionError`,
-      which is NOT a `ValueError`, so the `except ValueError` below would let
-      it escape into `run_ps`. The depth guard refuses before parsing;
+      which is NOT a `ValueError`, so the `except` below names it explicitly;
+      without that the error escapes `_accept` into `parse_marker` and
+      `run_ps`. The 4 KiB length bound caps how deep a payload can be, so the
+      stack burn is bounded;
     - MAGNITUDE — an integer wider than `_MAX_MARKER_INT_BITS` is dropped, so
       a marker carrying a 4000-digit value cannot inflate the audit row (the
       timing dict is the one record field inserted without the redaction
@@ -218,9 +240,14 @@ def _accept(payload: str) -> dict:
 
     if len(payload) > _MAX_MARKER_BYTES:
         return {}
+    # RecursionError is NOT a ValueError, so the except clause has to name it:
+    # a deeply nested array inside the 4 KiB window raises it out of json.loads
+    # and would otherwise escape _accept into parse_marker and run_ps.
     try:
         data = json.loads(payload)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError is NOT a ValueError, so without it a deeply nested
+        # payload escapes _accept into parse_marker and run_ps.
         return {}
     if not isinstance(data, dict):
         return {}
