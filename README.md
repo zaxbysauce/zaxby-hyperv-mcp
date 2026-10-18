@@ -352,6 +352,95 @@ Unknown keys are rejected at startup (typos must not disable a control).
 `"unrestricted": true` for disposable labs; unrestricted mode also forces a
 visible audit line per operation.
 
+#### Audit record schema
+
+One JSON object per audited operation, appended to `audit_log_path` (or one
+line per op on stderr when unset):
+
+```json
+{
+  "ts": "2026-10-17T15:25:35.721+00:00",
+  "tool": "hyperv_guest_run_ps",
+  "vm_name": "test-vm",
+  "category": "guest_exec",
+  "ok": true,
+  "duration_ms": 1247,
+  "exit_code": 0,
+  "error_class": "",
+  "agent_id": null,
+  "request_id": "31ee4c18f3be4a7c843902a37fb3996d",
+  "job_id": null,
+  "relay_id": null,
+  "timing": {
+    "lock_wait_ms": 0,
+    "ps_ms": 1200,
+    "ps_spawns": 1,
+    "total_ms": 1247,
+    "ps_startup_ms": 120,
+    "psdirect_session_ms": 1300,
+    "guest_ms": 900
+  }
+}
+```
+
+`timing` is additive: `duration_ms` and every key above it keep their meaning,
+so existing log consumers are unaffected. `lock_wait_ms` is how long the call
+waited for the per-VM lock (0 when it never waited, and a real number on a
+`busy` failure that timed out). `ps_ms`/`ps_spawns` are the total duration and
+the count of `powershell.exe` children the call started. `total_ms` is the
+whole operation, measured from the operation's entry, so it is never smaller
+than `duration_ms` and never smaller than `ps_ms`. The three guest keys are
+populated only when the guest host script emitted timing markers — null
+otherwise, which is the normal answer for console-only calls and for a fake
+transport. `guest_ms` is the guest-side measurement; `psdirect_session_ms` is
+the whole PowerShell Direct session, so it includes the guest round trip, and
+the setup cost is recoverable as `psdirect_session_ms - guest_ms`. Values are
+numeric or null; nothing in `timing` ever carries script text, arguments or
+credentials.
+
+`hyperv_console_screenshot` is the one console image tool that returns this
+same object as its `timing` metadata key. `hyperv_console_wait_frame_change`
+and `hyperv_console_capture_sequence` still return the legacy `timings` block
+only, so a consumer reading `timing` from them gets nothing — read the audit
+record for those two.
+
+#### Soak benchmark
+
+`scripts/soak_bench.py` runs 1, 4 and 8 concurrent agents against the real tool
+layer and reports p50/p95/p99 plus busy and incorrect rates per agent count
+and per tool, and the median guest timing breakdown for `guest_run_ps`. Only
+read-only and console-input tools are used — no lifecycle or destructive call.
+The harness ships in the sdist (`scripts/` at the extraction root, so the
+`python scripts/soak_bench.py` invocations below work there and from a git
+checkout) and in the wheel (force-included as
+`<site-packages>/scripts/soak_bench.py` after `pip install`).
+
+```bash
+# CI-runnable: stubs run_ps, needs no Hyper-V
+python scripts/soak_bench.py --fake --agents 1,4,8 --iterations 5 --json
+
+# live: refuses to start unless all three variables are set and guest
+# credentials resolve, and only ever touches the named disposable VM
+HYPERV_MCP_INTEGRATION=1 HYPERV_MCP_SOAK=1 HYPERV_MCP_TEST_VM="Deployment Test 3" \
+    python scripts/soak_bench.py --agents 1,4,8 --iterations 20 --json
+```
+
+Fake and live mode share the tool layer, the percentile helper and the audit
+sink. They differ in three ways besides whether `pswindows.run_ps` is stubbed:
+fake mode force-disables the in-process WMI backend so every leg takes the
+PowerShell transport, it swaps in a `test-*` config with `console_input`
+enabled instead of `unrestricted`, and it injects a fake guest credential pair.
+Policy, credential resolution and the audit operation still behave the same way
+in both, but a fake-mode run is not evidence about the production regime: live
+mode is the one that measures the real backend and the real lock contention.
+Percentiles reuse `hyperv_mcp.consolebench.pct` (nearest-rank), so the two
+cannot drift; no new runtime dependency.
+
+`--vm <name>` overrides the VM every agent addresses (default: the VM named by
+`HYPERV_MCP_TEST_VM`). `guest_timing_median_ms` appears in the JSON row only
+when at least one `guest_run_ps` row in the audit log carried a marker, so its
+absence is itself the signal that no guest timing was measured.
+
 `host_powershell_path` limitation: the child environment handed to every
 spawn always carries a PowerShell 5.1-shaped `PSModulePath` (pwsh7 module
 directories stripped, the 5.1 system module directory appended). Pointing

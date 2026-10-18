@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import console, vmident
+from . import console, timing, vmident
 from .config import Config
 from .credentials import CredentialError, CredentialSet
 from .diagnostics import run_guest_inner
@@ -178,4 +178,14 @@ def capture_evidence(
             }
     meta = dict(meta)
     meta["ui_tree"] = ui
+    # The screenshot leg snapshotted the collector MID-operation, before this
+    # UI-tree leg ran. Re-snapshot now so the metadata's `timing` is the value
+    # the server will record for the whole call — otherwise a ui_tree=True call
+    # reports metadata {ps_spawns: 3} beside an audit row's {ps_spawns: 4}
+    # (feedback PRR-007). With no collector (a direct module call) the block
+    # console.screenshot derived stands, so a non-audited caller still gets an
+    # honest breakdown rather than a fabricated zero.
+    collector = timing.current()
+    if collector is not None:
+        meta["timing"] = collector.snapshot()
     return {"ok": True, "image": image, "meta": meta}

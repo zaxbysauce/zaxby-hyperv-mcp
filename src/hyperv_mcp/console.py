@@ -9,7 +9,11 @@ unreachable — the WS-Man hop composes exactly as before). A WMI METHOD
 failure (or a mid-op backend unavailability) is a structured error and is
 never retried through PowerShell so input can never double-send. Every
 SUCCESSFUL result reports a per-call ``timings`` breakdown (failure
-envelopes carry the standard error shape without timings); the WMI
+envelopes carry the standard error shape without timings), and the
+image-returning operations additionally carry the issue-#20 ``timing``
+block — ``lock_wait_ms``, ``ps_ms``, ``ps_spawns``, ``total_ms`` plus the
+three guest marker keys (``ps_startup_ms``, ``psdirect_session_ms``,
+``guest_ms``), null when no marker was emitted; the WMI
 transport additionally has no per-call COM timeout — a hung provider
 blocks that VM's operations until it returns, where the PowerShell
 transport's child process is killed at its timeout.
@@ -91,6 +95,7 @@ from PIL import Image as PILImage
 from PIL import features as _PILFeatures
 
 from . import guestexec, policy, pswindows, vmident, vmlocks, wmiconsole
+from . import timing as timing_mod
 from .config import Config
 
 _WMI_NS = "root\\virtualization\\v2"
@@ -597,6 +602,43 @@ def _wmi_timings(connect_ms: float, *phase_dicts: dict) -> dict:
         "connect_ms": float(connect_ms),
         "rebind_ms": float(rebind),
         "method_ms": float(method),
+    }
+
+
+def _meta_timing(t0: float, ps_timing: _PsTiming | None, *, wmi: bool = False) -> dict:
+    """The per-call `timing` block for an image tool's metadata (issue #20).
+
+    Prefers the active audit operation's collector. That is the value the
+    server records ONLY IF this snapshot is taken at the operation's end: a
+    caller that runs further legs after it (evidence.capture_evidence's UI
+    tree) must re-snapshot from the collector, or its metadata disagrees with
+    the audit row for the same call (feedback PRR-007). With no collector (a
+    direct module call — the consolebench operator CLI drives
+    console.screenshot that way), the block is derived from the op's own
+    accumulators so it is never a fabricated zero.
+
+    `t0` is `time.monotonic()` taken at the op's entry, before transport
+    selection; it is unused when a collector is active, because the collector's
+    own `total_ms` wins.
+
+    On the in-process WMI path no PowerShell process is started at all, so
+    `ps_spawns`/`ps_ms` are honestly zero rather than defaults.
+    """
+    collector = timing_mod.current()
+    if collector is not None:
+        return collector.snapshot()
+    total_ms = int((time.monotonic() - t0) * 1000)
+    if wmi:
+        return {**timing_mod.zeroed(), "total_ms": total_ms}
+    spawns = list(ps_timing.spawn_ms) if ps_timing is not None else []
+    return {
+        "lock_wait_ms": 0,
+        "ps_ms": int(sum(spawns)),
+        "ps_spawns": len(spawns),
+        "total_ms": total_ms,
+        "ps_startup_ms": None,
+        "psdirect_session_ms": None,
+        "guest_ms": None,
     }
 
 
@@ -1367,6 +1409,7 @@ def screenshot(
     # spawn takes a max_host_powershell slot (or the WMI chain runs).
     _validate_output_options(fmt, quality, scale)
     _validate_if_changed_from(if_changed_from)
+    t0 = time.monotonic()
     be, connect_ms = _try_backend(cfg)
     ref: vmident.VMRef | None = None
     if be is not None:
@@ -1377,7 +1420,7 @@ def screenshot(
     if be is not None:
         assert ref is not None
         return _screenshot_wmi(
-            cfg, be, connect_ms, ref, width, height, save_path,
+            cfg, be, connect_ms, ref, width, height, save_path, t0,
             fmt, quality, scale, crop, if_changed_from,
         )
     timing = _PsTiming()
@@ -1421,6 +1464,7 @@ def screenshot(
         "capture_method": "GetVirtualSystemThumbnailImage (WMI root\\virtualization\\v2)",
         "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
         "timings": _ps_timings(timing),
+        "timing": _meta_timing(t0, timing),
     }
     return _finish_screenshot(
         cfg, raw, actual_w, actual_h, save_path, fmt, quality, scale, crop,
@@ -1436,6 +1480,7 @@ def _screenshot_wmi(
     width: int,
     height: int,
     save_path: str,
+    t0: float = 0.0,
     fmt: str = "",
     quality=None,
     scale=None,
@@ -1481,6 +1526,7 @@ def _screenshot_wmi(
             "capture_method": "GetVirtualSystemThumbnailImage (in-process WMI, issue #45)",
             "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "timings": _wmi_timings(connect_ms, *phase_dicts),
+            "timing": _meta_timing(t0, None, wmi=True),
         }
         return _finish_screenshot(
             cfg, raw, actual_w, actual_h, save_path, fmt, quality, scale, crop,

@@ -58,6 +58,7 @@ from . import (
     relay,
     repair,
     stdio_proxy,
+    timing,
     vmlocks,
 )
 from .config import Config, ConfigError
@@ -1184,7 +1185,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         WinPE; independent of VMConnect, host foreground, guest login/network).
         Returns MCP image content plus a metadata text block:
         vm_id, dimensions, frame_hash, head resolution and scale note,
-        fallback_used, capture method. Fallback chain: requested → head
+        fallback_used, capture method, and timing — the per-call cost
+        breakdown (lock_wait_ms, ps_ms, ps_spawns, total_ms; the guest-marker
+        trio ps_startup_ms/psdirect_session_ms/guest_ms stays null on console
+        tools, whose scripts emit no marker). Fallback chain: requested → head
         native → 640x480 → 320x240. A corrupt/short payload is a structured
         error, never a successful image.
 
@@ -1948,7 +1952,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             """Capture console evidence in one call: screenshot paired with
             captured_at, vm_id, dimensions and frame hash, plus an optional
             bounded guest UI element tree (requires guest credentials; the
-            screenshot alone does not).
+            screenshot alone does not). The metadata also carries the per-call
+            timing breakdown (lock_wait_ms, ps_ms, ps_spawns, total_ms;
+            guest-marker keys null unless a leg emitted a marker).
 
             Args:
                 vm_name: Name of the VM
@@ -2135,6 +2141,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             captured_at, vm_id, dimensions and frame hash, plus an optional
             bounded guest UI element tree (requires guest credentials; the
             screenshot alone does not). Credentials from environment only.
+            The metadata also carries the per-call timing breakdown
+            (lock_wait_ms, ps_ms, ps_spawns, total_ms; guest-marker keys null
+            unless a leg emitted a marker).
 
             Args:
                 vm_name: Name of the VM
@@ -2332,14 +2341,28 @@ def _harden_tools(mcp: MCPServer) -> None:
             job_id = _opt_id("job_id")
             relay_id = _opt_id("relay_id")
             vm_name = str(args.get("vm_name") or "")
-            if not vm_name:
-                # A rejected by-id follow-up still knows its registry entry:
-                # resolve the VM so the row joins to the start row like the
-                # success path does (impl-review PRR-003).
-                if job_id:
-                    vm_name = guestjobs.peek_vm_name(job_id)
-                elif relay_id:
-                    vm_name = relay.peek_vm_name(relay_id)
+            # A short-lived collector so the rejection row reports an honest
+            # breakdown: no tool body ran, so no lock was taken and no process
+            # started. The peek calls below can raise, hence the try/finally.
+            timing_token = timing.start()
+            finished = False
+            try:
+                if not vm_name:
+                    # A rejected by-id follow-up still knows its registry
+                    # entry: resolve the VM so the row joins to the start row
+                    # like the success path does (impl-review PRR-003).
+                    if job_id:
+                        vm_name = guestjobs.peek_vm_name(job_id)
+                    elif relay_id:
+                        vm_name = relay.peek_vm_name(relay_id)
+                timing_snapshot = timing.finish(timing_token)
+                finished = True
+            finally:
+                # A peek that raised must still reset the ContextVar, or the
+                # collector leaks into the event-loop task's context and every
+                # later worker-thread hop inherits it.
+                if not finished:
+                    timing.finish(timing_token)
 
             try:
                 auditlog.log_operation(
@@ -2350,6 +2373,7 @@ def _harden_tools(mcp: MCPServer) -> None:
                     error_class=str(env.get("error_class") or ""),
                     job_id=job_id,
                     relay_id=relay_id,
+                    timing=timing_snapshot,
                 )
             except Exception as audit_exc:  # noqa: BLE001 - best-effort: a
                 # broken audit sink must not turn a rejection into a raw

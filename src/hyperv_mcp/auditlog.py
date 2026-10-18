@@ -1,10 +1,14 @@
 """Structured, secret-safe audit logging for hyperv-mcp.
 
 One JSON object per operation: timestamp, tool, vm_name, category, ok,
-duration_ms, exit_code, error_class, plus the correlation keys added by
-issue #10 — agent_id (the authenticated caller's client_id, null on
+duration_ms, exit_code, error_class, timing, plus the correlation keys added
+by issue #10 — agent_id (the authenticated caller's client_id, null on
 stdio/anonymous), request_id (server-generated per audited call), and
-job_id/relay_id when the operation addressed a guest job or relay. Command
+job_id/relay_id when the operation addressed a guest job or relay. The
+timing object (issue #20) is the per-call cost breakdown: lock_wait_ms,
+ps_ms, ps_spawns and total_ms on every record, plus the guest-marker trio
+ps_startup_ms / psdirect_session_ms / guest_ms when a script emitted one
+(null otherwise — a missing measurement is absent, never zero). Command
 content, file content and credentials are NEVER logged; all string fields
 pass the redaction filter.
 
@@ -26,6 +30,7 @@ from typing import Literal
 from mcp.server.auth.middleware.auth_context import get_access_token
 
 from . import credentials, vmlocks
+from . import timing as timing_mod
 from .config import Config
 
 _lock = threading.Lock()
@@ -81,6 +86,7 @@ def log_operation(
     request_id: str | None = None,
     job_id: str | None = None,
     relay_id: str | None = None,
+    timing: dict | None = None,
 ) -> None:
     if _config is None:
         return
@@ -107,6 +113,10 @@ def log_operation(
         "request_id": r(str(request_id)),
         "job_id": job_id if job_id is None else r(str(job_id)),
         "relay_id": relay_id if relay_id is None else r(str(relay_id)),
+        # Per-call cost breakdown (issue #20): additive, so existing log
+        # consumers keep reading duration_ms. A caller with no collector of its
+        # own (the pre-body rejection writer) reports the honest zeroes.
+        "timing": timing if timing is not None else timing_mod.zeroed(),
     }
     _emit(json.dumps(record, ensure_ascii=False))
 
@@ -158,25 +168,53 @@ class operation:  # noqa: N801 - context manager reads like a decorator
         self.agent_id: str | None = None
         self.request_id: str = ""
         self._tool_token: object | None = None
+        self._timing_token: object | None = None
 
     def __enter__(self) -> operation:
-        self.start = time.monotonic()
-        self.agent_id = current_agent_id()
-        self.request_id = uuid.uuid4().hex
-        # Issue #14: carry the tool name so a VMBusy raised anywhere inside
-        # this operation can name the holder without signature plumbing.
-        # The token is per-instance so nested operations reset correctly.
-        self._tool_token = vmlocks._current_tool.set(self.tool)
+        # The collector is installed first and its token kept per-instance, so
+        # nested operations reset correctly. Python does NOT call __exit__
+        # when __enter__ itself raises, so the statements below that can
+        # raise (the agent-id resolution reads the live auth context) are
+        # wrapped: the except arm resets BOTH contextvars itself, or the
+        # collector would leak into the next operation on this thread
+        # (feedback PRR-013).
+        self._timing_token = timing_mod.start()
+        try:
+            self.start = time.monotonic()
+            self.agent_id = current_agent_id()
+            self.request_id = uuid.uuid4().hex
+            # Issue #14: carry the tool name so a VMBusy raised anywhere inside
+            # this operation can name the holder without signature plumbing.
+            # The token is per-instance so nested operations reset correctly.
+            self._tool_token = vmlocks._current_tool.set(self.tool)
+        except BaseException:
+            tool_token = getattr(self, "_tool_token", None)
+            if tool_token is not None:
+                vmlocks._current_tool.reset(tool_token)
+                self._tool_token = None
+            timing_token = getattr(self, "_timing_token", None)
+            self._timing_token = None
+            if timing_token is not None:
+                timing_mod.finish(timing_token)  # resets the ContextVar
+            raise
         return self
 
     def __exit__(self, exc_type, exc, tb) -> Literal[False]:
         # Reset before anything that can raise (issue #14 plan): a classify
         # or log failure must never leak the tool ContextVar into the next
-        # task on this thread.
+        # task on this thread. The timing token is reset on the same
+        # discipline — and before log_operation, so a broken sink cannot leak
+        # a collector either.
         token = getattr(self, "_tool_token", None)
         if token is not None:
             vmlocks._current_tool.reset(token)
             self._tool_token = None
+        timing_token = getattr(self, "_timing_token", None)
+        if timing_token is not None:
+            timing = timing_mod.finish(timing_token)  # type: ignore[arg-type]
+            self._timing_token = None
+        else:
+            timing = timing_mod.zeroed()
         duration_ms = int((time.monotonic() - self.start) * 1000)
         if exc is not None:
             from . import errors  # late import: errors imports policy/media modules
@@ -194,5 +232,6 @@ class operation:  # noqa: N801 - context manager reads like a decorator
             request_id=self.request_id,
             job_id=self.job_id,
             relay_id=self.relay_id,
+            timing=timing,
         )
         return False  # never swallow

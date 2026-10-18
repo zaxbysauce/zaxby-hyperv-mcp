@@ -67,10 +67,25 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hyperv_mcp"]
+# PRR-021: the soak harness ships in the wheel too. `packages` above only
+# maps src/hyperv_mcp into the archive root, so the top-level script needs
+# an explicit mapping; force-include places it at scripts/soak_bench.py in
+# the wheel, i.e. <site-packages>/scripts/soak_bench.py after `pip install`.
+# The `python scripts/soak_bench.py` form documented in the README is the
+# source-checkout / sdist-extraction invocation; from an installed wheel,
+# run `python <site-packages>/scripts/soak_bench.py`.
+force-include = { "scripts/soak_bench.py" = "scripts/soak_bench.py" }
 
 [tool.hatch.build.targets.sdist]
 include = [
     "src/hyperv_mcp",
+    # scripts/soak_bench.py is the documented entry point for the soak
+    # benchmark (README "Soak benchmark"): the sdist carries the scripts/
+    # directory at its root (so an extraction supports `python
+    # scripts/soak_bench.py`), and the wheel force-includes the one file
+    # (see the wheel target above). Omitting both made the documented entry
+    # point work only from a git checkout.
+    "scripts",
     "README.md",
     "LICENSE",
     "NOTICE",
@@ -120,4 +135,7 @@ ignore = ["E501"]
 python_version = "3.10"
 ignore_missing_imports = true
 check_untyped_defs = true
-files = ["src/hyperv_mcp"]
+# scripts/ is in scope (PRR-020): the soak harness is shipped, executed
+# code — ruff-only coverage let a real inference bug ship unnoticed. It is
+# clean under the same config as src/hyperv_mcp.
+files = ["src/hyperv_mcp", "scripts"]

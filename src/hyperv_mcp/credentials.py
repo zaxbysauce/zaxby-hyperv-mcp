@@ -49,6 +49,25 @@ class _RedactionRegistry:
                 if secret not in self._secrets:
                     self._secrets.append(secret)
 
+    def unregister(self, secret: str) -> None:
+        """Withdraw a secret from the redaction set (feedback PRR-037).
+
+        Exists for HARNESS teardown: the soak benchmark's fake mode sets a
+        fake guest password that credential resolution then registers in this
+        process-global registry, and without a withdrawal the fake password
+        keeps scrubbing unrelated text in every later redaction the process
+        performs. Nothing in the server calls this — a withdrawn secret stops
+        being scrubbed everywhere, which is precisely why un-redacting a live
+        credential is not a supported operation. Withdrawing a secret that was
+        never registered is a no-op, so teardown stays idempotent.
+        """
+        if secret and len(secret) >= 3:
+            with self._lock:
+                try:
+                    self._secrets.remove(secret)
+                except ValueError:
+                    pass
+
     def all(self) -> list[str]:
         with self._lock:
             return list(self._secrets)

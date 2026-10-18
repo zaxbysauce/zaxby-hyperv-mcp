@@ -23,8 +23,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
       - name: Ruff
-        run: ruff check src tests
+        run: ruff check src tests scripts
       - name: Mypy
-        run: mypy src/hyperv_mcp
+        # scripts/ is type-checked too (PRR-020 half): it was ruff-covered
+        # only, which left soak_bench.py's one real inference error (an
+        # unannotated dict join) invisible. It is clean under the same
+        # config as src, so no separate scope is needed.
+        run: mypy src/hyperv_mcp scripts
       - name: Unit tests (no Hyper-V)
         run: pytest tests/unit
