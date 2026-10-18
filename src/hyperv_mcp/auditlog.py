@@ -26,6 +26,7 @@ from typing import Literal
 from mcp.server.auth.middleware.auth_context import get_access_token
 
 from . import credentials, vmlocks
+from . import timing as timing_mod
 from .config import Config
 
 _lock = threading.Lock()
@@ -81,6 +82,7 @@ def log_operation(
     request_id: str | None = None,
     job_id: str | None = None,
     relay_id: str | None = None,
+    timing: dict | None = None,
 ) -> None:
     if _config is None:
         return
@@ -107,6 +109,10 @@ def log_operation(
         "request_id": r(str(request_id)),
         "job_id": job_id if job_id is None else r(str(job_id)),
         "relay_id": relay_id if relay_id is None else r(str(relay_id)),
+        # Per-call cost breakdown (issue #20): additive, so existing log
+        # consumers keep reading duration_ms. A caller with no collector of its
+        # own (the pre-body rejection writer) reports the honest zeroes.
+        "timing": timing if timing is not None else timing_mod.zeroed(),
     }
     _emit(json.dumps(record, ensure_ascii=False))
 
@@ -158,8 +164,13 @@ class operation:  # noqa: N801 - context manager reads like a decorator
         self.agent_id: str | None = None
         self.request_id: str = ""
         self._tool_token: object | None = None
+        self._timing_token: object | None = None
 
     def __enter__(self) -> operation:
+        # The collector is installed first and its token kept per-instance, so
+        # nested operations reset correctly and a raise anywhere below still
+        # resets it in __exit__.
+        self._timing_token = timing_mod.start()
         self.start = time.monotonic()
         self.agent_id = current_agent_id()
         self.request_id = uuid.uuid4().hex
@@ -172,11 +183,19 @@ class operation:  # noqa: N801 - context manager reads like a decorator
     def __exit__(self, exc_type, exc, tb) -> Literal[False]:
         # Reset before anything that can raise (issue #14 plan): a classify
         # or log failure must never leak the tool ContextVar into the next
-        # task on this thread.
+        # task on this thread. The timing token is reset on the same
+        # discipline — and before log_operation, so a broken sink cannot leak
+        # a collector either.
         token = getattr(self, "_tool_token", None)
         if token is not None:
             vmlocks._current_tool.reset(token)
             self._tool_token = None
+        timing_token = getattr(self, "_timing_token", None)
+        if timing_token is not None:
+            timing = timing_mod.finish(timing_token)  # type: ignore[arg-type]
+            self._timing_token = None
+        else:
+            timing = timing_mod.zeroed()
         duration_ms = int((time.monotonic() - self.start) * 1000)
         if exc is not None:
             from . import errors  # late import: errors imports policy/media modules
@@ -194,5 +213,6 @@ class operation:  # noqa: N801 - context manager reads like a decorator
             request_id=self.request_id,
             job_id=self.job_id,
             relay_id=self.relay_id,
+            timing=timing,
         )
         return False  # never swallow

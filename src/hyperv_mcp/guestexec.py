@@ -262,19 +262,41 @@ def _host_script(vm_id: str, inner_script: str, cred: CredentialSet, elevated: b
     # remoting boundary. GetRandomFileName avoids GetTempFileName's base .tmp
     # residue (a fresh unique name, no side-effect file to clean up). The VM
     # is addressed by the pre-resolved GUID ($vmTarget preamble, vmident).
+    #
+    # The trailing __MCP_TIMING= line is the per-call cost breakdown (issue
+    # #20). pswindows.run_ps splits it off stdout BEFORE any tool parses that
+    # stdout — including before _run_inner's json.loads, which would otherwise
+    # see "Extra data" — and feeds the values to the active call's collector.
+    # Emitter and stripper ship together for that reason.
+    #
+    #   ps_startup_ms         host process start -> this script's first statement
+    #   psdirect_session_ms   the Invoke-Command: PS Direct session setup plus
+    #                         the guest round trip (what session reuse removes)
+    #   guest_ms              the guest-side work, measured inside the scriptblock
+    #
+    # Every literal brace below is doubled because this is an f-string; see the
+    # `}} -ArgumentList $enc` and `[PSCustomObject]@{{ ... }}` lines that were
+    # already doubled. All three values are cast to [int] so ConvertTo-Json
+    # emits a JSON integer and the int-only marker parser keeps them.
     return f"""
+$__mcpBorn = [Diagnostics.Process]::GetCurrentProcess().StartTime
+$__mcpBornMs = [int]((Get-Date) - $__mcpBorn).TotalMilliseconds
 {psdirect_prefix(cred, cfg)}
 {vm_target_preamble(vm_id)}
 $enc = '{pswindows.utf8_b64(inner_script)}'
+$__mcpSw = [Diagnostics.Stopwatch]::StartNew()
 $r = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptBlock {{
     param($enc)
+    $__mcpGuest = [Diagnostics.Stopwatch]::StartNew()
     $text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($enc))
     $tmp  = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName() + '.ps1')
     [System.IO.File]::WriteAllText($tmp, $text, [System.Text.UTF8Encoding]::new($false))
 {body}
-    [PSCustomObject]@{{ exit_code=$ec; stdout=$so; stderr=$se }}
+    [PSCustomObject]@{{ exit_code=$ec; stdout=$so; stderr=$se; duration_ms=$__mcpGuest.ElapsedMilliseconds }}
 }} -ArgumentList $enc
+$__mcpSessionMs = $__mcpSw.ElapsedMilliseconds
 $r | ConvertTo-Json -Compress -Depth 2
+"__MCP_TIMING=" + (@{{ ps_startup_ms=[int]$__mcpBornMs; psdirect_session_ms=[int]$__mcpSessionMs; guest_ms=[int]$r.duration_ms }} | ConvertTo-Json -Compress)
 """
 
 

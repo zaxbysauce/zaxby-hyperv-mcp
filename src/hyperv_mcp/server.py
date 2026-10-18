@@ -58,6 +58,7 @@ from . import (
     relay,
     repair,
     stdio_proxy,
+    timing,
     vmlocks,
 )
 from .config import Config, ConfigError
@@ -2332,14 +2333,28 @@ def _harden_tools(mcp: MCPServer) -> None:
             job_id = _opt_id("job_id")
             relay_id = _opt_id("relay_id")
             vm_name = str(args.get("vm_name") or "")
-            if not vm_name:
-                # A rejected by-id follow-up still knows its registry entry:
-                # resolve the VM so the row joins to the start row like the
-                # success path does (impl-review PRR-003).
-                if job_id:
-                    vm_name = guestjobs.peek_vm_name(job_id)
-                elif relay_id:
-                    vm_name = relay.peek_vm_name(relay_id)
+            # A short-lived collector so the rejection row reports an honest
+            # breakdown: no tool body ran, so no lock was taken and no process
+            # started. The peek calls below can raise, hence the try/finally.
+            timing_token = timing.start()
+            finished = False
+            try:
+                if not vm_name:
+                    # A rejected by-id follow-up still knows its registry
+                    # entry: resolve the VM so the row joins to the start row
+                    # like the success path does (impl-review PRR-003).
+                    if job_id:
+                        vm_name = guestjobs.peek_vm_name(job_id)
+                    elif relay_id:
+                        vm_name = relay.peek_vm_name(relay_id)
+                timing_snapshot = timing.finish(timing_token)
+                finished = True
+            finally:
+                # A peek that raised must still reset the ContextVar, or the
+                # collector leaks into the event-loop task's context and every
+                # later worker-thread hop inherits it.
+                if not finished:
+                    timing.finish(timing_token)
 
             try:
                 auditlog.log_operation(
@@ -2350,6 +2365,7 @@ def _harden_tools(mcp: MCPServer) -> None:
                     error_class=str(env.get("error_class") or ""),
                     job_id=job_id,
                     relay_id=relay_id,
+                    timing=timing_snapshot,
                 )
             except Exception as audit_exc:  # noqa: BLE001 - best-effort: a
                 # broken audit sink must not turn a rejection into a raw

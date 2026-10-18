@@ -59,6 +59,8 @@ from contextvars import ContextVar
 
 import anyio
 
+from . import timing
+
 #: Tool name of the enclosing `auditlog.operation`, set/reset by its
 #: __enter__/__exit__ so a VMBusy raised anywhere inside a tool call can
 #: name the holding tool without threading it through every signature.
@@ -76,11 +78,17 @@ class VMBusy(RuntimeError):
     `holder` (when attached) is a dict {"tool", "mode", "since", "held_ms"}
     describing the operation that held the lock at failure time; it never
     contains command text, file content, or credentials.
+
+    `waited_ms` is how long the failing waiter was parked on the lock. It rides
+    the exception because a return value cannot escape a raise, and a busy
+    failure's audit row must report the wait that actually elapsed rather than
+    a fabricated zero.
     """
 
-    def __init__(self, message: str, holder: dict | None = None):
+    def __init__(self, message: str, holder: dict | None = None, waited_ms: int = 0):
         super().__init__(message)
         self.holder = holder
+        self.waited_ms = waited_ms
 
 
 #: Server default bounded wait; 0 restores the pre-#14 fail-fast. Re-set
@@ -131,7 +139,15 @@ def _display_key(key: object) -> str:
     return str(key)
 
 
-def _busy(key: object, holder: dict | None) -> VMBusy:
+def _busy(key: object, holder: dict | None, waited_ms: int = 0) -> VMBusy:
+    """Build the contention failure, carrying how long the waiter was parked.
+
+    `waited_ms` defaults to 0 and is passed only by callers that actually
+    waited. The pre-loop re-entry fast-fail raises before any wait, so it
+    genuinely reports 0; both in-loop raises pass the accumulated wait,
+    including the `holder is None` branch, which is reached after the bounded
+    window expired — that waiter really did sit out the full wait.
+    """
     if holder is None:
         # Contention drained between the waiter's wakeup and its expiry:
         # no holder exists, so claim none. Message keeps no tool clause and
@@ -141,12 +157,14 @@ def _busy(key: object, holder: dict | None) -> VMBusy:
             f"another operation is already running on VM '{_display_key(key)}'; "
             "wait for it to finish before starting a conflicting one",
             holder=None,
+            waited_ms=waited_ms,
         )
     return VMBusy(
         f"another operation is already running on VM '{_display_key(key)}': "
         f"tool={holder['tool']} mode={holder['mode']} held_ms={holder['held_ms']}; "
         "wait for it to finish before starting a conflicting one",
         holder=holder,
+        waited_ms=waited_ms,
     )
 
 
@@ -198,7 +216,14 @@ class _RWLock:
             return _live_holder(self._pending_writer)
         return None
 
-    def acquire(self, key: object, mode: str, wait_s: float | None, tid: int) -> None:
+    def acquire(self, key: object, mode: str, wait_s: float | None, tid: int) -> int:
+        """Acquire in `mode` and return the milliseconds spent parked.
+
+        The wait is accumulated only inside the `while` loops, so an
+        uncontended acquire returns exactly 0 rather than the sub-millisecond
+        cost of taking the Condition. On the busy path the accumulated value
+        rides the `VMBusy` (see `_busy`).
+        """
         # Re-entry from the holding thread fails fast: this lock is not
         # reentrant, and waiting would deadlock (AC8 keeps the phrase).
         with self._cv:
@@ -206,6 +231,11 @@ class _RWLock:
                 raise _busy(key, self._current_holder())
 
             deadline = None if wait_s is None else time.monotonic() + max(0.0, wait_s)
+            # The wait is measured around the WHOLE loop, not per _wait_tick
+            # slice: a per-slice accumulation loses the final slice on the
+            # timeout path, so a busy failure could under-report its wait by one
+            # 0.2 s poll window.
+            wait_started = time.monotonic()
             if mode == "write":
                 self._waiting_writers += 1
                 if self._pending_writer is None:
@@ -213,7 +243,12 @@ class _RWLock:
                 try:
                     while self._writer is not None or self._readers:
                         if not self._wait_tick(deadline):
-                            raise _busy(key, self._current_holder())
+                            raise _busy(
+                                key, self._current_holder(),
+                                waited_ms=int(
+                                    (time.monotonic() - wait_started) * 1000
+                                ),
+                            )
                     self._writer = (tid, _holder_dict(mode, time.time()))
                 finally:
                     self._waiting_writers -= 1
@@ -226,8 +261,14 @@ class _RWLock:
             else:
                 while self._writer is not None or self._waiting_writers > 0:
                     if not self._wait_tick(deadline):
-                        raise _busy(key, self._current_holder())
+                        raise _busy(
+                            key, self._current_holder(),
+                            waited_ms=int(
+                                (time.monotonic() - wait_started) * 1000
+                            ),
+                        )
                 self._readers[tid] = _holder_dict(mode, time.time())
+            return int((time.monotonic() - wait_started) * 1000)
 
     def _wait_tick(self, deadline: float | None) -> bool:
         """Wait for the CV until the predicate may have changed; return
@@ -287,17 +328,17 @@ def _normalize_key(key: object) -> object:
     return str(key).casefold()
 
 
-def _acquire(key: object, mode: str, wait_s: float | None) -> _RWLock:
+def _acquire(key: object, mode: str, wait_s: float | None) -> tuple[_RWLock, int]:
     """Fetch-or-create the key's RW lock and acquire it.
 
-    The registry mutation happens atomically under _registry_lock WITH an
-    in-flight pin, so eviction (which also runs under _registry_lock) can
-    never remove a lock between this fetch and its acquire — the exact race
-    the pre-#14 code closed for the plain Lock (round-2 review finding,
-    issue #14 plan BLOCKER-1). The (possibly waiting) acquire itself runs
-    OUTSIDE the registry lock: holding it across a bounded wait would
-    serialize every VM in the server. Pins are dropped once the acquire
-    resolves (held locks are then protected by idle(); failures simply
+    Returns `(lock, waited_ms)`. The registry mutation happens atomically
+    under _registry_lock WITH an in-flight pin, so eviction (which also runs
+    under _registry_lock) can never remove a lock between this fetch and its
+    acquire — the exact race the pre-#14 code closed for the plain Lock
+    (round-2 review finding, issue #14 plan BLOCKER-1). The (possibly waiting)
+    acquire itself runs OUTSIDE the registry lock: holding it across a bounded
+    wait would serialize every VM in the server. Pins are dropped once the
+    acquire resolves (held locks are then protected by idle(); failures simply
     release the fetch).
     """
     key = _normalize_key(key)
@@ -317,7 +358,7 @@ def _acquire(key: object, mode: str, wait_s: float | None) -> _RWLock:
             _locks[key] = lock
         _pins[key] = _pins.get(key, 0) + 1
     try:
-        lock.acquire(key, mode, wait_s, threading.get_ident())
+        waited_ms = lock.acquire(key, mode, wait_s, threading.get_ident())
     finally:
         with _registry_lock:
             remaining = _pins.get(key, 0) - 1
@@ -325,7 +366,14 @@ def _acquire(key: object, mode: str, wait_s: float | None) -> _RWLock:
                 _pins.pop(key, None)
             else:
                 _pins[key] = remaining
-    return lock
+    return lock, waited_ms
+
+
+def _feed_lock_wait(ms: int) -> None:
+    """Hand a measured lock wait to the active call's collector, if any."""
+    collector = timing.current()
+    if collector is not None:
+        collector.add_lock_wait(ms)
 
 
 @contextmanager
@@ -351,7 +399,17 @@ def vm_lock(key: object, mode: str = "write", wait_s: float | None = None) -> It
     # GC — feedback PRR-015), the finally must still release THIS thread's
     # records instead of silently wedging a phantom holder forever.
     tid = threading.get_ident()
-    lock = _acquire(key, mode, wait_s)
+    # The wait is fed immediately after _acquire resolves, on the acquiring
+    # thread and in the acquiring context — never in the generator's exit
+    # finally, which can run on another thread (feedback PRR-015) and would
+    # then attribute this wait to an unrelated call's collector. A VMBusy
+    # carries the wait on the exception, so a failed acquire is measured too.
+    try:
+        lock, waited_ms = _acquire(key, mode, wait_s)
+    except VMBusy as exc:
+        _feed_lock_wait(exc.waited_ms)
+        raise
+    _feed_lock_wait(waited_ms)
     try:
         yield
     finally:

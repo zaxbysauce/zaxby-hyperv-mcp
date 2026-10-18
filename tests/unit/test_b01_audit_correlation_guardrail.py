@@ -25,7 +25,7 @@ from hyperv_mcp.config import Config, ConfigError
 
 AUDIT_KEYS = {
     "ts", "tool", "vm_name", "category", "ok", "duration_ms", "exit_code",
-    "error_class", "agent_id", "request_id", "job_id", "relay_id",
+    "error_class", "agent_id", "request_id", "job_id", "relay_id", "timing",
 }
 
 
