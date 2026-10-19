@@ -83,6 +83,7 @@ import io
 import itertools
 import json
 import math
+import operator
 import os
 import re
 import time
@@ -764,6 +765,12 @@ class Frame(PILImage.Image):
     _encoded: bytes
     _mime: str
     _quality: int | None
+    # Ours, not PIL's: see `from_image` for why the memoisation flag cannot be
+    # keyed on a PIL attribute across the declared `pillow>=10.0` floor.
+    _raster_loaded: bool
+    # Pillow 10's pixel-access cache, which its `__init__` initialises and
+    # Pillow 12 removed. See `from_image`.
+    pyaccess: object | None
 
     @classmethod
     def from_image(
@@ -789,6 +796,19 @@ class Frame(PILImage.Image):
         frame.readonly = 0
         frame._exif = None
         frame._im = None
+        # Our OWN materialisation flag. Deliberately not derived from any PIL
+        # attribute: PIL moved the raster from the plain `im` attribute (10.x)
+        # to a property backed by `_im` (11+), so a guard keyed on either one
+        # is version-specific. On the declared floor `pillow>=10.0` a guard
+        # reading `_im` never fires, which re-decodes on every pixel access
+        # and silently discards mutations.
+        frame._raster_loaded = False
+        # Pillow 10's `putpixel` reads `self.pyaccess`, which its `__init__`
+        # sets to None; Pillow 12 dropped the attribute entirely. Building with
+        # `__new__` bypasses that initialiser, so supply it. An attribute a
+        # newer Pillow ignores is harmless; a missing one an older Pillow reads
+        # is an AttributeError.
+        frame.pyaccess = None
         return frame
 
     def load(self):
@@ -802,14 +822,24 @@ class Frame(PILImage.Image):
         produced it, so the pixels are identical to the ones the frame was
         built from.
         """
-        # `self.im` asserts `_im is not None`, so the guard reads the backing
-        # attribute directly.
-        if self._im is not None:
-            return self._im
-        img = PILImage.open(io.BytesIO(self._encoded))
-        img.load()
-        self.__dict__.update(img.__dict__)
-        return self._im
+        if not self._raster_loaded:
+            img = PILImage.open(io.BytesIO(self._encoded))
+            img.load()
+            # The construction-time `info` is the frame's own: `__dict__.update`
+            # would replace it wholesale with the decoder's, so a consumer
+            # reading `frame.info` before and after a pixel access would see two
+            # different dicts. Keep ours.
+            info = self.info
+            self.__dict__.update(img.__dict__)
+            self.info = info
+            self._raster_loaded = True
+        # Delegate the rest to PIL's own load(), which is idempotent and does
+        # the per-version bookkeeping this class must not reimplement: Pillow
+        # 10's `putpixel` reads `self.pyaccess`, which only `Image.load()` sets,
+        # and Pillow 11+ wraps `_im` in a property that asserts it is not None.
+        # Returning PIL's value also honours the documented
+        # `-> PixelAccess | None` contract, so `px = img.load(); px[x, y]` works.
+        return PILImage.Image.load(self)
 
     @classmethod
     def from_png(cls, png: bytes) -> Frame:
@@ -830,10 +860,18 @@ class Frame(PILImage.Image):
         # and must not hand back different bytes (bytes are immutable, so
         # sharing them is safe). A copy needs pixels, so the source is
         # materialised here if it was still lazy.
+        self.load()
         dup = Frame.__new__(Frame)
         dup.__dict__.update(self.__dict__)
-        self.load()
         dup.im = self.im.copy()
+        # `dup` now owns a real raster, so it is materialised in its own right.
+        dup._raster_loaded = True
+        # The copied dict carries the SOURCE's pixel-access cache, which is
+        # bound to the source's raster and would alias it. Reset it so PIL
+        # rebuilds one for the copy on its next access. Assigning None rather
+        # than deleting: Pillow 10's `putpixel` reads the attribute, so it must
+        # exist, and a newer Pillow that dropped it simply ignores it.
+        dup.pyaccess = None
         return dup
 
     def __reduce__(self):
@@ -907,6 +945,8 @@ def _rebuild_frame(encoded: bytes, mime: str, quality: int | None = None) -> Fra
     frame.readonly = 0
     frame._exif = None
     frame._im = None
+    frame._raster_loaded = False
+    frame.pyaccess = None
     return frame
 
 
@@ -1012,10 +1052,14 @@ def _changed_pixel_bytes(prev_raw: bytes | None, raw: bytes) -> int:
 
     Two costs are avoided. The equal-payload case — an idle console, which is
     the common one — is a single C-level `memcmp` with no Python loop at all.
-    When the payloads differ, the count is taken over fixed-size CHUNKS: the
-    per-chunk comparison is C-level and only the chunk boundaries are Python,
-    so the line-event count scales with `payload / chunk` rather than with the
-    payload. The number is unchanged.
+    When the payloads differ, the count is taken over fixed-size CHUNKS: an
+    unchanged chunk is skipped by a single C-level `==`, so only the chunks
+    that actually changed are walked. Inside a changed chunk the count uses
+    `sum(map(operator.ne, ...))`, which is C-level on both sides and executes
+    ZERO Python line events per byte — unlike the per-byte `zip` generator it
+    replaced, which cost one line event per byte. So a change confined to one
+    64 KiB chunk costs that chunk, and a change in every chunk costs the same
+    C-level walk a whole-payload comparison always did.
     """
     if prev_raw is None:
         return 0
@@ -1041,7 +1085,7 @@ def _changed_pixel_bytes(prev_raw: bytes | None, raw: bytes) -> int:
         piece_b = b[start:start + chunk]
         if piece_a == piece_b:
             continue
-        total += sum(1 for x, y in zip(piece_a, piece_b, strict=True) if x != y)
+        total += sum(map(operator.ne, piece_a, piece_b))
     return total
 
 
@@ -2239,7 +2283,7 @@ def _capture_sequence_wmi(
     width: int, height: int,
 ) -> dict:
     """capture_sequence over the in-process WMI backend, preserving the
-    per-frame bookkeeping contract (strict-zip changed-byte counts over
+    per-frame bookkeeping contract (exact changed-byte counts over
     equal-length pixel slices, first-and-last-only images)."""
     frames: list[dict] = []
     images: list = []

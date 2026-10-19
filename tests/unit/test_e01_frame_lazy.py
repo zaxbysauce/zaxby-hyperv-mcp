@@ -138,32 +138,97 @@ def test_untouched_frame_retains_only_the_encoding():
     img = console_mod._decode_rgb565_image(raw, 1024, 768)
     frame = console_mod.Frame.from_image(img, "image/png")
     del img
-    assert frame._im is None, (
-        f"AC1: an untouched frame must not materialise the {_RASTER}-byte "
-        f"raster. `_im` is set, so the decode's raster is retained for the "
-        f"frame's whole lifetime — which is the defect."
+    assert frame._raster_loaded is False, (
+        f"AC1: an untouched frame must not have materialised its raster. "
+        f"`_raster_loaded` is {frame._raster_loaded!r}, so the decode's raster "
+        f"is retained for the frame's whole lifetime — which is the defect."
     )
 
     # --- 2. retention ------------------------------------------------------
+    # The frame must HOLD the encoding (this is what stops a design that
+    # "fixed" the problem by holding nothing at all) and must hold no other
+    # buffer of consequence.
+    #
+    # An earlier version of this leg summed `len(encoded) + len(png)`, which is
+    # a tautology: `png` and `_png` are the SAME bytes object for a PNG frame,
+    # so the sum is `2 * len(encoded)` and the assertion reduced to
+    # `len(encoded) < 64 KiB` — a statement about PNG compressibility that no
+    # memory property could fail. Summing every buffer the frame actually owns
+    # keeps the claim meaningful without depending on PIL's attribute names,
+    # which moved between the 10.x and 11+ lines.
     png = len(frame.encoded)
-    retained = png + len(frame.png)
+    assert png > 0, "AC1: the frame must retain its encoding"
+    held = sum(
+        len(v) for v in vars(frame).values() if isinstance(v, (bytes, bytearray))
+    )
     ceiling = png + _CONSTANT
-    assert retained < ceiling, (
-        f"AC1: an untouched frame retains {retained} bytes, expected under "
-        f"{ceiling} (png {png} + {_CONSTANT} constant)"
+    assert held <= ceiling, (
+        f"AC1: an untouched frame holds {held} bytes of buffers, expected no "
+        f"more than {ceiling} (encoding {png} + {_CONSTANT} constant). A second "
+        f"copy of the raster stored as bytes would show up here."
     )
 
     # --- 3. measured -------------------------------------------------------
     hold_high = _child(_CHILD, str(_HIGH_N))
     touch_high = _child(_CHILD, str(_HIGH_N), "touch")
     materialise_cost = int(touch_high["rss"]) - int(hold_high["rss"])
-    print(f"png={png} retained={retained} ceiling={ceiling} "
+    print(f"png={png} held={held} ceiling={ceiling} "
           f"materialise_cost={materialise_cost} raster={_RASTER}")
     assert materialise_cost >= _RASTER, (
         f"positive control failed: materialising {_HIGH_N} frames costs only "
         f"{materialise_cost} bytes more than holding them, so this probe cannot "
         f"see the {_RASTER}-byte raster and the structural assertion above is "
         f"not corroborated by memory"
+    )
+
+
+def test_materialisation_is_a_real_cache_not_a_redecode():
+    """C1b / AC1: the raster is materialised ONCE, not re-decoded per access.
+
+    This is the leg that catches the version-specific memoisation bug. The
+    first implementation guarded on `self._im`, which is the property backing
+    only in Pillow 11+; on the declared `pillow>=10.0` floor the raster lives
+    in the plain attribute `im`, so the guard never fired, every pixel access
+    re-decoded from the pristine encoding, and every mutation was silently
+    discarded. `assert frame._im is None` cannot see that, because `_im` is
+    None forever on 10.x — which is why the guard is now our own
+    `_raster_loaded` flag and why this test asserts OBSERVABLE behaviour
+    (raster identity and mutation survival) rather than an attribute name.
+    """
+    raw = _payload(64, 48)
+    img = console_mod._decode_rgb565_image(raw, 64, 48)
+    frame = console_mod.Frame.from_image(img, "image/png")
+    del img
+
+    frame.getpixel((0, 0))                      # first materialisation
+    raster = frame.im
+    frame.getpixel((1, 1))                      # must NOT re-decode
+    assert frame.im is raster, (
+        "AC1: a second pixel access replaced the raster, so the frame is "
+        "re-decoding from its encoding on every access instead of caching "
+        "the materialised raster"
+    )
+
+    # A mutation must survive: if every access re-decodes from the encoding,
+    # the next read silently restores the original pixel.
+    before = frame.getpixel((1, 1))
+    frame.putpixel((1, 1), (before[0] ^ 0xFF, before[1], before[2]))
+    after = frame.getpixel((1, 1))
+    assert after != before, (
+        f"AC1: a putpixel mutation was silently discarded (read back "
+        f"{after!r} where something else was written at (1,1)). The raster is "
+        f"being re-decoded from the encoding on every access."
+    )
+
+    # And the re-save must differ from the frozen snapshot, which is the
+    # invariant the pre-existing d01 check pins.
+    import io
+
+    buf = io.BytesIO()
+    frame.save(buf, format="PNG")
+    assert buf.getvalue() != frame.png, (
+        "AC1: re-saving a mutated frame reproduced the original encoding "
+        "byte-for-byte, so the mutation never reached the raster"
     )
 
 

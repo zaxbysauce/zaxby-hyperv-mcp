@@ -14,9 +14,11 @@ neither Hyper-V nor a guest is touched, and the code under test is the shipped
 code rather than a reimplementation of it. The stub returns a fixed guest
 duration, which is exactly the number the relay currently discards.
 
-C8 (AC8, PRESERVING) is the existing `tests/unit/test_relay.py` suite: the
-latency summary must be additive, with `counters` keeping its meaning. It is
-replayed as its own acceptance row rather than duplicated here.
+C8 (AC8, PRESERVING) is the existing `tests/unit/test_relay.py` suite, which
+pins that `counters` keeps its meaning. The ADDITIVITY of the new `latency`
+key is asserted here, in `test_relay_status_reports_latency`, rather than in
+that file — an earlier version of this docstring pointed at `test_relay.py`
+for it, which contains no reference to latency at all.
 """
 from __future__ import annotations
 
@@ -33,6 +35,9 @@ from hyperv_mcp.config import Config
 
 _PROBE_GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
 _GUEST_MS = 37
+#: A sanity ceiling on the published cap, so a lying implementation cannot
+#: turn C9 into a multi-million-request loop. The real cap is 1024.
+_MAX_REASONABLE_CAP = 100_000
 
 
 class _Stub:
@@ -131,14 +136,12 @@ def _sample_count(latency: dict) -> int:
     sample in the status payload would grow the response without bound, which
     is the thing AC9 exists to prevent.
     """
-    for key in ("samples", "count", "n"):
-        value = latency.get(key)
-        if isinstance(value, int):
-            return value
-    raise AssertionError(
-        f"the latency summary must report how many samples it holds; got "
-        f"{json.dumps(latency, sort_keys=True)}"
-    )
+    if "samples" not in latency:
+        raise AssertionError(
+            f"the latency summary must report its sample count as 'samples'; "
+            f"got {sorted(latency)}"
+        )
+    return int(latency["samples"])
 
 
 def test_relay_records_request_latency():
@@ -150,15 +153,19 @@ def test_relay_records_request_latency():
         "duration and `relay_status` returns no latency companion"
     )
     count = _sample_count(latency)
-    assert count >= 3, (
-        f"C6: the latency store must carry the request samples; got "
+    assert count == 3, (
+        f"C6: the latency store must carry exactly one sample per completed "
+        f"request; got {count} for 3 requests: "
         f"{json.dumps(latency, sort_keys=True)}"
     )
-    # The stub's guest duration is _GUEST_MS; the recorded latencies must be in
-    # that neighbourhood, so a store that records a constant zero is caught.
-    assert latency.get("p50_ms"), (
-        f"C6: at least one recorded latency must be non-zero; got "
-        f"{json.dumps(latency, sort_keys=True)}"
+    # The stub's guest duration is _GUEST_MS and the summary is nearest-rank,
+    # so with three identical samples p50 must be EXACTLY that number. A store
+    # recording a constant, or host wall-clock, or anything but the guest leg's
+    # own duration, fails here. The earlier version asserted only that p50 was
+    # truthy, which a store of constant 1s satisfied.
+    assert latency.get("p50_ms") == _GUEST_MS, (
+        f"C6: p50 must be the guest leg's duration ({_GUEST_MS} ms), not some "
+        f"other clock; got {json.dumps(latency, sort_keys=True)}"
     )
 
 
@@ -208,7 +215,13 @@ def test_relay_status_reports_latency():
 
 
 def test_relay_latency_store_is_bounded():
-    """C9 / AC9: the store cannot grow without bound."""
+    """C9 / AC9: the store cannot grow without bound, and evicts oldest-first.
+
+    Two assertions, because the upper bound alone is satisfied by a store that
+    records NOTHING — which is precisely the failure the earlier one-sided
+    version of this check walked past. A mutation that made `_record_latency` a
+    no-op left C6 red but C7 and C9 green.
+    """
     row = _drive(3)
     latency = row["latency"]
     cap = latency.get("cap")
@@ -216,13 +229,21 @@ def test_relay_latency_store_is_bounded():
         f"the latency store must publish its bound; got {sorted(latency)}"
     )
     cap = int(cap)
+    # The bound is read from the summary, so it is capped here to keep a lying
+    # implementation from turning this check into a multi-million-request loop.
+    assert cap <= _MAX_REASONABLE_CAP, (
+        f"the published cap {cap} is implausibly large; refusing to drive "
+        f"{cap + 50} requests against it"
+    )
 
     # Push far past the bound through a fresh relay and re-read.
     over = _drive(cap + 50)
     count = _sample_count(over["latency"])
-    assert count <= cap, (
-        f"the latency store grew past its bound: {count} samples against a cap "
-        f"of {cap}"
+    assert count == cap, (
+        f"the latency store must fill to its bound and then evict: {count} "
+        f"samples against a cap of {cap} after {cap + 50} requests. A count "
+        f"below the cap means samples are being dropped or never recorded; a "
+        f"count above it means the ring is unbounded."
     )
 
 

@@ -38,11 +38,14 @@ _PREFIX_LEN = console_mod._PREFIX_LEN
 #:    fixed-size chunks, so a change confined to one chunk costs one chunk
 #:    rather than the whole payload.
 #:
-#: What is NOT claimed, because it is not achieved: a change in every chunk
-#: still costs O(payload). There is no stdlib C-level primitive that counts
-#: differing bytes between two byte strings, and numpy is not a dependency.
-#: That residual is disclosed in the trace and in the PR body rather than
-#: papered over with a threshold that happens to pass.
+#: What IS claimed about a change in every chunk: the chunks that did not
+#: change are skipped by a C-level `==`, and inside a changed chunk the count
+#: uses `sum(map(operator.ne, ...))`, which is C-level on both sides and runs
+#: ZERO Python line events per byte. So a fully-changing frame costs a single
+#: C-level walk rather than a Python loop — measured at 0 line events per byte
+#: against the 1.000168 the per-byte `zip` generator it replaced cost. The
+#: work is still O(payload) in wall-clock, which is inherent, but it is no
+#: longer a per-byte Python loop.
 _MAX_LINE_EVENTS_PER_BYTE = 100
 _MAX_IDLE_EVENTS = 100
 _MAX_SPARSE_EVENTS = 1_000_000
@@ -143,6 +146,35 @@ def test_diff_reports_zero_when_only_the_prefix_drifted():
     assert console_mod._changed_pixel_bytes(None, a) == 0, (
         "AC5 companion: the first frame has no predecessor, so it reports zero"
     )
+
+
+def test_diff_refuses_mismatched_payload_lengths():
+    """C5's second companion: the length guard is load-bearing, so it is pinned.
+
+    The base implementation got its length check for free from a whole-payload
+    `zip(..., strict=True)`. Chunking would otherwise let a trailing length
+    difference fall outside the last compared chunk and return a silent PREFIX
+    count — a wrong answer that looks like a plausible one. The explicit guard
+    exists to prevent exactly that, and until this check existed it had no test:
+    deleting it left the whole suite green.
+    """
+    a = _payload(64, 48)
+    longer = a + b"\x00"
+    shorter = a[:-1]
+    for label, other in (("longer", longer), ("shorter", shorter)):
+        try:
+            console_mod._changed_pixel_bytes(a, other)
+        except ValueError as exc:
+            assert "payload lengths differ" in str(exc), (
+                f"AC5 companion: the length guard's message should name the "
+                f"problem; got {exc!r}"
+            )
+        else:
+            raise AssertionError(
+                f"AC5 companion: a {label} payload must be refused, not "
+                f"silently prefix-counted. Deleting the guard would make this "
+                f"check fail."
+            )
 
 
 if __name__ == "__main__":

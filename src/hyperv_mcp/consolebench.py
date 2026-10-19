@@ -42,15 +42,22 @@ import json
 import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from . import config as config_mod
 
 
-def pct(values: list[float], q: float) -> float:
+def pct(values: Sequence[float], q: float) -> float:
     """Nearest-rank percentile: rank = max(1, ceil(q * n)) over the
-    ascending-sorted values; pct(values, q) == sorted(values)[rank - 1]."""
+    ascending-sorted values; pct(values, q) == sorted(values)[rank - 1].
+
+    `Sequence` rather than `list` because `list` is invariant: a
+    `list[int]` — which is what a millisecond counter naturally holds —
+    is not a `list[float]`, so a `list` annotation here forces every
+    caller to convert. `sorted()` works on any Sequence, so widening
+    costs nothing and `int` is promotable to `float`.
+    """
     if not values:
         raise ValueError("pct of an empty list")
     if not (0.0 <= q <= 1.0):
