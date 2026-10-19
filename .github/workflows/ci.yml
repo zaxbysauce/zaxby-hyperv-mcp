@@ -5,9 +5,20 @@ on:
     branches: [main]
   pull_request:
 
-# Cancel superseded runs on a PR; never cancel push-to-main runs. Non-PR
-# runs get a unique group (run_id): with a shared group, a newer queued
-# main push would still replace an older pending one.
+# Cancel an in-progress run when a NEW member joins the same group. For a
+# pull_request the group is the merge ref (refs/pull/<N>/merge), which carries
+# no head-SHA component, so every run attempt for a PR — for ANY commit — is
+# one group member and cancellation is ordered by ARRIVAL, not by commit
+# recency. That covers the intended case (pushing again supersedes the old
+# commit's run) and also means re-running an older commit's run cancels the
+# newer head run in flight; the newer run must then be re-run. That is the
+# trade the push-cancels-push behaviour requires, since a head-SHA-keyed group
+# would stop a new push from cancelling the old run at all.
+#
+# Never cancel push-to-main runs. Non-PR runs get a unique group (run_id): with
+# a shared group, a newer queued main push would still REPLACE an older pending
+# one (GitHub holds at most one pending run per group), which is what would
+# leave a middle commit untested.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

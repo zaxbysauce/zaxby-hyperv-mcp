@@ -1322,6 +1322,20 @@ pytest tests/integration
 CI (`.github/workflows/ci.yml`) runs ruff + mypy + unit tests on
 `windows-latest`; it does **not** validate real Hyper-V behavior.
 
+Two run-lifecycle behaviours worth knowing before reading a check run:
+
+- **Pushing again to an open PR cancels the earlier run.** The workflow's
+  `concurrency` group is the PR's merge ref, so a new member of the group
+  cancels whatever is in flight. The trade-off is that this is ordered by
+  *arrival*, not by commit recency: re-running an older commit's run also
+  cancels the newer head run, which then has to be re-run. Runs on `main`
+  are never cancelled and never replaced — each push gets its own group.
+- **A job fails at 15 minutes.** The longest successful job observed over
+  261 runs was 5.8 minutes, so 15 minutes is roughly 2.5x headroom. A
+  per-test `pytest-timeout` of 120 s already bounds a single hung test well
+  inside that, so the job timeout is a backstop rather than the first line
+  of defence.
+
 ---
 
 ## Security limitations
