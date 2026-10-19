@@ -83,22 +83,6 @@ def _count_events(a: bytes, b: bytes) -> int:
     return events[0]
 
 
-def _count_events(a: bytes, b: bytes) -> int:
-    events = [0]
-
-    def _tracer(frame, event, arg):
-        if event == "line":
-            events[0] += 1
-        return _tracer
-
-    sys.settrace(_tracer)
-    try:
-        console_mod._changed_pixel_bytes(a, b)
-    finally:
-        sys.settrace(None)
-    return events[0]
-
-
 def test_diff_cost_does_not_scale_with_the_payload():
     """C5 / AC5: the changed-byte diff must not run a per-byte Python loop.
 

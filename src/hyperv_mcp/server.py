@@ -2252,9 +2252,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
     @mcp.tool()
     def hyperv_relay_status(relay_id: str = "") -> dict:
-        """List relays (or one) with liveness and request counters.
+        """List relays (or one) with liveness, request counters and latency.
 
-        Returns: {ok, relays: [{relay_id, url, counters, stopped, ...}]}.
+        Returns: {ok, relays: [{relay_id, url, counters, stopped, latency,
+        ...}]}. `latency` is additive and reports the successful guest leg's
+        duration as {cap, samples, p50_ms, p95_ms}; it is null until a request
+        has completed.
         """
         return _run_guest_tool(
             "hyperv_relay_status", "", "relay",
