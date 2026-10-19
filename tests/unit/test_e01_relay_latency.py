@@ -86,26 +86,42 @@ def _drive(requests: int, guest_ms: int = _GUEST_MS) -> dict:
             cfg, vm_name="probe-vm", guest_port=9999, cred=cred,
         )
         relay_id = started["relay_id"]
-        target = started["url"] + "/json/version"
-        port = started["host_port"]
         try:
-            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-            try:
-                for _ in range(requests):
-                    conn.request("GET", target.split(str(port), 1)[1])
-                    resp = conn.getresponse()
-                    resp.read()
-                    assert resp.status == 200, (
-                        f"probe request failed: {resp.status}"
-                    )
-            finally:
-                conn.close()
-            return relay_mod.relay_status(cfg, relay_id)["relays"][0]
+            return _status_after(cfg, relay_id, requests, started["url"],
+                                 started["host_port"])
         finally:
             try:
                 relay_mod.relay_stop(cfg, relay_id)
             except Exception:
                 pass
+
+
+def _status_after(cfg, relay_id: str, requests: int, url: str, port: int) -> dict:
+    """Push `requests` through a started relay, then read its status row."""
+    target = url + "/json/version"
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        for _ in range(requests):
+            conn.request("GET", target.split(str(port), 1)[1])
+            resp = conn.getresponse()
+            resp.read()
+            assert resp.status == 200, (
+                f"probe request failed: {resp.status}"
+            )
+    finally:
+        conn.close()
+    return relay_mod.relay_status(cfg, relay_id)["relays"][0]
+
+
+def _fresh_relay():
+    """Start a relay with NO request pushed through it yet."""
+    cfg = Config(unrestricted=True)
+    cred = creds.CredentialSet(username="probe", password="probe-pass")
+    with _Stub():
+        started = relay_mod.relay_start(
+            cfg, vm_name="probe-vm", guest_port=9999, cred=cred,
+        )
+    return cfg, started["relay_id"], started["url"], started["host_port"]
 
 
 def _sample_count(latency: dict) -> int:
@@ -163,6 +179,28 @@ def test_relay_status_reports_latency():
     assert row["counters"].get("requests") == 5, (
         f"counters must keep their meaning; got {row['counters']}"
     )
+    # A relay that has served NOTHING reports null percentiles, not zeros, so
+    # "no requests yet" is distinguishable from "requests were instantaneous".
+    # Every other check in this file drives requests first, so without this
+    # assertion the empty branch is unpinned: a probe that replaced the nulls
+    # with 0 left the whole suite green.
+    cfg, fresh_id, _url, _port = _fresh_relay()
+    try:
+        empty = relay_mod.relay_status(cfg, fresh_id)["relays"][0]["latency"]
+        for key in ("p50_ms", "p95_ms", "p99_ms"):
+            assert empty.get(key) is None, (
+                f"an un-driven relay must report null {key}, not "
+                f"{empty.get(key)!r}; got {json.dumps(empty, sort_keys=True)}"
+            )
+        assert _sample_count(empty) == 0, (
+            f"an un-driven relay must hold no samples; got "
+            f"{json.dumps(empty, sort_keys=True)}"
+        )
+    finally:
+        try:
+            relay_mod.relay_stop(cfg, fresh_id)
+        except Exception:
+            pass
 
 
 def test_relay_latency_store_is_bounded():
