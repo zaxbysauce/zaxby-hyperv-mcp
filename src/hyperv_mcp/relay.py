@@ -260,14 +260,23 @@ class _RelayHandler(BaseHTTPRequestHandler):
             self.context["counters"][key] += amount
 
     def _record_request(self, ok: bool, duration_ms: int) -> None:
-        """Record one COMPLETED request: its outcome counter and its latency.
+        """Record one COMPLETED guest leg: its outcome counter and its latency.
 
-        Every request that reached the guest leg is recorded, whichever way the
-        leg ended — a guest 404/500, a transport failure and a PS Direct timeout
-        all contribute a sample. Recording only the successes would leave p95
-        and p99 structurally blind to exactly the slow tail issue #88 was opened
-        to expose, and would let `latency.samples` disagree with
-        `counters.requests` whenever `counters.errors` is non-zero.
+        Every leg that RAN is recorded, whichever way it ended — a guest
+        404/500, a transport failure and a PS Direct timeout all contribute a
+        sample. Recording only the successes would leave p95 and p99
+        structurally blind to exactly the slow tail issue #88 was opened to
+        expose.
+
+        `counters.requests` is bumped before the listener guards, so a request
+        rejected at the guard — a missing or wrong secret (401), a
+        non-path-absolute target (400), a bad Content-Length (400), an
+        oversized body (413) or a relay stopped mid-flight (503) — is counted
+        but contributes NO sample, because no guest leg ran and there is no
+        duration to attribute. So `latency.samples` counts guest-leg attempts,
+        not requests: it equals `counters.requests` only when nothing was
+        rejected at the guard, and it is bounded by `counters.ok +
+        counters.errors` in general.
 
         The counter and the sample are updated under ONE lock acquisition, so a
         `relay_status` snapshot taken between them cannot observe the counter
