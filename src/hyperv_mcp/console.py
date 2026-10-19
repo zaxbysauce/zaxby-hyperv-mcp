@@ -1021,6 +1021,15 @@ def _changed_pixel_bytes(prev_raw: bytes | None, raw: bytes) -> int:
         return 0
     a = prev_raw[_PREFIX_LEN:]
     b = raw[_PREFIX_LEN:]
+    if len(a) != len(b):
+        # The base implementation got this for free from a whole-payload
+        # `zip(..., strict=True)`; chunking would otherwise let a trailing
+        # length difference fall outside the last compared chunk and return a
+        # silent prefix count. Both transports length-validate every frame
+        # against the same fixed per-sequence dimensions, so this guards the
+        # contract rather than a reachable path — but a silent 0 for mismatched
+        # payloads is worse than a loud failure.
+        raise ValueError(f"payload lengths differ: {len(a)} vs {len(b)}")
     if a == b:
         return 0
     # A chunk that divides evenly into the common frame sizes; 64 KiB keeps the
