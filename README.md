@@ -1032,7 +1032,7 @@ Direct only.
 | Tool | Parameters | Returns |
 |------|-----------|---------|
 | `hyperv_relay_start` | `vm_name` or `vm_id`, `guest_port`, `host_port=0` (ephemeral) | `{ok, relay_id, url, host_port, ...}` |
-| `hyperv_relay_status` | `relay_id?` | `{ok, relays[{relay_id, url, counters, stopped, ...}]}` |
+| `hyperv_relay_status` | `relay_id?` | `{ok, relays[{relay_id, url, counters, latency, stopped, ...}]}` |
 | `hyperv_relay_stop` | `relay_id` | `{ok, relay_id, host_port, stopped}` |
 
 A loopback-only host listener (127.0.0.1; non-loopback binds are refused)
@@ -1090,6 +1090,18 @@ transcript or audit row cannot be guessed either. Guest-side HTTP error statuses
 guest 404 arrives as 404 with the relay error envelope); a request racing
 `hyperv_relay_stop` receives a clean 503 relay-stopped envelope.
 
+**Per-request latency.** Each successful request's guest-leg elapsed time is
+recorded in a per-relay ring of the last 1024 samples, and `relay_status`
+returns a `latency` summary beside the unchanged `counters`:
+`{cap, samples, p50_ms, p95_ms, p99_ms}`. An empty store reports null
+percentiles rather than zeros, so "no requests yet" is distinguishable from
+"requests were instantaneous". Percentiles are nearest-rank, reusing
+`consolebench.pct` so the relay and the soak benchmark cannot drift. The ring
+is bounded structurally (`deque(maxlen=...)`), so a long-lived relay cannot
+grow it. The relay's per-request legs run outside any `auditlog.operation`,
+which is why this store exists at all: issue #20's per-call `timing` object
+reaches every tool's audit row but never the relay path.
+
 ### Evidence Capture (0.3.0)
 
 | Tool | Parameters | Returns |
@@ -1135,7 +1147,7 @@ unchanged result is exactly as informative about the request as a changed one.
 | `hyperv_console_wait_frame_change` | `vm_name` or `vm_id`, `baseline_hash=""`, `width=640`, `height=480`, `timeout_s=60`, `interval_s=2` | list[ImageContent(image/png), TextContent({stop_reason: changed\|deadline, polls, elapsed_ms, frame_hash, hash_domain})] or deadline dict |
 | `hyperv_console_capture_sequence` | `vm_name` or `vm_id`, `count=3`, `interval_s=2`, `width=640`, `height=480` | [first Image, last Image (a single Image when count==1), meta_text(frames[] with per-frame hash + changed_bytes_vs_previous)] |
 
-Console notes: text rides the stdin channel (never in argv/script/errors); non-ASCII input must use type_scancodes; mouse coordinates are in the space of the observed image — pass `frame_width`/`frame_height` matching your screenshot dimensions to scale to head space, or omit them to use head coordinates directly; `wait_frame_change` with `baseline_hash=""` treats the first polled frame as the baseline, and a returned `frame_hash` can be passed back as `baseline_hash` to detect changes across calls (both are the full lowercase-hex sha256 of the PIXEL payload, i.e. the thumbnail bytes after the 4-byte opaque prefix — see the 0.4.0 breaking change above; the tool also returns `hash_domain` so a client can refuse a baseline recorded in a different domain); `capture_sequence`'s `changed_bytes_vs_previous` counts PIXEL bytes, the same domain `frame_hash` covers; WinPE errors and wizard screens are returned as images for visual interpretation (no OCR is performed).
+Console notes: text rides the stdin channel (never in argv/script/errors); non-ASCII input must use type_scancodes; mouse coordinates are in the space of the observed image — pass `frame_width`/`frame_height` matching your screenshot dimensions to scale to head space, or omit them to use head coordinates directly; `wait_frame_change` with `baseline_hash=""` treats the first polled frame as the baseline, and a returned `frame_hash` can be passed back as `baseline_hash` to detect changes across calls (both are the full lowercase-hex sha256 of the PIXEL payload, i.e. the thumbnail bytes after the 4-byte opaque prefix — see the 0.4.0 breaking change above; the tool also returns `hash_domain` so a client can refuse a baseline recorded in a different domain); `capture_sequence`'s `changed_bytes_vs_previous` counts PIXEL bytes, the same domain `frame_hash` covers (an idle console costs one C-level comparison rather than a per-byte walk, and a change confined to one 64 KiB chunk costs that chunk rather than the whole payload — a change in EVERY chunk walks those chunks, but with `sum(map(operator.ne, ...))` the per-byte work is C-level and executes no Python line events at all, so the cost is a single C walk rather than a Python loop); a returned `console.Frame` holds only its encoding until something reads a pixel — the raster is derived from the encoding on first pixel access and cached from then on, so an untouched frame retains no `width*height*3` buffer, and a mutation made after the first access survives; WinPE errors and wizard screens are returned as images for visual interpretation (no OCR is performed).
 
 #### Console transport: in-process WMI or PowerShell (issue #45)
 

@@ -83,6 +83,7 @@ import io
 import itertools
 import json
 import math
+import operator
 import os
 import re
 import time
@@ -741,21 +742,20 @@ class Frame(PILImage.Image):
     webp — and `png` remains the PNG-only view, read-only, available only when
     the frame IS a PNG.
 
-    A frame IS a `PIL.Image.Image`, not a wrapper around one: it is built by
-    copying the decoded image's state onto this class, so `isinstance` checks,
-    the context-manager protocol, numpy interop and every read method behave
-    exactly as they did on the return value this replaced. `png` is read-only —
-    reassigning it is refused — and is the encoding of the frame's own pixels,
-    so a caller that mutates the image and then re-saves it gets different
-    bytes, which is what the frame-invariant tests pin.
+    A frame IS a `PIL.Image.Image`, not a wrapper around one: `isinstance`
+    checks, the context-manager protocol, numpy interop and every read method
+    behave exactly as they did on the return value this replaced. `png` is
+    read-only — reassigning it is refused — and is the encoding of the frame's
+    own pixels, so a caller that mutates the image and then re-saves it gets
+    different bytes, which is what the frame-invariant tests pin.
 
-    Memory: because `"BGR;16"` is not one of Pillow's mappable raw modes, the
-    decode materialises a `width*height*3` raster, and a frame retains it
-    alongside its encoding for the frame's lifetime. That is a bounded increase
-    over the lazy `PILImage.open` this replaced — dimensions are clamped to
-    160..4096 at every entry point and at most two frames are retained per
-    `capture_sequence`, so the worst case is roughly 50 MB per held frame at the
-    ceiling. Making the raster lazy is tracked separately.
+    Memory: the RASTER is derived from the encoding on the first pixel access
+    (see `load`), so an untouched frame retains only the encoded bytes plus the
+    handful of scalars PIL needs. Until something reads a pixel, no
+    `width*height*3` buffer exists. Dimensions are still clamped to 160..4096
+    at every entry point and at most two frames are retained per
+    `capture_sequence`, so the worst case after materialisation is roughly
+    50 MB per held frame at the ceiling.
 
     Build one with `Frame.from_image`, not by calling the constructor: the
     class deliberately does not override `PIL.Image.Image.__init__`.
@@ -765,19 +765,81 @@ class Frame(PILImage.Image):
     _encoded: bytes
     _mime: str
     _quality: int | None
+    # Ours, not PIL's: see `from_image` for why the memoisation flag cannot be
+    # keyed on a PIL attribute across the declared `pillow>=10.0` floor.
+    _raster_loaded: bool
+    # Pillow 10's pixel-access cache, which its `__init__` initialises and
+    # Pillow 12 removed. See `from_image`.
+    pyaccess: object | None
 
     @classmethod
     def from_image(
         cls, img: PILImage.Image, mime: str = "image/png", quality: int | None = None
     ) -> Frame:
-        """Wrap an already-decoded image, encoding it exactly once."""
+        """Wrap an already-decoded image, encoding it exactly once.
+
+        Only the ENCODING is retained. The decoded `img` is read for the
+        handful of scalars PIL needs before any pixel access (`mode`, `size`,
+        `info`, `palette`) — none of which touch the raster — and is then
+        released by the caller. The raster comes back from the encoding when
+        `load()` runs.
+        """
         frame = cls.__new__(cls)
-        frame.__dict__.update(img.__dict__)
         frame._encoded = _encode(img, mime, quality)
         frame._mime = mime
         frame._png = frame._encoded if mime == "image/png" else b""
         frame._quality = quality
+        frame._mode = img.mode
+        frame._size = img.size
+        frame.palette = img.palette
+        frame.info = dict(img.info)
+        frame.readonly = 0
+        frame._exif = None
+        frame._im = None
+        # Our OWN materialisation flag. Deliberately not derived from any PIL
+        # attribute: PIL moved the raster from the plain `im` attribute (10.x)
+        # to a property backed by `_im` (11+), so a guard keyed on either one
+        # is version-specific. On the declared floor `pillow>=10.0` a guard
+        # reading `_im` never fires, which re-decodes on every pixel access
+        # and silently discards mutations.
+        frame._raster_loaded = False
+        # Pillow 10's `putpixel` reads `self.pyaccess`, which its `__init__`
+        # sets to None; Pillow 12 dropped the attribute entirely. Building with
+        # `__new__` bypasses that initialiser, so supply it. An attribute a
+        # newer Pillow ignores is harmless; a missing one an older Pillow reads
+        # is an AttributeError.
+        frame.pyaccess = None
         return frame
+
+    def load(self):
+        """Materialise the raster from the encoding, exactly once.
+
+        PIL calls `load()` before every pixel access — `getpixel`, `tobytes`,
+        `save`, `resize`, `crop`, `convert`, the numpy protocol — so overriding
+        it is the single place the raster comes into being, and no other part
+        of the class has to know it was ever lazy. The encoding is decoded by
+        Pillow's own loader for the format, which is the same decoder that
+        produced it, so the pixels are identical to the ones the frame was
+        built from.
+        """
+        if not self._raster_loaded:
+            img = PILImage.open(io.BytesIO(self._encoded))
+            img.load()
+            # The construction-time `info` is the frame's own: `__dict__.update`
+            # would replace it wholesale with the decoder's, so a consumer
+            # reading `frame.info` before and after a pixel access would see two
+            # different dicts. Keep ours.
+            info = self.info
+            self.__dict__.update(img.__dict__)
+            self.info = info
+            self._raster_loaded = True
+        # Delegate the rest to PIL's own load(), which is idempotent and does
+        # the per-version bookkeeping this class must not reimplement: Pillow
+        # 10's `putpixel` reads `self.pyaccess`, which only `Image.load()` sets,
+        # and Pillow 11+ wraps `_im` in a property that asserts it is not None.
+        # Returning PIL's value also honours the documented
+        # `-> PixelAccess | None` contract, so `px = img.load(); px[x, y]` works.
+        return PILImage.Image.load(self)
 
     @classmethod
     def from_png(cls, png: bytes) -> Frame:
@@ -796,11 +858,20 @@ class Frame(PILImage.Image):
         # both the class and the encoding. Clone the raster and carry the
         # SAME encoding bytes across: a copy must not spend a second encode
         # and must not hand back different bytes (bytes are immutable, so
-        # sharing them is safe).
+        # sharing them is safe). A copy needs pixels, so the source is
+        # materialised here if it was still lazy.
+        self.load()
         dup = Frame.__new__(Frame)
         dup.__dict__.update(self.__dict__)
-        self.load()
         dup.im = self.im.copy()
+        # `dup` now owns a real raster, so it is materialised in its own right.
+        dup._raster_loaded = True
+        # The copied dict carries the SOURCE's pixel-access cache, which is
+        # bound to the source's raster and would alias it. Reset it so PIL
+        # rebuilds one for the copy on its next access. Assigning None rather
+        # than deleting: Pillow 10's `putpixel` reads the attribute, so it must
+        # exist, and a newer Pillow that dropped it simply ignores it.
+        dup.pyaccess = None
         return dup
 
     def __reduce__(self):
@@ -854,22 +925,28 @@ class Frame(PILImage.Image):
 def _rebuild_frame(encoded: bytes, mime: str, quality: int | None = None) -> Frame:
     """Module-level rebuild target so a Frame pickles in its own format.
 
-    The encoding is decoded to recover a raster, but the encoding itself is
-    KEPT VERBATIM and becomes the frame's single encoding: a deepcopy or
-    pickle of a frame must not spend a second encode and must not hand back
-    different bytes. `quality` rides along so the rebuilt frame still knows
-    what it was made with. The image is loaded before its state is copied
-    onto the Frame, because a lazily-opened image's tile decoding depends on
-    its original subclass's `load_read`.
+    The encoding is KEPT VERBATIM and becomes the frame's single encoding: a
+    deepcopy or pickle of a frame must not spend a second encode and must not
+    hand back different bytes. `quality` rides along so the rebuilt frame still
+    knows what it was made with. The frame stays LAZY — `mode`/`size` are read
+    from the encoding's header, which Pillow parses without decoding, so a
+    pickled-and-restored frame costs no raster either.
     """
     img = PILImage.open(io.BytesIO(encoded))
-    img.load()
     frame = Frame.__new__(Frame)
-    frame.__dict__.update(img.__dict__)
     frame._encoded = encoded
     frame._mime = mime
     frame._png = encoded if mime == "image/png" else b""
     frame._quality = quality
+    frame._mode = img.mode
+    frame._size = img.size
+    frame.palette = img.palette
+    frame.info = dict(img.info)
+    frame.readonly = 0
+    frame._exif = None
+    frame._im = None
+    frame._raster_loaded = False
+    frame.pyaccess = None
     return frame
 
 
@@ -972,14 +1049,44 @@ def _changed_pixel_bytes(prev_raw: bytes | None, raw: bytes) -> int:
     entry that disagree on exactly the prefix-drift input the pixel-only hash
     exists to handle — an identical `frame_hash` alongside a nonzero byte
     count, which reads as a contradiction to whoever is interpreting it.
+
+    Two costs are avoided. The equal-payload case — an idle console, which is
+    the common one — is a single C-level `memcmp` with no Python loop at all.
+    When the payloads differ, the count is taken over fixed-size CHUNKS: an
+    unchanged chunk is skipped by a single C-level `==`, so only the chunks
+    that actually changed are walked. Inside a changed chunk the count uses
+    `sum(map(operator.ne, ...))`, which is C-level on both sides and executes
+    ZERO Python line events per byte — unlike the per-byte `zip` generator it
+    replaced, which cost one line event per byte. So a change confined to one
+    64 KiB chunk costs that chunk, and a change in every chunk costs the same
+    C-level walk a whole-payload comparison always did.
     """
     if prev_raw is None:
         return 0
-    return sum(
-        1
-        for a, b in zip(prev_raw[_PREFIX_LEN:], raw[_PREFIX_LEN:], strict=True)
-        if a != b
-    )
+    a = prev_raw[_PREFIX_LEN:]
+    b = raw[_PREFIX_LEN:]
+    if len(a) != len(b):
+        # The base implementation got this for free from a whole-payload
+        # `zip(..., strict=True)`; chunking would otherwise let a trailing
+        # length difference fall outside the last compared chunk and return a
+        # silent prefix count. Both transports length-validate every frame
+        # against the same fixed per-sequence dimensions, so this guards the
+        # contract rather than a reachable path — but a silent 0 for mismatched
+        # payloads is worse than a loud failure.
+        raise ValueError(f"payload lengths differ: {len(a)} vs {len(b)}")
+    if a == b:
+        return 0
+    # A chunk that divides evenly into the common frame sizes; 64 KiB keeps the
+    # slice objects small and the boundary count negligible.
+    chunk = 65536
+    total = 0
+    for start in range(0, len(a), chunk):
+        piece_a = a[start:start + chunk]
+        piece_b = b[start:start + chunk]
+        if piece_a == piece_b:
+            continue
+        total += sum(map(operator.ne, piece_a, piece_b))
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -2176,7 +2283,7 @@ def _capture_sequence_wmi(
     width: int, height: int,
 ) -> dict:
     """capture_sequence over the in-process WMI backend, preserving the
-    per-frame bookkeeping contract (strict-zip changed-byte counts over
+    per-frame bookkeeping contract (exact changed-byte counts over
     equal-length pixel slices, first-and-last-only images)."""
     frames: list[dict] = []
     images: list = []
