@@ -50,11 +50,12 @@ import base64
 import json
 import secrets
 import threading
+from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from . import policy, pswindows, vmident
+from . import consolebench, policy, pswindows, vmident
 from .config import Config
 from .credentials import CredentialSet
 from .diagnostics import build_guest_script
@@ -127,6 +128,23 @@ def _new_counters() -> dict[str, int]:
         "requests": 0, "ok": 0, "errors": 0,
         "bytes_in": 0, "bytes_out": 0,
     }
+
+
+#: How many request latencies a relay keeps. A fixed-capacity ring, so a
+#: long-lived relay cannot grow the store without bound: `deque(maxlen=...)`
+#: evicts the oldest sample on append, which makes the bound structural rather
+#: than a check that could drift from the implementation.
+_LATENCY_CAP = 1024
+
+
+def _new_latency() -> dict[str, Any]:
+    """A relay's per-request latency store and the lock that guards it.
+
+    The store is a bounded ring of the guest leg's elapsed milliseconds. It is
+    guarded by the SAME lock the counters already use, so no new lock is
+    introduced and the lock ordering is unchanged.
+    """
+    return {"samples": deque(maxlen=_LATENCY_CAP), "cap": _LATENCY_CAP}
 
 
 # -- per-request PS Direct leg ------------------------------------------------
@@ -203,9 +221,13 @@ def _run_forward(cfg, script: str, cred: CredentialSet) -> dict:
         return {"error": "guest request timed out", "status": 0}
     try:
         pswindows.check_result(result)
-        return json.loads(result.stdout.strip() or "{}")
+        payload = json.loads(result.stdout.strip() or "{}")
     except Exception as exc:
         return {"error": pswindows.redact(str(exc)), "status": 0}
+    # The elapsed time rides along so the handler can attribute it to this
+    # relay. It is deliberately NOT part of the payload the caller sees.
+    payload["_duration_ms"] = int(result.duration_ms)
+    return payload
 
 
 # -- HTTP listener -------------------------------------------------------------
@@ -227,6 +249,18 @@ class _RelayHandler(BaseHTTPRequestHandler):
     def _bump(self, key: str, amount: int = 1) -> None:
         with self.context["counter_lock"]:
             self.context["counters"][key] += amount
+
+    def _record_latency(self, duration_ms: int) -> None:
+        """Record one request's guest-leg latency.
+
+        The duration is `PSResult.duration_ms`, which the guest leg already
+        computes and which issue #20's collector already reads everywhere else
+        — the relay was the one path that discarded it, because its per-request
+        legs run outside any `auditlog.operation`. The lock is the counters'
+        own, so the two stay consistent.
+        """
+        with self.context["counter_lock"]:
+            self.context["latency"]["samples"].append(int(duration_ms))
 
     def _reply(
         self, status: int, payload: bytes, content_type: str, *, close: bool = False,
@@ -367,6 +401,7 @@ class _RelayHandler(BaseHTTPRequestHandler):
             )
             return
         self._bump("ok")
+        self._record_latency(int(outcome.get("_duration_ms") or 0))
         payload = base64.b64decode(outcome.get("body_b64") or "")
         self._bump("bytes_out", len(payload))
         self._reply(
@@ -502,6 +537,7 @@ def relay_start(
             "cred": cred,
             "secret": secret,
             "counters": _new_counters(),
+            "latency": _new_latency(),
             "counter_lock": threading.Lock(),
         }
         handler = type("BoundRelayHandler", (_RelayHandler,), {"context": context})
@@ -601,6 +637,7 @@ def relay_status(cfg: Config, relay_id: str = "", *, owner: str | None = None) -
     for entry in selected:
         with entry["context"]["counter_lock"]:
             counters = dict(entry["context"]["counters"])
+            latency = _latency_summary(entry["context"]["latency"])
         rows.append({
             "relay_id": entry["relay_id"],
             "vm_name": entry["vm_name"],
@@ -612,8 +649,38 @@ def relay_status(cfg: Config, relay_id: str = "", *, owner: str | None = None) -
             "stopped": bool(entry["stopped"]),
             "thread_alive": bool(entry["thread"].is_alive()),
             "counters": counters,
+            # Additive: the existing `counters` contract is unchanged, exactly
+            # as issue #20's `timing` object was additive to the audit record.
+            "latency": latency,
         })
     return {"ok": True, "relays": rows}
+
+
+def _latency_summary(store: dict[str, Any]) -> dict[str, Any]:
+    """Percentiles over a relay's recorded request latencies.
+
+    Nearest-rank, reusing `consolebench.pct` so the relay and the soak
+    benchmark cannot drift on what a percentile means. An empty store reports
+    nulls rather than zeros, so "no requests yet" is distinguishable from
+    "requests were instantaneous".
+    """
+    # The caller already holds the relay's counter_lock (relay_status reads
+    # the counters under it), so the snapshot is taken without re-acquiring:
+    # `list(deque)` is atomic with respect to appends under the GIL, and
+    # re-acquiring a non-reentrant Lock here would deadlock.
+    samples = list(store["samples"])
+    if not samples:
+        return {
+            "cap": store["cap"], "samples": 0,
+            "p50_ms": None, "p95_ms": None, "p99_ms": None,
+        }
+    return {
+        "cap": store["cap"],
+        "samples": len(samples),
+        "p50_ms": consolebench.pct(samples, 0.50),
+        "p95_ms": consolebench.pct(samples, 0.95),
+        "p99_ms": consolebench.pct(samples, 0.99),
+    }
 
 
 def relay_stop(cfg: Config, relay_id: str, *, owner: str | None = None) -> dict:
