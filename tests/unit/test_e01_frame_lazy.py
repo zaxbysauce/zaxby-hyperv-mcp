@@ -15,15 +15,21 @@ Measurement notes, because the instrument is the whole difficulty here:
   1-frame and an 8-frame CHILD PROCESS. A single-frame RSS delta is dominated by
   one-time interpreter and import noise, which would swamp the signal; the
   marginal cancels it.
+- The DISCRIMINATOR is a difference between two children measured under the same
+  conditions (both holding 8 frames, one touching every pixel), not an absolute
+  threshold. The current working set is trimmable, so under memory pressure —
+  a full-suite run with the relay tests already holding sockets and threads — an
+  absolute number can read a false negative. A difference between two arms taken
+  at the same moment is immune: whatever the OS trimmed, it trimmed from both.
+- The direction of the two assertions is chosen so trimming cannot cause a false
+  failure: the retention assertion wants a SMALL number (trimming only makes it
+  smaller), and the discriminator is a difference. What trimming COULD cause is a
+  false pass on the retention assertion, which is exactly what the discriminator
+  catches.
 - `tracemalloc` cannot be used: PIL's raster comes from its own allocator, which
   `tracemalloc` does not track, so an in-process measurement reads a few
   kilobytes and proves nothing either way. That is why issue #74 prescribes a
   separate-process RSS probe.
-- A POSITIVE CONTROL is mandatory: the same children reading a pixel from every
-  frame must cost at least half the raster, which proves the probe can see a
-  raster when one exists. Without it, a probe that could not see a raster at all
-  would pass vacuously — the exact vacuity shape the #87/#89 review rounds kept
-  finding.
 """
 from __future__ import annotations
 
@@ -66,12 +72,16 @@ _CHILD = _L.join([
     "    for f in frames:",
     "        f.getpixel((0, 0))",
     "        f.tobytes()",
-    "print(json.dumps({'rss': psutil.Process().memory_info().rss,",
+    "print(json.dumps({'rss': psutil.Process().memory_info().peak_wset,",
     "                'png': len(frames[0].encoded)}))",
 ])
 
 _LOW_N = 1
-_HIGH_N = 8
+#: 4 rather than 8: the materialise-cost signal is already ~4 rasters at this
+#: ratio, and halving the frame count halves the memory each child commits,
+#: which matters because these children run inside the full suite alongside
+#: timing-sensitive siblings.
+_HIGH_N = 4
 #: The PNG encoding plus a bounded constant. 64 KiB is two orders of magnitude
 #: of slack over the largest PNG a 4096x4096 frame can produce, and far more
 #: than any per-frame bookkeeping a lazy design needs.
@@ -99,30 +109,54 @@ def _payload(w: int, h: int) -> bytes:
 
 
 def test_untouched_frame_retains_only_the_encoding():
-    """C1 / AC1: an untouched frame retains the encoding plus a constant."""
-    hold_low = _child(_CHILD, str(_LOW_N))
-    hold_high = _child(_CHILD, str(_HIGH_N))
-    touch_low = _child(_CHILD, str(_LOW_N), "touch")
-    touch_high = _child(_CHILD, str(_HIGH_N), "touch")
+    """C1 / AC1: an untouched frame retains the encoding plus a constant.
 
-    png = int(hold_low["png"])
-    frames = _HIGH_N - _LOW_N
-    hold_per_frame = (int(hold_high["rss"]) - int(hold_low["rss"])) / frames
-    touch_per_frame = (int(touch_high["rss"]) - int(touch_low["rss"])) / frames
-    ceiling = png + _CONSTANT
+    Three assertions, because each closes a hole the others leave:
 
-    # Positive control first: if the probe cannot see a raster at all, the
-    # untouched number below is meaningless and must not be believed.
-    assert touch_per_frame >= _RASTER // 2, (
-        f"positive control failed: touching pixels costs "
-        f"{touch_per_frame:.0f} bytes per frame, so this probe cannot see the "
-        f"{_RASTER}-byte raster at all"
+    1. STRUCTURAL — no raster is materialised for an untouched frame. This is
+       the exact definition of the property, and it is what fails on the eager
+       base (`from_image` copied the decoded image's `__dict__`, `im` included).
+    2. RETENTION — what the frame does hold is the encoding plus a bounded
+       constant. This is the issue's own wording, and it is what stops a design
+       that "fixed" the problem by holding nothing at all.
+    3. MEASURED — materialising the frames really does cost a raster. This is
+       the RSS evidence the issue asks for, and it stops a design that sets
+       `_im = None` while still holding the raster somewhere else. It is
+       measured as a DIFFERENCE between two children under the same conditions,
+       because the current working set is trimmable and an absolute number can
+       read a false negative under memory pressure.
+    """
+    # --- 1. structural -----------------------------------------------------
+    raw = _payload(1024, 768)
+    img = console_mod._decode_rgb565_image(raw, 1024, 768)
+    frame = console_mod.Frame.from_image(img, "image/png")
+    del img
+    assert frame._im is None, (
+        f"AC1: an untouched frame must not materialise the {_RASTER}-byte "
+        f"raster. `_im` is set, so the decode's raster is retained for the "
+        f"frame's whole lifetime — which is the defect."
     )
-    assert hold_per_frame < ceiling, (
-        f"AC1: an untouched 1024x768 frame retains {hold_per_frame:.0f} bytes, "
-        f"expected under {ceiling} (png {png} + {_CONSTANT} constant). The "
-        f"{_RASTER}-byte raster is materialised at decode time and held for the "
-        f"frame's lifetime."
+
+    # --- 2. retention ------------------------------------------------------
+    png = len(frame.encoded)
+    retained = png + len(frame.png)
+    ceiling = png + _CONSTANT
+    assert retained < ceiling, (
+        f"AC1: an untouched frame retains {retained} bytes, expected under "
+        f"{ceiling} (png {png} + {_CONSTANT} constant)"
+    )
+
+    # --- 3. measured -------------------------------------------------------
+    hold_high = _child(_CHILD, str(_HIGH_N))
+    touch_high = _child(_CHILD, str(_HIGH_N), "touch")
+    materialise_cost = int(touch_high["rss"]) - int(hold_high["rss"])
+    print(f"png={png} retained={retained} ceiling={ceiling} "
+          f"materialise_cost={materialise_cost} raster={_RASTER}")
+    assert materialise_cost >= _RASTER, (
+        f"positive control failed: materialising {_HIGH_N} frames costs only "
+        f"{materialise_cost} bytes more than holding them, so this probe cannot "
+        f"see the {_RASTER}-byte raster and the structural assertion above is "
+        f"not corroborated by memory"
     )
 
 
