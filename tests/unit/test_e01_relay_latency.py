@@ -188,9 +188,13 @@ def test_relay_status_reports_latency():
     try:
         empty = relay_mod.relay_status(cfg, fresh_id)["relays"][0]["latency"]
         for key in ("p50_ms", "p95_ms", "p99_ms"):
-            assert empty.get(key) is None, (
+            assert key in empty, (
+                f"an un-driven relay must still report {key}; got "
+                f"{sorted(empty)}"
+            )
+            assert empty[key] is None, (
                 f"an un-driven relay must report null {key}, not "
-                f"{empty.get(key)!r}; got {json.dumps(empty, sort_keys=True)}"
+                f"{empty[key]!r}; got {json.dumps(empty, sort_keys=True)}"
             )
         assert _sample_count(empty) == 0, (
             f"an un-driven relay must hold no samples; got "

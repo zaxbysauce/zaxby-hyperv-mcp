@@ -119,12 +119,19 @@ def test_untouched_frame_retains_only_the_encoding():
     2. RETENTION — what the frame does hold is the encoding plus a bounded
        constant. This is the issue's own wording, and it is what stops a design
        that "fixed" the problem by holding nothing at all.
-    3. MEASURED — materialising the frames really does cost a raster. This is
-       the RSS evidence the issue asks for, and it stops a design that sets
-       `_im = None` while still holding the raster somewhere else. It is
-       measured as a DIFFERENCE between two children under the same conditions,
-       because the current working set is trimmable and an absolute number can
-       read a false negative under memory pressure.
+    3. MEASURED — materialising the frames really does cost a raster, as a
+       DIFFERENCE between two children under the same conditions, because the
+       current working set is trimmable and an absolute number can read a false
+       negative under memory pressure. This is a POSITIVE CONTROL that the
+       instrument can see a raster at all: it rules out a measurement rig so
+       blind that every leg would read zero and the other two assertions would
+       be carried by nothing. It does NOT discriminate a design that hides the
+       raster behind `_im = None` while still holding it off-frame — a stash in
+       a module global keeps the frame's own RSS low, and the `tobytes()`
+       transient in the touching arm alone exceeds one raster, so such a design
+       measures about 1.35x and passes. The eager case is carried by the
+       STRUCTURAL leg; off-frame process retention is a different defect class
+       and no leg here claims to catch it.
     """
     # --- 1. structural -----------------------------------------------------
     raw = _payload(1024, 768)
