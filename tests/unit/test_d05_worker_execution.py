@@ -51,6 +51,42 @@ def test_open_handshake_arrives_before_any_request(worker):
     assert worker.is_alive()
 
 
+def test_the_inner_script_crosses_as_base64(worker):
+    """PRR-001: the request frame carries the inner guest script as BASE64.
+
+    The shipped guest scriptblock decodes its `$enc` parameter with
+    `[Convert]::FromBase64String`, so a raw frame makes every pooled guest call
+    fail — and it failed the way that looks like success: `exit_code=0` with
+    empty stdout, because the worker's own catch answered on the guest's behalf.
+    No mocked test could see it; every pooled test drives a `FakeWorker` that
+    never inspects the frame.
+
+    The placeholder loop applies the SAME decode to `$req.script` that
+    `_worker_loop` applies, so this pins the contract end to end: the live
+    worker accepts the frame `run()` builds and refuses a raw one.
+    """
+    result = worker.run("Write-Output 'kept verbatim'", timeout_ms=30000)
+    assert result.timed_out is False, result
+    assert result.returncode == 0, (
+        f"the live worker refused the frame run() built; the inner script is "
+        f"not crossing as base64: {result}"
+    )
+
+    # And at the framing boundary itself, the script survives the round trip.
+    inner = "Write-Output 'verbatim: $x'"
+    frame = json.dumps({
+        "script": pswindows.pswindows_b64(inner),
+        "expect_epoch": None,
+        "elevated": False,
+    })
+    wire = base64.b64encode(frame.encode("utf-8")).decode("ascii")
+    decoded = json.loads(base64.b64decode(wire.strip()).decode("utf-8", "replace"))
+    assert base64.b64decode(decoded["script"]).decode("utf-8") == inner, (
+        "the inner script did not survive the frame round trip; the guest "
+        "scriptblock would receive something other than the caller's script"
+    )
+
+
 def test_request_frame_round_trips_as_json(worker):
     """A base64 JSON request frame on stdin produces a base64 JSON response
     frame on stdout that decodes to the per-call wrapper shape."""
@@ -125,17 +161,17 @@ def test_an_arbitrary_frame_still_gets_a_well_formed_answer(worker):
     keeps serving: a frame that is not base64 JSON must not desynchronise the
     stream or kill the worker for the next caller.
 
-    Scope, stated honestly: the no-credential placeholder loop answers every
-    frame with a canned success, so this pins the framing contract (one line in,
-    one decodable line out, worker survives) rather than the real loop's
-    `phase = 'frame'` validation branch, which is only reachable with a live
-    guest session.
+    Scope: the no-credential placeholder loop answers a BAD frame with the same
+    `ok=false, phase='frame'` the real loop answers (PRR-079 aligned them), so
+    this pins that branch too. What it cannot reach is the real loop's
+    session-state and boot-epoch guards, which need a live guest session.
     """
     bad = base64.b64encode(b"not json at all").decode("ascii")
     worker._proc.stdin.write((bad + "\n").encode("ascii"))
     worker._proc.stdin.flush()
     line = worker._lines.get(timeout=30)
     payload = json.loads(base64.b64decode(line.strip()).decode("utf-8"))
-    assert isinstance(payload, dict) and "ok" in payload, payload
+    assert payload.get("ok") is False, payload
+    assert payload.get("phase") == "frame", payload
     result = worker.run("Write-Output still-alive", timeout_ms=30000)
     assert result.returncode == 0, result

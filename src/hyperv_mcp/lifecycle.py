@@ -263,8 +263,30 @@ def _invalidate_sessions(vm_guid: str, reason: str) -> int:
     A module-attribute lookup (`psdsessions.invalidate_vm`) rather than an
     import-time binding, so a test that patches the module attribute is
     observed, and so this stays a no-op when no pool is installed.
+
+    The reason is recorded in the audit log as its own row, so an operator can
+    see WHY a session was dropped rather than having to infer it from the tool
+    row. The row carries no script text, no credential and no key.
     """
-    return psdsessions.invalidate_vm(vm_guid, reason)
+    closed = psdsessions.invalidate_vm(vm_guid, reason)
+    try:
+        from . import auditlog
+
+        # The reason rides in the tool name's suffix rather than a free-text
+        # field, because `log_operation`'s record shape is fixed and a new
+        # column would be a schema change this PR does not need.
+        auditlog.log_operation(
+            tool=f"hyperv_session_invalidate:{reason}",
+            vm_name=vm_guid,
+            category="guest",
+            ok=True,
+            duration_ms=0,
+            exit_code=None,
+            error_class="",
+        )
+    except Exception:
+        pass  # the audit sink must never fail the lifecycle action
+    return closed
 
 
 def start_vm(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
@@ -435,6 +457,7 @@ Remove-VMSnapshot -Name {cn} -VM (Get-VM -Id $vmTarget -ErrorAction Stop) {subtr
 """
         result = _run(cfg, script, timeout_s=300)
         pswindows.check_result(result, f"hyperv_checkpoint_remove({vm_name or vm_id})")
+        _invalidate_sessions(ref.id, "checkpoint_remove")
         return {"status": "removed", "vm_name": ref.name, "checkpoint_name": checkpoint_name}
 
 
@@ -533,6 +556,8 @@ Invoke-Command -VMId $vmTarget -Credential $cred -ScriptBlock {{ & 'shutdown.exe
             )
             pswindows.check_result(rr, f"hyperv_configure_kdnet reboot({vm_name or vm_id})")
             rebooting = True
+            # The guest is rebooting: every pooled session for it is now stale.
+            _invalidate_sessions(ref.id, "kdnet_reboot")
 
         return {
             "status": "configured",
@@ -618,6 +643,8 @@ Invoke-Command -VMId $vmTarget -Credential $cred -ScriptBlock {{ & 'shutdown.exe
             )
             pswindows.check_result(rr, f"hyperv_configure_kdcom reboot({vm_name or vm_id})")
             rebooting = True
+            # The guest is rebooting: every pooled session for it is now stale.
+            _invalidate_sessions(ref.id, "kdcom_reboot")
 
         return {
             "status": "configured",

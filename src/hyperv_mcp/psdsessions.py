@@ -64,6 +64,13 @@ DEFAULT_MAX_SESSIONS = 4
 #: caller passes ``wait_s=0`` — i.e. immediately.
 POLL_INTERVAL_S = 0.02
 
+#: How long ``invalidate_vm`` waits for a spawn that is already past the
+#: invalidation check to finish, so the scan sees its entry. Bounded because
+#: the invalidation callers run under the VM write lock, which the guest legs
+#: that would be spawning cannot hold, so a wait here means something is already
+#: wrong and the invalidation must still complete.
+INVALIDATE_DRAIN_S = 5.0
+
 #: Process-local secret keying the credential-profile fingerprint. Generated
 #: once per process with ``os.urandom`` and never persisted, so the same
 #: credential yields a different string in a different process. That is the
@@ -87,9 +94,9 @@ class SessionKey(NamedTuple):
     ``agent_id`` is the authenticated bearer-token ``client_id``
     (``auditlog.current_agent_id``) and is ``None`` on the paths that carry no
     identity — plain stdio, ``--standalone`` and ``--allow-anonymous``.
-    README.md:1078-1080 documents that in those modes all callers form one
-    local principal, so ``None`` is one legitimate bucket rather than a
-    blocker.
+    The session-reuse section's agent-id bullet in README.md documents that in
+    those modes all callers form one local principal, so ``None`` is one
+    legitimate bucket rather than a blocker.
 
     ``boot_epoch`` is whatever the caller can say about the guest's current
     boot; ``None`` means "not tracked", and live detection then falls to the
@@ -190,6 +197,16 @@ class SessionPool:
         self._gates: dict[SessionKey, threading.Lock] = {}
         self._closed = False
         self._reaper: _Reaper | None = None
+        #: Normalized VM GUIDs with a close batch in flight. `acquire` will not
+        #: CREATE a session for a GUID in this set: the close removed the entry,
+        #: so a create landing in that window would produce a session that
+        #: escapes the close — which is exactly what `invalidate_vm` promises
+        #: cannot happen. The caller waits for the batch to drain instead.
+        self._invalidating: set[str] = set()
+        #: Normalized VM GUID -> number of spawns in flight for that VM. An
+        #: invalidation drains these before it scans, so a session opened
+        #: concurrently with it is closed by it rather than surviving it.
+        self._creating: dict[str, int] = {}
         self.invalidated = 0
         self.evicted = 0
         self.reaped = 0
@@ -197,9 +214,12 @@ class SessionPool:
     def start_reaper(self) -> None:
         """Start the idle-TTL reaper. Idempotent; the server-shutdown path stops
         it through `close_all`."""
-        if self._reaper is None and not self._closed:
-            self._reaper = _Reaper(self, self._idle_ttl_s / 4.0)
-            self._reaper.start()
+        with self._mu:
+            if self._reaper is not None or self._closed:
+                return
+            reaper = _Reaper(self, self._idle_ttl_s / 4.0)
+            self._reaper = reaper
+        reaper.start()
 
     # -- acquisition -------------------------------------------------------
 
@@ -219,6 +239,11 @@ class SessionPool:
 
         Returns the worker. The caller MUST pass it to :meth:`release` (or
         :meth:`discard`) in a ``finally``.
+
+        A missing session is CREATED, so a failure to spawn propagates to the
+        caller instead of being retried for the whole bounded wait — retrying a
+        spawn that cannot succeed would only burn the wait. The wait covers one
+        case only: every session for this key is checked out.
         """
         key = _as_key(key)
         deadline = self._clock() + max(0.0, float(wait_s))
@@ -231,11 +256,39 @@ class SessionPool:
                     entry.in_use = True
                     entry.last_used = self._clock()
                     return entry.worker
-                gate = self._gates.setdefault(key, threading.Lock()) if entry is None else None
+                # Only take the create path when nothing is closing this VM's
+                # sessions: see `_invalidating`.
+                gate = (
+                    self._gates.setdefault(key, threading.Lock())
+                    if entry is None and _norm_guid(key.vm_guid) not in self._invalidating
+                    else None
+                )
             if gate is not None:
+                # A failure to CREATE is fatal for this call, not a reason to
+                # wait: retrying it would burn the whole bounded wait on a spawn
+                # that cannot succeed, and the caller's per-call fallback is the
+                # correct response.
                 with gate:
                     worker = self._create_locked(key, cred)
                     if worker is not None:
+                        # A close for this VM may have landed while the factory
+                        # ran. Re-check under the lock so a session the pool has
+                        # already invalidated is never handed out.
+                        with self._mu:
+                            held = self._entries.get(key)
+                            escaped = (
+                                held
+                                if held is not None
+                                and held.worker is worker
+                                and held.doomed
+                                else None
+                            )
+                        if escaped is not None:
+                            self._close_entries([escaped])
+                            raise SessionBusy(
+                                f"the session for {key!r} was invalidated "
+                                f"while it was being opened"
+                            )
                         return worker
                     # Another thread created it while we held the gate and it
                     # is checked out; fall through to the bounded wait.
@@ -250,41 +303,116 @@ class SessionPool:
         """Create the worker for ``key``, or return None if it now exists and is
         checked out. Runs with the per-key gate held and ``_mu`` released for
         the spawn itself."""
-        with self._mu:
-            entry = self._entries.get(key)
-            if entry is not None and not entry.doomed:
-                if entry.in_use:
-                    return None
-                entry.in_use = True
-                entry.last_used = self._clock()
-                return entry.worker
-            self._close_stale_epochs(key)
-            self._evict_for_capacity()
-            script, stdin_b64 = establishment_script(key, cred)
-            opened_at = self._clock()
-        worker = self._factory(key, script, stdin_b64)
-        open_ms = int((self._clock() - opened_at) * 1000)
-        with self._mu:
-            self._gates.pop(key, None)
-            if self._closed:
-                # Closed while we were spawning: do not strand the child.
-                _close_quietly(worker)
-                raise SessionBusy("the session pool is closed")
-            fresh = _Entry(key, worker, open_ms)
-            fresh.in_use = True
-            fresh.last_used = self._clock()
-            self._entries[key] = fresh
-        return worker
+        try:
+            victims: list[_Entry] = []
+            try:
+                with self._mu:
+                    entry = self._entries.get(key)
+                    if entry is not None and not entry.doomed:
+                        if entry.in_use:
+                            return None
+                        entry.in_use = True
+                        entry.last_used = self._clock()
+                        return entry.worker
+                    victims += self._retire_victims(key)
+                    victims += self._stale_epoch_victims(key)
+                    victims += self._capacity_victims()
+                    script, stdin_b64 = establishment_script(key, cred)
+                    opened_at = self._clock()
+                    guid = _norm_guid(key.vm_guid)
+                    self._creating[guid] = self._creating.get(guid, 0) + 1
+            except BaseException:
+                # `_capacity_victims` raises when the pool is full and every
+                # session is in use. By then the retire and stale-epoch
+                # collectors have ALREADY marked their entries doomed, and
+                # nothing else will ever close them: `reap` skips doomed,
+                # `acquire` skips doomed, and `release` only closes the entry
+                # for the worker being returned. Left marked-but-open they would
+                # hold a host-wide slot and a live session with a decrypted
+                # credential for the life of the process — and with
+                # `max_sessions == 1` they would wedge the pool permanently.
+                # `_mu` is released by the time this runs, so the close is safe.
+                if victims:
+                    self._close_entries(victims)
+                raise
+            try:
+                if victims:
+                    self._close_entries(victims)
+                worker = self._factory(key, script, stdin_b64)
+            finally:
+                with self._mu:
+                    left = self._creating.get(guid, 1) - 1
+                    if left > 0:
+                        self._creating[guid] = left
+                    else:
+                        self._creating.pop(guid, None)
+            open_ms = int((self._clock() - opened_at) * 1000)
+            with self._mu:
+                if self._closed:
+                    # Closed while we were spawning: do not strand the child.
+                    _close_quietly(worker)
+                    raise SessionBusy("the session pool is closed")
+                # An invalidation for this VM that landed while the spawn ran
+                # must not be escaped by the session it just produced.
+                if guid in self._invalidating:
+                    _close_quietly(worker)
+                    raise SessionBusy(
+                        f"the session for {key!r} was invalidated while it was "
+                        f"being opened"
+                    )
+                # The cap is re-checked AFTER the spawn, because the factory ran
+                # with `_mu` released and concurrent acquires for other keys may
+                # have filled the table in the meantime.
+                if len(self._entries) >= self.max_sessions:
+                    _close_quietly(worker)
+                    raise SessionBusy(
+                        f"the session pool reached its cap of {self.max_sessions} "
+                        f"while opening a session"
+                    )
+                fresh = _Entry(key, worker, open_ms)
+                fresh.in_use = True
+                fresh.last_used = self._clock()
+                self._entries[key] = fresh
+                return worker
+        finally:
+            # The gate is removed on EVERY exit, not just the success path: a
+            # raise here would otherwise leak one `threading.Lock` per distinct
+            # key for the life of the process.
+            with self._mu:
+                self._gates.pop(key, None)
 
-    def _close_stale_epochs(self, key: SessionKey) -> None:
-        """Close sessions for the same VM, credential profile and agent whose
-        boot epoch no longer matches ``key``.
+    def _retire_victims(self, key: SessionKey) -> list[_Entry]:
+        """Sessions for the same VM and agent whose CREDENTIAL PROFILE no longer
+        matches ``key``, marked doomed.
+
+        A rotated password produces a different key, so without this the worker
+        holding the retired credential — and an authenticated PSSession opened
+        with it — survives until the idle TTL or cap eviction. Caller holds
+        ``_mu``; the returned entries are closed by :meth:`_close_entries`
+        outside it.
+        """
+        victims = [
+            e for e in self._entries.values()
+            if (e.key.vm_guid, e.key.agent_id)
+            == (key.vm_guid, key.agent_id)
+            and e.key.cred_profile != key.cred_profile
+            and not e.in_use
+            and not e.doomed
+        ]
+        for entry in victims:
+            entry.doomed = True
+        return victims
+
+    def _stale_epoch_victims(self, key: SessionKey) -> list[_Entry]:
+        """Sessions for the same VM, credential profile and agent whose BOOT
+        EPOCH no longer matches ``key``, marked doomed.
 
         A guest reboot breaks the underlying VMBus session, so a session opened
         under an older epoch must never be handed out again. Caller holds
-        ``_mu``; the closes happen outside it.
+        ``_mu``; the returned entries are closed by :meth:`_close_entries`
+        outside it.
         """
-        stale = [
+        victims = [
             e for e in self._entries.values()
             if (e.key.vm_guid, e.key.cred_profile, e.key.agent_id)
             == (key.vm_guid, key.cred_profile, key.agent_id)
@@ -292,26 +420,36 @@ class SessionPool:
             and not e.in_use
             and not e.doomed
         ]
-        self._close_entries(stale)
+        for entry in victims:
+            entry.doomed = True
+        return victims
 
-    def _evict_for_capacity(self) -> None:
-        """Make room for one more session by closing the least recently used
-        IDLE entries. In-use entries are never evicted; when every entry is in
-        use the caller gets SessionBusy. Caller holds ``_mu``; the closes happen
-        outside it."""
-        while len(self._entries) >= self.max_sessions:
+    def _capacity_victims(self) -> list[_Entry]:
+        """Enough least-recently-used IDLE entries to make room for one more,
+        marked doomed. In-use entries are never evicted; when every entry is in
+        use the caller gets SessionBusy. Caller holds ``_mu``; the returned
+        entries are closed by :meth:`_close_entries` outside it."""
+        victims: list[_Entry] = []
+        while len(self._entries) - len(victims) >= self.max_sessions:
             victim = min(
-                (e for e in self._entries.values() if not e.in_use and not e.doomed),
+                (
+                    e for e in self._entries.values()
+                    if not e.in_use and not e.doomed and e not in victims
+                ),
                 key=lambda e: e.last_used,
                 default=None,
             )
             if victim is None:
-                raise SessionBusy(
-                    f"the session pool is at its cap of {self.max_sessions} and "
-                    f"every session is in use"
-                )
-            self._close_entries([victim])
-            self.evicted += 1
+                if not victims:
+                    raise SessionBusy(
+                        f"the session pool is at its cap of {self.max_sessions} and "
+                        f"every session is in use"
+                    )
+                break
+            victim.doomed = True
+            victims.append(victim)
+        self.evicted += len(victims)
+        return victims
 
     # -- release -----------------------------------------------------------
 
@@ -319,7 +457,10 @@ class SessionPool:
         """Return a checked-out session to the pool.
 
         A session whose worker died underneath it (closed by something other
-        than the pool) is dropped rather than handed out again.
+        than the pool) is dropped rather than handed out again, as is one that
+        was doomed while it was checked out. Such an entry is doomed HERE, under
+        the lock, before the slow close: an entry that is merely not-in-use
+        would be handed to another caller between the release and the close.
         """
         worker = session
         with self._mu:
@@ -329,18 +470,30 @@ class SessionPool:
             entry.in_use = False
             entry.last_used = self._clock()
             if entry.doomed or _worker_is_dead(worker):
-                self._close_entries([entry])
+                entry.doomed = True
+                victims = [entry]
+            else:
+                victims = []
+        if victims:
+            self._close_entries(victims)
 
     def discard(self, session: Any) -> None:
         """Drop a checked-out session without returning it: the worker failed,
-        timed out, or its guest session broke. Closes the worker now."""
+        timed out, or its guest session broke. Closes the worker now.
+
+        A worker with no table entry was already closed by whoever removed it,
+        so this must NOT close it again — `PooledWorker.close` releases the
+        host-wide slot, and a second release on a recycled fd would close an
+        unrelated worker's slot.
+        """
         worker = session
         with self._mu:
             entry = next((e for e in self._entries.values() if e.worker is worker), None)
             if entry is None:
-                _close_quietly(worker)
                 return
-            self._close_entries([entry])
+            entry.doomed = True
+            victims = [entry]
+        self._close_entries(victims)
 
     # -- invalidation ------------------------------------------------------
 
@@ -348,62 +501,122 @@ class SessionPool:
         """Close every session for ``vm_guid`` — all agents, all credential
         profiles — and leave other VMs' sessions alone.
 
-        A session that is checked out at invalidation time is marked doomed
-        rather than killed mid-pipeline: killing a worker while a caller is
-        inside its script would corrupt that caller's result. The lifecycle
-        operations that call this hold the VM's write lock, and guest legs hold
-        the read lock, so in practice nothing for that GUID is checked out.
+        A session that is checked out at invalidation time is marked DOOMED and
+        closed at its release, never killed mid-pipeline: killing a worker while
+        a caller is inside its script would corrupt that caller's result. The
+        lifecycle operations that call this hold the VM's write lock, and guest
+        legs hold the read lock, so in practice nothing for that GUID is checked
+        out — but the guarantee does not rest on that.
+
+        The close is marked in `_invalidating` for its duration and in-flight
+        spawns for this GUID are drained first, so an ``acquire`` racing it
+        either waits or has its freshly opened session closed by this call —
+        never hands a caller a session this invalidation was meant to kill.
         """
-        guid = (vm_guid or "").strip().lower()
+        guid = _norm_guid(vm_guid)
         with self._mu:
-            victims = [e for e in self._entries.values() if e.key.vm_guid == guid]
-            for entry in self._entries.values():
-                if entry.key.vm_guid == guid:
+            self._invalidating.add(guid)
+        try:
+            # A spawn already past the `_invalidating` check is finishing right
+            # now; wait for it so the scan below sees its entry.
+            #
+            # This drain is a SECOND line of defence, not the guarantee. The
+            # lifecycle callers hold the VM write lock while the guest legs hold
+            # the read lock, so a spawn for this GUID cannot be in flight when
+            # they call — that discipline is what actually closes the window.
+            # If it is ever broken, a spawn that slips past the drain is still
+            # caught by the insert-time re-check in `_create_locked`, so the
+            # session is closed rather than handed out; only the `invalidated`
+            # accounting can under-count.
+            deadline = self._clock() + INVALIDATE_DRAIN_S
+            while True:
+                with self._mu:
+                    if not self._creating.get(guid):
+                        break
+                if self._clock() >= deadline:
+                    break
+                time.sleep(POLL_INTERVAL_S)
+            with self._mu:
+                victims = []
+                for entry in self._entries.values():
+                    if _norm_guid(entry.key.vm_guid) != guid:
+                        continue
                     entry.doomed = True
+                    if not entry.in_use:
+                        victims.append(entry)
             self._close_entries(victims)
-            self.invalidated += len(victims)
+            with self._mu:
+                self.invalidated += len(victims)
             return len(victims)
+        finally:
+            with self._mu:
+                self._invalidating.discard(guid)
 
     def reap(self) -> int:
         """Close sessions idle longer than ``idle_ttl_s``. In-use sessions are
         never reaped — an idle clock is only meaningful for a released one."""
+        if self._closed:
+            return 0
         now = self._clock()
         with self._mu:
             victims = [
                 e for e in self._entries.values()
                 if not e.in_use and not e.doomed and (now - e.last_used) > self._idle_ttl_s
             ]
-            self._close_entries(victims)
+            for entry in victims:
+                # Doomed here, under the lock, so a concurrent acquire cannot
+                # take one out between the snapshot and the close.
+                entry.doomed = True
+        self._close_entries(victims)
+        with self._mu:
             self.reaped += len(victims)
-            return len(victims)
+        return len(victims)
 
     def close_all(self) -> int:
-        """Close every session, in use or not. The server-shutdown path."""
-        reaper = getattr(self, "_reaper", None)
-        if reaper is not None:
-            reaper.stop()
+        """Close every session, in use or not. The server-shutdown path.
+
+        `_closed` is set and the reaper captured under ONE hold of `_mu`, so a
+        `start_reaper` interleaving here sees the closed flag and installs
+        nothing: the check-then-act cannot leave a thread running against a pool
+        nothing can reach. The reaper OBJECT is kept (stopped, not discarded) so
+        a caller can still observe that its thread really ended.
+        """
         with self._mu:
             self._closed = True
+            reaper = self._reaper
             victims = list(self._entries.values())
-            self._close_entries(victims)
             self._gates.clear()
-            return len(victims)
+        if reaper is not None:
+            reaper.stop()
+        self._close_entries(victims)
+        return len(victims)
 
     def _close_entries(self, victims: list[_Entry]) -> None:
-        """Remove ``victims`` from the table and close their workers. The caller
-        holds ``_mu``; closing happens after it is released so a slow kill never
-        stalls an unrelated key."""
+        """Remove ``victims`` from the table and close their workers.
+
+        Must be called WITHOUT ``_mu`` held. The entries are removed under a
+        short hold of the lock and the slow closes happen entirely OUTSIDE it,
+        so a slow kill never stalls unrelated keys. Every affected VM GUID is
+        added to `_invalidating` for the duration, which is what stops a
+        concurrent ``acquire`` from finding no entry and opening a session that
+        escapes this close — the window that matters most for
+        :meth:`invalidate_vm`, whose contract is that no session for that VM
+        survives it.
+        """
         if not victims:
             return
-        for entry in victims:
-            self._entries.pop(entry.key, None)
-        workers = [e.worker for e in victims]
-        self._mu.release()
+        guids = {_norm_guid(e.key.vm_guid) for e in victims}
+        with self._mu:
+            for entry in victims:
+                self._entries.pop(entry.key, None)
+            workers = [e.worker for e in victims]
+            self._invalidating |= guids
         try:
             for worker in workers:
                 _close_quietly(worker)
         finally:
-            self._mu.acquire()
+            with self._mu:
+                self._invalidating -= guids
 
     # -- introspection -----------------------------------------------------
 
@@ -490,21 +703,44 @@ def default_pool() -> SessionPool | None:
     return DEFAULT
 
 
+#: The spawn function the default pool uses. `None` means "resolve
+#: :func:`pswindows.spawn_worker` lazily". It is a module global rather than a
+#: direct reference so a test can replace it: `server.bootstrap` installs the
+#: default pool, and a unit test that stubs `pswindows.run_ps` but reaches
+#: `bootstrap` would otherwise spawn a REAL host `powershell.exe` on its next
+#: guest call and hang on `New-PSSession`.
+_spawn_worker = None
+
+
+def set_worker_spawn(fn) -> None:
+    """Replace the spawn function the default pool uses.
+
+    The same test-seam shape `relay.clear_registry_for_tests` and
+    `guestjobs.clear_registry_for_tests` use: a module the server initialises
+    exposes the one seam a test needs to keep it hermetic.
+    """
+    global _spawn_worker
+    _spawn_worker = fn
+
+
 def _default_worker_factory(key: Any, script: str, stdin_b64: str | None) -> Any:
-    """The pool's worker_factory over :func:`pswindows.spawn_worker`.
+    """The pool's worker_factory over the spawn seam.
 
     The pool calls the factory with the key FIRST so a factory can record what
     it opened a worker for (the frozen checks rely on that); the transport itself
     needs only the script and the credential line.
     """
-    from . import pswindows
+    spawn = _spawn_worker
+    if spawn is None:
+        from . import pswindows
 
-    return pswindows.spawn_worker(script, stdin_b64)
+        spawn = pswindows.spawn_worker
+    return spawn(script, stdin_b64)
 
 
 def install_default_pool(cfg: Any) -> SessionPool | None:
     """Install the default pool from ``cfg``, or leave ``DEFAULT`` unset when
-    reuse is off.
+    reuse is off or the mode is remote.
 
     The session cap is derived from the host PowerShell cap with reserved
     headroom: every pooled worker holds one host-wide slot
@@ -512,21 +748,44 @@ def install_default_pool(cfg: Any) -> SessionPool | None:
     ``max_sessions == max_host_powershell`` would let a saturated idle pool
     consume every slot and leave the per-call legs — the ``vmident.resolve``
     leg on every guest call, every lifecycle action, ``wait_guest_recovery`` —
-    with nothing to run on. Two slots of headroom is enough for those legs to
-    fail fast with the retryable busy envelope instead of blocking for
-    ``host_powershell_wait_s``.
+    with nothing to run on. Two slots of headroom is what leaves those legs able
+    to run instead of queueing for ``host_powershell_wait_s``. At a cap of 2 or
+    less there is no headroom to reserve, so the pool is not installed at all:
+    a one-session pool at a cap of 2 would let a single idle worker hold the
+    host's last slot for the whole idle TTL, and every per-call leg would
+    busy-fail after ``host_powershell_wait_s`` instead of running.
+
+    A pool this call replaces is CLOSED, not orphaned: an orphan keeps its
+    workers holding host-wide slots and its reaper thread running against a pool
+    nothing can reach.
     """
     global DEFAULT
-    if not getattr(cfg, "psdirect_session_reuse", False):
+    # The same default `_pooled_pool` reads. An attribute-missing cfg means
+    # "not configured", which is the schema default — reuse ON — not off.
+    if not getattr(cfg, "psdirect_session_reuse", True):
+        return None
+    from . import pswindows
+
+    # Remote mode never pools (AC17): a worker would have to be spawned on the
+    # remote host through a second transport. Installing one anyway would leave
+    # a live reaper thread and a pool object nothing uses.
+    if pswindows.hyperv_host(cfg):
         return None
     cap = int(getattr(cfg, "max_host_powershell", 8) or 8)
+    if cap <= 2:
+        # No headroom can be reserved at this cap, so a pooled worker could hold
+        # the host's last slot and starve every per-call leg.
+        return None
+    previous = DEFAULT
     pool = SessionPool(
         _default_worker_factory,
         idle_ttl_s=DEFAULT_IDLE_TTL_S,
-        max_sessions=max(1, cap - 2),
+        max_sessions=cap - 2,
     )
     pool.start_reaper()
     DEFAULT = pool
+    if previous is not None and previous is not pool:
+        previous.close_all()
     return pool
 
 
@@ -749,9 +1008,15 @@ def _placeholder_loop() -> str:
     """The loop used when no credential is supplied — the unit-test shape.
 
     It reads no credential line, because `establishment_script` passes no stdin
-    payload in that case, and answers every request with an empty successful
-    guest result. Kept as a function so the shipped ReadLine census attributes
-    its one read to this name rather than to `_worker_loop`.
+    payload in that case, and answers every WELL-FORMED request with an empty
+    successful guest result. Kept as a function so the shipped ReadLine census
+    attributes its one read to this name rather than to `_worker_loop`.
+
+    It is a hand-maintained second copy of the framing protocol, so it MUST stay
+    in step with `_worker_loop`: a bad frame is answered `ok=false,
+    phase='frame'` there and here, and the guest result carries `boot_epoch` there
+    and here. A placeholder that drifts makes every test built on it exercise a
+    protocol the host never sees.
     """
     return "\n".join([
         "[Console]::InputEncoding  = [System.Text.UTF8Encoding]::new($false)",
@@ -763,8 +1028,27 @@ def _placeholder_loop() -> str:
         "    $line = [Console]::In.ReadLine()",
         "    if ($null -eq $line) { break }",
         "    if ($line -eq '__MCP_WORKER_EXIT__') { break }",
+        "    # The SAME bad-frame answer the shipped loop gives, so the framing",
+        "    # protocol the host classifies is the one the tests exercise.",
+        "    try { $req = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line)) | ConvertFrom-Json } catch { $req = $null }",
+        "    if ($null -eq $req) {",
+        "        $bad = @{ ok = $false; phase = 'frame'; error = 'unreadable request frame' } | ConvertTo-Json -Compress",
+        "        [Console]::Out.WriteLine([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bad)))",
+        "        continue",
+        "    }",
+        "    # The SAME decode the shipped loop applies to the inner script, so a",
+        "    # frame that carries it RAW is refused here exactly as it is there.",
+        "    # Without this the placeholder would answer a raw script with a",
+        "    # canned success, and no test could tell the two apart.",
+        "    $enc = $null",
+        "    try { $enc = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$req.script)) } catch { $enc = $null }",
+        "    if ($null -eq $enc) {",
+        "        $bad = @{ ok = $false; phase = 'frame'; error = 'the inner script is not base64' } | ConvertTo-Json -Compress",
+        "        [Console]::Out.WriteLine([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bad)))",
+        "        continue",
+        "    }",
         "    $resp = @{ ok = $true; phase = 'guest'; exit_code = 0; stdout = '';"
-        " stderr = ''; guest_ms = 0 } | ConvertTo-Json -Compress",
+        " stderr = ''; guest_ms = 0; boot_epoch = '' } | ConvertTo-Json -Compress",
         "    [Console]::Out.WriteLine([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($resp)))",
         "}",
     ])
@@ -775,14 +1059,22 @@ def _placeholder_loop() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _norm_guid(guid: str) -> str:
+    """Normalize a VM GUID the way `vmident.resolve` does, so a key built from
+    one spelling of a GUID always matches an invalidation for another."""
+    return (guid or "").strip().lower()
+
+
 def _as_key(key: Any) -> SessionKey:
     if isinstance(key, SessionKey):
         return key
     if isinstance(key, tuple) and len(key) == 4:
         return SessionKey(*key)
+    # `repr` of an arbitrary argument can carry the credential profile, which is
+    # derived from the password — so the rejected value is described by TYPE only.
     raise TypeError(
         "a session key is (vm_guid, cred_profile, agent_id, boot_epoch); "
-        f"got {key!r}"
+        f"got {type(key).__name__}"
     )
 
 

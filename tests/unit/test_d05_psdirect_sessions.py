@@ -383,7 +383,14 @@ def test_invalidate_vm_closes_every_session_for_that_vm_only():
         pool.release(pool.acquire(key))
     b_session = pool.acquire(key_vm_b)
     pool.release(b_session)
-    assert factory.closed_keys == []
+    # Opening the third session RETIRES the first: same VM and agent, different
+    # credential profile, so the worker still holding the retired credential
+    # must not survive the rotation (PRR-044). Nothing else is closed by merely
+    # opening these sessions.
+    assert factory.closed_keys == [keys_vm_a[0]], (
+        f"opening a rotated-credential session closed {factory.closed_keys}; "
+        f"expected exactly the retired {keys_vm_a[0]}"
+    )
 
     pool.invalidate_vm(GUID, reason="test")
 

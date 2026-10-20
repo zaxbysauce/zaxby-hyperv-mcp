@@ -395,8 +395,11 @@ than `duration_ms` and never smaller than `ps_ms`. The three guest keys are
 populated only when the guest host script emitted timing markers — null
 otherwise, which is the normal answer for console-only calls and for a fake
 transport. `guest_ms` is the guest-side measurement; `psdirect_session_ms` is
-the whole PowerShell Direct session, so it includes the guest round trip, and
-the setup cost is recoverable as `psdirect_session_ms - guest_ms`. Values are
+the PowerShell Direct **session-establishment** cost, and it is emitted only on
+the call that opened the session. On the per-call path it covers the whole
+session, so the setup cost is recoverable as `psdirect_session_ms - guest_ms`;
+on the pooled path it is establishment only, so that subtraction does not hold
+there. Values are
 numeric or null; nothing in `timing` ever carries script text, arguments or
 credentials.
 
@@ -615,7 +618,7 @@ error — fix that before calling tools (see Troubleshooting).
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `hyperv.target_probe UNREACHABLE: The client cannot connect to the destination specified` | WinRM not listening on the host, or the agent box does not trust it (workgroup) | `Enable-PSRemoting -SkipNetworkProfileCheck` on the host; `Set-Item WSMan:\localhost\Client\TrustedHosts -Value '<host>' -Concatenate` on the agent box; retest with `Test-WSMan -ComputerName <host>` |
-| `hyperv.target_probe POOL_BUSY: host PowerShell pool saturated: ...` | The host-wide PowerShell slot pool is full (`max_host_powershell` children already running) and the bounded wait expired | Retry (the envelope is `busy`, retryable); reduce concurrency or raise `max_host_powershell` (1..64) if the host has headroom |
+| `hyperv.target_probe POOL_BUSY: host PowerShell pool saturated: ...` | The host-wide PowerShell slot pool is full (`max_host_powershell` children already running) and the bounded wait expired. With session reuse on (the default), an **idle** pooled worker holds its slot for its whole lifetime — up to 300 s with no call in flight — so the pool can be saturated with no tool leg running at all | Retry (the envelope is `busy`, retryable); reduce concurrency or raise `max_host_powershell` (1..64) if the host has headroom; when the slots are held by idle pooled workers, set `psdirect_session_reuse: false` or lower `max_host_powershell` |
 | Legs fail as `error_class: "transport"` with `cannot open PowerShell slot file slot-NN.lock` | The slot directory's ACLs do not include the running account (e.g. a second non-admin account against the hardened default directory) | Set `ps_slot_dir` to a directory both accounts can use, or grant the account access to `%ProgramData%\hyperv-mcp\ps-slots`; `--check-env` prints the effective `max_host_powershell`, `host_powershell_wait_s` and `ps_slot_dir` |
 | `Access is denied` (or 0x80070005) on every remote tool | Wrong `HYPERV_HOST_*` credentials, or the account lacks remote VM rights | Check the credential env vars are in the **server's** environment (restart the MCP client after editing `.mcp.json`); put the account in the host's `Hyper-V Administrators` group |
 | Tools worked locally; after adding `hyperv.host` every call fails | Server process started before the env/config landed | Config is read at server start; env per call but from the server's process — restart the MCP client and re-check the banner line |
@@ -708,10 +711,14 @@ name-vs-`vm_id` addressing, nor against a write-scope op, which always
 resolves first and keys on the GUID (tracked in issue #77).
 
 Host PowerShell itself is bounded host-wide (issue #15): every tool leg,
-relay request, and every server process that shares the slot directory
+every relay request, every server process that shares the slot directory, and
+— with `psdirect_session_reuse` on (the default) — every **idle pooled worker**
 draws from a pool of `max_host_powershell` (default 8) slot lock files, so
 the number of simultaneous `powershell.exe` children stays at or below the
-cap for the whole host. The cap is only as wide as the slot directory:
+cap for the whole host. A pooled worker holds its slot for its whole LIFETIME
+rather than for the duration of a call, which is why the pool reserves two
+slots of headroom (`max_host_powershell - 2`) and installs no pool at all
+below a host cap of 3: see the session-reuse section below. The cap is only as wide as the slot directory:
 servers configured with different `ps_slot_dir` values run separate pools,
 and a server started with a smaller `max_host_powershell` sees only its own
 first N slots (the effective host-wide bound is then the largest configured
@@ -882,6 +889,14 @@ cases and requires the VM Off/Saved for the `Set-VMComPort` step.
   documented breaking change: host-side tools no longer raise through the
   protocol), delivered with `isError: true` so failures are visible at the
   MCP protocol level — the envelope rides as the text content AND as
+  `structuredContent`. The five keys are the minimum set; module-level
+  diagnostics (`timed_out`, `stopped`, `alive_pids`, ...) ride alongside,
+  and per-VM `busy` failures additionally carry `holder`
+  (`{tool, mode, since, held_ms}` — see the Concurrency section above; the
+  host-wide PowerShell-pool `busy` is a capacity condition and carries no
+  `holder`).
+  The envelope and the audit log share one isinstance-based taxonomy, so a
+  record's `error_class` always equals the envelope's.
 
 #### PowerShell Direct session reuse (0.4.0, issue #21)
 
@@ -893,7 +908,7 @@ and opening a fresh PowerShell Direct session on every guest call. The key is
 (VM GUID, credential profile, agent id, boot epoch)
 ```
 
-and each of the four components is load-bearing:
+and each component is load-bearing, with one caveat on the fourth:
 
 - **VM GUID** — the identity the caller already resolved, so a renamed VM can
   never silently re-target a pooled session.
@@ -907,31 +922,42 @@ and each of the four components is load-bearing:
   one it was opened for. On the paths that carry no identity — plain stdio,
   `--standalone`, `--allow-anonymous` — all callers form one local principal
   (see the relay ownership section), so they form one key bucket.
-- **boot epoch** — read from the guest once at session open. A session opened
-  under an older epoch is closed rather than handed out.
+- **boot epoch** — read from the guest at session open and re-read on every
+  request. The worker compares the two and refuses to run the inner script
+  when they differ, reporting a session-phase failure, so a guest reboot
+  under a live session is detected rather than assumed away. The POOL does
+  not close a session on an epoch change: the key carries no epoch today, so
+  the worker's per-request guard is the whole of that protection.
 
 What the pool does and does not touch:
 
 | | |
 |---|---|
-| **Pooled** | `hyperv_guest_run`, `hyperv_guest_run_ps`, `hyperv_victim_run`, `hyperv_victim_run_ps`, `hyperv_guest_read_file`, `hyperv_guest_list_dir`, the diagnose/repair/evidence guest legs, and every guest-job follow-up leg (they share `diagnostics.run_guest_inner`) |
+| **Pooled** | `hyperv_guest_run`, `hyperv_guest_run_ps`, `hyperv_victim_run`, `hyperv_victim_run_ps`, `hyperv_guest_read_file`, `hyperv_guest_list_dir`, the diagnose/repair/evidence guest legs, and every guest-job leg including `hyperv_guest_job_start` (they share `diagnostics.run_guest_inner`) |
 | **Not pooled (yet)** | `hyperv_guest_put` and `hyperv_guest_get`. A transfer rides `Copy-Item -ToSession`, which needs the session object in the guest scriptblock's own scope; routing that through a pooled worker needs a second worker mode this change does not add. They keep the per-call path. |
 | **Not pooled, by design** | `hyperv_wait_guest_recovery` (it exists to detect a guest coming back, so it must open fresh sessions and observe a real failure) and the relay's per-request legs (they deliberately skip `vm_lock`) |
 | **Never pooled** | remote Hyper-V host mode (`hyperv.host`, issue #43) — a pooled worker would have to be spawned on the remote host through a second transport this does not add. Remote mode takes the per-call path unchanged |
 
-Invalidation. A session is closed when its boot epoch changes, when the VM is
-checkpoint-restored, stopped, reset or started (each lifecycle tool invalidates
+Invalidation. A session is closed when the VM is
+checkpoint-restored, checkpoint-removed, stopped, reset or started, when a
+debugging configuration reboots the guest, and when its credential profile is
+rotated. Each lifecycle tool invalidates
 after the action **succeeds** — a failed action leaves the guest as it was and
-invalidates nothing), when the session is Broken or Closed, or on a transport
-error during use. The next call then retries once on a fresh session, but only
-when the failure happened before any guest-side effect.
+invalidates nothing. A session is also closed when it reports itself Broken or
+Closed, and on a transport error during use. The next call then retries once on a fresh session, but only
+when the failure happened before any guest-side effect — the worker reports
+that in its own response frame, which is the only signal the host has. A
+script that breaks its own session part-way through (a `Restart-Computer`,
+say) is a guest-phase failure and is never retried.
 
 Bounds. Every worker holds one host-wide PowerShell slot
 (`max_host_powershell`) for its whole lifetime, so the session cap is derived as
-`max(1, max_host_powershell - 2)`: two slots of headroom is what keeps the
+`max_host_powershell - 2`: two slots of headroom is what keeps the
 per-call legs — the identity-resolution leg on every guest call, every lifecycle
 action, `hyperv_wait_guest_recovery` — able to run instead of queueing for
-`host_powershell_wait_s`. Workers are also closed after 300 s idle, at the cap
+`host_powershell_wait_s`. At a host cap of 1 or 2 there is no headroom to
+reserve, so no pool is installed at all and every guest call takes the
+per-call path. Workers are also closed after 300 s idle, at the cap
 (least-recently-used **idle** session first; in-use sessions are never evicted),
 and at server exit by the lifespan teardown, so the host `powershell.exe` count
 returns to zero without waiting out the idle TTL.
@@ -942,28 +968,29 @@ never inside a request frame. All worker output passes the redaction filter.
 
 Honest limits, stated rather than hidden:
 
-- A reboot started **from inside the guest** has no host-side hook, so it is
-  detected on the next call's failure (broken session, discard, retry once), not
-  proactively. A per-call epoch probe would close that gap at the cost of one
-  guest round trip per call, which defeats the purpose of pooling.
+- A reboot started **from inside the guest** has no host-side hook, so nothing
+  on the host notices it as it happens. The worker's per-request epoch guard
+  catches it on the next call: the guard reports a session-phase failure, the
+  worker is discarded, and the call is retried once on a fresh session. That
+  guard is one extra guest round trip per call, which is the price of
+  detecting it at all.
 - The audit record's `ps_spawns` is **not** zero for a pooled guest call: every
   guest call still pays the identity-resolution leg, which is a real process
   spawn. Pooling removes the session establishment, not the resolution. The
   timing trio's `psdirect_session_ms` therefore appears only on the call that
   opened each session.
 - Setting `"psdirect_session_reuse": false` restores the exact per-call path.
+  Note that once the key is present in the config file, that file is no longer
+  loadable by any pre-0.4.0 binary: the older `from_dict` hard-aborts on an
+  unknown key rather than ignoring it, so removing the key again is required
+  before an older binary can read the file.
 
 `scripts/soak_bench.py --session-reuse off,on` runs each agent count once with
 reuse off and once with it on, so the before/after latency comparison is one
-command (live mode; see the soak section).
-  `structuredContent`. The five keys are the minimum set; module-level
-  diagnostics (`timed_out`, `stopped`, `alive_pids`, ...) ride alongside,
-  and per-VM `busy` failures additionally carry `holder`
-  (`{tool, mode, since, held_ms}` — see the Concurrency section above; the
-  host-wide PowerShell-pool `busy` is a capacity condition and carries no
-  `holder`).
-  The envelope and the audit log share one isinstance-based taxonomy, so a
-  record's `error_class` always equals the envelope's.
+command (live mode). Both legs are labelled `session_reuse=off` /
+`session_reuse=on` in the output, so the rows are distinguishable without
+`--json`.
+
 - (0.4.0) **Retry guidance:** `busy` is the only retryable class
   (`retry_after_ms` is a fixed ~2s hint; the holder data an FND-14
   derivation will consume now ships on busy envelopes — the derivation

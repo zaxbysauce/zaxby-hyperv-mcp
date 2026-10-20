@@ -319,8 +319,13 @@ def _pooled_pool(cfg: Config):
     host through a second transport this change does not add — issue #43), and a
     credential is available. Anything else takes the per-call path unchanged,
     which is what every unit test and every flag-off deployment exercises.
+
+    The flag is read with the SCHEMA's default, not `False`: an attribute-missing
+    config object means "not configured", and `Config.psdirect_session_reuse`
+    defaults to True, so a defensive `False` here would silently invert the
+    documented default while `policy_summary` still printed `True`.
     """
-    if not getattr(cfg, "psdirect_session_reuse", False):
+    if not getattr(cfg, "psdirect_session_reuse", True):
         return None
     if pswindows.hyperv_host(cfg):
         return None
@@ -331,7 +336,7 @@ def _pooled_pool(cfg: Config):
 def _session_key(vm_id: str, cred: CredentialSet) -> psdsessions.SessionKey:
     """The pool key for one guest call: (VM GUID, credential profile, agent id,
     boot epoch). The agent id is the authenticated bearer-token client_id and is
-    None on the paths that carry no identity — README.md:1078-1080 documents that
+    None on the paths that carry no identity — README.md:906-909 documents that
     in those modes all callers form one local principal, so None is one bucket
     rather than a blocker."""
     from . import auditlog
@@ -361,18 +366,27 @@ def _run_pooled_raw(
     optimisation, so it must never be able to fail a call the per-call path
     would have served. It falls back whenever it cannot produce a DEFINITIVE
     guest result — the pool is busy, the worker could not be spawned, the worker
-    died, or two consecutive attempts failed at the session phase (which means
-    no guest-side effect happened, so re-running the script is safe). A
-    guest-phase result is definitive and is reported as-is.
+    died, or two consecutive attempts failed at the session phase. A guest-phase
+    result is definitive and is reported as-is.
 
     On a session-phase failure the worker is discarded and the call is retried
     exactly once on a fresh session; a guest-phase failure is a RESULT, not a
     transport fault, and is never retried — the guest already ran the script.
+    An "unknown" outcome (the worker died, or answered unreadably) is reported
+    as a transport failure without a retry and without a per-call fallback,
+    because neither can prove the guest script never ran.
     """
     if pool is None:
         return None
     key = _session_key(vm_id, cred)
-    wait_s = float(getattr(cfg, "host_powershell_wait_s", 0.0) or 0.0)
+    # Bounded by the VM-lock budget, not the host-PowerShell one: this wait runs
+    # INSIDE `vm_lock(mode="read")`, and a 60 s park here would hold the read
+    # lock far past the `vm_lock_wait_s` a queued lifecycle writer is prepared
+    # to wait (FND-02).
+    wait_s = min(
+        float(getattr(cfg, "host_powershell_wait_s", 0.0) or 0.0),
+        float(getattr(cfg, "vm_lock_wait_s", 0.0) or 0.0),
+    )
     try:
         worker = pool.acquire(key, wait_s, cred=cred)
     except Exception:
@@ -399,7 +413,7 @@ def _run_pooled_raw(
                 return None
             try:
                 result = _attempt(worker)
-                _report_pooled_timing(result, None)
+                _report_pooled_timing(result, pool.take_open_cost(worker))
             except Exception:
                 pool.discard(worker)
                 return None
@@ -422,11 +436,11 @@ def _report_pooled_timing(result, opened_ms: int | None) -> None:
 
     Honest by construction: a call that OPENED the worker reports the spawn and
     session-establishment cost it actually paid (`ps_spawns` incremented, the
-    full trio); a call that REUSED a session reports only the guest-side work
-    and increments no spawn, because no process was started. Without this the
-    pooled path would be invisible in the audit record and the before/after
-    comparison `soak_bench --session-reuse` exists to make would have nothing to
-    compare.
+    full trio); a call that REUSED a session reports the host-side time the
+    worker really spent and increments no spawn, because no process was started.
+    Without this the pooled path would be invisible in the audit record and the
+    before/after comparison `soak_bench --session-reuse` exists to make would
+    have nothing to compare.
     """
     collector = timing.current()
     if collector is None:
@@ -436,13 +450,24 @@ def _report_pooled_timing(result, opened_ms: int | None) -> None:
     if not isinstance(guest_ms, int):
         guest_ms = getattr(result, "guest_ms", None)
     if opened_ms is None:
-        collector.add_pooled(0, {"guest_ms": guest_ms}, spawned=False)
+        # A reused session: charge the worker's real host-side round trip, which
+        # is the work this call actually caused, and claim no spawn.
+        collector.add_pooled(
+            int(getattr(result, "duration_ms", 0) or 0),
+            {"guest_ms": guest_ms},
+            spawned=False,
+        )
         return
     collector.add_pooled(
         opened_ms,
         {
             "ps_startup_ms": opened_ms,
-            "psdirect_session_ms": getattr(result, "duration_ms", None) or opened_ms,
+            # The session-establishment cost, measured HOST-SIDE across the
+            # spawn and the handshake read. `PooledResult` carries no
+            # `session_ms`, so this is the pool's own measurement rather than
+            # the worker's; the request's round trip is charged to `ps_ms`
+            # instead, so the marker does not silently mean two things.
+            "psdirect_session_ms": opened_ms,
             "guest_ms": guest_ms,
         },
         spawned=True,
@@ -474,32 +499,46 @@ def _pooled_payload(result) -> dict | None:
     """The JSON object a pooled worker's response carries, or None if there
     isn't one. Every caller already json.loads this on the per-call path, so the
     pooled path reuses that exact unwrap rather than inventing a second shape."""
+    raw = (getattr(result, "stdout", "") or "").strip()
+    if not raw:
+        # NO wrapper at all. Parsing this as "{}" would make an empty answer
+        # read as a completed guest run with no fields, which is exactly the
+        # misreading `_phase`'s "unknown" class exists to prevent.
+        return None
     try:
-        data = json.loads((result.stdout or "").strip() or "{}")
+        data = json.loads(raw)
     except (json.JSONDecodeError, AttributeError, TypeError):
         return None
     return data if isinstance(data, dict) else None
 
 
 def _phase(result) -> str:
-    """"session" when the pooled worker reports that the SESSION failed, as
-    opposed to the guest scriptblock having run. Only a session failure is
-    retryable on a fresh session; a guest-phase result is definitive.
+    """Classify a pooled worker's response as "session", "guest" or "unknown".
 
-    Three independent signals, because a worker that died before answering has
-    no wrapper to read: the wrapper's own `phase`, the result object's `phase`
-    attribute, and a missing return code (a completed host leg always has one).
-    Any of them means "no guest-side effect", which is what makes the retry and
-    the per-call fallback safe.
+    - "session" — the worker's OWN failure frame says the session failed. Those
+      frames are emitted by guards that run BEFORE the guest scriptblock is
+      entered, so they prove no guest-side effect happened. Only this class is
+      retryable on a fresh session.
+    - "guest" — the guest scriptblock ran and produced a result. Definitive;
+      never retried, because the guest already did the work.
+    - "unknown" — the worker died or answered with something unreadable. This
+      says nothing about whether the guest ran, so it is neither retried nor
+      silently re-run through the per-call fallback: both would repeat a script
+      that may already have had its effect.
+
+    The distinction is load-bearing. Treating "unknown" as "session" — which is
+    what a missing return code or an undecodable frame alone would suggest —
+    makes the retry re-run a script that already ran in the guest.
     """
     payload = _pooled_payload(result)
-    if payload and payload.get("phase") == "session":
-        return "session"
-    if getattr(result, "phase", "guest") == "session":
-        return "session"
-    if getattr(result, "returncode", 0) is None:
-        return "session"
-    return "guest"
+    if payload is not None:
+        # A wrapper exists, so the guest scriptblock ran far enough to report on
+        # itself. Its own `phase` is the worker's statement about whether it
+        # ever entered the inner script, and it is the ONLY retryable signal.
+        return "session" if payload.get("phase") == "session" else "guest"
+    # No wrapper: the worker died, timed out, or answered with something
+    # unreadable. That says nothing about whether the guest ran.
+    return "unknown"
 
 
 def _run_pooled(
@@ -519,7 +558,13 @@ def _run_pooled(
 
 
 def _pooled_envelope(cfg: Config, result, elevated: bool, timeout_ms: int = 0) -> dict:
-    """Turn a pooled worker's response into the same envelope _run_inner returns."""
+    """Turn a pooled worker's response into the same envelope _run_inner returns.
+
+    The worker's own wrapper is read FIRST: it is the only thing that carries the
+    worker's real error and its phase, and a failure frame deliberately has no
+    `exit_code` — so testing the host-leg shape first would discard both and
+    report a generic transport or parse error instead.
+    """
     if result.timed_out:
         timeout_s = max(30, timeout_ms // 1000 + _GRACE_S) if timeout_ms else 30
         return {
@@ -530,23 +575,28 @@ def _pooled_envelope(cfg: Config, result, elevated: bool, timeout_ms: int = 0) -
             ),
             "timed_out": True,
         }
-    if result.returncode is None:
-        return _result_err(cfg, result.stderr or "pooled session failure", "transport")
     raw = (result.stdout or "").strip()
-    if not raw:
-        return _result_err(cfg, "no output from guest", "parse")
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        return _result_err(cfg, f"guest result JSON parse failed: {exc} | raw: {raw[:200]!r}", "parse")
-    if not isinstance(data, dict) or "exit_code" not in data:
-        return _result_err(cfg, f"unexpected guest result shape: {raw[:200]!r}", "parse")
-    if data.get("ok") is False:
+    data = None
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            return _result_err(
+                cfg, f"guest result JSON parse failed: {exc} | raw: {raw[:200]!r}", "parse"
+            )
+        if isinstance(parsed, dict):
+            data = parsed
+    if data is not None and data.get("ok") is False:
         return _result_err(
             cfg,
             str(data.get("error") or "pooled session failure"),
             "transport" if data.get("phase") == "session" else "guest",
         )
+    if data is None or "exit_code" not in data:
+        # No readable wrapper: this is a host-leg failure, not a guest result.
+        if result.returncode is None:
+            return _result_err(cfg, result.stderr or "pooled session failure", "transport")
+        return _result_err(cfg, f"unexpected guest result shape: {raw[:200]!r}", "parse")
     exit_code = data.get("exit_code")
     if exit_code is None:
         return _result_err(cfg, "guest child process produced no exit code", "guest")

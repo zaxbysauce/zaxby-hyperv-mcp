@@ -207,8 +207,14 @@ def _read_file_inner(remote: str, max_bytes: int, cfg=None) -> str:
     The per-call path embeds this text inside `Invoke-Command -VMId
     -ScriptBlock { ... }` together with the credential preamble and the
     $vmTarget binding; the pooled path hands exactly this text to the worker,
-    which already holds the session and the credential. Keeping one source for
-    the guest logic is what stops the two transports from drifting.
+    which already holds the session and the credential.
+
+    CAVEAT, stated because the claim is easy to over-read: this is one source
+    for the pooled path only. The per-call path carries its own literal body
+    (`guest_read_file` below, and `guest_list_dir` for the sibling tool), so
+    the guest logic exists in TWO independently written copies and a change to
+    one must be made to the other by hand. The census guardrail in
+    `tests/unit/test_d05_pool_census.py` is what keeps the second copy visible.
     """
     return f"""
 $path = {pswindows.ps_quote(remote)}

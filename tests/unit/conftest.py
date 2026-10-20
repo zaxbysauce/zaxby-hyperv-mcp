@@ -148,11 +148,30 @@ def _restore_bootstrap_module_globals():
     from hyperv_mcp import server as _srv
     from hyperv_mcp import vmlocks as _vl
 
+    def _no_spawn(script, stdin_b64=None):
+        """Refuse to spawn a host powershell.exe from a unit test.
+
+        `server.bootstrap` installs the default session pool (issue #21), so a
+        test that stubs `pswindows.run_ps` but still reaches `bootstrap` would
+        otherwise spawn a REAL worker on its next guest call and block on
+        `New-PSSession` against a VM that does not exist. Raising here makes the
+        pooled path fail fast and fall back to the per-call path the test
+        actually stubbed.
+        """
+        raise _pw.PowerShellTransportError(
+            "psdsessions: unit tests must not spawn a pooled worker"
+        )
+
     saved = {
         ("auditlog", "_config"): getattr(_a, "_config", None),
         ("credentials", "_config"): getattr(_c, "_config", None),
         ("pswindows", "_config"): getattr(_pw, "_config", None),
         ("pswindows", "_redact"): getattr(_pw, "_redact", None),
+        # PRR-074: pswindows.init() also sets _ps_path, and nothing restored it,
+        # so whichever test initialised first decided whether every later test
+        # could spawn PowerShell at all — an ordering dependency that reads as a
+        # random failure when the file order changes.
+        ("pswindows", "_ps_path"): getattr(_pw, "_ps_path", None),
         ("server", "_bootstrapped"): getattr(_srv, "_bootstrapped", False),
         ("server", "CFG"): getattr(_srv, "CFG", None),
         # bootstrap() also wires vmlocks' default bounded wait; without this
@@ -165,14 +184,18 @@ def _restore_bootstrap_module_globals():
         # pooled into the real spawn path instead of the per-call path it was
         # written against.
         ("psdsessions", "DEFAULT"): getattr(_ps, "DEFAULT", None),
+        ("psdsessions", "_spawn_worker"): getattr(_ps, "_spawn_worker", None),
     }
+    _ps.set_worker_spawn(_no_spawn)
     yield
     _a._config = saved[("auditlog", "_config")]
     _c._config = saved[("credentials", "_config")]
     _pw._config = saved[("pswindows", "_config")]
     _pw._redact = saved[("pswindows", "_redact")]
+    _pw._ps_path = saved[("pswindows", "_ps_path")]
     _srv._bootstrapped = saved[("server", "_bootstrapped")]
     _srv.CFG = saved[("server", "CFG")]
     _vl._DEFAULT_WAIT_S = saved[("vmlocks", "_DEFAULT_WAIT_S")]
     _ps.DEFAULT = saved[("psdsessions", "DEFAULT")]
+    _ps.set_worker_spawn(saved[("psdsessions", "_spawn_worker")])
 

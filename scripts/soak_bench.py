@@ -597,6 +597,10 @@ def _parse_reuse(spec: str) -> list[bool | None]:
     An empty spec is ONE run that leaves the config default alone (the
     historical behaviour). "off,on" is two runs, with the config key written
     explicitly so the run measures the state it claims to.
+
+    Each comma-separated token is one run. Accepted spellings: on / off (also
+    true / false, 1 / 0, yes / no), and `default` (or an empty token) for a
+    run that leaves the config default alone. Anything else is an error.
     """
     spec = (spec or "").strip()
     if not spec:
@@ -612,7 +616,8 @@ def _parse_reuse(spec: str) -> list[bool | None]:
             out.append(None)
         else:
             raise ValueError(
-                f"--session-reuse entries must be off or on, got {token!r}"
+                f"--session-reuse entries must be off, on or default "
+                f"(true/false, 1/0 and yes/no are accepted too), got {token!r}"
             )
     if not out:
         return [None]
@@ -627,6 +632,7 @@ def _run_fake(agents: int, iterations: int, *, session_reuse: bool | None = None
             return _run(
                 agents, iterations, stub=stub, vm=FAKE_VM, mode="fake",
                 audit_log=Path(tmpdir) / "soak-audit.jsonl",
+                session_reuse=session_reuse,
             )
         finally:
             for name, value in saved_env.items():
@@ -700,7 +706,7 @@ def _render(row: dict) -> str:
         return f"{value:9.1f}" if isinstance(value, (int, float)) else "      null"
 
     return (
-        f"agents={row['agents']:<3} n={row['n']:<5} ok={row['ok']:<5} "
+        f"session_reuse={row.get('session_reuse')} agents={row['agents']:<3} n={row['n']:<5} ok={row['ok']:<5} "
         f"busy={row['busy']:<3} incorrect={row['incorrect']:<3} "
         f"p50={num('p50_ms')} p95={num('p95_ms')} p99={num('p99_ms')} "
         f"busy_rate={row['busy_rate']:.4f} incorrect_rate={row['incorrect_rate']:.4f}"
@@ -722,7 +728,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--session-reuse", default="",
         help="comma-separated reuse states (off,on); each agent count runs once "
-             "per state. Empty means the config default, run once",
+             "per state. Also accepts true/false, 1/0, yes/no, and `default` "
+             "for a run that leaves the config default alone. Empty means the "
+             "config default, run once",
     )
     args = parser.parse_args(argv)
 

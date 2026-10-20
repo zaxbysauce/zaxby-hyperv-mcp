@@ -27,6 +27,8 @@ import hashlib
 import json
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -108,6 +110,21 @@ class FakeWorker:
         self.calls: list[tuple] = []
         self.closed = False
         self.run_count = 0
+        #: Whether the underlying PROCESS is alive, independent of whether the
+        #: pool has closed it. A test models a worker that died by setting this
+        #: False, exactly as `PooledWorker._dead` does in production.
+        self.process_alive = True
+
+    def is_alive(self) -> bool:
+        """Answered TRUTHFULLY, not through `__getattr__`.
+
+        `SessionPool.release` probes this on every release and drops a worker
+        that reports dead. A `__getattr__` answer would hand back the canned
+        result — truthy — so no test could ever observe a dead worker being
+        dropped, and the probe itself would be recorded as a call, inflating
+        `run_count` and contaminating any retry oracle built on it.
+        """
+        return self.process_alive and not self.closed
 
     def _close(self, *args, **kwargs) -> None:
         self.closed = True
@@ -477,25 +494,39 @@ def test_install_default_pool_starts_the_idle_ttl_reaper():
         psdsessions.DEFAULT = None
 
 
-@pytest.mark.parametrize("cap,expected", [(8, 6), (3, 1), (1, 1), (64, 62)])
+@pytest.mark.parametrize("cap,expected", [(8, 6), (3, 1), (64, 62), (2, None), (1, None)])
 def test_installed_pool_reserves_host_powershell_headroom(cap, expected):
     """AC27: the pool `server.bootstrap` installs derives its session cap from
     the host PowerShell cap with reserved headroom, so pooled workers — each of
     which holds one host-wide slot for its whole lifetime — can never consume
     every slot and starve the per-call legs (resolver legs, lifecycle actions,
-    `wait_guest_recovery`)."""
+    `wait_guest_recovery`).
+
+    At a cap of 1 or 2 there is no headroom to reserve at all: `max(1, cap-2)`
+    would install a one-session pool whose single worker can hold the host's
+    last slot for the whole idle TTL, so no pool is installed and every guest
+    call takes the per-call path (PRR-018)."""
     psdsessions = _psdsessions()
     cfg = Config(unrestricted=True, max_host_powershell=cap)
     pool = psdsessions.install_default_pool(cfg)
     try:
+        if expected is None:
+            assert pool is None, (
+                f"max_host_powershell={cap} installed a pool with "
+                f"{pool.max_sessions} sessions; at this cap no headroom can be "
+                f"reserved, so one idle worker could hold the host's last slot "
+                f"for the whole idle TTL and every per-call leg would busy-fail"
+            )
+            return
         assert pool is not None, "no pool was installed"
         assert pool.max_sessions == expected, (
             f"max_host_powershell={cap} installed max_sessions={pool.max_sessions}; "
             f"expected {expected} (cap - 2, floor 1)"
         )
-        assert pool.max_sessions < cap or cap == 1
+        assert pool.max_sessions < cap
     finally:
-        pool.close_all()
+        if pool is not None:
+            pool.close_all()
         psdsessions.DEFAULT = None
 
 
@@ -543,3 +574,358 @@ class _FailingRestorePS:
         if self.calls == 1:
             return pswindows.PSResult(stdout=GUID, returncode=0)
         return pswindows.PSResult(stdout="", stderr="Restore-VMSnapshot failed", returncode=1)
+
+
+# ---------------------------------------------------------------------------
+# PRR follow-up: the pool's close paths must RETURN, not self-deadlock
+# ---------------------------------------------------------------------------
+
+
+class _CloseSpy:
+    """A pooled worker whose close is observable, and whose liveness is fine."""
+
+    def __init__(self) -> None:
+        self.closed = 0
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class _MutableClock:
+    """A clock the test advances by hand, so an idle-TTL boundary is exact
+    rather than a bet on `time.monotonic`'s resolution."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def jump(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _bounded(label: str, fn, limit_s: float = 5.0):
+    """Run ``fn`` on a thread and FAIL if it does not return.
+
+    Every `_close_entries` caller used to hold ``_mu`` while `_close_entries`
+    took it again, which self-deadlocks on a plain ``threading.Lock``. Under
+    pytest that is a HANG — it reads as a slow suite, not a failure — so these
+    pins assert the call RETURNS, on a daemon thread the test can abandon.
+    """
+    box: dict = {}
+
+    def target() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # re-raised on the asserting thread
+            box["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(limit_s)
+    assert not thread.is_alive(), (
+        f"{label} did not return within {limit_s}s: the session pool "
+        f"deadlocked. A close helper called with _mu held must not take _mu "
+        f"itself."
+    )
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def _key(guid: str, profile: str = "p", agent: str = "a", epoch=None):
+    return _psdsessions().SessionKey(
+        vm_guid=guid, cred_profile=profile, agent_id=agent, boot_epoch=epoch
+    )
+
+
+def test_every_close_path_returns_instead_of_self_deadlocking():
+    """Each way a session leaves the pool must complete.
+
+    `invalidate_vm` (every lifecycle hook), `discard` (every failed pooled
+    call), `release` of a doomed entry, `reap` past the idle TTL and cap
+    eviction all remove entries and then close the workers. When the removal
+    and the close share one non-reentrant lock hold, every one of those paths
+    hangs the tool call that triggered it — and a hang is invisible to a test
+    that only checks the return value.
+    """
+    psdsessions = _psdsessions()
+    made: list[_CloseSpy] = []
+
+    def factory(key, script, stdin_b64=None):
+        worker = _CloseSpy()
+        made.append(worker)
+        return worker
+
+    guid, other = GUID, GUID_B
+
+    # 1. invalidate_vm — the lifecycle-hook path.
+    pool = psdsessions.SessionPool(factory, idle_ttl_s=1e9, max_sessions=8)
+    pool.release(pool.acquire(_key(guid)))
+    assert _bounded("invalidate_vm", lambda: pool.invalidate_vm(guid)) == 1
+    assert made[-1].closed == 1, "invalidate_vm did not close the session"
+
+    # 2. discard — the failed-pooled-call path.
+    pool = psdsessions.SessionPool(factory, idle_ttl_s=1e9, max_sessions=8)
+    held = pool.acquire(_key(guid))
+    _bounded("discard", lambda: pool.discard(held))
+    assert made[-1].closed == 1, "discard did not close the session"
+
+    # 3. release of a session doomed while it was checked out.
+    pool = psdsessions.SessionPool(factory, idle_ttl_s=1e9, max_sessions=8)
+    held = pool.acquire(_key(guid))
+    _bounded("invalidate while held", lambda: pool.invalidate_vm(guid))
+    _bounded("release of doomed", lambda: pool.release(held))
+    assert made[-1].closed == 1, "release did not close the doomed session"
+
+    # 4. reap past the idle TTL.
+    clock = _MutableClock()
+    pool = psdsessions.SessionPool(
+        factory, idle_ttl_s=1.0, max_sessions=8, clock=clock
+    )
+    pool.release(pool.acquire(_key(guid)))
+    clock.jump(10.0)
+    assert _bounded("reap", lambda: pool.reap()) == 1
+    assert made[-1].closed == 1, "reap did not close the idle session"
+
+    # 5. cap eviction.
+    pool = psdsessions.SessionPool(factory, idle_ttl_s=1e9, max_sessions=1)
+    pool.release(pool.acquire(_key(guid)))
+    _bounded("acquire past the cap", lambda: pool.acquire(_key(other)))
+    assert made[0].closed == 1, "cap eviction did not close the LRU session"
+
+    # 6. close_all — the server-shutdown path.
+    pool = psdsessions.SessionPool(factory, idle_ttl_s=1e9, max_sessions=8)
+    pool.release(pool.acquire(_key(guid)))
+    assert _bounded("close_all", lambda: pool.close_all()) == 1
+    assert made[-1].closed == 1, "close_all did not close the session"
+
+
+def test_a_missing_session_is_created_not_waited_for():
+    """`acquire` CREATES a session when there is none.
+
+    The gate used to be conditioned on a close batch being in flight, so with
+    none in flight — the normal case — a missing entry was never created and
+    every pooled call burned its whole bounded wait before falling back. The
+    pool therefore never reused anything.
+    """
+    psdsessions = _psdsessions()
+    made: list[_CloseSpy] = []
+
+    def factory(key, script, stdin_b64=None):
+        worker = _CloseSpy()
+        made.append(worker)
+        return worker
+
+    pool = psdsessions.SessionPool(factory, idle_ttl_s=1e9, max_sessions=8)
+    worker = _bounded("acquire of a missing session", lambda: pool.acquire(_key(GUID)))
+    assert worker is made[0], "acquire did not create the missing session"
+    assert pool.stats()["sessions"] == 1
+
+    # And the SAME key hands back the same worker: that is the whole feature.
+    pool.release(worker)
+    again = _bounded("re-acquire", lambda: pool.acquire(_key(GUID)))
+    assert again is worker, "a released session was not reused"
+    assert len(made) == 1, "a second worker was spawned for a reusable session"
+
+
+def test_a_spawn_failure_propagates_instead_of_burning_the_wait():
+    """A factory that cannot spawn fails the call at once.
+
+    Retrying a spawn that cannot succeed would only consume the bounded wait,
+    and the caller's per-call fallback is the correct response — so the error
+    must surface, not be waited out.
+    """
+    psdsessions = _psdsessions()
+
+    def exploding_factory(key, script, stdin_b64=None):
+        raise PowerShellTransportError("no host PowerShell available")
+
+    pool = psdsessions.SessionPool(exploding_factory, idle_ttl_s=1e9, max_sessions=8)
+
+    started = time.monotonic()
+    with pytest.raises(PowerShellTransportError):
+        _bounded("acquire with a failing factory", lambda: pool.acquire(_key(GUID), 30.0))
+    elapsed = time.monotonic() - started
+    assert elapsed < 5.0, (
+        f"a spawn that cannot succeed was retried for {elapsed:.1f}s instead "
+        f"of failing the call"
+    )
+    assert pool.stats()["sessions"] == 0, "a failed spawn left an entry behind"
+
+
+class _EofResult(_DuckResult):
+    """The shape `PooledWorker.run` returns when the worker exits WITHOUT
+    answering: no wrapper, no return code, and `phase="session"` because the
+    transport — not the guest scriptblock — gave up."""
+
+    def __init__(self) -> None:
+        super().__init__(stdout="")
+        self.returncode = None
+        self.phase = "session"
+
+
+def test_a_worker_that_died_mid_script_is_not_retried(monkeypatch):
+    """PRR-062: a worker that dies or answers unreadably says NOTHING about
+    whether the guest scriptblock ran, so the call is neither retried nor
+    silently re-run through the per-call fallback — both would repeat a script
+    that may already have had its effect (a checkpoint, a file write, a guest
+    reboot).
+
+    The positive control is `test_broken_session_is_discarded_and_retried_
+    exactly_once` above: a worker that REPORTS `phase: "session"` in its own
+    wrapper is retried, because that is the guest scriptblock stating it never
+    entered the inner script. This pin is the negative half — the same
+    `phase="session"` string arriving WITHOUT a wrapper must not move.
+    """
+    psdsessions = _psdsessions()
+    cfg = Config(unrestricted=True)
+
+    def always_eof(n):
+        # The process is gone: that is what an EOF answer means, and it is why
+        # the worker must be dropped rather than handed to the next caller.
+        factory.workers[-1].process_alive = False
+        return _EofResult()
+
+    factory = RecordingFactory(behaviour=always_eof)
+    pool = _pool(factory)
+    monkeypatch.setattr(psdsessions, "DEFAULT", pool)
+    _stub_resolve(monkeypatch)
+
+    out = guestexec.guest_run_ps(cfg, "vm1", "New-Checkpoint", cred=CRED)
+    assert out.get("ok") is False, out
+    assert out.get("error_class") == "transport", (
+        f"a worker that died mid-script was reported as {out.get('error_class')!r}, "
+        f"not a transport failure"
+    )
+    assert len(factory.workers) == 1, (
+        f"a worker that died mid-script was retried ({len(factory.workers)} "
+        f"workers); the script may already have run in the guest"
+    )
+    assert factory.closed_keys, "the dead worker was not closed"
+
+
+def test_a_failed_create_does_not_strand_doomed_entries(monkeypatch):
+    """A create that fails AFTER the retire/stale-epoch collectors have marked
+    their entries must not leak them.
+
+    Those collectors set `doomed = True` before the spawn. Nothing else ever
+    closes a doomed entry — `reap` and `acquire` both skip them, and `release`
+    closes only the entry for the worker being returned — so leaving one
+    marked-but-open holds a host-wide slot and a live session with a decrypted
+    credential for the life of the process.
+
+    There are TWO reachable triggers, and the guard covers both:
+
+      1. `establishment_script` raising between the collectors and the spawn;
+      2. `_capacity_victims` raising `SessionBusy`.
+
+    Trigger 2 is the subtle one. `_retire_victims` marks its entries doomed but
+    LEAVES them in `_entries`, and `_capacity_victims`'s candidate filter is
+    `not e.doomed` — so the retired entries are invisible to it. Its loop
+    condition counts its OWN local victim list, which starts empty, so the
+    condition `len(self._entries) - 0 >= max_sessions` holds on a full pool and
+    the generator finds nothing evictable. It raises with the caller's victim
+    list non-empty. Verified by execution across caps 1, 2, 3, 4 and 8: the
+    retired entry is doomed, `_capacity_victims` raises, and without the guard
+    nothing ever closes it.
+    """
+    psdsessions = _psdsessions()
+    closed: list = []
+    made: list = []
+
+    class Spy:
+        def __init__(self, tag):
+            self.tag = tag
+
+        def close(self):
+            closed.append(self.tag)
+
+    def factory(key, script, stdin_b64=None):
+        worker = Spy(f"{key.cred_profile}:{len(made)}")
+        made.append(worker)
+        return worker
+
+    real_script = psdsessions.establishment_script
+    armed = {"fail": False}
+
+    def exploding_script(key, cred):
+        if armed["fail"]:
+            raise PowerShellTransportError(
+                "could not build the establishment script"
+            )
+        return real_script(key, cred)
+
+    monkeypatch.setattr(psdsessions, "establishment_script", exploding_script)
+
+    pool = psdsessions.SessionPool(factory, idle_ttl_s=1e9, max_sessions=8)
+    # An idle session under profile p1: a rotated password retires it.
+    pool.release(pool.acquire(_key(GUID, "p1"), 1.0))
+    assert pool.stats()["sessions"] == 1
+    armed["fail"] = True
+
+    with pytest.raises(PowerShellTransportError):
+        pool.acquire(_key(GUID, "p2"), 1.0)
+
+    assert closed, (
+        "the retired entry was doomed but never closed; it holds a host-wide "
+        "slot and a live session with a decrypted credential"
+    )
+    assert pool.stats()["sessions"] == 0, (
+        f"the pool still holds {pool.stats()['sessions']} doomed entries, so "
+        f"they occupy capacity nothing can reclaim"
+    )
+    # The pool is still usable afterwards: a later create succeeds.
+    armed["fail"] = False
+    pool.release(pool.acquire(_key(GUID, "p3"), 1.0))
+    assert pool.stats()["sessions"] == 1
+
+
+def test_a_capacity_busy_does_not_strand_the_retired_entry():
+    """The second reachable trigger for the same leak: the pool is full.
+
+    `_retire_victims` marks the retired entry doomed but leaves it in
+    `_entries`; `_capacity_victims` filters on `not e.doomed`, so it cannot see
+    it, and its loop condition counts its own (empty) local list. It therefore
+    raises `SessionBusy` while the caller's victim list is non-empty. Without the
+    guard the retired entry stays doomed-but-open forever: `reap` and `acquire`
+    skip doomed, and `release` closes only the entry for the worker returned.
+    """
+    psdsessions = _psdsessions()
+    closed: list = []
+
+    class Spy:
+        def __init__(self, tag):
+            self.tag = tag
+
+        def close(self):
+            closed.append(self.tag)
+
+    made: list = []
+
+    def factory(key, script, stdin_b64=None):
+        worker = Spy(f"{key.cred_profile}:{len(made)}")
+        made.append(worker)
+        return worker
+
+    pool = psdsessions.SessionPool(factory, idle_ttl_s=1e9, max_sessions=2)
+    # An idle session under p1 (the one a rotation retires), plus one checked
+    # out for another VM so the pool is at its cap.
+    pool.release(pool.acquire(_key(GUID, "p1"), 1.0))
+    held = pool.acquire(_key(GUID_B, "p1"), 1.0)
+    assert pool.stats()["sessions"] == 2
+
+    with pytest.raises(psdsessions.SessionBusy):
+        pool.acquire(_key(GUID, "p2"), 1.0)
+
+    assert closed, (
+        "the retired entry was doomed by the rotation but never closed; it "
+        "holds a host-wide slot and a live session with a decrypted credential"
+    )
+    assert pool.stats()["doomed"] == 0, (
+        f"{pool.stats()['doomed']} doomed entries survived the failed create"
+    )
+    # The other VM's session is untouched and still checked out to its caller.
+    pool.release(held)
+    assert pool.stats()["sessions"] == 1
