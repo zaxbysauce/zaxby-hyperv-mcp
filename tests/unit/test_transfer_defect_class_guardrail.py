@@ -251,7 +251,12 @@ def test_placement_census_all_four_tools(monkeypatch, tmp_path, rooted_cfg):  # 
                 scope = parents.get(scope)
             assert scope is not None, "_guest_root_assertion call outside any function"
             callers.add(scope.name)
-    assert callers == set(EXPECTED_INSIDE), (
+    # issue #21: read_file and list_dir emit their guest-side script from a
+    # shared inner-script helper so the per-call and pooled paths cannot drift,
+    # so their assertion call site is that helper rather than the tool function.
+    # The emitted text is unchanged, which is what EXPECTED_INSIDE pins.
+    expected_callers = set(EXPECTED_INSIDE) | {"_read_file_inner", "_list_dir_inner"}
+    assert callers == expected_callers, (
         f"_guest_root_assertion callers drifted: "
-        f"{sorted(callers ^ set(EXPECTED_INSIDE))}"
+        f"{sorted(callers ^ expected_callers)}"
     )

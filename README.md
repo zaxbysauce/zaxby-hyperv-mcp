@@ -339,6 +339,8 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
                                        // %ProgramData%\hyperv-mcp\ps-slots (shared per host); a shared
                                        // temp dir when ProgramData is unset (per-account on Windows).
                                        // All servers on a host must use the same value and cap
+  "psdirect_session_reuse": true,      // reuse PowerShell Direct sessions across calls (issue #21).
+                                       // See "PowerShell Direct session reuse" below
   // "hyperv": { "host": "nuc01" },    // remote Hyper-V host (issue #43);
   //                                    // OMIT the section entirely for local mode
   //                                    // (the section requires a non-empty host)
@@ -880,6 +882,79 @@ cases and requires the VM Off/Saved for the `Set-VMComPort` step.
   documented breaking change: host-side tools no longer raise through the
   protocol), delivered with `isError: true` so failures are visible at the
   MCP protocol level — the envelope rides as the text content AND as
+
+#### PowerShell Direct session reuse (0.4.0, issue #21)
+
+`psdirect_session_reuse` (default **true**) keeps one long-lived host
+`powershell.exe` worker per **session key** instead of starting a fresh process
+and opening a fresh PowerShell Direct session on every guest call. The key is
+
+```
+(VM GUID, credential profile, agent id, boot epoch)
+```
+
+and each of the four components is load-bearing:
+
+- **VM GUID** — the identity the caller already resolved, so a renamed VM can
+  never silently re-target a pooled session.
+- **credential profile** — derived from the credential identity (username plus
+  an HMAC of the password under a per-process random key). Two credentials that
+  share a username but differ by password never share a session, so a rotated
+  password cannot inherit a session opened under the old one.
+- **agent id** — the authenticated bearer-token `client_id`. Microsoft documents
+  that persistent PowerShell Direct sessions retain state (variables, imported
+  modules, location), so a session is never handed to a caller that is not the
+  one it was opened for. On the paths that carry no identity — plain stdio,
+  `--standalone`, `--allow-anonymous` — all callers form one local principal
+  (see the relay ownership section), so they form one key bucket.
+- **boot epoch** — read from the guest once at session open. A session opened
+  under an older epoch is closed rather than handed out.
+
+What the pool does and does not touch:
+
+| | |
+|---|---|
+| **Pooled** | `hyperv_guest_run`, `hyperv_guest_run_ps`, `hyperv_victim_run`, `hyperv_victim_run_ps`, `hyperv_guest_read_file`, `hyperv_guest_list_dir`, `hyperv_guest_put`, `hyperv_guest_get`, the diagnose/repair/evidence guest legs, and every guest-job follow-up leg (they share `diagnostics.run_guest_inner`) |
+| **Not pooled, by design** | `hyperv_wait_guest_recovery` (it exists to detect a guest coming back, so it must open fresh sessions and observe a real failure) and the relay's per-request legs (they deliberately skip `vm_lock`) |
+| **Never pooled** | remote Hyper-V host mode (`hyperv.host`, issue #43) — a pooled worker would have to be spawned on the remote host through a second transport this does not add. Remote mode takes the per-call path unchanged |
+
+Invalidation. A session is closed when its boot epoch changes, when the VM is
+checkpoint-restored, stopped, reset or started (each lifecycle tool invalidates
+after the action **succeeds** — a failed action leaves the guest as it was and
+invalidates nothing), when the session is Broken or Closed, or on a transport
+error during use. The next call then retries once on a fresh session, but only
+when the failure happened before any guest-side effect.
+
+Bounds. Every worker holds one host-wide PowerShell slot
+(`max_host_powershell`) for its whole lifetime, so the session cap is derived as
+`max(1, max_host_powershell - 2)`: two slots of headroom is what keeps the
+per-call legs — the identity-resolution leg on every guest call, every lifecycle
+action, `hyperv_wait_guest_recovery` — able to run instead of queueing for
+`host_powershell_wait_s`. Workers are also closed after 300 s idle, at the cap
+(least-recently-used **idle** session first; in-use sessions are never evicted),
+and at server exit by the lifespan teardown, so the host `powershell.exe` count
+returns to zero without waiting out the idle TTL.
+
+Secrets. The password reaches a worker only on its stdin, once, as base64 —
+never in argv, never in the script text, never in the worker command line, and
+never inside a request frame. All worker output passes the redaction filter.
+
+Honest limits, stated rather than hidden:
+
+- A reboot started **from inside the guest** has no host-side hook, so it is
+  detected on the next call's failure (broken session, discard, retry once), not
+  proactively. A per-call epoch probe would close that gap at the cost of one
+  guest round trip per call, which defeats the purpose of pooling.
+- The audit record's `ps_spawns` is **not** zero for a pooled guest call: every
+  guest call still pays the identity-resolution leg, which is a real process
+  spawn. Pooling removes the session establishment, not the resolution. The
+  timing trio's `psdirect_session_ms` therefore appears only on the call that
+  opened each session.
+- Setting `"psdirect_session_reuse": false` restores the exact per-call path.
+
+`scripts/soak_bench.py --session-reuse off,on` runs each agent count once with
+reuse off and once with it on, so the before/after latency comparison is one
+command (live mode; see the soak section).
   `structuredContent`. The five keys are the minimum set; module-level
   diagnostics (`timed_out`, `stopped`, `alive_pids`, ...) ride alongside,
   and per-VM `busy` failures additionally carry `holder`

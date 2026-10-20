@@ -129,7 +129,7 @@ def test_soak_bench_fake_mode_reports_a_rejection_only_run_as_such(monkeypatch):
 
     import hyperv_mcp.server as server_module
 
-    def denying_server(mode, audit_log):
+    def denying_server(mode, audit_log, session_reuse=None):
         """A server whose policy matches no VM name at all.
 
         Returns the (module, teardown) pair `_run` unpacks; the teardown

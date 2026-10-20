@@ -194,6 +194,31 @@ def audited_server(tmp_path, fresh_server):
     return mod, log
 
 
+@pytest.fixture()
+def audited_server_percall(tmp_path, fresh_server):
+    """audited_server with `psdirect_session_reuse` OFF (issue #21).
+
+    The `__MCP_TIMING` marker protocol under test belongs to the PER-CALL host
+    script. On the pooled path the worker carries `guest_ms` in its response
+    frame instead and emits no marker, so a bootstrapped server with reuse on
+    desynchronises the scripted child stdout this test serves. Reuse-off is the
+    honest way to pin the per-call instrumentation; the pooled path's timing
+    honesty is pinned separately by test_d05_psdirect_sessions (C18: a reused
+    call reports ps_spawns == 0 and no psdirect_session_ms).
+    """
+    log = tmp_path / "audit-d04.jsonl"
+    doc = {
+        "allowed_vm_patterns": ["test-*"],
+        "audit_log_path": str(log),
+        "destructive": {"console_input": True},
+        "psdirect_session_reuse": False,
+    }
+    p = tmp_path / "d04-config.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    mod = fresh_server({"HYPERV_MCP_CONFIG": str(p)})
+    return mod, log
+
+
 def _rows(log) -> list[dict]:
     return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
 
@@ -343,14 +368,14 @@ def test_audit_timing_has_lock_wait_and_total(audited_server, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_guest_timing_separates_psdirect_session_setup(audited_server, monkeypatch):
+def test_guest_timing_separates_psdirect_session_setup(audited_server_percall, monkeypatch):
     """AC5: a guest-leg script that emits the __MCP_TIMING marker gets its
     ps_startup_ms/psdirect_session_ms/guest_ms into the audit timing with the
     marker's numeric values; a marker-less script reports all three as None.
     The marker rides the REAL run_ps (a scripted fake child under a patched
     Popen), so it reaches the collector the way the real protocol does.
     RED at base, GREEN after the fix."""
-    mod, log = audited_server
+    mod, log = audited_server_percall
     _guest_env(monkeypatch)
     marker = '__MCP_TIMING={"ps_startup_ms":120,"psdirect_session_ms":340,"guest_ms":900}'
     guest_with_marker = (

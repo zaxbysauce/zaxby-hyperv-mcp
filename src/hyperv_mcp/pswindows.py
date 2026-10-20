@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -29,6 +31,7 @@ import time
 from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol, TypeVar
 
 import anyio
 
@@ -388,6 +391,45 @@ def redact(text: str) -> str:
 # the OS (a named kernel semaphore would leak capacity instead). A fresh
 # open per acquisition excludes correctly between threads of one process
 # (separate file objects / open file descriptions) and across processes.
+
+@dataclass
+class PooledResult:
+    """The pooled-path counterpart of :class:`PSResult`.
+
+    Deliberately NOT a PSResult: ``PSResult.__post_init__`` feeds the active
+    timing collector's spawn counter, and a REUSED session must not claim a host
+    spawn that never happened (issue #21, AC21). Same field names, so every
+    consumer that reads ``stdout`` / ``stderr`` / ``returncode`` / ``timed_out``
+    works unchanged.
+    """
+
+    stdout: str
+    stderr: str = ""
+    returncode: int | None = None
+    timed_out: bool = False
+    duration_ms: int = 0
+    #: Guest-side work, reported by the worker from inside the session.
+    guest_ms: int | None = None
+    #: "session" when the PSSession itself broke before any guest-side effect
+    #: (retryable on a fresh session), "guest" when the inner script ran.
+    phase: str = "guest"
+    #: The guest's current boot epoch, reported by the worker on every response.
+    boot_epoch: str | None = None
+
+
+class _ResultLike(Protocol):
+    """What :func:`check_result` reads. Both PSResult and PooledResult
+    satisfy it, so the per-call and pooled paths share one validator without
+    either losing its concrete type at the call site."""
+
+    stdout: str
+    stderr: str
+    returncode: int | None
+    timed_out: bool
+
+
+_ResultT = TypeVar("_ResultT", bound=_ResultLike)
+
 
 _REAL_POPEN = subprocess.Popen  # bound at import: survives test patches of the module attribute
 
@@ -752,13 +794,21 @@ def _decode_clixml(text: str) -> str:
     return "\n".join(lines) if lines else text
 
 
-def check_result(result: PSResult, ctx: str = "") -> PSResult:
-    """Raise RuntimeError (redacted) when a completed run failed or timed out."""
+def check_result(result: _ResultT, ctx: str = "") -> _ResultT:
+    """Raise PowerShellTransportError (redacted) when a completed run failed or
+    timed out.
+
+    PowerShellTransportError is already a RuntimeError subclass, so every
+    existing caller that catches RuntimeError keeps working; the narrower type
+    is what the rest of the codebase maps to ``error_class: "transport"``.
+    """
     if result.timed_out:
-        raise RuntimeError(f"{ctx}: PowerShell timed out" if ctx else "PowerShell timed out")
+        raise PowerShellTransportError(
+            f"{ctx}: PowerShell timed out" if ctx else "PowerShell timed out"
+        )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "unknown PowerShell error"
-        raise RuntimeError(f"{ctx}: {detail}" if ctx else detail)
+        raise PowerShellTransportError(f"{ctx}: {detail}" if ctx else detail)
     return result
 
 
@@ -903,3 +953,344 @@ def compose_remote(
         + " -ErrorAction Stop"
     )
     return script, new_stdin
+
+
+# ---------------------------------------------------------------------------
+# long-lived workers (issue #21)
+#
+# `run_ps` above spawns a child, runs ONE script and tears the child down with
+# the Job Object. A pooled session needs the opposite: a child that outlives the
+# call and answers many requests over stdin/stdout. This is the only other place
+# in the module that spawns, and it reuses every piece of the plumbing above —
+# the host-wide slot pool (held for the worker's WHOLE lifetime), the
+# kill-on-close Job Object, suspended start + resume, `child_env`,
+# CREATE_NO_WINDOW, and a finally-guarded teardown that kills the tree and
+# releases the slot. A worker therefore dies with the server process even if
+# nobody closes it politely.
+# ---------------------------------------------------------------------------
+
+_WORKER_EXIT = "__MCP_WORKER_EXIT__"
+#: Slack added to a per-call timeout so the host does not kill a worker that
+#: is about to answer. Same 10 s guestexec uses for the per-call path.
+_WORKER_GRACE_S = 10
+
+
+class PooledWorker:
+    """One long-lived host `powershell.exe` hosting a single PSSession.
+
+    The protocol is one base64 JSON line per request on stdin and one base64
+    JSON line per response on stdout. Responses are framed that way — rather
+    than being the guest script's raw stdout — so a guest script that prints
+    arbitrary bytes can never desynchronise the host.
+
+    Reads happen on a daemon thread that pushes lines onto a queue, because a
+    blocking `readline()` cannot honour a per-call timeout and Windows pipes are
+    not selectable.
+    """
+
+    def __init__(self, proc, job, slot, boot_epoch, session_ms):
+        self._proc = proc
+        self._job = job
+        self._slot = slot
+        self.boot_epoch = boot_epoch
+        self.session_ms = session_ms
+        self._lines: queue.Queue = queue.Queue()
+        self._reader = threading.Thread(
+            target=self._pump, name="pswindows-worker-reader", daemon=True
+        )
+        self._reader.start()
+        self._dead = False
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def _pump(self) -> None:
+        try:
+            while True:
+                raw = self._proc.stdout.readline()
+                if not raw:
+                    break
+                self._lines.put(raw)
+        except Exception:
+            pass
+        finally:
+            self._lines.put(None)  # EOF sentinel
+
+    def is_alive(self) -> bool:
+        return not self._dead and self._proc.poll() is None
+
+    def close(self) -> None:
+        """Kill the worker tree and release its slot. Idempotent.
+
+        The release runs on EVERY call, including after a timeout already marked
+        the worker dead: `run` kills the tree on a timeout but leaves the slot to
+        this method, and an early return there would strand one of the
+        host-wide `max_host_powershell` slots for the life of the process.
+        """
+        first_close = not self._dead
+        self._dead = True
+        if first_close:
+            try:
+                if self._proc.stdin is not None:
+                    self._proc.stdin.write((_WORKER_EXIT + "\n").encode("ascii"))
+                    self._proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                self._proc.wait(timeout=5)
+            except Exception:
+                pass
+            self._kill_tree()
+        try:
+            self._proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            self._proc.stdin.close()
+        except Exception:
+            pass
+        if self._job is not None:
+            try:
+                ctypes.windll.kernel32.CloseHandle(self._job)
+            except OSError:
+                pass
+        if self._slot is not None:
+            _release_ps_slot(self._slot)
+
+    def _kill_tree(self) -> None:
+        try:
+            if self._job is not None:
+                ctypes.windll.kernel32.TerminateJobObject(self._job, 1)
+        except Exception:
+            pass
+        try:
+            self._proc.kill()
+        except OSError:
+            pass
+
+    # -- requests ----------------------------------------------------------
+
+    def run(self, inner_script: str, *, elevated: bool = False,
+            timeout_ms: int | None = None) -> PooledResult:
+        """Run one inner guest script over the pooled session.
+
+        `elevated` is accepted for signature parity with the per-call path; the
+        guest-side elevation happens inside the inner script (Start-Process
+        -Verb RunAs), exactly as it does today, so it needs nothing here.
+        """
+        if self._dead or self._proc.poll() is not None:
+            return PooledResult(
+                stdout="", stderr="the pooled worker is not running",
+                returncode=None, phase="session",
+            )
+        timeout_s = (
+            float(timeout_ms) / 1000.0 + _WORKER_GRACE_S
+            if timeout_ms is not None
+            else float(_config.ps_timeout_s if _config else 120)
+        )
+        started = time.monotonic()
+        frame = json.dumps({
+            "script": inner_script,
+            "expect_epoch": self.boot_epoch,
+        })
+        try:
+            if self._proc.stdin is None:
+                raise OSError("the pooled worker has no stdin")
+            self._proc.stdin.write(
+                (base64.b64encode(frame.encode("utf-8")).decode("ascii") + "\n").encode("ascii")
+            )
+            self._proc.stdin.flush()
+        except OSError as exc:
+            self._dead = True
+            return PooledResult(
+                stdout="", stderr=redact(str(exc)), returncode=None, phase="session",
+            )
+        try:
+            line = self._lines.get(timeout=timeout_s)
+        except queue.Empty:
+            self._kill_tree()
+            self._dead = True
+            return PooledResult(
+                stdout="",
+                stderr=f"pooled worker timeout after {timeout_s:g}s",
+                returncode=None,
+                timed_out=True,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                phase="session",
+            )
+        if line is None:
+            self._dead = True
+            return PooledResult(
+                stdout="", stderr="the pooled worker exited", returncode=None,
+                phase="session",
+            )
+        duration_ms = int((time.monotonic() - started) * 1000)
+        return _decode_worker_response(line, duration_ms)
+
+
+def _decode_worker_response(line: bytes, duration_ms: int) -> PooledResult:
+    """Turn one base64 JSON response frame into a PooledResult."""
+    try:
+        payload = json.loads(
+            base64.b64decode(line.strip()).decode("utf-8", "replace")
+        )
+    except Exception:
+        return PooledResult(
+            stdout="", stderr="unreadable pooled worker response",
+            returncode=None, phase="session", duration_ms=duration_ms,
+        )
+    if not isinstance(payload, dict):
+        return PooledResult(
+            stdout="", stderr="unexpected pooled worker response shape",
+            returncode=None, phase="session", duration_ms=duration_ms,
+        )
+    # `stdout` always carries a JSON object, so every caller can unwrap it with
+    # the SAME json.loads it already runs on the per-call host script's output.
+    # On success that object is {exit_code, stdout, stderr, duration_ms} — the
+    # wrapper the guest body emits — and on failure it is {ok: false, error,
+    # phase}, which is what tells the caller whether the failure is retryable.
+    if not payload.get("ok"):
+        return PooledResult(
+            stdout=json.dumps({
+                "ok": False,
+                "error": str(payload.get("error") or "pooled worker failure"),
+                "phase": str(payload.get("phase") or "session"),
+                "boot_epoch": payload.get("boot_epoch"),
+            }),
+            returncode=0,
+            duration_ms=duration_ms,
+            phase=str(payload.get("phase") or "session"),
+            boot_epoch=payload.get("boot_epoch"),
+        )
+    return PooledResult(
+        stdout=json.dumps({
+            "exit_code": payload.get("exit_code"),
+            "stdout": str(payload.get("stdout") or ""),
+            "stderr": str(payload.get("stderr") or ""),
+            "duration_ms": payload.get("guest_ms"),
+        }),
+        returncode=0,
+        timed_out=False,
+        duration_ms=duration_ms,
+        guest_ms=payload.get("guest_ms"),
+        phase=str(payload.get("phase") or "guest"),
+        boot_epoch=payload.get("boot_epoch"),
+    )
+
+
+def spawn_worker(script: str, credential_b64: str | None = None) -> PooledWorker:
+    """Start a long-lived host PowerShell worker running `script`.
+
+    Same plumbing as `run_ps`: one host-wide slot (held for the worker's whole
+    lifetime, released on close), a kill-on-close Job Object assigned before the
+    process is resumed, `child_env`, CREATE_NO_WINDOW, and a finally-guarded
+    teardown. The credential arrives on the worker's stdin as its first line and
+    appears nowhere else.
+
+    Returns a `PooledWorker` whose `run` answers one request at a time.
+    """
+    if _ps_path is None:
+        raise PowerShellTransportError("pswindows.init() was not called")
+    argv = [_ps_path, "-NonInteractive", "-NoProfile", "-EncodedCommand",
+            encode_command(_PS_PIN + script)]
+    slot = _acquire_ps_slot()
+    job = None
+    proc = None
+    try:
+        job = _make_kill_on_close_job() if os.name == "nt" else None
+        creationflags = _CREATE_SUSPENDED if os.name == "nt" else 0
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=(
+                creationflags | _CREATE_NO_WINDOW if os.name == "nt" else creationflags
+            ),
+            env=child_env(),
+        )
+        if job is not None:
+            _assign_to_job(job, int(proc._handle))  # type: ignore[attr-defined]
+        if os.name == "nt" and not _resume_process(proc.pid):
+            raise PowerShellTransportError("could not resume suspended worker process")
+    except OSError as exc:
+        _release_ps_slot(slot)
+        raise PowerShellTransportError(
+            f"failed to spawn pooled worker: {redact(str(exc))}"
+        ) from None
+    except Exception:
+        if proc is not None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        if job is not None:
+            try:
+                ctypes.windll.kernel32.CloseHandle(job)
+            except OSError:
+                pass
+        _release_ps_slot(slot)
+        raise
+
+    # The worker reads its credential as its first stdin line. Writing one short
+    # line cannot fill the pipe buffer, so there is no ordering hazard.
+    if credential_b64 is not None and proc.stdin is not None:
+        try:
+            proc.stdin.write((credential_b64 + "\n").encode("ascii"))
+            proc.stdin.flush()
+        except OSError as exc:
+            _abandon_worker(proc, job, slot)
+            raise PowerShellTransportError(
+                f"could not deliver the credential to the pooled worker: "
+                f"{redact(str(exc))}"
+            ) from None
+
+    # The worker's open handshake is one response frame reporting the guest's
+    # boot epoch; it is what makes the epoch part of the key meaningful.
+    boot_epoch = None
+    session_ms = None
+    line = _read_first_line(proc, timeout=60.0)
+    if line:
+        try:
+            payload = json.loads(base64.b64decode(line.strip()).decode("utf-8", "replace"))
+            if isinstance(payload, dict) and payload.get("ok"):
+                boot_epoch = payload.get("boot_epoch")
+                session_ms = payload.get("session_ms")
+        except Exception:
+            boot_epoch = None
+    return PooledWorker(proc, job, slot, boot_epoch, session_ms)
+
+
+def _abandon_worker(proc, job, slot) -> None:
+    """Kill a half-started worker and release everything it holds."""
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    if job is not None:
+        try:
+            ctypes.windll.kernel32.CloseHandle(job)
+        except OSError:
+            pass
+    _release_ps_slot(slot)
+
+
+def _read_first_line(proc, timeout: float) -> bytes:
+    """Read one line from `proc.stdout` with a deadline, on a throwaway thread.
+
+    A blocking `readline()` cannot honour a deadline and Windows pipes are not
+    selectable, so the read happens on a daemon thread and this call waits on a
+    queue.
+    """
+    q: queue.Queue = queue.Queue()
+
+    def _pump() -> None:
+        try:
+            q.put(proc.stdout.readline())
+        except Exception:
+            q.put(b"")
+
+    threading.Thread(target=_pump, daemon=True).start()
+    try:
+        return q.get(timeout=timeout)
+    except queue.Empty:
+        return b""

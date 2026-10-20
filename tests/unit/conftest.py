@@ -143,6 +143,7 @@ def _restore_bootstrap_module_globals():
     one test's config out of the next test."""
     from hyperv_mcp import auditlog as _a
     from hyperv_mcp import credentials as _c
+    from hyperv_mcp import psdsessions as _ps
     from hyperv_mcp import pswindows as _pw
     from hyperv_mcp import server as _srv
     from hyperv_mcp import vmlocks as _vl
@@ -158,6 +159,12 @@ def _restore_bootstrap_module_globals():
         # a test reaching bootstrap leaks its vm_lock_wait_s into the rest of
         # the session (review CLEAN-note on PR #58).
         ("vmlocks", "_DEFAULT_WAIT_S"): getattr(_vl, "_DEFAULT_WAIT_S", 30.0),
+        # issue #21: bootstrap() installs the reusable PS Direct session pool
+        # when psdirect_session_reuse is on, which the default Config is. Without
+        # restoring DEFAULT, every later guest-tool test in the session routes
+        # pooled into the real spawn path instead of the per-call path it was
+        # written against.
+        ("psdsessions", "DEFAULT"): getattr(_ps, "DEFAULT", None),
     }
     yield
     _a._config = saved[("auditlog", "_config")]
@@ -167,4 +174,5 @@ def _restore_bootstrap_module_globals():
     _srv._bootstrapped = saved[("server", "_bootstrapped")]
     _srv.CFG = saved[("server", "CFG")]
     _vl._DEFAULT_WAIT_S = saved[("vmlocks", "_DEFAULT_WAIT_S")]
+    _ps.DEFAULT = saved[("psdsessions", "DEFAULT")]
 

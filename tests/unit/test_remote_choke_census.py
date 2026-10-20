@@ -121,6 +121,13 @@ READLINE_BUDGETS = {
     ("pswindows.py", "_remote_parts"): 2,      # hostpw line + param-loop f-string
     ("guestexec.py", "psdirect_prefix"): 1,    # pinned local-mode emission
     ("console.py", "type_text"): 1,            # pinned local-mode inline emission
+    # issue #21: the pooled worker's OWN stdin channel. The first read takes the
+    # credential line the pool writes before any request; the second reads one
+    # request frame per call. Neither is a remote-hop preamble, which is what
+    # this guardrail exists to protect — a new read inside a remote branch would
+    # hang remote calls, and these are outside every hop.
+    ("psdsessions.py", "_worker_loop"): 2,
+    ("psdsessions.py", "_placeholder_loop"): 1,  # the no-credential unit-test shape
 }
 
 

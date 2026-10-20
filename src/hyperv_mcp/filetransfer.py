@@ -41,7 +41,7 @@ import os
 import secrets
 from uuid import uuid4
 
-from . import policy, pswindows, vmident, vmlocks
+from . import guestexec, policy, pswindows, vmident, vmlocks
 from .config import Config
 from .credentials import CredentialSet
 from .guestexec import psdirect_prefix, vm_target_preamble
@@ -199,6 +199,55 @@ def _deny_root_destination(cfg: Config, cp: policy.CanonicalPath, key: str, cate
             continue
         if rr.replace("/", "\\").casefold().rstrip("\\") == dest:
             raise policy.PolicyDenied(category, "destination equals a configured root")
+
+
+def _read_file_inner(remote: str, max_bytes: int, cfg=None) -> str:
+    """The GUEST-side half of `guest_read_file`, as a standalone inner script.
+
+    The per-call path embeds this text inside `Invoke-Command -VMId
+    -ScriptBlock { ... }` together with the credential preamble and the
+    $vmTarget binding; the pooled path hands exactly this text to the worker,
+    which already holds the session and the credential. Keeping one source for
+    the guest logic is what stops the two transports from drifting.
+    """
+    return f"""
+$path = {pswindows.ps_quote(remote)}
+{_guest_root_assertion(remote, _effective_guest_roots(cfg, 'guest_read_roots'), 'read').strip()}
+$stream = [System.IO.File]::Open($path, 'Open', 'Read', 'Read')
+try {{
+    $buf = New-Object byte[] ({int(max_bytes)} + 1)
+    $read = 0
+    while ($read -lt ({int(max_bytes)} + 1)) {{
+        $n = $stream.Read($buf, $read, {int(max_bytes)} + 1 - $read)
+        if ($n -le 0) {{ break }}
+        $read += $n
+    }}
+}} finally {{ $stream.Dispose() }}
+$truncated = $read -gt {int(max_bytes)}
+if ($truncated) {{ $read = {int(max_bytes)} }}
+[PSCustomObject]@{{
+    content_b64 = [System.Convert]::ToBase64String($buf, 0, $read)
+    bytes_read = $read
+    truncated = $truncated
+}} | ConvertTo-Json -Compress
+""".strip()
+
+
+def _list_dir_inner(remote: str, cfg=None) -> str:
+    """The GUEST-side half of `guest_list_dir` (see `_read_file_inner`)."""
+    return f"""
+$path = {pswindows.ps_quote(remote)}
+{_guest_root_assertion(remote, _effective_guest_roots(cfg, 'guest_read_roots'), 'read').strip()}
+$items = Get-ChildItem -LiteralPath $path -ErrorAction Stop | ForEach-Object {{
+    [PSCustomObject]@{{
+        name       = $_.Name
+        is_dir     = $_.PSIsContainer
+        size_bytes = if ($_.PSIsContainer) {{ 0 }} else {{ $_.Length }}
+        modified   = $_.LastWriteTimeUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    }}
+}}
+if ($items) {{ @($items) | ConvertTo-Json -Compress }} else {{ '[]' }}
+""".strip()
 
 
 def _session_body(cred: CredentialSet, vm_id: str, script_body: str, cfg=None) -> str:
@@ -864,6 +913,29 @@ $r = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptB
 }} -ArgumentList {pswindows.ps_quote(remote)}, {int(max_bytes)}
 $r | ConvertTo-Json -Compress
 """
+    pool = guestexec._pooled_pool(cfg)
+    if pool is not None:
+        pooled = guestexec._run_pooled_raw(
+            cfg, pool, ref.id, _read_file_inner(remote, max_bytes, cfg), cred, 120000,
+        )
+        if pooled is not None:
+            result = pooled
+            if result.timed_out:
+                return {"ok": False, "vm_name": ref.name, "error": "host timeout reading guest file", "error_class": "timeout"}
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip() or "unknown PowerShell error"
+                return {"ok": False, "vm_name": ref.name, "error": detail, "error_class": _failure_class(detail)}
+            try:
+                data = json.loads(result.stdout)
+                return {
+                    "ok": True,
+                    "vm_name": ref.name,
+                    "content_b64": data.get("content_b64"),
+                    "bytes_read": data.get("bytes_read"),
+                    "truncated": data.get("truncated"),
+                }
+            except json.JSONDecodeError as exc:
+                return {"ok": False, "vm_name": ref.name, "error": f"result JSON parse failed: {exc}", "error_class": "parse"}
     with vmlocks.vm_lock(ref.id, mode="read"):
         result = _run(
             cfg, body.strip(), timeout_s=120, stdin_b64=pswindows.utf8_b64(cred.password)
@@ -920,6 +992,28 @@ $items = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -Scr
 }} -ArgumentList {pswindows.ps_quote(remote)}
 if ($items) {{ @($items) | ConvertTo-Json -Compress }} else {{ '[]' }}
 """
+    pool = guestexec._pooled_pool(cfg)
+    if pool is not None:
+        pooled = guestexec._run_pooled_raw(
+            cfg, pool, ref.id, _list_dir_inner(remote, cfg), cred, 60000,
+        )
+        if pooled is not None:
+            result = pooled
+            if result.timed_out:
+                return {"ok": False, "vm_name": ref.name, "error": "host timeout listing guest directory", "error_class": "timeout"}
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip() or "unknown PowerShell error"
+                return {"ok": False, "vm_name": ref.name, "error": detail, "error_class": _failure_class(detail)}
+            try:
+                raw = result.stdout.strip()
+                if not raw or raw == "null":
+                    entries = []
+                else:
+                    parsed = json.loads(raw)
+                    entries = [parsed] if isinstance(parsed, dict) else list(parsed)
+                return {"ok": True, "vm_name": ref.name, "entries": entries}
+            except json.JSONDecodeError as exc:
+                return {"ok": False, "vm_name": ref.name, "error": f"result JSON parse failed: {exc}", "error_class": "parse"}
     with vmlocks.vm_lock(ref.id, mode="read"):
         result = _run(
             cfg, body.strip(), timeout_s=60, stdin_b64=pswindows.utf8_b64(cred.password)

@@ -54,6 +54,7 @@ from . import (
     guestjobs,
     lifecycle,
     media,
+    psdsessions,
     pswindows,
     relay,
     repair,
@@ -160,7 +161,14 @@ def _make_tool_limiter_lifespan(cap: int):
         # The SDK's default lifespan yields {}; replacing it with a bare
         # yield would make request_context.lifespan_context None for any
         # embedder that subscripts it.
-        yield {}
+        try:
+            yield {}
+        finally:
+            # Every pooled PowerShell Direct worker is a live host
+            # powershell.exe holding a decrypted credential. Closing them here
+            # is what returns the host process count to zero on server exit
+            # without waiting out the idle TTL (issue #21).
+            psdsessions.close_default_pool()
 
     return _tool_limiter_lifespan
 
@@ -175,6 +183,10 @@ def bootstrap(environ: dict[str, str] | None = None) -> Config:
     pswindows.init(cfg, credentials.redact)
     auditlog.init(cfg)
     vmlocks.set_default_wait_s(cfg.vm_lock_wait_s)  # issue #14 bounded lock wait
+    # issue #21: install the reusable PS Direct session pool. A no-op when the
+    # flag is off, and the session cap is derived from the host PowerShell cap
+    # so pooled workers cannot starve the per-call legs of slots.
+    psdsessions.install_default_pool(cfg)
     auth = None
     if _http_token_verifier is not None:
         # MCPServer requires AuthSettings when a token_verifier is installed.

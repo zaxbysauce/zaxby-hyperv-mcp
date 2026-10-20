@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import re
 
-from . import credentials, policy, pswindows, vmident, vmlocks
+from . import credentials, policy, psdsessions, pswindows, timing, vmident, vmlocks
 from .config import Config
 from .credentials import CredentialSet
 
@@ -311,6 +311,235 @@ $__mcpGuestMs = if ($null -ne $r.duration_ms) {{ [int]$r.duration_ms }} else {{ 
 """
 
 
+def _pooled_pool(cfg: Config):
+    """The pool this call may use, or None.
+
+    Four conditions, all required: the config switch is on, a pool is installed,
+    the mode is LOCAL (a pooled worker would have to be spawned on the remote
+    host through a second transport this change does not add — issue #43), and a
+    credential is available. Anything else takes the per-call path unchanged,
+    which is what every unit test and every flag-off deployment exercises.
+    """
+    if not getattr(cfg, "psdirect_session_reuse", False):
+        return None
+    if pswindows.hyperv_host(cfg):
+        return None
+    pool = psdsessions.DEFAULT
+    return pool if pool is not None and not pool.stats().get("closed") else None
+
+
+def _session_key(vm_id: str, cred: CredentialSet) -> psdsessions.SessionKey:
+    """The pool key for one guest call: (VM GUID, credential profile, agent id,
+    boot epoch). The agent id is the authenticated bearer-token client_id and is
+    None on the paths that carry no identity — README.md:1078-1080 documents that
+    in those modes all callers form one local principal, so None is one bucket
+    rather than a blocker."""
+    from . import auditlog
+
+    return psdsessions.SessionKey(
+        vm_guid=vm_id,
+        cred_profile=psdsessions.credential_profile(cred),
+        agent_id=auditlog.current_agent_id(),
+        boot_epoch=None,
+    )
+
+
+def _run_pooled_raw(
+    cfg: Config,
+    pool,
+    vm_id: str,
+    inner_script: str,
+    cred: CredentialSet,
+    timeout_ms: int,
+    elevated: bool = False,
+):
+    """Run one inner script over a REUSED PowerShell Direct session.
+
+    Returns the worker's result, or None to fall back to the per-call path.
+
+    The fallback is the load-bearing property: the pooled path is an
+    optimisation, so it must never be able to fail a call the per-call path
+    would have served. It falls back whenever it cannot produce a DEFINITIVE
+    guest result — the pool is busy, the worker could not be spawned, the worker
+    died, or two consecutive attempts failed at the session phase (which means
+    no guest-side effect happened, so re-running the script is safe). A
+    guest-phase result is definitive and is reported as-is.
+
+    On a session-phase failure the worker is discarded and the call is retried
+    exactly once on a fresh session; a guest-phase failure is a RESULT, not a
+    transport fault, and is never retried — the guest already ran the script.
+    """
+    if pool is None:
+        return None
+    key = _session_key(vm_id, cred)
+    wait_s = float(getattr(cfg, "host_powershell_wait_s", 0.0) or 0.0)
+    try:
+        worker = pool.acquire(key, wait_s, cred=cred)
+    except Exception:
+        return None
+
+    def _attempt(session):
+        result = session.run(inner_script, elevated=elevated, timeout_ms=timeout_ms)
+        if result.timed_out:
+            # A per-call timeout kills the worker (the guest work may still be
+            # running); it must never be handed out again. The result itself is
+            # definitive and is reported.
+            pool.discard(session)
+        return result
+
+    try:
+        opened_ms = pool.take_open_cost(worker)
+        result = _attempt(worker)
+        _report_pooled_timing(result, opened_ms)
+        if not result.timed_out and _phase(result) == "session":
+            pool.discard(worker)
+            try:
+                worker = pool.acquire(key, wait_s, cred=cred)
+            except Exception:
+                return None
+            try:
+                result = _attempt(worker)
+                _report_pooled_timing(result, None)
+            except Exception:
+                pool.discard(worker)
+                return None
+            if not result.timed_out and _phase(result) == "session":
+                # Two session-phase failures and still no guest-side effect:
+                # hand the call to the per-call path rather than report a
+                # transport error the caller could have avoided.
+                pool.discard(worker)
+                return None
+        return result
+    except Exception:
+        pool.discard(worker)
+        return None
+    finally:
+        pool.release(worker)
+
+
+def _report_pooled_timing(result, opened_ms: int | None) -> None:
+    """Feed the audit timing collector for one pooled call.
+
+    Honest by construction: a call that OPENED the worker reports the spawn and
+    session-establishment cost it actually paid (`ps_spawns` incremented, the
+    full trio); a call that REUSED a session reports only the guest-side work
+    and increments no spawn, because no process was started. Without this the
+    pooled path would be invisible in the audit record and the before/after
+    comparison `soak_bench --session-reuse` exists to make would have nothing to
+    compare.
+    """
+    collector = timing.current()
+    if collector is None:
+        return
+    payload = _pooled_payload(result) or {}
+    guest_ms = payload.get("duration_ms")
+    if not isinstance(guest_ms, int):
+        guest_ms = getattr(result, "guest_ms", None)
+    if opened_ms is None:
+        collector.add_pooled(0, {"guest_ms": guest_ms}, spawned=False)
+        return
+    collector.add_pooled(
+        opened_ms,
+        {
+            "ps_startup_ms": opened_ms,
+            "psdirect_session_ms": getattr(result, "duration_ms", None) or opened_ms,
+            "guest_ms": guest_ms,
+        },
+        spawned=True,
+    )
+
+
+def _pooled_payload(result) -> dict | None:
+    """The JSON object a pooled worker's response carries, or None if there
+    isn't one. Every caller already json.loads this on the per-call path, so the
+    pooled path reuses that exact unwrap rather than inventing a second shape."""
+    try:
+        data = json.loads((result.stdout or "").strip() or "{}")
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _phase(result) -> str:
+    """"session" when the pooled worker reports that the SESSION failed, as
+    opposed to the guest scriptblock having run. Only a session failure is
+    retryable on a fresh session; a guest-phase result is definitive.
+
+    Three independent signals, because a worker that died before answering has
+    no wrapper to read: the wrapper's own `phase`, the result object's `phase`
+    attribute, and a missing return code (a completed host leg always has one).
+    Any of them means "no guest-side effect", which is what makes the retry and
+    the per-call fallback safe.
+    """
+    payload = _pooled_payload(result)
+    if payload and payload.get("phase") == "session":
+        return "session"
+    if getattr(result, "phase", "guest") == "session":
+        return "session"
+    if getattr(result, "returncode", 0) is None:
+        return "session"
+    return "guest"
+
+
+def _run_pooled(
+    cfg: Config,
+    pool,
+    vm_id: str,
+    inner_script: str,
+    cred: CredentialSet,
+    timeout_ms: int,
+    elevated: bool,
+) -> dict | None:
+    """The `_run_inner` envelope over a pooled call, or None to fall back."""
+    result = _run_pooled_raw(cfg, pool, vm_id, inner_script, cred, timeout_ms, elevated)
+    if result is None:
+        return None
+    return _pooled_envelope(cfg, result, elevated, timeout_ms)
+
+
+def _pooled_envelope(cfg: Config, result, elevated: bool, timeout_ms: int = 0) -> dict:
+    """Turn a pooled worker's response into the same envelope _run_inner returns."""
+    if result.timed_out:
+        timeout_s = max(30, timeout_ms // 1000 + _GRACE_S) if timeout_ms else 30
+        return {
+            **_result_err(
+                cfg,
+                f"host timeout after {timeout_s}s; guest execution may still be running",
+                "timeout",
+            ),
+            "timed_out": True,
+        }
+    if result.returncode is None:
+        return _result_err(cfg, result.stderr or "pooled session failure", "transport")
+    raw = (result.stdout or "").strip()
+    if not raw:
+        return _result_err(cfg, "no output from guest", "parse")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return _result_err(cfg, f"guest result JSON parse failed: {exc} | raw: {raw[:200]!r}", "parse")
+    if not isinstance(data, dict) or "exit_code" not in data:
+        return _result_err(cfg, f"unexpected guest result shape: {raw[:200]!r}", "parse")
+    if data.get("ok") is False:
+        return _result_err(
+            cfg,
+            str(data.get("error") or "pooled session failure"),
+            "transport" if data.get("phase") == "session" else "guest",
+        )
+    exit_code = data.get("exit_code")
+    if exit_code is None:
+        return _result_err(cfg, "guest child process produced no exit code", "guest")
+    out = _result_ok(
+        cfg, exit_code, data.get("stdout") or "", data.get("stderr") or "", vm_name=""
+    )
+    if elevated:
+        out["note"] = (
+            "elevated run: guest stdout/stderr are merged (RunAs cannot redirect streams); "
+            "stderr is reported empty"
+        )
+    return out
+
+
 def _run_inner(
     cfg: Config,
     vm_id: str,
@@ -324,7 +553,17 @@ def _run_inner(
 
     GUID-native: the caller resolved the identity (vmident.resolve, which
     also ran the VM policy) and holds the per-VM lock on the same GUID.
+
+    Takes the pooled path when reuse is enabled and a pool is installed, and the
+    per-call path otherwise (issue #21). The two paths produce the same envelope.
     """
+    pool = _pooled_pool(cfg)
+    if pool is not None:
+        pooled = _run_pooled(cfg, pool, vm_id, inner_script, cred, timeout_ms, elevated)
+        if pooled is not None:
+            if vm_name:
+                pooled["vm_name"] = vm_name
+            return pooled
     timeout_s = max(30, timeout_ms // 1000 + _GRACE_S)
     try:
         script, stdin = pswindows.compose_remote(
