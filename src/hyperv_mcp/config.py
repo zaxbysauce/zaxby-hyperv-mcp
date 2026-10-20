@@ -155,6 +155,11 @@ class Config:
     max_host_powershell: int = 8
     host_powershell_wait_s: float = 60.0
     ps_slot_dir: str | None = None
+    # Issue #21 (ENH-05): reuse PowerShell Direct sessions across calls. On by
+    # default; a lab turns it off for a fresh-session comparison run (the soak
+    # harness's --session-reuse off leg). Appended last for the same
+    # positional-compat reason as the fields above.
+    psdirect_session_reuse: bool = True
 
     # -- loading ---------------------------------------------------------
 
@@ -331,6 +336,7 @@ class Config:
             f"max_host_powershell={self.max_host_powershell}",
             f"host_powershell_wait_s={self.host_powershell_wait_s:g}",
             f"ps_slot_dir={self.ps_slot_dir or '(derived default)'}",
+            f"psdirect_session_reuse={self.psdirect_session_reuse}",
         ]
         return "; ".join(lines)
 
@@ -457,6 +463,7 @@ Config._FIELD_MAP = {  # type: ignore[attr-defined]
     "max_host_powershell": lambda c, v: c._set_int("max_host_powershell", v),
     "host_powershell_wait_s": lambda c, v: c._set_number("host_powershell_wait_s", v),
     "ps_slot_dir": lambda c, v: c._set_str_opt("ps_slot_dir", v),
+    "psdirect_session_reuse": lambda c, v: c._set_bool("psdirect_session_reuse", v),
     "hyperv": lambda c, v: c._set_hyperv(v),
     "http": lambda c, v: c._set_http(v),
 }

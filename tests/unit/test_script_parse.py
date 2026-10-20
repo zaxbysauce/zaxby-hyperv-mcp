@@ -600,3 +600,70 @@ def test_parse_media_video(monkeypatch, parsed_ps):
                        for s in rec.scripts), "observed-head script not generated"
         for script in rec.scripts:
             assert _parse_errors(script) == []
+
+
+# ---------------------------------------------------------------------------
+# issue #21: the pooled worker's own PowerShell
+# ---------------------------------------------------------------------------
+
+def _pooled_scripts():
+    """Both PowerShell programs the session pool ships.
+
+    `_worker_loop` is the credentialed read-eval loop every pooled call runs;
+    `_placeholder_loop` is the no-credential shape the unit tests drive. Both
+    are generated text crossing into real PowerShell, so both must parse.
+    """
+    from hyperv_mcp import psdsessions
+
+    key = psdsessions.SessionKey(
+        vm_guid="e953c649-dcab-438d-9a54-3af74a82b624",
+        cred_profile="parse-check",
+        agent_id=None,
+        boot_epoch=None,
+    )
+    credential = psdsessions.establishment_script(key, CredentialSet("Administrator", "parse-pass"))
+    placeholder = psdsessions.establishment_script(key, None)
+    return {
+        "worker_loop": credential[0],
+        "placeholder_loop": placeholder[0],
+    }
+
+
+@pytest.mark.parametrize("name", ["worker_loop", "placeholder_loop"])
+def test_parse_the_pooled_worker_scripts(name):
+    """PRR-025: the credentialed worker loop was the one generated PowerShell
+    program no test ever parse-checked, while the PR body claimed every emitted
+    script was. The loop is built by quote-substitution and line-splitting
+    (`q=chr(39)` plus concatenation), which is exactly the construction that
+    produces a script no mock can validate and no diff can be read in.
+
+    `_parse_errors` runs the real parser, so it needs `pswindows.init`; calling
+    it here rather than inheriting it keeps the check independent of file order
+    (the conftest boundary restores `_ps_path`, PRR-074).
+    """
+    pswindows.init(Config(unrestricted=True))
+    scripts = _pooled_scripts()
+    assert scripts[name].strip(), f"{name} produced no script"
+    assert _parse_errors(scripts[name]) == [], (
+        f"psdsessions.{name} does not parse under PowerShell 5.1"
+    )
+
+
+def test_the_two_pooled_loops_agree_on_the_framing_contract():
+    """PRR-079: the placeholder is a hand-maintained second copy of the framing
+    protocol, so it must answer the same shapes the shipped loop answers. A
+    placeholder that drifts makes every test built on it exercise a protocol the
+    host never sees — which is how a bad frame came to be answered `ok=true`.
+    """
+    scripts = _pooled_scripts()
+    worker, placeholder = scripts["worker_loop"], scripts["placeholder_loop"]
+    for needle in (
+        "phase = " + chr(39) + "frame" + chr(39),
+        "unreadable request frame",
+        "boot_epoch",
+    ):
+        assert needle in worker, f"the shipped loop lost {needle!r}"
+        assert needle in placeholder, (
+            f"the placeholder loop drifted from the shipped loop: {needle!r} "
+            f"is in _worker_loop but not in _placeholder_loop"
+        )

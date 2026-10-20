@@ -41,7 +41,7 @@ import os
 import secrets
 from uuid import uuid4
 
-from . import policy, pswindows, vmident, vmlocks
+from . import guestexec, policy, pswindows, vmident, vmlocks
 from .config import Config
 from .credentials import CredentialSet
 from .guestexec import psdirect_prefix, vm_target_preamble
@@ -199,6 +199,61 @@ def _deny_root_destination(cfg: Config, cp: policy.CanonicalPath, key: str, cate
             continue
         if rr.replace("/", "\\").casefold().rstrip("\\") == dest:
             raise policy.PolicyDenied(category, "destination equals a configured root")
+
+
+def _read_file_inner(remote: str, max_bytes: int, cfg=None) -> str:
+    """The GUEST-side half of `guest_read_file`, as a standalone inner script.
+
+    The per-call path embeds this text inside `Invoke-Command -VMId
+    -ScriptBlock { ... }` together with the credential preamble and the
+    $vmTarget binding; the pooled path hands exactly this text to the worker,
+    which already holds the session and the credential.
+
+    CAVEAT, stated because the claim is easy to over-read: this is one source
+    for the pooled path only. The per-call path carries its own literal body
+    (`guest_read_file` below, and `guest_list_dir` for the sibling tool), so
+    the guest logic exists in TWO independently written copies and a change to
+    one must be made to the other by hand. The census guardrail in
+    `tests/unit/test_d05_pool_census.py` is what keeps the second copy visible.
+    """
+    return f"""
+$path = {pswindows.ps_quote(remote)}
+{_guest_root_assertion(remote, _effective_guest_roots(cfg, 'guest_read_roots'), 'read').strip()}
+$stream = [System.IO.File]::Open($path, 'Open', 'Read', 'Read')
+try {{
+    $buf = New-Object byte[] ({int(max_bytes)} + 1)
+    $read = 0
+    while ($read -lt ({int(max_bytes)} + 1)) {{
+        $n = $stream.Read($buf, $read, {int(max_bytes)} + 1 - $read)
+        if ($n -le 0) {{ break }}
+        $read += $n
+    }}
+}} finally {{ $stream.Dispose() }}
+$truncated = $read -gt {int(max_bytes)}
+if ($truncated) {{ $read = {int(max_bytes)} }}
+[PSCustomObject]@{{
+    content_b64 = [System.Convert]::ToBase64String($buf, 0, $read)
+    bytes_read = $read
+    truncated = $truncated
+}} | ConvertTo-Json -Compress
+""".strip()
+
+
+def _list_dir_inner(remote: str, cfg=None) -> str:
+    """The GUEST-side half of `guest_list_dir` (see `_read_file_inner`)."""
+    return f"""
+$path = {pswindows.ps_quote(remote)}
+{_guest_root_assertion(remote, _effective_guest_roots(cfg, 'guest_read_roots'), 'read').strip()}
+$items = Get-ChildItem -LiteralPath $path -ErrorAction Stop | ForEach-Object {{
+    [PSCustomObject]@{{
+        name       = $_.Name
+        is_dir     = $_.PSIsContainer
+        size_bytes = if ($_.PSIsContainer) {{ 0 }} else {{ $_.Length }}
+        modified   = $_.LastWriteTimeUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    }}
+}}
+if ($items) {{ @($items) | ConvertTo-Json -Compress }} else {{ '[]' }}
+""".strip()
 
 
 def _session_body(cred: CredentialSet, vm_id: str, script_body: str, cfg=None) -> str:
@@ -865,6 +920,28 @@ $r = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptB
 $r | ConvertTo-Json -Compress
 """
     with vmlocks.vm_lock(ref.id, mode="read"):
+        pool = guestexec._pooled_pool(cfg)
+        if pool is not None:
+            pooled = guestexec._run_pooled_raw(
+                cfg, pool, ref.id, _read_file_inner(remote, max_bytes, cfg), cred, 120000,
+            )
+            if pooled is not None:
+                result = pooled
+                if result.timed_out:
+                    return {"ok": False, "vm_name": ref.name, "error": "host timeout reading guest file", "error_class": "timeout"}
+                if result.returncode != 0:
+                    detail = result.stderr.strip() or result.stdout.strip() or "unknown PowerShell error"
+                    return {"ok": False, "vm_name": ref.name, "error": detail, "error_class": _failure_class(detail)}
+                data = guestexec.pooled_guest_payload(result)
+                if not isinstance(data, dict) or "content_b64" not in data:
+                    return {"ok": False, "vm_name": ref.name, "error": "unexpected guest read payload", "error_class": "parse"}
+                return {
+                    "ok": True,
+                    "vm_name": ref.name,
+                    "content_b64": data.get("content_b64"),
+                    "bytes_read": data.get("bytes_read"),
+                    "truncated": data.get("truncated"),
+                }
         result = _run(
             cfg, body.strip(), timeout_s=120, stdin_b64=pswindows.utf8_b64(cred.password)
         )
@@ -921,6 +998,26 @@ $items = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -Scr
 if ($items) {{ @($items) | ConvertTo-Json -Compress }} else {{ '[]' }}
 """
     with vmlocks.vm_lock(ref.id, mode="read"):
+        pool = guestexec._pooled_pool(cfg)
+        if pool is not None:
+            pooled = guestexec._run_pooled_raw(
+                cfg, pool, ref.id, _list_dir_inner(remote, cfg), cred, 60000,
+            )
+            if pooled is not None:
+                result = pooled
+                if result.timed_out:
+                    return {"ok": False, "vm_name": ref.name, "error": "host timeout listing guest directory", "error_class": "timeout"}
+                if result.returncode != 0:
+                    detail = result.stderr.strip() or result.stdout.strip() or "unknown PowerShell error"
+                    return {"ok": False, "vm_name": ref.name, "error": detail, "error_class": _failure_class(detail)}
+                parsed = guestexec.pooled_guest_payload(result)
+                if parsed in (None, {}, ""):
+                    entries = []
+                elif isinstance(parsed, dict):
+                    entries = [parsed]
+                else:
+                    entries = list(parsed)
+                return {"ok": True, "vm_name": ref.name, "entries": entries}
         result = _run(
             cfg, body.strip(), timeout_s=60, stdin_b64=pswindows.utf8_b64(cred.password)
         )

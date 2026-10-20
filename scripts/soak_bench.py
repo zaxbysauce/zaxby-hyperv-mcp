@@ -273,7 +273,7 @@ def _sample(tool: str, result, elapsed_ms: float, token: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _server_for(mode: str, audit_log: Path):
+def _server_for(mode: str, audit_log: Path, session_reuse: bool | None = None):
     """Bootstrap a real server for the run, and return it with a TEARDOWN.
 
     The teardown restores `auditlog._config` to whatever the process had before
@@ -315,6 +315,10 @@ def _server_for(mode: str, audit_log: Path):
     else:
         doc = {"unrestricted": True}
     doc["audit_log_path"] = str(audit_log)
+    if session_reuse is not None:
+        # Written into the config the harness hands bootstrap, so the run
+        # measures the state it claims to rather than a state it only reports.
+        doc["psdirect_session_reuse"] = bool(session_reuse)
     tmp = audit_log.parent
     cfg = tmp / "soak-config.json"
     cfg.write_text(json.dumps(doc), encoding="utf-8")
@@ -399,10 +403,51 @@ def _agent_loop(mcp, stub, token: str, iterations: int, vm: str,
                 samples.append(sample)
 
 
+class _StubPooledWorker:
+    """The fake-mode counterpart of pswindows.PooledWorker.
+
+    Fake mode stubs the transport; the pool's worker factory IS the transport,
+    so leaving pswindows.spawn_worker real would make a --session-reuse on run
+    spawn genuine host powershell.exe children against a fake VM. Stubbing it
+    keeps the "on" row honest about what it measured: the pooled PATH over the
+    same stub the per-call path uses.
+    """
+
+    def __init__(self, stub: SoakStub) -> None:
+        self._stub = stub
+        self.boot_epoch = "fake-boot-epoch"
+        self.session_ms = 25
+        self.closed = False
+
+    def run(self, inner_script: str, *, elevated: bool = False,
+            timeout_ms: int | None = None):
+        payload = {"exit_code": 0, "stdout": self._stub._token(), "stderr": ""}
+        return pswindows.PooledResult(
+            stdout=json.dumps(payload), returncode=0, duration_ms=25, guest_ms=5,
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+    def is_alive(self) -> bool:
+        return not self.closed
+
+
+def _stub_spawn_worker(stub: SoakStub):
+    """A pswindows.spawn_worker replacement bound to one SoakStub."""
+    def _spawn(script: str, credential_b64: str | None = None) -> _StubPooledWorker:
+        return _StubPooledWorker(stub)
+
+    return _spawn
+
+
+
+
 def _run(agents: int, iterations: int, *, stub, vm: str, mode: str,
-         audit_log: Path) -> dict:
+         audit_log: Path, session_reuse: bool | None = None) -> dict:
     """The shared runner. `stub` is a SoakStub for --fake and None for live."""
     saved_run_ps = pswindows.run_ps
+    saved_spawn_worker = pswindows.spawn_worker
     if stub is not None:
         from hyperv_mcp import wmiconsole
 
@@ -414,12 +459,14 @@ def _run(agents: int, iterations: int, *, stub, vm: str, mode: str,
         # transport error instead of a measurement.
         wmiconsole.COM_AVAILABLE = False
         pswindows.run_ps = stub
+        # The pool's worker factory is the transport too (issue #21).
+        pswindows.spawn_worker = _stub_spawn_worker(stub)
     samples: list[dict] = []
     lock = threading.Lock()
     hung: list[str] = []
     try:
         teardown = None
-        mod, teardown = _server_for(mode, audit_log)
+        mod, teardown = _server_for(mode, audit_log, session_reuse)
         mcp = mod.get_mcp()
         threads = [
             threading.Thread(
@@ -450,6 +497,7 @@ def _run(agents: int, iterations: int, *, stub, vm: str, mode: str,
         # (feedback PRR-010). A daemon thread that never returns is the only
         # shape left, and it holds no dependency on the restored globals.
         pswindows.run_ps = saved_run_ps
+        pswindows.spawn_worker = saved_spawn_worker
         if stub is not None:
             wmiconsole.COM_AVAILABLE = saved_com_available
         # teardown stays None when _server_for itself raised, so the finally
@@ -543,7 +591,40 @@ _FAKE_ENV = (
 )
 
 
-def _run_fake(agents: int, iterations: int) -> dict:
+def _parse_reuse(spec: str) -> list[bool | None]:
+    """Parse --session-reuse into a list of states.
+
+    An empty spec is ONE run that leaves the config default alone (the
+    historical behaviour). "off,on" is two runs, with the config key written
+    explicitly so the run measures the state it claims to.
+
+    Each comma-separated token is one run. Accepted spellings: on / off (also
+    true / false, 1 / 0, yes / no), and `default` (or an empty token) for a
+    run that leaves the config default alone. Anything else is an error.
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return [None]
+    out: list[bool | None] = []
+    for token in spec.split(","):
+        token = token.strip().lower()
+        if token in ("off", "false", "0", "no"):
+            out.append(False)
+        elif token in ("on", "true", "1", "yes"):
+            out.append(True)
+        elif token in ("default", ""):
+            out.append(None)
+        else:
+            raise ValueError(
+                f"--session-reuse entries must be off, on or default "
+                f"(true/false, 1/0 and yes/no are accepted too), got {token!r}"
+            )
+    if not out:
+        return [None]
+    return out
+
+
+def _run_fake(agents: int, iterations: int, *, session_reuse: bool | None = None) -> dict:
     stub = SoakStub()
     saved_env = {name: os.environ.get(name) for name in _FAKE_ENV}
     with tempfile.TemporaryDirectory(prefix="hyperv-mcp-soak-") as tmpdir:
@@ -551,6 +632,7 @@ def _run_fake(agents: int, iterations: int) -> dict:
             return _run(
                 agents, iterations, stub=stub, vm=FAKE_VM, mode="fake",
                 audit_log=Path(tmpdir) / "soak-audit.jsonl",
+                session_reuse=session_reuse,
             )
         finally:
             for name, value in saved_env.items():
@@ -583,7 +665,9 @@ def _live_env_ready(vm_override: str) -> tuple[bool, str]:
     return True, vm
 
 
-def _run_live(agents: int, iterations: int, vm_override: str = "") -> dict:
+def _run_live(
+    agents: int, iterations: int, vm_override: str = "", *, session_reuse: bool | None = None
+) -> dict:
     ready, detail = _live_env_ready(vm_override)
     if not ready:
         raise SystemExit(f"soak_bench: live mode refused: {detail}")
@@ -592,6 +676,7 @@ def _run_live(agents: int, iterations: int, vm_override: str = "") -> dict:
         return _run(
             agents, iterations, stub=None, vm=vm, mode="live",
             audit_log=Path(tmpdir) / "soak-audit.jsonl",
+            session_reuse=session_reuse,
         )
 
 
@@ -621,7 +706,7 @@ def _render(row: dict) -> str:
         return f"{value:9.1f}" if isinstance(value, (int, float)) else "      null"
 
     return (
-        f"agents={row['agents']:<3} n={row['n']:<5} ok={row['ok']:<5} "
+        f"session_reuse={row.get('session_reuse')} agents={row['agents']:<3} n={row['n']:<5} ok={row['ok']:<5} "
         f"busy={row['busy']:<3} incorrect={row['incorrect']:<3} "
         f"p50={num('p50_ms')} p95={num('p95_ms')} p99={num('p99_ms')} "
         f"busy_rate={row['busy_rate']:.4f} incorrect_rate={row['incorrect_rate']:.4f}"
@@ -638,6 +723,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--iterations", type=int, default=3, help="loops per agent")
     parser.add_argument("--json", action="store_true", help="one JSON row per agent count")
     parser.add_argument("--vm", default="", help="live mode only: the disposable test VM")
+    # issue #21: run each agent count once with PS Direct session reuse off and
+    # once with it on, so the before/after latency comparison is one command.
+    parser.add_argument(
+        "--session-reuse", default="",
+        help="comma-separated reuse states (off,on); each agent count runs once "
+             "per state. Also accepts true/false, 1/0, yes/no, and `default` "
+             "for a run that leaves the config default alone. Empty means the "
+             "config default, run once",
+    )
     args = parser.parse_args(argv)
 
     if args.iterations < 1:
@@ -648,17 +742,24 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"soak_bench: {exc}", file=sys.stderr)
         return 2
+    try:
+        reuse_states = _parse_reuse(args.session_reuse)
+    except ValueError as exc:
+        print(f"soak_bench: {exc}", file=sys.stderr)
+        return 2
 
-    for count in counts:
-        row = (
-            _run_fake(count, args.iterations)
-            if args.fake
-            else _run_live(count, args.iterations, args.vm)
-        )
-        if args.json:
-            print(json.dumps(row, sort_keys=True))
-        else:
-            print(_render(row))
+    for reuse in reuse_states:
+        for count in counts:
+            row = (
+                _run_fake(count, args.iterations, session_reuse=reuse)
+                if args.fake
+                else _run_live(count, args.iterations, args.vm, session_reuse=reuse)
+            )
+            row["session_reuse"] = reuse
+            if args.json:
+                print(json.dumps(row, sort_keys=True))
+            else:
+                print(_render(row))
     return 0
 
 

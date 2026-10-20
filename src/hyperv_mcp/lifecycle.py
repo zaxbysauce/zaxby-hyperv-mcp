@@ -21,7 +21,7 @@ import re
 import secrets
 from datetime import datetime
 
-from . import guestexec, policy, pswindows, vmident, vmlocks
+from . import guestexec, policy, psdsessions, pswindows, vmident, vmlocks
 from .config import Config
 from .credentials import CredentialSet
 from .guestexec import psdirect_prefix  # re-exported prefix for kd tools
@@ -250,6 +250,45 @@ $snaps = (Get-VMSnapshot -VM $vm -ErrorAction Stop | Measure-Object).Count
     return _add_legacy_aliases(rows[0], _INFO_KEY_ALIASES)
 
 
+def _invalidate_sessions(vm_guid: str, reason: str) -> int:
+    """Close every pooled PowerShell Direct session for this VM (issue #21).
+
+    Called after a lifecycle action SUCCEEDS, inside the VM's write lock: the
+    guest under every holder of a session for this GUID has just been rolled
+    back, stopped, reset or started, so a reused session would point at a guest
+    that no longer matches the one it was opened against. Placed after
+    `check_result` so a FAILED action — which leaves the guest exactly as it was
+    — invalidates nothing.
+
+    A module-attribute lookup (`psdsessions.invalidate_vm`) rather than an
+    import-time binding, so a test that patches the module attribute is
+    observed, and so this stays a no-op when no pool is installed.
+
+    The reason is recorded in the audit log as its own row, so an operator can
+    see WHY a session was dropped rather than having to infer it from the tool
+    row. The row carries no script text, no credential and no key.
+    """
+    closed = psdsessions.invalidate_vm(vm_guid, reason)
+    try:
+        from . import auditlog
+
+        # The reason rides in the tool name's suffix rather than a free-text
+        # field, because `log_operation`'s record shape is fixed and a new
+        # column would be a schema change this PR does not need.
+        auditlog.log_operation(
+            tool=f"hyperv_session_invalidate:{reason}",
+            vm_name=vm_guid,
+            category="guest",
+            ok=True,
+            duration_ms=0,
+            exit_code=None,
+            error_class="",
+        )
+    except Exception:
+        pass  # the audit sink must never fail the lifecycle action
+    return closed
+
+
 def start_vm(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     script = f"""
@@ -262,6 +301,7 @@ if ($initial -ne 'Running') {{ Start-VM -VM $vm -ErrorAction Stop }}
     with vmlocks.vm_lock(ref.id):
         result = _run(cfg, script, timeout_s=60)
         pswindows.check_result(result, f"hyperv_start_vm({vm_name or vm_id})")
+        _invalidate_sessions(ref.id, "start")
         rows = _parse_json_objects(result, "start_vm")
         initial = rows[0].get("initial_state", "") if rows else ""
         final = _wait_for_state(cfg, ref, ["Running"], timeout_s=90)
@@ -302,6 +342,7 @@ if ($initial -notin ({", ".join(f"'{w}'" for w in wanted)})) {{
     with vmlocks.vm_lock(ref.id):
         result = _run(cfg, script, timeout_s=60)
         pswindows.check_result(result, f"hyperv_stop_vm({vm_name or vm_id}, {method})")
+        _invalidate_sessions(ref.id, "stop")
         rows = _parse_json_objects(result, "stop_vm")
         initial = rows[0].get("initial_state", "") if rows else ""
         final = _wait_for_state(cfg, ref, wanted, timeout_s=300 if method == "shutdown" else 120)
@@ -325,6 +366,7 @@ Start-VM -VM $vm -ErrorAction Stop
     with vmlocks.vm_lock(ref.id):
         result = _run(cfg, script, timeout_s=60)
         pswindows.check_result(result, f"hyperv_reset_vm({vm_name or vm_id})")
+        _invalidate_sessions(ref.id, "reset")
         final = _wait_for_state(cfg, ref, ["Running"], timeout_s=90)
         return {"status": "reset", "vm_name": ref.name, "state": final}
 
@@ -380,6 +422,7 @@ Restore-VMSnapshot -Name {cn} -VM (Get-VM -Id $vmTarget -ErrorAction Stop) -Conf
 """
         result = _run(cfg, script, timeout_s=300)
         pswindows.check_result(result, f"hyperv_checkpoint_restore({vm_name or vm_id}, {checkpoint_name})")
+        _invalidate_sessions(ref.id, "checkpoint_restore")
         # Restoring a checkpoint whose subtree has descendants merges their
         # differencing disks; the VM can stay in transitional states for many
         # minutes (observed: >120s on a 10-deep tree). Wait generously.
@@ -414,6 +457,7 @@ Remove-VMSnapshot -Name {cn} -VM (Get-VM -Id $vmTarget -ErrorAction Stop) {subtr
 """
         result = _run(cfg, script, timeout_s=300)
         pswindows.check_result(result, f"hyperv_checkpoint_remove({vm_name or vm_id})")
+        _invalidate_sessions(ref.id, "checkpoint_remove")
         return {"status": "removed", "vm_name": ref.name, "checkpoint_name": checkpoint_name}
 
 
@@ -512,6 +556,8 @@ Invoke-Command -VMId $vmTarget -Credential $cred -ScriptBlock {{ & 'shutdown.exe
             )
             pswindows.check_result(rr, f"hyperv_configure_kdnet reboot({vm_name or vm_id})")
             rebooting = True
+            # The guest is rebooting: every pooled session for it is now stale.
+            _invalidate_sessions(ref.id, "kdnet_reboot")
 
         return {
             "status": "configured",
@@ -597,6 +643,8 @@ Invoke-Command -VMId $vmTarget -Credential $cred -ScriptBlock {{ & 'shutdown.exe
             )
             pswindows.check_result(rr, f"hyperv_configure_kdcom reboot({vm_name or vm_id})")
             rebooting = True
+            # The guest is rebooting: every pooled session for it is now stale.
+            _invalidate_sessions(ref.id, "kdcom_reboot")
 
         return {
             "status": "configured",

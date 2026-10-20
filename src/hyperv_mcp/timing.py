@@ -89,6 +89,30 @@ class Collector:
         with self._mu:
             self.lock_wait_ms += int(ms)
 
+    def add_pooled(self, duration_ms: int, markers: dict | None, *, spawned: bool) -> None:
+        """Record a pooled-session call (issue #21).
+
+        `spawned` is True only on the call that OPENED the worker, because that
+        call really did start a host process; a call that REUSED a session did
+        not, and reporting it as a spawn would make the audit row claim a cost
+        that was not paid. `markers` merges rather than replaces: on the opening
+        call it carries ps_startup_ms, psdirect_session_ms and guest_ms, and on a
+        reused call only guest_ms, so the session-establishment numbers recorded
+        by the opening call are not wiped by a later vaguer one. `ps_ms` still
+        accumulates the host-side time the worker spent, which is real work even
+        though no process was started.
+        """
+        with self._mu:
+            if spawned:
+                self.ps_spawns += 1
+            self.ps_ms += int(duration_ms)
+            if markers is not None:
+                merged = dict(self._markers)
+                for key, value in markers.items():
+                    if value is not None:
+                        merged[key] = value
+                self._markers = merged
+
     def snapshot(self) -> dict:
         with self._mu:
             out: dict[str, int | None] = {
