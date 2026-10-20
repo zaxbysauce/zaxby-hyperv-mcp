@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import subprocess
 
 import pytest
 
@@ -71,6 +72,52 @@ def test_worker_exit_terminates_the_process(worker):
     assert worker._proc.poll() is not None, (
         f"worker pid {pid} survived close(); the slot it holds would leak"
     )
+
+
+def test_real_worker_loop_emits_the_per_call_wrapper(tmp_path):
+    """The REAL credentialed worker loop produces the same
+    `{exit_code, stdout, stderr}` wrapper the per-call host script produces.
+
+    This is the check the implementation reviewer's finding 1 demanded. A bare
+    `& $tmp` inside the guest scriptblock yields `null` on the parent pipeline —
+    the guest's stdout never arrives and every exit code reads 0 — so the pooled
+    path would silently fabricate success with empty output. The loop therefore
+    runs `guestexec`'s capture body, and this test proves it by executing the
+    emitted scriptblock text against a REAL powershell.
+
+    Scope: the loop's session-establishment leg needs a live VM, so this executes
+    the guest scriptblock the worker would send, not the whole loop. The loop's
+    own parse-and-frame behaviour is covered by the placeholder-lane tests above.
+    """
+    pswindows.init(Config(audit_log_path=None))
+    sb_text = psdsessions.guest_scriptblock(False)
+    inner = "Write-Output 'd05-real-loop'; exit 7"
+
+    # Both payloads cross as FILES, never as a -Command string: the scriptblock
+    # text is full of quotes and dollar signs, and -Command would mangle them.
+    sb_file = tmp_path / "sb.txt"
+    inner_file = tmp_path / "inner.txt"
+    runner = tmp_path / "run.ps1"
+    sb_file.write_text(sb_text, encoding="utf-8")
+    inner_file.write_text(inner, encoding="utf-8")
+    runner.write_text(
+        "$sb = [ScriptBlock]::Create((Get-Content -Raw $args[0]))\n"
+        "$enc = [Convert]::ToBase64String("
+        "[Text.Encoding]::UTF8.GetBytes((Get-Content -Raw $args[1])))\n"
+        "& $sb $enc | ConvertTo-Json -Compress -Depth 3\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [pswindows._ps_path or "powershell.exe", "-NoProfile", "-NonInteractive",
+         "-ExecutionPolicy", "Bypass", "-File", str(runner),
+         str(sb_file), str(inner_file)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr[-400:]
+    payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert payload["exit_code"] == 7, payload
+    assert "d05-real-loop" in payload["stdout"], payload
+    assert payload["stderr"] == "", payload
 
 
 def test_an_arbitrary_frame_still_gets_a_well_formed_answer(worker):

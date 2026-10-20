@@ -139,7 +139,13 @@ class RecordingFactory:
     string argument it or its workers ever receive, and every close."""
 
     def __init__(self, canned=None, behaviour=None) -> None:
-        self.canned = canned if canned is not None else _envelope()
+        # The canned response models the REAL worker: `stdout` is the per-call
+        # wrapper, and the wrapper's own `stdout` is the guest payload.
+        self.canned = canned if canned is not None else _DuckResult(stdout=json.dumps({
+            "exit_code": 0,
+            "stdout": json.dumps({"probe": "pooled-ok"}),
+            "stderr": "",
+        }))
         self.behaviour = behaviour
         self.workers: list[FakeWorker] = []
         self.keys: list[tuple] = []
@@ -271,7 +277,12 @@ def test_filetransfer_and_diagnostics_chokes_reuse_one_session(monkeypatch):
 
     d1 = diagnostics.run_guest_inner(cfg, GUID, "Write-Output a", CRED)
     d2 = diagnostics.run_guest_inner(cfg, GUID, "Write-Output b", CRED)
-    assert d1 == {"exit_code": 0, "stdout": "pooled-ok", "stderr": ""}, d1
+    # The worker reports the SAME wrapper the per-call host script reports, so
+    # `run_guest_inner` must take one more step than the per-call path and read
+    # the wrapper's `stdout`. An earlier revision of this check asserted the
+    # WRAPPER was the payload, which is exactly the bug the implementation
+    # reviewer caught: the guest payload would have been silently dropped.
+    assert d1 == {"probe": "pooled-ok"}, d1
     assert d2 == d1, d2
 
     assert len(factory.workers) == 1, (
@@ -339,7 +350,9 @@ def test_broken_session_is_discarded_and_retried_exactly_once(monkeypatch):
 
     out = guestexec.guest_run_ps(cfg, "vm1", "Write-Output after-retry", cred=CRED)
     assert out.get("ok") is True, out
-    assert out.get("stdout") == "pooled-ok", out
+    # `guest_run_ps` unwraps the per-call wrapper, so the guest payload is the
+    # wrapper's own `stdout`.
+    assert out.get("stdout") == json.dumps({"probe": "pooled-ok"}), out
     assert len(factory.workers) == 2, (
         f"{len(factory.workers)} workers for one session-break retry"
     )

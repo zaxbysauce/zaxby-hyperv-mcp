@@ -574,8 +574,15 @@ def test_remote_host_mode_never_uses_pooled_worker(monkeypatch):
         "allowed_vm_patterns": ["test-*"],
     })
 
+    attempts: list[tuple] = []
+
     class _NoAcquirePool(psdsessions.SessionPool):
         def acquire(self, *args, **kwargs):
+            # Record FIRST, then raise. The pooled path's documented contract is
+            # to fall back to the per-call path when the pool cannot serve a
+            # call, which swallows this exception — so the attempt, not the
+            # exception, is what the check must observe.
+            attempts.append((args, kwargs))
             raise AssertionError(
                 "remote mode acquired a pooled worker "
                 f"({args!r} {kwargs!r})"
@@ -605,6 +612,10 @@ def test_remote_host_mode_never_uses_pooled_worker(monkeypatch):
     )
     assert "Invoke-Command -ComputerName 'nuc01'" in fake.scripts[1]
     assert "Invoke-Command -VMId" in fake.scripts[1]
+    assert attempts == [], (
+        f"remote mode attempted {len(attempts)} pooled acquisition(s); the "
+        f"per-call path must be taken whenever hyperv.host is set"
+    )
 
 
 # ---------------------------------------------------------------------------

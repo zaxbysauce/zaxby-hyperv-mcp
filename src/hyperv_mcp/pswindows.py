@@ -1091,6 +1091,7 @@ class PooledWorker:
         frame = json.dumps({
             "script": inner_script,
             "expect_epoch": self.boot_epoch,
+            "elevated": bool(elevated),
         })
         try:
             if self._proc.stdin is None:

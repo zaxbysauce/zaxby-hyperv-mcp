@@ -369,17 +369,20 @@ def run_guest_inner(
     """
     timeout_s = max(30, timeout_ms // 1000 + guestexec._GRACE_S)
     script = _guest_leg_script(vm_id, inner_script, cred, cfg)
-    pool = guestexec._pooled_pool(cfg)
-    if pool is not None:
-        result = guestexec._run_pooled_raw(
-            cfg, pool, vm_id, inner_script, cred, timeout_ms,
-        )
-        if result is not None:
-            if result.timed_out:
-                raise TimeoutError(f"guest leg timed out for '{vm_id}'")
-            pswindows.check_result(result)
-            return json.loads(result.stdout.strip() or "{}")
     with vm_lock(vm_id, mode=mode):
+        # The pooled branch sits INSIDE the lock, exactly like the per-call one:
+        # `invalidate_vm`'s premise is that a guest leg holds the read lock, so a
+        # lifecycle write action can never overlap it.
+        pool = guestexec._pooled_pool(cfg)
+        if pool is not None:
+            result = guestexec._run_pooled_raw(
+                cfg, pool, vm_id, inner_script, cred, timeout_ms,
+            )
+            if result is not None:
+                if result.timed_out:
+                    raise TimeoutError(f"guest leg timed out for '{vm_id}'")
+                pswindows.check_result(result)
+                return guestexec.pooled_guest_payload(result)
         result = _run(
             cfg, script, timeout_s=timeout_s,
             stdin_b64=pswindows.utf8_b64(cred.password),

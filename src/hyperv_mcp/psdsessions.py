@@ -189,9 +189,17 @@ class SessionPool:
         self._entries: dict[SessionKey, _Entry] = {}
         self._gates: dict[SessionKey, threading.Lock] = {}
         self._closed = False
+        self._reaper: _Reaper | None = None
         self.invalidated = 0
         self.evicted = 0
         self.reaped = 0
+
+    def start_reaper(self) -> None:
+        """Start the idle-TTL reaper. Idempotent; the server-shutdown path stops
+        it through `close_all`."""
+        if self._reaper is None and not self._closed:
+            self._reaper = _Reaper(self, self._idle_ttl_s / 4.0)
+            self._reaper.start()
 
     # -- acquisition -------------------------------------------------------
 
@@ -371,6 +379,9 @@ class SessionPool:
 
     def close_all(self) -> int:
         """Close every session, in use or not. The server-shutdown path."""
+        reaper = getattr(self, "_reaper", None)
+        if reaper is not None:
+            reaper.stop()
         with self._mu:
             self._closed = True
             victims = list(self._entries.values())
@@ -438,6 +449,38 @@ class SessionPool:
 DEFAULT: SessionPool | None = None
 
 
+class _Reaper:
+    """Wakes periodically and closes sessions idle past the TTL.
+
+    Without a trigger, `reap()` has no caller and an idle worker holds a
+    decrypted credential and a host-wide PowerShell slot until invalidation, cap
+    eviction or server exit — which is exactly what the idle TTL exists to
+    prevent. A daemon thread is the only thing that can notice a pool nobody is
+    calling.
+    """
+
+    def __init__(self, pool: SessionPool, every_s: float) -> None:
+        self._pool = pool
+        self._every_s = max(1.0, float(every_s))
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="psdsessions-reaper", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._every_s):
+            try:
+                self._pool.reap()
+            except Exception:
+                pass  # a reaper must never take the server down
+
+
 def default_pool() -> SessionPool | None:
     return DEFAULT
 
@@ -477,6 +520,7 @@ def install_default_pool(cfg: Any) -> SessionPool | None:
         idle_ttl_s=DEFAULT_IDLE_TTL_S,
         max_sessions=max(1, cap - 2),
     )
+    pool.start_reaper()
     DEFAULT = pool
     return pool
 
@@ -505,6 +549,39 @@ def close_default_pool() -> int:
 # ---------------------------------------------------------------------------
 # the establishment script
 # ---------------------------------------------------------------------------
+
+
+def guest_scriptblock(elevated: bool) -> str:
+    """The guest-side scriptblock text the worker runs for an ordinary call.
+
+    This is the SAME capture wrapper the per-call host script uses
+    (`guestexec._normal_body` / `_elevated_body`): the inner .ps1 runs as a
+    child powershell with redirected streams, so the result object carries a
+    real exit code and the real stdout/stderr. Reusing it rather than
+    re-implementing it is what keeps the two transports from drifting — and
+    what stops the pooled path from fabricating `exit_code: 0` with empty
+    streams, which is what a bare `& $tmp` does (verified on a real host: the
+    child's output never reaches the parent pipeline).
+
+    Imported lazily: `guestexec` imports this module, so a module-level import
+    here would be a cycle.
+    """
+    from . import guestexec
+
+    body = (guestexec._elevated_body() if elevated else guestexec._normal_body()).strip()
+    lines = [
+        "param($enc)",
+        "$__mcpGuest = [Diagnostics.Stopwatch]::StartNew()",
+        "$text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($enc))",
+        "$tmp  = Join-Path ([System.IO.Path]::GetTempPath())"
+        " ([System.IO.Path]::GetRandomFileName() + '.ps1')",
+        "[System.IO.File]::WriteAllText($tmp, $text,"
+        " [System.Text.UTF8Encoding]::new($false))",
+        body,
+        "[PSCustomObject]@{ exit_code=$ec; stdout=$so; stderr=$se;"
+        " duration_ms=$__mcpGuest.ElapsedMilliseconds }",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def establishment_script(
@@ -545,87 +622,122 @@ def _worker_loop(key: SessionKey, cred: CredentialSet) -> str:
     PowerShell 5.1 compatible throughout: no ternary, no null-coalescing, no
     ``??=``. Every response is a single base64 line on stdout, so the host can
     frame it unambiguously whatever the guest script itself printed.
+
+    Three guards run BEFORE the guest scriptblock, so a retry can never re-run a
+    script that already had a side effect:
+
+      1. the session must still be ``Opened`` — a Broken/Closed/Disconnected
+         session means the scriptblock was never entered;
+      2. the guest's boot epoch must match the one read at open — a reboot
+         under a live session breaks the VMBus channel;
+      3. the request must decode.
+
+    The guest scriptblock itself comes from :func:`guest_scriptblock`, which is
+    the SAME capture wrapper the per-call host script uses, so a pooled call
+    reports a real exit code and real stdout/stderr.
     """
-    return f"""
-[Console]::InputEncoding  = [System.Text.UTF8Encoding]::new($false)
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$ErrorActionPreference = 'Stop'
-$__mcpBorn = [Diagnostics.Process]::GetCurrentProcess().StartTime
-$secRaw = [Console]::In.ReadLine()
-$secText = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($secRaw))
-$sec = $secText | ConvertTo-SecureString -AsPlainText -Force
-$cred = [System.Management.Automation.PSCredential]::new({_ps_quote(cred.username)}, $sec)
-$secRaw = $null; $secText = $null; $sec = $null
-$vmTarget = {_ps_quote(key.vm_guid)}
-$s = $null
-try {{
-    $s = New-PSSession -VMId $vmTarget -Credential $cred -ErrorAction Stop
-    $bootEpoch = Invoke-Command -Session $s -ErrorAction SilentlyContinue -ScriptBlock {{
-        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
-        if ($null -ne $os) {{ $os.LastBootUpTime.ToString('o') }} else {{ '' }}
-    }}
-    $openMs = [int]((Get-Date) - $__mcpBorn).TotalMilliseconds
-}} catch {{
-    $err = @{{ ok = $false; phase = 'open'; error = $_.Exception.Message }} | ConvertTo-Json -Compress
-    [Console]::Out.WriteLine([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($err)))
-    exit 1
-}}
-$global:__mcpSession = $s
-$global:__mcpBootEpoch = $bootEpoch
-# The open handshake. spawn_worker reads exactly one line after starting the
-# process and expects THIS frame: without it the host would block until its
-# deadline and then hand the caller a worker it believes is dead.
-$open = @{{ ok = $true; phase = 'open'; boot_epoch = $bootEpoch; session_ms = $openMs }} | ConvertTo-Json -Compress
-[Console]::Out.WriteLine([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($open)))
-while ($true) {{
-    $line = [Console]::In.ReadLine()
-    if ($null -eq $line) {{ break }}
-    if ($line -eq '__MCP_WORKER_EXIT__') {{ break }}
-    $req = $null
-    try {{ $req = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line)) | ConvertFrom-Json }} catch {{ $req = $null }}
-    if ($null -eq $req) {{
-        $bad = @{{ ok = $false; phase = 'frame'; error = 'unreadable request frame' }} | ConvertTo-Json -Compress
-        [Console]::Out.WriteLine([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bad)))
-        continue
-    }}
-    $resp = $null
-    try {{
-        $enc = $req.script
-        $wantEpoch = $req.expect_epoch
-        $nowEpoch = $global:__mcpBootEpoch
-        if (($null -ne $wantEpoch) -and ($wantEpoch -ne '') -and ($wantEpoch -ne $nowEpoch)) {{
-            $resp = @{{
-                ok = $false; phase = 'session'; error = 'boot epoch changed'
-                boot_epoch = $nowEpoch
-            }} | ConvertTo-Json -Compress
-        }} else {{
-            $sw = [Diagnostics.Stopwatch]::StartNew()
-            $out = Invoke-Command -Session $s -ErrorAction Stop -ScriptBlock {{
-                param($enc, $body)
-                $text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($enc))
-                $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName() + '.ps1')
-                [System.IO.File]::WriteAllText($tmp, $text, [System.Text.UTF8Encoding]::new($false))
-                try {{ & $tmp }} finally {{ Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }}
-            }} -ArgumentList $enc, $body
-            $guestMs = $sw.ElapsedMilliseconds
-            $resp = @{{
-                ok = $true; phase = 'guest'
-                exit_code = [int]$out.exit_code
-                stdout = [string]$out.stdout
-                stderr = [string]$out.stderr
-                guest_ms = [int]$guestMs
-                boot_epoch = $nowEpoch
-            }} | ConvertTo-Json -Compress -Depth 3
-        }}
-    }} catch {{
-        $resp = @{{
-            ok = $false; phase = 'session'; error = $_.Exception.Message
-            boot_epoch = $global:__mcpBootEpoch
-        }} | ConvertTo-Json -Compress
-    }}
-    [Console]::Out.WriteLine([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($resp)))
-}}
-""".strip()
+    normal_b64 = _b64(guest_scriptblock(False))
+    elevated_b64 = _b64(guest_scriptblock(True))
+    q = chr(39)
+    lines = [
+        "[Console]::InputEncoding  = [System.Text.UTF8Encoding]::new($false)",
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+        "$ErrorActionPreference = " + q + "Stop" + q,
+        "$__mcpBorn = [Diagnostics.Process]::GetCurrentProcess().StartTime",
+        "$secRaw = [Console]::In.ReadLine()",
+        "$secText = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($secRaw))",
+        "$sec = $secText | ConvertTo-SecureString -AsPlainText -Force",
+        "$cred = [System.Management.Automation.PSCredential]::new("
+        + _ps_quote(cred.username) + ", $sec)",
+        "$secRaw = $null; $secText = $null; $sec = $null",
+        "$vmTarget = " + _ps_quote(key.vm_guid),
+        "$s = $null",
+        "$bootEpoch = $null",
+        "$openMs = 0",
+        "try {",
+        "    $s = New-PSSession -VMId $vmTarget -Credential $cred -ErrorAction Stop",
+        "    $openMs = [int]((Get-Date) - $__mcpBorn).TotalMilliseconds",
+        "    $bootEpoch = Invoke-Command -Session $s -ErrorAction SilentlyContinue -ScriptBlock {",
+        "        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue",
+        "        if ($null -ne $os) { $os.LastBootUpTime.ToString(" + q + "o" + q + ") } else { " + q + q + " }",
+        "    }",
+        "} catch {",
+        "    $err = @{ ok = $false; phase = " + q + "open" + q + "; error = $_.Exception.Message } | ConvertTo-Json -Compress",
+        "    [Console]::Out.WriteLine([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($err)))",
+        "    exit 1",
+        "}",
+        "$global:__mcpSession = $s",
+        "$global:__mcpBootEpoch = $bootEpoch",
+        "$global:__mcpSbNormal = " + q + normal_b64 + q,
+        "$global:__mcpSbElevated = " + q + elevated_b64 + q,
+        "# The open handshake. spawn_worker reads exactly one line after starting",
+        "# the process and expects THIS frame.",
+        "$open = @{ ok = $true; phase = " + q + "open" + q + "; boot_epoch = $bootEpoch;"
+        " session_ms = $openMs } | ConvertTo-Json -Compress",
+        "[Console]::Out.WriteLine([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($open)))",
+        "while ($true) {",
+        "    $line = [Console]::In.ReadLine()",
+        "    if ($null -eq $line) { break }",
+        "    if ($line -eq " + q + "__MCP_WORKER_EXIT__" + q + ") { break }",
+        "    $req = $null",
+        "    try { $req = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line)) | ConvertFrom-Json } catch { $req = $null }",
+        "    if ($null -eq $req) {",
+        "        $bad = @{ ok = $false; phase = " + q + "frame" + q + "; error = " + q + "unreadable request frame" + q + " } | ConvertTo-Json -Compress",
+        "        [Console]::Out.WriteLine([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bad)))",
+        "        continue",
+        "    }",
+        "    $resp = $null",
+        "    try {",
+        "        $enc = [string]$req.script",
+        "        $wantEpoch = [string]$req.expect_epoch",
+        "        $elevated = [bool]$req.elevated",
+        "        # Guard 2 reads the guest's boot time afresh on every request, so a",
+        "        # reboot under a live session is detected rather than assumed away.",
+        "        $nowEpoch = Invoke-Command -Session $s -ErrorAction SilentlyContinue -ScriptBlock {",
+        "            $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue",
+        "            if ($null -ne $os) { $os.LastBootUpTime.ToString(" + q + "o" + q + ") } else { " + q + q + " }",
+        "        }",
+        "        if ($null -eq $nowEpoch) { $nowEpoch = $global:__mcpBootEpoch }",
+        "        # Guard 1: the session must still be open. A session that is not",
+        "        # Opened was never entered by this request, so reporting a",
+        "        # session-phase failure here is what makes the caller's retry safe.",
+        "        if ($s.State -ne " + q + "Opened" + q + ") {",
+        "            $resp = @{ ok = $false; phase = " + q + "session" + q + ";"
+        " error = (" + q + "session state is " + q + " + $s.State) } | ConvertTo-Json -Compress",
+        "        } elseif (($wantEpoch -ne " + q + q + ") -and ($wantEpoch -ne $nowEpoch)) {",
+        "            # Guard 2: the guest rebooted under this session.",
+        "            $resp = @{ ok = $false; phase = " + q + "session" + q + ";"
+        " error = " + q + "boot epoch changed" + q + "; boot_epoch = $nowEpoch } | ConvertTo-Json -Compress",
+        "        } else {",
+        "            $sbText = if ($elevated) { $global:__mcpSbElevated } else { $global:__mcpSbNormal }",
+        "            $sw = [Diagnostics.Stopwatch]::StartNew()",
+        "            $out = Invoke-Command -Session $s -ErrorAction Stop -ScriptBlock"
+        " ([ScriptBlock]::Create($sbText)) -ArgumentList $enc",
+        "            $guestMs = $sw.ElapsedMilliseconds",
+        "            $resp = @{ ok = $true; phase = " + q + "guest" + q + ";"
+        " exit_code = [int]$out.exit_code; stdout = [string]$out.stdout;"
+        " stderr = [string]$out.stderr; guest_ms = [int]$guestMs;"
+        " boot_epoch = $nowEpoch } | ConvertTo-Json -Compress -Depth 3",
+        "        }",
+        "    } catch {",
+        "        # The scriptblock may or may not have started. Re-read the session",
+        "        # state: only a session that is no longer Opened proves the guest",
+        "        # was never entered, so only that is reported as retryable.",
+        "        $st = $null",
+        "        try { $st = [string]$s.State } catch { $st = $null }",
+        "        if (($null -ne $st) -and ($st -ne " + q + "Opened" + q + ")) {",
+        "            $resp = @{ ok = $false; phase = " + q + "session" + q + ";"
+        " error = $_.Exception.Message; boot_epoch = $global:__mcpBootEpoch } | ConvertTo-Json -Compress",
+        "        } else {",
+        "            $resp = @{ ok = $false; phase = " + q + "guest" + q + ";"
+        " error = $_.Exception.Message; boot_epoch = $global:__mcpBootEpoch } | ConvertTo-Json -Compress",
+        "        }",
+        "    }",
+        "    [Console]::Out.WriteLine([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($resp)))",
+        "}",
+    ]
+    return "\n".join(lines) + "\n"
+
 
 
 def _placeholder_loop() -> str:

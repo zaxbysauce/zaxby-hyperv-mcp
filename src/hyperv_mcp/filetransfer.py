@@ -913,20 +913,22 @@ $r = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -ScriptB
 }} -ArgumentList {pswindows.ps_quote(remote)}, {int(max_bytes)}
 $r | ConvertTo-Json -Compress
 """
-    pool = guestexec._pooled_pool(cfg)
-    if pool is not None:
-        pooled = guestexec._run_pooled_raw(
-            cfg, pool, ref.id, _read_file_inner(remote, max_bytes, cfg), cred, 120000,
-        )
-        if pooled is not None:
-            result = pooled
-            if result.timed_out:
-                return {"ok": False, "vm_name": ref.name, "error": "host timeout reading guest file", "error_class": "timeout"}
-            if result.returncode != 0:
-                detail = result.stderr.strip() or result.stdout.strip() or "unknown PowerShell error"
-                return {"ok": False, "vm_name": ref.name, "error": detail, "error_class": _failure_class(detail)}
-            try:
-                data = json.loads(result.stdout)
+    with vmlocks.vm_lock(ref.id, mode="read"):
+        pool = guestexec._pooled_pool(cfg)
+        if pool is not None:
+            pooled = guestexec._run_pooled_raw(
+                cfg, pool, ref.id, _read_file_inner(remote, max_bytes, cfg), cred, 120000,
+            )
+            if pooled is not None:
+                result = pooled
+                if result.timed_out:
+                    return {"ok": False, "vm_name": ref.name, "error": "host timeout reading guest file", "error_class": "timeout"}
+                if result.returncode != 0:
+                    detail = result.stderr.strip() or result.stdout.strip() or "unknown PowerShell error"
+                    return {"ok": False, "vm_name": ref.name, "error": detail, "error_class": _failure_class(detail)}
+                data = guestexec.pooled_guest_payload(result)
+                if not isinstance(data, dict) or "content_b64" not in data:
+                    return {"ok": False, "vm_name": ref.name, "error": "unexpected guest read payload", "error_class": "parse"}
                 return {
                     "ok": True,
                     "vm_name": ref.name,
@@ -934,9 +936,6 @@ $r | ConvertTo-Json -Compress
                     "bytes_read": data.get("bytes_read"),
                     "truncated": data.get("truncated"),
                 }
-            except json.JSONDecodeError as exc:
-                return {"ok": False, "vm_name": ref.name, "error": f"result JSON parse failed: {exc}", "error_class": "parse"}
-    with vmlocks.vm_lock(ref.id, mode="read"):
         result = _run(
             cfg, body.strip(), timeout_s=120, stdin_b64=pswindows.utf8_b64(cred.password)
         )
@@ -992,29 +991,27 @@ $items = Invoke-Command -VMId $vmTarget -Credential $cred -ErrorAction Stop -Scr
 }} -ArgumentList {pswindows.ps_quote(remote)}
 if ($items) {{ @($items) | ConvertTo-Json -Compress }} else {{ '[]' }}
 """
-    pool = guestexec._pooled_pool(cfg)
-    if pool is not None:
-        pooled = guestexec._run_pooled_raw(
-            cfg, pool, ref.id, _list_dir_inner(remote, cfg), cred, 60000,
-        )
-        if pooled is not None:
-            result = pooled
-            if result.timed_out:
-                return {"ok": False, "vm_name": ref.name, "error": "host timeout listing guest directory", "error_class": "timeout"}
-            if result.returncode != 0:
-                detail = result.stderr.strip() or result.stdout.strip() or "unknown PowerShell error"
-                return {"ok": False, "vm_name": ref.name, "error": detail, "error_class": _failure_class(detail)}
-            try:
-                raw = result.stdout.strip()
-                if not raw or raw == "null":
-                    entries = []
-                else:
-                    parsed = json.loads(raw)
-                    entries = [parsed] if isinstance(parsed, dict) else list(parsed)
-                return {"ok": True, "vm_name": ref.name, "entries": entries}
-            except json.JSONDecodeError as exc:
-                return {"ok": False, "vm_name": ref.name, "error": f"result JSON parse failed: {exc}", "error_class": "parse"}
     with vmlocks.vm_lock(ref.id, mode="read"):
+        pool = guestexec._pooled_pool(cfg)
+        if pool is not None:
+            pooled = guestexec._run_pooled_raw(
+                cfg, pool, ref.id, _list_dir_inner(remote, cfg), cred, 60000,
+            )
+            if pooled is not None:
+                result = pooled
+                if result.timed_out:
+                    return {"ok": False, "vm_name": ref.name, "error": "host timeout listing guest directory", "error_class": "timeout"}
+                if result.returncode != 0:
+                    detail = result.stderr.strip() or result.stdout.strip() or "unknown PowerShell error"
+                    return {"ok": False, "vm_name": ref.name, "error": detail, "error_class": _failure_class(detail)}
+                parsed = guestexec.pooled_guest_payload(result)
+                if parsed in (None, {}, ""):
+                    entries = []
+                elif isinstance(parsed, dict):
+                    entries = [parsed]
+                else:
+                    entries = list(parsed)
+                return {"ok": True, "vm_name": ref.name, "entries": entries}
         result = _run(
             cfg, body.strip(), timeout_s=60, stdin_b64=pswindows.utf8_b64(cred.password)
         )

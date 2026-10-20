@@ -449,6 +449,27 @@ def _report_pooled_timing(result, opened_ms: int | None) -> None:
     )
 
 
+def pooled_guest_payload(result):
+    """The guest-side payload from a pooled worker's response.
+
+    A pooled worker reports the per-call wrapper — `{exit_code, stdout, stderr,
+    duration_ms}` — because it runs the SAME capture body the per-call host
+    script runs. Callers whose inner script's stdout IS the payload (diagnostics,
+    filetransfer) therefore have to take one more step than the per-call path
+    and read `stdout`. Returning it here keeps that unwrap in one place.
+    """
+    payload = _pooled_payload(result)
+    if payload is None:
+        return {}
+    raw = payload.get("stdout")
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        return json.loads(raw.strip())
+    except json.JSONDecodeError:
+        return {}
+
+
 def _pooled_payload(result) -> dict | None:
     """The JSON object a pooled worker's response carries, or None if there
     isn't one. Every caller already json.loads this on the per-call path, so the
