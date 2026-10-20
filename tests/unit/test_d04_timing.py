@@ -198,13 +198,15 @@ def audited_server(tmp_path, fresh_server):
 def audited_server_percall(tmp_path, fresh_server):
     """audited_server with `psdirect_session_reuse` OFF (issue #21).
 
-    The `__MCP_TIMING` marker protocol under test belongs to the PER-CALL host
-    script. On the pooled path the worker carries `guest_ms` in its response
-    frame instead and emits no marker, so a bootstrapped server with reuse on
-    desynchronises the scripted child stdout this test serves. Reuse-off is the
-    honest way to pin the per-call instrumentation; the pooled path's timing
-    honesty is pinned separately by test_d05_psdirect_sessions (C18: a reused
-    call reports ps_spawns == 0 and no psdirect_session_ms).
+    Used by the tests that measure the PER-CALL transport's instrumentation:
+    the `__MCP_TIMING` marker protocol, `ps_spawns`/`ps_ms` equal to the fake
+    run_ps call count and duration sum, and per-thread accounting. On the pooled
+    path none of those hold BY DESIGN — the worker carries `guest_ms` in its
+    response frame instead of a marker, a call that opened a worker reports one
+    spawn and its own open cost, and a reused call reports none. Reuse-off is
+    therefore the honest way to pin the per-call instrumentation, and the pooled
+    path's timing honesty is pinned separately by test_d05_psdirect_sessions
+    (C18: a reused call reports ps_spawns == 0 and no psdirect_session_ms).
     """
     log = tmp_path / "audit-d04.jsonl"
     doc = {
@@ -307,11 +309,11 @@ def test_audit_record_carries_timing_for_console_tool(audited_server, monkeypatc
     )
 
 
-def test_audit_record_carries_timing_for_guest_tool(audited_server, monkeypatch):
+def test_audit_record_carries_timing_for_guest_tool(audited_server_percall, monkeypatch):
     """AC3: the guest tool's audit row carries timing.ps_ms equal to the sum
     of the run_ps durations the transport served. RED at base, GREEN after
     the fix."""
-    mod, log = audited_server
+    mod, log = audited_server_percall
     _guest_env(monkeypatch)
     fake = FakeTimingPS(durations={"resolve_name": 300, "guest": 2500})
     monkeypatch.setattr(pswindows, "run_ps", fake)
@@ -419,12 +421,12 @@ def test_guest_timing_separates_psdirect_session_setup(audited_server_percall, m
 # ---------------------------------------------------------------------------
 
 
-def test_concurrent_calls_get_their_own_timing(audited_server, monkeypatch):
+def test_concurrent_calls_get_their_own_timing(audited_server_percall, monkeypatch):
     """AC6: two REAL threads driving different VMs' tools through one server
     object each get an audit row whose timing.ps_spawns/ps_ms equal the calls
     and durations the fake run_ps recorded FOR THAT THREAD. RED at base,
     GREEN after the fix."""
-    mod, log = audited_server
+    mod, log = audited_server_percall
     _guest_env(monkeypatch)
     fake = FakeTimingPS(
         durations={"input": 250, "resolve_name": 250, "guest": 250}, sleep_s=0.2,
