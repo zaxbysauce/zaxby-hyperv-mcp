@@ -420,6 +420,63 @@ def test_pooled_timeout_kills_the_worker_and_reports_the_base_envelope(monkeypat
 # ---------------------------------------------------------------------------
 
 
+def test_session_key_repr_masks_the_credential_profile():
+    """A pool key must never reach a traceback or a log line with its credential
+    profile in it. `SessionBusy(key)` and `raise KeyError(key)` both interpolate
+    the key, and the profile is derived from the password — so `__repr__` shows
+    the VM GUID and the agent id and replaces the profile with a marker.
+
+    Pinned because the final critic's probe (adding the profile back to `__repr__`)
+    survived the whole frozen suite: nothing else asserts the redaction, and a
+    future edit to the NamedTuple could quietly undo it.
+    """
+    psdsessions = _psdsessions()
+    key = psdsessions.SessionKey(
+        vm_guid=GUID,
+        cred_profile=psdsessions.credential_profile(CRED),
+        agent_id="agent-a",
+        boot_epoch="2026-10-20T00:00:00.0000000Z",
+    )
+    text = repr(key)
+    assert "<redacted>" in text, text
+    assert key.cred_profile not in text, text
+    assert CRED.password not in text, text
+    # The components that are safe to show still are, so a key stays diagnosable.
+    assert GUID in text and "agent-a" in text, text
+
+
+def test_install_default_pool_starts_the_idle_ttl_reaper():
+    """The reaper is what makes the idle TTL real.
+
+    `reap()` on its own has no production caller, so without a trigger an idle
+    worker holds a decrypted credential and a host PowerShell slot until
+    invalidation, cap eviction or server exit. `install_default_pool` therefore
+    starts one, and `close_all` stops it.
+
+    Pinned because the final critic's probe (dropping the `start_reaper()` call)
+    survived the whole frozen suite: C8 proves `reap()` works when called, and
+    nothing proved it gets called.
+    """
+    psdsessions = _psdsessions()
+    cfg = Config(unrestricted=True)
+    pool = psdsessions.install_default_pool(cfg)
+    try:
+        assert pool is not None
+        assert pool._reaper is not None, (
+            "install_default_pool did not start the idle-TTL reaper, so idle "
+            "workers are never closed and the README's 300 s claim is false"
+        )
+        assert pool._reaper._thread.is_alive(), "the reaper thread is not running"
+        # close_all must stop it, or a stopped server leaks a live thread.
+        pool.close_all()
+        assert not pool._reaper._thread.is_alive(), (
+            "close_all did not stop the reaper thread"
+        )
+    finally:
+        pool.close_all()
+        psdsessions.DEFAULT = None
+
+
 @pytest.mark.parametrize("cap,expected", [(8, 6), (3, 1), (1, 1), (64, 62)])
 def test_installed_pool_reserves_host_powershell_headroom(cap, expected):
     """AC27: the pool `server.bootstrap` installs derives its session cap from

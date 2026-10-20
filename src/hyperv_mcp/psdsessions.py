@@ -471,7 +471,12 @@ class _Reaper:
         self._thread.start()
 
     def stop(self) -> None:
+        """Signal the thread and WAIT for it. Bounded, because the loop body only
+        takes the pool lock briefly — a shutdown that leaves the thread running
+        would keep a reference to the pool (and through it, every worker) alive."""
         self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=5.0)
 
     def _run(self) -> None:
         while not self._stop.wait(self._every_s):
