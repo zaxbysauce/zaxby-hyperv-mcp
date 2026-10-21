@@ -197,15 +197,6 @@ def _restored_rows(cfg: Config, owner: str | None) -> list[dict[str, Any]]:
     return out
 
 
-def _stopped_row(entry: dict[str, Any]) -> statestore.RelayRow:
-    """A relay's stop row, keeping the cred_ref the entry already recorded."""
-    row = _row(entry, statestore.RELAY_STOPPED)
-    recorded = entry.get("cred_ref")
-    if recorded:
-        return statestore.RelayRow(**{**row.as_dict(), "cred_ref": recorded})
-    return row
-
-
 def _row_state(store: statestore.Store, relay_id: str) -> str:
     """A store row's state, or "" when there is no row (in-memory only)."""
     row = store.relay_get(relay_id)

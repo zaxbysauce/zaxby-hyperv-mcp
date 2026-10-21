@@ -155,11 +155,15 @@ def resolve_guest(
             + ("; inline arguments are disabled by policy (allow_inline_credentials)"
                if had_inline_args else "")
         )
-    # "inline argument" is a per-call credential, not an environment one. It
-    # must record "inline" so a restored job refuses to re-attach rather than
-    # silently re-resolving a DIFFERENT identity from the environment.
+    # A per-call credential is not an environment one. Key on whether ANY
+    # surviving inline argument was used, not just the password source: a
+    # username-only override still starts the job as that username, and
+    # labelling it "env" would make a restored leg re-resolve the ENVIRONMENT
+    # username and silently run a different account. Recording "inline" makes
+    # reattach refuse instead. (resolve_victim and resolve_host take no inline
+    # arguments, so they always fall through to the env/file branches.)
     cred_ref = (
-        "inline" if p_source == "inline argument"
+        "inline" if (username or password)
         else "file" if p_source.endswith("_FILE")
         else "env"
     )

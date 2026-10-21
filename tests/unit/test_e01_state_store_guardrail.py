@@ -4,7 +4,7 @@ Class: **process-local registry for state whose lifetime exceeds the process** â
 a module-level dict that is the only copy of something a client holds a handle
 to, so a restart strands the handle while the underlying resource keeps running.
 
-Six pins, each proven by an executed mutation probe:
+Eight pins, each proven by an executed mutation probe:
 
 1. **Restart survival.** With a live job and a live relay, reloading BOTH
    registry modules (which re-creates their module dicts, exactly as a process
@@ -17,6 +17,7 @@ Six pins, each proven by an executed mutation probe:
 
 from __future__ import annotations
 
+import base64
 import importlib
 import json
 import re
@@ -74,6 +75,7 @@ class _LegFakePS:
         self.start = start
         self.later = later
         self.scripts: list[str] = []
+        self.credentials: list[tuple[str, str]] = []
         self._actions = 0
 
     def __call__(self, script, **kwargs):
@@ -81,6 +83,19 @@ class _LegFakePS:
         if _is_resolution_leg(script):
             return pswindows.PSResult(stdout=_resolved_guid(script), returncode=0)
         self._actions += 1
+        # Record the identity this leg carries: the username rides the composed
+        # script as `PSCredential]::new('<user>', ...)` and the password rides
+        # stdin as base64. That is what lets a check assert WHICH credential a
+        # restored leg used, rather than only that a leg ran.
+        user = ""
+        m = re.search(r"PSCredential\]?::new\('([^']*)'", script)
+        if m:
+            user = m.group(1)
+        secret = ""
+        raw = kwargs.get("stdin_b64")
+        if raw:
+            secret = base64.b64decode(raw).decode("utf-8", "replace")
+        self.credentials.append((user, secret))
         payload = self.start if self._actions == 1 else self.later
         return pswindows.PSResult(stdout=json.dumps(payload), returncode=0)
 
@@ -386,6 +401,29 @@ def test_inline_tool_argument_credential_is_not_reattachable(monkeypatch, tmp_pa
         guestjobs.job_status(cfg, job_id)
     # No substitution: the environment identity never appears in the error.
     assert "env-admin" not in str(excinfo.value)
+
+    # The username-only dimension. `server._cred_args` takes the inline branch
+    # when EITHER argument is set, and resolve_guest honours an inline username,
+    # so a username-only override still starts the job as that account. Keying
+    # the reference on the password source alone would label it "env" and
+    # substitute the environment username after a restart.
+    username_only = credentials.resolve_guest("inline-user", "")
+    assert username_only.username == "inline-user", username_only
+    assert username_only.source == "inline", username_only.source
+
+    fake2 = _LegFakePS(
+        start={"pid": 4243, "job_dir": "d", "start_time_ticks": 2},
+        later={"status": "running"},
+    )
+    monkeypatch.setattr(pswindows, "run_ps", fake2)
+    started2 = guestjobs.job_start(cfg, "test-vm", "x.exe", cred=username_only)
+    job_id2 = started2["job_id"]
+    assert fake2.credentials, fake2.credentials
+    assert fake2.credentials[0][0] == "inline-user", fake2.credentials
+
+    importlib.reload(guestjobs)
+    with pytest.raises(credentials.CredentialError):
+        guestjobs.job_status(cfg, job_id2)
 
 
 def test_stop_persists_the_credential_reference(monkeypatch, tmp_path):
