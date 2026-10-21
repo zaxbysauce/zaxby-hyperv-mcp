@@ -197,6 +197,15 @@ def _restored_rows(cfg: Config, owner: str | None) -> list[dict[str, Any]]:
     return out
 
 
+def _stopped_row(entry: dict[str, Any]) -> statestore.RelayRow:
+    """A relay's stop row, keeping the cred_ref the entry already recorded."""
+    row = _row(entry, statestore.RELAY_STOPPED)
+    recorded = entry.get("cred_ref")
+    if recorded:
+        return statestore.RelayRow(**{**row.as_dict(), "cred_ref": recorded})
+    return row
+
+
 def _row_state(store: statestore.Store, relay_id: str) -> str:
     """A store row's state, or "" when there is no row (in-memory only)."""
     row = store.relay_get(relay_id)
@@ -682,14 +691,25 @@ def relay_start(
                     )
             known = set(_relays) | {r.relay_id for r in store.relay_rows()}
             if len(known) >= _MAX_RELAYS:
-                # `interrupted` rows are evictable too: their listener died with
-                # a previous process, nothing can bring them back, and leaving
-                # them would let 16 restarts permanently fill the cap.
+                # A key present LOCALLY is judged on its local stopped flag.
+                # A key with NO local entry is judged on its store row, and is
+                # evictable when that row is stopped OR interrupted: its
+                # listener died with a previous process, nothing can bring it
+                # back, and leaving it would let 16 restarts permanently fill
+                # the cap. Consulting the store for a key that IS local would
+                # evict a relay whose listener is alive here, because a peer's
+                # open() flips this process's active rows to `interrupted`
+                # (implementation review, round 2).
+                def _evictable(key: str) -> bool:
+                    entry = _relays.get(key)
+                    if entry is not None:
+                        return bool(entry.get("stopped"))
+                    return _row_state(store, key) in (
+                        statestore.RELAY_STOPPED, statestore.RELAY_INTERRUPTED,
+                    )
+
                 evictable = sorted(
-                    (k for k in known
-                     if (_relays.get(k) or {}).get("stopped")
-                     or _row_state(store, k) in (statestore.RELAY_STOPPED,
-                                                 statestore.RELAY_INTERRUPTED)),
+                    (k for k in known if _evictable(k)),
                     key=lambda k: _started_at(_relays.get(k), store, k),
                 )
                 for key in evictable[: max(1, len(known) - _MAX_RELAYS + 1)]:
@@ -858,8 +878,12 @@ def relay_status(cfg: Config, relay_id: str = "", *, owner: str | None = None) -
         # Union with the store's non-stopped rows, deduplicated by relay_id
         # with the local entry taking priority, so a relay restored after a
         # restart is visible rather than silently omitted and a relay that is
-        # mid-bind in this process is not double-counted.
-        local_ids = {e["relay_id"] for e in selected}
+        # mid-bind in this process is not double-counted. `local_ids` is the RAW
+        # local key set, not the filtered selection: a mid-bind placeholder is
+        # invisible in `selected`, and excluding only the filtered set would
+        # publish its store row as a ghost with a dead thread while by-id
+        # answers `unknown relay_id` for the very same id.
+        local_ids = set(local)
         selected.extend(
             e for e in _restored_rows(cfg, owner)
             if e["relay_id"] not in local_ids
@@ -956,19 +980,22 @@ def relay_stop(cfg: Config, relay_id: str, *, owner: str | None = None) -> dict:
             owner is not None and entry.get("owner") != owner
         ):
             raise ValueError(f"unknown relay_id {relay_id!r}")
-        # `already` is read BEFORE the flag is set, so exactly one of two racing
-        # stops observes already=False (issue #11, PRR-027b).
-        already = bool(entry["stopped"])
+        # The read and the write are ONE critical section, so exactly one of
+        # two racing stops observes already=False (issue #11, PRR-027b). The
+        # store is not touched here: store-lock is the outer order, and taking
+        # it under _relays_lock is the deadlock round 1 found.
         with _relays_lock:
-            _relays[relay_id]["stopped"] = True
-        entry["stopped"] = True
+            already = bool(entry["stopped"])
+            entry["stopped"] = True
     if not already:
         _shutdown_server(entry)
         with _relays_lock:
             entry["context"]["cred"] = None
         # Registry lock released first: store-lock is the outer order. An
-        # interrupted relay has no listener, so its shutdown is a no-op.
-        _store(cfg).relay_upsert(_row(entry, statestore.RELAY_STOPPED))
+        # interrupted relay has no listener, so its shutdown is a no-op. The
+        # row's cred_ref is captured before the live credential is nulled, so
+        # the persisted provenance is not silently rewritten to "inline".
+        _store(cfg).relay_upsert(_stopped_row(entry))
     return {
         "ok": True,
         "relay_id": relay_id,

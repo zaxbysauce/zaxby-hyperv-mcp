@@ -177,3 +177,174 @@ def test_store_schema_holds_no_secret_or_command_column(tmp_path):
                     f"{table}.{column} could hold material the audit posture "
                     "forbids persisting"
                 )
+
+
+# ---------------------------------------------------------------------------
+# Round-2 implementation-review pins.
+#
+# Each of these pins an invariant the shipped suite did not cover when the
+# reviewer's own probes found the defect. Every one is proven by an executed
+# mutation probe (see 08a-recurrence-sweep.md).
+# ---------------------------------------------------------------------------
+
+
+def test_cap_eviction_never_drops_a_live_local_relay(monkeypatch, tmp_path):
+    """A key present in the local registry is judged on its LOCAL stopped flag.
+
+    A peer's `open()` flips this process's active rows to `interrupted` in the
+    store, so consulting the store for a locally-present key would evict a
+    relay whose listener is alive HERE — leaking the listener and the
+    credential and leaving the id unaddressable.
+    """
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
+    cfg = Config(
+        unrestricted=True, allowed_vm_patterns=["test-*"],
+        destructive={"relay": True},
+    )
+    credentials.init(cfg)
+    monkeypatch.setattr(pswindows, "run_ps", _LegFakePS({}, {}))
+    live = relay.relay_start(cfg, "test-vm", 9401, cred=CRED)
+    relay_id = live["relay_id"]
+
+    # Simulate a peer process opening the same store: recovery flips this
+    # process's `active` row to `interrupted` in the FILE.
+    from hyperv_mcp import statestore
+
+    store = statestore.store_for(cfg)
+    row = store.relay_get(relay_id)
+    store.relay_upsert(statestore.RelayRow(
+        **{**row.as_dict(), "state": statestore.RELAY_INTERRUPTED},
+    ))
+
+    relay._MAX_RELAYS = 1
+    try:
+        with pytest.raises(RuntimeError, match="relay registry is full"):
+            relay.relay_start(cfg, "test-vm", 9402, cred=CRED)
+        # The live relay survived, is still local, and is still stoppable.
+        assert relay_id in relay._relays
+        assert relay._relays[relay_id]["stopped"] is False
+        stopped = relay.relay_stop(cfg, relay_id)
+        assert stopped["stopped"] is True, stopped
+    finally:
+        relay._MAX_RELAYS = 16
+
+
+def test_no_id_listing_never_discloses_a_mid_bind_relay(monkeypatch, tmp_path):
+    """The no-id listing must not publish a relay that is still binding.
+
+    During the bind window the store row exists (the reservation wrote it)
+    while the local entry is an in-flight placeholder. `local_ids` is the RAW
+    local key set, so the row is excluded; deriving it from the filtered
+    selection would publish the id as a ghost row with a dead thread while
+    by-id answered `unknown relay_id` for the very same id.
+    """
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
+    cfg = Config(
+        unrestricted=True, allowed_vm_patterns=["test-*"],
+        destructive={"relay": True},
+    )
+    credentials.init(cfg)
+    monkeypatch.setattr(pswindows, "run_ps", _LegFakePS({}, {}))
+    started = relay.relay_start(cfg, "test-vm", 9403, cred=CRED)
+    relay_id = started["relay_id"]
+
+    # Recreate the mid-bind window: the placeholder is in `_relays` (so by-id
+    # answers `unknown relay_id`) and its store row exists.
+    with relay._relays_lock:
+        relay._relays[relay_id]["in_flight"] = True
+    with pytest.raises(ValueError, match="unknown relay_id"):
+        relay.relay_status(cfg, relay_id)
+
+    rows = relay.relay_status(cfg)["relays"]
+    assert relay_id not in {r["relay_id"] for r in rows}, rows
+    # Back out of the simulated window so teardown can stop the listener.
+    with relay._relays_lock:
+        relay._relays[relay_id]["in_flight"] = False
+    relay.relay_stop(cfg, relay_id)
+
+
+def test_relay_stop_already_flag_is_atomic(monkeypatch, tmp_path):
+    """Exactly one of two racing stops performs the shutdown.
+
+    The read and the write of `stopped` are one critical section. Reading the
+    flag outside the lock lets both threads observe `already=False`, which
+    double-shuts-down, double-writes the store, and returns zero
+    "was already stopped" notes — the PRR-027b invariant base held.
+    """
+    import threading
+
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
+    cfg = Config(
+        unrestricted=True, allowed_vm_patterns=["test-*"],
+        destructive={"relay": True},
+    )
+    credentials.init(cfg)
+    monkeypatch.setattr(pswindows, "run_ps", _LegFakePS({}, {}))
+    started = relay.relay_start(cfg, "test-vm", 9404, cred=CRED)
+    relay_id = started["relay_id"]
+
+    # A dict subclass that yields the moment `stopped` is READ. Under the fixed
+    # code that read happens while `_relays_lock` is held, so the other thread
+    # blocks and cannot interleave; under the mutant the read is outside the
+    # lock, the other thread completes first, and both take the real-stop path.
+    gate = threading.Event()
+    proceed = threading.Event()
+
+    class _YieldingEntry(dict):
+        def __getitem__(self, key):
+            if key == "stopped" and not gate.is_set():
+                gate.set()
+                proceed.wait(10)
+            return super().__getitem__(key)
+
+    with relay._relays_lock:
+        relay._relays[relay_id] = _YieldingEntry(relay._relays[relay_id])
+
+    results = []
+    lock = threading.Lock()
+
+    def stopper():
+        r = relay.relay_stop(cfg, relay_id)
+        with lock:
+            results.append(r)
+
+    first = threading.Thread(target=stopper)
+    first.start()
+    assert gate.wait(10), "the stop never read the stopped flag"
+    second = threading.Thread(target=stopper)
+    second.start()
+    second.join(20)
+    proceed.set()
+    first.join(20)
+
+    assert len(results) == 2, results
+    assert sum(1 for r in results if "note" in r) == 1, results
+
+
+def test_restored_starting_row_answers_still_starting(monkeypatch, tmp_path):
+    """A `starting` row belongs to a LIVE peer's in-flight start.
+
+    This process already ran recovery, so nothing of its own is left in that
+    state. Answering it "still starting" (and never caching it) is the honest
+    response; caching it instead poisons later reads, because the placeholder's
+    cred_ref is "inline" by construction.
+    """
+    from hyperv_mcp import statestore
+
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
+    cfg = Config(unrestricted=True)
+    credentials.init(cfg)
+    store = statestore.store_for(cfg)
+    job_id = "a" * 32
+    store.job_upsert(statestore.JobRow(
+        job_id=job_id, vm_name="test-vm",
+        vm_id="11111111-2222-3333-4444-555555555555",
+        state=statestore.JOB_STARTING, cred_ref="inline",
+    ))
+
+    with pytest.raises(ValueError, match="still starting"):
+        guestjobs.job_status(cfg, job_id)
+    # Nothing was cached, so the answer is stable across reads.
+    with pytest.raises(ValueError, match="still starting"):
+        guestjobs.job_output(cfg, job_id)
+    assert job_id not in guestjobs._jobs

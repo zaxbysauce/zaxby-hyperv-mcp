@@ -331,6 +331,13 @@ def _lookup(job_id: str, owner: str | None = None,
         # issue #22: the entry died with a previous process; rebuild it from
         # the store. The store lock is taken with _jobs_lock already released.
         entry = _restore_entry(cfg, job_id, owner)
+        if entry is not None and entry.get("row_state") == statestore.JOB_STARTING:
+            # A `starting` row belongs to a LIVE peer's in-flight start (this
+            # process already ran recovery, so nothing of ours is left in that
+            # state). Answer it the way an in-flight placeholder is answered,
+            # and never cache it: caching would poison later reads, because the
+            # placeholder's cred_ref is "inline" by construction.
+            raise ValueError(f"job {job_id!r} is still starting")
         if entry is not None and entry.get("row_state") != statestore.JOB_ORPHANED:
             # An orphaned row is answered WITHOUT caching a live-looking entry:
             # a `starting` placeholder is pid 0 with empty paths, and caching it
