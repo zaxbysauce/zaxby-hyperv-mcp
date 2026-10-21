@@ -298,8 +298,12 @@ def test_relay_stop_reads_stopped_under_the_registry_lock(monkeypatch, tmp_path)
         destructive={"relay": True},
     )
     credentials.init(cfg)
+    monkeypatch.setenv("HYPERV_GUEST_USERNAME", "Administrator")
+    monkeypatch.setenv("HYPERV_GUEST_PASSWORD", "placeholder-pass")
     monkeypatch.setattr(pswindows, "run_ps", _LegFakePS({}, {}))
-    started = relay.relay_start(cfg, "test-vm", 9405, cred=CRED)
+    started = relay.relay_start(
+        cfg, "test-vm", 9405, cred=credentials.resolve_guest(),
+    )
     relay_id = started["relay_id"]
 
     real_lock = relay._relays_lock
@@ -332,6 +336,12 @@ def test_relay_stop_reads_stopped_under_the_registry_lock(monkeypatch, tmp_path)
     # Exactly one `stopped` read, and it happened with the lock held.
     assert reads, "relay_stop never read the stopped flag"
     assert reads == [True], reads
+    # The relay row keeps the reference it was started with (R2-N5).
+    from hyperv_mcp import statestore
+
+    row = statestore.store_for(cfg).relay_get(relay_id)
+    assert row is not None and row.state == statestore.RELAY_STOPPED, row
+    assert row.cred_ref == "env", row
 
 
 def test_restored_starting_row_answers_still_starting(monkeypatch, tmp_path):
