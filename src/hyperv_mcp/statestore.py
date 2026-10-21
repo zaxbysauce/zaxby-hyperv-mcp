@@ -119,19 +119,59 @@ def _is_busy(exc: sqlite3.Error) -> bool:
     return "locked" in text or "busy" in text
 
 
+#: Windows OpenProcess/PROCESS_QUERY_LIMITED_INFORMATION, resolved lazily so a
+#: non-Windows host never touches ctypes. ERROR_INVALID_PARAMETER (87) is the
+#: no-such-process answer; any other failure is an unknown, never a verdict.
+_WIN_OPENPROCESS_QUERY_LIMITED = 0x1000
+_WIN_ERROR_INVALID_PARAMETER = 87
+
+
+def _windows_pid_probe(pid: int) -> bool | None:
+    """True = a live process, False = provably none, None = cannot tell.
+
+    Deliberately NOT ``os.kill(pid, 0)``: CPython maps signal 0 to
+    CTRL_C_EVENT on Windows and calls GenerateConsoleCtrlEvent, so that call
+    delivers a console Ctrl-C to the named process GROUP — it interrupts the
+    caller instead of asking a question. Probing our own pid raised
+    KeyboardInterrupt on CI (the runner has a console attached) and was inert
+    locally (Git Bash pipes leave the process with none), which is exactly the
+    kind of environment split a probe must not have.
+    """
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(
+        ctypes.c_uint32(_WIN_OPENPROCESS_QUERY_LIMITED), ctypes.c_int(0),
+        ctypes.c_uint32(pid),
+    )
+    if handle:
+        kernel32.CloseHandle(handle)
+        return True
+    error = ctypes.get_last_error()
+    if error == _WIN_ERROR_INVALID_PARAMETER:
+        return False
+    # ERROR_ACCESS_DENIED (5) means the process exists but we may not query
+    # it — alive, not dead.
+    if error == 5:
+        return True
+    return None
+
+
 def _default_pid_probe(pid: int) -> bool | None:
     """Best-effort HOST-side liveness probe. Never raises.
 
     True = a live process, False = provably no such process, None = cannot
     tell. POSIX signal 0 is the standard probe (ESRCH = dead, EPERM = exists
-    but not ours, hence alive). On Windows ``os.kill(pid, 0)`` is likewise an
-    existence probe, where ERROR_INVALID_PARAMETER (87) is the no-such-pid
-    answer; an inaccessible live pid surfaces as anything from
-    PermissionError to SystemError depending on build, so every other error
-    is an unknown, never a verdict.
+    but not ours, hence alive); Windows uses OpenProcess instead, because
+    ``os.kill(pid, 0)`` there is a Ctrl-C delivery, not a query.
     """
     if pid <= 0:
         return None
+    if os.name == "nt":
+        try:
+            return _windows_pid_probe(pid)
+        except Exception:
+            return None
     try:
         os.kill(pid, 0)
         return True
@@ -139,9 +179,7 @@ def _default_pid_probe(pid: int) -> bool | None:
         return False
     except PermissionError:
         return True
-    except OSError as exc:
-        if os.name == "nt" and getattr(exc, "winerror", None) == 87:
-            return False
+    except OSError:
         return None
     except Exception:
         return None
