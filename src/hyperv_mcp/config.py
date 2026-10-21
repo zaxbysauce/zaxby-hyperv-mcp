@@ -77,6 +77,19 @@ class ConfigError(RuntimeError):
     """Raised when configuration cannot be loaded or is invalid."""
 
 
+def default_state_db_path(environ: dict[str, str] | None = None) -> str:
+    """Per-profile default location of the durable state store (issue #22).
+
+    Resolved from the CALLER's environment rather than cached at import time,
+    so a process (or a test) that repoints LOCALAPPDATA gets the path it asked
+    for. ``statestore.resolve_state_db_path`` re-uses this so the precedence
+    has exactly one definition.
+    """
+    env = dict(os.environ if environ is None else environ)
+    base = env.get("LOCALAPPDATA") or env.get("TEMP") or env.get("TMP") or os.getcwd()
+    return os.path.join(base, "hyperv-mcp", "state.db")
+
+
 @dataclass
 class DestructivePolicy:
     """Per-category switches for destructive and interactive operations."""
@@ -160,6 +173,13 @@ class Config:
     # harness's --session-reuse off leg). Appended last for the same
     # positional-compat reason as the fields above.
     psdirect_session_reuse: bool = True
+    # Issue #22 (ENH-06): where the durable state store lives. None means "not
+    # configured"; load() resolves it to the environment override, this key, or
+    # the per-profile default, and statestore.resolve_state_db_path re-resolves a
+    # blank at call time so a directly-constructed Config() still gets a path.
+    # Appended last so every pre-existing positional construction keeps its
+    # argument order.
+    state_db_path: str | None = None
 
     # -- loading ---------------------------------------------------------
 
@@ -193,6 +213,15 @@ class Config:
         cfg = cls.from_dict(data)
         if env.get("HYPERV_MCP_UNRESTRICTED", "") in ("1", "true", "yes"):
             cfg = replace(cfg, unrestricted=True)
+        # Issue #22: HYPERV_MCP_STATE_DB overrides the config-file key, exactly
+        # as HYPERV_MCP_UNRESTRICTED overrides `unrestricted`; with neither, the
+        # per-profile default applies. The store is always on — there is no
+        # process-local mode.
+        state_db = (env.get("HYPERV_MCP_STATE_DB") or "").strip()
+        if state_db:
+            cfg = replace(cfg, state_db_path=state_db)
+        elif not (cfg.state_db_path or "").strip():
+            cfg = replace(cfg, state_db_path=default_state_db_path(env))
         cfg = replace(
             cfg,
             config_path=config_path,
@@ -337,6 +366,7 @@ class Config:
             f"host_powershell_wait_s={self.host_powershell_wait_s:g}",
             f"ps_slot_dir={self.ps_slot_dir or '(derived default)'}",
             f"psdirect_session_reuse={self.psdirect_session_reuse}",
+            f"state_db_path={self.state_db_path or '(derived default)'}",
         ]
         return "; ".join(lines)
 
@@ -464,6 +494,7 @@ Config._FIELD_MAP = {  # type: ignore[attr-defined]
     "host_powershell_wait_s": lambda c, v: c._set_number("host_powershell_wait_s", v),
     "ps_slot_dir": lambda c, v: c._set_str_opt("ps_slot_dir", v),
     "psdirect_session_reuse": lambda c, v: c._set_bool("psdirect_session_reuse", v),
+    "state_db_path": lambda c, v: c._set_str_opt("state_db_path", v),
     "hyperv": lambda c, v: c._set_hyperv(v),
     "http": lambda c, v: c._set_http(v),
 }

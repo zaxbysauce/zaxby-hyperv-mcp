@@ -58,6 +58,7 @@ from . import (
     pswindows,
     relay,
     repair,
+    statestore,
     stdio_proxy,
     timing,
     vmlocks,
@@ -224,6 +225,10 @@ def _startup_banner(cfg: Config) -> None:
     else:
         print("[hyperv-mcp] Hyper-V target: local host", file=sys.stderr)
     print(f"[hyperv-mcp] policy: {cfg.policy_summary()}", file=sys.stderr)
+    # Issue #22: the durable state store is always on. Print where it lives so
+    # an operator can find (and back up, or delete) it.
+    print(f"[hyperv-mcp] state store: {statestore.resolve_state_db_path(cfg)}",
+          file=sys.stderr)
     if cfg.unrestricted:
         print(
             "[hyperv-mcp] WARNING: UNRESTRICTED mode — every policy axis is "
@@ -2216,7 +2221,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             "hyperv_guest_job_status", "", "exec",
             guestjobs.job_status, _cfg(), job_id,
             owner=auditlog.current_agent_id(),
-            audit_job_id=job_id, audit_vm_name=guestjobs.peek_vm_name(job_id),
+            audit_job_id=job_id, audit_vm_name=guestjobs.peek_vm_name(job_id, _cfg()),
         )
 
     @mcp.tool()
@@ -2231,7 +2236,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             "hyperv_guest_job_output", "", "exec",
             guestjobs.job_output, _cfg(), job_id, tail_bytes=tail_bytes,
             owner=auditlog.current_agent_id(),
-            audit_job_id=job_id, audit_vm_name=guestjobs.peek_vm_name(job_id),
+            audit_job_id=job_id, audit_vm_name=guestjobs.peek_vm_name(job_id, _cfg()),
         )
 
     @mcp.tool()
@@ -2259,7 +2264,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             "hyperv_guest_job_stop", "", "exec",
             guestjobs.job_stop, _cfg(), job_id,
             owner=auditlog.current_agent_id(),
-            audit_job_id=job_id, audit_vm_name=guestjobs.peek_vm_name(job_id),
+            audit_job_id=job_id, audit_vm_name=guestjobs.peek_vm_name(job_id, _cfg()),
         )
 
     @mcp.tool()
@@ -2278,7 +2283,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             relay.relay_status, _cfg(), relay_id,
             owner=auditlog.current_agent_id(),
             audit_relay_id=relay_id,
-            audit_vm_name=relay.peek_vm_name(relay_id) if relay_id else "",
+            audit_vm_name=relay.peek_vm_name(relay_id, _cfg()) if relay_id else "",
         )
 
     @mcp.tool()
@@ -2292,7 +2297,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             "hyperv_relay_stop", "", "relay",
             relay.relay_stop, _cfg(), relay_id,
             owner=auditlog.current_agent_id(),
-            audit_relay_id=relay_id, audit_vm_name=relay.peek_vm_name(relay_id),
+            audit_relay_id=relay_id, audit_vm_name=relay.peek_vm_name(relay_id, _cfg()),
         )
 
     _harden_tools(mcp)
@@ -2490,6 +2495,7 @@ def main(argv: list[str] | None = None) -> int:
             "HYPERV_HOST_PASSWORD", "HYPERV_HOST_PASSWORD_FILE",
             "HYPERV_MCP_CONFIG",
             "HYPERV_MCP_UNRESTRICTED", "HYPERV_MCP_HTTP_TOKEN",
+            "HYPERV_MCP_STATE_DB",
         ):
             print(f"{name:36}{'set' if name in os.environ else 'not set'}")
         # http.agents decides proxy/controller auth in agents-mode; name the

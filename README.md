@@ -293,6 +293,57 @@ Hardening properties:
 
 ---
 
+## Durable state store
+
+Job and relay handles survive a server restart. The registry lives in a SQLite
+database in WAL mode, so a `job_id` or `relay_id` an agent is holding still
+addresses the guest process after the server process exits, crashes, or is
+restarted — a stdio client restart is enough. The store is always on; there is
+no in-memory-only mode.
+
+```jsonc
+{
+  "state_db_path": "C:\\ProgramData\\hyperv-mcp\\state.db"   // optional
+}
+```
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `state_db_path` | `%LOCALAPPDATA%\hyperv-mcp\state.db` | Where the store lives. |
+| `HYPERV_MCP_STATE_DB` | — | Environment override of `state_db_path`, like `HYPERV_MCP_UNRESTRICTED`. |
+
+The startup banner and `hyperv-mcp --check-env` print the resolved path. The
+database must be on a local disk: WAL mode needs shared memory and does not
+work over a network filesystem, so a UNC path is refused with a clear error.
+
+What the store holds, and what it never holds:
+
+- **Holds** — `job_id`, VM name and GUID, PID and its start-time identity,
+  the job directory and stream paths, `started_at`, lifecycle state, the
+  owning agent, and a *credential reference* (`env`, `file`, or `inline`).
+- **Never holds** — no password, no password-file content, no command text,
+  no argument text, and no relay capability secret. A restored job re-resolves
+  its credential from the source it was started with, which registers the
+  secret for redaction exactly as at start.
+
+Lifecycle after a restart:
+
+- A job that was running is still addressable: `hyperv_guest_job_status`,
+  `_output` and `_stop` reattach to it.
+- A job whose start was interrupted by the crash comes back as `orphaned`.
+- A relay whose listener died with the process is reported as
+  `state: "interrupted"` instead of `unknown relay_id`, and starting the same
+  VM + guest port again is not refused as a duplicate. No listener is re-bound
+  automatically — bringing a relay back is an explicit `hyperv_relay_start`,
+  which re-checks policy.
+- A job started with inline credentials cannot be re-attached: it reports a
+  credential error rather than silently substituting whatever credentials the
+  environment now holds.
+
+The schema is versioned with `PRAGMA user_version` (this release sets 1) and
+migrations only go forward. A database written by a newer build is refused
+rather than silently corrupted.
+
 ## Configuration
 
 No configuration file = **deny everything** (safe default; the server prints
@@ -341,6 +392,8 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
                                        // All servers on a host must use the same value and cap
   "psdirect_session_reuse": true,      // reuse PowerShell Direct sessions across calls (issue #21).
                                        // See "PowerShell Direct session reuse" below
+ "state_db_path": null,                // durable state store location (issue #22); null = the
+                                       // %LOCALAPPDATA% default. See "Durable state store" above
   // "hyperv": { "host": "nuc01" },    // remote Hyper-V host (issue #43);
   //                                    // OMIT the section entirely for local mode
   //                                    // (the section requires a non-empty host)
@@ -1096,11 +1149,10 @@ an unrelated process is never killed (a confirmed start-time mismatch
 returns `pid_reused: true`, and the already-gone job reports stopped; an
 UNREADABLE start time is an unknown, not a mismatch — nothing is killed
 and `pid_reused` stays false). Non-elevated
-only (RunAs cannot redirect streams). The in-process registry is capped at
+only (RunAs cannot redirect streams). The registry is capped at
 128 active jobs (oldest stopped entries are evicted first; new starts are
 rejected once the cap is reached) and holds the start-time credentials until
-a successful stop, cap eviction, or process exit — plan accordingly on
-shared hosts. Every job belongs to the agent that started it: a
+a successful stop or cap eviction. Every job belongs to the agent that started it: a
 status/output/stop call from a different agent gets the same `unknown
 job_id` error as an absent id (a foreign caller's id is never distinguishable
 from a made-up one, and no guest leg runs for it). `exiting` is not a

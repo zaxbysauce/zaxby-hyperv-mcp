@@ -55,9 +55,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from . import consolebench, policy, pswindows, vmident
+from . import consolebench, credentials, policy, pswindows, statestore, vmident
 from .config import Config
-from .credentials import CredentialSet
+from .credentials import CredentialError, CredentialSet
 from .diagnostics import build_guest_script
 
 _LOOPBACK_BINDS = {"127.0.0.1", "localhost", "::1"}
@@ -70,8 +70,146 @@ _REMOTE_RESPONSE_BYTES = 192 * 1024
 _REQUEST_TIMEOUT_S = 30
 _MAX_RELAYS = 16
 
+# Process-local write-through cache by design (issue #22): the authoritative
+# copy of anything whose lifetime exceeds this process lives in the durable
+# state store, and this dict is the fast in-process view of it. It stays a real
+# dict because existing tests read and poke it directly.
 _relays: dict[str, dict[str, Any]] = {}
 _relays_lock = threading.Lock()
+
+
+def _store(cfg: Config) -> statestore.Store:
+    """The durable store for this config, cached per process by resolved path."""
+    return statestore.store_for(cfg)
+
+
+def _cred_ref(cred: CredentialSet | None) -> str:
+    """The credential reference a row records. Never the secret itself."""
+    if cred is None:
+        return "inline"
+    return str(getattr(cred, "source", "inline") or "inline")
+
+
+def _row(entry: dict[str, Any], state: str) -> statestore.RelayRow:
+    """Project a registry entry onto a store row. The per-relay secret and the
+    live credential are deliberately absent: neither is ever persisted."""
+    return statestore.RelayRow(
+        relay_id=str(entry["relay_id"]),
+        vm_name=str(entry.get("vm_name") or ""),
+        vm_id=str(entry.get("vm_id") or ""),
+        guest_port=int(entry.get("guest_port") or 0),
+        bind=str(entry.get("bind") or "127.0.0.1"),
+        host_port=int(entry.get("host_port") or 0),
+        started_at=str(entry.get("started_at") or ""),
+        state=state,
+        cred_ref=str(entry.get("cred_ref") or _cred_ref(entry.get("context", {}).get("cred"))),
+        owner=entry.get("owner"),
+    )
+
+
+class _DeadThread:
+    """Stand-in `thread` for a restored relay: it has no listener, so it is
+    never alive. Exists so a status row's shape is identical whether the relay
+    is live in this process or restored from the store."""
+
+    def is_alive(self) -> bool:
+        return False
+
+
+def _restored_entry(cfg: Config, row: statestore.RelayRow,
+                    owner: str | None) -> dict[str, Any] | None:
+    """Rebuild a process-local entry from a persisted row (issue #22).
+
+    Returns None for an absent row and for a foreign one, so the caller raises
+    the SAME `unknown relay_id` ValueError either way — no existence oracle.
+    The synthesized context is never used to serve a request: an interrupted
+    relay has no listener.
+    """
+    if owner is not None and (row.owner or None) != owner:
+        return None
+    cred = None
+    if row.cred_ref != "inline":
+        try:
+            cred = credentials.resolve_guest()
+        except CredentialError:
+            # A restored relay's credential is only needed to STOP it, and a
+            # stop of an interrupted relay performs no guest leg. Leave it None
+            # and let the request path (which no longer exists) be the only
+            # thing that would have needed it.
+            cred = None
+    context: dict[str, Any] = {
+        "cfg": cfg,
+        "vm_name": row.vm_name,
+        "vm_id": row.vm_id,
+        "guest_port": row.guest_port,
+        "cred": cred,
+        "secret": "",
+        "counters": _new_counters(),
+        "latency": _new_latency(),
+        "counter_lock": threading.Lock(),
+        "relay_id": row.relay_id,
+    }
+    return {
+        "relay_id": row.relay_id,
+        "vm_name": row.vm_name,
+        "vm_id": row.vm_id,
+        "guest_port": row.guest_port,
+        "bind": row.bind,
+        "host_port": row.host_port,
+        "server": None,
+        "thread": _DeadThread(),
+        "context": context,
+        "owner": row.owner,
+        "started_at": row.started_at,
+        "stopped": row.state == statestore.RELAY_STOPPED,
+        "row_state": row.state,
+        "cred_ref": row.cred_ref,
+    }
+
+
+def _restore_relay(cfg: Config, relay_id: str,
+                   owner: str | None) -> dict[str, Any] | None:
+    """Rebuild a relay entry from a persisted row, or None if there is none.
+
+    A restored relay's listener is gone by construction, so the row's persisted
+    state is normalized to `interrupted` here unless it was already stopped.
+    """
+    row = _store(cfg).relay_get(relay_id)
+    if row is None:
+        return None
+    entry = _restored_entry(cfg, row, owner)
+    if entry is None:
+        return None
+    if entry.get("row_state") == statestore.RELAY_ACTIVE:
+        entry["row_state"] = statestore.RELAY_INTERRUPTED
+    return entry
+
+
+def _restored_rows(cfg: Config, owner: str | None) -> list[dict[str, Any]]:
+    """Every store row this principal may see, as restored entries."""
+    out: list[dict[str, Any]] = []
+    for row in _store(cfg).relay_rows():
+        if row.state == statestore.RELAY_STOPPED:
+            continue
+        entry = _restored_entry(cfg, row, owner)
+        if entry is not None:
+            out.append(entry)
+    return out
+
+
+def _row_state(store: statestore.Store, relay_id: str) -> str:
+    """A store row's state, or "" when there is no row (in-memory only)."""
+    row = store.relay_get(relay_id)
+    return row.state if row is not None else ""
+
+
+def _started_at(entry: dict[str, Any] | None, store: statestore.Store,
+                relay_id: str) -> str:
+    """Oldest-first eviction key across the union of the two views."""
+    if entry is not None:
+        return str(entry.get("started_at") or "")
+    row = store.relay_get(relay_id)
+    return row.started_at if row is not None else ""
 
 
 def _utc_now_iso() -> str:
@@ -87,7 +225,7 @@ def clear_registry_for_tests() -> None:
         _shutdown_server(entry)
 
 
-def peek_vm_name(relay_id: str) -> str:
+def peek_vm_name(relay_id: str, cfg: Config | None = None) -> str:
     """Read-only vm_name lookup for audit rows (issue #10).
 
     Unlike the inline get-and-raise in relay_status/relay_stop this never
@@ -97,11 +235,20 @@ def peek_vm_name(relay_id: str) -> str:
     audit row can name the VM even when the tool leg itself fails.
     Read-only by design — it never touches credentials or stop state.
     """
+    key = relay_id or ""
     with _relays_lock:
-        entry = _relays.get(relay_id or "")
-    if entry is None or entry.get("in_flight"):
-        return ""
-    return str(entry.get("vm_name") or "")
+        entry = _relays.get(key)
+    if entry is not None:
+        if entry.get("in_flight"):
+            return ""
+        return str(entry.get("vm_name") or "")
+    # issue #22: after a restart the entry only exists in the store, and the
+    # pre-dispatch audit path still wants to name the VM.
+    if cfg is not None:
+        row = _store(cfg).relay_get(key)
+        if row is not None:
+            return str(row.vm_name or "")
+    return ""
 
 
 def _shutdown_server(entry: dict[str, Any]) -> None:
@@ -518,43 +665,68 @@ def relay_start(
     # one — the loser raises here, before binding anything. At capacity,
     # stopped entries are evicted oldest-first (credential nulled before
     # delete, mirroring guestjobs._reserve_slot).
-    with _relays_lock:
-        for entry in _relays.values():
-            if not entry.get("stopped") and entry["vm_id"] == ref.id \
-                    and entry["guest_port"] == guest_port:
-                raise ValueError(
-                    f"a relay to {ref.name}:{guest_port} already exists ({entry['relay_id']})"
+    # Issue #22: the store write transaction is the OUTER lock and
+    # `_relays_lock` the inner one — the process-wide order that keeps a
+    # concurrent register or stop from deadlocking against this path. The cap
+    # counts the UNION of the in-memory view and the store rows, because
+    # separate stdio server processes share one store and tests inject entries
+    # straight into `_relays`.
+    store = _store(cfg)
+    with store.transaction():
+        with _relays_lock:
+            for entry in _relays.values():
+                if not entry.get("stopped") and entry["vm_id"] == ref.id \
+                        and entry["guest_port"] == guest_port:
+                    raise ValueError(
+                        f"a relay to {ref.name}:{guest_port} already exists ({entry['relay_id']})"
+                    )
+            known = set(_relays) | {r.relay_id for r in store.relay_rows()}
+            if len(known) >= _MAX_RELAYS:
+                evictable = sorted(
+                    (k for k in known
+                     if (_relays.get(k) or {}).get("stopped")
+                     or _row_state(store, k) == statestore.RELAY_STOPPED),
+                    key=lambda k: _started_at(_relays.get(k), store, k),
                 )
-        if len(_relays) >= _MAX_RELAYS:
-            stopped = sorted(
-                (k for k, v in _relays.items() if v.get("stopped")),
-                key=lambda k: _relays[k]["started_at"],
-            )
-            for key in stopped[: max(1, len(_relays) - _MAX_RELAYS + 1)]:
-                evicted = _relays[key]
-                evicted["context"]["cred"] = None
-                del _relays[key]
-        if len(_relays) >= _MAX_RELAYS:
-            raise RuntimeError(
-                f"relay registry is full ({_MAX_RELAYS} active relays); "
-                "stop relays before starting more"
-            )
-        _relays[relay_id] = {
-            "relay_id": relay_id,
-            "vm_name": ref.name,
-            "vm_id": ref.id,
-            "guest_port": int(guest_port),
-            "owner": owner,
-            "in_flight": True,
-            "started_at": _utc_now_iso(),
-            "stopped": False,
-        }
+                for key in evictable[: max(1, len(known) - _MAX_RELAYS + 1)]:
+                    evicted = _relays.get(key)
+                    if evicted is not None:
+                        evicted["context"]["cred"] = None
+                        del _relays[key]
+                    store.relay_delete(key)
+                    known.discard(key)
+            if len(known) >= _MAX_RELAYS:
+                raise RuntimeError(
+                    f"relay registry is full ({_MAX_RELAYS} active relays); "
+                    "stop relays before starting more"
+                )
+            started_at = _utc_now_iso()
+            _relays[relay_id] = {
+                "relay_id": relay_id,
+                "vm_name": ref.name,
+                "vm_id": ref.id,
+                "guest_port": int(guest_port),
+                "owner": owner,
+                "in_flight": True,
+                "started_at": started_at,
+                "stopped": False,
+            }
+            store.relay_upsert(statestore.RelayRow(
+                relay_id=relay_id, vm_name=ref.name, vm_id=ref.id,
+                guest_port=int(guest_port), bind=bind,
+                started_at=started_at, state=statestore.RELAY_ACTIVE,
+                cred_ref=_cred_ref(cred), owner=owner,
+            ))
 
     def _release() -> None:
         with _relays_lock:
             current = _relays.get(relay_id)
             if current is not None and current.get("in_flight"):
                 del _relays[relay_id]
+        # Registry lock released first: store-lock is the outer order. A
+        # stranded row would be invisible to status, unstoppable, cap-consuming
+        # and would block this vm:guest_port forever via the duplicate scan.
+        store.relay_delete(relay_id)
 
     try:
         context: dict[str, Any] = {
@@ -604,6 +776,8 @@ def relay_start(
         }
         with _relays_lock:
             _relays[relay_id] = entry
+        # Registry lock released first: store-lock is the outer order.
+        store.relay_upsert(_row(entry, statestore.RELAY_ACTIVE))
     except BaseException:
         # No exception between the reservation and the registration may
         # strand the in-flight placeholder (it is invisible to status,
@@ -653,7 +827,13 @@ def relay_status(cfg: Config, relay_id: str = "", *, owner: str | None = None) -
             if entry is None or entry.get("in_flight") or (
                 owner is not None and entry.get("owner") != owner
             ):
-                raise ValueError(f"unknown relay_id {relay_id!r}")
+                # issue #22: the entry died with a previous process. A row that
+                # is not in the LOCAL registry is reported interrupted — its
+                # listener died with the process that started it, because this
+                # process did not start it.
+                entry = _restore_relay(cfg, relay_id, owner)
+                if entry is None:
+                    raise ValueError(f"unknown relay_id {relay_id!r}")
             selected = [entry]
         else:
             selected = [
@@ -661,6 +841,15 @@ def relay_status(cfg: Config, relay_id: str = "", *, owner: str | None = None) -
                 if not e.get("in_flight")
                 and (owner is None or e.get("owner") == owner)
             ]
+            # Union with the store's non-stopped rows, deduplicated by
+            # relay_id with the local entry taking priority, so a relay restored
+            # after a restart is visible rather than silently omitted and a
+            # relay that is mid-bind in this process is not double-counted.
+            local_ids = {e["relay_id"] for e in selected}
+            selected.extend(
+                e for e in _restored_rows(cfg, owner)
+                if e["relay_id"] not in local_ids
+            )
     rows = []
     for entry in selected:
         with entry["context"]["counter_lock"]:
@@ -672,6 +861,7 @@ def relay_status(cfg: Config, relay_id: str = "", *, owner: str | None = None) -
             latency_samples = list(entry["context"]["latency"]["samples"])
             latency_cap = entry["context"]["latency"]["cap"]
         latency = _latency_summary(latency_samples, latency_cap)
+        restored = entry.get("row_state") not in (None, statestore.RELAY_ACTIVE)
         rows.append({
             "relay_id": entry["relay_id"],
             "vm_name": entry["vm_name"],
@@ -681,11 +871,16 @@ def relay_status(cfg: Config, relay_id: str = "", *, owner: str | None = None) -
             "url": f"http://{entry['bind']}:{entry['host_port']}/",
             "started_at": entry["started_at"],
             "stopped": bool(entry["stopped"]),
-            "thread_alive": bool(entry["thread"].is_alive()),
+            "thread_alive": False if restored else bool(entry["thread"].is_alive()),
             "counters": counters,
             # Additive: the existing `counters` contract is unchanged, exactly
             # as issue #20's `timing` object was additive to the audit record.
             "latency": latency,
+            # Additive (issue #22): a restored relay's listener is gone, so the
+            # row says so instead of leaving the caller to infer it from
+            # thread_alive on a relay it can no longer reach.
+            "state": ("stopped" if entry.get("stopped")
+                      else "interrupted" if restored else "active"),
         })
     return {"ok": True, "relays": rows}
 
@@ -732,13 +927,20 @@ def relay_stop(cfg: Config, relay_id: str, *, owner: str | None = None) -> dict:
         if entry is None or entry.get("in_flight") or (
             owner is not None and entry.get("owner") != owner
         ):
-            raise ValueError(f"unknown relay_id {relay_id!r}")
+            # issue #22: a relay restored from the store has no listener to
+            # shut down; report it as already stopped rather than unknown.
+            entry = _restore_relay(cfg, relay_id, owner)
+            if entry is None:
+                raise ValueError(f"unknown relay_id {relay_id!r}")
         already = bool(entry["stopped"])
         entry["stopped"] = True
     if not already:
         _shutdown_server(entry)
         with _relays_lock:
             entry["context"]["cred"] = None
+        # Registry lock released first: store-lock is the outer order. An
+        # interrupted relay has no listener, so its shutdown is a no-op.
+        _store(cfg).relay_upsert(_row(entry, statestore.RELAY_STOPPED))
     return {
         "ok": True,
         "relay_id": relay_id,

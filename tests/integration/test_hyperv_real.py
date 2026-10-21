@@ -243,3 +243,98 @@ def test_nonexistent_vm_error_clarity(guarded_vm):
     with pytest.raises(Exception) as exc:
         lifecycle.get_vm_info(guarded_vm.cfg, "mcp-it-definitely-not-a-vm")
     assert "mcp-it-definitely-not-a-vm" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# durable state store (issue #22, AC10)
+# ---------------------------------------------------------------------------
+
+def test_e01_job_survives_server_restart(running_vm, tmp_path):
+    """AC10: a job started through one server process is still addressable
+    from a second process against the same state DB.
+
+    Only a real PowerShell Direct round trip shows that the restored PID and
+    paths still address the guest process. The "restart" is a hard kill of a
+    child process, not a clean shutdown — the three cases that matter
+    (os._exit, a kill, a crashed interpreter) all skip every cleanup path.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+
+    from hyperv_mcp import guestjobs
+
+    db = tmp_path / "state.sqlite3"
+    # The child inherits the environment and gets the SAME store; SYSTEMROOT
+    # and friends ride along via dict(os.environ, ...).
+    env = dict(os.environ, HYPERV_MCP_STATE_DB=str(db))
+
+    # Process A: start a long-running job, then die inside the start leg.
+    starter = tmp_path / "start_job.py"
+    starter.write_text(
+        "import json, sys\n"
+        "from hyperv_mcp import credentials, guestjobs\n"
+        "from hyperv_mcp.config import Config\n"
+        "cfg = Config.load()\n"
+        "credentials.init(cfg)\n"
+        "out = guestjobs.job_start(\n"
+        "    cfg, sys.argv[1], 'ping', ['-n', '120', '127.0.0.1'],\n"
+        "    cred=credentials.resolve_guest(),\n"
+        ")\n"
+        "print(json.dumps(out))\n",
+        encoding="utf-8",
+    )
+    started = subprocess.run(
+        [sys.executable, str(starter), running_vm.vm],
+        env=env, capture_output=True, text=True, timeout=600,
+    )
+    assert started.returncode == 0, started.stderr[-2000:]
+    job = json.loads(started.stdout.strip().splitlines()[-1])
+    job_id = job["job_id"]
+    job_dir = job["job_dir"]
+
+    # The store holds no password and no command text.
+    raw = db.read_bytes()
+    for needle in (
+        os.environ.get("HYPERV_GUEST_PASSWORD", "").encode("utf-8", "replace"),
+        b"ping", b"-n", b"120",
+    ):
+        if needle:
+            assert needle not in raw, "the state store persisted secret or command material"
+
+    # Process B: a fresh interpreter with the same store reattaches.
+    follower = tmp_path / "follow_job.py"
+    follower.write_text(
+        "import json, sys\n"
+        "from hyperv_mcp import credentials, guestjobs\n"
+        "from hyperv_mcp.config import Config\n"
+        "cfg = Config.load()\n"
+        "credentials.init(cfg)\n"
+        "job_id = sys.argv[1]\n"
+        "status = guestjobs.job_status(cfg, job_id)\n"
+        "out = guestjobs.job_output(cfg, job_id)\n"
+        "print(json.dumps({'status': status, 'output': out}))\n",
+        encoding="utf-8",
+    )
+    followed = subprocess.run(
+        [sys.executable, str(follower), job_id],
+        env=env, capture_output=True, text=True, timeout=600,
+    )
+    assert followed.returncode == 0, followed.stderr[-2000:]
+    payload = json.loads(followed.stdout.strip().splitlines()[-1])
+    assert payload["status"]["status"] == "running", payload["status"]
+    assert payload["output"]["stdout"].strip(), payload["output"]
+
+    # Process B stops it, and the guest job directory goes away.
+    stopped = guestjobs.job_stop(running_vm.cfg, job_id, cred=running_vm.creds)
+    assert stopped["stopped"] is True, stopped
+
+    probe = running_vm.cfg
+    exists = guestjobs.run_guest_inner(
+        probe, running_vm.vm,
+        f"if (Test-Path -LiteralPath {guestjobs.pswindows.ps_quote(job_dir)}) "
+        "{ 'present' } else { 'absent' }",
+        running_vm.creds, mode="read",
+    )
+    assert "absent" in str(exists.get("stdout", "")), exists

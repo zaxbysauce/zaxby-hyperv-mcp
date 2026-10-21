@@ -31,6 +31,12 @@ class CredentialError(RuntimeError):
 class CredentialSet:
     username: str
     password: str
+    # Where this credential came from. The durable state store records this
+    # reference and never the secret, so a job restored after a server restart
+    # re-resolves from the SAME source it started with. A hand-built set
+    # defaults to "inline" and is therefore never re-resolvable: substituting a
+    # different identity would run guest legs as the wrong account.
+    source: str = "inline"
 
     def __repr__(self) -> str:  # pragma: no cover - trivial
         return f"<CredentialSet username={self.username!r} password=***>"
@@ -149,7 +155,8 @@ def resolve_guest(
             + ("; inline arguments are disabled by policy (allow_inline_credentials)"
                if had_inline_args else "")
         )
-    return CredentialSet(u, _validated_password(p, p_source))
+    cred_ref = "file" if p_source.endswith("_FILE") else "env"
+    return CredentialSet(u, _validated_password(p, p_source), cred_ref)
 
 
 def resolve_victim(environ: dict[str, str] | None = None) -> CredentialSet:
@@ -171,7 +178,8 @@ def resolve_victim(environ: dict[str, str] | None = None) -> CredentialSet:
         if env.get("HYPERV_GUEST_VICTIM_PASSWORD_FILE", "").strip() and not env.get("HYPERV_GUEST_VICTIM_PASSWORD")
         else "HYPERV_GUEST_VICTIM_PASSWORD"
     )
-    return CredentialSet(u, _validated_password(p, p_source))
+    cred_ref = "file" if p_source.endswith("_FILE") else "env"
+    return CredentialSet(u, _validated_password(p, p_source), cred_ref)
 
 
 def resolve_host(environ: dict[str, str] | None = None) -> CredentialSet | None:
@@ -201,4 +209,5 @@ def resolve_host(environ: dict[str, str] | None = None) -> CredentialSet | None:
             "Remote host credentials are incomplete. Set HYPERV_HOST_USERNAME "
             "and HYPERV_HOST_PASSWORD (or HYPERV_HOST_PASSWORD_FILE)"
         )
-    return CredentialSet(u, _validated_password(p, p_source))
+    cred_ref = "file" if p_source.endswith("_FILE") else "env"
+    return CredentialSet(u, _validated_password(p, p_source), cred_ref)
