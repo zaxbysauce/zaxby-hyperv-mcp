@@ -987,15 +987,21 @@ def relay_stop(cfg: Config, relay_id: str, *, owner: str | None = None) -> dict:
         with _relays_lock:
             already = bool(entry["stopped"])
             entry["stopped"] = True
+    recorded_ref = entry.get("cred_ref") or _cred_ref(
+        entry.get("context", {}).get("cred")
+    )
     if not already:
         _shutdown_server(entry)
         with _relays_lock:
             entry["context"]["cred"] = None
         # Registry lock released first: store-lock is the outer order. An
         # interrupted relay has no listener, so its shutdown is a no-op. The
-        # row's cred_ref is captured before the live credential is nulled, so
-        # the persisted provenance is not silently rewritten to "inline".
-        _store(cfg).relay_upsert(_stopped_row(entry))
+        # reference is captured before the live credential is nulled, so the
+        # persisted provenance is not silently rewritten to "inline".
+        row = _row(entry, statestore.RELAY_STOPPED)
+        _store(cfg).relay_upsert(statestore.RelayRow(
+            **{**row.as_dict(), "cred_ref": recorded_ref}
+        ))
     return {
         "ok": True,
         "relay_id": relay_id,

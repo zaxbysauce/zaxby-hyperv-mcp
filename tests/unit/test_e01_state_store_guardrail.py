@@ -4,7 +4,7 @@ Class: **process-local registry for state whose lifetime exceeds the process** �
 a module-level dict that is the only copy of something a client holds a handle
 to, so a restart strands the handle while the underlying resource keeps running.
 
-Two pins, both proven by mutation:
+Six pins, each proven by an executed mutation probe:
 
 1. **Restart survival.** With a live job and a live relay, reloading BOTH
    registry modules (which re-creates their module dicts, exactly as a process
@@ -180,11 +180,12 @@ def test_store_schema_holds_no_secret_or_command_column(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Round-2 implementation-review pins.
+# Round-2 and round-3 implementation-review pins.
 #
 # Each of these pins an invariant the shipped suite did not cover when the
 # reviewer's own probes found the defect. Every one is proven by an executed
-# mutation probe (see 08a-recurrence-sweep.md).
+# mutation probe; the probes and their outputs are recorded in
+# 08a-recurrence-sweep.md.
 # ---------------------------------------------------------------------------
 
 
@@ -263,16 +264,19 @@ def test_no_id_listing_never_discloses_a_mid_bind_relay(monkeypatch, tmp_path):
     relay.relay_stop(cfg, relay_id)
 
 
-def test_relay_stop_already_flag_is_atomic(monkeypatch, tmp_path):
-    """Exactly one of two racing stops performs the shutdown.
+def test_relay_stop_reads_stopped_under_the_registry_lock(monkeypatch, tmp_path):
+    """`relay_stop` reads and writes `stopped` inside ONE critical section.
 
-    The read and the write of `stopped` are one critical section. Reading the
-    flag outside the lock lets both threads observe `already=False`, which
-    double-shuts-down, double-writes the store, and returns zero
-    "was already stopped" notes — the PRR-027b invariant base held.
+    Reading the flag outside the lock lets two racing stops both observe
+    `already=False`, which double-shuts-down, double-writes the store, and
+    returns zero "was already stopped" notes — the PRR-027b invariant base
+    held and frozen C13 pins behaviourally.
+
+    The pin observes the discipline rather than the outcome: a lock wrapper
+    records whether `_relays_lock` is held, and the entry records whether each
+    `stopped` read happened while it was. Deterministic, single-threaded, and
+    it cannot pass for an unrelated reason.
     """
-    import threading
-
     monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
     cfg = Config(
         unrestricted=True, allowed_vm_patterns=["test-*"],
@@ -280,45 +284,39 @@ def test_relay_stop_already_flag_is_atomic(monkeypatch, tmp_path):
     )
     credentials.init(cfg)
     monkeypatch.setattr(pswindows, "run_ps", _LegFakePS({}, {}))
-    started = relay.relay_start(cfg, "test-vm", 9404, cred=CRED)
+    started = relay.relay_start(cfg, "test-vm", 9405, cred=CRED)
     relay_id = started["relay_id"]
 
-    # A dict subclass that yields the moment `stopped` is READ. Under the fixed
-    # code that read happens while `_relays_lock` is held, so the other thread
-    # blocks and cannot interleave; under the mutant the read is outside the
-    # lock, the other thread completes first, and both take the real-stop path.
-    gate = threading.Event()
-    proceed = threading.Event()
+    real_lock = relay._relays_lock
+    held = [False]
 
-    class _YieldingEntry(dict):
+    class _TrackingLock:
+        def __enter__(self):
+            real_lock.acquire()
+            held[0] = True
+            return self
+
+        def __exit__(self, *exc):
+            held[0] = False
+            real_lock.release()
+
+    reads: list[bool] = []
+
+    class _TrackingEntry(dict):
         def __getitem__(self, key):
-            if key == "stopped" and not gate.is_set():
-                gate.set()
-                proceed.wait(10)
+            if key == "stopped":
+                reads.append(held[0])
             return super().__getitem__(key)
 
+    monkeypatch.setattr(relay, "_relays_lock", _TrackingLock())
     with relay._relays_lock:
-        relay._relays[relay_id] = _YieldingEntry(relay._relays[relay_id])
+        relay._relays[relay_id] = _TrackingEntry(relay._relays[relay_id])
 
-    results = []
-    lock = threading.Lock()
-
-    def stopper():
-        r = relay.relay_stop(cfg, relay_id)
-        with lock:
-            results.append(r)
-
-    first = threading.Thread(target=stopper)
-    first.start()
-    assert gate.wait(10), "the stop never read the stopped flag"
-    second = threading.Thread(target=stopper)
-    second.start()
-    second.join(20)
-    proceed.set()
-    first.join(20)
-
-    assert len(results) == 2, results
-    assert sum(1 for r in results if "note" in r) == 1, results
+    stopped = relay.relay_stop(cfg, relay_id)
+    assert stopped["stopped"] is True, stopped
+    # Exactly one `stopped` read, and it happened with the lock held.
+    assert reads, "relay_stop never read the stopped flag"
+    assert reads == [True], reads
 
 
 def test_restored_starting_row_answers_still_starting(monkeypatch, tmp_path):
@@ -348,3 +346,78 @@ def test_restored_starting_row_answers_still_starting(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="still starting"):
         guestjobs.job_output(cfg, job_id)
     assert job_id not in guestjobs._jobs
+
+
+def test_inline_tool_argument_credential_is_not_reattachable(monkeypatch, tmp_path):
+    """A per-call inline credential is NOT an environment credential.
+
+    `resolve_guest(u, p)` with inline arguments is how an operator overrides the
+    environment for ONE call. Persisting that as `cred_ref="env"` would make a
+    restored job re-resolve the ENVIRONMENT identity and run guest legs as a
+    different account — the silent substitution the issue's constraint and the
+    README both forbid.
+    """
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
+    monkeypatch.setenv("HYPERV_GUEST_USERNAME", "env-admin")
+    monkeypatch.setenv("HYPERV_GUEST_PASSWORD", "env-placeholder-pass")
+    # allow_inline_credentials is a config key with no environment equivalent;
+    # without it resolve_guest drops the inline arguments by policy.
+    cfg = Config(
+        unrestricted=True, allowed_vm_patterns=["test-*"],
+        allow_inline_credentials=True,
+    )
+    credentials.init(cfg)
+
+    inline = credentials.resolve_guest("inline-admin", "inline-placeholder-pass")
+    assert inline.source == "inline", inline.source
+
+    fake = _LegFakePS(
+        start={"pid": 4242, "job_dir": "d", "start_time_ticks": 1},
+        later={"status": "running"},
+    )
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    started = guestjobs.job_start(cfg, "test-vm", "x.exe", cred=inline)
+    job_id = started["job_id"]
+
+    importlib.reload(guestjobs)
+    # The environment holds a DIFFERENT identity. Reattach must refuse rather
+    # than substitute it.
+    with pytest.raises(credentials.CredentialError) as excinfo:
+        guestjobs.job_status(cfg, job_id)
+    # No substitution: the environment identity never appears in the error.
+    assert "env-admin" not in str(excinfo.value)
+
+
+def test_stop_persists_the_credential_reference(monkeypatch, tmp_path):
+    """A stopped row keeps the credential reference it was started with.
+
+    The live entry carries no `cred_ref` of its own, so capturing it after the
+    credential is nulled silently rewrites the persisted provenance to
+    "inline". Stopped rows never re-resolve today, so the loss is invisible
+    until something reads it — which is exactly why it is pinned here.
+    """
+    from hyperv_mcp import statestore
+
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
+    monkeypatch.setenv("HYPERV_GUEST_USERNAME", "Administrator")
+    monkeypatch.setenv("HYPERV_GUEST_PASSWORD", "placeholder-pass")
+    cfg = Config(unrestricted=True, allowed_vm_patterns=["test-*"])
+    credentials.init(cfg)
+    fake = _LegFakePS(
+        start={"pid": 4242, "job_dir": "d", "start_time_ticks": 1},
+        later={"status": "running"},
+    )
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    started = guestjobs.job_start(
+        cfg, "test-vm", "x.exe", cred=credentials.resolve_guest(),
+    )
+    job_id = started["job_id"]
+    store = statestore.store_for(cfg)
+    assert store.job_get(job_id).cred_ref == "env"
+
+    fake.later = {"stopped": True, "alive_pids": [], "job_dir_removed": True}
+    stopped = guestjobs.job_stop(cfg, job_id)
+    assert stopped["stopped"] is True, stopped
+    row = store.job_get(job_id)
+    assert row is not None and row.state == statestore.JOB_STOPPED, row
+    assert row.cred_ref == "env", row

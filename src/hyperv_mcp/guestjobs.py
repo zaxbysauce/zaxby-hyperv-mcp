@@ -822,24 +822,27 @@ def job_stop(cfg: Config, job_id: str, *, owner: str | None = None) -> dict:
     # Survivors win over a contradictory `stopped: true`.
     stopped = bool(outcome.get("stopped")) and not alive_pids
     job_dir_removed = outcome.get("job_dir_removed")
+    recorded_ref = ""
     if stopped:
         # Registry bookkeeping (registry lock only, outside any vm_lock).
         with _jobs_lock:
             current = _jobs.get(job_id)
             if current is not None:
                 current["stopped"] = True
+                # Captured before the null: a live entry carries no cred_ref of
+                # its own, so reading it afterwards would silently rewrite the
+                # persisted provenance to "inline".
+                recorded_ref = current.get("cred_ref") or _cred_ref(current.get("cred"))
                 current["cred"] = None
         # Store write AFTER the registry lock is released: store-lock is the
         # outer order process-wide. A failed stop writes nothing, which is what
         # keeps the entry stoppable and the credential retained for a retry.
-        # `entry` keeps the row's cred_ref (a live entry has none), so the
-        # persisted provenance is not silently rewritten to "inline".
+        if not recorded_ref:
+            recorded_ref = entry.get("cred_ref") or _cred_ref(entry.get("cred"))
         stopped_row = _row(entry, statestore.JOB_STOPPED)
-        if entry.get("cred_ref"):
-            stopped_row = statestore.JobRow(
-                **{**stopped_row.as_dict(), "cred_ref": entry["cred_ref"]}
-            )
-        _store(cfg).job_upsert(stopped_row)
+        _store(cfg).job_upsert(statestore.JobRow(
+            **{**stopped_row.as_dict(), "cred_ref": recorded_ref}
+        ))
     result = {
         "ok": stopped,
         "job_id": job_id,

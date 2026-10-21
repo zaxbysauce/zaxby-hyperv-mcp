@@ -155,7 +155,14 @@ def resolve_guest(
             + ("; inline arguments are disabled by policy (allow_inline_credentials)"
                if had_inline_args else "")
         )
-    cred_ref = "file" if p_source.endswith("_FILE") else "env"
+    # "inline argument" is a per-call credential, not an environment one. It
+    # must record "inline" so a restored job refuses to re-attach rather than
+    # silently re-resolving a DIFFERENT identity from the environment.
+    cred_ref = (
+        "inline" if p_source == "inline argument"
+        else "file" if p_source.endswith("_FILE")
+        else "env"
+    )
     return CredentialSet(u, _validated_password(p, p_source), cred_ref)
 
 
@@ -178,7 +185,14 @@ def resolve_victim(environ: dict[str, str] | None = None) -> CredentialSet:
         if env.get("HYPERV_GUEST_VICTIM_PASSWORD_FILE", "").strip() and not env.get("HYPERV_GUEST_VICTIM_PASSWORD")
         else "HYPERV_GUEST_VICTIM_PASSWORD"
     )
-    cred_ref = "file" if p_source.endswith("_FILE") else "env"
+    # "inline argument" is a per-call credential, not an environment one. It
+    # must record "inline" so a restored job refuses to re-attach rather than
+    # silently re-resolving a DIFFERENT identity from the environment.
+    cred_ref = (
+        "inline" if p_source == "inline argument"
+        else "file" if p_source.endswith("_FILE")
+        else "env"
+    )
     return CredentialSet(u, _validated_password(p, p_source), cred_ref)
 
 
@@ -209,5 +223,12 @@ def resolve_host(environ: dict[str, str] | None = None) -> CredentialSet | None:
             "Remote host credentials are incomplete. Set HYPERV_HOST_USERNAME "
             "and HYPERV_HOST_PASSWORD (or HYPERV_HOST_PASSWORD_FILE)"
         )
-    cred_ref = "file" if p_source.endswith("_FILE") else "env"
+    # "inline argument" is a per-call credential, not an environment one. It
+    # must record "inline" so a restored job refuses to re-attach rather than
+    # silently re-resolving a DIFFERENT identity from the environment.
+    cred_ref = (
+        "inline" if p_source == "inline argument"
+        else "file" if p_source.endswith("_FILE")
+        else "env"
+    )
     return CredentialSet(u, _validated_password(p, p_source), cred_ref)
