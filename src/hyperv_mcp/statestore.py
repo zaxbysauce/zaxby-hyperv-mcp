@@ -37,6 +37,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -62,37 +63,55 @@ RELAY_STOPPED = "stopped"
 RELAY_INTERRUPTED = "interrupted"
 RELAY_STATES = (RELAY_ACTIVE, RELAY_STOPPED, RELAY_INTERRUPTED)
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS jobs (
-    job_id TEXT PRIMARY KEY,
-    vm_name TEXT NOT NULL DEFAULT '',
-    vm_id TEXT NOT NULL DEFAULT '',
-    pid INTEGER NOT NULL DEFAULT 0,
-    start_time_ticks INTEGER,
-    job_dir TEXT NOT NULL DEFAULT '',
-    out_path TEXT NOT NULL DEFAULT '',
-    err_path TEXT NOT NULL DEFAULT '',
-    exit_path TEXT NOT NULL DEFAULT '',
-    started_at TEXT NOT NULL DEFAULT '',
-    state TEXT NOT NULL DEFAULT 'starting'
-        CHECK (state IN ('starting','active','stopped','orphaned')),
-    cred_ref TEXT NOT NULL DEFAULT 'inline',
-    owner TEXT
-);
-CREATE TABLE IF NOT EXISTS relays (
-    relay_id TEXT PRIMARY KEY,
-    vm_name TEXT NOT NULL DEFAULT '',
-    vm_id TEXT NOT NULL DEFAULT '',
-    guest_port INTEGER NOT NULL DEFAULT 0,
-    bind TEXT NOT NULL DEFAULT '127.0.0.1',
-    host_port INTEGER NOT NULL DEFAULT 0,
-    started_at TEXT NOT NULL DEFAULT '',
-    state TEXT NOT NULL DEFAULT 'active'
-        CHECK (state IN ('active','stopped','interrupted')),
-    cred_ref TEXT NOT NULL DEFAULT 'inline',
-    owner TEXT
-);
-"""
+# One statement per element: executescript() implicitly COMMITs a pending
+# transaction, which would make the schema and the user_version write two
+# separate units and let a concurrent opener observe a half-created schema.
+_SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS jobs (
+        job_id TEXT PRIMARY KEY,
+        vm_name TEXT NOT NULL DEFAULT '',
+        vm_id TEXT NOT NULL DEFAULT '',
+        pid INTEGER NOT NULL DEFAULT 0,
+        start_time_ticks INTEGER,
+        job_dir TEXT NOT NULL DEFAULT '',
+        out_path TEXT NOT NULL DEFAULT '',
+        err_path TEXT NOT NULL DEFAULT '',
+        exit_path TEXT NOT NULL DEFAULT '',
+        started_at TEXT NOT NULL DEFAULT '',
+        state TEXT NOT NULL DEFAULT 'starting'
+            CHECK (state IN ('starting','active','stopped','orphaned')),
+        cred_ref TEXT NOT NULL DEFAULT 'inline',
+        owner TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS relays (
+        relay_id TEXT PRIMARY KEY,
+        vm_name TEXT NOT NULL DEFAULT '',
+        vm_id TEXT NOT NULL DEFAULT '',
+        guest_port INTEGER NOT NULL DEFAULT 0,
+        bind TEXT NOT NULL DEFAULT '127.0.0.1',
+        host_port INTEGER NOT NULL DEFAULT 0,
+        started_at TEXT NOT NULL DEFAULT '',
+        state TEXT NOT NULL DEFAULT 'active'
+            CHECK (state IN ('active','stopped','interrupted')),
+        cred_ref TEXT NOT NULL DEFAULT 'inline',
+        owner TEXT
+    )
+    """,
+)
+
+# How long open() will keep retrying a transient SQLITE_BUSY while another
+# process is creating the same database. Separate stdio server processes are
+# the normal deployment, so first-open contention is expected, not exceptional.
+_OPEN_RETRIES = 8
+_OPEN_BACKOFF_S = 0.15
+
+
+def _is_busy(exc: sqlite3.Error) -> bool:
+    text = str(exc).lower()
+    return "locked" in text or "busy" in text
 
 
 class StateStoreError(RuntimeError):
@@ -460,46 +479,79 @@ def open(path: str) -> Store:
     except OSError as exc:
         raise StateStoreError(f"could not create the state store directory ({parent}): {exc}") from None
 
-    store = Store(path)
-    try:
-        con = store._connect()  # noqa: SLF001 - open() owns construction
-        found = int(con.execute("PRAGMA user_version").fetchone()[0])
-    except sqlite3.Error as exc:
-        store.close()
-        raise StateStoreError(f"could not open the state store ({path}): {exc}") from None
+    last: sqlite3.Error | None = None
+    for attempt in range(_OPEN_RETRIES):
+        store = Store(path)
+        try:
+            con = store._connect()  # noqa: SLF001 - open() owns construction
+            found = int(con.execute("PRAGMA user_version").fetchone()[0])
+        except sqlite3.Error as exc:
+            store.close()
+            if not _is_busy(exc):
+                raise StateStoreError(f"could not open the state store ({path}): {exc}") from None
+            last = exc
+            time.sleep(_OPEN_BACKOFF_S * (attempt + 1))
+            continue
 
-    if found > SCHEMA_VERSION:
-        store.close()
-        raise StateStoreError(
-            f"state store schema version {found} is newer than this build "
-            f"supports ({SCHEMA_VERSION}); refusing to open {path}"
-        )
+        if found > SCHEMA_VERSION:
+            # Refuse before applying any pragma that writes to the file.
+            store.close()
+            raise StateStoreError(
+                f"state store schema version {found} is newer than this build "
+                f"supports ({SCHEMA_VERSION}); refusing to open {path}"
+            )
 
-    try:
-        con.execute("PRAGMA journal_mode=WAL")
-        con.execute("PRAGMA synchronous=NORMAL")
-        con.execute("PRAGMA foreign_keys=ON")
-        if found == 0:
-            with store._lock:  # noqa: SLF001
-                store._begin()  # noqa: SLF001
+        try:
+            # journal_mode=WAL needs a brief exclusive lock when converting a
+            # fresh database, and SQLite does not apply the busy handler to it
+            # reliably, so retry it on its own.
+            for wal_attempt in range(_OPEN_RETRIES):
                 try:
-                    con.executescript(_SCHEMA)
-                    con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-                    store._commit()  # noqa: SLF001
-                except BaseException:
-                    store._rollback()  # noqa: SLF001
-                    raise
-        _recover(store)
-    except sqlite3.Error as exc:
-        store.close()
-        raise StateStoreError(f"could not initialize the state store ({path}): {exc}") from None
-    return store
+                    con.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.Error as exc:
+                    if not _is_busy(exc):
+                        raise
+                    time.sleep(_OPEN_BACKOFF_S * (wal_attempt + 1))
+            else:
+                raise StateStoreError(
+                    f"could not switch the state store to WAL mode ({path}): "
+                    "another process holds it"
+                )
+            con.execute("PRAGMA synchronous=NORMAL")
+            con.execute("PRAGMA foreign_keys=ON")
+            if found == 0:
+                # One transaction: the schema and the version write land
+                # together, so a concurrent opener never sees a half-created
+                # database with user_version still 0.
+                with store._lock:  # noqa: SLF001
+                    store._begin()  # noqa: SLF001
+                    try:
+                        for statement in _SCHEMA_STATEMENTS:
+                            con.execute(statement)
+                        con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                        store._commit()  # noqa: SLF001
+                    except BaseException:
+                        store._rollback()  # noqa: SLF001
+                        raise
+            _recover(store)
+            return store
+        except sqlite3.Error as exc:
+            store.close()
+            if not _is_busy(exc):
+                raise StateStoreError(
+                    f"could not initialize the state store ({path}): {exc}"
+                ) from None
+            last = exc
+            time.sleep(_OPEN_BACKOFF_S * (attempt + 1))
+            continue
+
+    raise StateStoreError(
+        f"could not open the state store ({path}): another process holds it "
+        f"({last})"
+    )
 
 
-# Process-local by design: this caches Store HANDLES, not state. The
-# authoritative copy is in the database file, which outlives the process, so a
-# restart simply re-opens it and runs recovery. Nothing a client holds is lost
-# when this dict dies with the process.
 _stores: dict[str, Store] = {}
 _stores_lock = threading.Lock()
 
