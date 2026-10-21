@@ -356,11 +356,6 @@ class Store:
             values = cur.fetchall()
         return [_row_to_job(v) for v in values]
 
-    def job_ids(self) -> set[str]:
-        with self._lock:
-            cur = self._connect().execute("SELECT job_id FROM jobs")
-            return {str(r[0]) for r in cur.fetchall()}
-
     def job_delete(self, job_id: str) -> None:
         with self._lock:
             self._begin()

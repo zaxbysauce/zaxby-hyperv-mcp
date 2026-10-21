@@ -469,3 +469,27 @@ def test_stop_persists_the_credential_reference(monkeypatch, tmp_path):
     row = store.job_get(job_id)
     assert row is not None and row.state == statestore.JOB_STOPPED, row
     assert row.cred_ref == "env", row
+
+
+def test_store_refuses_a_network_path(tmp_path):
+    """The store must refuse a UNC path: WAL mode needs shared memory and does
+    not work over a network filesystem, and a half-working store over SMB is
+    worse than a clear refusal.
+    """
+    from hyperv_mcp import statestore
+
+    # Both spellings of a UNC path. The Windows form needs TWO leading
+    # backslashes in the runtime string (four in source); a single leading
+    # backslash is a root-relative path on the current drive, not a UNC path,
+    # and must NOT be refused.
+    unc_paths = ("\\\\fileserver\\share\\state.db", "//fileserver/share/state.db")
+    for unc in unc_paths:
+        with pytest.raises(statestore.StateStoreError) as excinfo:
+            statestore.open(unc)
+        message = str(excinfo.value)
+        assert "network" in message.lower(), message
+        assert "wal" in message.lower(), message
+    # A single leading backslash is drive-relative, not a network path.
+    assert statestore._is_unc("\\state.db") is False
+    assert statestore._is_unc("C:\\hyperv-mcp\\state.db") is False
+    assert statestore._is_unc(str(tmp_path / "state.db")) is False
