@@ -19,6 +19,7 @@ import json
 import ntpath
 import os
 import re
+import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, ClassVar
@@ -84,9 +85,18 @@ def default_state_db_path(environ: dict[str, str] | None = None) -> str:
     so a process (or a test) that repoints LOCALAPPDATA gets the path it asked
     for. ``statestore.resolve_state_db_path`` re-uses this so the precedence
     has exactly one definition.
+
+    The terminal fallback is the platform temp dir, NEVER the CWD: a cwd
+    fallback made the "default" a different store per process (each server
+    resolved it against wherever it happened to be launched from), silently
+    splitting the one cross-process registry the store exists to provide —
+    the exact hazard the ``ps_slot_dir`` rule rejects (PRR-009).
     """
     env = dict(os.environ if environ is None else environ)
-    base = env.get("LOCALAPPDATA") or env.get("TEMP") or env.get("TMP") or os.getcwd()
+    base = (
+        env.get("LOCALAPPDATA") or env.get("TEMP") or env.get("TMP")
+        or tempfile.gettempdir()
+    )
     return os.path.join(base, "hyperv-mcp", "state.db")
 
 
@@ -277,6 +287,17 @@ class Config:
             # host-wide). Reject it at load time.
             if not Path(self.ps_slot_dir).is_absolute():
                 raise ConfigError("ps_slot_dir must be an absolute path or null")
+        if self.state_db_path is not None:
+            if not self.state_db_path.strip():
+                raise ConfigError("state_db_path must be a non-empty path or null")
+            # Same reasoning as ps_slot_dir (PRR-009): a relative store path
+            # resolves against each process's CWD, so separate server
+            # processes would each open their OWN store and silently lose the
+            # cross-process registry the store exists to provide. Reject it
+            # at load time — the simplest rule that still proves the value
+            # can name an openable location: non-blank and absolute.
+            if not Path(self.state_db_path).is_absolute():
+                raise ConfigError("state_db_path must be an absolute path or null")
         # child_env() strips the token_env-named variable from every spawned
         # child; naming a functional variable would break that child (bare-name
         # resolution, PowerShell internals), so reject it at load time.

@@ -22,6 +22,29 @@ import pytest
 from hyperv_mcp.config import Config
 
 
+@pytest.fixture(autouse=True)
+def _state_store_in_tmp(monkeypatch, tmp_path):
+    """Point the durable state store at a per-test temp directory (issue #22,
+    PRR-009 — the same redirect the unit conftest applies).
+
+    The store is always on, so an opt-in real-Hyper-V run that reaches
+    job_start or relay_start would otherwise open — and rewrite — the
+    developer's live %LOCALAPPDATA% store. LOCALAPPDATA is redirected too so
+    every other profile-derived path lands in tmp. Tests that need several
+    processes to share ONE store (AC10) set HYPERV_MCP_STATE_DB themselves on
+    top of this, and the override simply wins.
+
+    Teardown closes every cached Store so pytest's tmp cleanup can delete
+    the -wal/-shm side files on Windows.
+    """
+    from hyperv_mcp import statestore
+
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    yield
+    statestore.clear_store_cache_for_tests()
+
+
 def _integration_ready() -> tuple[bool, str]:
     if os.environ.get("HYPERV_MCP_INTEGRATION", "") != "1":
         return False, "HYPERV_MCP_INTEGRATION is not set to 1 (real Hyper-V tests stay skipped)"

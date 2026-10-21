@@ -67,9 +67,22 @@ def _read_pragmas(path: str) -> tuple[str, int, int]:
 def test_store_schema_contract(tmp_path):
     """C7 (AC7): open() yields a WAL database at user_version 1 with a
     busy_timeout of at least 5000 ms, and a database from a NEWER schema is
-    refused with StateStoreError naming both versions and left unmodified.
+    refused with StateStoreError naming both versions and left BYTE-UNTOUCHED
+    (PRR-011: the refusal path must never open a read-write connection,
+    because closing one checkpoints a WAL database).
     RED at base: `from hyperv_mcp import statestore` fails this file at
-    collection, so neither half of the contract can be exercised."""
+    collection, so neither half of the contract can be exercised.
+
+    Honest scope of the busy_timeout clause, stated rather than implied
+    (PRR-015): the store configures its pragma to 5000 ms, which EQUALS the
+    sqlite3 module's own connect() default, so no observable through the
+    connection can distinguish the store's pragma from Python's default —
+    including a busy-writer timing probe, which would wait ~5 s either way.
+    What the assertion below pins is the EFFECTIVE value on the store's OWN
+    connection (the control proves the read reflects that connection's
+    timeout); which of the two equal mechanisms set it is not provable from
+    outside, and this check does not claim it is.
+    """
     path = str(tmp_path / "state.sqlite3")
     store = statestore.open(path)
     try:
@@ -95,19 +108,44 @@ def test_store_schema_contract(tmp_path):
         _close(store)
 
     # A newer schema must be refused loudly, naming BOTH the code's version
-    # and the file's, and the refusal must not touch the file.
+    # and the file's, and the refusal must not touch the file — not even its
+    # BYTES, and not even when the newer version only lives in an
+    # uncheckpointed -wal (PRR-011/AC7): a crashed writer leaves exactly
+    # that, and the one refusal path that could modify the file is an
+    # rw connection, whose close merges the -wal into it. open() settles the
+    # version before opening one.
     newer = str(tmp_path / "newer.sqlite3")
-    con = sqlite3.connect(newer)
-    try:
-        con.execute("PRAGMA user_version = 2")
-        con.commit()
-    finally:
-        con.close()
+    crashed = subprocess.run(
+        [sys.executable, "-c",
+         "import os, sqlite3, sys\n"
+         "con = sqlite3.connect(sys.argv[1], isolation_level=None)\n"
+         "con.execute('PRAGMA journal_mode=WAL')\n"
+         "con.execute('PRAGMA user_version=2')\n"
+         "con.execute('CREATE TABLE t(x)')\n"
+         "con.execute('INSERT INTO t VALUES (1)')\n"
+         "os._exit(0)\n", newer],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert crashed.returncode == 0, crashed.stderr
+    assert os.path.exists(newer + "-wal"), "the crashed writer left a -wal"
+    before = open(newer, "rb").read()
+    sidecars_before = sorted(
+        name for name in os.listdir(str(tmp_path)) if name.startswith("newer.sqlite3")
+    )
     with pytest.raises(statestore.StateStoreError) as excinfo:
         statestore.open(newer)
     message = str(excinfo.value)
     assert "1" in message
     assert "2" in message
+    # Byte comparison FIRST: reading the pragmas below opens its own rw
+    # connection, whose close would checkpoint the -wal and legitimately
+    # change the bytes — the refusal itself must not have.
+    assert open(newer, "rb").read() == before, (
+        "a refused store must stay byte-untouched"
+    )
+    assert sorted(
+        name for name in os.listdir(str(tmp_path)) if name.startswith("newer.sqlite3")
+    ) == sidecars_before, "a refused store must not disturb its -wal/-shm"
     _, version_after, _ = _read_pragmas(newer)
     assert version_after == 2
 

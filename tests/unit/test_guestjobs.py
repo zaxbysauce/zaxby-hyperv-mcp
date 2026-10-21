@@ -9,7 +9,7 @@ import uuid
 
 import pytest
 
-from hyperv_mcp import guestjobs, pswindows
+from hyperv_mcp import credentials, guestjobs, pswindows
 from hyperv_mcp.config import Config
 from hyperv_mcp.credentials import CredentialSet
 from hyperv_mcp.policy import PolicyDenied
@@ -443,3 +443,227 @@ def test_output_full_read_utf16_has_no_bom_leak(monkeypatch):
     assert out["stdout"] == text
     assert out["stdout_encoding"] == "utf-16"
     assert not out["stdout"].startswith("\ufeff")
+
+
+# ---------------------------------------------------------------------------
+# Durable-store review pins (PRR-002 / PRR-003 / PRR-014 / PRR-007/008).
+# Each behaviour is pinned by a test that is red with the pre-fix shape; the
+# mutation probes ran against byte copies of the fixed sources and were
+# restored with byte-identity asserted.
+# ---------------------------------------------------------------------------
+
+
+def _env_state(monkeypatch):
+    """Set env credentials, so a started job's row carries cred_ref="env"
+    and re-attaches after a reload (the store redirect is the conftest's)."""
+    import os
+
+    monkeypatch.setenv("HYPERV_GUEST_USERNAME", "Administrator")
+    monkeypatch.setenv("HYPERV_GUEST_PASSWORD", "placeholder-pass")
+    assert os.environ.get("HYPERV_MCP_STATE_DB")  # the unit conftest redirect
+
+
+def test_status_observing_exit_retires_the_durable_row(monkeypatch):
+    """PRR-002: a job_status that observes the guest process EXITED must
+    demote the persisted row to `stopped`, or a caller that polls status but
+    never stops holds a cap slot forever — across a restart nothing else can
+    ever demote an env/file row."""
+    import importlib
+
+    from hyperv_mcp import statestore
+
+    _env_state(monkeypatch)
+    cfg = Config(unrestricted=True)
+    fake = FakePS([
+        _start_ok(),
+        _ok({"status": "exited", "exit_code": "0"}),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    start = guestjobs.job_start(
+        cfg, "test-vm", "x.exe", cred=credentials.resolve_guest())
+    job_id = start["job_id"]
+    importlib.reload(guestjobs)  # the process-local registry dies here
+    out = guestjobs.job_status(cfg, job_id)
+    assert out["status"] == "exited"
+    store = statestore.store_for(cfg)
+    row = store.job_get(job_id)
+    assert row is not None and row.state == statestore.JOB_STOPPED, row
+    # The demoted row is now evictable across a restart (the in-process entry
+    # keeps its own stoppable state by design, so simulate the restart): a
+    # reservation at a cap of one admits by evicting the demoted row instead
+    # of wedging the registry forever.
+    importlib.reload(guestjobs)
+    guestjobs._MAX_JOBS = 1
+    try:
+        guestjobs._reserve_slot("n" * 32, None, cfg=cfg)
+        assert store.job_get(job_id) is None
+        guestjobs._release_slot("n" * 32, cfg=cfg)
+    finally:
+        guestjobs._MAX_JOBS = 128
+
+
+def test_register_store_failure_still_hands_back_the_job_id(monkeypatch):
+    """PRR-003: a failed registration write must not strand the ALREADY
+    LAUNCHED guest process behind an id the caller never receives. The
+    process-local entry stands in and the stop still works."""
+    import sqlite3
+
+    from hyperv_mcp import statestore
+
+    _env_state(monkeypatch)
+    cfg = Config(unrestricted=True)
+    fake = FakePS([_start_ok(), _ok({"stopped": True, "alive_pids": []})])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    calls = {"n": 0}
+    real_upsert = statestore.Store.job_upsert
+
+    def flaky_upsert(self, row):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the reservation wrote; the REGISTRATION fails
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_upsert(self, row)
+
+    monkeypatch.setattr(statestore.Store, "job_upsert", flaky_upsert)
+    out = guestjobs.job_start(
+        cfg, "test-vm", "x.exe", cred=credentials.resolve_guest())
+    assert out["ok"] is True and out["job_id"], out
+    # The caller's handle is backed by the process-local entry, and a stop
+    # (whose own write goes through) still reaps the guest process.
+    assert out["job_id"] in guestjobs._jobs
+    stopped = guestjobs.job_stop(cfg, out["job_id"])
+    assert stopped["stopped"] is True, stopped
+
+
+def test_full_registry_rolls_the_memory_eviction_back(monkeypatch):
+    """PRR-003: when the reservation raises `registry is full`, the store
+    transaction rolls the eviction deletes back — the MEMORY eviction must
+    roll back with it, or the registry silently loses entries (and their
+    credentials) whose rows come back to life."""
+    from hyperv_mcp import statestore
+
+    _env_state(monkeypatch)
+    cfg = Config(unrestricted=True)
+    store = statestore.store_for(cfg)
+    guestjobs._jobs["stopped-one"] = {
+        "job_id": "stopped-one", "vm_name": "vm", "pid": 1, "job_dir": "d",
+        "out_path": "o", "err_path": "e", "exit_path": "x",
+        "started_at": "2026-01-01T00:00:00Z", "cred": CRED, "stopped": True,
+    }
+    store.job_upsert(statestore.JobRow(
+        job_id="stopped-one", state=statestore.JOB_STOPPED, cred_ref="env",
+    ))
+    store.job_upsert(statestore.JobRow(
+        job_id="active-one", state=statestore.JOB_ACTIVE, cred_ref="env",
+    ))
+    guestjobs._MAX_JOBS = 1
+    try:
+        with pytest.raises(RuntimeError, match="registry is full"):
+            guestjobs._reserve_slot("next", None, cfg=cfg)
+        # The evicted stopped entry is back — memory AND row — with its
+        # credential intact, and no placeholder survived the failed start.
+        assert "stopped-one" in guestjobs._jobs
+        assert guestjobs._jobs["stopped-one"]["cred"] is CRED
+        row = store.job_get("stopped-one")
+        assert row is not None and row.state == statestore.JOB_STOPPED, row
+        assert "next" not in guestjobs._jobs
+        assert store.job_get("next") is None
+    finally:
+        guestjobs._MAX_JOBS = 128
+
+
+def test_stop_writes_the_durable_row_before_nulling_the_credential(monkeypatch):
+    """PRR-014: a store failure during job_stop must leave the entry fully
+    stoppable — the credential retained AND the provenance pinned on the
+    entry, so the retry persists cred_ref="env" instead of "inline"."""
+    import sqlite3
+
+    from hyperv_mcp import statestore
+
+    _env_state(monkeypatch)
+    cfg = Config(unrestricted=True)
+    fake = FakePS([
+        _start_ok(),
+        _ok({"stopped": True, "alive_pids": [], "job_dir_removed": True}),
+        _ok({"stopped": True, "alive_pids": [], "job_dir_removed": True}),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    start = guestjobs.job_start(
+        cfg, "test-vm", "x.exe", cred=credentials.resolve_guest())
+    job_id = start["job_id"]
+    store = statestore.store_for(cfg)
+    failing = {"on": True}
+    real_upsert = statestore.Store.job_upsert
+
+    def flaky_upsert(self, row):
+        if failing["on"] and row.state == statestore.JOB_STOPPED:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_upsert(self, row)
+
+    monkeypatch.setattr(statestore.Store, "job_upsert", flaky_upsert)
+    with pytest.raises(sqlite3.OperationalError):
+        guestjobs.job_stop(cfg, job_id)
+    # Nothing was destroyed by the failed stop: the credential is retained
+    # and the captured provenance is pinned for the racing or retrying stop.
+    entry = guestjobs._jobs[job_id]
+    assert entry["stopped"] is False
+    assert entry["cred"] is not None
+    assert entry["cred_ref"] == "env", entry
+
+    failing["on"] = False
+    stopped = guestjobs.job_stop(cfg, job_id)
+    assert stopped["stopped"] is True, stopped
+    row = store.job_get(job_id)
+    assert row is not None and row.state == statestore.JOB_STOPPED, row
+    assert row.cred_ref == "env", row
+
+
+def test_release_slot_failure_restores_the_placeholder(monkeypatch):
+    """PRR-003: when the store delete fails, the reservation release puts the
+    placeholder back (a paired memory/row view) instead of leaving an
+    orphaned `starting` row — and never masks the start's original error."""
+    import sqlite3
+
+    from hyperv_mcp import statestore
+
+    _env_state(monkeypatch)
+    cfg = Config(unrestricted=True)
+    fake = FakePS([pswindows.PSResult(stdout="", returncode=1, stderr="boom")])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+
+    def boom(self, job_id):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(statestore.Store, "job_delete", boom)
+    with pytest.raises(RuntimeError, match="boom"):  # the ORIGINAL error wins
+        guestjobs.job_start(
+            cfg, "test-vm", "x.exe", cred=credentials.resolve_guest())
+    # The placeholder is back in the registry, still in flight, pairing the
+    # row that could not be deleted.
+    assert len(guestjobs._jobs) == 1
+    entry = next(iter(guestjobs._jobs.values()))
+    assert entry["in_flight"] is True
+
+
+def test_peek_vm_name_is_owner_filtered_and_never_raises(monkeypatch):
+    """PRR-007/PRR-008: the audit-side peek reads a store row only for its
+    owner — a foreign OR unattributed caller gets "" — and a failing store
+    read degrades to "" instead of escaping the error envelope."""
+    from hyperv_mcp import statestore
+
+    cfg = Config(unrestricted=True)
+    store = statestore.store_for(cfg)
+    job_id = "f" * 32
+    store.job_upsert(statestore.JobRow(
+        job_id=job_id, vm_name="owned-vm",
+        vm_id="11111111-2222-3333-4444-555555555555",
+        state=statestore.JOB_ACTIVE, cred_ref="env", owner="agent-a",
+    ))
+    assert guestjobs.peek_vm_name(job_id, cfg, owner="agent-a") == "owned-vm"
+    assert guestjobs.peek_vm_name(job_id, cfg, owner=None) == ""
+    assert guestjobs.peek_vm_name(job_id, cfg, owner="agent-b") == ""
+
+    def boom(self, key):
+        raise statestore.StateStoreError("store unavailable")
+
+    monkeypatch.setattr(statestore.Store, "job_get", boom)
+    assert guestjobs.peek_vm_name(job_id, cfg, owner="agent-a") == ""

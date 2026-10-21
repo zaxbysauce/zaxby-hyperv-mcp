@@ -4,7 +4,11 @@ Class: **process-local registry for state whose lifetime exceeds the process** �
 a module-level dict that is the only copy of something a client holds a handle
 to, so a restart strands the handle while the underlying resource keeps running.
 
-Eight pins, each proven by an executed mutation probe:
+Sixteen pins. The two phase-4.2 originals are each proven by an executed
+mutation probe; the round-2/round-3 block and the PR-review block carry
+their own provenance notes where a probe was run (every PR-review pin was
+probed against a byte copy of the fixed source and restored with
+byte-identity asserted):
 
 1. **Restart survival.** With a live job and a live relay, reloading BOTH
    registry modules (which re-creates their module dicts, exactly as a process
@@ -18,8 +22,10 @@ Eight pins, each proven by an executed mutation probe:
 from __future__ import annotations
 
 import base64
+import gc
 import importlib
 import json
+import os
 import re
 import uuid
 
@@ -280,7 +286,7 @@ def test_no_id_listing_never_discloses_a_mid_bind_relay(monkeypatch, tmp_path):
 
 
 def test_relay_stop_reads_stopped_under_the_registry_lock(monkeypatch, tmp_path):
-    """`relay_stop` reads and writes `stopped` inside ONE critical section.
+    """`relay_stop` reads AND writes `stopped` inside ONE critical section.
 
     Reading the flag outside the lock lets two racing stops both observe
     `already=False`, which double-shuts-down, double-writes the store, and
@@ -288,9 +294,14 @@ def test_relay_stop_reads_stopped_under_the_registry_lock(monkeypatch, tmp_path)
     held and frozen C13 pins behaviourally.
 
     The pin observes the discipline rather than the outcome: a lock wrapper
-    records whether `_relays_lock` is held, and the entry records whether each
-    `stopped` read happened while it was. Deterministic, single-threaded, and
-    it cannot pass for an unrelated reason.
+    records whether `_relays_lock` is held, and the entry records whether
+    each `stopped` read AND write happened while it was. Deterministic,
+    single-threaded, and it cannot pass for an unrelated reason. The count
+    is deliberately NOT pinned to exactly one per kind: a correct
+    implementation may re-read the flag (the guard's own finally is one
+    such shape), so the pin requires every observed access to have happened
+    UNDER the lock — a write moved outside the critical section is what it
+    exists to kill.
     """
     monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
     cfg = Config(
@@ -320,6 +331,7 @@ def test_relay_stop_reads_stopped_under_the_registry_lock(monkeypatch, tmp_path)
             real_lock.release()
 
     reads: list[bool] = []
+    writes: list[bool] = []
 
     class _TrackingEntry(dict):
         def __getitem__(self, key):
@@ -327,15 +339,22 @@ def test_relay_stop_reads_stopped_under_the_registry_lock(monkeypatch, tmp_path)
                 reads.append(held[0])
             return super().__getitem__(key)
 
+        def __setitem__(self, key, value):
+            if key == "stopped":
+                writes.append(held[0])
+            super().__setitem__(key, value)
+
     monkeypatch.setattr(relay, "_relays_lock", _TrackingLock())
     with relay._relays_lock:
         relay._relays[relay_id] = _TrackingEntry(relay._relays[relay_id])
 
     stopped = relay.relay_stop(cfg, relay_id)
     assert stopped["stopped"] is True, stopped
-    # Exactly one `stopped` read, and it happened with the lock held.
+    # Every `stopped` access — read AND write — happened with the lock held.
     assert reads, "relay_stop never read the stopped flag"
-    assert reads == [True], reads
+    assert all(reads), reads
+    assert writes, "relay_stop never wrote the stopped flag"
+    assert all(writes), writes
     # The relay row keeps the reference it was started with (R2-N5).
     from hyperv_mcp import statestore
 
@@ -474,7 +493,8 @@ def test_stop_persists_the_credential_reference(monkeypatch, tmp_path):
 def test_store_refuses_a_network_path(tmp_path):
     """The store must refuse a UNC path: WAL mode needs shared memory and does
     not work over a network filesystem, and a half-working store over SMB is
-    worse than a clear refusal.
+    worse than a clear refusal. PRR-012: the refusal names the condition
+    without disclosing the host/share it names either.
     """
     from hyperv_mcp import statestore
 
@@ -489,7 +509,241 @@ def test_store_refuses_a_network_path(tmp_path):
         message = str(excinfo.value)
         assert "network" in message.lower(), message
         assert "wal" in message.lower(), message
+        # PRR-012: the UNC host/share never reaches the client envelope.
+        assert "fileserver" not in message, message
+        assert "share\\state.db" not in message, message
     # A single leading backslash is drive-relative, not a network path.
     assert statestore._is_unc("\\state.db") is False
     assert statestore._is_unc("C:\\hyperv-mcp\\state.db") is False
     assert statestore._is_unc(str(tmp_path / "state.db")) is False
+
+
+# ---------------------------------------------------------------------------
+# PR #96 swarm-review pins (PRR-002 / PRR-005 / PRR-008 / PRR-011 / PRR-012 /
+# PRR-015). Every one was probed against a byte copy of the fixed source and
+# restored with byte-identity asserted; each is red at the pre-fix shape.
+# ---------------------------------------------------------------------------
+
+
+def test_stop_refuses_an_orphaned_row_without_a_guest_leg(monkeypatch, tmp_path):
+    """PRR-015: job_stop's "never taskkill PID 0" refusal. An orphaned row is
+    pid 0 with an empty job_dir by construction — running _stop_script(0, "")
+    would enumerate and taskkill the Win32 children of PID 0 as guest admin.
+    The refusal must answer with the full-key invalid envelope and NEVER
+    reach a guest leg."""
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
+    cfg = Config(unrestricted=True)
+    credentials.init(cfg)
+    from hyperv_mcp import statestore
+
+    job_id = "0" * 32
+    statestore.store_for(cfg).job_upsert(statestore.JobRow(
+        job_id=job_id, vm_name="test-vm",
+        vm_id="11111111-2222-3333-4444-555555555555",
+        state=statestore.JOB_ORPHANED, cred_ref="env",
+    ))
+
+    def no_guest_leg(script, **kwargs):
+        if _is_resolution_leg(script):
+            return pswindows.PSResult(stdout=_resolved_guid(script), returncode=0)
+        raise AssertionError("an orphaned stop must never run a guest leg")
+
+    monkeypatch.setattr(pswindows, "run_ps", no_guest_leg)
+    out = guestjobs.job_stop(cfg, job_id)
+    assert out["ok"] is False, out
+    assert out["error_class"] == "invalid", out
+    assert "no PID to stop" in out["error"], out
+    assert out["stopped"] is False and out["alive_pids"] == [], out
+
+
+def test_recovery_interrupts_a_populated_relays_table(monkeypatch, tmp_path):
+    """PRR-015: `_recover`'s relay UPDATE had no test that ever ran it against
+    a populated relays table. A fresh open of a store holding an `active`
+    relay row must flip that row to `interrupted` — that flip is what makes a
+    dead process's relay evictable instead of a permanent cap wedge."""
+    from hyperv_mcp import statestore
+
+    db = str(tmp_path / "state.db")
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", db)
+    cfg = Config(unrestricted=True)
+    store = statestore.store_for(cfg)
+    relay_id = "relay-9500-recover" + "0" * 18
+    store.relay_upsert(statestore.RelayRow(
+        relay_id=relay_id, vm_name="test-vm",
+        vm_id="11111111-2222-3333-4444-555555555555", guest_port=9500,
+        state=statestore.RELAY_ACTIVE, cred_ref="env",
+    ))
+    # A fresh process opens the same file — recovery runs inside open().
+    statestore.clear_store_cache_for_tests()
+    fresh = statestore.open(db)
+    try:
+        row = fresh.relay_get(relay_id)
+        assert row is not None and row.state == statestore.RELAY_INTERRUPTED, row
+    finally:
+        fresh.close()
+
+
+def test_recovery_orphans_inline_rows_whose_pid_is_gone(monkeypatch, tmp_path):
+    """PRR-002: recovery must demote a leftover `active` job row that can
+    never re-attach — an inline-credential row, whose every restored read
+    raises before a guest leg — once its recorded pid is provably no live
+    process. An env/file row is NEVER demoted this way: its pid is a GUEST
+    pid a host probe cannot see, and a false dead verdict would orphan a
+    live peer's running job. A row that cannot be probed is left alone."""
+    import subprocess
+    import sys
+
+    from hyperv_mcp import statestore
+
+    db = str(tmp_path / "state.db")
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", db)
+    cfg = Config(unrestricted=True)
+    store = statestore.store_for(cfg)
+    inline_id, env_id, unknown_id = "i" * 32, "e" * 32, "u" * 32
+    for job_id, ref, pid in (
+        (inline_id, "inline", 4242), (env_id, "env", 4242),
+        (unknown_id, "inline", 7),
+    ):
+        store.job_upsert(statestore.JobRow(
+            job_id=job_id, vm_name="test-vm",
+            vm_id="11111111-2222-3333-4444-555555555555",
+            pid=pid, state=statestore.JOB_ACTIVE, cred_ref=ref,
+        ))
+
+    verdicts = {"4242": False}
+    real_probe = statestore._default_pid_probe
+    monkeypatch.setattr(
+        statestore, "_default_pid_probe",
+        lambda pid: verdicts.get(str(pid)),
+    )
+    statestore.clear_store_cache_for_tests()
+    fresh = statestore.open(db)
+    try:
+        assert fresh.job_get(inline_id).state == statestore.JOB_ORPHANED
+        assert fresh.job_get(env_id).state == statestore.JOB_ACTIVE
+        assert fresh.job_get(unknown_id).state == statestore.JOB_ACTIVE
+    finally:
+        fresh.close()
+
+    # The real helper's own verdicts, pinned directly through the injectable
+    # probe parameter: a process we own is alive, a process that already
+    # exited is dead, and pid 0 is not probed at all.
+    assert statestore._pid_is_live(0, real_probe) is None
+    assert statestore._pid_is_live(0) is None
+    assert statestore._pid_is_live(os.getpid(), real_probe) is True
+    exited = subprocess.Popen([sys.executable, "-c", "pass"])
+    exited.wait(timeout=60)
+    dead_pid = exited.pid
+    # Drop the Popen (and its process handle) first: on Windows an exited
+    # process whose handle is still held keeps its kernel object alive, and
+    # the honest probe answer for it is True, not False.
+    del exited
+    gc.collect()
+    assert statestore._pid_is_live(dead_pid, real_probe) is False
+
+
+def test_job_cap_counts_store_only_rows(monkeypatch, tmp_path):
+    """PRR-015: the job cap counts the UNION with the store — a store-only
+    key must count, or separate server processes collectively exceed
+    _MAX_JOBS."""
+    from hyperv_mcp import statestore
+
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
+    cfg = Config(unrestricted=True)
+    store = statestore.store_for(cfg)
+    for i in range(2):
+        store.job_upsert(statestore.JobRow(
+            job_id=f"{i}" * 32, vm_name="test-vm",
+            vm_id="11111111-2222-3333-4444-555555555555",
+            state=statestore.JOB_ACTIVE, cred_ref="env",
+        ))
+    guestjobs._MAX_JOBS = 2
+    try:
+        with pytest.raises(RuntimeError, match="registry is full"):
+            guestjobs._reserve_slot("n" * 32, None, cfg=cfg)
+    finally:
+        guestjobs._MAX_JOBS = 128
+
+
+def test_resolve_state_db_path_honours_the_config_key(monkeypatch, tmp_path):
+    """PRR-015: the config-key branch of resolve_state_db_path was
+    unreachable from the suite. A directly-constructed Config naming
+    state_db_path resolves to exactly that path (env var absent)."""
+    from hyperv_mcp import statestore
+
+    monkeypatch.delenv("HYPERV_MCP_STATE_DB", raising=False)
+    configured = str(tmp_path / "cfg-key.db")
+    cfg = Config(unrestricted=True, state_db_path=configured)
+    assert statestore.resolve_state_db_path(cfg) == configured
+    assert statestore.store_for(cfg).path == configured
+
+
+def test_store_errors_name_the_directory_not_the_path(tmp_path):
+    """PRR-012: StateStoreError messages never interpolate the absolute path
+    (the profile default would disclose the local account name); they name
+    the directory NAME only, matching the pswindows slot-directory posture.
+    The full detail stays on the chained exception for local logs."""
+    import sqlite3
+
+    from hyperv_mcp import statestore
+
+    newer = tmp_path / "guardrail-newer.db"
+    con = sqlite3.connect(str(newer))
+    try:
+        con.execute("PRAGMA user_version = 2")
+        con.commit()
+    finally:
+        con.close()
+    with pytest.raises(statestore.StateStoreError) as excinfo:
+        statestore.open(str(newer))
+    message = str(excinfo.value)
+    assert str(newer) not in message, message
+    assert str(tmp_path) not in message, message
+    # The refusal still names both versions (C7's clause).
+    assert "2" in message and "1" in message, message
+
+
+def test_unattributed_caller_cannot_address_an_owned_row(monkeypatch, tmp_path):
+    """PRR-008: `owner is None` used to bypass the ownership check on the
+    restore paths. The store made the registry cross-process, so an
+    unattributed stdio/anonymous caller must read the SAME `unknown` answer
+    as a foreign agent for a row that carries an owner."""
+    from hyperv_mcp import statestore
+
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
+    cfg = Config(unrestricted=True, allowed_vm_patterns=["test-*"],
+                 destructive={"relay": True})
+    credentials.init(cfg)
+    store = statestore.store_for(cfg)
+    job_id = "a" * 32
+    relay_id = "relay-9501-owned" + "0" * 18
+    store.job_upsert(statestore.JobRow(
+        job_id=job_id, vm_name="test-vm",
+        vm_id="11111111-2222-3333-4444-555555555555",
+        pid=4242, state=statestore.JOB_ACTIVE, cred_ref="env",
+        owner="agent-a",
+    ))
+    store.relay_upsert(statestore.RelayRow(
+        relay_id=relay_id, vm_name="test-vm",
+        vm_id="11111111-2222-3333-4444-555555555555", guest_port=9501,
+        state=statestore.RELAY_ACTIVE, cred_ref="env", owner="agent-a",
+    ))
+    monkeypatch.setenv("HYPERV_GUEST_USERNAME", "Administrator")
+    monkeypatch.setenv("HYPERV_GUEST_PASSWORD", "placeholder-pass")
+    monkeypatch.setattr(pswindows, "run_ps", _LegFakePS(
+        {"status": "running"},
+        {"status": "running"},
+    ))
+    # The unattributed principal and a foreign agent read the SAME refusal.
+    with pytest.raises(ValueError, match="unknown job_id"):
+        guestjobs.job_status(cfg, job_id, owner=None)
+    with pytest.raises(ValueError, match="unknown job_id"):
+        guestjobs.job_status(cfg, job_id, owner="agent-b")
+    with pytest.raises(ValueError, match="unknown relay_id"):
+        relay.relay_status(cfg, relay_id, owner=None)
+    with pytest.raises(ValueError, match="unknown relay_id"):
+        relay.relay_stop(cfg, relay_id, owner="agent-b")
+    # The owner still addresses its own rows.
+    assert guestjobs.job_status(cfg, job_id, owner="agent-a")["status"] == "running"
+    row = relay.relay_status(cfg, relay_id, owner="agent-a")["relays"][0]
+    assert row["state"] == "interrupted", row

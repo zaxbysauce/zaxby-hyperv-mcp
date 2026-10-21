@@ -34,6 +34,7 @@ and PR 3 (operations) extend it through migrations.
 
 from __future__ import annotations
 
+import builtins
 import os
 import sqlite3
 import threading
@@ -41,6 +42,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .config import Config, default_state_db_path
@@ -103,15 +105,64 @@ _SCHEMA_STATEMENTS = (
 )
 
 # How long open() will keep retrying a transient SQLITE_BUSY while another
-# process is creating the same database. Separate stdio server processes are
-# the normal deployment, so first-open contention is expected, not exceptional.
-_OPEN_RETRIES = 8
+# process is creating the same database, across EVERY leg of the open (the
+# WAL switch used to carry an independent budget of its own, so one call
+# could block ~8x longer than any caller expects — PRR-011). Separate stdio
+# server processes are the normal deployment, so first-open contention is
+# expected, not exceptional.
+_OPEN_BUDGET_S = 10.0
 _OPEN_BACKOFF_S = 0.15
 
 
 def _is_busy(exc: sqlite3.Error) -> bool:
     text = str(exc).lower()
     return "locked" in text or "busy" in text
+
+
+def _default_pid_probe(pid: int) -> bool | None:
+    """Best-effort HOST-side liveness probe. Never raises.
+
+    True = a live process, False = provably no such process, None = cannot
+    tell. POSIX signal 0 is the standard probe (ESRCH = dead, EPERM = exists
+    but not ours, hence alive). On Windows ``os.kill(pid, 0)`` is likewise an
+    existence probe, where ERROR_INVALID_PARAMETER (87) is the no-such-pid
+    answer; an inaccessible live pid surfaces as anything from
+    PermissionError to SystemError depending on build, so every other error
+    is an unknown, never a verdict.
+    """
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 87:
+            return False
+        return None
+    except Exception:
+        return None
+
+
+def _pid_is_live(pid: int, probe=None) -> bool | None:
+    """One liveness verdict through an injectable probe callable.
+
+    Recovery needs a verdict it can act on, and the act (demoting a row) is
+    destructive, so the only answers that matter are ``False`` (act) and
+    everything else (leave the row alone). The probe runs inside the guard
+    so a raising probe degrades to "cannot tell" instead of failing open().
+    """
+    if pid <= 0:
+        return None
+    if probe is None:
+        probe = _default_pid_probe
+    try:
+        return probe(int(pid))
+    except Exception:
+        return None
 
 
 class StateStoreError(RuntimeError):
@@ -422,128 +473,227 @@ def _is_unc(path: str) -> bool:
     return normalized.startswith("//") or normalized.startswith("\\\\")
 
 
-def _recover(store: Store) -> None:
+def _where(path: str) -> str:
+    """The directory NAME a client-facing message may name, never the path.
+
+    The full absolute path would disclose the host filesystem layout — and,
+    on the profile default, the local account name — to MCP clients; the
+    repo's established posture for exactly this trade is the slot-directory
+    error in pswindows.py, which reports the name and keeps the detail for
+    local logs (here: the chained exception, PRR-012). A path whose parent
+    has no name (a drive root, a UNC share) yields no name at all — any part
+    of a UNC host/share is itself the disclosure.
+    """
+    parent = os.path.dirname(os.path.abspath(path))
+    return os.path.basename(parent.rstrip("\\/"))
+
+
+def _recover_locked(store: Store, pid_probe=None) -> None:
     """Mark state left behind by a process that is no longer here.
+
+    Runs inside the caller's open write transaction (open() folds this into
+    its ONE initialization transaction, so a busy failure can no longer
+    abort an already-created store in a second, separate transaction —
+    PRR-011). The caller holds ``store._lock``.
 
     A `starting` job row is a reservation placeholder whose only legitimate
     transitions are promote-to-active (by the process that created it, which
-    writes unconditionally) or delete-on-clean-failure. Marking it `orphaned` is
-    therefore idempotent-safe: the creator's next write wins either way, and a
-    third reader seeing `orphaned` for a job that is about to become `active` is
-    a transient state, not a wrong answer.
+    writes unconditionally) or delete-on-clean-failure. Marking it `orphaned`
+    is therefore idempotent-safe: the creator's next write wins either way,
+    and a third reader seeing `orphaned` for a job that is about to become
+    `active` is a transient state, not a wrong answer.
 
-    A host-PID liveness check would be the tighter rule, but its failure mode is
-    a permanently stuck `starting` row that `_lookup` then refuses with "still
-    starting" — strictly worse and non-deterministic across platforms.
+    An `active` job row whose credential reference is `inline` is demoted to
+    `orphaned` once its recorded pid is provably no live process (PRR-002).
+    These are the rows nothing else can ever heal: every restored read of an
+    inline row raises CredentialError BEFORE a guest leg, so job_status can
+    never observe the exit that would demote it, and a different principal
+    is refused outright — without this demotion, 128 of them permanently
+    block job_start host-wide. The demotion fires only on a definitive
+    False verdict: the recorded pid is a GUEST pid this host-side probe
+    cannot really see, so a false `dead` on an env/file row would orphan a
+    live peer's running job (the PRR-005 live-peer rule), and a row that
+    cannot be probed is left alone, not assumed dead.
+
+    A host-PID liveness check would be the tighter rule for the `starting`
+    flip too, but its failure mode is a permanently stuck `starting` row
+    that `_lookup` then refuses with "still starting" — strictly worse and
+    non-deterministic across platforms.
     """
-    with store._lock:  # noqa: SLF001 - same module, recovery owns the write
-        store._begin()  # noqa: SLF001
+    con = store._connect()  # noqa: SLF001 - same module, recovery owns the write
+    con.execute(
+        "UPDATE jobs SET state = ? WHERE state = ?", (JOB_ORPHANED, JOB_STARTING)
+    )
+    for row in store.job_rows():
+        if row.state != JOB_ACTIVE or row.cred_ref != "inline":
+            continue
+        if _pid_is_live(row.pid, pid_probe) is False:
+            con.execute(
+                "UPDATE jobs SET state = ? WHERE job_id = ?",
+                (JOB_ORPHANED, row.job_id),
+            )
+    con.execute(
+        "UPDATE relays SET state = ? WHERE state = ?",
+        (RELAY_INTERRUPTED, RELAY_ACTIVE),
+    )
+
+
+def _header_user_version(path: str) -> int | None:
+    """user_version read straight from the file header (offset 60, 4 bytes,
+    big-endian), or None when no file exists or it is too short to carry one.
+
+    Costs nothing and opens nothing, which is what lets open() refuse the
+    common case (a cleanly closed store) with no sqlite involvement at all.
+    Its blind spot: a crashed WAL writer leaves the newer version inside the
+    uncheckpointed -wal while the main file's header still shows the old one
+    — only sqlite sees through that (see _probed_user_version).
+    """
+    try:
+        # builtins.open, not open: this module defines its own open() below,
+        # which shadows the builtin inside this file.
+        with builtins.open(path, "rb") as fh:
+            head = fh.read(64)
+    except OSError:
+        return None
+    if len(head) < 64:
+        return None
+    return int.from_bytes(head[60:64], "big")
+
+
+def _probed_user_version(path: str) -> int | None:
+    """The refusal verdict on user_version, or None for "no verdict".
+
+    The raw header is the first opinion; when it does not already settle the
+    matter, a READ-ONLY sqlite connection gives the WAL-aware one. Read-only
+    is the load-bearing property: closing an rw connection CHECKPOINTS a WAL
+    database — merging the -wal into the file — which is exactly the byte
+    modification a refusal must never make (PRR-011/AC7), while a read-only
+    connection cannot checkpoint and cannot create the -shm sidecar. A
+    missing file, a missing -shm, or any probe failure is "no verdict", and
+    open() proceeds to its authoritative read-write read.
+    """
+    header = _header_user_version(path)
+    if header is not None and header > SCHEMA_VERSION:
+        return header
+    try:
+        con = sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True)
+    except (OSError, ValueError, sqlite3.Error):
+        return header
+    try:
+        return int(con.execute("PRAGMA user_version").fetchone()[0])
+    except sqlite3.Error:
+        return header
+    finally:
         try:
-            con = store._connect()  # noqa: SLF001
-            con.execute(
-                "UPDATE jobs SET state = ? WHERE state = ?", (JOB_ORPHANED, JOB_STARTING)
-            )
-            con.execute(
-                "UPDATE relays SET state = ? WHERE state = ?",
-                (RELAY_INTERRUPTED, RELAY_ACTIVE),
-            )
-            store._commit()  # noqa: SLF001
-        except BaseException:
-            store._rollback()  # noqa: SLF001
-            raise
+            con.close()
+        except sqlite3.Error:  # pragma: no cover - close of a dead handle
+            pass
 
 
 def open(path: str) -> Store:
     """Open (creating if needed) the state store at ``path``.
 
-    Reads ``PRAGMA user_version`` FIRST, before applying any pragma that writes
-    to the file, so refusing a newer schema leaves the file byte-untouched.
+    ``PRAGMA user_version`` is settled BEFORE any directory is created and
+    BEFORE any read-write connection is opened — raw header first, then a
+    read-only sqlite probe that sees through an uncheckpointed -wal — so
+    refusing a newer schema leaves the file byte-untouched (an rw close
+    would checkpoint a WAL database). Schema creation and recovery land in
+    ONE transaction, and every SQLITE_BUSY retry (including the WAL-mode
+    switch, which SQLite does not route through the busy handler reliably)
+    draws on ONE shared time budget instead of per-leg budgets.
     """
     if not path or not str(path).strip():
         raise StateStoreError("state store path is empty")
     path = str(path)
     if _is_unc(path):
+        # No part of the UNC host/share is nameable — the host name IS the
+        # disclosure (PRR-012) — so the message names the condition only.
         raise StateStoreError(
-            f"refusing to open the state store on a network path ({path}): "
-            "SQLite WAL mode needs shared memory and does not work over a "
-            "network filesystem"
+            "refusing to open the state store on a network path: SQLite WAL "
+            "mode needs shared memory and does not work over a network "
+            "filesystem"
+        )
+    early = _probed_user_version(path)
+    if early is not None and early > SCHEMA_VERSION:
+        # PRR-012: both version numbers and the directory NAME only — the
+        # path never reaches a client envelope. Nothing that could touch
+        # bytes has run yet (PRR-011: no directory, no rw connection).
+        where = f" in ({_where(path)})" if _where(path) else ""
+        raise StateStoreError(
+            f"state store{where} has schema version {early}, "
+            f"newer than this build supports ({SCHEMA_VERSION}); refusing "
+            "to open it"
         )
     parent = os.path.dirname(os.path.abspath(path))
     try:
         os.makedirs(parent, exist_ok=True)
     except OSError as exc:
-        raise StateStoreError(f"could not create the state store directory ({parent}): {exc}") from None
+        # Chained (not `from None`) so local logs keep the full path; the
+        # message itself names only the directory (PRR-012).
+        raise StateStoreError(
+            f"could not create the state store directory ({os.path.basename(parent)}): {exc}"
+        ) from exc
 
+    deadline = time.monotonic() + _OPEN_BUDGET_S
+    backoff = _OPEN_BACKOFF_S
     last: sqlite3.Error | None = None
-    for attempt in range(_OPEN_RETRIES):
+    while True:
         store = Store(path)
         try:
             con = store._connect()  # noqa: SLF001 - open() owns construction
             found = int(con.execute("PRAGMA user_version").fetchone()[0])
-        except sqlite3.Error as exc:
-            store.close()
-            if not _is_busy(exc):
-                raise StateStoreError(f"could not open the state store ({path}): {exc}") from None
-            last = exc
-            time.sleep(_OPEN_BACKOFF_S * (attempt + 1))
-            continue
-
-        if found > SCHEMA_VERSION:
-            # Refuse before applying any pragma that writes to the file.
-            store.close()
-            raise StateStoreError(
-                f"state store schema version {found} is newer than this build "
-                f"supports ({SCHEMA_VERSION}); refusing to open {path}"
-            )
-
-        try:
-            # journal_mode=WAL needs a brief exclusive lock when converting a
-            # fresh database, and SQLite does not apply the busy handler to it
-            # reliably, so retry it on its own.
-            for wal_attempt in range(_OPEN_RETRIES):
-                try:
-                    con.execute("PRAGMA journal_mode=WAL")
-                    break
-                except sqlite3.Error as exc:
-                    if not _is_busy(exc):
-                        raise
-                    time.sleep(_OPEN_BACKOFF_S * (wal_attempt + 1))
-            else:
+            if found > SCHEMA_VERSION:
+                # The header pre-check above usually refuses first; this
+                # catches a store created between the two reads.
+                store.close()
                 raise StateStoreError(
-                    f"could not switch the state store to WAL mode ({path}): "
-                    "another process holds it"
+                    f"state store schema version {found} is newer than this "
+                    f"build supports ({SCHEMA_VERSION}); refusing to open it"
                 )
+            # journal_mode=WAL needs a brief exclusive lock when converting a
+            # fresh database, and SQLite does not apply the busy handler to
+            # it reliably, so a busy answer here unwinds to the shared
+            # outer retry below — it no longer carries a budget of its own
+            # (PRR-011).
+            con.execute("PRAGMA journal_mode=WAL")
             con.execute("PRAGMA synchronous=NORMAL")
             con.execute("PRAGMA foreign_keys=ON")
-            if found == 0:
-                # One transaction: the schema and the version write land
-                # together, so a concurrent opener never sees a half-created
-                # database with user_version still 0.
-                with store._lock:  # noqa: SLF001
-                    store._begin()  # noqa: SLF001
-                    try:
+            with store._lock:  # noqa: SLF001 - open() owns construction
+                store._begin()  # noqa: SLF001
+                try:
+                    if found == 0:
+                        # One transaction: the schema, the version write and
+                        # recovery land together, so a concurrent opener never
+                        # sees a half-created database with user_version
+                        # still 0, and a busy failure cannot abort an
+                        # already-created store (PRR-011).
                         for statement in _SCHEMA_STATEMENTS:
                             con.execute(statement)
                         con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-                        store._commit()  # noqa: SLF001
-                    except BaseException:
-                        store._rollback()  # noqa: SLF001
-                        raise
-            _recover(store)
+                    _recover_locked(store)
+                    store._commit()  # noqa: SLF001
+                except BaseException:
+                    store._rollback()  # noqa: SLF001
+                    raise
             return store
         except sqlite3.Error as exc:
             store.close()
             if not _is_busy(exc):
+                where = f" ({_where(path)})" if _where(path) else ""
                 raise StateStoreError(
-                    f"could not initialize the state store ({path}): {exc}"
-                ) from None
+                    f"could not open the state store{where}: {exc}"
+                ) from exc
             last = exc
-            time.sleep(_OPEN_BACKOFF_S * (attempt + 1))
-            continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(backoff, remaining))
+            backoff += _OPEN_BACKOFF_S
 
+    where = f" ({_where(path)})" if _where(path) else ""
     raise StateStoreError(
-        f"could not open the state store ({path}): another process holds it "
-        f"({last})"
+        f"could not open the state store{where}: another process "
+        f"holds it ({last})"
     )
 
 

@@ -126,12 +126,16 @@ def _restore_entry(cfg: Config, job_id: str, owner: str | None) -> dict[str, Any
 
     Returns None for an absent row and for a foreign one, so the caller raises
     the SAME `unknown job_id` ValueError either way — ids cannot be probed for
-    existence, exactly as for the in-memory path.
+    existence, exactly as for the in-memory path. PRR-008: the check is a
+    strict owner equality with no `owner is None` bypass — the store made the
+    registry cross-process, and an unattributed stdio/anonymous caller must
+    not address a row an authenticated agent owns; None matches only rows
+    that carry no owner themselves.
     """
     row = _store(cfg).job_get(job_id)
     if row is None:
         return None
-    if owner is not None and (row.owner or None) != owner:
+    if (row.owner or None) != owner:
         return None
     return {
         "job_id": row.job_id,
@@ -164,13 +168,21 @@ def clear_registry_for_tests() -> None:
         _jobs.clear()
 
 
-def peek_vm_name(job_id: str, cfg: Config | None = None) -> str:
+def peek_vm_name(job_id: str, cfg: Config | None = None,
+                 owner: str | None = None) -> str:
     """Read-only vm_name lookup for audit rows (issue #10).
 
     Unlike _lookup this never raises: an unknown, empty, or still-in-flight
     id reads as "" (an honest absence), so a follow-up call's audit row can
     name the VM even when the tool leg itself fails. Read-only by design —
     it never touches credentials or stop state.
+
+    PRR-007: the store fallback applies the SAME ownership filter the restore
+    path uses (a foreign or unattributed caller reads "", never another
+    principal's VM name), and the read is guarded — an audit sidecar must
+    never turn a store failure into a tool failure, so the answer degrades
+    to "". The read only happens on a LOCAL miss, so a hot path with a live
+    entry never opens the store at all.
     """
     key = job_id or ""
     with _jobs_lock:
@@ -182,8 +194,11 @@ def peek_vm_name(job_id: str, cfg: Config | None = None) -> str:
     # issue #22: after a restart the entry only exists in the store, and the
     # pre-dispatch audit path still wants to name the VM.
     if cfg is not None:
-        row = _store(cfg).job_get(key)
-        if row is not None:
+        try:
+            row = _store(cfg).job_get(key)
+        except Exception:
+            return ""
+        if row is not None and (row.owner or None) == owner:
             return str(row.vm_name or "")
     return ""
 
@@ -214,55 +229,75 @@ def _reserve_slot(job_id: str, owner: str | None = None,
         return
     store = _store(cfg)
     with store.transaction():
-        with _jobs_lock:
-            rows = {row.job_id: row for row in store.job_rows()}
+        # PRR-003: the memory mutations below ride the store transaction, so
+        # they must roll back WITH it — an unwind used to leave evicted
+        # entries (and their credentials) deleted from memory while their
+        # rows came back to life in the rolled-back store.
+        evicted: list[tuple[str, dict[str, Any], Any]] = []
+        try:
+            with _jobs_lock:
+                rows = {row.job_id: row for row in store.job_rows()}
 
-            def _started_at(key: str) -> str:
-                entry = _jobs.get(key)
-                if entry is not None:
-                    return str(entry.get("started_at") or "")
-                row = rows.get(key)
-                return row.started_at if row is not None else ""
-
-            def _stopped(key: str) -> bool:
-                entry = _jobs.get(key)
-                if entry is not None:
-                    return bool(entry.get("stopped"))
-                row = rows.get(key)
-                # `orphaned` is evictable too: the crash left no PID to stop,
-                # so nothing can ever clear it, and leaving it would let 128
-                # hard crashes permanently fill the cap.
-                return row is not None and row.state in (
-                    statestore.JOB_STOPPED, statestore.JOB_ORPHANED,
-                )
-
-            known = set(_jobs) | set(rows)
-            if len(known) >= _MAX_JOBS:
-                evictable = sorted((k for k in known if _stopped(k)), key=_started_at)
-                for key in evictable[: max(1, len(known) - _MAX_JOBS + 1)]:
+                def _started_at(key: str) -> str:
                     entry = _jobs.get(key)
                     if entry is not None:
-                        entry["cred"] = None
-                        del _jobs[key]
-                    store.job_delete(key)
-                    known.discard(key)
-            if len(known) >= _MAX_JOBS:
-                raise RuntimeError(
-                    f"guest job registry is full ({_MAX_JOBS} active jobs); "
-                    "stop jobs before starting more"
-                )
-            started_at = _utc_now_iso()
-            _jobs[job_id] = {
-                "job_id": job_id, "vm_name": "", "vm_id": "", "pid": 0,
-                "in_flight": True, "owner": owner,
-                "started_at": started_at, "cred": None, "stopped": False,
-            }
-            # The `starting` row is committed BEFORE the guest leg runs, so a
-            # hard kill inside the leg leaves an addressable row (issue #22).
-            store.job_upsert(statestore.JobRow(
-                job_id=job_id, started_at=started_at, owner=owner,
-                state=statestore.JOB_STARTING, cred_ref="inline",
-            ))
+                        return str(entry.get("started_at") or "")
+                    row = rows.get(key)
+                    return row.started_at if row is not None else ""
+
+                def _stopped(key: str) -> bool:
+                    entry = _jobs.get(key)
+                    if entry is not None:
+                        return bool(entry.get("stopped"))
+                    row = rows.get(key)
+                    # `orphaned` is evictable too: the crash left no PID to stop,
+                    # so nothing can ever clear it, and leaving it would let 128
+                    # hard crashes permanently fill the cap.
+                    return row is not None and row.state in (
+                        statestore.JOB_STOPPED, statestore.JOB_ORPHANED,
+                    )
+
+                known = set(_jobs) | set(rows)
+                if len(known) >= _MAX_JOBS:
+                    evictable = sorted((k for k in known if _stopped(k)), key=_started_at)
+                    for key in evictable[: max(1, len(known) - _MAX_JOBS + 1)]:
+                        entry = _jobs.get(key)
+                        if entry is not None:
+                            evicted.append((key, entry, entry.get("cred")))
+                            entry["cred"] = None
+                            del _jobs[key]
+                        store.job_delete(key)
+                        known.discard(key)
+                if len(known) >= _MAX_JOBS:
+                    raise RuntimeError(
+                        f"guest job registry is full ({_MAX_JOBS} active jobs); "
+                        "stop jobs before starting more"
+                    )
+                started_at = _utc_now_iso()
+                _jobs[job_id] = {
+                    "job_id": job_id, "vm_name": "", "vm_id": "", "pid": 0,
+                    "in_flight": True, "owner": owner,
+                    "started_at": started_at, "cred": None, "stopped": False,
+                }
+                # The `starting` row is committed BEFORE the guest leg runs, so a
+                # hard kill inside the leg leaves an addressable row (issue #22).
+                store.job_upsert(statestore.JobRow(
+                    job_id=job_id, started_at=started_at, owner=owner,
+                    state=statestore.JOB_STARTING, cred_ref="inline",
+                ))
+        except BaseException:
+            # Compensation in the failure direction: the store transaction is
+            # unwinding around this handler (the reservation row, and every
+            # eviction delete above, roll back with it), so the memory view
+            # must return to what it was — evicted entries restored WITH
+            # their credentials, and no half-inserted placeholder left for a
+            # start that never happened.
+            with _jobs_lock:
+                for key, entry, cred in evicted:
+                    entry["cred"] = cred
+                    _jobs[key] = entry
+                _jobs.pop(job_id, None)
+            raise
 
 
 def _reserve_slot_local(job_id: str, owner: str | None) -> None:
@@ -289,24 +324,45 @@ def _reserve_slot_local(job_id: str, owner: str | None) -> None:
 
 
 def _release_slot(job_id: str, cfg: Config | None = None) -> None:
+    """Withdraw a reservation. Never raises: this runs on job_start's failure
+    path, where a secondary error would mask the caller's real one."""
     with _jobs_lock:
         entry = _jobs.get(job_id)
         if entry is None or not entry.get("in_flight"):
             return
         del _jobs[job_id]
     if cfg is not None:
-        # Registry lock released first: store-lock is the outer order.
-        _store(cfg).job_delete(job_id)
+        try:
+            # Registry lock released first: store-lock is the outer order.
+            _store(cfg).job_delete(job_id)
+        except Exception:
+            # Compensation (PRR-003): put the placeholder back rather than
+            # leave a `starting` row with no memory view to pair with it. The
+            # row stays addressable and recovery orphans it at the next open;
+            # losing the pairing silently is strictly worse.
+            with _jobs_lock:
+                _jobs.setdefault(job_id, entry)
 
 
 def _register(job: dict[str, Any], cfg: Config | None = None) -> None:
+    if cfg is not None:
+        try:
+            # Store BEFORE memory (PRR-003): the guest process is already
+            # running, and memory-then-store used to strand it behind a
+            # job_id the caller never received when the write failed. The
+            # registry lock is NOT held across the write (store-lock is the
+            # outer order process-wide, so holding _jobs_lock here would
+            # deadlock AB-BA against a reservation).
+            _store(cfg).job_upsert(_row(job, statestore.JOB_ACTIVE))
+        except Exception:
+            # Compensation in the failure direction: fall back to the
+            # process-local entry alone. The caller still receives a usable
+            # id — the only outcome that does not orphan a launched guest
+            # process — and the row reappears on the next write-through (a
+            # status observation, a stop) or ends with this process.
+            pass
     with _jobs_lock:
         _jobs[job["job_id"]] = job
-    if cfg is not None:
-        # Registry lock released first: store-lock is the outer order, so
-        # holding _jobs_lock across this write would deadlock AB-BA against a
-        # reservation.
-        _store(cfg).job_upsert(_row(job, statestore.JOB_ACTIVE))
 
 
 def _lookup(job_id: str, owner: str | None = None,
@@ -676,12 +732,28 @@ def job_status(cfg: Config, job_id: str, *, owner: str | None = None) -> dict:
         _status_script(entry["pid"], entry["exit_path"], entry.get("start_time_ticks")),
         cred, mode="read",
     )
+    status = str(outcome.get("status", "unknown"))
+    if status == "exited" and cfg is not None:
+        # PRR-002: an observed exit is the one moment this job can retire its
+        # own durable row — a caller that polls status but never stops would
+        # otherwise hold a cap slot forever, and after a restart nothing else
+        # can demote an env/file row at all. Only the ROW is demoted: the
+        # in-memory entry stays stoppable with its credential, because the
+        # wrapper exiting says nothing about orphaned descendants a later
+        # job_stop still has to kill. (job_output is not this place — reading
+        # a stream observes nothing about the process.)
+        try:
+            _store(cfg).job_upsert(_row(entry, statestore.JOB_STOPPED))
+        except Exception:
+            # The observation is the caller's answer and stands; an
+            # undemotable row heals at the next observation.
+            pass
     return {
         "ok": True,
         "job_id": job_id,
         "vm_name": entry["vm_name"],
         "pid": entry["pid"],
-        "status": str(outcome.get("status", "unknown")),
+        "status": status,
         "process_name": outcome.get("process_name"),
         "exit_code": outcome.get("exit_code"),
     }
@@ -822,27 +894,40 @@ def job_stop(cfg: Config, job_id: str, *, owner: str | None = None) -> dict:
     # Survivors win over a contradictory `stopped: true`.
     stopped = bool(outcome.get("stopped")) and not alive_pids
     job_dir_removed = outcome.get("job_dir_removed")
-    recorded_ref = ""
     if stopped:
-        # Registry bookkeeping (registry lock only, outside any vm_lock).
+        # PRR-014: capture the credential provenance ONCE, under the lock,
+        # and pin it on the entry before anything else happens to the
+        # credential — a racing second stop used to read the already-nulled
+        # credential (or no pinned reference) and persist cred_ref="inline"
+        # over the correct value, which later refuses re-attach.
+        with _jobs_lock:
+            current = _jobs.get(job_id)
+            if current is not None:
+                if not current.get("cred_ref"):
+                    current["cred_ref"] = _cred_ref(current.get("cred"))
+                recorded_ref = str(current["cred_ref"])
+            else:
+                recorded_ref = ""
+        if not recorded_ref:
+            recorded_ref = entry.get("cred_ref") or _cred_ref(entry.get("cred"))
+        stopped_row = _row(entry, statestore.JOB_STOPPED)
+        # PRR-014: the durable row is written BEFORE the credential is
+        # nulled. A store failure between the null and the write used to
+        # destroy an inline credential that was the only copy while the row
+        # stayed `active` — now the failure leaves the entry fully stoppable
+        # for a retry instead. A failed stop writes nothing, which is what
+        # keeps the credential retained.
+        _store(cfg).job_upsert(statestore.JobRow(
+            **{**stopped_row.as_dict(), "cred_ref": recorded_ref}
+        ))
+        # Registry bookkeeping (registry lock only, outside any vm_lock),
+        # AFTER the durable row made it: store-lock is the outer order
+        # process-wide.
         with _jobs_lock:
             current = _jobs.get(job_id)
             if current is not None:
                 current["stopped"] = True
-                # Captured before the null: a live entry carries no cred_ref of
-                # its own, so reading it afterwards would silently rewrite the
-                # persisted provenance to "inline".
-                recorded_ref = current.get("cred_ref") or _cred_ref(current.get("cred"))
                 current["cred"] = None
-        # Store write AFTER the registry lock is released: store-lock is the
-        # outer order process-wide. A failed stop writes nothing, which is what
-        # keeps the entry stoppable and the credential retained for a retry.
-        if not recorded_ref:
-            recorded_ref = entry.get("cred_ref") or _cred_ref(entry.get("cred"))
-        stopped_row = _row(entry, statestore.JOB_STOPPED)
-        _store(cfg).job_upsert(statestore.JobRow(
-            **{**stopped_row.as_dict(), "cred_ref": recorded_ref}
-        ))
     result = {
         "ok": stopped,
         "job_id": job_id,
