@@ -42,7 +42,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from .config import Config
+from .config import Config, default_state_db_path
 
 SCHEMA_VERSION = 1
 BUSY_TIMEOUT_MS = 5000
@@ -512,6 +512,9 @@ def resolve_state_db_path(cfg: Config, environ: dict[str, str] | None = None) ->
     test that repoints ``LOCALAPPDATA`` is honoured, and so a directly
     constructed ``Config()`` — which never went through ``load()`` — still gets
     the documented default rather than an empty path.
+
+    The default comes from ``config.default_state_db_path`` so the precedence
+    has exactly one definition.
     """
     import os as _os
 
@@ -522,13 +525,7 @@ def resolve_state_db_path(cfg: Config, environ: dict[str, str] | None = None) ->
     configured = (cfg.state_db_path or "").strip()
     if configured:
         return configured
-    base = (
-        env.get("LOCALAPPDATA")
-        or env.get("TEMP")
-        or env.get("TMP")
-        or _os.getcwd()
-    )
-    return _os.path.join(base, "hyperv-mcp", "state.db")
+    return default_state_db_path(env)
 
 
 def store_for(cfg: Config, environ: dict[str, str] | None = None) -> Store:

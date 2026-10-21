@@ -682,10 +682,14 @@ def relay_start(
                     )
             known = set(_relays) | {r.relay_id for r in store.relay_rows()}
             if len(known) >= _MAX_RELAYS:
+                # `interrupted` rows are evictable too: their listener died with
+                # a previous process, nothing can bring them back, and leaving
+                # them would let 16 restarts permanently fill the cap.
                 evictable = sorted(
                     (k for k in known
                      if (_relays.get(k) or {}).get("stopped")
-                     or _row_state(store, k) == statestore.RELAY_STOPPED),
+                     or _row_state(store, k) in (statestore.RELAY_STOPPED,
+                                                 statestore.RELAY_INTERRUPTED)),
                     key=lambda k: _started_at(_relays.get(k), store, k),
                 )
                 for key in evictable[: max(1, len(known) - _MAX_RELAYS + 1)]:
@@ -821,35 +825,45 @@ def relay_status(cfg: Config, relay_id: str = "", *, owner: str | None = None) -
     capability secret appears only in the starting agent's relay_start
     result.
     """
+    # The store is read with _relays_lock RELEASED: the process-wide order is
+    # store-lock > registry-lock, and taking Store._lock under _relays_lock
+    # deadlocks AB-BA against relay_start's reservation (implementation review,
+    # round 1). The local view is read under the lock, then the store, then the
+    # lock again only to consult the local view — mirroring guestjobs._lookup.
     with _relays_lock:
-        if relay_id:
-            entry = _relays.get(relay_id)
-            if entry is None or entry.get("in_flight") or (
-                owner is not None and entry.get("owner") != owner
-            ):
-                # issue #22: the entry died with a previous process. A row that
-                # is not in the LOCAL registry is reported interrupted — its
-                # listener died with the process that started it, because this
-                # process did not start it.
-                entry = _restore_relay(cfg, relay_id, owner)
-                if entry is None:
-                    raise ValueError(f"unknown relay_id {relay_id!r}")
-            selected = [entry]
-        else:
-            selected = [
-                e for e in _relays.values()
-                if not e.get("in_flight")
-                and (owner is None or e.get("owner") == owner)
-            ]
-            # Union with the store's non-stopped rows, deduplicated by
-            # relay_id with the local entry taking priority, so a relay restored
-            # after a restart is visible rather than silently omitted and a
-            # relay that is mid-bind in this process is not double-counted.
-            local_ids = {e["relay_id"] for e in selected}
-            selected.extend(
-                e for e in _restored_rows(cfg, owner)
-                if e["relay_id"] not in local_ids
-            )
+        local = dict(_relays)
+    if relay_id:
+        entry = local.get(relay_id)
+        if entry is None:
+            # issue #22: the entry died with a previous process. A row that is
+            # not in the LOCAL registry is reported interrupted — its listener
+            # died with the process that started it, because this process did
+            # not start it. The fallback fires ONLY on local absence: an
+            # in-flight placeholder (a start still binding) is invisible here
+            # exactly as at base, and an owner mismatch stays `unknown`.
+            entry = _restore_relay(cfg, relay_id, owner)
+            if entry is None:
+                raise ValueError(f"unknown relay_id {relay_id!r}")
+        elif entry.get("in_flight") or (
+            owner is not None and entry.get("owner") != owner
+        ):
+            raise ValueError(f"unknown relay_id {relay_id!r}")
+        selected = [entry]
+    else:
+        selected = [
+            e for e in local.values()
+            if not e.get("in_flight")
+            and (owner is None or e.get("owner") == owner)
+        ]
+        # Union with the store's non-stopped rows, deduplicated by relay_id
+        # with the local entry taking priority, so a relay restored after a
+        # restart is visible rather than silently omitted and a relay that is
+        # mid-bind in this process is not double-counted.
+        local_ids = {e["relay_id"] for e in selected}
+        selected.extend(
+            e for e in _restored_rows(cfg, owner)
+            if e["relay_id"] not in local_ids
+        )
     rows = []
     for entry in selected:
         with entry["context"]["counter_lock"]:
@@ -922,17 +936,31 @@ def relay_stop(cfg: Config, relay_id: str, *, owner: str | None = None) -> dict:
     stopped in relay_status) until cap-time eviction."""
     if not relay_id:
         raise ValueError("relay_id is required")
+    # Same lock discipline as relay_status: read the local view under the
+    # lock, release, then read the store. No store call runs while
+    # _relays_lock is held.
     with _relays_lock:
         entry = _relays.get(relay_id)
-        if entry is None or entry.get("in_flight") or (
+    if entry is None:
+        # issue #22: a relay restored from the store has no listener to shut
+        # down; report it as already stopped rather than unknown. Only local
+        # absence falls through — an in-flight placeholder stays invisible and
+        # an owner mismatch stays `unknown`.
+        entry = _restore_relay(cfg, relay_id, owner)
+        if entry is None:
+            raise ValueError(f"unknown relay_id {relay_id!r}")
+        already = bool(entry["stopped"])
+        entry["stopped"] = True
+    else:
+        if entry.get("in_flight") or (
             owner is not None and entry.get("owner") != owner
         ):
-            # issue #22: a relay restored from the store has no listener to
-            # shut down; report it as already stopped rather than unknown.
-            entry = _restore_relay(cfg, relay_id, owner)
-            if entry is None:
-                raise ValueError(f"unknown relay_id {relay_id!r}")
+            raise ValueError(f"unknown relay_id {relay_id!r}")
+        # `already` is read BEFORE the flag is set, so exactly one of two racing
+        # stops observes already=False (issue #11, PRR-027b).
         already = bool(entry["stopped"])
+        with _relays_lock:
+            _relays[relay_id]["stopped"] = True
         entry["stopped"] = True
     if not already:
         _shutdown_server(entry)

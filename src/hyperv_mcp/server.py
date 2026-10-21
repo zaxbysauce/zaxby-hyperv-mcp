@@ -2374,9 +2374,9 @@ def _harden_tools(mcp: MCPServer) -> None:
                     # entry: resolve the VM so the row joins to the start row
                     # like the success path does (impl-review PRR-003).
                     if job_id:
-                        vm_name = guestjobs.peek_vm_name(job_id)
+                        vm_name = guestjobs.peek_vm_name(job_id, _cfg())
                     elif relay_id:
-                        vm_name = relay.peek_vm_name(relay_id)
+                        vm_name = relay.peek_vm_name(relay_id, _cfg())
                 timing_snapshot = timing.finish(timing_token)
                 finished = True
             finally:
@@ -2505,7 +2505,7 @@ def main(argv: list[str] | None = None) -> int:
             "HYPERV_GUEST_VICTIM_USERNAME HYPERV_GUEST_VICTIM_PASSWORD "
             "HYPERV_GUEST_VICTIM_PASSWORD_FILE HYPERV_HOST_USERNAME "
             "HYPERV_HOST_PASSWORD HYPERV_HOST_PASSWORD_FILE HYPERV_MCP_CONFIG "
-            "HYPERV_MCP_UNRESTRICTED HYPERV_MCP_HTTP_TOKEN"
+            "HYPERV_MCP_UNRESTRICTED HYPERV_MCP_HTTP_TOKEN HYPERV_MCP_STATE_DB"
         ).split()
         for agent_var in sorted(set(cfg.http.agents.values())):
             if agent_var not in listed:

@@ -326,13 +326,19 @@ def test_e01_job_survives_server_restart(running_vm, tmp_path):
     assert payload["status"]["status"] == "running", payload["status"]
     assert payload["output"]["stdout"].strip(), payload["output"]
 
-    # Process B stops it, and the guest job directory goes away.
-    stopped = guestjobs.job_stop(running_vm.cfg, job_id, cred=running_vm.creds)
+    # Process B stops it, and the guest job directory goes away. job_stop takes
+    # no credential: a restored job re-resolves its own from the environment,
+    # which is the behaviour under test.
+    stopped = guestjobs.job_stop(running_vm.cfg, job_id)
     assert stopped["stopped"] is True, stopped
 
-    probe = running_vm.cfg
-    exists = guestjobs.run_guest_inner(
-        probe, running_vm.vm,
+    # run_guest_inner is GUID-native (no name resolution happens inside), so the
+    # probe leg addresses the VM by the id job_start resolved and stored.
+    from hyperv_mcp import diagnostics, vmident
+
+    ref = vmident.resolve(running_vm.cfg, vm_name=running_vm.vm)
+    exists = diagnostics.run_guest_inner(
+        running_vm.cfg, ref.id,
         f"if (Test-Path -LiteralPath {guestjobs.pswindows.ps_quote(job_dir)}) "
         "{ 'present' } else { 'absent' }",
         running_vm.creds, mode="read",

@@ -40,6 +40,7 @@ test_relay.py, which this change does not touch.
 
 from __future__ import annotations
 
+import base64
 import importlib
 import json
 import os
@@ -90,16 +91,35 @@ class OrderedFakePS:
     resolution cannot be told apart by content. Call #1 is always the
     by-name resolution leg, #2 the guest start, and every later call a
     follow-up observation leg answered from `later`.
+
+    Every leg's (script, kwargs) pair is recorded, and the credential each leg
+    carried is decoded out of it: the username rides the composed script as
+    `PSCredential::new('<user>', ...)` and the password rides stdin as base64.
+    That is what lets C1 assert the credential the RESTORED leg actually used,
+    rather than only that some leg ran.
     """
 
     def __init__(self, start: dict, later: dict):
         self.start = start
         self.later = later
         self.scripts: list[str] = []
+        self.legs: list[tuple[str, dict]] = []
+        self.credentials: list[tuple[str, str]] = []
         self._n = 0
 
     def __call__(self, script, **kwargs):
         self.scripts.append(script)
+        self.legs.append((script, dict(kwargs)))
+        if not _is_resolution_leg(script):
+            user = ""
+            m = re.search(r"PSCredential\]?::new\('([^']*)'", script)
+            if m:
+                user = m.group(1)
+            secret = ""
+            raw = kwargs.get("stdin_b64")
+            if raw:
+                secret = base64.b64decode(raw).decode("utf-8", "replace")
+            self.credentials.append((user, secret))
         self._n += 1
         if self._n == 1:
             assert _is_resolution_leg(script), "first leg must be identity resolution"
@@ -162,6 +182,8 @@ def test_job_status_after_restart_reattaches(monkeypatch, tmp_path):
             later={"status": "running"},
         )
         monkeypatch.setattr(pswindows, "run_ps", fake)
+        env_user = os.environ["HYPERV_GUEST_USERNAME"]
+        env_secret = os.environ["HYPERV_GUEST_PASSWORD"]
         start = guestjobs.job_start(
             cfg, "test-vm", "x.exe", cred=credentials.resolve_guest(),
         )
@@ -170,6 +192,16 @@ def test_job_status_after_restart_reattaches(monkeypatch, tmp_path):
         # the durable store must not.
         importlib.reload(guestjobs)
         assert guestjobs.job_status(cfg, job_id)["status"] == "running"
+        # AC1's provenance clause: the restored leg must re-resolve the
+        # credential FROM THE ENVIRONMENT it was started with. Legs #1 and #2
+        # carry the start-time credential; leg #3 is the post-restart status
+        # leg, and it must carry the SAME identity — an implementation that
+        # substituted any other credential would fail here.
+        # Two legs carry a credential: the start leg (#2) and the post-restart
+        # status leg (#3). Both must name the environment identity.
+        assert len(fake.credentials) >= 2, fake.credentials
+        for user, secret in fake.credentials:
+            assert (user, secret) == (env_user, env_secret), (user, secret)
     finally:
         pswindows.run_ps = original
 

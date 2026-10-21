@@ -229,7 +229,12 @@ def _reserve_slot(job_id: str, owner: str | None = None,
                 if entry is not None:
                     return bool(entry.get("stopped"))
                 row = rows.get(key)
-                return row is not None and row.state == statestore.JOB_STOPPED
+                # `orphaned` is evictable too: the crash left no PID to stop,
+                # so nothing can ever clear it, and leaving it would let 128
+                # hard crashes permanently fill the cap.
+                return row is not None and row.state in (
+                    statestore.JOB_STOPPED, statestore.JOB_ORPHANED,
+                )
 
             known = set(_jobs) | set(rows)
             if len(known) >= _MAX_JOBS:
@@ -680,6 +685,18 @@ def job_output(cfg: Config, job_id: str, *, tail_bytes: int = 65536,
     if tail_bytes < 1:
         raise ValueError("tail_bytes must be >= 1")
     entry = _lookup(job_id, owner, cfg)
+    if entry.get("row_state") == statestore.JOB_ORPHANED:
+        # A `starting` placeholder never created its stream files, so there is
+        # nothing to read and no leg to run. Answer the empty-stream result
+        # directly: running _entry_credential here would raise a FALSE
+        # CredentialError, because the placeholder's cred_ref is "inline" by
+        # construction even when the job was started from the environment.
+        return {
+            "ok": True, "job_id": job_id, "vm_name": entry["vm_name"],
+            "pid": entry["pid"], "tail_bytes": tail_bytes,
+            "stdout": "", "stdout_truncated": False, "stdout_encoding": "utf-8",
+            "stderr": "", "stderr_truncated": False, "stderr_encoding": "utf-8",
+        }
     cred = _entry_credential(cfg, entry)
     result: dict[str, Any] = {
         "ok": True, "job_id": job_id, "vm_name": entry["vm_name"],
@@ -736,11 +753,13 @@ def job_stop(cfg: Config, job_id: str, *, owner: str | None = None) -> dict:
             "stopped": True, "alive_pids": [], "job_dir_removed": None,
             "pid_reused": False, "note": "was already stopped",
         }
-    if (entry.get("row_state") == statestore.JOB_ORPHANED
-            and int(entry.get("pid") or 0) <= 0):
-        # The crash happened before the guest leg recorded a PID. Refuse rather
-        # than run _stop_script(0, ""), which would enumerate and taskkill the
-        # Win32 children of PID 0 as guest admin (issue #22).
+    if entry.get("row_state") == statestore.JOB_ORPHANED:
+        # A crash inside the guest start leg leaves the `starting` placeholder,
+        # which is pid 0 with an empty job_dir by construction: there is no PID
+        # to stop. Refuse rather than run _stop_script(0, ""), which would
+        # enumerate and taskkill the Win32 children of PID 0 as guest admin
+        # (issue #22). Nothing is written, so the row stays `orphaned` and
+        # remains evictable at cap time.
         return {
             "ok": False, "job_id": job_id, "vm_name": entry["vm_name"],
             "pid": entry["pid"],
@@ -806,7 +825,14 @@ def job_stop(cfg: Config, job_id: str, *, owner: str | None = None) -> dict:
         # Store write AFTER the registry lock is released: store-lock is the
         # outer order process-wide. A failed stop writes nothing, which is what
         # keeps the entry stoppable and the credential retained for a retry.
-        _store(cfg).job_upsert(_row(entry, statestore.JOB_STOPPED))
+        # `entry` keeps the row's cred_ref (a live entry has none), so the
+        # persisted provenance is not silently rewritten to "inline".
+        stopped_row = _row(entry, statestore.JOB_STOPPED)
+        if entry.get("cred_ref"):
+            stopped_row = statestore.JobRow(
+                **{**stopped_row.as_dict(), "cred_ref": entry["cred_ref"]}
+            )
+        _store(cfg).job_upsert(stopped_row)
     result = {
         "ok": stopped,
         "job_id": job_id,
