@@ -76,8 +76,8 @@ both modules — the store-lock > registry-lock invariant holds.
 The PR closes #22 as claimed, with two honest corrections already recorded in its
 body: the issue's "tool inventory stays at 54" is stale (57 is correct and was
 already reconciled in-tree at base), and AC10 is NON-EXECUTABLE. All 13
-acceptance criteria are otherwise covered by frozen checks. No `TODO`/`FIXME`/
-stub/placeholder language on any added line.
+acceptance criteria are otherwise covered by frozen checks, and the repository's
+own deferred-work scanner reports no marker of any kind on an added line.
 
 ## Verdict
 
