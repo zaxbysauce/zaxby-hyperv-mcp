@@ -88,7 +88,11 @@ def test_store_schema_contract(tmp_path):
     try:
         mode, version, _raw_timeout = _read_pragmas(path)
         assert mode.lower() == "wal"
-        assert version == 1
+        # Issue #23 moved the schema to version 2 (the leases +
+        # fence_counters tables). The migration is additive and forward-only:
+        # an existing v1 store migrates on open, and an OLDER build opening a
+        # v2 store is still refused byte-untouched.
+        assert version == 2
 
         # busy_timeout is PER CONNECTION, so a raw sqlite3.connect cannot
         # observe what the store configured: Python's default timeout=5.0
@@ -120,7 +124,7 @@ def test_store_schema_contract(tmp_path):
          "import os, sqlite3, sys\n"
          "con = sqlite3.connect(sys.argv[1], isolation_level=None)\n"
          "con.execute('PRAGMA journal_mode=WAL')\n"
-         "con.execute('PRAGMA user_version=2')\n"
+         "con.execute('PRAGMA user_version=99')\n"
          "con.execute('CREATE TABLE t(x)')\n"
          "con.execute('INSERT INTO t VALUES (1)')\n"
          "os._exit(0)\n", newer],
@@ -135,7 +139,10 @@ def test_store_schema_contract(tmp_path):
     with pytest.raises(statestore.StateStoreError) as excinfo:
         statestore.open(newer)
     message = str(excinfo.value)
-    assert "1" in message
+    # Issue #23 moved the code's version to 2, so "newer than this build
+    # supports" now names 99 against 2 (the OLD build's refusal named 2
+    # against 1; the contract -- both numbers present -- is unchanged).
+    assert "99" in message
     assert "2" in message
     # Byte comparison FIRST: reading the pragmas below opens its own rw
     # connection, whose close would checkpoint the -wal and legitimately
@@ -147,7 +154,7 @@ def test_store_schema_contract(tmp_path):
         name for name in os.listdir(str(tmp_path)) if name.startswith("newer.sqlite3")
     ) == sidecars_before, "a refused store must not disturb its -wal/-shm"
     _, version_after, _ = _read_pragmas(newer)
-    assert version_after == 2
+    assert version_after == 99
 
 
 def test_two_processes_share_store(tmp_path):

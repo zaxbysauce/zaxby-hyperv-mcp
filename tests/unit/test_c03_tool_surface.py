@@ -84,6 +84,9 @@ TOOL_NAMES = {
     "hyperv_wait_guest_recovery",
     "hyperv_relay_start",
     "hyperv_relay_status",
+    # issue #23: the lease surface
+    "hyperv_lease_acquire", "hyperv_lease_renew",
+    "hyperv_lease_release", "hyperv_lease_list",
     "hyperv_relay_stop",
     "hyperv_capture_evidence",
 }
@@ -229,7 +232,7 @@ def test_ac12_tool_inventory_per_credential_mode(tmp_path, fresh_server):
         f"extra={sorted(set(base_schemas) - TOOL_NAMES)}, "
         f"missing={sorted(TOOL_NAMES - set(base_schemas))}"
     )
-    assert len(base_schemas) == len(TOOL_NAMES) == 57, f"AC12: tool count {len(base_schemas)} != 57"
+    assert len(base_schemas) == len(TOOL_NAMES) == 61, f"AC12: tool count {len(base_schemas)} != 61"
     doc = {"allow_inline_credentials": True}
     p = tmp_path / "cfg.json"
     p.write_text(json.dumps(doc), encoding="utf-8")

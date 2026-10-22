@@ -365,6 +365,13 @@ def _server_for(mode: str, audit_log: Path, session_reuse: bool | None = None):
             import hyperv_mcp.credentials as credentials
 
             credentials.registry().unregister(_FAKE_GUEST_PASSWORD)
+        # Issue #23: close the cached store BEFORE the tmp dir goes away. The
+        # store is opened lazily by the first lease/registry call and cached
+        # per path; without this close its WAL/SHM handles keep the soak's
+        # state file alive and the tmp cleanup dies with WinError 32.
+        import hyperv_mcp.statestore as statestore
+
+        statestore.clear_store_cache_for_tests()
         importlib.reload(server_module)
 
     return mod, _teardown

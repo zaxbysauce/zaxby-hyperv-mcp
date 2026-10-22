@@ -140,6 +140,20 @@ class HyperVTarget:
 
 
 @dataclass
+class LeasePolicy:
+    """Lease coordination (issue #23).
+
+    `required` defaults to False so a standalone stdio server is unaffected;
+    http_entry turns it on for the shared controller, where several agents
+    share one process. TTLs are seconds: a lease expires that long after its
+    last heartbeat, and `max_ttl_s` bounds what a caller may ask for."""
+
+    required: bool = False
+    default_ttl_s: int = 300
+    max_ttl_s: int = 3600
+
+
+@dataclass
 class Config:
     allowed_vm_patterns: list[str] = field(default_factory=list)
     host_read_roots: list[str] = field(default_factory=list)
@@ -190,6 +204,11 @@ class Config:
     # Appended last so every pre-existing positional construction keeps its
     # argument order.
     state_db_path: str | None = None
+    # Issue #23: lease coordination. `required` stays False by default so a
+    # standalone stdio server is unaffected; http_entry turns it on for the
+    # shared controller, where several agents share one process. Appended last
+    # for the same positional-compat reason as the fields above.
+    leases: LeasePolicy = field(default_factory=LeasePolicy)
 
     # -- loading ---------------------------------------------------------
 
@@ -495,6 +514,48 @@ class Config:
             )
         object.__setattr__(self, "hyperv", HyperVTarget(host=host))
 
+    def _set_leases(self, value: Any) -> None:
+        """Validate the optional leases section (issue #23).
+
+        TTLs are bounded at load time rather than at acquire time so a bad
+        config fails at startup instead of on the first mutating call.
+        """
+        if not isinstance(value, dict):
+            raise ConfigError("leases must be an object")
+        unknown = set(value) - {"required", "default_ttl_s", "max_ttl_s"}
+        if unknown:
+            raise ConfigError(
+                f"unknown leases key(s): {sorted(unknown)} — "
+                f"offending key: {sorted(unknown)[0]}"
+            )
+        leases = LeasePolicy()
+        if "required" in value:
+            self._set_bool_on(leases, "required", value["required"])
+        if "default_ttl_s" in value:
+            self._set_int_on(leases, "default_ttl_s", value["default_ttl_s"], 1, 86400)
+        if "max_ttl_s" in value:
+            self._set_int_on(leases, "max_ttl_s", value["max_ttl_s"], 1, 86400)
+        if leases.default_ttl_s > leases.max_ttl_s:
+            raise ConfigError(
+                f"leases.default_ttl_s ({leases.default_ttl_s}) must not exceed "
+                f"leases.max_ttl_s ({leases.max_ttl_s})"
+            )
+        object.__setattr__(self, "leases", leases)
+
+    @staticmethod
+    def _set_bool_on(target: Any, name: str, value: Any) -> None:
+        if not isinstance(value, bool):
+            raise ConfigError(f"leases.{name} must be a boolean")
+        object.__setattr__(target, name, value)
+
+    @staticmethod
+    def _set_int_on(target: Any, name: str, value: Any, low: int, high: int) -> None:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(f"leases.{name} must be an integer")
+        if not low <= value <= high:
+            raise ConfigError(f"leases.{name} must be between {low} and {high}")
+        object.__setattr__(target, name, value)
+
 
 Config._FIELD_MAP = {  # type: ignore[attr-defined]
     "allowed_vm_patterns": lambda c, v: c._set_str_list("allowed_vm_patterns", v),
@@ -518,4 +579,5 @@ Config._FIELD_MAP = {  # type: ignore[attr-defined]
     "state_db_path": lambda c, v: c._set_str_opt("state_db_path", v),
     "hyperv": lambda c, v: c._set_hyperv(v),
     "http": lambda c, v: c._set_http(v),
+    "leases": lambda c, v: c._set_leases(v),
 }

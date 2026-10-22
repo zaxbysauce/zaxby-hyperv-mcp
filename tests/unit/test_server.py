@@ -54,6 +54,9 @@ TOOL_NAMES = {
     "hyperv_wait_guest_recovery",
     "hyperv_relay_start", "hyperv_relay_status", "hyperv_relay_stop",
     "hyperv_capture_evidence",
+    # issue #23: the lease surface
+    "hyperv_lease_acquire", "hyperv_lease_renew",
+    "hyperv_lease_release", "hyperv_lease_list",
 }
 CONFIRM_TOOLS = {
     "hyperv_stop_vm", "hyperv_reset_vm", "hyperv_checkpoint_restore",
@@ -88,7 +91,7 @@ def test_tool_inventory_registered(fresh_server):
     mod = fresh_server({})
     schemas = _schemas(mod)
     assert set(schemas) == TOOL_NAMES
-    assert len(schemas) == 57
+    assert len(schemas) == 61
 
 
 def test_every_vm_tool_schema_has_vm_id(fresh_server):

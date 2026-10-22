@@ -56,6 +56,14 @@ _REQUIRED_RELAY_COLUMNS = {
     "relay_id", "vm_name", "vm_id", "guest_port", "bind", "host_port",
     "started_at", "state", "cred_ref", "owner",
 }
+# Issue #23. The fencing counter columns are named *_seq (NOT *_token)
+# deliberately: "token" is a forbidden fragment, and narrowing that list to
+# keep a column name would weaken a security pin for a cosmetic choice.
+_REQUIRED_LEASE_COLUMNS = {
+    "row_key", "lease_id", "vm_key", "vm_name", "scope", "holder_agent",
+    "fencing_seq", "acquired_at", "ttl_s", "expires_at", "kind", "write_lock",
+}
+_REQUIRED_FENCE_COLUMNS = {"vm_key", "scope", "last_seq"}
 
 
 def _is_resolution_leg(script: str) -> bool:
@@ -188,9 +196,11 @@ def test_store_schema_holds_no_secret_or_command_column(tmp_path):
     finally:
         con.close()
 
-    assert set(tables) >= {"jobs", "relays"}, sorted(tables)
+    assert set(tables) >= {"jobs", "relays", "leases", "fence_counters"}, sorted(tables)
     assert set(tables["jobs"]) == _REQUIRED_JOB_COLUMNS
     assert set(tables["relays"]) == _REQUIRED_RELAY_COLUMNS
+    assert set(tables["leases"]) == _REQUIRED_LEASE_COLUMNS
+    assert set(tables["fence_counters"]) == _REQUIRED_FENCE_COLUMNS
     for table, columns in tables.items():
         for column in columns:
             for fragment in _FORBIDDEN_COLUMN_FRAGMENTS:

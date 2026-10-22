@@ -1,7 +1,7 @@
 # hyperv-mcp (hardened fork)
 
 An MCP (Model Context Protocol) server for Hyper-V VM management and guest
-execution. Exposes 57 tools for VM lifecycle, checkpoint management, kernel
+execution. Exposes 61 tools for VM lifecycle, checkpoint management, kernel
 debug setup (KDNET/KDCOM), and guest file transfer/command execution via
 PowerShell Direct (no WinRM required).
 
@@ -292,6 +292,61 @@ Hardening properties:
   file provider is the current non-env option.
 
 ---
+
+## Leases: multi-call exclusion with fencing tokens (0.5.0)
+
+A test agent's unit of work spans several tool calls — restore a checkpoint,
+start the VM, run a probe, collect output. Per-call locks cannot protect the
+gaps between those calls, and two separate server processes never saw each
+other's locks at all. Leases close both gaps.
+
+**Workflow:** `hyperv_lease_acquire(vm_name, scopes, ttl_s)` → pass the returned
+`lease_id` + `fencing_token` on every subsequent mutating call →
+`hyperv_lease_renew(lease_id)` periodically (a heartbeat) →
+`hyperv_lease_release(lease_id)` when done. `hyperv_lease_list` shows the
+leases on a VM; holder, scopes and expiry are public, but a lease's id and
+token are visible ONLY to the agent that holds it.
+
+**Scopes:** `lifecycle` (start/stop/reset/checkpoints/KD/provisioning —
+exclusive against every other scope), `guest_exec` (guest runs, victim runs,
+jobs, relays, repair), `transfer` (guest put/get), `console` (keyboard/mouse
+input). Two non-`lifecycle` scopes held by different agents coexist.
+
+**Fencing:** every grant bumps a per-`(VM, scope)` counter that is persisted in
+the state store, so tokens strictly increase across restarts. A call presenting
+a superseded token is refused `fenced` — a paused former holder cannot resume
+into a VM another agent has taken over. Hyper-V itself cannot verify the token;
+the store checks it before any PowerShell runs.
+
+**Required vs optional:** on the shared HTTP controller (`hyperv-mcp-http`)
+every mutating call MUST carry a valid lease — a call without one is refused
+`lease_required` before anything runs. Standalone stdio servers default to
+optional: an unleased call is still refused `lease_conflict` when ANOTHER agent
+holds a lease on the VM, but a single-agent deployment needs no changes. Config
+override:
+
+```jsonc
+{ "leases": { "required": false, "default_ttl_s": 300, "max_ttl_s": 3600 } }
+```
+
+**Cross-process exclusion:** every mutating call also takes a short per-call
+row in the state store, so two `hyperv-mcp` server processes sharing one
+`HYPERV_MCP_STATE_DB` now exclude each other on the same VM — previously each
+process had its own lock dict and the exclusion was invisible between them. The
+per-call row is deleted when the call ends; if a process dies, its rows expire
+with their TTL and no manual cleanup is needed. Concurrent read-mode legs
+(guest probes, job polling) still coexist, within and across processes.
+
+**What a lease does NOT do:** a leg already running when its lease expires is
+not aborted — fencing stops the NEXT call, it cannot un-send a PowerShell
+child. Cancellation is a separate workstream. Read-only tools (list, info,
+screenshots, status) never require a lease and are never blocked by one.
+Deny-by-default policy and `confirm` gates are unchanged: a lease never
+authorizes an operation policy denies.
+
+Upgrade note: enabling `leases.required` on a shared controller is a breaking
+change for clients that have not adopted leases — they will start receiving
+`lease_required`. That is the intended design for a multi-agent host.
 
 ## Durable state store
 
@@ -844,7 +899,7 @@ claude mcp add hyperv -- hyperv-mcp
 
 ---
 
-## Available Tools (57 total)
+## Available Tools (61 total)
 
 Every registered tool in the tables below returns failures the same way:
 the one-envelope contract (`ok/error/error_class/retryable/retry_after_ms`,
@@ -938,7 +993,10 @@ cases and requires the VM Off/Saved for the `Set-VMComPort` step.
 - (0.4.0) Failures return ONE envelope `{ok: false, error, error_class,
   retryable, retry_after_ms}` where `error_class` is one of `timeout | transport |
   policy | credential | busy | invalid | parse | integrity | not_found |
-  guest`. Every registered tool returns this envelope on failure (0.4.0
+  guest | lease_conflict | lease_required | lease_unknown | lease_expired |
+  fenced | lease_not_owned`. `lease_conflict` is retryable with
+  `retry_after_ms` = milliseconds to the holder's expiry; the other lease
+  classes are not retryable. Every registered tool returns this envelope on failure (0.4.0
   documented breaking change: host-side tools no longer raise through the
   protocol), delivered with `isError: true` so failures are visible at the
   MCP protocol level — the envelope rides as the text content AND as

@@ -53,8 +53,10 @@ from . import (
     filetransfer,
     guestexec,
     guestjobs,
+    leases,
     lifecycle,
     media,
+    policy,
     psdsessions,
     pswindows,
     relay,
@@ -62,6 +64,7 @@ from . import (
     statestore,
     stdio_proxy,
     timing,
+    vmident,
     vmlocks,
 )
 from .config import Config, ConfigError
@@ -185,6 +188,14 @@ def bootstrap(environ: dict[str, str] | None = None) -> Config:
     pswindows.init(cfg, credentials.redact)
     auditlog.init(cfg)
     vmlocks.set_default_wait_s(cfg.vm_lock_wait_s)  # issue #14 bounded lock wait
+    # issue #23: wire the cross-process lease row into vm_lock, plus the
+    # scope/agent resolvers the row needs. http_entry turns leases.required
+    # on for the shared controller; standalone stdio stays opt-in.
+    vmlocks.set_store_provider(lambda: CFG)
+    vmlocks.set_scope_resolver(
+        lambda: TOOL_SCOPES.get(vmlocks.current_tool() or "", "call")
+    )
+    vmlocks.set_agent_resolver(auditlog.current_agent_id)
     # issue #21: install the reusable PS Direct session pool. A no-op when the
     # flag is off, and the session cap is derived from the host PowerShell cap
     # so pooled workers cannot starve the per-call legs of slots.
@@ -583,7 +594,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         )
 
     @mcp.tool()
-    def hyperv_start_vm(vm_name: str = "", vm_id: str = "") -> dict:
+    def hyperv_start_vm(
+        vm_name: str = "", vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
+    ) -> dict:
         """Start a Hyper-V VM and wait until it reports Running.
 
         Idempotent: an already-running VM returns status "already_running".
@@ -599,7 +613,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         )
 
     @mcp.tool()
-    def hyperv_stop_vm(vm_name: str = "", method: str = "shutdown", confirm: bool = False, vm_id: str = "") -> dict:
+    def hyperv_stop_vm(
+        vm_name: str = "", method: str = "shutdown", confirm: bool = False, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
+    ) -> dict:
         """Stop a Hyper-V VM and wait until it reaches the final state.
 
         Args:
@@ -622,7 +639,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         )
 
     @mcp.tool()
-    def hyperv_reset_vm(vm_name: str = "", confirm: bool = False, vm_id: str = "") -> dict:
+    def hyperv_reset_vm(
+        vm_name: str = "", confirm: bool = False, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
+    ) -> dict:
         """Hard-reset a Hyper-V VM (power off immediately, start again) and
         wait until it reports Running. Equivalent to the physical reset button.
 
@@ -642,7 +662,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     # ---- checkpoints ----------------------------------------------------
 
     @mcp.tool()
-    def hyperv_checkpoint_create(vm_name: str = "", checkpoint_name: str = "", vm_id: str = "") -> dict:
+    def hyperv_checkpoint_create(
+        vm_name: str = "", checkpoint_name: str = "", vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
+    ) -> dict:
         """Create a checkpoint (snapshot) of a Hyper-V VM.
 
         Args:
@@ -680,7 +703,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
     @mcp.tool()
     def hyperv_checkpoint_restore(
-        vm_name: str = "", checkpoint_name: str = "", confirm: bool = False, vm_id: str = ""
+        vm_name: str = "", checkpoint_name: str = "", confirm: bool = False, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Restore a VM to a checkpoint. ALL STATE SINCE THE CHECKPOINT IS
         DISCARDED. The VM ends powered off; call hyperv_start_vm afterwards.
@@ -704,6 +728,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_checkpoint_remove(
         vm_name: str = "", checkpoint_name: str = "", include_subtree: bool = False,
         confirm: bool = False, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Remove a checkpoint, optionally with its whole child subtree.
         Merged disks cannot be undone afterwards.
@@ -735,6 +760,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             reboot: bool = False, confirm: bool = False,
             username: str = "", password: str = "",
             vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Configure KDNET (network kernel debugging) in a guest via
             PowerShell Direct + bcdedit. Returns kernel_attach_string for
@@ -768,6 +794,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             reboot: bool = False, confirm: bool = False,
             username: str = "", password: str = "",
             vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Configure COM-port/named-pipe kernel debugging. Maps the VM COM
             port to a host named pipe (VM must be Off/Saved) and runs bcdedit
@@ -798,6 +825,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         def hyperv_configure_kdnet(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", host_ip: str = "", port: int = 50000, key: str = "",
             reboot: bool = False, confirm: bool = False, vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Configure KDNET (network kernel debugging) in a guest via
             PowerShell Direct + bcdedit. Returns kernel_attach_string for
@@ -829,6 +857,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         def hyperv_configure_kdcom(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", pipe_name: str = "", com_port: int = 1,
             reboot: bool = False, confirm: bool = False, vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Configure COM-port/named-pipe kernel debugging. Maps the VM COM
             port to a host named pipe (VM must be Off/Saved) and runs bcdedit
@@ -864,6 +893,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             elevated: bool = False, confirm: bool = False,
             username: str = "", password: str = "",
             vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Run a PowerShell script inside a guest via PowerShell Direct.
             stdout/stderr are SEPARATE (0.2.0 change); exit codes are real.
@@ -891,6 +921,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             elevated: bool = False, confirm: bool = False,
             username: str = "", password: str = "",
             vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Run an executable inside a guest via PowerShell Direct.
             Separate stdout/stderr, real exit codes. elevated=true needs
@@ -916,6 +947,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             confirm: bool = False, verify: bool | None = None,
             username: str = "", password: str = "",
             vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Copy a host file into a guest via PowerShell Direct. Staged
             rename, parent dirs created, optional SHA-256 verification
@@ -941,6 +973,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             verify: bool | None = None,
             username: str = "", password: str = "",
             vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Copy a guest file to the host via PowerShell Direct. Staged
             rename, local parent dirs created, optional SHA-256 verification.
@@ -1008,6 +1041,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         def hyperv_guest_run_ps(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", script: str = "", timeout_ms: int = 60000,
             elevated: bool = False, confirm: bool = False, vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Run a PowerShell script inside a guest via PowerShell Direct.
             stdout/stderr are SEPARATE (0.2.0 change); exit codes are real.
@@ -1032,6 +1066,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_name: str = "", command: str = "", args: list[str] | None = None,
             cwd: str | None = None, timeout_ms: int = 60000,
             elevated: bool = False, confirm: bool = False, vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Run an executable inside a guest via PowerShell Direct.
             Separate stdout/stderr, real exit codes. Credentials:
@@ -1055,6 +1090,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         def hyperv_guest_put(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", local_path: str = "", remote_path: str = "",
             confirm: bool = False, verify: bool | None = None, vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Copy a host file into a guest via PowerShell Direct. Staged
             rename, parent dirs created, optional SHA-256 verification.
@@ -1076,6 +1112,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         def hyperv_guest_get(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", remote_path: str = "", local_path: str = "",
             verify: bool | None = None, vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Copy a guest file to the host via PowerShell Direct. Staged
             rename, local parent dirs created, optional SHA-256 verification.
@@ -1131,6 +1168,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_victim_run(
         vm_name: str = "", command: str = "", args: list[str] | None = None,
         cwd: str | None = None, timeout_ms: int = 60000, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Run an executable in the guest as the unprivileged victim account
         (Medium IL). Credentials: HYPERV_GUEST_VICTIM_USERNAME /
@@ -1150,7 +1188,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
     @mcp.tool()
     def hyperv_victim_run_ps(
-        vm_name: str = "", script: str = "", timeout_ms: int = 60000, vm_id: str = ""
+        vm_name: str = "", script: str = "", timeout_ms: int = 60000, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Run a PowerShell script in the guest as the unprivileged victim
         account (Medium IL). Victim credentials from environment only.
@@ -1287,7 +1326,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         )
 
     @mcp.tool()
-    def hyperv_console_type_text(vm_name: str = "", text: str = "", vm_id: str = "") -> dict:
+    def hyperv_console_type_text(
+        vm_name: str = "", text: str = "", vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
+    ) -> dict:
         """Type ASCII text into the VM console via Msvm_Keyboard.TypeText
         (works pre-login, in WinPE). Text rides the stdin channel — it never
         appears in process argv, the PowerShell script, or error records.
@@ -1307,6 +1349,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_console_press_key(
         vm_name: str = "", key: str = "", modifiers: list[str] | None = None,
         vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Press a named key (scan-code make/break pair) with optional
         modifiers (ctrl/alt/shift). Supported keys: enter, escape, tab,
@@ -1324,7 +1367,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
     @mcp.tool()
     def hyperv_console_key_combo(
-        vm_name: str = "", keys: list[str] | None = None, vm_id: str = ""
+        vm_name: str = "", keys: list[str] | None = None, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Send a key combination: modifier makes first, keys in order,
         modifier breaks last (e.g. ["ctrl", "alt", "delete"]).
@@ -1341,7 +1385,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
     @mcp.tool()
     def hyperv_console_type_scancodes(
-        vm_name: str = "", scancodes: list[int] | None = None, vm_id: str = ""
+        vm_name: str = "", scancodes: list[int] | None = None, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Send raw PS/2 scan codes (0..255 ints, make/break pairs included)
         via Msvm_Keyboard.TypeScancodes; chunked at 64 codes with pacing.
@@ -1360,6 +1405,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_console_mouse_move(
         vm_name: str = "", x: int | None = None, y: int | None = None,
         frame_width: int = 0, frame_height: int = 0, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Position the synthetic mouse. Coordinates are in the space of the
         image you observed; give frame_width/frame_height (the snapshot
@@ -1384,6 +1430,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_console_click(
         vm_name: str = "", x: int = 0, y: int = 0, frame_width: int = 0,
         frame_height: int = 0, button: int = 1, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Click at frame-space coordinates (optional; positions first when
         x/y are given, else clicks at the current position). button: 1=left,
@@ -1402,7 +1449,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
     @mcp.tool()
     def hyperv_console_button(
-        vm_name: str = "", button: int = 1, is_down: bool = False, vm_id: str = ""
+        vm_name: str = "", button: int = 1, is_down: bool = False, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Hold or release a mouse button (raw SetButtonState; for drag
         gestures). Policy: console_input.
@@ -1417,7 +1465,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         )
 
     @mcp.tool()
-    def hyperv_console_scroll(vm_name: str = "", delta: int = 0, vm_id: str = "") -> dict:
+    def hyperv_console_scroll(
+        vm_name: str = "", delta: int = 0, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
+    ) -> dict:
         """Scroll the console wheel by delta (positive = down).
         Policy: console_input.
 
@@ -1548,6 +1599,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         name: str, vhd_path: str, memory_mb: int = 2048, cpu_count: int = 1,
         generation: int = 2, vhd_size_gb: int = 64, switch_name: str = "",
         confirm: bool = False,
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Create a disposable VM with a fresh VHDX (New-VHD + New-VM). The
         new name must match allowed_vm_patterns so it stays policy-scoped.
@@ -1568,6 +1620,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_vm_disk_add(
         vm_name: str = "", path: str = "", size_gb: int = 0,
         controller_type: str = "SCSI", confirm: bool = False, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Create and attach an additional VHDX (for multi-disk deployment
         tests). Policy: vm_provision + confirm=true.
@@ -1602,7 +1655,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         )
 
     @mcp.tool()
-    def hyperv_vm_media_attach(vm_name: str = "", iso_path: str = "", vm_id: str = "") -> dict:
+    def hyperv_vm_media_attach(
+        vm_name: str = "", iso_path: str = "", vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
+    ) -> dict:
         """Attach an ISO to a virtual DVD drive (Add-VMDvdDrive). Verify the
         ISO is the intended, freshly built media before claiming a deployment
         tests new fixes. Policy: media category (reversible, no confirm).
@@ -1622,7 +1678,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         )
 
     @mcp.tool()
-    def hyperv_vm_media_detach(vm_name: str = "", vm_id: str = "") -> dict:
+    def hyperv_vm_media_detach(
+        vm_name: str = "", vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
+    ) -> dict:
         """Detach all virtual DVD drives; returns the removed ISO paths.
         Policy: media category (reversible, no confirm).
 
@@ -1666,6 +1725,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_vm_firmware_set_boot_order(
         vm_name: str = "", boot_type: str = "Drive", confirm: bool = False,
         vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Set the first boot device by type (Drive | Network | File) — e.g.
         boot from attached DVD media. Policy: vm_provision + confirm=true.
@@ -1685,7 +1745,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
     @mcp.tool()
     def hyperv_vm_tpm_set(
-        vm_name: str = "", *, enabled: bool, confirm: bool = False, vm_id: str = ""
+        vm_name: str = "", *, enabled: bool, confirm: bool = False, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Enable or disable the virtual TPM (Gen2 only).
         Policy: vm_provision + confirm=true.
@@ -1708,6 +1769,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_vm_secureboot_set(
         vm_name: str = "", *, enabled: bool, template: str = "",
         confirm: bool = False, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Enable or disable Secure Boot (Gen2 only), optionally setting the
         template (e.g. MicrosoftWindows, MicrosoftUEFICertificateAuthority).
@@ -1755,6 +1817,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         vm_name: str = "", width: int = 0, height: int = 0,
         resolution_type: str = "single", restart: bool = False,
         confirm: bool = False, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Set the VM display resolution via Set-VMVideo so modern apps are
         not stuck at 1024x768. resolution_type "single" forces exactly
@@ -1804,7 +1867,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         )
 
     @mcp.tool()
-    def hyperv_vm_network_set(vm_name: str = "", switch_name: str = "", vm_id: str = "") -> dict:
+    def hyperv_vm_network_set(
+        vm_name: str = "", switch_name: str = "", vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
+    ) -> dict:
         """Connect the VM's network adapter to a virtual switch.
         Policy: media category (reversible, no confirm).
 
@@ -1857,6 +1923,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_name: str = "", apply: bool = False, confirm: bool = False,
             username: str = "", password: str = "",
             vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Propose (dry run, default) or apply narrow guest access fixes:
             stale SSH ListenAddress bindings (config backed up first;
@@ -1886,6 +1953,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             cwd: str = "", timeout_ms: int = 60000,
             username: str = "", password: str = "",
             vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Start a guest command as a managed job WITHOUT waiting.
             Returns a job_id plus the guest PID, the process start time used
@@ -1944,6 +2012,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_name: str = "", guest_port: int = 0, host_port: int = 0,
             username: str = "", password: str = "",
             vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Start a loopback-only host HTTP listener forwarding requests
             through PowerShell Direct to the guest's 127.0.0.1:guest_port —
@@ -2055,6 +2124,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         def hyperv_repair_guest_access(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", apply: bool = False, confirm: bool = False,
             vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Propose (dry run, default) or apply narrow guest access fixes:
             stale SSH ListenAddress bindings (config backed up first;
@@ -2080,6 +2150,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         def hyperv_guest_job_start(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", command: str = "", args: list[str] | None = None,
             cwd: str = "", timeout_ms: int = 60000, vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Start a guest command as a managed job WITHOUT waiting.
             Returns a job_id plus the guest PID, the process start time used
@@ -2134,6 +2205,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         def hyperv_relay_start(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", guest_port: int = 0, host_port: int = 0,
             vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
             """Start a loopback-only host HTTP listener forwarding requests
             through PowerShell Direct to the guest's 127.0.0.1:guest_port —
@@ -2257,7 +2329,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         )
 
     @mcp.tool()
-    def hyperv_guest_job_stop(job_id: str) -> dict:
+    def hyperv_guest_job_stop(job_id: str, lease_id: str = "", fencing_token: int = 0) -> dict:
         """Stop the guest process of a managed job and all of its descendants,
         then report what was observed. Descendants are enumerated and killed
         EVEN when the wrapper has already exited (an orphaned child keeps
@@ -2310,7 +2382,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         )
 
     @mcp.tool()
-    def hyperv_relay_stop(relay_id: str) -> dict:
+    def hyperv_relay_stop(relay_id: str, lease_id: str = "", fencing_token: int = 0) -> dict:
         """Stop a relay: close the loopback listener and release the stored
         credentials.
 
@@ -2325,7 +2397,235 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 relay_id, _cfg(), owner=auditlog.current_agent_id()),
         )
 
+    # ---- issue #23: the lease surface -------------------------------------
+    @mcp.tool()
+    def hyperv_lease_acquire(
+        vm_name: str = "", vm_id: str = "", scopes: list[str] | None = None,
+        ttl_s: int = 0,
+    ) -> dict:
+        """Acquire a lease on a VM for the calling agent.
+
+        A lease is a multi-call exclusion: while you hold it, another agent's
+        mutating tool call on the same VM is refused with the holder named.
+        Scopes: lifecycle (exclusive against everything), guest_exec,
+        transfer, console. Returns lease_id and fencing_token -- pass BOTH on
+        every subsequent mutating call. The lease expires ttl_s seconds after
+        its last renew (default 300, max 3600) and is renewed by
+        hyperv_lease_renew. Release it with hyperv_lease_release when done.
+        """
+        wanted = list(scopes or [])
+        if not vm_name and not vm_id:
+            raise ValueError("vm_name or vm_id is required")
+        if not wanted:
+            raise ValueError("scopes is required (at least one of: "
+                             + ", ".join(leases.SCOPES) + ")")
+        with _audit("hyperv_lease_acquire", vm_name, "lease"):
+            # PolicyDenied propagates unchanged (deny-all must stay "policy").
+            # Only a RESOLUTION failure -- the VM does not exist yet -- falls
+            # back to the name namespace, because hyperv_vm_create must be
+            # leasable before the VM exists. PolicyDenied is a RuntimeError
+            # subclass, so it is caught and re-raised FIRST, unconditionally
+            # (round-2 B3: the naive widening was a policy bypass).
+            try:
+                ref = vmident.resolve(_cfg(), vm_name=vm_name, vm_id=vm_id)
+            except policy.PolicyDenied:
+                raise
+            except Exception:
+                if vm_id:
+                    raise
+                ref = vmident.VMRef(id=f"name:{vm_name}", name=vm_name)
+            granted = leases.acquire(
+                _cfg(), ref.id, wanted, auditlog.current_agent_id(),
+                ttl_s=(ttl_s or None),
+                vm_name=ref.name,
+            )
+            return {
+                "ok": True,
+                "vm_id": ref.id,
+                "vm_name": ref.name,
+                "lease_id": granted[0].lease_id,
+                "fencing_token": granted[0].fencing_token,
+                "scopes": [g.scope for g in granted],
+                "expires_at": granted[0].expires_at,
+                "ttl_s": granted[0].ttl_s,
+                "leases": [g.as_dict(reveal=True) for g in granted],
+            }
+
+    def _owned_lease_or_invalid(lease_id: str) -> list:
+        """The caller's own live lease rows, or raise ValueError -> "invalid".
+
+        Owner-scoped ON PURPOSE (round-2 B6): under deny-all, an arbitrary
+        lease_id finds no row this caller owns and is refused "unknown lease"
+        as "invalid" -- never "lease_unknown", which would leak that the id
+        exists and would break the deny-all census's class contract. The
+        lease's VM is also policy-checked, so a lease on a VM this caller may
+        not even see is refused "policy".
+        """
+        cfg = _cfg()
+        agent = auditlog.current_agent_id()
+        rows = leases.owned_rows(cfg, lease_id, agent)
+        policy.vm_allowed(cfg, rows[0].vm_name or rows[0].vm_key)
+        return rows
+
+    @mcp.tool()
+    def hyperv_lease_renew(lease_id: str) -> dict:
+        """Renew a lease you hold: pushes its expiry to now + its own ttl.
+
+        Call this periodically from a long workflow (a heartbeat) so the lease
+        does not expire mid-flight and another agent takes the VM over. A
+        lease whose TTL lapsed reports "lease_expired" and must be re-acquired.
+        """
+        with _audit("hyperv_lease_renew", "", "lease"):
+            _owned_lease_or_invalid(lease_id)
+            renewed = leases.renew(_cfg(), lease_id, auditlog.current_agent_id())
+            return {"ok": True, **renewed.as_dict(reveal=True)}
+
+    @mcp.tool()
+    def hyperv_lease_release(lease_id: str) -> dict:
+        """Release a lease you hold, so other agents can use the VM again."""
+        with _audit("hyperv_lease_release", "", "lease"):
+            _owned_lease_or_invalid(lease_id)
+            leases.release(_cfg(), lease_id, auditlog.current_agent_id())
+            return {"ok": True, "released": True}
+
+    @mcp.tool()
+    def hyperv_lease_list(vm_name: str = "", vm_id: str = "") -> dict:
+        """List the leases on a VM (or on every VM when neither argument is
+        given). Holder, scopes and expiry are public; lease_id and
+        fencing_token appear ONLY for leases the calling agent holds."""
+        with _audit("hyperv_lease_list", vm_name, "lease"):
+            cfg = _cfg()
+            agent = auditlog.current_agent_id()
+            if vm_id or vm_name:
+                ref = vmident.resolve(_cfg(), vm_name=vm_name, vm_id=vm_id)
+                rows = leases.list_leases(cfg, vm_id=ref.id)
+            else:
+                ref = None
+                rows = leases.list_leases(cfg)
+            return {
+                "ok": True,
+                "vm_id": ref.id if ref else "",
+                "leases": [
+                    row.as_dict(reveal=bool(agent is not None
+                                            and row.holder_agent == agent))
+                    for row in rows
+                ],
+            }
+
     _harden_tools(mcp)
+
+
+# Issue #23: the mutating tools that accept (and require, where
+# leases.required is on) a lease, mapped to the scope of VM activity each one
+# belongs to. HAND-WRITTEN on purpose: deriving it from the audit categories
+# over-includes hyperv_guest_read_file / hyperv_guest_list_dir, which are
+# categorized "transfer" but mutate nothing. hyperv_guest_get is leased on the
+# issue's own "guest put/get -> transfer" scope map although it writes only the
+# host filesystem -- recorded, not silently corrected.
+TOOL_SCOPES: dict[str, str] = {
+    # lifecycle
+    "hyperv_start_vm": "lifecycle", "hyperv_stop_vm": "lifecycle",
+    "hyperv_reset_vm": "lifecycle", "hyperv_checkpoint_create": "lifecycle",
+    "hyperv_checkpoint_restore": "lifecycle", "hyperv_checkpoint_remove": "lifecycle",
+    "hyperv_configure_kdnet": "lifecycle", "hyperv_configure_kdcom": "lifecycle",
+    "hyperv_vm_create": "lifecycle", "hyperv_vm_disk_add": "lifecycle",
+    "hyperv_vm_media_attach": "lifecycle", "hyperv_vm_media_detach": "lifecycle",
+    "hyperv_vm_network_set": "lifecycle",
+    "hyperv_vm_firmware_set_boot_order": "lifecycle",
+    "hyperv_vm_tpm_set": "lifecycle", "hyperv_vm_secureboot_set": "lifecycle",
+    "hyperv_vm_set_resolution": "lifecycle",
+    # guest_exec
+    "hyperv_guest_run_ps": "guest_exec", "hyperv_guest_run": "guest_exec",
+    "hyperv_victim_run": "guest_exec", "hyperv_victim_run_ps": "guest_exec",
+    "hyperv_guest_job_start": "guest_exec", "hyperv_guest_job_stop": "guest_exec",
+    "hyperv_relay_start": "guest_exec", "hyperv_relay_stop": "guest_exec",
+    "hyperv_repair_guest_access": "guest_exec",
+    # transfer
+    "hyperv_guest_put": "transfer", "hyperv_guest_get": "transfer",
+    # console
+    "hyperv_console_type_text": "console", "hyperv_console_press_key": "console",
+    "hyperv_console_key_combo": "console", "hyperv_console_type_scancodes": "console",
+    "hyperv_console_mouse_move": "console", "hyperv_console_click": "console",
+    "hyperv_console_button": "console", "hyperv_console_scroll": "console",
+}
+
+
+def _lease_gate(name: str, arguments: dict) -> dict | None:
+    """The pre-body lease check for a mutating tool (issue #23).
+
+    Returns an ok:false envelope when the call is refused, else None. It reads
+    the RAW arguments -- the two parameters exist on the signatures so the SDK
+    validates them and the schema advertises them; the bodies never read them.
+
+    Order matters: a presented lease is authorized first (unknown / not-owned /
+    expired / fenced / wrong scope / wrong VM); then the required-without-lease
+    refusal; then the unleased path, which is a no-op whenever nobody else
+    holds a lease on the VM -- the default state of a fresh deployment.
+    """
+    scope = TOOL_SCOPES.get(name)
+    if scope is None:
+        return None
+    cfg = _cfg()
+    agent = auditlog.current_agent_id()
+    lease_id = str(arguments.get("lease_id") or "")
+    token = arguments.get("fencing_token") or 0
+    vm_hint = str(arguments.get("vm_id") or "")
+    vm_name = str(arguments.get("vm_name") or "")
+    vm_name_hint = vm_name
+    try:
+        if lease_id:
+            leases.authorize(cfg, lease_id, int(token), agent, scope,
+                             vm_hint=vm_hint, vm_name_hint=vm_name_hint)
+            return None
+        if getattr(cfg.leases, "required", False):
+            env = {
+                "ok": False,
+                "error": (
+                    f"{name} needs a lease on this shared controller: acquire one with "
+                    f"hyperv_lease_acquire and pass its lease_id and fencing_token"
+                ),
+                "error_class": "lease_required",
+            }
+            return errors.enrich_failure(env)
+        # Unleased path. For id-addressed tools the store row supplies the VM
+        # (round-3 MAJOR-6); resolution is deferred until candidates exist, so
+        # a quiet system pays one indexed query and no spawn.
+        if not vm_hint and not vm_name_hint and name in ("hyperv_guest_job_stop",):
+            row_vm = guestjobs.peek_vm_id(arguments.get("job_id") or "", cfg,
+                                          owner=agent)
+            vm_hint = row_vm or ""
+        # The conflict comparison is GUID-keyed, so the caller's name is
+        # resolved to its GUID BEFORE any conflict test (round-6 note). A
+        # lease probed with the raw name would have vm_key="test-vm" while the
+        # stored row's vm_key is the resolved GUID, and the comparison would
+        # silently miss -- which is exactly the bug the frozen AC10 run found.
+        #
+        # Deferred until a lease ACTUALLY exists that could conflict: this is
+        # the branch that would resolve (spawn PowerShell), and paying that on
+        # every mutating call would be a real regression. assert_unleased's
+        # by-name query answers the common "nobody holds anything" case with
+        # an indexed lookup and no spawn; only candidate rows force the GUID.
+        if vm_name and not vm_hint:
+            # One indexed by-name query answers the common "nobody holds
+            # anything" case with no spawn. When it DOES find candidates, the
+            # conflict decision still has to be made against the GUID-keyed
+            # rows, so resolve the GUID (one spawn, paid only here) and
+            # re-check. Resolution failing defers to the tool body
+            # (disclosure 5): the body's own vm_lock re-checks with the
+            # resolved identity, so a resolution failure is not a bypass.
+            if not leases.candidates_exist_by_name(cfg, vm_name_hint, agent):
+                return None
+            try:
+                ref = vmident.resolve(cfg, vm_name=vm_name)
+            except Exception:
+                return None
+            vm_hint = ref.id
+        if vm_hint or vm_name_hint:
+            leases.assert_unleased(cfg, agent, scope, vm_hint=vm_hint,
+                                   vm_name_hint=vm_name_hint)
+        return None
+    except leases.LeaseError as exc:
+        return errors.envelope(exc)
 
 
 def _harden_tools(mcp: MCPServer) -> None:
@@ -2459,6 +2759,14 @@ def _harden_tools(mcp: MCPServer) -> None:
                     "retryable": retryable,
                     "retry_after_ms": retry_after_ms,
                 })
+            # Issue #23: the lease gate. It returns an ENVELOPE (never raises)
+            # and is audited exactly like the unknown-argument rejection,
+            # because it fires before any tool body's audit region. MINOR-13:
+            # a raised LeaseError would escape the enveloping try below and
+            # fail the deny-all census's raised == [] assertion.
+            lease_env = _lease_gate(name, arguments or {})
+            if lease_env is not None:
+                return _audited_rejection(name, arguments, lease_env)
             try:
                 return await _run(arguments, context, convert_result=convert_result, **kwargs)
             except UrlElicitationRequiredError:
