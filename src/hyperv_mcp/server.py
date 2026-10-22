@@ -32,6 +32,7 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -58,6 +59,7 @@ from . import (
     pswindows,
     relay,
     repair,
+    statestore,
     stdio_proxy,
     timing,
     vmlocks,
@@ -224,6 +226,10 @@ def _startup_banner(cfg: Config) -> None:
     else:
         print("[hyperv-mcp] Hyper-V target: local host", file=sys.stderr)
     print(f"[hyperv-mcp] policy: {cfg.policy_summary()}", file=sys.stderr)
+    # Issue #22: the durable state store is always on. Print where it lives so
+    # an operator can find (and back up, or delete) it.
+    print(f"[hyperv-mcp] state store: {statestore.resolve_state_db_path(cfg)}",
+          file=sys.stderr)
     if cfg.unrestricted:
         print(
             "[hyperv-mcp] WARNING: UNRESTRICTED mode — every policy axis is "
@@ -442,7 +448,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def _run_guest_tool(
         tool: str, vm: str, category: str, fn, *args,
         cred_factory=None,
-        audit_vm_name: str = "",
+        audit_vm_name: str | Callable[[], str] = "",
         audit_job_id: str = "",
         audit_relay_id: str = "",
         **kwargs,
@@ -460,10 +466,20 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         Audit-only kwargs (issue #10) — consumed here, never forwarded to
         fn: audit_vm_name (registry-resolved VM for by-id follow-ups that
         accept no vm_name argument), audit_job_id/audit_relay_id (the handle
-        the call addresses). Results that carry job_id/relay_id (start tools,
-        and follow-ups echoing them) adopt them into the audit row after the
-        call, the same way the resolved vm_name is adopted below.
+        the call addresses). PRR-007: audit_vm_name may be a CALLABLE, and
+        the by-id follow-ups pass one — the eager peek used to run
+        statestore.open() (a write transaction) before this envelope existed
+        and even for ids that were about to be refused; resolving it here is
+        guarded, so a store failure reads as the honest empty name. Results
+        that carry job_id/relay_id (start tools, and follow-ups echoing
+        them) adopt them into the audit row after the call, the same way the
+        resolved vm_name is adopted below.
         """
+        if callable(audit_vm_name):
+            try:
+                audit_vm_name = str(audit_vm_name() or "")
+            except Exception:
+                audit_vm_name = ""
         op = auditlog.operation(
             tool=tool,
             vm_name=vm or audit_vm_name,
@@ -2216,7 +2232,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             "hyperv_guest_job_status", "", "exec",
             guestjobs.job_status, _cfg(), job_id,
             owner=auditlog.current_agent_id(),
-            audit_job_id=job_id, audit_vm_name=guestjobs.peek_vm_name(job_id),
+            audit_job_id=job_id,
+            # PRR-007: lazy — the store read happens inside the envelope, is
+            # owner-filtered, and never runs for a local registry hit.
+            audit_vm_name=lambda: guestjobs.peek_vm_name(
+                job_id, _cfg(), owner=auditlog.current_agent_id()),
         )
 
     @mcp.tool()
@@ -2231,7 +2251,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             "hyperv_guest_job_output", "", "exec",
             guestjobs.job_output, _cfg(), job_id, tail_bytes=tail_bytes,
             owner=auditlog.current_agent_id(),
-            audit_job_id=job_id, audit_vm_name=guestjobs.peek_vm_name(job_id),
+            audit_job_id=job_id,
+            audit_vm_name=lambda: guestjobs.peek_vm_name(
+                job_id, _cfg(), owner=auditlog.current_agent_id()),
         )
 
     @mcp.tool()
@@ -2259,7 +2281,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             "hyperv_guest_job_stop", "", "exec",
             guestjobs.job_stop, _cfg(), job_id,
             owner=auditlog.current_agent_id(),
-            audit_job_id=job_id, audit_vm_name=guestjobs.peek_vm_name(job_id),
+            audit_job_id=job_id,
+            audit_vm_name=lambda: guestjobs.peek_vm_name(
+                job_id, _cfg(), owner=auditlog.current_agent_id()),
         )
 
     @mcp.tool()
@@ -2278,7 +2302,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             relay.relay_status, _cfg(), relay_id,
             owner=auditlog.current_agent_id(),
             audit_relay_id=relay_id,
-            audit_vm_name=relay.peek_vm_name(relay_id) if relay_id else "",
+            audit_vm_name=(
+                lambda: relay.peek_vm_name(
+                    relay_id, _cfg(), owner=auditlog.current_agent_id())
+                if relay_id else ""
+            ),
         )
 
     @mcp.tool()
@@ -2292,7 +2320,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             "hyperv_relay_stop", "", "relay",
             relay.relay_stop, _cfg(), relay_id,
             owner=auditlog.current_agent_id(),
-            audit_relay_id=relay_id, audit_vm_name=relay.peek_vm_name(relay_id),
+            audit_relay_id=relay_id,
+            audit_vm_name=lambda: relay.peek_vm_name(
+                relay_id, _cfg(), owner=auditlog.current_agent_id()),
         )
 
     _harden_tools(mcp)
@@ -2368,10 +2398,19 @@ def _harden_tools(mcp: MCPServer) -> None:
                     # A rejected by-id follow-up still knows its registry
                     # entry: resolve the VM so the row joins to the start row
                     # like the success path does (impl-review PRR-003).
-                    if job_id:
-                        vm_name = guestjobs.peek_vm_name(job_id)
-                    elif relay_id:
-                        vm_name = relay.peek_vm_name(relay_id)
+                    # PRR-007: owner-filtered and guarded, so a foreign id
+                    # reads "" and a store failure cannot turn a rejection
+                    # into a raw exception.
+                    agent_id = auditlog.current_agent_id()
+                    try:
+                        if job_id:
+                            vm_name = guestjobs.peek_vm_name(
+                                job_id, _cfg(), owner=agent_id)
+                        elif relay_id:
+                            vm_name = relay.peek_vm_name(
+                                relay_id, _cfg(), owner=agent_id)
+                    except Exception:
+                        vm_name = ""
                 timing_snapshot = timing.finish(timing_token)
                 finished = True
             finally:
@@ -2490,6 +2529,7 @@ def main(argv: list[str] | None = None) -> int:
             "HYPERV_HOST_PASSWORD", "HYPERV_HOST_PASSWORD_FILE",
             "HYPERV_MCP_CONFIG",
             "HYPERV_MCP_UNRESTRICTED", "HYPERV_MCP_HTTP_TOKEN",
+            "HYPERV_MCP_STATE_DB",
         ):
             print(f"{name:36}{'set' if name in os.environ else 'not set'}")
         # http.agents decides proxy/controller auth in agents-mode; name the
@@ -2499,7 +2539,7 @@ def main(argv: list[str] | None = None) -> int:
             "HYPERV_GUEST_VICTIM_USERNAME HYPERV_GUEST_VICTIM_PASSWORD "
             "HYPERV_GUEST_VICTIM_PASSWORD_FILE HYPERV_HOST_USERNAME "
             "HYPERV_HOST_PASSWORD HYPERV_HOST_PASSWORD_FILE HYPERV_MCP_CONFIG "
-            "HYPERV_MCP_UNRESTRICTED HYPERV_MCP_HTTP_TOKEN"
+            "HYPERV_MCP_UNRESTRICTED HYPERV_MCP_HTTP_TOKEN HYPERV_MCP_STATE_DB"
         ).split()
         for agent_var in sorted(set(cfg.http.agents.values())):
             if agent_var not in listed:

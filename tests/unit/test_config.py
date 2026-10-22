@@ -223,3 +223,46 @@ def test_token_env_reserved_names_rejected():
         Config.from_dict({"http": {"token_env": "SystemRoot"}})
     with pytest.raises(ConfigError, match="token_env"):
         Config.from_dict({"http": {"token_env": "PSModulePath"}})
+
+
+# ---------------------------------------------------------------------------
+# Durable-store path rules (issue #22, PRR-009). Each is red with the
+# pre-fix shape; the probes ran against byte copies of the fixed source and
+# were restored with byte-identity asserted.
+# ---------------------------------------------------------------------------
+
+
+def test_state_db_path_must_be_absolute_or_null(tmp_path):
+    """PRR-009: a relative store path resolves against each process's CWD,
+    silently splitting the one cross-process registry the store exists to
+    provide — the same reasoning as the ps_slot_dir rule. Rejected at load
+    time, from the config key AND from the environment override."""
+    with pytest.raises(ConfigError, match="state_db_path must be an absolute path"):
+        Config.from_dict({"state_db_path": "relative/state.db"})
+    with pytest.raises(ConfigError, match="state_db_path must be an absolute path"):
+        Config(state_db_path="relative/state.db").validate()
+    with pytest.raises(ConfigError, match="state_db_path must be an absolute path"):
+        Config.load({"HYPERV_MCP_STATE_DB": "relative/state.db"})
+    with pytest.raises(ConfigError, match="non-empty path"):
+        Config.from_dict({"state_db_path": "   "})
+    # Null and absolute spellings are accepted.
+    assert Config().state_db_path is None
+    assert Config.from_dict({"state_db_path": str(tmp_path / "state.db")}).state_db_path
+
+
+def test_state_db_default_falls_back_to_the_temp_dir(monkeypatch, tmp_path):
+    """PRR-009: with none of LOCALAPPDATA/TEMP/TMP set, the default lands in
+    the platform temp dir — NEVER the CWD, which made the "default" a
+    different store per process depending on the launch directory."""
+    import hyperv_mcp.config as config_module
+
+    sentinel = tmp_path / "fallback-home"
+    monkeypatch.setattr(config_module.tempfile, "gettempdir", lambda: str(sentinel))
+    path = config_module.default_state_db_path(
+        {"LOCALAPPDATA": "", "TEMP": "", "TMP": ""}
+    )
+    assert path == str(sentinel / "hyperv-mcp" / "state.db"), path
+    # And the precedence above the fallback is unchanged.
+    assert config_module.default_state_db_path(
+        {"LOCALAPPDATA": str(tmp_path / "profile"), "TEMP": "", "TMP": ""}
+    ) == str(tmp_path / "profile" / "hyperv-mcp" / "state.db")

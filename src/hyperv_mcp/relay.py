@@ -55,9 +55,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from . import consolebench, policy, pswindows, vmident
+from . import consolebench, credentials, policy, pswindows, statestore, vmident
 from .config import Config
-from .credentials import CredentialSet
+from .credentials import CredentialError, CredentialSet
 from .diagnostics import build_guest_script
 
 _LOOPBACK_BINDS = {"127.0.0.1", "localhost", "::1"}
@@ -70,8 +70,166 @@ _REMOTE_RESPONSE_BYTES = 192 * 1024
 _REQUEST_TIMEOUT_S = 30
 _MAX_RELAYS = 16
 
+# Process-local write-through cache by design (issue #22): the authoritative
+# copy of anything whose lifetime exceeds this process lives in the durable
+# state store, and this dict is the fast in-process view of it. It stays a real
+# dict because existing tests read and poke it directly.
 _relays: dict[str, dict[str, Any]] = {}
 _relays_lock = threading.Lock()
+
+# Relay rows THIS process wrote (PRR-005). Cap eviction may delete from the
+# store only rows it created: a row seeded by a peer — live, or interrupted
+# by a peer's own recovery — cannot be told apart from this process's own
+# without the leases issue #23 assigns to Workstream E PR 2, and deleting a
+# live peer's row makes its relay unaddressable after that peer's next
+# restart. Eviction still frees the slot locally, and a foreign row remains
+# remediable: a relay_stop WRITES the row (making it this process's own), so
+# the next eviction may delete it.
+_store_wrote: set[str] = set()
+_store_wrote_lock = threading.Lock()
+
+
+def _mark_store_wrote(relay_id: str) -> None:
+    with _store_wrote_lock:
+        _store_wrote.add(relay_id)
+
+
+def _we_wrote(relay_id: str) -> bool:
+    with _store_wrote_lock:
+        return relay_id in _store_wrote
+
+
+def _store(cfg: Config) -> statestore.Store:
+    """The durable store for this config, cached per process by resolved path."""
+    return statestore.store_for(cfg)
+
+
+def _cred_ref(cred: CredentialSet | None) -> str:
+    """The credential reference a row records. Never the secret itself."""
+    if cred is None:
+        return "inline"
+    return str(getattr(cred, "source", "inline") or "inline")
+
+
+def _row(entry: dict[str, Any], state: str) -> statestore.RelayRow:
+    """Project a registry entry onto a store row. The per-relay secret and the
+    live credential are deliberately absent: neither is ever persisted."""
+    return statestore.RelayRow(
+        relay_id=str(entry["relay_id"]),
+        vm_name=str(entry.get("vm_name") or ""),
+        vm_id=str(entry.get("vm_id") or ""),
+        guest_port=int(entry.get("guest_port") or 0),
+        bind=str(entry.get("bind") or "127.0.0.1"),
+        host_port=int(entry.get("host_port") or 0),
+        started_at=str(entry.get("started_at") or ""),
+        state=state,
+        cred_ref=str(entry.get("cred_ref") or _cred_ref(entry.get("context", {}).get("cred"))),
+        owner=entry.get("owner"),
+    )
+
+
+class _DeadThread:
+    """Stand-in `thread` for a restored relay: it has no listener, so it is
+    never alive. Exists so a status row's shape is identical whether the relay
+    is live in this process or restored from the store."""
+
+    def is_alive(self) -> bool:
+        return False
+
+
+def _restored_entry(cfg: Config, row: statestore.RelayRow,
+                    owner: str | None) -> dict[str, Any] | None:
+    """Rebuild a process-local entry from a persisted row (issue #22).
+
+    Returns None for an absent row and for a foreign one, so the caller raises
+    the SAME `unknown relay_id` ValueError either way — no existence oracle.
+    PRR-008: the check is a strict owner equality with no `owner is None`
+    bypass — the store made the registry cross-process, and an unattributed
+    stdio/anonymous caller must not address a row an authenticated agent
+    owns; None matches only rows that carry no owner themselves.
+
+    PRR-013: this is the ONE constructor every restored read goes through, so
+    the active→interrupted normalization lives HERE — the by-id path used to
+    normalize while the listing read the raw row, so one relay reported
+    `interrupted` by id and `active` in the listing. The synthesized context
+    is never used to serve a request: an interrupted relay has no listener.
+    """
+    if (row.owner or None) != owner:
+        return None
+    cred = None
+    if row.cred_ref != "inline":
+        try:
+            cred = credentials.resolve_guest()
+        except CredentialError:
+            # A restored relay's credential is only needed to STOP it, and a
+            # stop of an interrupted relay performs no guest leg. Leave it None
+            # and let the request path (which no longer exists) be the only
+            # thing that would have needed it.
+            cred = None
+    context: dict[str, Any] = {
+        "cfg": cfg,
+        "vm_name": row.vm_name,
+        "vm_id": row.vm_id,
+        "guest_port": row.guest_port,
+        "cred": cred,
+        "secret": "",
+        "counters": _new_counters(),
+        "latency": _new_latency(),
+        "counter_lock": threading.Lock(),
+        "relay_id": row.relay_id,
+    }
+    entry = {
+        "relay_id": row.relay_id,
+        "vm_name": row.vm_name,
+        "vm_id": row.vm_id,
+        "guest_port": row.guest_port,
+        "bind": row.bind,
+        "host_port": row.host_port,
+        "server": None,
+        "thread": _DeadThread(),
+        "context": context,
+        "owner": row.owner,
+        "started_at": row.started_at,
+        "stopped": row.state == statestore.RELAY_STOPPED,
+        "row_state": row.state,
+        "cred_ref": row.cred_ref,
+    }
+    if entry["row_state"] == statestore.RELAY_ACTIVE:
+        # A row not in the local registry has no listener HERE: its listener
+        # died with the process that started it, because this process did
+        # not start it.
+        entry["row_state"] = statestore.RELAY_INTERRUPTED
+    return entry
+
+
+def _restore_relay(cfg: Config, relay_id: str,
+                   owner: str | None) -> dict[str, Any] | None:
+    """Rebuild a relay entry from a persisted row, or None if there is none."""
+    row = _store(cfg).relay_get(relay_id)
+    if row is None:
+        return None
+    return _restored_entry(cfg, row, owner)
+
+
+def _restored_rows(cfg: Config, owner: str | None) -> list[dict[str, Any]]:
+    """Every store row this principal may see, as restored entries."""
+    out: list[dict[str, Any]] = []
+    for row in _store(cfg).relay_rows():
+        if row.state == statestore.RELAY_STOPPED:
+            continue
+        entry = _restored_entry(cfg, row, owner)
+        if entry is not None:
+            out.append(entry)
+    return out
+
+
+def _started_at(entry: dict[str, Any] | None, store: statestore.Store,
+                relay_id: str) -> str:
+    """Oldest-first eviction key across the union of the two views."""
+    if entry is not None:
+        return str(entry.get("started_at") or "")
+    row = store.relay_get(relay_id)
+    return row.started_at if row is not None else ""
 
 
 def _utc_now_iso() -> str:
@@ -83,11 +241,14 @@ def clear_registry_for_tests() -> None:
     with _relays_lock:
         entries = list(_relays.values())
         _relays.clear()
+    with _store_wrote_lock:
+        _store_wrote.clear()
     for entry in entries:
         _shutdown_server(entry)
 
 
-def peek_vm_name(relay_id: str) -> str:
+def peek_vm_name(relay_id: str, cfg: Config | None = None,
+                 owner: str | None = None) -> str:
     """Read-only vm_name lookup for audit rows (issue #10).
 
     Unlike the inline get-and-raise in relay_status/relay_stop this never
@@ -96,12 +257,31 @@ def peek_vm_name(relay_id: str) -> str:
     of any audit row, mirroring guestjobs.peek_vm_name), so a relay call's
     audit row can name the VM even when the tool leg itself fails.
     Read-only by design — it never touches credentials or stop state.
+
+    PRR-007: the store fallback applies the SAME ownership filter the restore
+    path uses (a foreign or unattributed caller reads "", never another
+    principal's VM name), and the read is guarded — an audit sidecar must
+    never turn a store failure into a tool failure, so the answer degrades
+    to "". The read only happens on a LOCAL miss, so a hot path with a live
+    entry never opens the store at all.
     """
+    key = relay_id or ""
     with _relays_lock:
-        entry = _relays.get(relay_id or "")
-    if entry is None or entry.get("in_flight"):
-        return ""
-    return str(entry.get("vm_name") or "")
+        entry = _relays.get(key)
+    if entry is not None:
+        if entry.get("in_flight"):
+            return ""
+        return str(entry.get("vm_name") or "")
+    # issue #22: after a restart the entry only exists in the store, and the
+    # pre-dispatch audit path still wants to name the VM.
+    if cfg is not None:
+        try:
+            row = _store(cfg).relay_get(key)
+        except Exception:
+            return ""
+        if row is not None and (row.owner or None) == owner:
+            return str(row.vm_name or "")
+    return ""
 
 
 def _shutdown_server(entry: dict[str, Any]) -> None:
@@ -518,43 +698,162 @@ def relay_start(
     # one — the loser raises here, before binding anything. At capacity,
     # stopped entries are evicted oldest-first (credential nulled before
     # delete, mirroring guestjobs._reserve_slot).
-    with _relays_lock:
-        for entry in _relays.values():
-            if not entry.get("stopped") and entry["vm_id"] == ref.id \
-                    and entry["guest_port"] == guest_port:
-                raise ValueError(
-                    f"a relay to {ref.name}:{guest_port} already exists ({entry['relay_id']})"
-                )
-        if len(_relays) >= _MAX_RELAYS:
-            stopped = sorted(
-                (k for k, v in _relays.items() if v.get("stopped")),
-                key=lambda k: _relays[k]["started_at"],
-            )
-            for key in stopped[: max(1, len(_relays) - _MAX_RELAYS + 1)]:
-                evicted = _relays[key]
-                evicted["context"]["cred"] = None
-                del _relays[key]
-        if len(_relays) >= _MAX_RELAYS:
-            raise RuntimeError(
-                f"relay registry is full ({_MAX_RELAYS} active relays); "
-                "stop relays before starting more"
-            )
-        _relays[relay_id] = {
-            "relay_id": relay_id,
-            "vm_name": ref.name,
-            "vm_id": ref.id,
-            "guest_port": int(guest_port),
-            "owner": owner,
-            "in_flight": True,
-            "started_at": _utc_now_iso(),
-            "stopped": False,
-        }
+    # Issue #22: the store write transaction is the OUTER lock and
+    # `_relays_lock` the inner one — the process-wide order that keeps a
+    # concurrent register or stop from deadlocking against this path. The cap
+    # counts the UNION of the in-memory view and the store rows, because
+    # separate stdio server processes share one store and tests inject entries
+    # straight into `_relays`. PRR-013: the duplicate scan walks that SAME
+    # union, key by key, with one judgment rule — a key present locally is
+    # judged on its local flags; a store-only key reads back `interrupted`
+    # (its listener died with the process that started it, exactly what
+    # relay_status reports for it), so it is never a live duplicate. Refusing
+    # on the raw `active` row state instead would wedge a target whose owner
+    # process crashed — the relay twin of the PRR-002 job wedge — and
+    # distinguishing a live peer's row from a dead process's leftover needs
+    # the leases issue #23 assigns to Workstream E PR 2.
+    store = _store(cfg)
+    with store.transaction():
+        # PRR-004 (the reservation sub-claim, mirroring guestjobs
+        # _reserve_slot): the memory mutations below ride the store
+        # transaction, so they must roll back WITH it. An unwind at the
+        # placeholder upsert used to leave the in-flight placeholder in
+        # `_relays` with no row behind it — nothing ever removes an in-flight
+        # entry (eviction judges it non-evictable, status and the by-id read
+        # hide it), permanently refusing this vm:guest_port in the duplicate
+        # scan until process exit — and left evicted entries deleted from
+        # memory while their rows came back to life in the rolled-back store.
+        evicted: list[tuple[str, dict[str, Any], Any]] = []
+        unmarked: set[str] = set()
+        try:
+            with _relays_lock:
+                rows = {row.relay_id: row for row in store.relay_rows()}
+                known = set(_relays) | set(rows)
+                for key in known:
+                    entry = _relays.get(key)
+                    if entry is not None:
+                        live_target = (
+                            not entry.get("stopped")
+                            and entry["vm_id"] == ref.id
+                            and entry["guest_port"] == guest_port
+                        )
+                    else:
+                        live_target = False  # store-only: interrupted by construction
+                    if live_target:
+                        raise ValueError(
+                            f"a relay to {ref.name}:{guest_port} already exists ({key})"
+                        )
+                if len(known) >= _MAX_RELAYS:
+                    # A key present LOCALLY is judged on its local stopped flag.
+                    # A key with NO local entry is judged on its store row, and is
+                    # evictable when that row is stopped OR interrupted: its
+                    # listener died with a previous process, nothing can bring it
+                    # back, and leaving it would let 16 restarts permanently fill
+                    # the cap. Consulting the store for a key that IS local would
+                    # evict a relay whose listener is alive here, because a peer's
+                    # open() flips this process's active rows to `interrupted`
+                    # (implementation review, round 2).
+                    def _evictable(key: str) -> bool:
+                        entry = _relays.get(key)
+                        if entry is not None:
+                            return bool(entry.get("stopped"))
+                        row = rows.get(key)
+                        return row is not None and row.state in (
+                            statestore.RELAY_STOPPED, statestore.RELAY_INTERRUPTED,
+                        )
+
+                    evictable = sorted(
+                        (k for k in known if _evictable(k)),
+                        key=lambda k: _started_at(_relays.get(k), store, k),
+                    )
+                    for key in evictable[: max(1, len(known) - _MAX_RELAYS + 1)]:
+                        evicted_entry = _relays.get(key)
+                        if evicted_entry is not None:
+                            # Recorded for the compensation below: the cred is
+                            # nulled here and must come back WITH the entry.
+                            evicted.append(
+                                (key, evicted_entry, evicted_entry["context"]["cred"])
+                            )
+                            evicted_entry["context"]["cred"] = None
+                            del _relays[key]
+                        if _we_wrote(key):
+                            # PRR-005: only rows this process wrote may be
+                            # deleted. A foreign row stays put — deleting it
+                            # could kill a live peer's persistence — while the
+                            # slot is still freed below.
+                            store.relay_delete(key)
+                            with _store_wrote_lock:
+                                _store_wrote.discard(key)
+                            unmarked.add(key)
+                        known.discard(key)
+                if len(known) >= _MAX_RELAYS:
+                    raise RuntimeError(
+                        f"relay registry is full ({_MAX_RELAYS} active relays); "
+                        "stop relays before starting more"
+                    )
+                started_at = _utc_now_iso()
+                _relays[relay_id] = {
+                    "relay_id": relay_id,
+                    "vm_name": ref.name,
+                    "vm_id": ref.id,
+                    "guest_port": int(guest_port),
+                    "owner": owner,
+                    "in_flight": True,
+                    "started_at": started_at,
+                    "stopped": False,
+                }
+                store.relay_upsert(statestore.RelayRow(
+                    relay_id=relay_id, vm_name=ref.name, vm_id=ref.id,
+                    guest_port=int(guest_port), bind=bind,
+                    started_at=started_at, state=statestore.RELAY_ACTIVE,
+                    cred_ref=_cred_ref(cred), owner=owner,
+                ))
+                _mark_store_wrote(relay_id)
+        except BaseException:
+            # Compensation in the failure direction (PRR-003/PRR-004 shape):
+            # the store transaction is unwinding around this handler (the
+            # placeholder row, and every eviction delete above, roll back with
+            # it), so the memory view must return to what it was — evicted
+            # entries restored WITH their credentials, their "we wrote it"
+            # markers restored (the rolled-back rows are still ours), and no
+            # half-inserted placeholder left blocking this vm:guest_port.
+            # Memory only: the store itself is unwound by the transaction
+            # context around this handler, and registry-lock is the inner
+            # order, so no store call runs here.
+            with _relays_lock:
+                for key, evicted_entry, evicted_cred in evicted:
+                    evicted_entry["context"]["cred"] = evicted_cred
+                    _relays[key] = evicted_entry
+                _relays.pop(relay_id, None)
+                with _store_wrote_lock:
+                    for key in unmarked:
+                        _store_wrote.add(key)
+            raise
 
     def _release() -> None:
+        """Withdraw the reservation/registration completely. NEVER raises
+        (PRR-004): every caller is on a failure path whose original error
+        must surface, and a raising release used to skip the
+        server_close() that releases the bound listener."""
         with _relays_lock:
-            current = _relays.get(relay_id)
-            if current is not None and current.get("in_flight"):
-                del _relays[relay_id]
+            # Unconditional: after registration the entry is no longer
+            # in_flight, and guarding the delete on that flag left a LIVE
+            # listener in _relays while its row was deleted — invisible to
+            # status, unstoppable through the tool, still serving requests.
+            _relays.pop(relay_id, None)
+        try:
+            # Registry lock released first: store-lock is the outer order. A
+            # stranded row would be invisible to status, unstoppable,
+            # cap-consuming and would block this vm:guest_port forever via
+            # the duplicate scan.
+            store.relay_delete(relay_id)
+        except Exception:
+            # The row is unreachable either way and recovery interrupts it at
+            # the next open; masking the caller's original error — or
+            # skipping the server_close below — would be strictly worse.
+            pass
+        with _store_wrote_lock:
+            _store_wrote.discard(relay_id)
 
     try:
         context: dict[str, Any] = {
@@ -604,18 +903,27 @@ def relay_start(
         }
         with _relays_lock:
             _relays[relay_id] = entry
+        # Registry lock released first: store-lock is the outer order.
+        store.relay_upsert(_row(entry, statestore.RELAY_ACTIVE))
+        _mark_store_wrote(relay_id)
     except BaseException:
         # No exception between the reservation and the registration may
         # strand the in-flight placeholder (it is invisible to status,
         # unstoppable, and would consume a cap slot and block this
         # vm:guest_port forever via the duplicate scan — implementation
         # review round 1, Finding 1, widened to the construction window by
-        # PR-review round 2, NEW-B) nor leak the bound socket. server_close
-        # (not shutdown: a failed start never entered serve_forever, and
-        # shutdown would wait on a loop that will never run) releases the
-        # listener; the placeholder release mirrors guestjobs job_start's
+        # PR-review round 2, NEW-B) nor leak the bound socket. When the
+        # thread DID start, serve_forever is running: shutdown() stops the
+        # loop first, because a bare server_close() pulls the socket out
+        # from under the live selector and surfaces as a thread exception
+        # (PRR-004). The placeholder release mirrors guestjobs job_start's
         # reserve-to-register window.
         _release()
+        try:
+            if thread.is_alive():
+                server.shutdown()
+        except Exception:
+            pass
         try:
             server.server_close()
         except Exception:
@@ -647,20 +955,49 @@ def relay_status(cfg: Config, relay_id: str = "", *, owner: str | None = None) -
     capability secret appears only in the starting agent's relay_start
     result.
     """
+    # The store is read with _relays_lock RELEASED: the process-wide order is
+    # store-lock > registry-lock, and taking Store._lock under _relays_lock
+    # deadlocks AB-BA against relay_start's reservation (implementation review,
+    # round 1). The local view is read under the lock, then the store, then the
+    # lock again only to consult the local view — mirroring guestjobs._lookup.
     with _relays_lock:
-        if relay_id:
-            entry = _relays.get(relay_id)
-            if entry is None or entry.get("in_flight") or (
-                owner is not None and entry.get("owner") != owner
-            ):
+        local = dict(_relays)
+    if relay_id:
+        entry = local.get(relay_id)
+        if entry is None:
+            # issue #22: the entry died with a previous process. A row that is
+            # not in the LOCAL registry is reported interrupted — its listener
+            # died with the process that started it, because this process did
+            # not start it. The fallback fires ONLY on local absence: an
+            # in-flight placeholder (a start still binding) is invisible here
+            # exactly as at base, and an owner mismatch stays `unknown`.
+            entry = _restore_relay(cfg, relay_id, owner)
+            if entry is None:
                 raise ValueError(f"unknown relay_id {relay_id!r}")
-            selected = [entry]
-        else:
-            selected = [
-                e for e in _relays.values()
-                if not e.get("in_flight")
-                and (owner is None or e.get("owner") == owner)
-            ]
+        elif entry.get("in_flight") or (
+            owner is not None and entry.get("owner") != owner
+        ):
+            raise ValueError(f"unknown relay_id {relay_id!r}")
+        selected = [entry]
+    else:
+        selected = [
+            e for e in local.values()
+            if not e.get("in_flight")
+            and (owner is None or e.get("owner") == owner)
+        ]
+        # Union with the store's non-stopped rows, deduplicated by relay_id
+        # with the local entry taking priority, so a relay restored after a
+        # restart is visible rather than silently omitted and a relay that is
+        # mid-bind in this process is not double-counted. `local_ids` is the RAW
+        # local key set, not the filtered selection: a mid-bind placeholder is
+        # invisible in `selected`, and excluding only the filtered set would
+        # publish its store row as a ghost with a dead thread while by-id
+        # answers `unknown relay_id` for the very same id.
+        local_ids = set(local)
+        selected.extend(
+            e for e in _restored_rows(cfg, owner)
+            if e["relay_id"] not in local_ids
+        )
     rows = []
     for entry in selected:
         with entry["context"]["counter_lock"]:
@@ -672,6 +1009,7 @@ def relay_status(cfg: Config, relay_id: str = "", *, owner: str | None = None) -
             latency_samples = list(entry["context"]["latency"]["samples"])
             latency_cap = entry["context"]["latency"]["cap"]
         latency = _latency_summary(latency_samples, latency_cap)
+        restored = entry.get("row_state") not in (None, statestore.RELAY_ACTIVE)
         rows.append({
             "relay_id": entry["relay_id"],
             "vm_name": entry["vm_name"],
@@ -681,11 +1019,16 @@ def relay_status(cfg: Config, relay_id: str = "", *, owner: str | None = None) -
             "url": f"http://{entry['bind']}:{entry['host_port']}/",
             "started_at": entry["started_at"],
             "stopped": bool(entry["stopped"]),
-            "thread_alive": bool(entry["thread"].is_alive()),
+            "thread_alive": False if restored else bool(entry["thread"].is_alive()),
             "counters": counters,
             # Additive: the existing `counters` contract is unchanged, exactly
             # as issue #20's `timing` object was additive to the audit record.
             "latency": latency,
+            # Additive (issue #22): a restored relay's listener is gone, so the
+            # row says so instead of leaving the caller to infer it from
+            # thread_alive on a relay it can no longer reach.
+            "state": ("stopped" if entry.get("stopped")
+                      else "interrupted" if restored else "active"),
         })
     return {"ok": True, "relays": rows}
 
@@ -727,16 +1070,55 @@ def relay_stop(cfg: Config, relay_id: str, *, owner: str | None = None) -> dict:
     stopped in relay_status) until cap-time eviction."""
     if not relay_id:
         raise ValueError("relay_id is required")
+    # Same lock discipline as relay_status: read the local view under the
+    # lock, release, then read the store. No store call runs while
+    # _relays_lock is held.
     with _relays_lock:
         entry = _relays.get(relay_id)
-        if entry is None or entry.get("in_flight") or (
-            owner is not None and entry.get("owner") != owner
-        ):
+    if entry is None:
+        # issue #22: a relay restored from the store has no listener to shut
+        # down; report it as already stopped rather than unknown. Only local
+        # absence falls through — an in-flight placeholder stays invisible and
+        # an owner mismatch stays `unknown`.
+        entry = _restore_relay(cfg, relay_id, owner)
+        if entry is None:
             raise ValueError(f"unknown relay_id {relay_id!r}")
         already = bool(entry["stopped"])
         entry["stopped"] = True
+    else:
+        if entry.get("in_flight") or (
+            owner is not None and entry.get("owner") != owner
+        ):
+            raise ValueError(f"unknown relay_id {relay_id!r}")
+        # The read and the write are ONE critical section, so exactly one of
+        # two racing stops observes already=False (issue #11, PRR-027b). The
+        # store is not touched here: store-lock is the outer order, and taking
+        # it under _relays_lock is the deadlock round 1 found.
+        with _relays_lock:
+            already = bool(entry["stopped"])
+            entry["stopped"] = True
+    recorded_ref = entry.get("cred_ref") or _cred_ref(
+        entry.get("context", {}).get("cred")
+    )
     if not already:
         _shutdown_server(entry)
+        # PRR-014 shape, relay side: the durable row is written BEFORE the
+        # credential is nulled. A store failure between the two used to
+        # destroy the only copy of an inline credential while the row stayed
+        # `active` — now the failure leaves the credential retained and the
+        # entry coherent for a retry. The reference was captured above,
+        # before anything touched the credential, so the persisted
+        # provenance survives the null. An interrupted relay has no
+        # listener, so its shutdown is a no-op.
+        row = _row(entry, statestore.RELAY_STOPPED)
+        _store(cfg).relay_upsert(statestore.RelayRow(
+            **{**row.as_dict(), "cred_ref": recorded_ref}
+        ))
+        # PRR-005: the stop WROTE the row, so it is this process's own now —
+        # a later eviction may delete it even though a peer started it.
+        _mark_store_wrote(relay_id)
+        # Registry lock only for the null (store-lock is the outer order
+        # process-wide; the store call above ran with no registry lock held).
         with _relays_lock:
             entry["context"]["cred"] = None
     return {

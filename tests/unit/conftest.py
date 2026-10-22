@@ -24,6 +24,29 @@ def _ps_transport_default(monkeypatch):
     monkeypatch.setattr(wmiconsole, "_connect_failures", {})
 
 
+@pytest.fixture(autouse=True)
+def _state_store_in_tmp(monkeypatch, tmp_path):
+    """Point the durable state store at a per-test temp directory (issue #22).
+
+    The store is always on, so without this every unit test that reaches
+    job_start or relay_start would open a SQLite database under the real
+    profile. Redirecting HYPERV_MCP_STATE_DB covers configs built through
+    Config.load(); redirecting LOCALAPPDATA covers the derived default, so
+    stdio_proxy._controller_log_path (the repo's other LOCALAPPDATA reader)
+    also lands in tmp rather than the live profile.
+
+    Teardown closes every cached Store: a long suite would otherwise
+    accumulate open SQLite connections and, on Windows, open -wal/-shm files
+    that pytest's tmp cleanup cannot delete.
+    """
+    from hyperv_mcp import statestore
+
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    yield
+    statestore.clear_store_cache_for_tests()
+
+
 @pytest.fixture()
 def png_encode_counter(monkeypatch):
     """Count PNG encodes (issue #17, PRR-016).

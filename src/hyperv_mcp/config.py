@@ -19,6 +19,7 @@ import json
 import ntpath
 import os
 import re
+import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, ClassVar
@@ -75,6 +76,28 @@ def _set_agents(value: Any) -> dict[str, str]:
 
 class ConfigError(RuntimeError):
     """Raised when configuration cannot be loaded or is invalid."""
+
+
+def default_state_db_path(environ: dict[str, str] | None = None) -> str:
+    """Per-profile default location of the durable state store (issue #22).
+
+    Resolved from the CALLER's environment rather than cached at import time,
+    so a process (or a test) that repoints LOCALAPPDATA gets the path it asked
+    for. ``statestore.resolve_state_db_path`` re-uses this so the precedence
+    has exactly one definition.
+
+    The terminal fallback is the platform temp dir, NEVER the CWD: a cwd
+    fallback made the "default" a different store per process (each server
+    resolved it against wherever it happened to be launched from), silently
+    splitting the one cross-process registry the store exists to provide —
+    the exact hazard the ``ps_slot_dir`` rule rejects (PRR-009).
+    """
+    env = dict(os.environ if environ is None else environ)
+    base = (
+        env.get("LOCALAPPDATA") or env.get("TEMP") or env.get("TMP")
+        or tempfile.gettempdir()
+    )
+    return os.path.join(base, "hyperv-mcp", "state.db")
 
 
 @dataclass
@@ -160,6 +183,13 @@ class Config:
     # harness's --session-reuse off leg). Appended last for the same
     # positional-compat reason as the fields above.
     psdirect_session_reuse: bool = True
+    # Issue #22 (ENH-06): where the durable state store lives. None means "not
+    # configured"; load() resolves it to the environment override, this key, or
+    # the per-profile default, and statestore.resolve_state_db_path re-resolves a
+    # blank at call time so a directly-constructed Config() still gets a path.
+    # Appended last so every pre-existing positional construction keeps its
+    # argument order.
+    state_db_path: str | None = None
 
     # -- loading ---------------------------------------------------------
 
@@ -193,6 +223,15 @@ class Config:
         cfg = cls.from_dict(data)
         if env.get("HYPERV_MCP_UNRESTRICTED", "") in ("1", "true", "yes"):
             cfg = replace(cfg, unrestricted=True)
+        # Issue #22: HYPERV_MCP_STATE_DB overrides the config-file key, exactly
+        # as HYPERV_MCP_UNRESTRICTED overrides `unrestricted`; with neither, the
+        # per-profile default applies. The store is always on — there is no
+        # process-local mode.
+        state_db = (env.get("HYPERV_MCP_STATE_DB") or "").strip()
+        if state_db:
+            cfg = replace(cfg, state_db_path=state_db)
+        elif not (cfg.state_db_path or "").strip():
+            cfg = replace(cfg, state_db_path=default_state_db_path(env))
         cfg = replace(
             cfg,
             config_path=config_path,
@@ -248,6 +287,17 @@ class Config:
             # host-wide). Reject it at load time.
             if not Path(self.ps_slot_dir).is_absolute():
                 raise ConfigError("ps_slot_dir must be an absolute path or null")
+        if self.state_db_path is not None:
+            if not self.state_db_path.strip():
+                raise ConfigError("state_db_path must be a non-empty path or null")
+            # Same reasoning as ps_slot_dir (PRR-009): a relative store path
+            # resolves against each process's CWD, so separate server
+            # processes would each open their OWN store and silently lose the
+            # cross-process registry the store exists to provide. Reject it
+            # at load time — the simplest rule that still proves the value
+            # can name an openable location: non-blank and absolute.
+            if not Path(self.state_db_path).is_absolute():
+                raise ConfigError("state_db_path must be an absolute path or null")
         # child_env() strips the token_env-named variable from every spawned
         # child; naming a functional variable would break that child (bare-name
         # resolution, PowerShell internals), so reject it at load time.
@@ -337,6 +387,7 @@ class Config:
             f"host_powershell_wait_s={self.host_powershell_wait_s:g}",
             f"ps_slot_dir={self.ps_slot_dir or '(derived default)'}",
             f"psdirect_session_reuse={self.psdirect_session_reuse}",
+            f"state_db_path={self.state_db_path or '(derived default)'}",
         ]
         return "; ".join(lines)
 
@@ -464,6 +515,7 @@ Config._FIELD_MAP = {  # type: ignore[attr-defined]
     "host_powershell_wait_s": lambda c, v: c._set_number("host_powershell_wait_s", v),
     "ps_slot_dir": lambda c, v: c._set_str_opt("ps_slot_dir", v),
     "psdirect_session_reuse": lambda c, v: c._set_bool("psdirect_session_reuse", v),
+    "state_db_path": lambda c, v: c._set_str_opt("state_db_path", v),
     "hyperv": lambda c, v: c._set_hyperv(v),
     "http": lambda c, v: c._set_http(v),
 }

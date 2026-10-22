@@ -71,3 +71,40 @@ def test_soak_bench_session_reuse_reports_both_states_for_every_agent_count():
         (8, "False"), (8, "True"),
     ], f"the rows did not cover every (agent count, reuse state) pair: {rows}"
     assert all("guest_timing_median_ms" in row for row in rows), rows
+
+
+def test_fake_mode_redirects_the_state_store_and_honours_an_operator_override(
+    monkeypatch,
+):
+    """Issue #22 / PRR-009: the harness bootstraps a real server in-process,
+    so without an explicit store path the run would open (and write) the
+    profile-default store — or wherever a CWD-derived fallback pointed —
+    instead of the TemporaryDirectory the run owns. The startup banner names
+    the store the run actually resolved; pin it for both the default (a
+    soak-owned path) and an operator override (which must win).
+    """
+    soak_bench = _import_soak_bench()
+
+    def _banner_state_store() -> str:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = soak_bench.main(
+                ["--fake", "--agents", "1", "--iterations", "1", "--json"]
+            )
+        assert rc == 0, "soak_bench --fake exited nonzero"
+        lines = [
+            line for line in err.getvalue().splitlines()
+            if "state store:" in line
+        ]
+        assert lines, f"no state-store banner line in stderr:\n{err.getvalue()}"
+        return lines[-1].split("state store:", 1)[1].strip()
+
+    monkeypatch.delenv("HYPERV_MCP_STATE_DB", raising=False)
+    soak_owned = _banner_state_store()
+    assert soak_owned.endswith("soak-state.db"), soak_owned
+
+    import os
+
+    operator = os.path.join(os.path.abspath(os.sep), "lab", "operator-state.db")
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", operator)
+    assert _banner_state_store() == operator

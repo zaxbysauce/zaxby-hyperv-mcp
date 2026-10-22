@@ -386,3 +386,259 @@ def test_concurrent_stop_single_shutdown(monkeypatch):
     assert all(r["stopped"] is True for r in results)
     assert sum(1 for r in results if "note" in r) == 1
     assert relay._relays[out["relay_id"]]["context"]["cred"] is None
+
+
+# ---------------------------------------------------------------------------
+# Durable-store review pins (PRR-004 / PRR-005 / PRR-007/008 / PRR-013 /
+# PRR-015). Each is red with the pre-fix shape; the mutation probes ran
+# against byte copies of the fixed sources and were restored with
+# byte-identity asserted.
+# ---------------------------------------------------------------------------
+
+
+def test_release_never_raises_and_the_original_error_wins(monkeypatch):
+    """PRR-004: on a bind failure the withdrawal must never raise — a raising
+    _release used to replace the bind error the caller needs to see."""
+    import sqlite3
+
+    from hyperv_mcp import statestore
+
+    cfg = _relay_cfg()
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+    # Occupy a port so the listener constructor fails with OSError.
+    import socket
+
+    with socket.socket() as blocker:
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        port = blocker.getsockname()[1]
+
+        def boom(self, relay_id):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(statestore.Store, "relay_delete", boom)
+        with pytest.raises(RuntimeError, match="could not bind"):
+            relay.relay_start(cfg, "test-vm", 9406, host_port=port, cred=CRED)
+        # The reservation placeholder is gone from the registry even though
+        # the store delete itself failed.
+        assert relay._relays == {}
+
+
+def test_failed_registration_leaves_no_row_and_no_listener(monkeypatch):
+    """PRR-004/PRR-015: a failure AFTER registration (the durable write) must
+    withdraw everything — the in-memory entry AND the store row — and still
+    reach server_close, or a live listener keeps serving with no registry
+    row backing it."""
+    import sqlite3
+
+    from hyperv_mcp import statestore
+
+    cfg = _relay_cfg()
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+    first = relay.relay_start(cfg, "test-vm", 9407, cred=CRED)
+    live_port = first["host_port"]
+    calls = {"n": 0}
+    real_upsert = statestore.Store.relay_upsert
+
+    def flaky_upsert(self, row):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the failing start's REGISTRATION write
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_upsert(self, row)
+
+    monkeypatch.setattr(statestore.Store, "relay_upsert", flaky_upsert)
+    with pytest.raises(sqlite3.OperationalError):
+        relay.relay_start(cfg, "test-vm", 9408, cred=CRED)
+    # No registry entry, no store row for the failed start.
+    assert set(relay._relays) == {first["relay_id"]}
+    store = statestore.store_for(cfg)
+    assert {row.relay_id for row in store.relay_rows()} == {first["relay_id"]}
+    # server_close was reached: the listener of the failed start never bound
+    # is unobservable, but the FIRST relay's listener is still healthy and
+    # the port it owns still accepts connections (nothing was dropped on the
+    # failure path).
+    import socket
+
+    with socket.create_connection(("127.0.0.1", live_port), timeout=10):
+        pass
+    relay.relay_stop(cfg, first["relay_id"])
+
+
+def test_reservation_store_failure_rolls_the_placeholder_back(monkeypatch):
+    """PRR-004 (the reservation sub-claim): a store failure at the RESERVATION
+    upsert must roll the in-memory placeholder back. The upsert sits inside
+    the reservation transaction and the first `_release()` used to start only
+    AFTER it — an unwind left an in-flight placeholder that nothing ever
+    removes (eviction judges it non-evictable, status and the by-id read hide
+    it), so that vm:guest_port was refused by the duplicate scan until
+    process exit. Mirrors guestjobs._reserve_slot's compensation."""
+    import sqlite3
+
+    from hyperv_mcp import statestore
+
+    cfg = _relay_cfg()
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+    calls = {"n": 0}
+    real_upsert = statestore.Store.relay_upsert
+
+    def flaky_upsert(self, row):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the failing start's RESERVATION write
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_upsert(self, row)
+
+    monkeypatch.setattr(statestore.Store, "relay_upsert", flaky_upsert)
+    with pytest.raises(sqlite3.OperationalError):
+        relay.relay_start(cfg, "test-vm", 9413, cred=CRED)
+    # The in-flight placeholder is gone from the registry...
+    assert relay._relays == {}
+    # ...so the same vm:guest_port is admitted on a fresh start (the
+    # duplicate scan no longer sees a live in-flight local target for it).
+    second = relay.relay_start(cfg, "test-vm", 9413, cred=CRED)
+    assert second["ok"] is True, second
+    store = statestore.store_for(cfg)
+    assert {row.relay_id for row in store.relay_rows()} == {second["relay_id"]}
+    relay.relay_stop(cfg, second["relay_id"])
+
+
+def test_relay_stop_writes_the_durable_row_before_nulling_the_credential(
+    monkeypatch,
+):
+    """PRR-014 shape on the relay side: the durable stopped row is written
+    BEFORE the credential is nulled. A store failure between the two used to
+    destroy the only copy of an inline credential while the row stayed
+    `active`; now the failure leaves the credential retained and the entry
+    coherent (the row self-heals via recovery/cap eviction exactly as the
+    bounded residual describes)."""
+    import sqlite3
+
+    from hyperv_mcp import statestore
+
+    cfg = _relay_cfg()
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+    out = relay.relay_start(cfg, "test-vm", 9414, cred=CRED)
+    relay_id = out["relay_id"]
+    real_upsert = statestore.Store.relay_upsert
+    calls = {"n": 0}
+
+    def flaky_upsert(self, row):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the stop's durable write
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_upsert(self, row)
+
+    monkeypatch.setattr(statestore.Store, "relay_upsert", flaky_upsert)
+    with pytest.raises(sqlite3.OperationalError):
+        relay.relay_stop(cfg, relay_id)
+    entry = relay._relays[relay_id]
+    # The listener is down and the local flag is stopped (both happened
+    # before the durable write) ...
+    assert entry["stopped"] is True
+    # ... but the credential SURVIVED the failed write: the null lands only
+    # after the row does. With the old order this read None.
+    assert entry["context"]["cred"] is CRED
+    # And the durable row never flipped to stopped.
+    monkeypatch.setattr(statestore.Store, "relay_upsert", real_upsert)
+    row = statestore.store_for(cfg).relay_get(relay_id)
+    assert row is not None and row.state == statestore.RELAY_ACTIVE, row
+    relay.relay_stop(cfg, relay_id)
+
+
+def test_restored_relay_reads_agree_by_id_and_in_the_listing(monkeypatch):
+    """PRR-013: one raw `active` row must read the SAME state everywhere —
+    the listing used to publish `active` while the by-id read said
+    `interrupted`."""
+    from hyperv_mcp import statestore
+
+    cfg = _relay_cfg()
+    store = statestore.store_for(cfg)
+    relay_id = "relay-9409-deadbeef" + "0" * 23
+    store.relay_upsert(statestore.RelayRow(
+        relay_id=relay_id, vm_name="test-vm",
+        vm_id="11111111-2222-3333-4444-555555555555", guest_port=9409,
+        started_at="2026-01-01T00:00:00Z", state=statestore.RELAY_ACTIVE,
+        cred_ref="inline",
+    ))
+    by_id = relay.relay_status(cfg, relay_id)["relays"][0]
+    assert by_id["state"] == "interrupted", by_id
+    listed = next(
+        r for r in relay.relay_status(cfg)["relays"]
+        if r["relay_id"] == relay_id
+    )
+    assert listed["state"] == "interrupted", listed
+    assert listed["thread_alive"] is False, listed
+
+
+def test_relay_cap_counts_store_only_rows(monkeypatch):
+    """PRR-015: the relay cap counts the UNION with the store — a store-only
+    key must count, or separate server processes collectively exceed
+    _MAX_RELAYS."""
+    from hyperv_mcp import statestore
+
+    cfg = _relay_cfg()
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+    store = statestore.store_for(cfg)
+    for i in range(2):
+        store.relay_upsert(statestore.RelayRow(
+            relay_id=f"relay-94{i:02d}-peer" + "0" * 24,
+            vm_name="test-vm", vm_id=f"{i}" * 36, guest_port=9500 + i,
+            state=statestore.RELAY_ACTIVE, cred_ref="env",
+        ))
+    relay._MAX_RELAYS = 2
+    try:
+        with pytest.raises(RuntimeError, match="registry is full"):
+            relay.relay_start(cfg, "test-vm", 9410, cred=CRED)
+    finally:
+        relay._MAX_RELAYS = 16
+
+
+def test_cap_eviction_keeps_a_foreign_store_row(monkeypatch):
+    """PRR-005: cap eviction must not delete a store row this process did not
+    write — the row could be a live peer's, and deleting it makes the peer's
+    relay unaddressable after its next restart. The slot is still freed."""
+    from hyperv_mcp import statestore
+
+    cfg = _relay_cfg()
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+    store = statestore.store_for(cfg)
+    foreign = "relay-9411-foreign" + "0" * 22
+    store.relay_upsert(statestore.RelayRow(
+        relay_id=foreign, vm_name="peer-vm",
+        vm_id="99999999-2222-3333-4444-555555555555", guest_port=9411,
+        state=statestore.RELAY_INTERRUPTED, cred_ref="env",
+    ))
+    relay._MAX_RELAYS = 1
+    try:
+        started = relay.relay_start(cfg, "test-vm", 9412, cred=CRED)
+        # The start was admitted (the slot was freed) but the peer's row is
+        # still in the store, untouched.
+        row = store.relay_get(foreign)
+        assert row is not None and row.state == statestore.RELAY_INTERRUPTED, row
+        relay.relay_stop(cfg, started["relay_id"])
+    finally:
+        relay._MAX_RELAYS = 16
+
+
+def test_peek_relay_vm_name_is_owner_filtered_and_never_raises(monkeypatch):
+    """PRR-007/PRR-008: the relay peek reads a store row only for its owner —
+    a foreign OR unattributed caller gets "" — and a failing store read
+    degrades to "" instead of escaping the error envelope."""
+    from hyperv_mcp import statestore
+
+    cfg = _relay_cfg()
+    store = statestore.store_for(cfg)
+    relay_id = "relay-9413-owned" + "0" * 21
+    store.relay_upsert(statestore.RelayRow(
+        relay_id=relay_id, vm_name="owned-vm",
+        vm_id="11111111-2222-3333-4444-555555555555", guest_port=9413,
+        state=statestore.RELAY_ACTIVE, cred_ref="env", owner="agent-a",
+    ))
+    assert relay.peek_vm_name(relay_id, cfg, owner="agent-a") == "owned-vm"
+    assert relay.peek_vm_name(relay_id, cfg, owner=None) == ""
+    assert relay.peek_vm_name(relay_id, cfg, owner="agent-b") == ""
+
+    def boom(self, key):
+        raise statestore.StateStoreError("store unavailable")
+
+    monkeypatch.setattr(statestore.Store, "relay_get", boom)
+    assert relay.peek_vm_name(relay_id, cfg, owner="agent-a") == ""

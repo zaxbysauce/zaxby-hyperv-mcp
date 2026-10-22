@@ -68,9 +68,11 @@ TOOLS = ("hyperv_console_screenshot", "hyperv_guest_run_ps", "hyperv_console_scr
 #: the agents, so 8 agents are not capped by a single serial 600 s join.
 _AGENT_JOIN_BUDGET_S = 600.0
 #: Environment keys the fake mode injects and the teardown must restore
-#: (feedback PRR-011 / PRR-037).
+#: (feedback PRR-011 / PRR-037). HYPERV_MCP_STATE_DB rides along (issue #22:
+#: the server opens the durable store at bootstrap) so an operator override
+#: survives a run instead of being silently discarded.
 _SOAK_ENV_KEYS = ("HYPERV_MCP_CONFIG", "HYPERV_GUEST_USERNAME",
-                  "HYPERV_GUEST_PASSWORD")
+                  "HYPERV_GUEST_PASSWORD", "HYPERV_MCP_STATE_DB")
 #: The fake guest password. Registered in the process-global redaction
 #: registry by every credential resolution during the run, so the teardown
 #: must WITHDRAW it again (PRR-037) — the registry is otherwise append-only.
@@ -331,8 +333,18 @@ def _server_for(mode: str, audit_log: Path, session_reuse: bool | None = None):
     # frozen acceptance checks do — bootstrap(environ) forwards it to
     # Config.load(environ), and an empty dict silently falls back to defaults,
     # which deny every console_input call and make the whole run measure its own
-    # rejections.
-    mod.bootstrap({"HYPERV_MCP_CONFIG": str(cfg)})
+    # rejections. The state store rides with it (issue #22): the harness runs
+    # in-process, so without an explicit path the server opens its store under
+    # the profile default (or wherever a CWD-derived fallback pointed) instead
+    # of the TemporaryDirectory this run owns. An operator-set
+    # HYPERV_MCP_STATE_DB wins — the override must not be discarded.
+    bootstrap_env = {"HYPERV_MCP_CONFIG": str(cfg)}
+    operator_db = os.environ.get("HYPERV_MCP_STATE_DB", "").strip()
+    if operator_db:
+        bootstrap_env["HYPERV_MCP_STATE_DB"] = operator_db
+    else:
+        bootstrap_env["HYPERV_MCP_STATE_DB"] = str(audit_log.parent / "soak-state.db")
+    mod.bootstrap(bootstrap_env)
 
     def _teardown():
         # Restore in the reverse order of the setup: the audit sink first (it

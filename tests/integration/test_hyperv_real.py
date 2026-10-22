@@ -243,3 +243,147 @@ def test_nonexistent_vm_error_clarity(guarded_vm):
     with pytest.raises(Exception) as exc:
         lifecycle.get_vm_info(guarded_vm.cfg, "mcp-it-definitely-not-a-vm")
     assert "mcp-it-definitely-not-a-vm" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# durable state store (issue #22, AC10)
+# ---------------------------------------------------------------------------
+
+def test_e01_job_survives_server_restart(running_vm, tmp_path, monkeypatch):
+    """AC10: a job started through one server process is still addressable
+    from a second process against the same state DB.
+
+    Only a real PowerShell Direct round trip shows that the restored PID and
+    paths still address the guest process. The restart is a real HARD KILL
+    of process A (Popen.kill → TerminateProcess, exactly the issue's "A is
+    terminated") while it is still alive holding the job — none of A's
+    cleanup paths can run — followed by a fresh interpreter as process B.
+    Both children get the SAME policy and the SAME store as the parent
+    (unrestricted via the environment, one HYPERV_MCP_STATE_DB for all three
+    processes), and PYTHONPATH is pinned the way the unit-suite child
+    drivers pin it, so the children import the tree under test.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from hyperv_mcp import guestjobs
+
+    db = tmp_path / "state.sqlite3"
+    src = Path(__file__).resolve().parents[2] / "src"
+    # One store for the parent and both children: the parent's job_stop at
+    # the end must resolve the very rows the starter wrote.
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(db))
+    # The children load their own Config from the environment; without the
+    # same unrestricted policy as the parent they would deny the guest legs.
+    monkeypatch.setenv("HYPERV_MCP_UNRESTRICTED", "1")
+    # dict(os.environ, ...) keeps SYSTEMROOT and friends, so the child Python
+    # processes start cleanly on Windows; PYTHONPATH pins the import tree.
+    env = dict(os.environ, PYTHONPATH=str(src))
+
+    # Process A: start a long-running job, publish the handle, then stay
+    # alive until the parent kills it — the kill, not a clean exit, is what
+    # makes this a restart rather than a shutdown.
+    starter = tmp_path / "start_job.py"
+    starter.write_text(
+        "import json, sys, time\n"
+        "from hyperv_mcp import credentials, guestjobs\n"
+        "from hyperv_mcp.config import Config\n"
+        "cfg = Config.load()\n"
+        "credentials.init(cfg)\n"
+        "out = guestjobs.job_start(\n"
+        "    cfg, sys.argv[1], 'ping', ['-n', '120', '127.0.0.1'],\n"
+        "    cred=credentials.resolve_guest(),\n"
+        ")\n"
+        "with open(sys.argv[2], 'w', encoding='utf-8') as fh:\n"
+        "    fh.write(json.dumps(out))\n"
+        "time.sleep(600)\n",
+        encoding="utf-8",
+    )
+    record = tmp_path / "job-record.json"
+    proc_a = subprocess.Popen(
+        [sys.executable, str(starter), running_vm.vm, str(record)],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    job = None
+    try:
+        for _ in range(600):
+            if record.exists():
+                job = json.loads(record.read_text(encoding="utf-8"))
+                break
+            if proc_a.poll() is not None:
+                out, err = proc_a.communicate()
+                raise AssertionError(f"starter died early: {err[-2000:]}")
+            time.sleep(1.0)
+        assert job is not None, "starter never published the job handle"
+        # A is terminated — hard, while it still holds the process-local
+        # registry the durable store must outlive.
+        proc_a.kill()
+        proc_a.wait(timeout=60)
+
+        job_id = job["job_id"]
+        job_dir = job["job_dir"]
+
+        # The store holds no password and no command text.
+        raw = db.read_bytes()
+        for needle in (
+            os.environ.get("HYPERV_GUEST_PASSWORD", "").encode("utf-8", "replace"),
+            b"ping", b"-n", b"120",
+        ):
+            if needle:
+                assert needle not in raw, "the state store persisted secret or command material"
+
+        # Process B: a fresh interpreter with the same store reattaches.
+        follower = tmp_path / "follow_job.py"
+        follower.write_text(
+            "import json, sys\n"
+            "from hyperv_mcp import credentials, guestjobs\n"
+            "from hyperv_mcp.config import Config\n"
+            "cfg = Config.load()\n"
+            "credentials.init(cfg)\n"
+            "job_id = sys.argv[1]\n"
+            "status = guestjobs.job_status(cfg, job_id)\n"
+            "out = guestjobs.job_output(cfg, job_id)\n"
+            "print(json.dumps({'status': status, 'output': out}))\n",
+            encoding="utf-8",
+        )
+        followed = subprocess.run(
+            [sys.executable, str(follower), job_id],
+            env=env, capture_output=True, text=True, timeout=600,
+        )
+        assert followed.returncode == 0, followed.stderr[-2000:]
+        payload = json.loads(followed.stdout.strip().splitlines()[-1])
+        assert payload["status"]["status"] == "running", payload["status"]
+        assert payload["output"]["stdout"].strip(), payload["output"]
+
+        # Process B stops it, and the guest job directory goes away. job_stop takes
+        # no credential: a restored job re-resolves its own from the environment,
+        # which is the behaviour under test.
+        stopped = guestjobs.job_stop(running_vm.cfg, job_id)
+        assert stopped["stopped"] is True, stopped
+
+        # run_guest_inner is GUID-native (no name resolution happens inside), so the
+        # probe leg addresses the VM by the id job_start resolved and stored.
+        from hyperv_mcp import diagnostics, vmident
+
+        ref = vmident.resolve(running_vm.cfg, vm_name=running_vm.vm)
+        exists = diagnostics.run_guest_inner(
+            running_vm.cfg, ref.id,
+            f"if (Test-Path -LiteralPath {guestjobs.pswindows.ps_quote(job_dir)}) "
+            "{ 'present' } else { 'absent' }",
+            running_vm.creds, mode="read",
+        )
+        assert "absent" in str(exists.get("stdout", "")), exists
+    finally:
+        # The guest job must be reaped even when an assertion above fails —
+        # the ping keeps running for two minutes otherwise.
+        if job is not None:
+            try:
+                guestjobs.job_stop(running_vm.cfg, job["job_id"])
+            except Exception:
+                pass
+        if proc_a.poll() is None:
+            proc_a.kill()
+            proc_a.wait(timeout=60)
