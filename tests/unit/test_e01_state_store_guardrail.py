@@ -702,6 +702,50 @@ def test_store_errors_name_the_directory_not_the_path(tmp_path):
     # The refusal still names both versions (C7's clause).
     assert "2" in message and "1" in message, message
 
+    # The makedirs site: a FILE squatting the parent-of-the-parent slot makes
+    # directory creation fail with an OSError whose __str__ embeds the FULL
+    # absolute path of the directory it could not create (measured:
+    # "[WinError 3] The system cannot find the path specified:
+    # 'C:\\Users\\<account>\\AppData\\...\\sub'"). The message may carry the
+    # directory NAME and the OSError's own text — never the path.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file, not a directory", encoding="utf-8")
+    with pytest.raises(statestore.StateStoreError) as excinfo:
+        statestore.open(str(blocker / "sub" / "state.db"))
+    message = str(excinfo.value)
+    # The FULL path is absent — not just the basename check: nothing of the
+    # absolute prefix (what an account-bearing profile default would
+    # disclose) and nothing of the failing directory's own path may appear.
+    # OSError embeds the filename repr-escaped (quotes + DOUBLED
+    # backslashes), so un-double before the substring check — a plain `in`
+    # on the raw message would miss the escaped leak.
+    unescaped = message.replace("\\\\", "\\")
+    assert str(tmp_path) not in unescaped, message
+    assert str(blocker / "sub") not in unescaped, message
+    # The directory NAME is still named.
+    assert "sub" in message, message
+    # Local logs keep the detail: the chain still carries the original
+    # OSError, whose text embeds the full path (repr-escaped by
+    # OSError.__str__, so un-double before matching).
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, OSError), cause
+    assert str(blocker / "sub") in str(cause).replace("\\\\", "\\"), str(cause)
+
+
+def test_open_refuses_an_embedded_nul_path_as_state_store_error(tmp_path):
+    """A path carrying an embedded NUL must surface StateStoreError from the
+    public open() entry. The raw header pre-read opens the file directly, and
+    a NUL makes every file API raise a bare ValueError ("embedded null
+    byte") that its OSError-only handler used to let escape un-enveloped."""
+    from hyperv_mcp import statestore
+
+    with pytest.raises(statestore.StateStoreError) as excinfo:
+        statestore.open(str(tmp_path / "nul\0byte.db"))
+    message = str(excinfo.value)
+    # The refusal names the condition only — no path, no NUL echo.
+    assert "\0" not in message
+    assert str(tmp_path) not in message, message
+
 
 def test_unattributed_caller_cannot_address_an_owned_row(monkeypatch, tmp_path):
     """PRR-008: `owner is None` used to bypass the ownership check on the

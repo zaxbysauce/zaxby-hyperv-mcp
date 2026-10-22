@@ -526,6 +526,25 @@ def _where(path: str) -> str:
     return os.path.basename(parent.rstrip("\\/"))
 
 
+def _oserror_text(exc: OSError) -> str:
+    """An OSError's text WITHOUT the filename it embeds.
+
+    ``OSError.__str__`` appends ``exc.filename`` — the full absolute path,
+    which for the profile default contains the local account name — so a
+    client-facing message cannot interpolate ``str(exc)`` directly (PRR-012,
+    the same posture as the pswindows slot-directory error). Render the
+    ``[WinError N] message`` / ``[Errno N] message`` head alone; the original
+    exception stays chained on the raised StateStoreError so local logs keep
+    the full path.
+    """
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return f"[WinError {winerror}] {exc.strerror}"
+    if exc.errno is not None and exc.strerror:
+        return f"[Errno {exc.errno}] {exc.strerror}"
+    return str(exc.strerror or exc.__class__.__name__)
+
+
 def _recover_locked(store: Store, pid_probe=None) -> None:
     """Mark state left behind by a process that is no longer here.
 
@@ -591,7 +610,10 @@ def _header_user_version(path: str) -> int | None:
         # which shadows the builtin inside this file.
         with builtins.open(path, "rb") as fh:
             head = fh.read(64)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError: a path carrying an embedded NUL makes every file API
+        # raise ("embedded null byte") before anything exists — read as "no
+        # header", never a raw escape from the store's error type.
         return None
     if len(head) < 64:
         return None
@@ -643,6 +665,15 @@ def open(path: str) -> Store:
     if not path or not str(path).strip():
         raise StateStoreError("state store path is empty")
     path = str(path)
+    if "\0" in path:
+        # An embedded NUL makes every file API raise a bare ValueError
+        # ("embedded null byte") — SQLite's path converter included — which
+        # would escape this entry un-enveloped. The public open() must
+        # surface StateStoreError for every unusable path, so refuse here,
+        # naming the condition only (PRR-012: the path never rides along).
+        raise StateStoreError(
+            "state store path contains an embedded NUL byte"
+        )
     if _is_unc(path):
         # No part of the UNC host/share is nameable — the host name IS the
         # disclosure (PRR-012) — so the message names the condition only.
@@ -666,10 +697,16 @@ def open(path: str) -> Store:
     try:
         os.makedirs(parent, exist_ok=True)
     except OSError as exc:
-        # Chained (not `from None`) so local logs keep the full path; the
-        # message itself names only the directory (PRR-012).
+        # PRR-012: the message names the directory NAME (``_where`` yields
+        # no name for a drive-root parent, so the parenthetical is omitted
+        # rather than rendered empty) and the OSError's own text WITHOUT its
+        # filename — ``str(exc)`` embeds the full absolute path, which on the
+        # profile default contains the local account name. Chained (not
+        # ``from None``) so local logs keep the full path.
+        where = f" ({_where(path)})" if _where(path) else ""
         raise StateStoreError(
-            f"could not create the state store directory ({os.path.basename(parent)}): {exc}"
+            f"could not create the state store directory{where}: "
+            f"{_oserror_text(exc)}"
         ) from exc
 
     deadline = time.monotonic() + _OPEN_BUDGET_S

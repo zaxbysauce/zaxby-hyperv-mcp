@@ -464,6 +464,86 @@ def test_failed_registration_leaves_no_row_and_no_listener(monkeypatch):
     relay.relay_stop(cfg, first["relay_id"])
 
 
+def test_reservation_store_failure_rolls_the_placeholder_back(monkeypatch):
+    """PRR-004 (the reservation sub-claim): a store failure at the RESERVATION
+    upsert must roll the in-memory placeholder back. The upsert sits inside
+    the reservation transaction and the first `_release()` used to start only
+    AFTER it — an unwind left an in-flight placeholder that nothing ever
+    removes (eviction judges it non-evictable, status and the by-id read hide
+    it), so that vm:guest_port was refused by the duplicate scan until
+    process exit. Mirrors guestjobs._reserve_slot's compensation."""
+    import sqlite3
+
+    from hyperv_mcp import statestore
+
+    cfg = _relay_cfg()
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+    calls = {"n": 0}
+    real_upsert = statestore.Store.relay_upsert
+
+    def flaky_upsert(self, row):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the failing start's RESERVATION write
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_upsert(self, row)
+
+    monkeypatch.setattr(statestore.Store, "relay_upsert", flaky_upsert)
+    with pytest.raises(sqlite3.OperationalError):
+        relay.relay_start(cfg, "test-vm", 9413, cred=CRED)
+    # The in-flight placeholder is gone from the registry...
+    assert relay._relays == {}
+    # ...so the same vm:guest_port is admitted on a fresh start (the
+    # duplicate scan no longer sees a live in-flight local target for it).
+    second = relay.relay_start(cfg, "test-vm", 9413, cred=CRED)
+    assert second["ok"] is True, second
+    store = statestore.store_for(cfg)
+    assert {row.relay_id for row in store.relay_rows()} == {second["relay_id"]}
+    relay.relay_stop(cfg, second["relay_id"])
+
+
+def test_relay_stop_writes_the_durable_row_before_nulling_the_credential(
+    monkeypatch,
+):
+    """PRR-014 shape on the relay side: the durable stopped row is written
+    BEFORE the credential is nulled. A store failure between the two used to
+    destroy the only copy of an inline credential while the row stayed
+    `active`; now the failure leaves the credential retained and the entry
+    coherent (the row self-heals via recovery/cap eviction exactly as the
+    bounded residual describes)."""
+    import sqlite3
+
+    from hyperv_mcp import statestore
+
+    cfg = _relay_cfg()
+    monkeypatch.setattr(pswindows, "run_ps", FakePS([]))
+    out = relay.relay_start(cfg, "test-vm", 9414, cred=CRED)
+    relay_id = out["relay_id"]
+    real_upsert = statestore.Store.relay_upsert
+    calls = {"n": 0}
+
+    def flaky_upsert(self, row):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the stop's durable write
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_upsert(self, row)
+
+    monkeypatch.setattr(statestore.Store, "relay_upsert", flaky_upsert)
+    with pytest.raises(sqlite3.OperationalError):
+        relay.relay_stop(cfg, relay_id)
+    entry = relay._relays[relay_id]
+    # The listener is down and the local flag is stopped (both happened
+    # before the durable write) ...
+    assert entry["stopped"] is True
+    # ... but the credential SURVIVED the failed write: the null lands only
+    # after the row does. With the old order this read None.
+    assert entry["context"]["cred"] is CRED
+    # And the durable row never flipped to stopped.
+    monkeypatch.setattr(statestore.Store, "relay_upsert", real_upsert)
+    row = statestore.store_for(cfg).relay_get(relay_id)
+    assert row is not None and row.state == statestore.RELAY_ACTIVE, row
+    relay.relay_stop(cfg, relay_id)
+
+
 def test_restored_relay_reads_agree_by_id_and_in_the_listing(monkeypatch):
     """PRR-013: one raw `active` row must read the SAME state everywhere —
     the listing used to publish `active` while the by-id read said
