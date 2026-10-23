@@ -52,7 +52,7 @@ from pathlib import Path
 
 import pytest
 
-from hyperv_mcp import credentials, guestjobs, pswindows, relay
+from hyperv_mcp import credentials, guestjobs, pswindows, relay, statestore
 from hyperv_mcp.config import Config
 from hyperv_mcp.credentials import CredentialSet
 
@@ -373,3 +373,37 @@ def test_state_db_defaults_under_localappdata(monkeypatch, tmp_path):
     from hyperv_mcp import statestore  # deferred: this file collects at base
     statestore.open(cfg.state_db_path)
     assert os.path.isdir(os.path.join(str(tmp_path), "hyperv-mcp"))
+
+
+def test_start_reservation_row_carries_resolved_vm_id(monkeypatch, tmp_path):
+    """Issue #23 (review B5 pin): the job_start RESERVATION row -- committed
+    before the guest leg -- carries the RESOLVED vm_id, not ''. The lease gate
+    for hyperv_guest_job_stop reads exactly this row, so a reservation with an
+    empty vm_id would leave the stop tool lease-bypassable for the whole
+    duration of every job start."""
+    _state_env(monkeypatch, tmp_path)
+    cfg = Config.load()
+    fake = OrderedFakePS(start={"pid": 9, "job_dir": "d"}, later={"status": "running"})
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+
+    captured: dict[str, str] = {}
+    real_upsert = statestore.Store.job_upsert
+
+    def spy_upsert(self, row):
+        if row.state == statestore.JOB_STARTING and not captured:
+            captured["vm_id"] = row.vm_id
+            captured["vm_name"] = row.vm_name
+        return real_upsert(self, row)
+
+    with monkeypatch.context() as m:
+        m.setattr(statestore.Store, "job_upsert", spy_upsert)
+        out = guestjobs.job_start(
+            cfg, "test-vm", "x.exe",
+            cred=credentials.CredentialSet("inline-admin", "inline-pass"),
+        )
+    assert out.get("ok"), out
+    assert captured, "no starting reservation row was written"
+    assert captured["vm_id"], (
+        f"the reservation row must carry the resolved vm_id; got {captured!r}"
+    )
+    assert captured["vm_name"] == "test-vm", captured

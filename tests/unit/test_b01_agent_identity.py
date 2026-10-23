@@ -117,7 +117,7 @@ def verifier_capture(monkeypatch):
     configure_http_auth instead of swallowing it."""
     fake = _FakeMcp()
     box = {}
-    monkeypatch.setattr(http_entry, "bootstrap", lambda: http_entry.Config.load())
+    monkeypatch.setattr(http_entry, "bootstrap", lambda *a, **k: http_entry.Config.load())
     monkeypatch.setattr(http_entry, "get_mcp", lambda: fake)
 
     def _capture(verifier):

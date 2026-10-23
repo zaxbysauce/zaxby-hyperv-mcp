@@ -26,6 +26,9 @@ from hyperv_mcp.config import Config, ConfigError
 AUDIT_KEYS = {
     "ts", "tool", "vm_name", "category", "ok", "duration_ms", "exit_code",
     "error_class", "agent_id", "request_id", "job_id", "relay_id", "timing",
+    # Issue #23 (review PRR-012): lease correlation id -- a 16-hex-char
+    # handle PREFIX, null on every non-lease path.
+    "lease_ref",
 }
 
 
@@ -50,7 +53,7 @@ class _FakeMcp:
 def verifier_capture(monkeypatch):
     fake = _FakeMcp()
     box = {"verifier": None}
-    monkeypatch.setattr(http_entry, "bootstrap", lambda: http_entry.Config.load())
+    monkeypatch.setattr(http_entry, "bootstrap", lambda *a, **k: http_entry.Config.load())
     monkeypatch.setattr(http_entry, "get_mcp", lambda: fake)
 
     def _capture(verifier):

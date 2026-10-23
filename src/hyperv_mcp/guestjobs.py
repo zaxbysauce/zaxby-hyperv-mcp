@@ -168,6 +168,35 @@ def clear_registry_for_tests() -> None:
         _jobs.clear()
 
 
+def peek_vm_id(job_id: str, cfg: Config | None = None,
+               owner: str | None = None) -> str:
+    """Owner-filtered vm_id read for the lease gate (issue #23).
+
+    Not peek_vm_name: that helper answers "" for in-flight entries, which is
+    exactly the window this gate must see. The reservation now writes the
+    resolved identity into both the memory entry and the store row (round-3
+    B5), so an in-flight job is lease-checked against its VM like any other.
+    Never raises: the gate must not turn a store hiccup into a bypass or a
+    crash, so the answer degrades to "" (an ungated call), which disclosure 4
+    of the plan records.
+    """
+    key = job_id or ""
+    with _jobs_lock:
+        entry = _jobs.get(key)
+    if entry is not None:
+        if (entry.get("owner") or None) != (owner or None):
+            return ""
+        return str(entry.get("vm_id") or "")
+    if cfg is not None:
+        try:
+            row = _store(cfg).job_get(key)
+        except Exception:
+            return ""
+        if row is not None and (row.owner or None) == (owner or None):
+            return str(row.vm_id or "")
+    return ""
+
+
 def peek_vm_name(job_id: str, cfg: Config | None = None,
                  owner: str | None = None) -> str:
     """Read-only vm_name lookup for audit rows (issue #10).
@@ -204,7 +233,8 @@ def peek_vm_name(job_id: str, cfg: Config | None = None,
 
 
 def _reserve_slot(job_id: str, owner: str | None = None,
-                   cfg: Config | None = None) -> None:
+                   cfg: Config | None = None, *, vm_id: str = "",
+                   vm_name: str = "") -> None:
     """Atomically reserve a registry slot BEFORE the guest start leg.
 
     Evicts oldest stopped entries when at capacity; rejects when the
@@ -225,7 +255,7 @@ def _reserve_slot(job_id: str, owner: str | None = None,
     if cfg is None:
         # No store: memory-only, exactly the pre-issue-#22 behaviour. Direct
         # callers (tests that inject entries into _jobs) use this shape.
-        _reserve_slot_local(job_id, owner)
+        _reserve_slot_local(job_id, owner, vm_id=vm_id, vm_name=vm_name)
         return
     store = _store(cfg)
     with store.transaction():
@@ -282,7 +312,8 @@ def _reserve_slot(job_id: str, owner: str | None = None,
                 # The `starting` row is committed BEFORE the guest leg runs, so a
                 # hard kill inside the leg leaves an addressable row (issue #22).
                 store.job_upsert(statestore.JobRow(
-                    job_id=job_id, started_at=started_at, owner=owner,
+                    job_id=job_id, vm_id=vm_id, vm_name=vm_name,
+                    started_at=started_at, owner=owner,
                     state=statestore.JOB_STARTING, cred_ref="inline",
                 ))
         except BaseException:
@@ -300,7 +331,8 @@ def _reserve_slot(job_id: str, owner: str | None = None,
             raise
 
 
-def _reserve_slot_local(job_id: str, owner: str | None) -> None:
+def _reserve_slot_local(job_id: str, owner: str | None, *,
+                        vm_id: str = "", vm_name: str = "") -> None:
     """The in-memory half of the reservation: evict, check the cap, insert."""
     with _jobs_lock:
         if len(_jobs) >= _MAX_JOBS:
@@ -317,7 +349,7 @@ def _reserve_slot_local(job_id: str, owner: str | None) -> None:
                 "stop jobs before starting more"
             )
         _jobs[job_id] = {
-            "job_id": job_id, "vm_name": "", "vm_id": "", "pid": 0,
+            "job_id": job_id, "vm_name": vm_name, "vm_id": vm_id, "pid": 0,
             "in_flight": True, "owner": owner,
             "started_at": _utc_now_iso(), "cred": None, "stopped": False,
         }
@@ -650,7 +682,11 @@ def job_start(
     # precedes the guest start leg, preserving the pinned behavior that a
     # registry-full start is rejected before any guest work.
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
-    _reserve_slot(job_id, owner, cfg=cfg)
+    # Issue #23 (round-3 B5): the reservation carries the RESOLVED identity so
+    # hyperv_guest_job_stop's lease gate can see the VM for the whole window
+    # between reservation and registration -- previously the placeholder wrote
+    # vm_id="" and the stop tool was lease-bypassable throughout every start.
+    _reserve_slot(job_id, owner, cfg=cfg, vm_id=ref.id, vm_name=ref.name)
     try:
         # Wrapper building and pid parsing stay inside the release window so
         # no exception between reservation and registration can strand an

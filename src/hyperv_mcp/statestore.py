@@ -39,7 +39,7 @@ import os
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,8 +47,19 @@ from typing import Any
 
 from .config import Config, default_state_db_path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 5000
+
+# Lease scopes (issue #23). `lifecycle` is exclusive against every other
+# scope: a restore or stop invalidates all other activity on the VM.
+LEASE_SCOPES = ("lifecycle", "guest_exec", "transfer", "console")
+
+# Lease kinds. `explicit` is an agent-held lease minted by hyperv_lease_acquire
+# and carried across calls by lease_id + fencing_token. `call` is the short
+# per-call row vmlocks.vm_lock writes, which is what turns an in-process lock
+# into an exclusion that spans processes sharing this database.
+LEASE_KIND_EXPLICIT = "explicit"
+LEASE_KIND_CALL = "call"
 
 # Job lifecycle. `starting` is the reservation placeholder committed BEFORE the
 # guest leg runs, so a hard kill inside the leg leaves an addressable row.
@@ -102,7 +113,108 @@ _SCHEMA_STATEMENTS = (
         owner TEXT
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS leases (
+        row_key      TEXT PRIMARY KEY,
+        lease_id     TEXT NOT NULL,
+        vm_key       TEXT NOT NULL,
+        vm_name      TEXT NOT NULL DEFAULT '',
+        scope        TEXT NOT NULL,
+        holder_agent TEXT,
+        fencing_seq  INTEGER NOT NULL DEFAULT 0,
+        acquired_at  REAL NOT NULL DEFAULT 0,
+        ttl_s        INTEGER NOT NULL DEFAULT 0,
+        expires_at   REAL NOT NULL DEFAULT 0,
+        kind         TEXT NOT NULL DEFAULT 'explicit'
+            CHECK (kind IN ('explicit','call')),
+        write_lock   INTEGER NOT NULL DEFAULT 1
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS leases_active ON leases(vm_key, expires_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS leases_by_id ON leases(lease_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS leases_by_name ON leases(vm_name COLLATE NOCASE)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS fence_counters (
+        vm_key   TEXT NOT NULL,
+        scope    TEXT NOT NULL,
+        last_seq INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (vm_key, scope)
+    )
+    """,
 )
+
+# Forward-only migrations, applied inside open()'s single BEGIN IMMEDIATE.
+# Without this branch a store already at user_version 1 would never receive
+# the v1 -> v2 tables: open() only created the schema when it found 0
+# (issue #23 localization finding C7). Each entry is (from_version, statements).
+_MIGRATIONS: dict[int, tuple[str, ...]] = {
+    1: (
+        *_SCHEMA_STATEMENTS[2:],
+    ),
+}
+
+
+def _tables_present(con: sqlite3.Connection) -> bool:
+    """Whether the current schema's tables all exist."""
+    for table in ("jobs", "relays", "leases", "fence_counters"):
+        present = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if present is None:
+            return False
+    return True
+
+
+def _migrate_to(con: sqlite3.Connection, found: int) -> None:
+    """Apply every forward migration from `found` up to SCHEMA_VERSION.
+
+    Migrations are additive only: no existing column changes type, no row is
+    rewritten, no index is dropped. Each step is the same CREATE ... IF NOT
+    EXISTS shape as the fresh-database path, so re-running one is harmless.
+    """
+    version = found
+    while version < SCHEMA_VERSION:
+        statements = _MIGRATIONS.get(version)
+        if statements is None:
+            raise StateStoreError(
+                f"state store schema version {version} has no migration to "
+                f"{SCHEMA_VERSION}; refusing to open it"
+            )
+        # Review PRR-022 (asm-01): the migration content is SLICED from
+        # _SCHEMA_STATEMENTS, so it must stay coupled to the version it
+        # targets. The slice is valid only while the first two statements
+        # are exactly the v1 tables; this pin fails loudly the moment the
+        # tuple is reordered or a statement is inserted ahead of them.
+        for position, table in ((0, "jobs"), (1, "relays")):
+            if "CREATE TABLE IF NOT EXISTS " + table not in _SCHEMA_STATEMENTS[position]:
+                raise StateStoreError(
+                    f"state store migration pin broken: schema statement "
+                    f"{position} no longer creates {table}"
+                )
+        # The migration is additive CREATE ... IF NOT EXISTS, so it must not
+        # paper over a schema that is missing the versions BELOW it: a store
+        # stamped `user_version=1` with no jobs/relays tables is corrupt, and
+        # stamping it 2 over that would hide the corruption behind a clean
+        # version number.
+        for table in ("jobs", "relays"):
+            present = con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if present is None:
+                raise StateStoreError(
+                    f"state store schema version {version} is missing its "
+                    f"{table} table; refusing to open it"
+                )
+        for statement in statements:
+            con.execute(statement)
+        version += 1
+    con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 # How long open() will keep retrying a transient SQLITE_BUSY while another
 # process is creating the same database, across EVERY leg of the open (the
@@ -321,7 +433,7 @@ class Store:
     every method takes the lock; the lock is reentrant so a transaction helper
     can call a plain reader without deadlocking on itself."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, clock: Callable[[], float] | None = None) -> None:
         self.path = path
         self._lock = threading.RLock()
         self._con: sqlite3.Connection | None = None
@@ -329,6 +441,16 @@ class Store:
         # single-statement write helpers below do not commit it out from under
         # the caller (SQLite rejects a nested BEGIN outright).
         self._depth = 0
+        # Issue #23: an injectable clock so lease TTLs are testable without
+        # sleeping. Defaults to None -> time.time, because statestore.open()
+        # constructs Store(path) itself and must keep working unchanged.
+        # Wall clock (not monotonic) is deliberate: lease expiry is PERSISTED
+        # and compared across restarts, and monotonic resets every boot.
+        self._clock = clock if clock is not None else time.time
+
+    def now(self) -> float:
+        """The store's clock. Every lease comparison must go through this."""
+        return float(self._clock())
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -504,6 +626,241 @@ class Store:
             except BaseException:
                 self._rollback()
                 raise
+
+    # -- leases (issue #23) ------------------------------------------------
+    #
+    # `row_key` is the ONLY unique column. Several rows may share the same
+    # (lease_id, vm_key, scope) triple: a multi-scope acquire writes one row per
+    # scope, and ONE tool call's nested vm_locks each write their own row under
+    # the call's shared lease_id. Making lease_id the primary key would make all
+    # three shapes impossible.
+    #
+    # Every method takes the lock and uses the same single-statement write
+    # discipline as the job/relay helpers, so callers never have to.
+
+    _LEASE_COLUMNS = (
+        "row_key, lease_id, vm_key, vm_name, scope, holder_agent, fencing_seq, "
+        "acquired_at, ttl_s, expires_at, kind, write_lock"
+    )
+
+    def lease_insert(self, values: tuple) -> str:
+        """Insert one lease row; `values` is positional per _LEASE_COLUMNS."""
+        with self._lock:
+            self._begin()
+            try:
+                self._connect().execute(
+                    "INSERT INTO leases (" + self._LEASE_COLUMNS
+                    + ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    values,
+                )
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+        return str(values[0])
+
+    def lease_rows_by_id(self, lease_id: str) -> list[tuple]:
+        with self._lock:
+            cur = self._connect().execute(
+                "SELECT " + self._LEASE_COLUMNS + " FROM leases WHERE lease_id = ?",
+                (lease_id,),
+            )
+            return cur.fetchall()
+
+    def lease_candidates_by_vm(self, vm_key: str, now: float, agent: str | None) -> list[tuple]:
+        """Unexpired rows for a VM, excluding the caller's OWN.
+
+        NULL-safe on purpose: binding None to `holder_agent != ?` matches
+        nothing, which would silently disable the gate for every unattributed
+        (stdio) caller. `X IS ?` is SQLite's NULL-safe equality, and an
+        unattributed caller gets NO benefit of the doubt -- every row is a
+        candidate -- matching the pinned posture for jobs and relays.
+        """
+        with self._lock:
+            cur = self._connect().execute(
+                "SELECT " + self._LEASE_COLUMNS + " FROM leases "
+                "WHERE vm_key = ? AND expires_at > ? "
+                "AND (? IS NULL OR NOT (holder_agent IS ?))",
+                (vm_key, now, agent, agent),
+            )
+            return cur.fetchall()
+
+    def lease_candidates_by_name(self, vm_name: str, now: float, agent: str | None) -> list[tuple]:
+        """The name-hint twin of lease_candidates_by_vm (SQLite NOCASE)."""
+        with self._lock:
+            cur = self._connect().execute(
+                "SELECT " + self._LEASE_COLUMNS + " FROM leases "
+                "WHERE vm_name = ? COLLATE NOCASE AND expires_at > ? "
+                "AND (? IS NULL OR NOT (holder_agent IS ?))",
+                (vm_name, now, agent, agent),
+            )
+            return cur.fetchall()
+
+    def lease_rows_live(self, vm_key: str, now: float, agent: str | None) -> list[tuple]:
+        """Live rows, optionally VM- and agent-scoped.
+
+        An empty vm_key means "any VM". The agent filter uses the same NULL-safe
+        shape as the candidate queries, but with `owner_visible` semantics: a
+        None agent means NO filter here (the caller-level ownership checks are
+        what decide who may act, not this read).
+        """
+        where = ["expires_at > ?"]
+        params: list[Any] = [now]
+        if vm_key:
+            where.append("vm_key = ?")
+            params.append(vm_key)
+        if agent is not None:
+            where.append("NOT (holder_agent IS ?)")
+            params.append(agent)
+        with self._lock:
+            cur = self._connect().execute(
+                "SELECT " + self._LEASE_COLUMNS + " FROM leases WHERE " + " AND ".join(where),
+                params,
+            )
+            return cur.fetchall()
+
+    def lease_expired_by_id(self, lease_id: str, now: float) -> list[tuple]:
+        """Rows for a lease id that exist but are past expiry.
+
+        Expired rows are RETAINED, not reaped on acquire: a later renew must be
+        able to report "expired" rather than "unknown", and a stale token must
+        be reportable as fenced rather than silently absent.
+        """
+        with self._lock:
+            cur = self._connect().execute(
+                "SELECT " + self._LEASE_COLUMNS + " FROM leases "
+                "WHERE lease_id = ? AND expires_at <= ?",
+                (lease_id, now),
+            )
+            return cur.fetchall()
+
+    def lease_touch(self, row_key: str, expires_at: float) -> None:
+        with self._lock:
+            self._begin()
+            try:
+                self._connect().execute(
+                    "UPDATE leases SET expires_at = ? WHERE row_key = ?", (expires_at, row_key)
+                )
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+
+    def lease_touch_if_live(self, row_key: str, now: float, expires_at: float) -> int:
+        """Touch ONLY a row that is still live at `now` (review PRR-009).
+
+        Returns the number of rows updated: 0 means the row lapsed between the
+        caller's read and this write, and the caller must report expiry rather
+        than silently resurrect it.
+        """
+        with self._lock:
+            self._begin()
+            try:
+                cur = self._connect().execute(
+                    "UPDATE leases SET expires_at = ? WHERE row_key = ? AND expires_at > ?",
+                    (expires_at, row_key, now),
+                )
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+        return int(cur.rowcount or 0)
+
+    def fence_last_explicit(self, vm_key: str, scope: str) -> int:
+        """The highest fencing token ever minted for (vm_key, scope) by an
+        EXPLICIT lease (review PRR-007).
+
+        Per-call rows bump the same counter, so a plain counter read would
+        fence every lease after its holder's first tool call; only explicit
+        grants -- the holder's own or a takeover's -- supersede a token."""
+        with self._lock:
+            cur = self._connect().execute(
+                "SELECT MAX(fencing_seq) FROM leases WHERE vm_key = ? AND scope = ?"
+                " AND kind = ?",
+                (vm_key, scope, "explicit"),
+            )
+            value = cur.fetchone()[0]
+        return int(value or 0)
+
+    def lease_delete_by_id(self, lease_id: str) -> None:
+        """Delete a lease's EXPLICIT rows only (review PRR-010).
+
+        Call rows that adopted the id share it while their mutation runs;
+        deleting them would strip a live call's cross-process exclusion
+        mid-flight."""
+        with self._lock:
+            self._begin()
+            try:
+                self._connect().execute(
+                    "DELETE FROM leases WHERE lease_id = ? AND kind = ?",
+                    (lease_id, "explicit"),
+                )
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+
+    def lease_delete_row(self, row_key: str) -> None:
+        """Delete exactly one row -- one vm_lock's own call row."""
+        with self._lock:
+            self._begin()
+            try:
+                self._connect().execute("DELETE FROM leases WHERE row_key = ?", (row_key,))
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+
+    def fence_bump(self, vm_key: str, scope: str) -> int:
+        """Next fencing token for (vm_key, scope): strictly increasing and
+        PERSISTED, so it survives a restart and cannot be re-issued to a stale
+        holder. The first token handed out for a pair is 1, never 0."""
+        with self._lock:
+            self._begin()
+            try:
+                con = self._connect()
+                con.execute(
+                    "INSERT INTO fence_counters (vm_key, scope, last_seq) VALUES (?,?,0) "
+                    "ON CONFLICT(vm_key, scope) DO NOTHING",
+                    (vm_key, scope),
+                )
+                con.execute(
+                    "UPDATE fence_counters SET last_seq = last_seq + 1 "
+                    "WHERE vm_key = ? AND scope = ?",
+                    (vm_key, scope),
+                )
+                value = int(
+                    con.execute(
+                        "SELECT last_seq FROM fence_counters WHERE vm_key = ? AND scope = ?",
+                        (vm_key, scope),
+                    ).fetchone()[0]
+                )
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+        return value
+
+    def sweep_expired_leases(self, horizon: float) -> int:
+        """Delete lease rows whose expiry is more than `horizon` in the past.
+
+        Runs ONLY from open()'s path with the default clock, never from
+        _connect/__init__: a store opened later against a session using an
+        injected clock would otherwise reap that session's rows, whose
+        expires_at sits far in the (real-clock) past.
+        """
+        with self._lock:
+            self._begin()
+            try:
+                cur = self._connect().execute(
+                    "DELETE FROM leases WHERE expires_at < ?", (horizon,)
+                )
+                removed = cur.rowcount
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+        return int(removed or 0)
 
 
 def _is_unc(path: str) -> bool:
@@ -736,6 +1093,19 @@ def open(path: str) -> Store:
             with store._lock:  # noqa: SLF001 - open() owns construction
                 store._begin()  # noqa: SLF001
                 try:
+                    if found == SCHEMA_VERSION and not _tables_present(con):
+                        # A store claiming the CURRENT version with none of
+                        # its tables is corrupt (hand-stamped, truncated
+                        # restore, ...). Refuse naming both versions, like
+                        # the newer-store refusal, rather than letting the
+                        # recovery read fail with a bare "no such table".
+                        store.close()
+                        raise StateStoreError(
+                            f"state store schema version {found} is newer "
+                            f"than its own tables (expected version "
+                            f"{SCHEMA_VERSION}, found an unversioned empty "
+                            f"store, oldest supported 1); refusing to open it"
+                        )
                     if found == 0:
                         # One transaction: the schema, the version write and
                         # recovery land together, so a concurrent opener never
@@ -745,7 +1115,30 @@ def open(path: str) -> Store:
                         for statement in _SCHEMA_STATEMENTS:
                             con.execute(statement)
                         con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                    elif 0 < found < SCHEMA_VERSION:
+                        # Issue #23: FORWARD MIGRATION. Without this branch a
+                        # store already at user_version 1 never receives the
+                        # v1->v2 tables, because open() only created the
+                        # schema when it found 0 -- every lease call would
+                        # then fail against an already-deployed store.
+                        # `PRAGMA user_version` is transactional, so a crash
+                        # here rolls the whole thing back and the next open
+                        # retries cleanly on a still-v1 database.
+                        #
+                        # A found version this build cannot migrate from
+                        # (older than the oldest migration, i.e. a v0 file
+                        # with user_version stamped but no tables) fails
+                        # LOUDLY here rather than stamping itself v2 over an
+                        # empty schema.
+                        _migrate_to(con, found)
                     _recover_locked(store)
+                    # Issue #23: expired-lease sweeping lives in store_for()
+                    # (first open per process, horizon = leases.max_ttl_s from
+                    # the caller's config), NOT here: open() has no Config, so
+                    # its horizon could not honor the operator's boundary, and
+                    # a sweep on this default-clock path would reap a
+                    # fake-clock session's rows (their expires_at sits in the
+                    # real past).
                     store._commit()  # noqa: SLF001
                 except BaseException:
                     store._rollback()  # noqa: SLF001
@@ -804,11 +1197,28 @@ def store_for(cfg: Config, environ: dict[str, str] | None = None) -> Store:
     """The process's Store for ``cfg``, cached by resolved path."""
     path = resolve_state_db_path(cfg, environ)
     with _stores_lock:
-        store = _stores.get(path)
-        if store is None:
+        found = _stores.get(path)
+        if found is None:
+            first_open = True
             store = open(path)
             _stores[path] = store
-        return store
+        else:
+            first_open = False
+            store = found
+    if first_open:
+        # Issue #23: sweep lease rows whose expiry lapsed more than one
+        # leases.max_ttl_s ago -- the plan's expired-vs-unknown boundary. Runs
+        # ONLY on the first open in this process (a cached hit would make every
+        # lease call pay a DELETE) and never inside open() itself, whose
+        # default clock would reap a fake-clock session's rows.
+        horizon = int(getattr(cfg.leases, "max_ttl_s", 3600) or 3600)
+        try:
+            store.sweep_expired_leases(store.now() - horizon)
+        except Exception:
+            # A sweep failure must never block the caller; the rows just live
+            # until the next first-open.
+            pass
+    return store
 
 
 def clear_store_cache_for_tests() -> None:

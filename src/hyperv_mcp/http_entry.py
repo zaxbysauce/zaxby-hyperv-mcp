@@ -307,6 +307,37 @@ def _handle_logon_task(
     return 0
 
 
+def load_controller_config() -> Config:
+    """The controller's effective startup config (issue #23).
+
+    Loads the config file/environment and then forces leases.required ON:
+    this process IS the shared controller -- several agents fan into it -- so
+    mutating calls require a valid lease by default. main() hands the result
+    straight to bootstrap(config=...); before that hand-off existed, the
+    adjusted copy was discarded by bootstrap's own re-load and the controller
+    silently ran with required-mode off.
+    """
+    cfg = Config.load()
+    return controller_leases_cfg(cfg)
+
+
+def controller_leases_cfg(cfg: Config) -> Config:
+    """The effective config for the SHARED CONTROLLER (issue #23).
+
+    Several agents fan into this one process, so mutating calls require a
+    valid lease by default: leases.required is forced ON here regardless of
+    the config file (a controller operator can still opt out by editing the
+    file AND running the raw server -- this entry point is the multi-agent
+    deployment, and its default is the safe one). HYPERV_MCP_LEASES_REQUIRED=1
+    forces it ON for a standalone server too (Config.load).
+    """
+    from dataclasses import replace as _dc_replace
+
+    if not cfg.leases.required:
+        return _dc_replace(cfg, leases=_dc_replace(cfg.leases, required=True))
+    return cfg
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="hyperv-mcp-http",
@@ -331,10 +362,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     ns = parser.parse_args(argv)
 
-    # Config loads FIRST: the token env-var name itself is configurable
-    # (http.token_env), so it cannot be resolved before the config exists.
     try:
-        cfg = Config.load()
+        cfg = load_controller_config()
     except ConfigError as exc:
         print(f"CONFIG ERROR: {exc}", file=sys.stderr)
         return 2
@@ -384,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if verifier is not None:
         configure_http_auth(verifier)
-    cfg = bootstrap()
+    cfg = bootstrap(config=cfg)
 
     host = ns.host or cfg.http.host
     port = ns.port or cfg.http.port

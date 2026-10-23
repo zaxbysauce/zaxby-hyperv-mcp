@@ -201,6 +201,15 @@ def _restore_bootstrap_module_globals():
         # a test reaching bootstrap leaks its vm_lock_wait_s into the rest of
         # the session (review CLEAN-note on PR #58).
         ("vmlocks", "_DEFAULT_WAIT_S"): getattr(_vl, "_DEFAULT_WAIT_S", 30.0),
+        # issue #23: bootstrap() wires the lease-row provider/resolvers into
+        # vmlocks. Without restoring them, a test that bootstraps leaves the
+        # provider pointing at its CFG in every later test -- masked today
+        # because CFG restores to None and vm_lock skips row work then, but
+        # any future test that leaves CFG set would silently route lockless
+        # tests through a real store.
+        ("vmlocks", "_store_provider"): getattr(_vl, "_store_provider", None),
+        ("vmlocks", "_scope_for_tool"): getattr(_vl, "_scope_for_tool", None),
+        ("vmlocks", "_agent_resolver"): getattr(_vl, "_agent_resolver", None),
         # issue #21: bootstrap() installs the reusable PS Direct session pool
         # when psdirect_session_reuse is on, which the default Config is. Without
         # restoring DEFAULT, every later guest-tool test in the session routes
@@ -219,6 +228,9 @@ def _restore_bootstrap_module_globals():
     _srv._bootstrapped = saved[("server", "_bootstrapped")]
     _srv.CFG = saved[("server", "CFG")]
     _vl._DEFAULT_WAIT_S = saved[("vmlocks", "_DEFAULT_WAIT_S")]
+    _vl._store_provider = saved[("vmlocks", "_store_provider")]
+    _vl._scope_for_tool = saved[("vmlocks", "_scope_for_tool")]
+    _vl._agent_resolver = saved[("vmlocks", "_agent_resolver")]
     _ps.DEFAULT = saved[("psdsessions", "DEFAULT")]
     _ps.set_worker_spawn(saved[("psdsessions", "_spawn_worker")])
 

@@ -56,6 +56,31 @@ def classify(exc: BaseException) -> str:
         return "credential"
     if isinstance(exc, VMBusy):
         return "busy"
+    # Issue #23: the lease taxonomy. EVERY LeaseError subclasses RuntimeError,
+    # so these arms must sit BEFORE the ValueError/TimeoutError/catch-all tail
+    # or every lease refusal would report "transport". Ordering, not just
+    # membership, decides the outcome (round-4 critic finding R4).
+    from .leases import (
+        LeaseConflict,
+        LeaseExpired,
+        LeaseFenced,
+        LeaseNotOwned,
+        LeaseRequired,
+        LeaseUnknown,
+    )
+
+    if isinstance(exc, LeaseConflict):
+        return "lease_conflict"
+    if isinstance(exc, LeaseRequired):
+        return "lease_required"
+    if isinstance(exc, LeaseUnknown):
+        return "lease_unknown"
+    if isinstance(exc, LeaseExpired):
+        return "lease_expired"
+    if isinstance(exc, LeaseFenced):
+        return "fenced"
+    if isinstance(exc, LeaseNotOwned):
+        return "lease_not_owned"
     from . import pswindows  # late import: errors -> media -> guestexec -> pswindows
 
     if isinstance(exc, pswindows.PowerShellBusy):
@@ -73,9 +98,15 @@ def classify(exc: BaseException) -> str:
 
 
 def retry_fields(error_class: str) -> tuple[bool, int | None]:
-    """Retry guidance for an error class: (retryable, retry_after_ms)."""
+    """Retry guidance for an error class: (retryable, retry_after_ms).
+
+    lease_conflict is retryable, but its retry_after_ms is ms-to-expiry and
+    only the exception carries it; envelope() fills it from the attribute
+    (the same shape VMBusy uses for waited_ms)."""
     if error_class == "busy":
         return True, BUSY_RETRY_MS
+    if error_class == "lease_conflict":
+        return True, None
     return False, None
 
 
@@ -108,6 +139,10 @@ def envelope(exc: BaseException) -> dict[str, Any]:
         "retryable": retryable,
         "retry_after_ms": retry_after_ms,
     }
+    if retry_after_ms is None and error_class == "lease_conflict":
+        attr = getattr(exc, "retry_after_ms", None)
+        if isinstance(attr, int) and attr >= 0:
+            out["retry_after_ms"] = attr
     holder = _holder_field(exc)
     if holder is not None:
         out["holder"] = holder

@@ -53,9 +53,10 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from typing import Any
 
 import anyio
 
@@ -397,6 +398,69 @@ def _feed_lock_wait(ms: int) -> None:
         collector.add_lock_wait(ms)
 
 
+# Issue #23: the cross-process half. When a store provider is wired (by
+# server.bootstrap), every vm_lock ALSO writes a short per-call lease row into
+# the shared state database, so two server processes sharing one
+# HYPERV_MCP_STATE_DB exclude each other on the same VM. With no provider the
+# row work is a NO-OP -- the in-process fast path is unchanged (frozen checks
+# C12/C13 call vm_lock with no bootstrap at all).
+_store_provider: Callable[[], Any] | None = None
+_scope_for_tool: Callable[[], str] | None = None
+_agent_resolver: Callable[[], str | None] | None = None
+
+
+def set_store_provider(provider: Callable[[], Any] | None) -> None:
+    """Wire (or unwire, with None) the shared state store provider."""
+    global _store_provider
+    _store_provider = provider
+
+
+def set_scope_resolver(resolver: Callable[[], str] | None) -> None:
+    """Wire the callback that maps the current tool to its lease scope."""
+    global _scope_for_tool
+    _scope_for_tool = resolver
+
+
+def set_agent_resolver(resolver: Callable[[], str | None] | None) -> None:
+    """Wire the callback that resolves the authenticated agent (or None)."""
+    global _agent_resolver
+    _agent_resolver = resolver
+
+
+def _vm_identity(key: object) -> str:
+    """The bare VM identity a lock key stands for.
+
+    A plain string IS the identity (a GUID, or vm_create's name). The console
+    dual-key `(vm_id, "console")` contributes its FIRST element only, so its
+    call row lands in the same namespace as every other row for that VM.
+    """
+    if isinstance(key, tuple):
+        return str(key[0]) if key else ""
+    return str(key)
+
+
+def _start_call_row_heartbeat(cfg: Any, row_key: str, ttl_s: int) -> threading.Timer:
+    """Re-arm one call row every ttl/3 until cancelled (review PRR-003).
+
+    Daemon timer: it never keeps the process alive, and a cancelled timer that
+    already fired at worst re-arms a row whose delete lands afterwards — the
+    delete wins because it runs last on the holder's own thread.
+    """
+
+    def _beat() -> None:
+        try:
+            from . import leases as _leases
+
+            _leases.touch_call_row(cfg, row_key, ttl_s)
+        except Exception:
+            pass  # a missed beat is retried on the next interval
+
+    timer = threading.Timer(max(1.0, ttl_s / 3.0), _beat)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
 @contextmanager
 def vm_lock(key: object, mode: str = "write", wait_s: float | None = None) -> Iterator[None]:
     """Hold the VM `key` in `mode` ("read" or "write") for the block.
@@ -430,8 +494,70 @@ def vm_lock(key: object, mode: str = "write", wait_s: float | None = None) -> It
     except VMBusy as exc:
         _feed_lock_wait(exc.waited_ms)
         raise
+    # Issue #23: the per-call cross-process row. This runs inside a try whose
+    # failure path RELEASES the lock just acquired: the enclosing try/finally
+    # below only STARTS after _acquire, so a raise here would otherwise wedge
+    # the in-process lock permanently.
+    row_key: str | None = None
+    row_ttl = 0
+    heartbeat: threading.Timer | None = None
+    if _store_provider is not None:
+        try:
+            from . import leases as _leases
+
+            cfg = _store_provider()
+            if cfg is not None:
+                agent = _agent_resolver() if _agent_resolver is not None else None
+                scope = _scope_for_tool() if _scope_for_tool is not None else "call"
+                # The cross-process check FIRST: if another process already
+                # holds this VM, refuse before writing anything. Contention
+                # with another process's CALL row raises VMBusy; contention
+                # with an EXPLICIT lease held by someone else raises
+                # LeaseConflict. Two classes on purpose (AC1 vs AC10).
+                _leases.check_call_row(cfg, _vm_identity(key), scope,
+                                       write_lock=(mode == "write"), agent=agent)
+                row_key, row_ttl = _leases.begin_call_row(
+                    cfg,
+                    _vm_identity(key),
+                    scope,
+                    write_lock=(mode == "write"),
+                    agent=agent,
+                    lease_id=_leases.presented_lease_id(),
+                )
+                # Review PRR-003: the call row used to carry the default TTL
+                # and never renew, so any call longer than ttl_s (a checkpoint
+                # restore legitimately runs ~900s against a 300s default)
+                # silently lost its cross-process exclusion mid-flight. A
+                # daemon heartbeat re-arms the row every ttl/3 for exactly as
+                # long as THIS thread holds the lock.
+                if row_ttl > 0:
+                    heartbeat = _start_call_row_heartbeat(
+                        cfg, row_key, row_ttl)
+        except BaseException:
+            lock.release(tid)
+            raise
     _feed_lock_wait(waited_ms)
     try:
         yield
     finally:
-        lock.release(tid)
+        if heartbeat is not None:
+            heartbeat.cancel()
+        if row_key is not None:
+            provider = _store_provider
+            try:
+                from . import leases as _leases
+
+                if provider is not None:
+                    try:
+                        _leases.end_call_row(provider(), row_key)
+                    except Exception:
+                        # Review PRR-018: a store error at exit must not
+                        # replace the tool's outcome (a successful mutation
+                        # reported as transport failure), and must not wedge
+                        # the in-process lock. The orphaned row expires with
+                        # its TTL (bounded by the sweep).
+                        pass
+            finally:
+                lock.release(tid)  # a store error must not wedge the lock
+        else:
+            lock.release(tid)

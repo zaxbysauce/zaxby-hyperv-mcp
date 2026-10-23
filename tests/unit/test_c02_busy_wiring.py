@@ -570,7 +570,7 @@ def test_check_env_renders_pool_busy_distinctly(monkeypatch, capsys):
     from hyperv_mcp.config import HyperVTarget
 
     cfg = Config(unrestricted=True, hyperv=HyperVTarget(host="nuc01"))
-    monkeypatch.setattr(server_module, "bootstrap", lambda: cfg)
+    monkeypatch.setattr(server_module, "bootstrap", lambda *a, **k: cfg)
     monkeypatch.setattr(server_module.pswindows, "run_ps", _raising_run_ps(
         pswindows.PowerShellBusy("pool saturated: 8 children; waited 60s")))
     monkeypatch.setattr(server_module.pswindows, "compose_remote",
