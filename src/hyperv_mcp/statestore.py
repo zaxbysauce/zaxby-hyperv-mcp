@@ -186,6 +186,17 @@ def _migrate_to(con: sqlite3.Connection, found: int) -> None:
                 f"state store schema version {version} has no migration to "
                 f"{SCHEMA_VERSION}; refusing to open it"
             )
+        # Review PRR-022 (asm-01): the migration content is SLICED from
+        # _SCHEMA_STATEMENTS, so it must stay coupled to the version it
+        # targets. The slice is valid only while the first two statements
+        # are exactly the v1 tables; this pin fails loudly the moment the
+        # tuple is reordered or a statement is inserted ahead of them.
+        for position, table in ((0, "jobs"), (1, "relays")):
+            if "CREATE TABLE IF NOT EXISTS " + table not in _SCHEMA_STATEMENTS[position]:
+                raise StateStoreError(
+                    f"state store migration pin broken: schema statement "
+                    f"{position} no longer creates {table}"
+                )
         # The migration is additive CREATE ... IF NOT EXISTS, so it must not
         # paper over a schema that is missing the versions BELOW it: a store
         # stamped `user_version=1` with no jobs/relays tables is corrupt, and
@@ -735,11 +746,55 @@ class Store:
                 self._rollback()
                 raise
 
-    def lease_delete_by_id(self, lease_id: str) -> None:
+    def lease_touch_if_live(self, row_key: str, now: float, expires_at: float) -> int:
+        """Touch ONLY a row that is still live at `now` (review PRR-009).
+
+        Returns the number of rows updated: 0 means the row lapsed between the
+        caller's read and this write, and the caller must report expiry rather
+        than silently resurrect it.
+        """
         with self._lock:
             self._begin()
             try:
-                self._connect().execute("DELETE FROM leases WHERE lease_id = ?", (lease_id,))
+                cur = self._connect().execute(
+                    "UPDATE leases SET expires_at = ? WHERE row_key = ? AND expires_at > ?",
+                    (expires_at, row_key, now),
+                )
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+        return int(cur.rowcount or 0)
+
+    def fence_last_explicit(self, vm_key: str, scope: str) -> int:
+        """The highest fencing token ever minted for (vm_key, scope) by an
+        EXPLICIT lease (review PRR-007).
+
+        Per-call rows bump the same counter, so a plain counter read would
+        fence every lease after its holder's first tool call; only explicit
+        grants -- the holder's own or a takeover's -- supersede a token."""
+        with self._lock:
+            cur = self._connect().execute(
+                "SELECT MAX(fencing_seq) FROM leases WHERE vm_key = ? AND scope = ?"
+                " AND kind = ?",
+                (vm_key, scope, "explicit"),
+            )
+            value = cur.fetchone()[0]
+        return int(value or 0)
+
+    def lease_delete_by_id(self, lease_id: str) -> None:
+        """Delete a lease's EXPLICIT rows only (review PRR-010).
+
+        Call rows that adopted the id share it while their mutation runs;
+        deleting them would strip a live call's cross-process exclusion
+        mid-flight."""
+        with self._lock:
+            self._begin()
+            try:
+                self._connect().execute(
+                    "DELETE FROM leases WHERE lease_id = ? AND kind = ?",
+                    (lease_id, "explicit"),
+                )
                 self._commit()
             except BaseException:
                 self._rollback()

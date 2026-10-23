@@ -300,7 +300,8 @@ start the VM, run a probe, collect output. Per-call locks cannot protect the
 gaps between those calls, and two separate server processes never saw each
 other's locks at all. Leases close both gaps.
 
-**Workflow:** `hyperv_lease_acquire(vm_name, scopes, ttl_s)` → pass the returned
+**Workflow:** `hyperv_lease_acquire(vm_name, scopes, ttl_s)` (`ttl_s` 0 or
+omitted means the configured default; above `max_ttl_s` is refused) → pass the returned
 `lease_id` + `fencing_token` on every subsequent mutating call →
 `hyperv_lease_renew(lease_id)` periodically (a heartbeat) →
 `hyperv_lease_release(lease_id)` when done. `hyperv_lease_list` shows the
@@ -371,9 +372,16 @@ authorizes an operation policy denies.
   rather than `lease_unknown`) until a sweep deletes them one `max_ttl_s`
   after expiry, on the store's first open per process.
 
-Upgrade note: enabling `leases.required` on a shared controller is a breaking
+Upgrade notes: enabling `leases.required` on a shared controller is a breaking
 change for clients that have not adopted leases — they will start receiving
-`lease_required`. That is the intended design for a multi-agent host.
+`lease_required`. That is the intended design for a multi-agent host. An OLDER
+binary cannot load a config file that contains the `leases` key at all
+(unknown config key at startup) — remove the key before downgrading.
+Anonymous leases (`--allow-anonymous`, or stdio where every caller is
+unattributed) are a supported posture: they provide mutual exclusion between
+processes but NO identity — any unattributed process that learns the lease id
+can use it, and two anonymous callers are indistinguishable to the ownership
+check. Attributed (bearer-token) callers get full identity binding.
 
 ## Durable state store
 
@@ -422,9 +430,12 @@ Lifecycle after a restart:
   credential error rather than silently substituting whatever credentials the
   environment now holds.
 
-The schema is versioned with `PRAGMA user_version` (this release sets 1) and
-migrations only go forward. A database written by a newer build is refused
-rather than silently corrupted.
+The schema is versioned with `PRAGMA user_version` (this release sets 2; a
+v1 database written by 0.4.x gains the lease tables automatically on first
+open — the migration is additive and transactional) and migrations only go
+forward. A database written by a newer build is refused rather than silently
+corrupted; conversely, an OLDER binary refuses any config file that contains
+the `leases` key (unknown config key) — remove the key or upgrade the binary.
 
 ## Configuration
 

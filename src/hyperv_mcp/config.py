@@ -414,6 +414,12 @@ class Config:
             f"ps_slot_dir={self.ps_slot_dir or '(derived default)'}",
             f"psdirect_session_reuse={self.psdirect_session_reuse}",
             f"state_db_path={self.state_db_path or '(derived default)'}",
+            # Issue #23 (review PRR-017): the lease posture is an enforcement
+            # axis -- operators must see it in the startup banner and
+            # --check-env without opening the config file.
+            f"leases.required={self.leases.required}",
+            f"leases.default_ttl_s={self.leases.default_ttl_s}",
+            f"leases.max_ttl_s={self.leases.max_ttl_s}",
         ]
         return "; ".join(lines)
 

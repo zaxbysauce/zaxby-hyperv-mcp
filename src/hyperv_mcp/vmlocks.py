@@ -439,6 +439,28 @@ def _vm_identity(key: object) -> str:
     return str(key)
 
 
+def _start_call_row_heartbeat(cfg: Any, row_key: str, ttl_s: int) -> threading.Timer:
+    """Re-arm one call row every ttl/3 until cancelled (review PRR-003).
+
+    Daemon timer: it never keeps the process alive, and a cancelled timer that
+    already fired at worst re-arms a row whose delete lands afterwards — the
+    delete wins because it runs last on the holder's own thread.
+    """
+
+    def _beat() -> None:
+        try:
+            from . import leases as _leases
+
+            _leases.touch_call_row(cfg, row_key, ttl_s)
+        except Exception:
+            pass  # a missed beat is retried on the next interval
+
+    timer = threading.Timer(max(1.0, ttl_s / 3.0), _beat)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
 @contextmanager
 def vm_lock(key: object, mode: str = "write", wait_s: float | None = None) -> Iterator[None]:
     """Hold the VM `key` in `mode` ("read" or "write") for the block.
@@ -476,7 +498,9 @@ def vm_lock(key: object, mode: str = "write", wait_s: float | None = None) -> It
     # failure path RELEASES the lock just acquired: the enclosing try/finally
     # below only STARTS after _acquire, so a raise here would otherwise wedge
     # the in-process lock permanently.
-    row_key = None
+    row_key: str | None = None
+    row_ttl = 0
+    heartbeat: threading.Timer | None = None
     if _store_provider is not None:
         try:
             from . import leases as _leases
@@ -492,7 +516,7 @@ def vm_lock(key: object, mode: str = "write", wait_s: float | None = None) -> It
                 # LeaseConflict. Two classes on purpose (AC1 vs AC10).
                 _leases.check_call_row(cfg, _vm_identity(key), scope,
                                        write_lock=(mode == "write"), agent=agent)
-                row_key = _leases.begin_call_row(
+                row_key, row_ttl = _leases.begin_call_row(
                     cfg,
                     _vm_identity(key),
                     scope,
@@ -500,6 +524,15 @@ def vm_lock(key: object, mode: str = "write", wait_s: float | None = None) -> It
                     agent=agent,
                     lease_id=_leases.presented_lease_id(),
                 )
+                # Review PRR-003: the call row used to carry the default TTL
+                # and never renew, so any call longer than ttl_s (a checkpoint
+                # restore legitimately runs ~900s against a 300s default)
+                # silently lost its cross-process exclusion mid-flight. A
+                # daemon heartbeat re-arms the row every ttl/3 for exactly as
+                # long as THIS thread holds the lock.
+                if row_ttl > 0:
+                    heartbeat = _start_call_row_heartbeat(
+                        cfg, row_key, row_ttl)
         except BaseException:
             lock.release(tid)
             raise
@@ -507,13 +540,23 @@ def vm_lock(key: object, mode: str = "write", wait_s: float | None = None) -> It
     try:
         yield
     finally:
+        if heartbeat is not None:
+            heartbeat.cancel()
         if row_key is not None:
             provider = _store_provider
             try:
                 from . import leases as _leases
 
                 if provider is not None:
-                    _leases.end_call_row(provider(), row_key)
+                    try:
+                        _leases.end_call_row(provider(), row_key)
+                    except Exception:
+                        # Review PRR-018: a store error at exit must not
+                        # replace the tool's outcome (a successful mutation
+                        # reported as transport failure), and must not wedge
+                        # the in-process lock. The orphaned row expires with
+                        # its TTL (bounded by the sweep).
+                        pass
             finally:
                 lock.release(tid)  # a store error must not wedge the lock
         else:

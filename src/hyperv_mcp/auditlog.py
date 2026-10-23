@@ -86,6 +86,7 @@ def log_operation(
     request_id: str | None = None,
     job_id: str | None = None,
     relay_id: str | None = None,
+    lease_ref: str | None = None,
     timing: dict | None = None,
 ) -> None:
     if _config is None:
@@ -113,6 +114,10 @@ def log_operation(
         "request_id": r(str(request_id)),
         "job_id": job_id if job_id is None else r(str(job_id)),
         "relay_id": relay_id if relay_id is None else r(str(relay_id)),
+        # Issue #23 (review PRR-012): a 16-hex-char lease-id PREFIX -- never
+        # the full handle -- so an operator can correlate lease audit rows
+        # without the log becoming a capability disclosure.
+        "lease_ref": (lease_ref if lease_ref is None else r(str(lease_ref))[:16]),
         # Per-call cost breakdown (issue #20): additive, so existing log
         # consumers keep reading duration_ms. A caller with no collector of its
         # own (the pre-body rejection writer) reports the honest zeroes.
@@ -155,6 +160,7 @@ class operation:  # noqa: N801 - context manager reads like a decorator
         category: str,
         job_id: str | None = None,
         relay_id: str | None = None,
+        lease_ref: str | None = None,
     ) -> None:
         self.tool = tool
         self.vm_name = vm_name
@@ -165,6 +171,7 @@ class operation:  # noqa: N801 - context manager reads like a decorator
         self.error_class = ""
         self.job_id = job_id
         self.relay_id = relay_id
+        self.lease_ref = lease_ref
         self.agent_id: str | None = None
         self.request_id: str = ""
         self._tool_token: object | None = None
@@ -232,6 +239,7 @@ class operation:  # noqa: N801 - context manager reads like a decorator
             request_id=self.request_id,
             job_id=self.job_id,
             relay_id=self.relay_id,
+            lease_ref=self.lease_ref,
             timing=timing,
         )
         return False  # never swallow

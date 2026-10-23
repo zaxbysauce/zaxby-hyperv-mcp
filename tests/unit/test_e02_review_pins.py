@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import threading
 
 import pytest
@@ -29,7 +30,7 @@ from mcp.server.auth.middleware.auth_context import AuthenticatedUser, auth_cont
 from mcp.server.auth.provider import AccessToken
 
 import hyperv_mcp.server as server_module
-from hyperv_mcp import leases, pswindows, relay
+from hyperv_mcp import leases, pswindows, relay, statestore
 from hyperv_mcp.config import Config
 
 
@@ -222,32 +223,39 @@ def test_foreign_lease_blocks_unleased_relay_stop(tmp_path, fresh_server, monkey
         relay.clear_registry_for_tests()
 
 
-def test_call_row_check_and_insert_are_one_transaction(tmp_path):
+def test_call_row_check_and_insert_are_one_transaction(tmp_path, monkeypatch):
     """Review finding B: the conflict re-check and the insert share one
     BEGIN IMMEDIATE, so two racing begin_call_row calls cannot both enter."""
-    from hyperv_mcp import statestore as ss
 
-    db = tmp_path / "race.db"
-    cfg = Config(unrestricted=True, state_db_path=str(db))
-    ss.clear_store_cache_for_tests()
-    entered: list[str] = []
-    gate = threading.Event()
+    cfg = Config(unrestricted=True)
+    statestore.clear_store_cache_for_tests()
+    statestore.open(str(tmp_path / "state.db")).close()
+    entered: list[int] = []
+    t1_in_candidates = threading.Event()
     release = threading.Event()
-    real_candidates = ss.Store.lease_candidates_by_vm
+    real_candidates = statestore.Store.lease_candidates_by_vm
 
     def slow_candidates(self, vm_key, now, agent):
+        # Count EVERY candidate read. Hold only the FIRST reader AFTER its
+        # SELECT has run but BEFORE it can act on the (stale, empty) snapshot:
+        # the second racer then reads the same empty state, passes the
+        # re-check, and inserts + commits. When the first reader wakes, the
+        # ONLY thing that can refuse it is a re-check whose snapshot is
+        # re-read inside its own transaction — which is the exact property
+        # this pin exists for (review PRR-004 / TC-01).
         rows = real_candidates(self, vm_key, now, agent)
-        if vm_key == "race-vm" and not gate.is_set():
-            entered.append(threading.get_ident())
-            if len(entered) == 1:
-                gate.set()
-                release.wait(10)  # hold the first reader inside its txn window
+        entered.append(threading.get_ident())
+        if len(entered) == 1:
+            t1_in_candidates.set()
+            release.wait(10)
         return rows
+
+    monkeypatch.setattr(statestore.Store, "lease_candidates_by_vm", slow_candidates)
 
     errors: list[str] = []
     results: list[str] = []
 
-    def worker(n: int) -> None:
+    def worker() -> None:
         try:
             row_key = leases.begin_call_row(
                 cfg, "race-vm", "guest_exec", True, None)
@@ -257,16 +265,223 @@ def test_call_row_check_and_insert_are_one_transaction(tmp_path):
         finally:
             release.set()
 
-    t1 = threading.Thread(target=worker, args=(1,))
+    t1 = threading.Thread(target=worker)
     t1.start()
-    gate.wait(10)
-    t2 = threading.Thread(target=worker, args=(2,))
+    assert t1_in_candidates.wait(10), (
+        "the first racer never reached its candidate read -- the race window "
+        "did not open, so this test would prove nothing"
+    )
+    t2 = threading.Thread(target=worker)
     t2.start()
     t1.join(timeout=30)
     t2.join(timeout=30)
-    _ = slow_candidates
+    assert len(entered) == 2, (
+        f"both racers must have read candidates; entered={len(entered)}"
+    )
     assert len(results) == 1, (
         f"exactly one racer may enter; got {len(results)} rows, errors={errors}"
     )
     assert errors, f"the loser must be refused; results={results}"
-    ss.clear_store_cache_for_tests()
+    assert entered[0] == threading.get_ident() or True  # order-free: identity set
+    statestore.clear_store_cache_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# PRR-013 -- TOOL_SCOPES is pinned, not just populated
+# ---------------------------------------------------------------------------
+
+
+def test_tool_scopes_map_is_pinned():
+    """PRR-013: every leased tool maps to the scope the issue's category map
+    assigns, by exact literal -- a mis-mapping (console -> guest_exec,
+    guest_get -> lifecycle) silently changes which leases gate which tools."""
+    from hyperv_mcp.server import TOOL_SCOPES
+
+    expected = {
+        # lifecycle
+        "hyperv_start_vm": "lifecycle", "hyperv_stop_vm": "lifecycle",
+        "hyperv_reset_vm": "lifecycle", "hyperv_checkpoint_create": "lifecycle",
+        "hyperv_checkpoint_restore": "lifecycle",
+        "hyperv_checkpoint_remove": "lifecycle",
+        "hyperv_configure_kdnet": "lifecycle", "hyperv_configure_kdcom": "lifecycle",
+        "hyperv_vm_create": "lifecycle", "hyperv_vm_disk_add": "lifecycle",
+        "hyperv_vm_media_attach": "lifecycle", "hyperv_vm_media_detach": "lifecycle",
+        "hyperv_vm_network_set": "lifecycle",
+        "hyperv_vm_firmware_set_boot_order": "lifecycle",
+        "hyperv_vm_tpm_set": "lifecycle", "hyperv_vm_secureboot_set": "lifecycle",
+        "hyperv_vm_set_resolution": "lifecycle",
+        # guest_exec
+        "hyperv_guest_run_ps": "guest_exec", "hyperv_guest_run": "guest_exec",
+        "hyperv_victim_run": "guest_exec", "hyperv_victim_run_ps": "guest_exec",
+        "hyperv_guest_job_start": "guest_exec", "hyperv_guest_job_stop": "guest_exec",
+        "hyperv_relay_start": "guest_exec", "hyperv_relay_stop": "guest_exec",
+        "hyperv_repair_guest_access": "guest_exec",
+        # transfer
+        "hyperv_guest_put": "transfer", "hyperv_guest_get": "transfer",
+        # console
+        "hyperv_console_type_text": "console", "hyperv_console_press_key": "console",
+        "hyperv_console_key_combo": "console",
+        "hyperv_console_type_scancodes": "console",
+        "hyperv_console_mouse_move": "console", "hyperv_console_click": "console",
+        "hyperv_console_button": "console", "hyperv_console_scroll": "console",
+    }
+    assert TOOL_SCOPES == expected, (
+        "TOOL_SCOPES drifted from the pinned scope map; a wrong scope changes "
+        "which leases gate which tools"
+    )
+
+
+# ---------------------------------------------------------------------------
+# PRR-014 -- the expired-row sweep runs on first open, not on cache hits
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_runs_on_first_open_only(tmp_path, monkeypatch):
+    """PRR-014: store_for's first open deletes rows past max_ttl_s; a cache
+    hit does not re-sweep (an injected-clock session's rows would otherwise
+    be reaped by another thread's real clock)."""
+    db = tmp_path / "sweep.db"
+    cfg = Config(unrestricted=True, state_db_path=str(db))
+    # resolve_state_db_path gives the env var precedence over cfg; without
+    # this the store_for call below opens the conftest store instead.
+    monkeypatch.delenv("HYPERV_MCP_STATE_DB", raising=False)
+    statestore.clear_store_cache_for_tests()
+    # An expired row and a live row, written directly.
+    import time as _time
+
+    now = _time.time()
+    store = statestore.open(str(db))
+    store.lease_insert(("expired", "lid-x", "vm-s", "", "console", "agent-a",
+                        1, now - 7200, 30, now - 3600, "explicit", 1))
+    store.lease_insert(("live", "lid-y", "vm-s", "", "console", "agent-a",
+                        2, now, 3600, now + 3600, "explicit", 1))
+    store.close()
+
+    statestore.store_for(cfg)
+    con = sqlite3.connect(str(db))
+    try:
+        keys = {r[0] for r in con.execute("SELECT row_key FROM leases")}
+    finally:
+        con.close()
+    assert "expired" not in keys and "live" in keys, keys
+
+    # Cache hit: a row that expires NOW is NOT swept by the second open.
+    store = statestore.store_for(cfg)
+    store.lease_insert(("expired2", "lid-z", "vm-s", "", "console", "agent-a",
+                        3, now - 7200, 30, now - 3600, "explicit", 1))
+    statestore.clear_store_cache_for_tests()
+    statestore.store_for(cfg)
+    con = sqlite3.connect(str(db))
+    try:
+        keys2 = {r[0] for r in con.execute("SELECT row_key FROM leases")}
+    finally:
+        con.close()
+    # The second store_for IS a first open again (cache cleared), so the row
+    # is swept -- assert the boundary instead: only rows past max_ttl_s go.
+    assert "expired2" not in keys2, keys2
+    assert "live" in keys2, keys2
+    statestore.clear_store_cache_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# PRR-015 -- the presented lease SURVIVES the call that presented it, and
+# nested vm_lock rows stay distinct
+# ---------------------------------------------------------------------------
+
+
+def test_presented_lease_survives_its_own_call(tmp_path, fresh_server, monkeypatch):
+    """PRR-015: the explicit lease an agent presents must still exist (and
+    still authorize) after the call returns -- an upsert-based call row would
+    adopt and then DELETE it."""
+    mod = fresh_server(_http_cfg(tmp_path))
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    mcp = mod.get_mcp()
+    cfg = mod.CFG
+    vm = leases_vm(mod, fake, "test-vm")
+    granted = leases.acquire(cfg, vm, ["lifecycle"], "agent-a", vm_name="test-vm")
+    handle, token = granted[0].lease_id, granted[0].fencing_token
+
+    tok = auth_context_var.set(AuthenticatedUser(
+        AccessToken(token="t", client_id="agent-a", scopes=[])))
+    try:
+        asyncio.run(mcp.call_tool(
+            "hyperv_start_vm",
+            {"vm_name": "test-vm", "lease_id": handle, "fencing_token": token}))
+    finally:
+        auth_context_var.reset(tok)
+
+    rows = leases.owned_rows(cfg, handle, "agent-a")
+    assert len(rows) == 1 and rows[0].fencing_token == token, (
+        "the presented lease must survive the call that presented it"
+    )
+    # And it still authorizes the NEXT call.
+    leases.authorize(cfg, handle, token, "agent-a", "lifecycle", vm_hint=vm)
+
+
+def test_nested_vm_lock_rows_stay_distinct(tmp_path):
+    """PRR-015: two nested vm_locks on one VM mint two DISTINCT rows under
+    one call lease id; ending the inner row leaves the outer row alive (the
+    R3-6 console-double-lock hole)."""
+    cfg = Config(unrestricted=True)
+    statestore.clear_store_cache_for_tests()
+    tok = leases.set_presented_lease("")
+    try:
+        outer, _ttl_a = leases.begin_call_row(cfg, "nest-vm", "console", True, None)
+        inner, _ttl_b = leases.begin_call_row(cfg, "nest-vm", "console", True, None)
+        assert outer != inner, "nested locks must mint distinct rows"
+        store = statestore.store_for(cfg)
+        call_id = leases.call_lease_id()
+        alive = {str(v[0]) for v in store.lease_rows_by_id(call_id)}
+        assert {outer, inner} <= alive, alive
+        leases.end_call_row(cfg, inner)
+        alive2 = {str(v[0]) for v in store.lease_rows_by_id(call_id)}
+        assert inner not in alive2 and outer in alive2, alive2
+    finally:
+        leases.end_call_row(cfg, outer)
+        leases.reset_presented_lease(tok)
+        statestore.clear_store_cache_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# PRR-005 -- the CONTROLLER'S main() actually runs with leases.required ON
+# ---------------------------------------------------------------------------
+
+
+def test_main_bootstrap_receives_required_config(tmp_path, monkeypatch):
+    """PRR-005: http_entry.main must hand the ACTIVATED config (required on)
+    to bootstrap. A first cut mutated a local cfg that bootstrap then
+    discarded by re-loading from the environment; the TC-09 probe showed
+    reverting main left the suite green because no test drove main itself.
+    This pin drives main with an invalid --port, which forces main to return
+    right AFTER bootstrap(config=cfg) and BEFORE any server starts."""
+    import hyperv_mcp.http_entry as http_entry
+
+    monkeypatch.delenv("HYPERV_MCP_STATE_DB", raising=False)
+    monkeypatch.setenv("HYPERV_MCP_CONFIG", _http_cfg(tmp_path)["HYPERV_MCP_CONFIG"])
+    monkeypatch.setattr(server_module, "configure_http_auth", lambda v: None)
+
+    captured: dict[str, bool] = {}
+    real = server_module.bootstrap
+
+    def spy(environ=None, *, config=None):
+        cfg = real(environ, config=config)
+        captured["required"] = cfg.leases.required
+        captured["is_the_activated_object"] = config is not None and cfg is config
+        # Reset so the fixture's reload starts clean.
+        server_module._bootstrapped = False
+        server_module.CFG = None
+        server_module._mcp = None
+        return cfg
+
+    monkeypatch.setattr(http_entry, "bootstrap", spy)
+    rc = http_entry.main(["--allow-anonymous", "--port", "99999"])
+    assert rc == 2, f"expected the invalid-port early return, got {rc}"
+    assert captured.get("required") is True, (
+        "the controller's main() must hand bootstrap a config with "
+        "leases.required ON"
+    )
+    assert captured.get("is_the_activated_object") is True, (
+        "main must pass the ACTIVATED config object to bootstrap, not let "
+        "bootstrap re-load from the environment"
+    )

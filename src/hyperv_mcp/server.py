@@ -446,8 +446,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return credentials.resolve_guest(u, p)
         return credentials.resolve_guest()
 
-    def _audit(tool: str, vm: str, category: str):
-        return auditlog.operation(tool=tool, vm_name=vm, category=category)
+    def _audit(tool: str, vm: str, category: str, lease_ref: str | None = None):
+        return auditlog.operation(tool=tool, vm_name=vm, category=category,
+                                  lease_ref=lease_ref)
 
     def _image_meta_content(result: dict) -> list:
         """evidence.capture_evidence result -> [ImageContent, TextContent].
@@ -2419,8 +2420,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         Scopes: lifecycle (exclusive against everything), guest_exec,
         transfer, console. Returns lease_id and fencing_token -- pass BOTH on
         every subsequent mutating call. The lease expires ttl_s seconds after
-        its last renew (default 300, max 3600) and is renewed by
-        hyperv_lease_renew. Release it with hyperv_lease_release when done.
+        its last renew (0 or omitted = the configured default, 300; max 3600)
+        and is renewed by hyperv_lease_renew. For a VM that does not exist yet
+        (hyperv_vm_create workflow) the lease keys on the raw NAME and does not
+        follow a rename. Release it with hyperv_lease_release when done.
         """
         wanted = list(scopes or [])
         if not vm_name and not vm_id:
@@ -2428,7 +2431,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         if not wanted:
             raise ValueError("scopes is required (at least one of: "
                              + ", ".join(leases.SCOPES) + ")")
-        with _audit("hyperv_lease_acquire", vm_name, "lease"):
+        with _audit("hyperv_lease_acquire", vm_name, "lease") as _lease_op:
             # PolicyDenied propagates unchanged (deny-all must stay "policy").
             # Only a RESOLUTION failure -- the VM does not exist yet -- falls
             # back to the name namespace, because hyperv_vm_create must be
@@ -2442,12 +2445,25 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             except Exception:
                 if vm_id:
                     raise
-                ref = vmident.VMRef(id=f"name:{vm_name}", name=vm_name)
+                # Review PRR-001: resolve can fail BEFORE the policy check
+                # (vmident validates the name string first), so the fallback
+                # must run the full screen itself -- checked-caller-name then
+                # vm_allowed -- or a deny-all host minted lease rows for an
+                # unvalidated caller-supplied string. Review PRR-008: the
+                # lease keys on the RAW name (no prefix) so it matches the
+                # call row hyperv_vm_create's vm_lock writes.
+                name_ref = str(vm_name or "")
+                vmident.checked_caller_name(name_ref)
+                policy.vm_allowed(_cfg(), name_ref)
+                ref = vmident.VMRef(id=name_ref, name=name_ref)
             granted = leases.acquire(
                 _cfg(), ref.id, wanted, auditlog.current_agent_id(),
                 ttl_s=(ttl_s or None),
                 vm_name=ref.name,
             )
+            # Review PRR-012: correlate the audit row with a 16-hex prefix —
+            # never the full handle.
+            _lease_op.lease_ref = granted[0].lease_id[:16]
             return {
                 "ok": True,
                 "vm_id": ref.id,
@@ -2484,7 +2500,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         does not expire mid-flight and another agent takes the VM over. A
         lease whose TTL lapsed reports "lease_expired" and must be re-acquired.
         """
-        with _audit("hyperv_lease_renew", "", "lease"):
+        with _audit("hyperv_lease_renew", "", "lease", lease_ref=str(lease_id)[:16]):
             _owned_lease_or_invalid(lease_id)
             renewed = leases.renew(_cfg(), lease_id, auditlog.current_agent_id())
             return {"ok": True, **renewed.as_dict(reveal=True)}
@@ -2492,7 +2508,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     @mcp.tool()
     def hyperv_lease_release(lease_id: str) -> dict:
         """Release a lease you hold, so other agents can use the VM again."""
-        with _audit("hyperv_lease_release", "", "lease"):
+        with _audit("hyperv_lease_release", "", "lease", lease_ref=str(lease_id)[:16]):
             _owned_lease_or_invalid(lease_id)
             leases.release(_cfg(), lease_id, auditlog.current_agent_id())
             return {"ok": True, "released": True}
@@ -2509,8 +2525,16 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 ref = vmident.resolve(_cfg(), vm_name=vm_name, vm_id=vm_id)
                 rows = leases.list_leases(cfg, vm_id=ref.id)
             else:
+                # Review PRR-011: the unaddressed enumeration is policy-
+                # filtered per row, so a deny-all (or narrow-pattern) caller
+                # cannot enumerate leases on VMs it may not even see. vm_allowed
+                # is a pure config check -- no spawn.
                 ref = None
-                rows = leases.list_leases(cfg)
+                rows = [
+                    row for row in leases.list_leases(cfg)
+                    if row.holder_agent == agent
+                    or _row_vm_allowed(cfg, row)
+                ]
             return {
                 "ok": True,
                 "vm_id": ref.id if ref else "",
@@ -2559,6 +2583,15 @@ TOOL_SCOPES: dict[str, str] = {
 }
 
 
+def _row_vm_allowed(cfg: Config, row) -> bool:
+    """Whether a stored lease row's VM passes the caller's vm policy."""
+    try:
+        policy.vm_allowed(cfg, row.vm_name or row.vm_id)
+        return True
+    except policy.PolicyDenied:
+        return False
+
+
 def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]:
     """The pre-body lease check for a mutating tool (issue #23).
 
@@ -2594,6 +2627,17 @@ def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]
     vm_name = str(arguments.get("vm_name") or "")
     vm_name_hint = vm_name
     try:
+        # Review PRR-006: policy runs BEFORE any lease logic, matching
+        # vmident.resolve's own ordering (checked-caller-name then vm_allowed
+        # on the caller-supplied name, both before any spawn). Both are pure
+        # config checks -- no PowerShell. Without this, a policy-denied caller
+        # presenting a lease id got `lease_unknown` instead of `policy` (an
+        # existence oracle), which B1 confirmed by probe. A call that supplies
+        # neither name nor id cannot be screened here; the body's own
+        # resolution raises the authoritative invalid/policy error.
+        if vm_name:
+            vmident.checked_caller_name(vm_name)
+            policy.vm_allowed(cfg, vm_name)
         if lease_id:
             leases.authorize(cfg, lease_id, token, agent, scope,
                              vm_hint=vm_hint, vm_name_hint=vm_name_hint)
@@ -2645,14 +2689,19 @@ def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]
             # anything" case with no spawn. When it DOES find candidates, the
             # conflict decision still has to be made against the GUID-keyed
             # rows, so resolve the GUID (one spawn, paid only here) and
-            # re-check. Resolution failing defers to the tool body
-            # (disclosure 5): the body's own vm_lock re-checks with the
-            # resolved identity, so a resolution failure is not a bypass.
+            # re-check. Resolution failing means the VM does not exist (yet):
+            # the name-namespace rows ARE the authoritative identity for that
+            # case (review PRR-008 -- deferring here used to leave vm_create's
+            # lease with no gate at all), so probe by name and refuse on a
+            # hit. The body's own vm_lock re-checks with whatever identity it
+            # resolves.
             if not leases.candidates_exist_by_name(cfg, vm_name_hint, agent):
                 return None, None
             try:
                 ref = vmident.resolve(cfg, vm_name=vm_name)
             except Exception:
+                leases.assert_unleased(cfg, agent, scope,
+                                       vm_name_hint=vm_name_hint)
                 return None, None
             vm_hint = ref.id
         if vm_hint or vm_name_hint:
@@ -2660,6 +2709,8 @@ def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]
                                    vm_name_hint=vm_name_hint)
         return None, None
     except leases.LeaseError as exc:
+        return errors.envelope(exc), None
+    except policy.PolicyDenied as exc:
         return errors.envelope(exc), None
 
 

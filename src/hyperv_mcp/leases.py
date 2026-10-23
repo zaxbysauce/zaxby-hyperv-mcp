@@ -236,8 +236,11 @@ def matches_hint(row: _Row, vm_hint: str, vm_name_hint: str) -> bool:
     it; a caller who supplied only a name is matched on the name. With neither
     hint the caller has not identified a VM and every row is a candidate.
     """
+    # casefold on BOTH arms (review PRR-002): vmident stores the GUID
+    # lower-cased while a caller may present the canonical upper-case Hyper-V
+    # form, and Hyper-V names are case-preserving.
     if vm_hint:
-        return row.vm_key == vm_hint
+        return row.vm_key.casefold() == vm_hint.casefold()
     if vm_name_hint:
         return row.vm_name.casefold() == vm_name_hint.casefold()
     return True
@@ -399,15 +402,26 @@ def owned_rows(cfg: Config, lease_id: str, agent: str | None) -> list[_Row]:
 
 
 def renew(cfg: Config, lease_id: str, agent: str | None) -> Lease:
-    """Extend the lease by its OWN ttl, from now."""
-    live, expired, now = _owned_rows(cfg, lease_id, agent)
-    if expired:
-        raise LeaseExpired("that lease has expired and cannot be renewed")
+    """Extend the lease by its OWN ttl, from now.
+
+    The ownership/expiry read and the touch share ONE transaction (review
+    PRR-009): a lease that expires -- or is taken over -- between a read and a
+    later write used to be silently resurrected, producing two live leases on
+    one (vm, scope). The touch carries an `expires_at > now` predicate, so a
+    row that lapsed before the write is reported expired, not re-armed.
+    """
     store = _store(cfg)
     with store.transaction():
+        live, expired, now = _owned_rows(cfg, lease_id, agent)
+        if expired:
+            raise LeaseExpired("that lease has expired and cannot be renewed")
         deadline = now + int(live[0].ttl_s)
+        touched = 0
         for row in live:
-            store.lease_touch(row.row_key, deadline)
+            touched += store.lease_touch_if_live(row.row_key, now, deadline)
+        if touched == 0:
+            # Every row lapsed between the read and the write.
+            raise LeaseExpired("that lease has expired and cannot be renewed")
     return Lease(
         lease_id=lease_id, scope=live[0].scope, vm_id=live[0].vm_key,
         vm_name=live[0].vm_name, holder_agent=agent,
@@ -470,11 +484,24 @@ def authorize(
         # scope: report what it DOES cover, never its id or token.
         raise _conflict_from(live, now)
     row = covers[0]
-    if int(fencing_token) != int(row.fencing_token):
+    store = _store(cfg)
+    # Supersession fencing (review PRR-007): a token older than the highest
+    # EXPLICIT grant on this (vm, scope) is stale, whoever minted the newer
+    # one. Per-call rows bump the same counter and must never fence a lease,
+    # so only explicit grants count. Call rows carry a different token, so the
+    # exact-match selection below also cannot pick one (review PRR-019).
+    if int(fencing_token) < store.fence_last_explicit(row.vm_key, scope):
         raise LeaseFenced(
             "the presented fencing token for that lease is stale; it was "
             "superseded on this VM"
         )
+    matching = [r for r in covers if int(r.fencing_token) == int(fencing_token)]
+    if not matching:
+        raise LeaseFenced(
+            "the presented fencing token for that lease is stale; it was "
+            "superseded on this VM"
+        )
+    row = matching[0]
     if not matches_hint(row, vm_hint, vm_name_hint):
         raise LeaseConflict(
             "that lease is for a different VM",
@@ -561,7 +588,7 @@ def begin_call_row(
     agent: str | None,
     vm_name: str = "",
     lease_id: str | None = None,
-) -> str:
+) -> tuple[str, int]:
     """Insert this vm_lock's OWN call row and return its row_key.
 
     ALWAYS INSERTS a fresh row. It never upserts and never reuses: nested
@@ -603,7 +630,15 @@ def begin_call_row(
             (row_key, shared, vm_key, vm_name, scope, agent, token, now, ttl,
              now + ttl, statestore.LEASE_KIND_CALL, 1 if write_lock else 0)
         )
-    return row_key
+    # The ttl rides back to vm_lock, whose heartbeat keeps the row alive for
+    # as long as the holder's call actually runs (review PRR-003).
+    return row_key, ttl
+
+
+def touch_call_row(cfg: Config, row_key: str, ttl_s: int) -> None:
+    """Heartbeat one call row: re-arm its expiry one more ttl (review PRR-003)."""
+    store = _store(cfg)
+    store.lease_touch(row_key, store.now() + int(ttl_s))
 
 
 def end_call_row(cfg: Config, row_key: str) -> None:
