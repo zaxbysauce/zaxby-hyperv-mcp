@@ -303,7 +303,10 @@ def acquire(
     compatibility, bump each scope's persisted fencing counter, insert. Two
     takers therefore cannot both win.
     """
-    wanted = [str(s) for s in (scopes or [])]
+    # Dedupe preserving order (review minor D): a duplicated scope would mint
+    # two rows with two tokens under one lease id, and authorize -- reading
+    # covers[0] -- would fence the second token the response itself advertised.
+    wanted = list(dict.fromkeys(str(s) for s in (scopes or [])))
     if not wanted:
         raise ValueError("at least one scope is required")
     unknown = [s for s in wanted if s not in SCOPES]
@@ -390,9 +393,7 @@ def owned_rows(cfg: Config, lease_id: str, agent: str | None) -> list[_Row]:
     now = store.now()
     live = [_row(v) for v in store.lease_rows_by_id(lease_id)
             if float(v[_IDX["expires_at"]]) > now]
-    if live and all(r.holder_agent == agent for r in live) and any(live):
-        if agent is None:
-            return [] if live[0].holder_agent is not None else live
+    if live and all(r.holder_agent == agent for r in live):
         return live
     raise ValueError("unknown lease")
 
@@ -433,8 +434,16 @@ def list_leases(cfg: Config, vm_id: str = "", agent: str | None = None) -> list[
     """
     store = _store(cfg)
     now = store.now()
-    values = store.lease_rows_live(vm_id, now, agent) if vm_id else store.lease_rows_live("", now, agent)
-    return [_to_lease(_row(v)) for v in values if float(v[_IDX["expires_at"]]) > now]
+    # Listing is unfiltered by owner on purpose (the plan: "holder, scopes and
+    # expiry for all"); the TOOL layer reveals ids/tokens only for the caller's
+    # own leases. kind="call" rows are transient per-call state, not leases,
+    # so they are not listed.
+    values = store.lease_rows_live(vm_id, now, None)
+    return [
+        _to_lease(_row(v)) for v in values
+        if float(v[_IDX["expires_at"]]) > now
+        and v[_IDX["kind"]] == statestore.LEASE_KIND_EXPLICIT
+    ]
 
 
 def authorize(
@@ -568,12 +577,32 @@ def begin_call_row(
         shared = _new_id()
         _call_lease_id.set(shared)
     row_key = _new_id()
-    token = store.fence_bump(vm_key, scope)
     ttl = int(getattr(cfg.leases, "default_ttl_s", DEFAULT_TTL_S))
-    store.lease_insert(
-        (row_key, shared, vm_key, vm_name, scope, agent, token, now, ttl,
-         now + ttl, statestore.LEASE_KIND_CALL, 1 if write_lock else 0)
+    # ONE BEGIN IMMEDIATE covers the conflict re-check, the counter bump and
+    # the insert. A pre-flight check plus a later insert are two transactions:
+    # two processes can both pass the check before either inserts (review
+    # finding B -- probe-confirmed TOCTOU), and BEGIN IMMEDIATE is what makes
+    # the decision and the write one serialized unit.
+    mine = _Row(
+        row_key="", lease_id=shared, vm_key=vm_key, vm_name=vm_name,
+        scope=scope, holder_agent=agent, fencing_token=0, acquired_at=now,
+        ttl_s=ttl, expires_at=now + ttl, kind=statestore.LEASE_KIND_CALL,
+        write_lock=write_lock,
     )
+    with store.transaction():
+        live = [
+            _row(v) for v in store.lease_candidates_by_vm(vm_key, now, agent)
+            # The presented lease's own rows never block this call: a call row
+            # adopting it shares the id (predicate arm 2 would exempt it, but
+            # the candidate filter runs BEFORE any predicate).
+            if v[_IDX["lease_id"]] != shared
+        ]
+        _raise_call_conflict(_blocking(live, mine), vm_key, now)
+        token = store.fence_bump(vm_key, scope)
+        store.lease_insert(
+            (row_key, shared, vm_key, vm_name, scope, agent, token, now, ttl,
+             now + ttl, statestore.LEASE_KIND_CALL, 1 if write_lock else 0)
+        )
     return row_key
 
 
@@ -586,25 +615,14 @@ def reset_call_scope() -> None:
     _call_lease_id.set(None)
 
 
-def check_call_row(
-    cfg: Config, vm_key: str, scope: str, write_lock: bool, agent: str | None
-) -> None:
-    """Raise BEFORE the caller writes anything.
+def _raise_call_conflict(blocking: list[_Row], vm_key: str, now: float) -> None:
+    """Turn blocking rows into the right exception class.
 
     Contention with another CALL row is a plain busy VM (an in-flight operation
     elsewhere); contention with an EXPLICIT lease held by someone else is a
     lease conflict. The two classes stay distinct because callers act on them
     differently.
     """
-    store = _store(cfg)
-    now = store.now()
-    live = [_row(v) for v in store.lease_candidates_by_vm(vm_key, now, agent)]
-    mine = _Row(
-        row_key="", lease_id=_call_lease_id.get() or _presented_lease.get(), vm_key=vm_key,
-        vm_name="", scope=scope, holder_agent=agent, fencing_token=0, acquired_at=now,
-        ttl_s=0, expires_at=now, kind=statestore.LEASE_KIND_CALL, write_lock=write_lock,
-    )
-    blocking = _blocking(live, mine)
     if not blocking:
         return
     if all(r.kind == statestore.LEASE_KIND_CALL for r in blocking):
@@ -615,3 +633,23 @@ def check_call_row(
             "wait for it to finish before starting a conflicting one"
         )
     raise _conflict_from(blocking, now)
+
+
+def check_call_row(
+    cfg: Config, vm_key: str, scope: str, write_lock: bool, agent: str | None
+) -> None:
+    """Friendly PRE-flight check (nice error classes before any work).
+
+    NOT authoritative: the authoritative check runs inside begin_call_row's
+    single BEGIN IMMEDIATE, because a check here and an insert later are two
+    transactions and two processes can pass both (review finding B).
+    """
+    store = _store(cfg)
+    now = store.now()
+    live = [_row(v) for v in store.lease_candidates_by_vm(vm_key, now, agent)]
+    mine = _Row(
+        row_key="", lease_id=_call_lease_id.get() or _presented_lease.get(), vm_key=vm_key,
+        vm_name="", scope=scope, holder_agent=agent, fencing_token=0, acquired_at=now,
+        ttl_s=0, expires_at=now, kind=statestore.LEASE_KIND_CALL, write_lock=write_lock,
+    )
+    _raise_call_conflict(_blocking(live, mine), vm_key, now)

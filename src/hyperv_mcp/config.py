@@ -242,6 +242,13 @@ class Config:
         cfg = cls.from_dict(data)
         if env.get("HYPERV_MCP_UNRESTRICTED", "") in ("1", "true", "yes"):
             cfg = replace(cfg, unrestricted=True)
+        if env.get("HYPERV_MCP_LEASES_REQUIRED", "") in ("1", "true", "yes"):
+            # Issue #23: operator override for lease-required mode. The shared
+            # controller turns it on unconditionally (http_entry); this env var
+            # forces it ON for a standalone server too. It never forces it OFF
+            # for the controller -- set leases.required=false in the config for
+            # that.
+            cfg = replace(cfg, leases=replace(cfg.leases, required=True))
         # Issue #22: HYPERV_MCP_STATE_DB overrides the config-file key, exactly
         # as HYPERV_MCP_UNRESTRICTED overrides `unrestricted`; with neither, the
         # per-profile default applies. The store is always on — there is no

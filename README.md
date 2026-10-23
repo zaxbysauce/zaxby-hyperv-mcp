@@ -344,6 +344,24 @@ screenshots, status) never require a lease and are never blocked by one.
 Deny-by-default policy and `confirm` gates are unchanged: a lease never
 authorizes an operation policy denies.
 
+**Disclosed limits:**
+
+- A lease on a VM that does not exist yet (`hyperv_vm_create`, or acquiring
+  before first boot) is keyed by NAME in a distinct namespace; renaming the VM
+  right after creation splits that lease. GUID-keyed leases survive renames.
+- `hyperv_relay_start` / `hyperv_relay_stop` take no per-call VM lock (the
+  relay transport's own design), so their lease enforcement is guard-level
+  only. `relay_stop` resolves the VM from the relay's store row; if that row
+  is absent or owner-mismatched, the call is not lease-gated against a VM
+  (it is still owner-scoped, so a foreign agent cannot stop your relay).
+- The same store-row lookup covers `hyperv_guest_job_stop`; if the job row is
+  pruned the call is likewise not lease-gated against the VM.
+- When a caller supplies only `vm_name` and another agent's lease exists, the
+  guard resolves the name to its GUID (one PowerShell spawn, paid only when
+  candidate leases exist). If that resolution itself fails, the guard defers
+  and the tool body raises the authoritative identity error — a resolution
+  failure is never treated as "no lease held".
+
 Upgrade note: enabling `leases.required` on a shared controller is a breaking
 change for clients that have not adopted leases — they will start receiving
 `lease_required`. That is the intended design for a multi-agent host.

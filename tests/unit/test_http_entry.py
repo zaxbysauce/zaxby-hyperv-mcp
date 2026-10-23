@@ -39,7 +39,7 @@ class _FakeMcp:
 @pytest.fixture()
 def fake_server(monkeypatch):
     fake = _FakeMcp()
-    monkeypatch.setattr(http_entry, "bootstrap", lambda: http_entry.Config.load())
+    monkeypatch.setattr(http_entry, "bootstrap", lambda *a, **k: http_entry.Config.load())
     monkeypatch.setattr(http_entry, "get_mcp", lambda: fake)
     monkeypatch.setattr(http_entry, "configure_http_auth", lambda v: None)
     return fake

@@ -178,12 +178,21 @@ def _make_tool_limiter_lifespan(cap: int):
     return _tool_limiter_lifespan
 
 
-def bootstrap(environ: dict[str, str] | None = None) -> Config:
-    """Load config, wire modules, register tools. Idempotent."""
+def bootstrap(
+    environ: dict[str, str] | None = None, *, config: Config | None = None
+) -> Config:
+    """Load config, wire modules, register tools. Idempotent.
+
+    `config` (issue #23) lets an entry point that has already loaded and
+    ADJUSTED the config -- http_entry forces leases.required on for the shared
+    controller -- hand the adjusted object straight through. Without it the
+    adjusted copy was dead: bootstrap re-loaded from the environment and the
+    controller silently ran with required-mode off.
+    """
     global CFG, _mcp, _bootstrapped
     if _bootstrapped:
         return CFG  # type: ignore[return-value]
-    cfg = Config.load(environ)
+    cfg = config if config is not None else Config.load(environ)
     credentials.init(cfg)
     pswindows.init(cfg, credentials.redact)
     auditlog.init(cfg)
@@ -2550,7 +2559,7 @@ TOOL_SCOPES: dict[str, str] = {
 }
 
 
-def _lease_gate(name: str, arguments: dict) -> dict | None:
+def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]:
     """The pre-body lease check for a mutating tool (issue #23).
 
     Returns an ok:false envelope when the call is refused, else None. It reads
@@ -2564,19 +2573,39 @@ def _lease_gate(name: str, arguments: dict) -> dict | None:
     """
     scope = TOOL_SCOPES.get(name)
     if scope is None:
-        return None
+        return None, None
     cfg = _cfg()
     agent = auditlog.current_agent_id()
     lease_id = str(arguments.get("lease_id") or "")
-    token = arguments.get("fencing_token") or 0
+    raw_token = arguments.get("fencing_token") or 0
+    try:
+        token = int(raw_token)
+    except (TypeError, ValueError):
+        # MINOR-13: the gate returns an ENVELOPE, never raises. A malformed
+        # fencing_token used to escape the guard as a raw ValueError (the
+        # SDK validates types only after this gate runs).
+        env = {
+            "ok": False,
+            "error": "fencing_token must be an integer",
+            "error_class": "invalid",
+        }
+        return errors.enrich_failure(env), None
     vm_hint = str(arguments.get("vm_id") or "")
     vm_name = str(arguments.get("vm_name") or "")
     vm_name_hint = vm_name
     try:
         if lease_id:
-            leases.authorize(cfg, lease_id, int(token), agent, scope,
+            leases.authorize(cfg, lease_id, token, agent, scope,
                              vm_hint=vm_hint, vm_name_hint=vm_name_hint)
-            return None
+            # Issue #23 (review critical 2): present the lease to THIS call's
+            # body, so the per-call row the body's vm_lock writes ADOPTS the
+            # id instead of conflicting with the agent's own lease. Without
+            # this, an unattributed (stdio) caller holding a lease is refused
+            # by its OWN lease the moment it presents it. The ContextVar is
+            # copied into the worker thread that runs the body; the guard
+            # resets it in its finally.
+            reset_token = leases.set_presented_lease(lease_id)
+            return None, reset_token
         if getattr(cfg.leases, "required", False):
             env = {
                 "ok": False,
@@ -2586,12 +2615,18 @@ def _lease_gate(name: str, arguments: dict) -> dict | None:
                 ),
                 "error_class": "lease_required",
             }
-            return errors.enrich_failure(env)
+            return errors.enrich_failure(env), None
         # Unleased path. For id-addressed tools the store row supplies the VM
         # (round-3 MAJOR-6); resolution is deferred until candidates exist, so
         # a quiet system pays one indexed query and no spawn.
-        if not vm_hint and not vm_name_hint and name in ("hyperv_guest_job_stop",):
-            row_vm = guestjobs.peek_vm_id(arguments.get("job_id") or "", cfg,
+        if not vm_hint and not vm_name_hint and name in (
+            "hyperv_guest_job_stop", "hyperv_relay_stop",
+        ):
+            if name == "hyperv_guest_job_stop":
+                row_vm = guestjobs.peek_vm_id(arguments.get("job_id") or "", cfg,
+                                              owner=agent)
+            else:
+                row_vm = relay.peek_vm_id(arguments.get("relay_id") or "", cfg,
                                           owner=agent)
             vm_hint = row_vm or ""
         # The conflict comparison is GUID-keyed, so the caller's name is
@@ -2614,18 +2649,18 @@ def _lease_gate(name: str, arguments: dict) -> dict | None:
             # (disclosure 5): the body's own vm_lock re-checks with the
             # resolved identity, so a resolution failure is not a bypass.
             if not leases.candidates_exist_by_name(cfg, vm_name_hint, agent):
-                return None
+                return None, None
             try:
                 ref = vmident.resolve(cfg, vm_name=vm_name)
             except Exception:
-                return None
+                return None, None
             vm_hint = ref.id
         if vm_hint or vm_name_hint:
             leases.assert_unleased(cfg, agent, scope, vm_hint=vm_hint,
                                    vm_name_hint=vm_name_hint)
-        return None
+        return None, None
     except leases.LeaseError as exc:
-        return errors.envelope(exc)
+        return errors.envelope(exc), None
 
 
 def _harden_tools(mcp: MCPServer) -> None:
@@ -2764,7 +2799,7 @@ def _harden_tools(mcp: MCPServer) -> None:
             # because it fires before any tool body's audit region. MINOR-13:
             # a raised LeaseError would escape the enveloping try below and
             # fail the deny-all census's raised == [] assertion.
-            lease_env = _lease_gate(name, arguments or {})
+            lease_env, lease_reset = _lease_gate(name, arguments or {})
             if lease_env is not None:
                 return _audited_rejection(name, arguments, lease_env)
             try:
@@ -2785,6 +2820,13 @@ def _harden_tools(mcp: MCPServer) -> None:
                     logger.exception("tool %s raised an unexpected exception", name)
                 env = errors.envelope(cause if cause is not None else exc)
                 return _audited_rejection(name, arguments, env)
+            finally:
+                # Issue #23: the presented lease rides only THIS call. The
+                # reset must cover every exit (success, failure, rejection)
+                # or a stale lease id leaks into the next call on the same
+                # request context.
+                if lease_reset is not None:
+                    leases.reset_presented_lease(lease_reset)
 
         guard._unknown_arg_guard = True  # type: ignore[attr-defined]
         object.__setattr__(tool, "run", guard)

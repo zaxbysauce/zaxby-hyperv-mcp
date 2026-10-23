@@ -206,7 +206,6 @@ def _migrate_to(con: sqlite3.Connection, found: int) -> None:
                     f"state store schema version {version} is missing its "
                     f"{table} table; refusing to open it"
                 )
-        _ = _tables_present  # documented above; the v1 check is jobs/relays only
         for statement in statements:
             con.execute(statement)
         version += 1
@@ -1149,12 +1148,28 @@ def resolve_state_db_path(cfg: Config, environ: dict[str, str] | None = None) ->
 def store_for(cfg: Config, environ: dict[str, str] | None = None) -> Store:
     """The process's Store for ``cfg``, cached by resolved path."""
     path = resolve_state_db_path(cfg, environ)
+    store: Store | None = _stores.get(path)
     with _stores_lock:
         store = _stores.get(path)
-        if store is None:
+        first_open = store is None
+        if first_open:
             store = open(path)
             _stores[path] = store
-        return store
+    assert store is not None  # set on both paths above
+    if first_open:
+        # Issue #23: sweep lease rows whose expiry lapsed more than one
+        # leases.max_ttl_s ago -- the plan's expired-vs-unknown boundary. Runs
+        # ONLY on the first open in this process (a cached hit would make every
+        # lease call pay a DELETE) and never inside open() itself, whose
+        # default clock would reap a fake-clock session's rows.
+        horizon = int(getattr(cfg.leases, "max_ttl_s", 3600) or 3600)
+        try:
+            store.sweep_expired_leases(store.now() - horizon)
+        except Exception:
+            # A sweep failure must never block the caller; the rows just live
+            # until the next first-open.
+            pass
+    return store
 
 
 def clear_store_cache_for_tests() -> None:

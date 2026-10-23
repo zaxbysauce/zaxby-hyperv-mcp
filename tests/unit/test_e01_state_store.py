@@ -65,7 +65,7 @@ def _read_pragmas(path: str) -> tuple[str, int, int]:
 
 
 def test_store_schema_contract(tmp_path):
-    """C7 (AC7): open() yields a WAL database at user_version 1 with a
+    """C7 (AC7): open() yields a WAL database at user_version 2 with a
     busy_timeout of at least 5000 ms, and a database from a NEWER schema is
     refused with StateStoreError naming both versions and left BYTE-UNTOUCHED
     (PRR-011: the refusal path must never open a read-write connection,
@@ -225,3 +225,69 @@ def test_two_processes_share_store(tmp_path):
         con.close()
     assert job_rows == 50, job_rows
     assert relay_rows == 0, relay_rows
+
+
+def test_v1_store_migrates_forward_to_v2(tmp_path):
+    """Issue #23: an EXISTING v1 store (jobs + relays, user_version 1) gains
+    the leases + fence_counters tables and the version stamp on its first
+    open -- the forward migration the whole compatibility requirement rests
+    on. Without it every lease call would fail against an already-deployed
+    store, because open() only created schema when it found version 0.
+
+    RED at base (issue #22 tree): SCHEMA_VERSION is 1, so the hand-built v1
+    store opens unchanged and the assertion on version 2 fails; the lease
+    tables do not exist to be found.
+    """
+    import sqlite3
+
+    db = str(tmp_path / "v1.sqlite3")
+    con = sqlite3.connect(db)
+    try:
+        con.execute(
+            "CREATE TABLE jobs (job_id TEXT PRIMARY KEY, vm_name TEXT NOT NULL"
+            " DEFAULT '', vm_id TEXT NOT NULL DEFAULT '', pid INTEGER NOT NULL"
+            " DEFAULT 0, start_time_ticks INTEGER, job_dir TEXT NOT NULL"
+            " DEFAULT '', out_path TEXT NOT NULL DEFAULT '', err_path TEXT"
+            " NOT NULL DEFAULT '', exit_path TEXT NOT NULL DEFAULT '',"
+            " started_at TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT"
+            " 'starting' CHECK (state IN"
+            " ('starting','active','stopped','orphaned')), cred_ref TEXT NOT"
+            " NULL DEFAULT 'inline', owner TEXT)"
+        )
+        con.execute(
+            "CREATE TABLE relays (relay_id TEXT PRIMARY KEY, vm_name TEXT"
+            " NOT NULL DEFAULT '', vm_id TEXT NOT NULL DEFAULT '', guest_port"
+            " INTEGER NOT NULL DEFAULT 0, bind TEXT NOT NULL DEFAULT"
+            " '127.0.0.1', host_port INTEGER NOT NULL DEFAULT 0, started_at"
+            " TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'active'"
+            " CHECK (state IN ('active','stopped','interrupted')), cred_ref"
+            " TEXT NOT NULL DEFAULT 'inline', owner TEXT)"
+        )
+        con.execute("INSERT INTO jobs (job_id) VALUES ('pre-existing')")
+        con.execute("PRAGMA user_version=1")
+        con.commit()
+    finally:
+        con.close()
+
+    store = statestore.open(db)
+    try:
+        assert store.fence_bump("some-vm", "console") >= 1, (
+            "the migrated store must be immediately usable for leases"
+        )
+    finally:
+        store.close()
+
+    con = sqlite3.connect(db)
+    try:
+        version = con.execute("PRAGMA user_version").fetchone()[0]
+        tables = {
+            row[0] for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        jobs_left = con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    finally:
+        con.close()
+    assert version == statestore.SCHEMA_VERSION == 2, version
+    assert {"leases", "fence_counters"} <= tables, sorted(tables)
+    assert jobs_left == 1, "the migration must not disturb existing rows"

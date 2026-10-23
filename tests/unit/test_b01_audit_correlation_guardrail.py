@@ -50,7 +50,7 @@ class _FakeMcp:
 def verifier_capture(monkeypatch):
     fake = _FakeMcp()
     box = {"verifier": None}
-    monkeypatch.setattr(http_entry, "bootstrap", lambda: http_entry.Config.load())
+    monkeypatch.setattr(http_entry, "bootstrap", lambda *a, **k: http_entry.Config.load())
     monkeypatch.setattr(http_entry, "get_mcp", lambda: fake)
 
     def _capture(verifier):

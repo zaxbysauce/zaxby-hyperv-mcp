@@ -247,6 +247,32 @@ def clear_registry_for_tests() -> None:
         _shutdown_server(entry)
 
 
+def peek_vm_id(relay_id: str, cfg: Config | None = None,
+               owner: str | None = None) -> str:
+    """Owner-filtered vm_id read for the lease gate (issue #23).
+
+    Mirrors guestjobs.peek_vm_id: an unknown, foreign, or in-flight id reads
+    as "" (the call is then not lease-gated against a VM, which disclosure 4
+    records), and a store failure degrades to "" rather than raising — the
+    gate must never turn a store hiccup into a bypass or a crash.
+    """
+    key = relay_id or ""
+    with _relays_lock:
+        entry = _relays.get(key)
+    if entry is not None:
+        if (entry.get("owner") or None) != (owner or None):
+            return ""
+        return str(entry.get("vm_id") or "")
+    if cfg is not None:
+        try:
+            row = _store(cfg).relay_get(key)
+        except Exception:
+            return ""
+        if row is not None and (row.owner or None) == (owner or None):
+            return str(row.vm_id or "")
+    return ""
+
+
 def peek_vm_name(relay_id: str, cfg: Config | None = None,
                  owner: str | None = None) -> str:
     """Read-only vm_name lookup for audit rows (issue #10).
