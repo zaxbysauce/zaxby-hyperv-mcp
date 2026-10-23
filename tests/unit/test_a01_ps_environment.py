@@ -187,7 +187,7 @@ def test_child_env_carries_no_server_secrets(monkeypatch):
 
 def test_server_info_tool_registered():
     """AC3: a bootstrapped server registers hyperv_server_info and the tool
-    inventory counts exactly 57 tools."""
+    inventory counts exactly 61 tools."""
     mod = importlib.reload(server_module)
     try:
         mod.bootstrap({})
@@ -198,7 +198,7 @@ def test_server_info_tool_registered():
             f"{len(names)} tools, expected 61 including hyperv_server_info"
         )
         assert len(names) == 61, (
-            f"tool inventory is {len(names)} tools; expected exactly 57 "
+            f"tool inventory is {len(names)} tools; expected exactly 61 "
             "(60 existing tools plus hyperv_server_info)"
         )
     finally:

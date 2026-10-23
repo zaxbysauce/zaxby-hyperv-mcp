@@ -363,6 +363,13 @@ authorizes an operation policy denies.
   candidate leases exist). If that resolution itself fails, the guard defers
   and the tool body raises the authoritative identity error — a resolution
   failure is never treated as "no lease held".
+- A lease never bypasses policy or `confirm` gates, and read-only tools are
+  never gated. Note `hyperv_guest_get` is leased (scope `transfer`) because
+  the issue's scope map puts guest put/get together, even though `get` writes
+  only the HOST filesystem — the guest stays read-only to it.
+- Expired lease rows are retained (so a late `renew` reports `lease_expired`
+  rather than `lease_unknown`) until a sweep deletes them one `max_ttl_s`
+  after expiry, on the store's first open per process.
 
 Upgrade note: enabling `leases.required` on a shared controller is a breaking
 change for clients that have not adopted leases — they will start receiving
