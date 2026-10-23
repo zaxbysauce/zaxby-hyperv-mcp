@@ -43,6 +43,13 @@ def _state_store_in_tmp(monkeypatch, tmp_path):
 
     monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    # Issue #24: pin the PowerShell slot-pool directory into the per-test tmp
+    # too. The derived default reads %ProgramData% at call time, so without
+    # this every test shares ONE real pool under C:\ProgramData — a real-PS
+    # test's straggler child (the c02 kill tests, the b03 controller
+    # subprocess) holds its slot past the test's end and a later detached
+    # runner's guest leg waits out host_powershell_wait_s on it.
+    monkeypatch.setenv("ProgramData", str(tmp_path))
     yield
     statestore.clear_store_cache_for_tests()
 
@@ -217,7 +224,15 @@ def _restore_bootstrap_module_globals():
         # written against.
         ("psdsessions", "DEFAULT"): getattr(_ps, "DEFAULT", None),
         ("psdsessions", "_spawn_worker"): getattr(_ps, "_spawn_worker", None),
+        # issue #24: bootstrap() sizes the detached-runner semaphore and the
+        # tasks extension caches the config; operations also caches fingerprint
+        # keys per store path. Without this, one test's key/bound serves the
+        # next test's store.
+        ("server", "_RUNNER_SLOTS"): getattr(_srv, "_RUNNER_SLOTS", None),
     }
+    import hyperv_mcp.operations as _ops
+
+    _ops.reset_for_tests()
     _ps.set_worker_spawn(_no_spawn)
     yield
     _a._config = saved[("auditlog", "_config")]
@@ -233,4 +248,6 @@ def _restore_bootstrap_module_globals():
     _vl._agent_resolver = saved[("vmlocks", "_agent_resolver")]
     _ps.DEFAULT = saved[("psdsessions", "DEFAULT")]
     _ps.set_worker_spawn(saved[("psdsessions", "_spawn_worker")])
+    _srv._RUNNER_SLOTS = saved[("server", "_RUNNER_SLOTS")]
+    _ops.reset_for_tests()
 

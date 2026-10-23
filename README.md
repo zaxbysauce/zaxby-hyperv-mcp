@@ -437,6 +437,65 @@ forward. A database written by a newer build is refused rather than silently
 corrupted; conversely, an OLDER binary refuses any config file that contains
 the `leases` key (unknown config key) — remove the key or upgrade the binary.
 
+## Durable operation handles: detach, idempotency, and the event cursor (issue #24)
+
+The slow tools — start/stop/reset VM, checkpoint create/restore/remove,
+wait_vm_state, wait_guest_recovery, vm_create, and guest run/run_ps/put/get —
+accept two extra coordination arguments:
+
+- `detach: true` returns an operation handle (`{op_id, status: "working",
+  poll_interval_ms}`) immediately, after the policy/confirm/lease gates have
+  run synchronously and the op row is durably committed. A detached runner
+  thread executes the tool body holding the same VM lock and lease a
+  synchronous call would; the client polls `hyperv_op_status` and reads the
+  stored (redacted) result with `hyperv_op_result` (64 KiB pages,
+  resumable by cursor, byte-identical across restarts).
+- `idempotency_key` deduplicates retries: the same agent repeating the same
+  tool with the same key and arguments gets the stored result back marked
+  `replayed: true` — across server restarts too. The same key with different
+  arguments is refused with `error_class: "idempotency_conflict"`. Arguments
+  are stored only as an HMAC fingerprint (credential and coordination fields
+  excluded), never in plaintext.
+
+`hyperv_op_cancel` requests cooperative cancellation — the runner honours it
+at its next leg boundary; a crashed runner surfaces as `failed` with
+`error_class: "interrupted"` and a note that the VM-side outcome is unknown,
+never as a `working` that never ends. `hyperv_op_list` lists the calling
+agent's handles. Everything is scoped to the calling agent: another agent's
+(or an unknown) id answers exactly like an unknown id.
+
+Every state transition also appends to an event log read with
+`hyperv_events(after=<cursor>)`: op, lease, job, and relay transitions arrive
+in order with monotonic sequence numbers that survive retention pruning, so
+an agent can resume an event stream across restarts. A cursor older than the
+retention window answers `cursor_expired: true` with `oldest_cursor`.
+
+When an MCP client advertises the `io.modelcontextprotocol/tasks` capability
+per request (the 2026-07-28 protocol), the same durable ops are served as
+tasks: a detachable `tools/call` answers with a `CreateTaskResult`
+(`resultType: "task"`), and `tasks/get` / `tasks/cancel` / `tasks/update`
+drive it — `taskId` is the same id as `op_id`, so the `op_*` tools and the
+tasks methods are two views of one store row. Clients that do not advertise
+the capability get ordinary synchronous results.
+
+```jsonc
+{
+  "operations": {
+    "enabled": true,              // optional, default true
+    "retention_s": 86400,         // op/result retention
+    "idempotency_ttl_s": 86400,   // replay window; a later retry re-executes
+    "heartbeat_ttl_s": 60,        // runner liveness; lapse -> failed/interrupted
+    "runner_bound": 0,            // 0 = share max_host_powershell
+    "event_retention_s": 604800,
+    "event_max_rows": 10000,
+    "key_env": ""                 // env var carrying the fingerprint HMAC key
+  }
+}
+```
+
+Excess detached calls beyond `runner_bound` are refused with a retryable busy
+envelope, never queued without bound.
+
 ## Configuration
 
 No configuration file = **deny everything** (safe default; the server prints
@@ -937,7 +996,7 @@ claude mcp add hyperv -- hyperv-mcp
 
 ---
 
-## Available Tools (61 total)
+## Available Tools (66 total)
 
 Every registered tool in the tables below returns failures the same way:
 the one-envelope contract (`ok/error/error_class/retryable/retry_after_ms`,

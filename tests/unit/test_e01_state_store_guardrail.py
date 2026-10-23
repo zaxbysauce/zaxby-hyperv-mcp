@@ -64,6 +64,18 @@ _REQUIRED_LEASE_COLUMNS = {
     "fencing_seq", "acquired_at", "ttl_s", "expires_at", "kind", "write_lock",
 }
 _REQUIRED_FENCE_COLUMNS = {"vm_key", "scope", "last_seq"}
+# Issue #24. Same naming discipline: the argument fingerprint is `params_hmac`
+# and the dedup key `idem_key` (never *token*/*args*), and the stored result
+# is `result_json` (never *content*). Event payloads live in `data_json`.
+_REQUIRED_OPS_COLUMNS = {
+    "op_id", "agent", "tool", "vm_id", "vm_name", "status", "error_class",
+    "created_at", "updated_at", "runner", "heartbeat_at", "cancel_requested",
+    "params_hmac", "idem_key", "result_json", "result_size", "poll_interval_ms",
+}
+_REQUIRED_EVENT_COLUMNS = {
+    "seq", "ts", "agent", "kind", "ref_id", "vm_id", "data_json",
+}
+_REQUIRED_META_COLUMNS = {"key", "value"}
 
 
 def _is_resolution_leg(script: str) -> bool:
@@ -196,11 +208,16 @@ def test_store_schema_holds_no_secret_or_command_column(tmp_path):
     finally:
         con.close()
 
-    assert set(tables) >= {"jobs", "relays", "leases", "fence_counters"}, sorted(tables)
+    assert set(tables) >= {
+        "jobs", "relays", "leases", "fence_counters", "ops", "events", "meta",
+    }, sorted(tables)
     assert set(tables["jobs"]) == _REQUIRED_JOB_COLUMNS
     assert set(tables["relays"]) == _REQUIRED_RELAY_COLUMNS
     assert set(tables["leases"]) == _REQUIRED_LEASE_COLUMNS
     assert set(tables["fence_counters"]) == _REQUIRED_FENCE_COLUMNS
+    assert set(tables["ops"]) == _REQUIRED_OPS_COLUMNS
+    assert set(tables["events"]) == _REQUIRED_EVENT_COLUMNS
+    assert set(tables["meta"]) == _REQUIRED_META_COLUMNS
     for table, columns in tables.items():
         for column in columns:
             for fragment in _FORBIDDEN_COLUMN_FRAGMENTS:
@@ -700,7 +717,7 @@ def test_store_errors_name_the_directory_not_the_path(tmp_path):
     newer = tmp_path / "guardrail-newer.db"
     con = sqlite3.connect(str(newer))
     try:
-        con.execute("PRAGMA user_version = 2")
+        con.execute(f"PRAGMA user_version = {statestore.SCHEMA_VERSION + 1}")
         con.commit()
     finally:
         con.close()
@@ -709,8 +726,10 @@ def test_store_errors_name_the_directory_not_the_path(tmp_path):
     message = str(excinfo.value)
     assert str(newer) not in message, message
     assert str(tmp_path) not in message, message
-    # The refusal still names both versions (C7's clause).
-    assert "2" in message and "1" in message, message
+    # The refusal still names both versions (C7's clause), relative to the
+    # live schema version so the pin survives forward migrations.
+    assert str(statestore.SCHEMA_VERSION + 1) in message, message
+    assert str(statestore.SCHEMA_VERSION) in message, message
 
     # The makedirs site: a FILE squatting the parent-of-the-parent slot makes
     # directory creation fail with an OSError whose __str__ embeds the FULL

@@ -154,6 +154,26 @@ class LeasePolicy:
 
 
 @dataclass
+class OperationsPolicy:
+    """Durable operation handles (issue #24).
+
+    Every knob bounds a store-growth or admission axis so a misconfigured
+    deployment fails at startup rather than on the first detached call.
+    `key_env` names an env var carrying an operator-supplied fingerprint key;
+    when unset or empty the key is minted transactionally into the store's
+    meta table. The key material itself is never logged."""
+
+    enabled: bool = True
+    retention_s: int = 86400
+    idempotency_ttl_s: int = 86400
+    heartbeat_ttl_s: int = 60
+    runner_bound: int = 0
+    event_retention_s: int = 7 * 86400
+    event_max_rows: int = 10000
+    key_env: str = ""
+
+
+@dataclass
 class Config:
     allowed_vm_patterns: list[str] = field(default_factory=list)
     host_read_roots: list[str] = field(default_factory=list)
@@ -209,6 +229,9 @@ class Config:
     # shared controller, where several agents share one process. Appended last
     # for the same positional-compat reason as the fields above.
     leases: LeasePolicy = field(default_factory=LeasePolicy)
+    # Issue #24: durable operation handles (op rows, events, idempotency).
+    # Appended last for the same positional-compat reason as the fields above.
+    operations: OperationsPolicy = field(default_factory=OperationsPolicy)
 
     # -- loading ---------------------------------------------------------
 
@@ -420,6 +443,16 @@ class Config:
             f"leases.required={self.leases.required}",
             f"leases.default_ttl_s={self.leases.default_ttl_s}",
             f"leases.max_ttl_s={self.leases.max_ttl_s}",
+            # Issue #24: the durable-operations posture is an enforcement
+            # axis too. The fingerprint key material (key_env name aside) is
+            # deliberately never surfaced here.
+            f"operations.enabled={self.operations.enabled}",
+            f"operations.retention_s={self.operations.retention_s}",
+            f"operations.idempotency_ttl_s={self.operations.idempotency_ttl_s}",
+            f"operations.heartbeat_ttl_s={self.operations.heartbeat_ttl_s}",
+            f"operations.runner_bound={self.operations.runner_bound or self.max_host_powershell}",
+            f"operations.event_retention_s={self.operations.event_retention_s}",
+            f"operations.event_max_rows={self.operations.event_max_rows}",
         ]
         return "; ".join(lines)
 
@@ -569,6 +602,59 @@ class Config:
             raise ConfigError(f"leases.{name} must be between {low} and {high}")
         object.__setattr__(target, name, value)
 
+    def _set_operations(self, value: Any) -> None:
+        """Validate the optional operations section (issue #24).
+
+        Same startup-fail shape as _set_leases: every bound is checked at
+        load time so a bad deployment never reaches the first detached call.
+        """
+        if not isinstance(value, dict):
+            raise ConfigError("operations must be an object")
+        unknown = set(value) - {
+            "enabled", "retention_s", "idempotency_ttl_s", "heartbeat_ttl_s",
+            "runner_bound", "event_retention_s", "event_max_rows", "key_env",
+        }
+        if unknown:
+            raise ConfigError(
+                f"unknown operations key(s): {sorted(unknown)} — "
+                f"offending key: {sorted(unknown)[0]}"
+            )
+        ops = OperationsPolicy()
+        if "enabled" in value:
+            self._set_ops_bool_on(ops, "enabled", value["enabled"])
+        if "retention_s" in value:
+            self._set_ops_int_on(ops, "retention_s", value["retention_s"], 60, 30 * 86400)
+        if "idempotency_ttl_s" in value:
+            self._set_ops_int_on(ops, "idempotency_ttl_s", value["idempotency_ttl_s"], 60, 30 * 86400)
+        if "heartbeat_ttl_s" in value:
+            self._set_ops_int_on(ops, "heartbeat_ttl_s", value["heartbeat_ttl_s"], 5, 3600)
+        if "runner_bound" in value:
+            self._set_ops_int_on(ops, "runner_bound", value["runner_bound"], 0, 64)
+        if "event_retention_s" in value:
+            self._set_ops_int_on(ops, "event_retention_s", value["event_retention_s"], 60, 90 * 86400)
+        if "event_max_rows" in value:
+            self._set_ops_int_on(ops, "event_max_rows", value["event_max_rows"], 100, 1_000_000)
+        if "key_env" in value:
+            key_env = value["key_env"]
+            if not isinstance(key_env, str):
+                raise ConfigError("operations.key_env must be a string")
+            object.__setattr__(ops, "key_env", key_env.strip())
+        object.__setattr__(self, "operations", ops)
+
+    @staticmethod
+    def _set_ops_bool_on(target: Any, name: str, value: Any) -> None:
+        if not isinstance(value, bool):
+            raise ConfigError(f"operations.{name} must be a boolean")
+        object.__setattr__(target, name, value)
+
+    @staticmethod
+    def _set_ops_int_on(target: Any, name: str, value: Any, low: int, high: int) -> None:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(f"operations.{name} must be an integer")
+        if not low <= value <= high:
+            raise ConfigError(f"operations.{name} must be between {low} and {high}")
+        object.__setattr__(target, name, value)
+
 
 Config._FIELD_MAP = {  # type: ignore[attr-defined]
     "allowed_vm_patterns": lambda c, v: c._set_str_list("allowed_vm_patterns", v),
@@ -593,4 +679,5 @@ Config._FIELD_MAP = {  # type: ignore[attr-defined]
     "hyperv": lambda c, v: c._set_hyperv(v),
     "http": lambda c, v: c._set_http(v),
     "leases": lambda c, v: c._set_leases(v),
+    "operations": lambda c, v: c._set_operations(v),
 }

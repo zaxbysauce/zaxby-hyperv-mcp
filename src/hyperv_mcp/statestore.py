@@ -47,7 +47,7 @@ from typing import Any
 
 from .config import Config, default_state_db_path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 BUSY_TIMEOUT_MS = 5000
 
 # Lease scopes (issue #23). `lifecycle` is exclusive against every other
@@ -75,6 +75,27 @@ RELAY_ACTIVE = "active"
 RELAY_STOPPED = "stopped"
 RELAY_INTERRUPTED = "interrupted"
 RELAY_STATES = (RELAY_ACTIVE, RELAY_STOPPED, RELAY_INTERRUPTED)
+
+# Operation lifecycle (issue #24). The names are SEP-2663's task statuses;
+# `input_required` is reserved (this server never enters it). A crash must
+# surface as `failed` + error_class `interrupted` at READ time, never as a
+# `working` that never ends.
+OP_WORKING = "working"
+OP_INPUT_REQUIRED = "input_required"
+OP_COMPLETED = "completed"
+OP_FAILED = "failed"
+OP_CANCELLED = "cancelled"
+OP_TERMINAL_STATES = (OP_COMPLETED, OP_FAILED, OP_CANCELLED)
+OP_STATUSES = (OP_WORKING, OP_INPUT_REQUIRED, OP_COMPLETED, OP_FAILED, OP_CANCELLED)
+#: error_class recorded when a `working` op's heartbeat lapsed (AC5).
+OP_INTERRUPTED = "interrupted"
+
+# Issue #24 agent sentinel. Ops/events rows store the caller identity as
+# NOT NULL: an unattributed (stdio) caller is the empty string, never SQL
+# NULL, so the (agent, tool, idem_key) UNIQUE dedup index sees one key space
+# and no caller is exempt from another's ownership scope (the leases
+# "unattributed never exempt" property, expressed without NULL binding).
+_UNATTRIBUTED = ""
 
 # One statement per element: executescript() implicitly COMMITs a pending
 # transaction, which would make the schema and the user_version write two
@@ -147,22 +168,97 @@ _SCHEMA_STATEMENTS = (
         PRIMARY KEY (vm_key, scope)
     )
     """,
+    # -- v3 (issue #24): durable operation handles, event log, metadata. ----
+    # Column names avoid every guardrail-forbidden fragment (no *token* /
+    # *args* / *command* / *content* substrings): the argument fingerprint is
+    # `params_hmac` and the dedup key is `idem_key`, mirroring the fencing_seq
+    # rename precedent. `result_json` stores the redacted envelope only.
+    # The idempotency dedup is a PARTIAL unique index: rows without an
+    # idempotency key (idem_key = '') must never collide with each other, so
+    # the constraint applies only to keyed rows.
+    """
+    CREATE TABLE IF NOT EXISTS ops (
+        op_id TEXT PRIMARY KEY,
+        agent TEXT NOT NULL DEFAULT '',
+        tool TEXT NOT NULL,
+        vm_id TEXT NOT NULL DEFAULT '',
+        vm_name TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'working'
+            CHECK (status IN ('working','input_required','completed','failed','cancelled')),
+        error_class TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        runner TEXT NOT NULL DEFAULT '',
+        heartbeat_at REAL NOT NULL DEFAULT 0,
+        cancel_requested INTEGER NOT NULL DEFAULT 0,
+        params_hmac TEXT NOT NULL DEFAULT '',
+        idem_key TEXT NOT NULL DEFAULT '',
+        result_json TEXT,
+        result_size INTEGER NOT NULL DEFAULT 0,
+        poll_interval_ms INTEGER NOT NULL DEFAULT 2000
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ops_by_agent ON ops(agent, status)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ops_idem
+        ON ops(agent, tool, idem_key) WHERE idem_key <> ''
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS events (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        agent TEXT NOT NULL DEFAULT '',
+        kind TEXT NOT NULL,
+        ref_id TEXT NOT NULL DEFAULT '',
+        vm_id TEXT NOT NULL DEFAULT '',
+        data_json TEXT NOT NULL DEFAULT '{}'
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS events_by_agent ON events(agent, seq)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )
+    """,
 )
+
+# Statement positions the forward migrations depend on. Every migration is
+# SLICED from _SCHEMA_STATEMENTS, so each slice must stay coupled to the
+# version it targets: the pin tuples below fail loudly the moment a statement
+# is inserted, removed, or reordered anywhere the slices reach (review
+# PRR-022, extended to the v3 boundary by the plan-critic F5 finding).
+_SCHEMA_PIN_POSITIONS = (
+    (0, "jobs"),
+    (1, "relays"),
+    (2, "leases"),
+    (6, "fence_counters"),
+    (7, "ops"),
+    (10, "events"),
+    (12, "meta"),
+)
+_V1_STATEMENTS = (2, 7)
+_V3_STATEMENTS = (7, 13)
 
 # Forward-only migrations, applied inside open()'s single BEGIN IMMEDIATE.
 # Without this branch a store already at user_version 1 would never receive
 # the v1 -> v2 tables: open() only created the schema when it found 0
 # (issue #23 localization finding C7). Each entry is (from_version, statements).
+_V2_STATEMENTS = _SCHEMA_STATEMENTS[2:7]
+_V3_TABLE_STATEMENTS = _SCHEMA_STATEMENTS[7:13]
 _MIGRATIONS: dict[int, tuple[str, ...]] = {
-    1: (
-        *_SCHEMA_STATEMENTS[2:],
-    ),
+    1: _V2_STATEMENTS,
+    2: _V3_TABLE_STATEMENTS,
 }
 
 
 def _tables_present(con: sqlite3.Connection) -> bool:
     """Whether the current schema's tables all exist."""
-    for table in ("jobs", "relays", "leases", "fence_counters"):
+    for table in ("jobs", "relays", "leases", "fence_counters", "ops", "events", "meta"):
         present = con.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
         ).fetchone()
@@ -191,18 +287,37 @@ def _migrate_to(con: sqlite3.Connection, found: int) -> None:
         # targets. The slice is valid only while the first two statements
         # are exactly the v1 tables; this pin fails loudly the moment the
         # tuple is reordered or a statement is inserted ahead of them.
-        for position, table in ((0, "jobs"), (1, "relays")):
+        for position, table in _SCHEMA_PIN_POSITIONS:
             if "CREATE TABLE IF NOT EXISTS " + table not in _SCHEMA_STATEMENTS[position]:
                 raise StateStoreError(
                     f"state store migration pin broken: schema statement "
                     f"{position} no longer creates {table}"
                 )
+        if len(_SCHEMA_STATEMENTS) != _V3_STATEMENTS[1]:
+            raise StateStoreError(
+                "state store migration pin broken: the schema tuple must hold "
+                f"exactly {_V3_STATEMENTS[1]} statements at version {SCHEMA_VERSION}"
+            )
+        if _MIGRATIONS[1] != _V2_STATEMENTS or not _MIGRATIONS[1]:
+            raise StateStoreError(
+                "state store migration pin broken: the v1->v2 migration must be "
+                "exactly the v2 statements (leases .. fence_counters)"
+            )
+        if _MIGRATIONS[2] != _V3_TABLE_STATEMENTS or not _MIGRATIONS[2]:
+            raise StateStoreError(
+                "state store migration pin broken: the v2->v3 migration must be "
+                "exactly the v3 statements (ops .. meta)"
+            )
         # The migration is additive CREATE ... IF NOT EXISTS, so it must not
         # paper over a schema that is missing the versions BELOW it: a store
         # stamped `user_version=1` with no jobs/relays tables is corrupt, and
         # stamping it 2 over that would hide the corruption behind a clean
-        # version number.
-        for table in ("jobs", "relays"):
+        # version number. The same guard covers the v2 tables before the
+        # v2 -> v3 step (plan-critic F5).
+        required_below = ("jobs", "relays") if version == 1 else (
+            "jobs", "relays", "leases", "fence_counters",
+        )
+        for table in required_below:
             present = con.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
             ).fetchone()
@@ -425,6 +540,85 @@ _JOB_COLUMNS = (
 _RELAY_COLUMNS = (
     "relay_id, vm_name, vm_id, guest_port, bind, host_port, started_at, "
     "state, cred_ref, owner"
+)
+
+
+@dataclass(frozen=True)
+class OpRow:
+    """The persisted projection of a durable operation (issue #24).
+
+    Never carries a secret: arguments live only as a keyed fingerprint
+    (`params_hmac`), results only as the redacted envelope (`result_json`).
+    `agent` is the caller identity with the empty-string sentinel for an
+    unattributed caller, so the (agent, tool, idem_key) dedup index has one
+    key space."""
+
+    op_id: str
+    tool: str
+    agent: str = _UNATTRIBUTED
+    vm_id: str = ""
+    vm_name: str = ""
+    status: str = OP_WORKING
+    error_class: str = ""
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    runner: str = ""
+    heartbeat_at: float = 0.0
+    cancel_requested: int = 0
+    params_hmac: str = ""
+    idem_key: str = ""
+    result_json: str | None = None
+    result_size: int = 0
+    poll_interval_ms: int = 2000
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "op_id": self.op_id,
+            "tool": self.tool,
+            "agent": self.agent,
+            "vm_id": self.vm_id,
+            "vm_name": self.vm_name,
+            "status": self.status,
+            "error_class": self.error_class,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "runner": self.runner,
+            "heartbeat_at": self.heartbeat_at,
+            "cancel_requested": self.cancel_requested,
+            "params_hmac": self.params_hmac,
+            "idem_key": self.idem_key,
+            "result_json": self.result_json,
+            "result_size": self.result_size,
+            "poll_interval_ms": self.poll_interval_ms,
+        }
+
+
+def _row_to_op(values: tuple) -> OpRow:
+    return OpRow(
+        op_id=str(values[0]),
+        agent=str(values[1] or ""),
+        tool=str(values[2] or ""),
+        vm_id=str(values[3] or ""),
+        vm_name=str(values[4] or ""),
+        status=str(values[5] or OP_WORKING),
+        error_class=str(values[6] or ""),
+        created_at=float(values[7] or 0.0),
+        updated_at=float(values[8] or 0.0),
+        runner=str(values[9] or ""),
+        heartbeat_at=float(values[10] or 0.0),
+        cancel_requested=int(values[11] or 0),
+        params_hmac=str(values[12] or ""),
+        idem_key=str(values[13] or ""),
+        result_json=None if values[14] is None else str(values[14]),
+        result_size=int(values[15] or 0),
+        poll_interval_ms=int(values[16] or 2000),
+    )
+
+
+_OPS_COLUMNS = (
+    "op_id, agent, tool, vm_id, vm_name, status, error_class, created_at, "
+    "updated_at, runner, heartbeat_at, cancel_requested, params_hmac, "
+    "idem_key, result_json, result_size, poll_interval_ms"
 )
 
 
@@ -862,6 +1056,264 @@ class Store:
                 raise
         return int(removed or 0)
 
+    # -- ops (issue #24) ----------------------------------------------------
+
+    def op_insert(self, row: OpRow) -> None:
+        """Insert one op row. Raises StateStoreError on a duplicate op_id or a
+        conflicting (agent, tool, idem_key) UNIQUE key; callers that implement
+        idempotency consult find_idem FIRST inside the same transaction()."""
+        with self._lock:
+            self._begin()
+            try:
+                try:
+                    self._connect().execute(
+                        "INSERT INTO ops (" + _OPS_COLUMNS + ") "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            row.op_id, row.agent, row.tool, row.vm_id, row.vm_name,
+                            row.status, row.error_class, row.created_at,
+                            row.updated_at, row.runner, row.heartbeat_at,
+                            row.cancel_requested, row.params_hmac, row.idem_key,
+                            row.result_json, row.result_size, row.poll_interval_ms,
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise StateStoreError(f"op insert conflict: {exc}") from exc
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+
+    def op_get(self, op_id: str) -> OpRow | None:
+        with self._lock:
+            cur = self._connect().execute(
+                "SELECT " + _OPS_COLUMNS + " FROM ops WHERE op_id = ?", (op_id,)
+            )
+            values = cur.fetchone()
+        return None if values is None else _row_to_op(values)
+
+    def op_get_scoped(self, op_id: str, agent: str) -> OpRow | None:
+        """Ownership-scoped read: another principal's op answers like an
+        unknown id (AC8). `agent` uses the empty-string sentinel for an
+        unattributed caller, so plain equality is NULL-safe by construction."""
+        with self._lock:
+            cur = self._connect().execute(
+                "SELECT " + _OPS_COLUMNS + " FROM ops WHERE op_id = ? AND agent = ?",
+                (op_id, agent),
+            )
+            values = cur.fetchone()
+        return None if values is None else _row_to_op(values)
+
+    def op_find_idem(self, agent: str, tool: str, idem_key: str) -> OpRow | None:
+        """The idempotency consult for (agent, tool, idem_key). Must run inside
+        the caller's transaction() alongside op_insert so a concurrent retry
+        cannot pass the consult and lose the insert race (BEGIN IMMEDIATE
+        serializes both)."""
+        with self._lock:
+            cur = self._connect().execute(
+                "SELECT " + _OPS_COLUMNS + " FROM ops "
+                "WHERE agent = ? AND tool = ? AND idem_key = ?",
+                (agent, tool, idem_key),
+            )
+            values = cur.fetchone()
+        return None if values is None else _row_to_op(values)
+
+    def op_rows_by_agent(
+        self, agent: str, include_terminal: bool = False, limit: int = 200
+    ) -> list[OpRow]:
+        with self._lock:
+            if include_terminal:
+                cur = self._connect().execute(
+                    "SELECT " + _OPS_COLUMNS + " FROM ops WHERE agent = ? "
+                    "ORDER BY created_at ASC, op_id ASC LIMIT ?",
+                    (agent, int(limit)),
+                )
+            else:
+                cur = self._connect().execute(
+                    "SELECT " + _OPS_COLUMNS + " FROM ops WHERE agent = ? "
+                    "AND status NOT IN ('completed','failed','cancelled') "
+                    "ORDER BY created_at ASC, op_id ASC LIMIT ?",
+                    (agent, int(limit)),
+                )
+            values = cur.fetchall()
+        return [_row_to_op(v) for v in values]
+
+    def op_transition(
+        self,
+        op_id: str,
+        from_statuses: tuple[str, ...],
+        to_status: str,
+        *,
+        error_class: str = "",
+        result_json: str | None = None,
+        result_size: int = 0,
+        updated_at: float,
+    ) -> bool:
+        """Status move guarded on the current state; False when the row is no
+        longer in `from_statuses` (a lost race against cancel/recovery)."""
+        placeholders = ",".join("?" for _ in from_statuses)
+        with self._lock:
+            self._begin()
+            try:
+                cur = self._connect().execute(
+                    "UPDATE ops SET status = ?, error_class = ?, result_json = ?, "
+                    "result_size = ?, updated_at = ? "
+                    f"WHERE op_id = ? AND status IN ({placeholders})",
+                    (to_status, error_class, result_json, int(result_size),
+                     float(updated_at), op_id, *from_statuses),
+                )
+                moved = cur.rowcount
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+        return bool(moved)
+
+    def op_heartbeat(self, op_id: str, at: float) -> None:
+        with self._lock:
+            self._begin()
+            try:
+                self._connect().execute(
+                    "UPDATE ops SET heartbeat_at = ?, updated_at = ? WHERE op_id = ?",
+                    (float(at), float(at), op_id),
+                )
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+
+    def op_request_cancel(self, op_id: str, agent: str, at: float) -> int:
+        """Record a cooperative cancel request. Ownership-scoped like every
+        read: another principal's op_id is simply not found (0 rows)."""
+        with self._lock:
+            self._begin()
+            try:
+                cur = self._connect().execute(
+                    "UPDATE ops SET cancel_requested = 1, updated_at = ? "
+                    "WHERE op_id = ? AND agent = ?",
+                    (float(at), op_id, agent),
+                )
+                moved = cur.rowcount
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+        return int(moved or 0)
+
+    # -- events (issue #24) --------------------------------------------------
+
+    def event_append(
+        self, ts: str, agent: str, kind: str, ref_id: str, vm_id: str, data_json: str
+    ) -> int:
+        """Append one event; returns its AUTOINCREMENT seq (never reused after
+        a prune, which is what keeps cursors monotonic across restarts)."""
+        with self._lock:
+            self._begin()
+            try:
+                cur = self._connect().execute(
+                    "INSERT INTO events (ts, agent, kind, ref_id, vm_id, data_json) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (ts, agent, kind, ref_id, vm_id, data_json),
+                )
+                seq = cur.lastrowid
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+        return int(seq or 0)
+
+    def events_after(self, agent: str, after_seq: int, limit: int = 100) -> list[dict[str, Any]]:
+        """Agent-scoped events with seq strictly greater than `after_seq`, in
+        sequence order. `data_json` stays a string; the tool layer parses it."""
+        with self._lock:
+            cur = self._connect().execute(
+                "SELECT seq, ts, agent, kind, ref_id, vm_id, data_json FROM events "
+                "WHERE agent = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
+                (agent, int(after_seq), int(limit)),
+            )
+            values = cur.fetchall()
+        return [
+            {
+                "seq": int(v[0]),
+                "ts": str(v[1] or ""),
+                "agent": str(v[2] or ""),
+                "kind": str(v[3] or ""),
+                "ref_id": str(v[4] or ""),
+                "vm_id": str(v[5] or ""),
+                "data_json": str(v[6] or "{}"),
+            }
+            for v in values
+        ]
+
+    def events_oldest(self, agent: str) -> int | None:
+        """The oldest surviving seq for this agent (None when no events)."""
+        with self._lock:
+            cur = self._connect().execute(
+                "SELECT MIN(seq) FROM events WHERE agent = ?", (agent,)
+            )
+            values = cur.fetchone()
+        if not values or values[0] is None:
+            return None
+        return int(values[0])
+
+    def events_prune(self, older_than_ts: str, keep_rows: int) -> int:
+        """Retention: drop events older than the ISO timestamp, then cap the
+        table at `keep_rows` newest. Returns the number removed. Runs best-
+        effort from store_for()'s first-open sweep, never from open()."""
+        removed = 0
+        with self._lock:
+            self._begin()
+            try:
+                cur = self._connect().execute(
+                    "DELETE FROM events WHERE ts < ?", (older_than_ts,)
+                )
+                removed += int(cur.rowcount or 0)
+                cur = self._connect().execute(
+                    "DELETE FROM events WHERE seq NOT IN "
+                    "(SELECT seq FROM events ORDER BY seq DESC LIMIT ?)",
+                    (int(keep_rows),),
+                )
+                removed += int(cur.rowcount or 0)
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+        return removed
+
+    # -- meta (issue #24) ----------------------------------------------------
+
+    def meta_get(self, key: str) -> str | None:
+        with self._lock:
+            cur = self._connect().execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            )
+            values = cur.fetchone()
+        return None if values is None else str(values[0])
+
+    def meta_put(self, key: str, value: str) -> None:
+        with self._lock:
+            self._begin()
+            try:
+                self._connect().execute(
+                    "INSERT INTO meta (key, value) VALUES (?,?) "
+                    "ON CONFLICT(key) DO NOTHING",
+                    (key, value),
+                )
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+
+
+def _iso_timestamp(epoch: float) -> str:
+    """ISO-8601 UTC (millisecond) rendering of a store-clock epoch — the same
+    shape events.ts carries, so retention compares like with like."""
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(float(epoch), tz=timezone.utc).isoformat(
+        timespec="milliseconds"
+    )
+
 
 def _is_unc(path: str) -> bool:
     normalized = path.replace("\\", "/")
@@ -1217,6 +1669,19 @@ def store_for(cfg: Config, environ: dict[str, str] | None = None) -> Store:
         except Exception:
             # A sweep failure must never block the caller; the rows just live
             # until the next first-open.
+            pass
+        # Issue #24: prune the event log by age and row count on the same
+        # first-open-only, best-effort schedule. Idempotency-record expiry is
+        # enforced at consult time (operations.py), not swept here, so an
+        # injected-clock session's rows are never reaped by a real clock.
+        try:
+            cutoff = _iso_timestamp(store.now() - int(
+                getattr(cfg.operations, "event_retention_s", 7 * 86400) or 7 * 86400
+            ))
+            store.events_prune(cutoff, int(
+                getattr(cfg.operations, "event_max_rows", 10000) or 10000
+            ))
+        except Exception:
             pass
     return store
 

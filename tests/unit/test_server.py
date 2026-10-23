@@ -57,6 +57,9 @@ TOOL_NAMES = {
     # issue #23: the lease surface
     "hyperv_lease_acquire", "hyperv_lease_renew",
     "hyperv_lease_release", "hyperv_lease_list",
+    # issue #24: the durable-operation / event-cursor surface
+    "hyperv_op_status", "hyperv_op_result",
+    "hyperv_op_cancel", "hyperv_op_list", "hyperv_events",
 }
 CONFIRM_TOOLS = {
     "hyperv_stop_vm", "hyperv_reset_vm", "hyperv_checkpoint_restore",
@@ -91,7 +94,9 @@ def test_tool_inventory_registered(fresh_server):
     mod = fresh_server({})
     schemas = _schemas(mod)
     assert set(schemas) == TOOL_NAMES
-    assert len(schemas) == 61
+    # 61 through issue #23; 66 with issue #24's five op/event tools
+    # (AC4 checkpoint: tests/unit/test_e03_operations.py::test_op_tools_registered).
+    assert len(schemas) == 66
 
 
 def test_every_vm_tool_schema_has_vm_id(fresh_server):

@@ -122,6 +122,12 @@ if ([string]$vm.State -notin ({wanted_ps})) {{ exit 3 }}
 
 
 def _wait_for_state(cfg: Config, ref: vmident.VMRef, wanted: list[str], timeout_s: int) -> str:
+    # Issue #24: the state wait is the long leg after a restore; a detached
+    # op cancel-requested before it raises here (no-op for synchronous calls,
+    # which carry no op context).
+    from . import operations as _operations
+
+    _operations.raise_if_cancelled()
     result = _run(cfg, _wait_state_script(cfg, ref, wanted, timeout_s), timeout_s=timeout_s + 15)
     if result.timed_out:
         raise RuntimeError(f"hyperv state wait timed out for '{ref.name}'")
@@ -422,6 +428,13 @@ Restore-VMSnapshot -Name {cn} -VM (Get-VM -Id $vmTarget -ErrorAction Stop) -Conf
 """
         result = _run(cfg, script, timeout_s=300)
         pswindows.check_result(result, f"hyperv_checkpoint_restore({vm_name or vm_id}, {checkpoint_name})")
+        # Issue #24: cooperative cancel check at the leg boundary — a detached
+        # call that was cancel-requested while this leg ran stops HERE (the
+        # state wait ahead of it is the runner's next cooperative check point)
+        # instead of reporting a completed restore (frozen AC7/AC14).
+        from . import operations as _operations
+
+        _operations.raise_if_cancelled()
         _invalidate_sessions(ref.id, "checkpoint_restore")
         # Restoring a checkpoint whose subtree has descendants merges their
         # differencing disks; the VM can stay in transitional states for many

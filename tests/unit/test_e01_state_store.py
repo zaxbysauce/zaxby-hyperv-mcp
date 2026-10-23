@@ -89,10 +89,11 @@ def test_store_schema_contract(tmp_path):
         mode, version, _raw_timeout = _read_pragmas(path)
         assert mode.lower() == "wal"
         # Issue #23 moved the schema to version 2 (the leases +
-        # fence_counters tables). The migration is additive and forward-only:
-        # an existing v1 store migrates on open, and an OLDER build opening a
-        # v2 store is still refused byte-untouched.
-        assert version == 2
+        # fence_counters tables); issue #24 moved it to 3 (ops/events/meta).
+        # The migration is additive and forward-only: an existing store
+        # migrates on open, and an OLDER build opening a newer store is still
+        # refused byte-untouched.
+        assert version == statestore.SCHEMA_VERSION
 
         # busy_timeout is PER CONNECTION, so a raw sqlite3.connect cannot
         # observe what the store configured: Python's default timeout=5.0
@@ -139,11 +140,11 @@ def test_store_schema_contract(tmp_path):
     with pytest.raises(statestore.StateStoreError) as excinfo:
         statestore.open(newer)
     message = str(excinfo.value)
-    # Issue #23 moved the code's version to 2, so "newer than this build
-    # supports" now names 99 against 2 (the OLD build's refusal named 2
-    # against 1; the contract -- both numbers present -- is unchanged).
+    # Issue #23 moved the code's version to 2, issue #24 to 3, so "newer
+    # than this build supports" names 99 against the LIVE SCHEMA_VERSION
+    # (the contract -- both numbers present -- is unchanged).
     assert "99" in message
-    assert "2" in message
+    assert str(statestore.SCHEMA_VERSION) in message
     # Byte comparison FIRST: reading the pragmas below opens its own rw
     # connection, whose close would checkpoint the -wal and legitimately
     # change the bytes — the refusal itself must not have.
@@ -288,6 +289,6 @@ def test_v1_store_migrates_forward_to_v2(tmp_path):
         jobs_left = con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
     finally:
         con.close()
-    assert version == statestore.SCHEMA_VERSION == 2, version
+    assert version == statestore.SCHEMA_VERSION, version
     assert {"leases", "fence_counters"} <= tables, sorted(tables)
     assert jobs_left == 1, "the migration must not disturb existing rows"
