@@ -351,9 +351,11 @@ authorizes an operation policy denies.
   right after creation splits that lease. GUID-keyed leases survive renames.
 - `hyperv_relay_start` / `hyperv_relay_stop` take no per-call VM lock (the
   relay transport's own design), so their lease enforcement is guard-level
-  only. `relay_stop` resolves the VM from the relay's store row; if that row
-  is absent or owner-mismatched, the call is not lease-gated against a VM
-  (it is still owner-scoped, so a foreign agent cannot stop your relay).
+  only. `relay_stop` resolves the VM from the relay's in-memory
+  registry first, then the store row (both owner-filtered); if neither
+  yields a VM — unknown id, foreign owner — the call is not lease-gated
+  against a VM (it is still owner-scoped, so a foreign agent cannot stop
+  your relay).
 - The same store-row lookup covers `hyperv_guest_job_stop`; if the job row is
   pruned the call is likewise not lease-gated against the VM.
 - When a caller supplies only `vm_name` and another agent's lease exists, the

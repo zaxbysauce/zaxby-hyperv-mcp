@@ -159,12 +159,6 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
     ),
 }
 
-# How far past expiry a lease row must be before open()'s sweep deletes it.
-# Expired rows are RETAINED so a renew can still report "expired" rather than
-# "unknown"; this horizon is far beyond any renew that could still legitimately
-# target one (a lease's max TTL is an hour).
-_LEASE_SWEEP_HORIZON_S = 86400.0
-
 
 def _tables_present(con: sqlite3.Connection) -> bool:
     """Whether the current schema's tables all exist."""
@@ -1083,14 +1077,13 @@ def open(path: str) -> Store:
                         # empty schema.
                         _migrate_to(con, found)
                     _recover_locked(store)
-                    # Issue #23: sweep lease rows whose TTL lapsed long ago.
-                    # Only here, on open()'s default-clock path -- never from
-                    # _connect/__init__, which a later open() would run under
-                    # a session whose injected clock puts its rows in the real
-                    # past.
-                    store.sweep_expired_leases(  # noqa: SLF001 - open() owns construction
-                        store.now() - _LEASE_SWEEP_HORIZON_S  # noqa: SLF001
-                    )
+                    # Issue #23: expired-lease sweeping lives in store_for()
+                    # (first open per process, horizon = leases.max_ttl_s from
+                    # the caller's config), NOT here: open() has no Config, so
+                    # its horizon could not honor the operator's boundary, and
+                    # a sweep on this default-clock path would reap a
+                    # fake-clock session's rows (their expires_at sits in the
+                    # real past).
                     store._commit()  # noqa: SLF001
                 except BaseException:
                     store._rollback()  # noqa: SLF001
@@ -1148,14 +1141,15 @@ def resolve_state_db_path(cfg: Config, environ: dict[str, str] | None = None) ->
 def store_for(cfg: Config, environ: dict[str, str] | None = None) -> Store:
     """The process's Store for ``cfg``, cached by resolved path."""
     path = resolve_state_db_path(cfg, environ)
-    store: Store | None = _stores.get(path)
     with _stores_lock:
-        store = _stores.get(path)
-        first_open = store is None
-        if first_open:
+        found = _stores.get(path)
+        if found is None:
+            first_open = True
             store = open(path)
             _stores[path] = store
-    assert store is not None  # set on both paths above
+        else:
+            first_open = False
+            store = found
     if first_open:
         # Issue #23: sweep lease rows whose expiry lapsed more than one
         # leases.max_ttl_s ago -- the plan's expired-vs-unknown boundary. Runs
