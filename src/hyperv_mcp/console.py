@@ -1844,13 +1844,19 @@ def press_key(
     cfg: Config, vm_name: str = "", key: str = "", modifiers: list[str] | None = None, vm_id: str = "",
 ) -> dict:
     policy.require_category(cfg, "console_input", f"press {key} on '{vm_name}' console")
+    # A bare key press has no modifiers to hold, so it encodes through the
+    # plain key path — otherwise a modifier-named key (win, ctrl, ...) would
+    # be rejected by the combo builder as modifier-only (issue #25: a bare
+    # win press must reach the guest).
+    if not modifiers:
+        codes = _scancodes_for_key(key)
+    else:
+        codes = _scancodes_for_combo([key] + list(modifiers))
     be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
     if be is not None and ref is not None:
-        codes = _scancodes_for_combo([key] + list(modifiers or []))
         return _send_scancodes_locked(cfg, ref, codes, be=be, connect_ms=connect_ms)
     timing = _PsTiming()
     prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
-    codes = _scancodes_for_combo([key] + list(modifiers or []))
     return _send_scancodes_locked(cfg, ref, codes, timing=timing, prelude=prelude)
 
 

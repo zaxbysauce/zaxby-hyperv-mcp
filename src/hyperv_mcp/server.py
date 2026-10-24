@@ -1574,8 +1574,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         both x/y are given — (0,0) is a real coordinate and moves the pointer
         to the frame origin — else clicks at the current position when both
         are omitted; exactly one raises an error). Coordinates are in the
-        space of the image you observed; give frame_width/frame_height to
-        scale them. button: 1=left, 2=right. Verify placement with a
+        space of the image you observed; give frame_width/frame_height (the
+        snapshot dimensions) to scale them — without frame dims the head
+        resolution must be available, else the tool errors rather than
+        clicking blind. button: 1=left, 2=right. Verify placement with a
         screenshot between steps — never assume focus from a prior frame.
         Policy: console_input.
 

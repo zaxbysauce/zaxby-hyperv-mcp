@@ -66,14 +66,18 @@ def _capture(names) -> dict:
 # AC1-AC4: named-key vocabulary (DISCRIMINATING)
 # ---------------------------------------------------------------------------
 
-def test_windows_key_scancodes():
+def test_windows_key_scancodes(monkeypatch, unrestricted):
     """AC1: win/leftwin/rightwin/apps encode as the PS/2 set-1 GUI and
     Application keys — E0 before make and before break, win aliasing
     leftwin and menu aliasing apps with the SAME prefixed bytes. RED at
     base (names unknown), GREEN after the fix. The alias-equivalence
     asserts exist because the encoders read _EXTENDED_KEYS membership of
     the called name: an alias registered without its extended-set entry
-    would emit unprefixed bytes and fail the equality legs below."""
+    would emit unprefixed bytes and fail the equality legs below. The
+    final leg drives the press_key TOOL path with a bare win press (final
+    critic FC1): the combo builder rejects modifier-only input, so the
+    tool must encode a modifierless press through the plain key path —
+    4 codes emitted, the win byte sequence in the TypeScancodes chunk."""
     expected = {
         "win": [0xE0, 0x5B, 0xE0, 0xDB],
         "leftwin": [0xE0, 0x5B, 0xE0, 0xDB],
@@ -90,6 +94,18 @@ def test_windows_key_scancodes():
     )
     assert captured["menu"] == captured["apps"], (
         "F01-AC1-RED-AT-BASE: menu must alias apps bytes " + repr(captured)
+    )
+    fake = FakePS([
+        pswindows.PSResult(stdout="RC=0 CHUNK=1/1", returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = console.press_key(unrestricted, "vm1", "win")
+    assert out["scancodes_sent"] == 4, (
+        "F01-AC1-RED-AT-BASE: bare win press " + repr(out)
+    )
+    assert "$chunks = @(224,91,224,219)" in fake.scripts[-1], (
+        "F01-AC1-RED-AT-BASE: bare win press bytes "
+        + repr(fake.scripts[-1][-400:])
     )
 
 

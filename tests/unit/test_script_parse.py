@@ -396,6 +396,8 @@ def test_parse_console_mouse_ops(monkeypatch, parsed_ps):
         lambda: console.mouse_move(UNRESTRICTED, "vm1", 100, 50),
         lambda: console.mouse_move(UNRESTRICTED, "vm1", 100, 50, 640, 480),
         lambda: console.click(UNRESTRICTED, "vm1", 100, 50, 640, 480),
+        # issue #25: the origin IS a positional click and must parse too
+        lambda: console.click(UNRESTRICTED, "vm1", 0, 0, 640, 480),
         lambda: console.click(UNRESTRICTED, "vm1"),
         lambda: console.mouse_button(UNRESTRICTED, "vm1", 1, True),
         lambda: console.scroll(UNRESTRICTED, "vm1", 3),
