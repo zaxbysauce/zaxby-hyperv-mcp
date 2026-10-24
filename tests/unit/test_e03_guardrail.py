@@ -24,6 +24,8 @@ import json
 import sqlite3
 import threading
 
+import pytest
+
 import hyperv_mcp.server as server_module
 from hyperv_mcp import operations, pswindows, statestore
 
@@ -294,3 +296,101 @@ def test_events_and_ops_retention_sweeps(tmp_path):
         assert store.op_get("op-old-0") is None
     finally:
         store.close()
+
+
+def test_interceptor_slot_accounting_across_create_reattach_conflict(tmp_path):
+    """Review F1: the tasks interceptor's admission slot is restored on EVERY
+    no-runner exit — re-attach AND idempotency_conflict — so one conflict can
+    never permanently erode the runner bound. Drives the SHIPPED extension
+    instance with a fabricated per-request-capability context (the same
+    object bootstrap installed), not a lookalike."""
+    from types import SimpleNamespace
+
+    mod = _boot(tmp_path, {**UNRESTRICTED, "operations": {"runner_bound": 2}})
+    gate = threading.Event()
+    fake = _FakePS(gate=gate)
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(pswindows, "run_ps", fake)
+        mcp = mod.get_mcp()
+        ext = next(e for e in mcp._extensions
+                   if getattr(e, "identifier", "") == "io.modelcontextprotocol/tasks")
+        caps = SimpleNamespace(extensions={"io.modelcontextprotocol/tasks": {}})
+        ctx = SimpleNamespace(session=SimpleNamespace(client_capabilities=caps))
+
+        async def run_intercept(name, arguments):
+            params = SimpleNamespace(name=name, arguments=arguments)
+            return await ext.intercept_tool_call(params, ctx, None)
+
+        def slots_free() -> int:
+            return server_module._runner_slots()._value
+
+        assert slots_free() == 2
+        a = asyncio.run(run_intercept(
+            "hyperv_checkpoint_create",
+            {"vm_name": "test-vm", "checkpoint_name": "k1", "idempotency_key": "kap"}))
+        assert getattr(a, "task_id", ""), "A: expected a task handle"
+        assert slots_free() == 1, f"A: one gated runner holds one slot; free={slots_free()}"
+
+        b = asyncio.run(run_intercept(
+            "hyperv_checkpoint_create",
+            {"vm_name": "test-vm", "checkpoint_name": "k1", "idempotency_key": "kap"}))
+        assert b.task_id == a.task_id, "B: keyed repeat re-attaches"
+        # B acquired then released on the re-attach path: back to A's level
+        assert slots_free() == 1, f"B: re-attach restores the slot; free={slots_free()}"
+
+        c = asyncio.run(run_intercept(
+            "hyperv_checkpoint_create",
+            {"vm_name": "test-vm", "checkpoint_name": "DIFFERENT", "idempotency_key": "kap"}))
+        payload = json.loads(c.content[0].text)
+        assert payload.get("error_class") == "idempotency_conflict", json.dumps(payload)[:200]
+        assert slots_free() == 1, (
+            f"F1: a conflict refusal must restore the admission slot; free={slots_free()}"
+        )
+
+        d = asyncio.run(run_intercept(
+            "hyperv_checkpoint_create",
+            {"vm_name": "test-vm", "checkpoint_name": "k2", "detach": True}))
+        assert getattr(d, "task_id", ""), "D: a fresh detach is still admitted after the conflict"
+        assert slots_free() == 0, "D: the fresh gated runner holds the last slot"
+    finally:
+        gate.set()
+        monkey.undo()
+        operations.drain_for_tests(timeout_s=5.0)
+
+
+def test_preflight_refusal_answers_audited_envelope_both_param_shapes(tmp_path):
+    """Review F2: a detached call refused by the synchronous preflight answers
+    the ordinary ok:false envelope (error_class policy for a missing confirm,
+    invalid for a mistyped confirm) with ZERO op rows — never a raw escape —
+    and leaves the same audit record every other guard refusal writes."""
+    mod = _boot(tmp_path, UNRESTRICTED)
+    fake = _FakePS()
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(pswindows, "run_ps", fake)
+        mcp = mod.get_mcp()
+
+        refused = _call(mcp, "hyperv_checkpoint_restore",
+                        {"vm_name": "test-vm", "checkpoint_name": "snap"})
+        assert refused.get("ok") is False and refused.get("error_class") == "policy", (
+            f"F2: detach without confirm must answer the policy envelope; "
+            f"got {json.dumps(refused)[:300]}"
+        )
+        mistyped = _call(mcp, "hyperv_checkpoint_restore",
+                         {"vm_name": "test-vm", "checkpoint_name": "snap",
+                          "confirm": "banana"})
+        assert mistyped.get("ok") is False and mistyped.get("error_class") == "invalid", (
+            f"F2: a mistyped confirm must answer invalid; got {json.dumps(mistyped)[:300]}"
+        )
+        assert fake.count("Restore-VMSnapshot") == 0
+        statestore.clear_store_cache_for_tests()
+        store = statestore.store_for(mod.CFG)
+        try:
+            assert store.op_rows_by_agent("", include_terminal=True) == [], (
+                "F2: a refused detached call must mint no op row"
+            )
+        finally:
+            statestore.clear_store_cache_for_tests()
+    finally:
+        monkey.undo()

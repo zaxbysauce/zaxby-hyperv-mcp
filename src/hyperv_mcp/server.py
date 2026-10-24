@@ -3047,7 +3047,7 @@ def _harden_tools(mcp: MCPServer) -> None:
             lease_env, lease_reset = _lease_gate(name, arguments or {})
             if lease_env is not None:
                 return _audited_rejection(name, arguments, lease_env)
-            # Issue #24: durable-operation interception — idempotency replay
+            # Issue #24: durable-operation interception - idempotency replay
             # or conflict refusal, or the detach divert. Gates have already
             # run, so a denied call never reaches here and never mints an op
             # row. The runner's context copy happens inside the consult,
@@ -3055,12 +3055,26 @@ def _harden_tools(mcp: MCPServer) -> None:
             # below flows through the same reset (plan-critic F4).
             try:
                 tool_fn = _tool.fn
-                ops_response, ops_ctx = operations.guard_consult(
-                    _cfg(), name, dict(arguments or {}),
-                    tool_fn, _runner_slots,
-                    preflight=lambda: _operations_preflight(
-                        name, dict(arguments or {}), _tool),
-                )
+                try:
+                    ops_response, ops_ctx = operations.guard_consult(
+                        _cfg(), name, dict(arguments or {}),
+                        tool_fn, _runner_slots,
+                        preflight=lambda: _operations_preflight(
+                            name, dict(arguments or {}), _tool),
+                    )
+                except UrlElicitationRequiredError:
+                    raise
+                except Exception as preflight_exc:
+                    # Issue #24 (review F2): a preflight refusal
+                    # (confirm/category policy, VM policy, SDK argument
+                    # validation) is an ORDINARY audited rejection - the same
+                    # envelope shape the sync route and the tasks route answer
+                    # - never a raw escape, and it must leave the same audit
+                    # record every other guard refusal writes. (MINOR-13:
+                    # gates answer, they do not raise.)
+                    env = errors.envelope(
+                        preflight_exc.__cause__ or preflight_exc)
+                    return _audited_rejection(name, arguments, env)
                 if ops_response is not None:
                     if ops_response.get("ok") is False:
                         return _audited_rejection(name, arguments, ops_response)

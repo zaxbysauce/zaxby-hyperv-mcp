@@ -416,13 +416,34 @@ def complete_inline(op_ctx: dict[str, Any], result: Any) -> None:
         agent = str(op_ctx.get("agent") or "")
         store = store_for(cfg)
         text = _result_text(result)
-        store.op_transition(
-            op_ctx["op_id"], (statestore.OP_WORKING, statestore.OP_FAILED),
-            statestore.OP_COMPLETED,
-            result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
-            updated_at=store.now(),
-        )
-        emit(cfg, "op.completed", op_ctx["op_id"], "", agent, {"mode": "inline"})
+        # Same classification rule as the detached path (review round-2 Q1):
+        # a tool-level ok:false envelope is a FAILED op, not a completed one
+        # carrying a refusal.
+        error_class = ""
+        try:
+            parsed = json.loads(text) if text.startswith("{") else None
+            if isinstance(parsed, dict) and parsed.get("ok") is False:
+                error_class = str(parsed.get("error_class") or "transport")
+        except ValueError:
+            parsed = None
+        if error_class:
+            store.op_transition(
+                op_ctx["op_id"], (statestore.OP_WORKING, statestore.OP_FAILED),
+                statestore.OP_FAILED,
+                error_class=error_class,
+                result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
+                updated_at=store.now(),
+            )
+            emit(cfg, "op.failed", op_ctx["op_id"], "", agent,
+                 {"error_class": error_class, "mode": "inline"})
+        else:
+            store.op_transition(
+                op_ctx["op_id"], (statestore.OP_WORKING, statestore.OP_FAILED),
+                statestore.OP_COMPLETED,
+                result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
+                updated_at=store.now(),
+            )
+            emit(cfg, "op.completed", op_ctx["op_id"], "", agent, {"mode": "inline"})
     except Exception:
         pass
 
@@ -937,6 +958,11 @@ def tasks_extension(
                     if existing is not None:
                         existing = _classify_stale(store, existing, cfg)
                         if existing.params_hmac and existing.params_hmac != fingerprint:
+                            # Release the admission slot BEFORE the refusal:
+                            # the conflict path starts no runner, and a leaked
+                            # permit erodes BOTH routes forever (review F1).
+                            slots.release()
+                            released = True
                             return errors.failure_result(
                                 _conflict_envelope(params.name, idem_key))
                         slots.release()
