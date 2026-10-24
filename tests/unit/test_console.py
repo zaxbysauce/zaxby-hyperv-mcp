@@ -41,8 +41,11 @@ def _folded_size(script: str) -> tuple[int, int]:
 
 def _folded_position(script: str) -> tuple[int, int] | None:
     """The head-space position a folded positional-mouse script computes (the
-    in-script replica of console._scale_to_head)."""
+    in-script replica of console._scale_to_head). Returns None only when the
+    script carries no folded $x/$y leg at all; (0,0) is a real coordinate
+    (issue #25) and computes to head (0,0), never to 'no position'."""
     x = y = fw = fh = 0
+    seen = False
     for line in script.splitlines():
         ls = line.strip()
         for name in ("$x", "$y", "$fw", "$fh"):
@@ -50,6 +53,7 @@ def _folded_position(script: str) -> tuple[int, int] | None:
                 raw = ls.split("=", 1)[1].strip()
                 if raw.lstrip("-").isdigit():
                     val = int(raw)
+                    seen = True
                     if name == "$x":
                         x = val
                     elif name == "$y":
@@ -58,7 +62,7 @@ def _folded_position(script: str) -> tuple[int, int] | None:
                         fw = val
                     else:
                         fh = val
-    if x == 0 and y == 0:
+    if not seen:
         return None
     head = (1024, 768)
     if fw or fh:
@@ -668,13 +672,14 @@ def test_click_with_coordinates_positions_first(monkeypatch, unrestricted):
     assert "SetAbsolutePosition" in script and "ClickButton" in script
 
 
-def test_click_at_origin_skips_positioning(monkeypatch, unrestricted):
-    """x=0,y=0 means 'click at current position' — no SetAbsolutePosition."""
+def test_click_without_coordinates_skips_positioning(monkeypatch, unrestricted):
+    """No coordinates means click at current position — no SetAbsolutePosition.
+    RED-never/GREEN at base and stays GREEN after the fix."""
     fake = FakePS([pswindows.PSResult(stdout="e953c649-dcab-438d-9a54-3af74a82b624", returncode=0),
         pswindows.PSResult(stdout='{"horizontal": 1024, "vertical": 768}', returncode=0),
         pswindows.PSResult(stdout="RC=0 DOWN=1", returncode=0)])
     monkeypatch.setattr(pswindows, "run_ps", fake)
-    out = console.click(unrestricted, "vm1", 0, 0)
+    out = console.click(unrestricted, "vm1")
     assert "head_x" not in out and "head_y" not in out
     script = fake.scripts[-1]
     assert "SetAbsolutePosition" not in script

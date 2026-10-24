@@ -226,6 +226,17 @@ definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN <token>` — available from the next logon) and
 the task-spawned controller reads it from the environment.
 
+### 0.6.0 breaking changes
+
+- **`hyperv_console_click` coordinates:** `x`/`y` now default to `null`
+  instead of `0`, and `(0,0)` is a real coordinate that moves the pointer to
+  the frame origin. To click at the current pointer position, OMIT both
+  `x` and `y` (callers that passed `x=0, y=0` to mean "here" must drop the
+  arguments). Giving exactly one of `x`/`y` is now an error
+  (`ValueError: x and y must be given together`). There is no
+  compatibility shim (issue #25); the versioning-policy follow-up is
+  tracked as issue #67.
+
 ---
 
 ## Installation
@@ -1452,11 +1463,11 @@ unchanged result is exactly as informative about the request as a changed one.
 | `hyperv_console_screenshot` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `format?` (png\|jpeg/jpg\|webp), `quality?` (1..100), `scale?` (0,1], `crop?` ([left,top,right,bottom]), `if_changed_from?` (frame_hash) | MCP ImageContent + metadata text (`vm_id`, `frame_hash`, `head_resolution`, `scale_note`, `fallback_used`, `capture_method`, `captured_at`, `timings`, `width`, `height`, `vm_name`, `prefix_hex`, plus `format`/`quality`/`scale`/`crop`/`saved_format` only when those options were supplied) — metadata alone when `if_changed_from` matches |
 | `hyperv_console_get_display_info` | `vm_name` or `vm_id` | `{ok, enabled_state, head_horizontal, head_vertical, keyboard_present, keyboard_enabled, mouse_present, mouse_enabled, guest_channel, guest_channel_note, vm_id}` |
 | `hyperv_console_type_text` | `vm_name` or `vm_id`, `text` (ASCII) | `{ok, chunks, chars}` |
-| `hyperv_console_press_key` | `vm_name` or `vm_id`, `key`, `modifiers[]` | `{ok, scancodes_sent, chunks}` |
-| `hyperv_console_key_combo` | `vm_name` or `vm_id`, `keys[]` | `{ok, scancodes_sent, chunks}` |
+| `hyperv_console_press_key` | `vm_name` or `vm_id`, `key`, `modifiers[]` (ctrl/alt/shift, win) — keys: enter, escape, tab, backspace, space, up/down/left/right, delete, home, end, pageup, pagedown, insert, f1-f12, a-z, 0-9, punctuation (minus/equals/leftbracket/rightbracket/semicolon/apostrophe/grave/backslash/comma/period/slash, single-char aliases), numpad (num0-num9, numdecimal, nummultiply, numsubtract, numadd, numlock, numdivide, numenter), win/menu | `{ok, scancodes_sent, chunks}` |
+| `hyperv_console_key_combo` | `vm_name` or `vm_id`, `keys[]` — modifiers ctrl/alt/shift (incl. right- variants) and win, e.g. `["win","r"]` | `{ok, scancodes_sent, chunks}` |
 | `hyperv_console_type_scancodes` | `vm_name` or `vm_id`, `scancodes[]` (0..255) | `{ok, scancodes_sent, chunks}` |
 | `hyperv_console_mouse_move` | `vm_name` or `vm_id`, `x`, `y`, `frame_width?`, `frame_height?` | `{ok, operation, head_x, head_y}` |
-| `hyperv_console_click` | `vm_name` or `vm_id`, `x?=0`, `y?=0`, `frame_width?=0`, `frame_height?=0`, `button=1` | `{ok, operation, head_x?, head_y?}` |
+| `hyperv_console_click` | `vm_name` or `vm_id`, `x?`/`y?` (null default — omit both to click at the current position; (0,0) is a real coordinate), `frame_width?=0`, `frame_height?=0`, `button=1` | `{ok, operation, head_x?, head_y?}` |
 | `hyperv_console_button` | `vm_name` or `vm_id`, `button`, `is_down` | `{ok, operation}` |
 | `hyperv_console_scroll` | `vm_name` or `vm_id`, `delta` | `{ok, operation}` |
 | `hyperv_console_wait_frame_change` | `vm_name` or `vm_id`, `baseline_hash=""`, `width=640`, `height=480`, `timeout_s=60`, `interval_s=2` | list[ImageContent(image/png), TextContent({stop_reason: changed\|deadline, polls, elapsed_ms, frame_hash, hash_domain})] or deadline dict |

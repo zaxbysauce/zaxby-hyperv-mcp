@@ -587,8 +587,9 @@ class ConsoleWMI:
     def mouse_click(
         self, guid: str, button: int, hx: int | None = None, hy: int | None = None
     ) -> tuple[None, dict]:
-        """Move-then-click when hx/hy given; hx/hy None (both) means click at
-        the CURRENT position (the preserved click(0,0) contract)."""
+        """Move-then-click when hx/hy given (including (0,0), a real
+        coordinate); hx/hy None (both) means click at the CURRENT position
+        (the click-without-coordinates contract)."""
         if (hx is None) != (hy is None):
             raise ValueError("mouse_click requires both hx and hy, or neither")
         with _com_thread():

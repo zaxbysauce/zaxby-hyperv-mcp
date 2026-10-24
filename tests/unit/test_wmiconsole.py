@@ -122,19 +122,20 @@ class PSStub:
                                 fw = val
                             else:
                                 fh = val
-            if x or y:
-                if fw or fh:
-                    hx = round(x * 320 / fw) if fw else x
-                    hy = round(y * 240 / fh) if fh else y
-                else:
-                    hx, hy = x, y
-                hx = max(0, min(hx, 319))
-                hy = max(0, min(hy, 239))
-                return pswindows.PSResult(
-                    stdout="HEADX=" + str(hx) + "\n" + "HEADY=" + str(hy)
-                    + "\n" + "RC=0",
-                    returncode=0,
-                )
+            # (0,0) is a real coordinate (issue #25): a positional script
+            # always reports its computed head position, never 'no position'.
+            if fw or fh:
+                hx = round(x * 320 / fw) if fw else x
+                hy = round(y * 240 / fh) if fh else y
+            else:
+                hx, hy = x, y
+            hx = max(0, min(hx, 319))
+            hy = max(0, min(hy, 239))
+            return pswindows.PSResult(
+                stdout="HEADX=" + str(hx) + "\n" + "HEADY=" + str(hy)
+                + "\n" + "RC=0",
+                returncode=0,
+            )
         if "Msvm_VideoHead" in script:
             return pswindows.PSResult(
                 stdout='{"horizontal": 320, "vertical": 240}', returncode=0)
@@ -551,3 +552,16 @@ def test_c9_remote_dcom(monkeypatch):
     assert stub.scripts
     assert any("Invoke-Command" in s and "nuc01" in s for s in stub.scripts)
     assert meta["timings"]["transport"] == "powershell"
+
+
+def test_click_at_origin_ps_positions_pointer(monkeypatch, unrestricted_cfg):
+    """Issue #25 origin protocol: a positional click at (0,0) reports the
+    computed head origin (HEADX=0/HEADY=0) instead of silently skipping
+    positioning — the stub emits the computed position for every genuine
+    positional script, value-independent."""
+    _maybe_force_powershell(monkeypatch)
+    stub = _ps(monkeypatch)
+    out = console.click(unrestricted_cfg, "vm1", 0, 0,
+                        frame_width=640, frame_height=480)
+    assert out["head_x"] == 0 and out["head_y"] == 0
+    assert "SetAbsolutePosition" in stub.scripts[-1]

@@ -143,7 +143,7 @@ def test_ps2_mouse_fallback_live(it, ps_transport):
     assert ps_transport.count - before == 1
 
     before = ps_transport.count
-    out = console.click(cfg, gen1, 0, 0)
+    out = console.click(cfg, gen1)
     assert out["ok"] is True
     assert ps_transport.count - before == 1
 

@@ -362,7 +362,8 @@ def test_parse_console_keyboard_type_text(monkeypatch, parsed_ps):
 
 def test_parse_console_keyboard_press_key_all_variants(monkeypatch, parsed_ps):
     """Named keys (plain + extended 0xE0) and combos — every array shape."""
-    for key in ("enter", "escape", "space", "up", "delete", "f12", "a", "5"):
+    for key in ("enter", "escape", "space", "up", "delete", "f12", "a", "5",
+                "win", "numenter", "minus"):
         rec = Recorder()
         monkeypatch.setattr(pswindows, "run_ps", rec)
         try:
@@ -375,6 +376,15 @@ def test_parse_console_keyboard_press_key_all_variants(monkeypatch, parsed_ps):
     monkeypatch.setattr(pswindows, "run_ps", rec)
     try:
         console.key_combo(UNRESTRICTED, "vm1", ["ctrl", "alt", "delete"])
+    except Exception:
+        pass
+    for script in rec.scripts:
+        assert _parse_errors(script) == []
+    # issue #25: the Windows key as a combo modifier parses on the PS lane too
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        console.key_combo(UNRESTRICTED, "vm1", ["win", "r"])
     except Exception:
         pass
     for script in rec.scripts:
