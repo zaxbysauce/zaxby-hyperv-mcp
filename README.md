@@ -469,6 +469,10 @@ Every state transition also appends to an event log read with
 in order with monotonic sequence numbers that survive retention pruning, so
 an agent can resume an event stream across restarts. A cursor older than the
 retention window answers `cursor_expired: true` with `oldest_cursor`.
+`oldest_cursor` is the window-start watermark - the cursor of the oldest
+event that survived retention - not a resume token: resuming from it can
+skip events that landed between your cursor and the window start, so
+gap-free recovery re-reads from `after=""`.
 
 When an MCP client advertises the `io.modelcontextprotocol/tasks` capability
 per request (the 2026-07-28 protocol), the same durable ops are served as

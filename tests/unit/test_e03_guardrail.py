@@ -465,3 +465,68 @@ def test_sync_keyed_envelope_refusal_records_failed_with_event(tmp_path):
         assert row_ok is not None and row_ok.status == statestore.OP_COMPLETED
     finally:
         monkey.undo()
+
+
+def test_oldest_cursor_watermark_value_pinned(tmp_path):
+    """Final-critic FC-F1: the cursor_expired answer's oldest_cursor is the
+    CURSOR OF THE OLDEST SURVIVING EVENT (documented in README as a
+    window-start watermark, not a resume token). Pins its exact value so a
+    regression that shifts the watermark silently drops surviving events."""
+    import base64 as _b64
+
+    mod = _boot(tmp_path, UNRESTRICTED)
+    store = statestore.store_for(mod.CFG)
+    try:
+        # 5 events, then prune the 2 oldest (the retention sweep's own
+        # DELETE shape, as in the frozen AC9): the watermark must name seq 3
+        for i in range(5):
+            store.event_append("2026-01-01T00:00:00.000+00:00", "agent-w",
+                               "op.created", f"op-{i}", "", "{}")
+        con = sqlite3.connect(store.path)
+        try:
+            con.execute("DELETE FROM events WHERE seq IN (SELECT seq FROM events ORDER BY seq LIMIT 2)")
+            con.commit()
+        finally:
+            con.close()
+        expired = operations.events_read(mod.CFG, "agent-w",
+                                         operations._seq_to_cursor(2), 100)
+        assert expired.get("cursor_expired") is True
+        oldest_seq = int.from_bytes(
+            _b64.urlsafe_b64decode(expired["oldest_cursor"] + "=" * (-len(expired["oldest_cursor"]) % 4)),
+            "big")
+        assert oldest_seq == 3, (
+            f"FC-F1: oldest_cursor must name the oldest SURVIVING event (seq 3); "
+            f"got {oldest_seq}"
+        )
+    finally:
+        store.close()
+
+
+def test_in_flight_replay_carries_replayed_marker(tmp_path):
+    """Final-critic FC-F3: a keyed DETACH retry while the first op is still
+    working re-attaches to the live op and the handle payload carries
+    replayed: true (the _replay_response working-row branch)."""
+    mod = _boot(tmp_path, UNRESTRICTED)
+    gate = threading.Event()
+    fake = _FakePS(gate=gate)
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(pswindows, "run_ps", fake)
+        mcp = mod.get_mcp()
+        first = _call(mcp, "hyperv_checkpoint_create",
+                      {"vm_name": "test-vm", "checkpoint_name": "live",
+                       "detach": True, "idempotency_key": "fc-f3"})
+        assert first.get("op_id") and first.get("status") == "working"
+        retry = _call(mcp, "hyperv_checkpoint_create",
+                      {"vm_name": "test-vm", "checkpoint_name": "live",
+                       "detach": True, "idempotency_key": "fc-f3"})
+        assert retry.get("op_id") == first["op_id"], (
+            f"FC-F3: the retry must re-attach to the same op; got {json.dumps(retry)[:200]}"
+        )
+        assert retry.get("replayed") is True, (
+            f"FC-F3: the in-flight re-attach must carry replayed: true; "
+            f"got {json.dumps(retry)[:200]}"
+        )
+    finally:
+        gate.set()
+        operations.drain_for_tests(timeout_s=5.0)
