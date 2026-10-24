@@ -91,6 +91,69 @@ def _runner_slots() -> threading.BoundedSemaphore:
     return _RUNNER_SLOTS
 
 
+# Issue #24 (implementation-review R2/R13): the synchronous body gates a
+# detached call must pass BEFORE any op row exists. The bodies re-check
+# them anyway (they are pure functions of (cfg, confirm)); running them
+# here means a denied call never yields an op_id and a mistyped argument
+# (e.g. confirm: "banana", which pydantic-coercion would refuse on the sync
+# path) never reaches the detached body as truthy.
+_OPERATIONS_DESTRUCTIVE_GATES: dict[str, Callable[[Config, dict], None]] = {
+    "hyperv_stop_vm": lambda cfg, a: policy.require_destructive(
+        cfg, "stop", bool(a.get("confirm")),
+        f"stop VM '{a.get('vm_name') or a.get('vm_id')}'"),
+    "hyperv_reset_vm": lambda cfg, a: policy.require_destructive(
+        cfg, "reset", bool(a.get("confirm")),
+        f"hard reset VM '{a.get('vm_name') or a.get('vm_id')}'"),
+    "hyperv_checkpoint_restore": lambda cfg, a: policy.require_destructive(
+        cfg, "checkpoint_restore", bool(a.get("confirm")),
+        f"restore VM '{a.get('vm_name') or a.get('vm_id')}' to '{a.get('checkpoint_name')}'"),
+    "hyperv_checkpoint_remove": lambda cfg, a: policy.require_destructive(
+        cfg, "checkpoint_remove", bool(a.get("confirm")),
+        f"remove checkpoint '{a.get('checkpoint_name')}' from VM '{a.get('vm_name') or a.get('vm_id')}'"),
+    "hyperv_vm_create": lambda cfg, a: policy.require_destructive(
+        cfg, "vm_provision", bool(a.get("confirm")), f"create VM '{a.get('vm_name')}'"),
+    "hyperv_guest_put": lambda cfg, a: policy.require_destructive(
+        cfg, "guest_write", bool(a.get("confirm")),
+        f"write '{a.get('remote_path')}' on '{a.get('vm_name') or a.get('vm_id')}'"),
+    "hyperv_guest_run": lambda cfg, a: (
+        policy.require_destructive(
+            cfg, "elevated_exec", bool(a.get("confirm")),
+            f"run an elevated script on '{a.get('vm_name') or a.get('vm_id')}'")
+        if a.get("elevated") else None
+    ),
+    "hyperv_guest_run_ps": lambda cfg, a: (
+        policy.require_destructive(
+            cfg, "elevated_exec", bool(a.get("confirm")),
+            f"run an elevated script on '{a.get('vm_name') or a.get('vm_id')}'")
+        if a.get("elevated") else None
+    ),
+}
+
+
+def _operations_preflight(name: str, arguments: dict, tool_obj: Any = None) -> None:
+    """The synchronous preflight for a detached/tasks call: SDK argument
+    validation (R13 - the runner invokes the raw fn, bypassing Tool.run's
+    pydantic validation), the VM policy screen for every vm-bearing tool
+    (including the wait_* tools that have no TOOL_SCOPES entry), and the
+    destructive confirm/category gate (R2). Raises PolicyDenied /
+    ValidationError / ValueError; the caller converts to its envelope."""
+    cfg = CFG
+    if cfg is None:
+        raise RuntimeError("bootstrap has not run")
+    if tool_obj is not None:
+        validate = getattr(tool_obj, "fn_metadata", None)
+        validate_args = getattr(validate, "validate_arguments", None)
+        if validate_args is not None:
+            validate_args(dict(arguments))
+    vm_name = str(arguments.get("vm_name") or "")
+    if vm_name:
+        vmident.checked_caller_name(vm_name)
+        policy.vm_allowed(cfg, vm_name)
+    gate = _OPERATIONS_DESTRUCTIVE_GATES.get(name)
+    if gate is not None:
+        gate(cfg, arguments)
+
+
 def _tool_fn_resolver(name: str) -> Callable[..., Any]:
     """The raw tool function behind a registered tool name, for a detached
     runner (the guard path passes tool.fn directly; the tasks interceptor
@@ -267,6 +330,7 @@ def bootstrap(
             gate_fn=_lease_gate,
             tool_fn_resolver=_tool_fn_resolver,
             runner_slots=_runner_slots,
+            preflight_fn=_operations_task_preflight,
         )],
     )
     _register_tools(cfg, _mcp)
@@ -2994,6 +3058,8 @@ def _harden_tools(mcp: MCPServer) -> None:
                 ops_response, ops_ctx = operations.guard_consult(
                     _cfg(), name, dict(arguments or {}),
                     tool_fn, _runner_slots,
+                    preflight=lambda: _operations_preflight(
+                        name, dict(arguments or {}), _tool),
                 )
                 if ops_response is not None:
                     if ops_response.get("ok") is False:
@@ -3179,3 +3245,11 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def _operations_task_preflight(name: str, arguments: dict) -> None:
+    """The tasks-interceptor preflight: resolves the registered Tool so the
+    SDK argument validation runs (R13), then the shared synchronous gates."""
+    tools = getattr(get_mcp(), "_tool_manager", None)
+    tool = (getattr(tools, "_tools", {}) or {}).get(name)
+    _operations_preflight(name, arguments, tool)

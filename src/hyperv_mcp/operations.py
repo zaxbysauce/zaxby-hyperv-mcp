@@ -55,6 +55,7 @@ import json
 import os
 import secrets
 import threading
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
@@ -152,6 +153,10 @@ _FINGERPRINT_EXCLUDED = frozenset({
 })
 _key_cache: dict[str, bytes] = {}
 _key_cache_lock = threading.Lock()
+# Live detached-runner registry (conftest drains it at teardown so a slow
+# runner cannot outlive its test's monkeypatches — implementation-review R9).
+_runners: dict[str, threading.Thread] = {}
+_runners_lock = threading.Lock()
 
 
 def _fingerprint_key(cfg: Config, store: statestore.Store) -> bytes:
@@ -202,6 +207,13 @@ def _classify_stale(store: statestore.Store, row: statestore.OpRow, cfg: Config)
     (another live process) keeps its op working."""
     if row.status != statestore.OP_WORKING or row.heartbeat_at <= 0:
         return row
+    if not row.runner:
+        # Sync (non-detach) keyed rows have no runner thread to heartbeat:
+        # the only process that can complete them is the one serving this
+        # read, so a lapsed heartbeat cannot mean "the runner is gone"
+        # (implementation-review R6). Their crash residue is retired by the
+        # consult-time idempotency-TTL expiry instead.
+        return row
     ttl = int(cfg.operations.heartbeat_ttl_s or 60)
     if row.heartbeat_at >= store.now() - ttl:
         return row
@@ -234,6 +246,7 @@ def guard_consult(
     arguments: dict[str, Any],
     tool_fn: Callable[..., Any],
     runner_slots: Callable[[], threading.BoundedSemaphore],
+    preflight: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Idempotency + detach interception for one dispatchable call.
 
@@ -247,9 +260,14 @@ def guard_consult(
       with the context.
 
     The caller has already run the unknown-argument guard, the policy gate
-    and the lease gate — a denied call never reaches here, so it never mints
-    an op row. The presented-lease ContextVar (if any) is captured into the
-    runner's copied context BEFORE the guard's finally resets it.
+    and the lease gate; `preflight` (when given) runs the remaining
+    synchronous body gates — SDK argument validation, the destructive
+    confirm/category screen, and the VM policy screen for tools outside
+    TOOL_SCOPES — BEFORE any op row exists, so a denied call never mints an
+    `op_id` (issue constraint; implementation-review R2/R13). A preflight
+    refusal propagates to the guard's envelope path. The presented-lease
+    ContextVar (if any) is captured into the runner's copied context BEFORE
+    the guard's finally resets it.
     """
     if not cfg.operations.enabled or name not in DETACHABLE_TOOLS:
         return None, None
@@ -257,6 +275,8 @@ def guard_consult(
     idem_key = str(arguments.get("idempotency_key") or "")
     if not detach and not idem_key:
         return None, None
+    if preflight is not None:
+        preflight()
 
     agent = auditlog.current_agent_id() or ""
     store = store_for(cfg)
@@ -267,6 +287,18 @@ def guard_consult(
     # concurrent retry cannot pass the consult and lose the insert race.
     with store.transaction():
         existing = store.op_find_idem(agent, name, idem_key) if idem_key else None
+        if existing is not None:
+            # Idempotency-window expiry (operations.idempotency_ttl_s): a
+            # working record older than the window cannot belong to any live
+            # caller — the creating request or runner is long gone — so it is
+            # retired (failed/interrupted semantics would be a lie; the row
+            # is simply forgotten) and the retry executes fresh.
+            ttl = int(cfg.operations.idempotency_ttl_s or 86400)
+            if existing.created_at > 0 and existing.created_at < now - ttl:
+                store.op_delete(existing.op_id)
+                emit(cfg, "op.expired", existing.op_id, "", agent,
+                     {"reason": "idempotency_ttl_lapsed"}, store=store)
+                existing = None
         if existing is not None:
             existing = _classify_stale(store, existing, cfg)
             if existing.params_hmac and existing.params_hmac != fingerprint:
@@ -311,7 +343,7 @@ def guard_consult(
             )
             store.op_insert(row)
             emit(cfg, "op.created", row.op_id, "", agent, {"tool": name, "detached": False})
-            return None, {"op_id": row.op_id, "cfg": cfg}
+            return None, {"op_id": row.op_id, "cfg": cfg, "agent": agent}
     return None, None
 
 
@@ -375,18 +407,22 @@ def _unknown_op_envelope(op_id: str) -> dict[str, Any]:
 
 def complete_inline(op_ctx: dict[str, Any], result: Any) -> None:
     """Store the synchronous result of a keyed (non-detach) call and close
-    its op row. Best-effort: a store failure must not alter the tool's
-    outcome."""
+    its op row. The transition also repairs a row that read-time staleness
+    flipped to failed/interrupted mid-call (the finishing request is the
+    proof the process lived). Best-effort: a store failure must not alter
+    the tool's outcome."""
     try:
         cfg: Config = op_ctx["cfg"]
+        agent = str(op_ctx.get("agent") or "")
         store = store_for(cfg)
         text = _result_text(result)
         store.op_transition(
-            op_ctx["op_id"], (statestore.OP_WORKING,), statestore.OP_COMPLETED,
+            op_ctx["op_id"], (statestore.OP_WORKING, statestore.OP_FAILED),
+            statestore.OP_COMPLETED,
             result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
             updated_at=store.now(),
         )
-        emit(cfg, "op.completed", op_ctx["op_id"], "", "", {"mode": "inline"})
+        emit(cfg, "op.completed", op_ctx["op_id"], "", agent, {"mode": "inline"})
     except Exception:
         pass
 
@@ -394,16 +430,19 @@ def complete_inline(op_ctx: dict[str, Any], result: Any) -> None:
 def fail_inline(op_ctx: dict[str, Any], exc: BaseException) -> None:
     try:
         cfg: Config = op_ctx["cfg"]
+        agent = str(op_ctx.get("agent") or "")
         store = store_for(cfg)
         env = errors.envelope(exc)
         text = json.dumps(env, separators=(",", ":"))
         store.op_transition(
-            op_ctx["op_id"], (statestore.OP_WORKING,), statestore.OP_FAILED,
+            op_ctx["op_id"], (statestore.OP_WORKING, statestore.OP_FAILED),
+            statestore.OP_FAILED,
             error_class=str(env.get("error_class") or "transport"),
             result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
             updated_at=store.now(),
         )
-        emit(cfg, "op.failed", op_ctx["op_id"], "", "", {"error_class": env.get("error_class")})
+        emit(cfg, "op.failed", op_ctx["op_id"], "", agent,
+             {"error_class": env.get("error_class")})
     except Exception:
         pass
 
@@ -453,6 +492,8 @@ def _start_runner(
         name=f"hyperv-op-{row.op_id[:8]}",
         daemon=True,
     )
+    with _runners_lock:
+        _runners[row.op_id] = thread
     thread.start()
 
 
@@ -497,6 +538,8 @@ def _run_detached(
     finally:
         stop.set()
         beat_timer.cancel()
+        with _runners_lock:
+            _runners.pop(op_id, None)
         try:
             runner_slots.release()
         except ValueError:
@@ -541,10 +584,28 @@ def _execute_body(
         _raise_if_cancelled_locked(cfg, op_id, store)
         result = tool_fn(**body_args)
         text = _result_text(result)
-        _safe_transition(
-            store, op_id, statestore.OP_COMPLETED, agent, cfg, "op.completed",
-            result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
-        )
+        # A tool-level failure leaves as a NORMAL return carrying the one
+        # envelope ({ok: false, error, error_class}) - recording that as
+        # `completed` would book a refusal as a success (R11). Any envelope
+        # with ok=false is a FAILED op whose stored result is the envelope.
+        error_class = ""
+        try:
+            parsed = json.loads(text) if text.startswith("{") else None
+            if isinstance(parsed, dict) and parsed.get("ok") is False:
+                error_class = str(parsed.get("error_class") or "transport")
+        except ValueError:
+            parsed = None
+        if error_class:
+            _safe_transition(
+                store, op_id, statestore.OP_FAILED, agent, cfg, "op.failed",
+                error_class=error_class,
+                result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
+            )
+        else:
+            _safe_transition(
+                store, op_id, statestore.OP_COMPLETED, agent, cfg, "op.completed",
+                result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
+            )
     except OperationCancelled:
         _safe_transition(store, op_id, statestore.OP_CANCELLED, agent, cfg,
                          "op.cancelled")
@@ -797,6 +858,7 @@ def tasks_extension(
     gate_fn: Callable[[str, dict], tuple[dict[str, Any] | None, Any]],
     tool_fn_resolver: Callable[[str], Callable[..., Any]],
     runner_slots: Callable[[], threading.BoundedSemaphore],
+    preflight_fn: Callable[[str, dict], None] | None = None,
 ) -> Any:
     """Build the Extension instance the server passes to MCPServer(...).
 
@@ -836,33 +898,88 @@ def tasks_extension(
             if env is not None:
                 # Gate refusal is an ordinary tool-envelope answer, never -32021.
                 return errors.failure_result(env)
+            if preflight_fn is not None:
+                try:
+                    preflight_fn(params.name, arguments)
+                except Exception as exc:
+                    # Synchronous body-gate refusal BEFORE any op row
+                    # (implementation-review R2/R13) - an ordinary envelope.
+                    return errors.failure_result(errors.envelope(exc))
+            # Runner admission (R4): symmetric with the guard path - excess
+            # detached calls are refused retryable-busy, never queued.
+            slots = runner_slots()
+            if not slots.acquire(blocking=False):
+                return errors.failure_result(_busy_envelope(params.name))
+            released = False
             try:
                 agent = auditlog.current_agent_id() or ""
                 store = store_for(cfg)
                 now = store.now()
-                row = statestore.OpRow(
-                    op_id=secrets.token_urlsafe(16),
-                    tool=params.name,
-                    agent=agent,
-                    vm_name=str(arguments.get("vm_name") or ""),
-                    status=statestore.OP_WORKING,
-                    created_at=now,
-                    updated_at=now,
-                    runner=secrets.token_hex(8),
-                    heartbeat_at=now,
-                    poll_interval_ms=2000,
+                idem_key = str(arguments.get("idempotency_key") or "")
+                fingerprint = (
+                    arguments_fingerprint(cfg, store, arguments) if idem_key else ""
                 )
-                # Durable creation BEFORE the response (SEP-2663: MUST NOT
-                # return CreateTaskResult until the task is durably created).
-                store.op_insert(row)
-                emit(cfg, "op.created", row.op_id, "", agent, {"tool": params.name, "detached": True, "tasks": True})
-                _start_runner(cfg, row, arguments, tool_fn_resolver(params.name), runner_slots())
+                # Idempotency consult + insert in one transaction (R5): a
+                # keyed retry re-attaches to the live task instead of
+                # re-executing the mutation.
+                with store.transaction():
+                    existing = (
+                        store.op_find_idem(agent, params.name, idem_key)
+                        if idem_key else None
+                    )
+                    if existing is not None:
+                        ttl = int(cfg.operations.idempotency_ttl_s or 86400)
+                        if existing.created_at > 0 and existing.created_at < now - ttl:
+                            store.op_delete(existing.op_id)
+                            emit(cfg, "op.expired", existing.op_id, "", agent,
+                                 {"reason": "idempotency_ttl_lapsed"}, store=store)
+                            existing = None
+                    if existing is not None:
+                        existing = _classify_stale(store, existing, cfg)
+                        if existing.params_hmac and existing.params_hmac != fingerprint:
+                            return errors.failure_result(
+                                _conflict_envelope(params.name, idem_key))
+                        slots.release()
+                        released = True
+                        return TaskHandleResult(
+                            task_id=existing.op_id,
+                            status=existing.status,
+                            ttl_ms=int(cfg.operations.retention_s) * 1000,
+                            poll_interval_ms=existing.poll_interval_ms,
+                        )
+                    row = statestore.OpRow(
+                        op_id=secrets.token_urlsafe(16),
+                        tool=params.name,
+                        agent=agent,
+                        vm_name=str(arguments.get("vm_name") or ""),
+                        status=statestore.OP_WORKING,
+                        created_at=now,
+                        updated_at=now,
+                        runner=secrets.token_hex(8),
+                        heartbeat_at=now,
+                        params_hmac=fingerprint,
+                        idem_key=idem_key,
+                        poll_interval_ms=2000,
+                    )
+                    # Durable creation BEFORE the response (SEP-2663: MUST NOT
+                    # return CreateTaskResult until the task is durably created).
+                    store.op_insert(row)
+                emit(cfg, "op.created", row.op_id, "", agent,
+                     {"tool": params.name, "detached": True, "tasks": True})
+                _start_runner(cfg, row, arguments, tool_fn_resolver(params.name), slots)
                 return TaskHandleResult(
                     task_id=row.op_id,
                     status=statestore.OP_WORKING,
                     ttl_ms=int(cfg.operations.retention_s) * 1000,
                     poll_interval_ms=row.poll_interval_ms,
                 )
+            except Exception:
+                if not released:
+                    try:
+                        slots.release()
+                    except ValueError:
+                        pass
+                raise
             finally:
                 if reset is not None:
                     leases.reset_presented_lease(reset)
@@ -894,7 +1011,10 @@ def tasks_extension(
             elif row.error_class:
                 view.status_message = row.error_class
             if embed_result and row.result_json:
-                view.result = CallToolResult(content=[TextContent(text=row.result_json)])
+                view.result = CallToolResult(
+                    content=[TextContent(text=row.result_json)],
+                    is_error=row.status == statestore.OP_FAILED,
+                )
             return view
 
         def methods(self) -> list[Any]:
@@ -929,6 +1049,20 @@ def tasks_extension(
             ]
 
     return TasksExtension()
+
+
+def drain_for_tests(timeout_s: float = 5.0) -> int:
+    """Wait (bounded) for live detached runners so a test teardown never
+    races one past its own monkeypatches. Returns the number still running
+    after the timeout — a runner blocked on a real child cannot be forced;
+    the test's own gating Events remain the authoritative release."""
+    with _runners_lock:
+        threads = list(_runners.values())
+    deadline = time.monotonic() + timeout_s
+    for thread in threads:
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    with _runners_lock:
+        return len(_runners)
 
 
 def reset_for_tests() -> None:

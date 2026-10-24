@@ -393,6 +393,15 @@ def _register(job: dict[str, Any], cfg: Config | None = None) -> None:
             # process — and the row reappears on the next write-through (a
             # status observation, a stop) or ends with this process.
             pass
+        else:
+            # Issue #24: the register transition's event (best-effort; the
+            # append unit the event cursor counts on is one per transition).
+            # Runs only when the store write SUCCEEDED (try/else), so an
+            # event never describes a row that is not there.
+            from . import operations as _ops
+
+            _ops.emit(cfg, "job.started", job["job_id"], job.get("vm_id", ""),
+                      job.get("owner"), {})
     with _jobs_lock:
         _jobs[job["job_id"]] = job
 
@@ -956,6 +965,11 @@ def job_stop(cfg: Config, job_id: str, *, owner: str | None = None) -> dict:
         _store(cfg).job_upsert(statestore.JobRow(
             **{**stopped_row.as_dict(), "cred_ref": recorded_ref}
         ))
+        # Issue #24: the stop transition's event (best-effort).
+        from . import operations as _ops
+
+        _ops.emit(cfg, "job.stopped", stopped_row.job_id, stopped_row.vm_id,
+                  stopped_row.owner, {})
         # Registry bookkeeping (registry lock only, outside any vm_lock),
         # AFTER the durable row made it: store-lock is the outer order
         # process-wide.

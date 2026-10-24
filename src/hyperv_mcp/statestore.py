@@ -1182,6 +1182,38 @@ class Store:
                 self._rollback()
                 raise
 
+    def op_delete(self, op_id: str) -> None:
+        """Remove one op row (the idempotency-TTL expiry retires its record so
+        a fresh retry can insert under the same (agent, tool, idem_key))."""
+        with self._lock:
+            self._begin()
+            try:
+                self._connect().execute("DELETE FROM ops WHERE op_id = ?", (op_id,))
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+
+    def ops_prune(self, older_than: float) -> int:
+        """Retention: delete TERMINAL op rows (with their result payloads)
+        whose created_at is older than the cutoff. Working rows are never
+        swept here — a live detached op's row is owned by its runner; stale
+        ones are failed at read time and retire on the next retention pass."""
+        with self._lock:
+            self._begin()
+            try:
+                cur = self._connect().execute(
+                    "DELETE FROM ops WHERE created_at < ? AND status IN "
+                    "('completed','failed','cancelled')",
+                    (float(older_than),),
+                )
+                removed = int(cur.rowcount or 0)
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+        return removed
+
     def op_request_cancel(self, op_id: str, agent: str, at: float) -> int:
         """Record a cooperative cancel request. Ownership-scoped like every
         read: another principal's op_id is simply not found (0 rows)."""
@@ -1680,6 +1712,15 @@ def store_for(cfg: Config, environ: dict[str, str] | None = None) -> Store:
             ))
             store.events_prune(cutoff, int(
                 getattr(cfg.operations, "event_max_rows", 10000) or 10000
+            ))
+        except Exception:
+            pass
+        # Issue #24 (implementation-review R8): op/result retention is a real
+        # knob — terminal op rows (and their stored payloads) older than
+        # operations.retention_s are pruned on the same first-open schedule.
+        try:
+            store.ops_prune(store.now() - int(
+                getattr(cfg.operations, "retention_s", 86400) or 86400
             ))
         except Exception:
             pass

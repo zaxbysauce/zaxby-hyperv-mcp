@@ -235,6 +235,11 @@ def _restore_bootstrap_module_globals():
     _ops.reset_for_tests()
     _ps.set_worker_spawn(_no_spawn)
     yield
+    # Issue #24 (implementation-review R9): wait (bounded) for live detached
+    # runners BEFORE the monkeypatches undo - a runner that outlives its test
+    # otherwise calls the REAL run_ps and its late writes bleed into the next
+    # test's mounted store.
+    _ops.drain_for_tests(timeout_s=5.0)
     _a._config = saved[("auditlog", "_config")]
     _c._config = saved[("credentials", "_config")]
     _pw._config = saved[("pswindows", "_config")]
