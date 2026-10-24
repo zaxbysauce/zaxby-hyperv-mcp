@@ -32,6 +32,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -40,7 +41,7 @@ import anyio
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import Image, MCPServer
 from mcp.shared.exceptions import UrlElicitationRequiredError
-from mcp.types import LATEST_PROTOCOL_VERSION, CallToolResult
+from mcp.types import LATEST_PROTOCOL_VERSION, CallToolResult, TextContent
 from pydantic import AnyHttpUrl
 
 from . import (
@@ -56,6 +57,7 @@ from . import (
     leases,
     lifecycle,
     media,
+    operations,
     policy,
     psdsessions,
     pswindows,
@@ -72,6 +74,97 @@ from .config import Config, ConfigError
 __all__ = ["mcp", "main", "bootstrap", "configure_http_auth"]  # noqa: F822 (mcp: module __getattr__)
 
 VERSION = "0.4.0"
+
+#: Issue #24: the detached-op runner admission bound, sized once per
+#: bootstrap (operations.runner_bound, defaulting to max_host_powershell).
+#: Acquired synchronously in the guard/interceptor BEFORE an op row exists
+#: and released by the runner when it finishes, so excess detached calls are
+#: refused with a retryable busy envelope instead of queued without bound.
+_RUNNER_SLOTS: Any = None
+
+
+def _runner_slots() -> threading.BoundedSemaphore:
+    """The current detached-runner admission semaphore (sized at bootstrap)."""
+    global _RUNNER_SLOTS
+    if _RUNNER_SLOTS is None:
+        raise RuntimeError("bootstrap has not sized the runner slots yet")
+    return _RUNNER_SLOTS
+
+
+# Issue #24 (implementation-review R2/R13): the synchronous body gates a
+# detached call must pass BEFORE any op row exists. The bodies re-check
+# them anyway (they are pure functions of (cfg, confirm)); running them
+# here means a denied call never yields an op_id and a mistyped argument
+# (e.g. confirm: "banana", which pydantic-coercion would refuse on the sync
+# path) never reaches the detached body as truthy.
+_OPERATIONS_DESTRUCTIVE_GATES: dict[str, Callable[[Config, dict], None]] = {
+    "hyperv_stop_vm": lambda cfg, a: policy.require_destructive(
+        cfg, "stop", bool(a.get("confirm")),
+        f"stop VM '{a.get('vm_name') or a.get('vm_id')}'"),
+    "hyperv_reset_vm": lambda cfg, a: policy.require_destructive(
+        cfg, "reset", bool(a.get("confirm")),
+        f"hard reset VM '{a.get('vm_name') or a.get('vm_id')}'"),
+    "hyperv_checkpoint_restore": lambda cfg, a: policy.require_destructive(
+        cfg, "checkpoint_restore", bool(a.get("confirm")),
+        f"restore VM '{a.get('vm_name') or a.get('vm_id')}' to '{a.get('checkpoint_name')}'"),
+    "hyperv_checkpoint_remove": lambda cfg, a: policy.require_destructive(
+        cfg, "checkpoint_remove", bool(a.get("confirm")),
+        f"remove checkpoint '{a.get('checkpoint_name')}' from VM '{a.get('vm_name') or a.get('vm_id')}'"),
+    "hyperv_vm_create": lambda cfg, a: policy.require_destructive(
+        cfg, "vm_provision", bool(a.get("confirm")), f"create VM '{a.get('vm_name')}'"),
+    "hyperv_guest_put": lambda cfg, a: policy.require_destructive(
+        cfg, "guest_write", bool(a.get("confirm")),
+        f"write '{a.get('remote_path')}' on '{a.get('vm_name') or a.get('vm_id')}'"),
+    "hyperv_guest_run": lambda cfg, a: (
+        policy.require_destructive(
+            cfg, "elevated_exec", bool(a.get("confirm")),
+            f"run an elevated script on '{a.get('vm_name') or a.get('vm_id')}'")
+        if a.get("elevated") else None
+    ),
+    "hyperv_guest_run_ps": lambda cfg, a: (
+        policy.require_destructive(
+            cfg, "elevated_exec", bool(a.get("confirm")),
+            f"run an elevated script on '{a.get('vm_name') or a.get('vm_id')}'")
+        if a.get("elevated") else None
+    ),
+}
+
+
+def _operations_preflight(name: str, arguments: dict, tool_obj: Any = None) -> None:
+    """The synchronous preflight for a detached/tasks call: SDK argument
+    validation (R13 - the runner invokes the raw fn, bypassing Tool.run's
+    pydantic validation), the VM policy screen for every vm-bearing tool
+    (including the wait_* tools that have no TOOL_SCOPES entry), and the
+    destructive confirm/category gate (R2). Raises PolicyDenied /
+    ValidationError / ValueError; the caller converts to its envelope."""
+    cfg = CFG
+    if cfg is None:
+        raise RuntimeError("bootstrap has not run")
+    if tool_obj is not None:
+        validate = getattr(tool_obj, "fn_metadata", None)
+        validate_args = getattr(validate, "validate_arguments", None)
+        if validate_args is not None:
+            validate_args(dict(arguments))
+    vm_name = str(arguments.get("vm_name") or "")
+    if vm_name:
+        vmident.checked_caller_name(vm_name)
+        policy.vm_allowed(cfg, vm_name)
+    gate = _OPERATIONS_DESTRUCTIVE_GATES.get(name)
+    if gate is not None:
+        gate(cfg, arguments)
+
+
+def _tool_fn_resolver(name: str) -> Callable[..., Any]:
+    """The raw tool function behind a registered tool name, for a detached
+    runner (the guard path passes tool.fn directly; the tasks interceptor
+    resolves by name)."""
+    tools = getattr(get_mcp(), "_tool_manager", None)
+    registry = getattr(tools, "_tools", {}) or {}
+    tool = registry.get(name)
+    fn = getattr(tool, "fn", None)
+    if fn is None:
+        raise ValueError(f"no registered tool {name!r} to detach")
+    return fn
 
 _INSTRUCTIONS = (
     "Hyper-V VM management MCP (hardened). VM lifecycle, checkpoints, "
@@ -217,6 +310,14 @@ def bootstrap(
             resource_server_url=AnyHttpUrl("http://127.0.0.1"),
             validate_token_resource=False,
         )
+    # Issue #24: the runner admission bound and the SEP-2663 tasks bridge.
+    # The semaphore is (re)sized at every bootstrap so a module reload in
+    # tests rebuilds it; operations.guard_consult acquires it synchronously
+    # before an op row exists.
+    global _RUNNER_SLOTS
+    _RUNNER_SLOTS = threading.BoundedSemaphore(
+        max(1, int(cfg.operations.runner_bound or cfg.max_host_powershell))
+    )
     _mcp = MCPServer(
         "hyperv_mcp",
         instructions=_INSTRUCTIONS,
@@ -224,6 +325,13 @@ def bootstrap(
         auth=auth,
         version=VERSION,
         lifespan=_make_tool_limiter_lifespan(cfg.max_host_powershell),
+        extensions=[operations.tasks_extension(
+            cfg,
+            gate_fn=_lease_gate,
+            tool_fn_resolver=_tool_fn_resolver,
+            runner_slots=_runner_slots,
+            preflight_fn=_operations_task_preflight,
+        )],
     )
     _register_tools(cfg, _mcp)
     _startup_banner(cfg)
@@ -607,6 +715,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_start_vm(
         vm_name: str = "", vm_id: str = "",
         lease_id: str = "", fencing_token: int = 0,
+        detach: bool = False, idempotency_key: str = "",
     ) -> dict:
         """Start a Hyper-V VM and wait until it reports Running.
 
@@ -626,6 +735,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_stop_vm(
         vm_name: str = "", method: str = "shutdown", confirm: bool = False, vm_id: str = "",
         lease_id: str = "", fencing_token: int = 0,
+        detach: bool = False, idempotency_key: str = "",
     ) -> dict:
         """Stop a Hyper-V VM and wait until it reaches the final state.
 
@@ -652,6 +762,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_reset_vm(
         vm_name: str = "", confirm: bool = False, vm_id: str = "",
         lease_id: str = "", fencing_token: int = 0,
+        detach: bool = False, idempotency_key: str = "",
     ) -> dict:
         """Hard-reset a Hyper-V VM (power off immediately, start again) and
         wait until it reports Running. Equivalent to the physical reset button.
@@ -675,6 +786,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_checkpoint_create(
         vm_name: str = "", checkpoint_name: str = "", vm_id: str = "",
         lease_id: str = "", fencing_token: int = 0,
+        detach: bool = False, idempotency_key: str = "",
     ) -> dict:
         """Create a checkpoint (snapshot) of a Hyper-V VM.
 
@@ -715,6 +827,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_checkpoint_restore(
         vm_name: str = "", checkpoint_name: str = "", confirm: bool = False, vm_id: str = "",
         lease_id: str = "", fencing_token: int = 0,
+        detach: bool = False, idempotency_key: str = "",
     ) -> dict:
         """Restore a VM to a checkpoint. ALL STATE SINCE THE CHECKPOINT IS
         DISCARDED. The VM ends powered off; call hyperv_start_vm afterwards.
@@ -739,6 +852,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         vm_name: str = "", checkpoint_name: str = "", include_subtree: bool = False,
         confirm: bool = False, vm_id: str = "",
         lease_id: str = "", fencing_token: int = 0,
+        detach: bool = False, idempotency_key: str = "",
     ) -> dict:
         """Remove a checkpoint, optionally with its whole child subtree.
         Merged disks cannot be undone afterwards.
@@ -904,6 +1018,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             username: str = "", password: str = "",
             vm_id: str = "",
             lease_id: str = "", fencing_token: int = 0,
+        detach: bool = False, idempotency_key: str = "",
         ) -> dict:
             """Run a PowerShell script inside a guest via PowerShell Direct.
             stdout/stderr are SEPARATE (0.2.0 change); exit codes are real.
@@ -932,6 +1047,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             username: str = "", password: str = "",
             vm_id: str = "",
             lease_id: str = "", fencing_token: int = 0,
+        detach: bool = False, idempotency_key: str = "",
         ) -> dict:
             """Run an executable inside a guest via PowerShell Direct.
             Separate stdout/stderr, real exit codes. elevated=true needs
@@ -958,6 +1074,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             username: str = "", password: str = "",
             vm_id: str = "",
             lease_id: str = "", fencing_token: int = 0,
+        detach: bool = False, idempotency_key: str = "",
         ) -> dict:
             """Copy a host file into a guest via PowerShell Direct. Staged
             rename, parent dirs created, optional SHA-256 verification
@@ -984,6 +1101,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             username: str = "", password: str = "",
             vm_id: str = "",
             lease_id: str = "", fencing_token: int = 0,
+        detach: bool = False, idempotency_key: str = "",
         ) -> dict:
             """Copy a guest file to the host via PowerShell Direct. Staged
             rename, local parent dirs created, optional SHA-256 verification.
@@ -1052,6 +1170,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_name: str = "", script: str = "", timeout_ms: int = 60000,
             elevated: bool = False, confirm: bool = False, vm_id: str = "",
             lease_id: str = "", fencing_token: int = 0,
+        detach: bool = False, idempotency_key: str = "",
         ) -> dict:
             """Run a PowerShell script inside a guest via PowerShell Direct.
             stdout/stderr are SEPARATE (0.2.0 change); exit codes are real.
@@ -1077,6 +1196,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             cwd: str | None = None, timeout_ms: int = 60000,
             elevated: bool = False, confirm: bool = False, vm_id: str = "",
             lease_id: str = "", fencing_token: int = 0,
+        detach: bool = False, idempotency_key: str = "",
         ) -> dict:
             """Run an executable inside a guest via PowerShell Direct.
             Separate stdout/stderr, real exit codes. Credentials:
@@ -1101,6 +1221,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_name: str = "", local_path: str = "", remote_path: str = "",
             confirm: bool = False, verify: bool | None = None, vm_id: str = "",
             lease_id: str = "", fencing_token: int = 0,
+        detach: bool = False, idempotency_key: str = "",
         ) -> dict:
             """Copy a host file into a guest via PowerShell Direct. Staged
             rename, parent dirs created, optional SHA-256 verification.
@@ -1123,6 +1244,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_name: str = "", remote_path: str = "", local_path: str = "",
             verify: bool | None = None, vm_id: str = "",
             lease_id: str = "", fencing_token: int = 0,
+        detach: bool = False, idempotency_key: str = "",
         ) -> dict:
             """Copy a guest file to the host via PowerShell Direct. Staged
             rename, local parent dirs created, optional SHA-256 verification.
@@ -1568,6 +1690,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_wait_vm_state(
         vm_name: str = "", states: list[str] | None = None, timeout_s: int = 300,
         vm_id: str = "",
+        detach: bool = False, idempotency_key: str = "",
     ) -> dict:
         """Wait (bounded) until the VM reaches one of the requested states.
         states must be from: Off, Running, Saved, Paused, Starting, Stopping,
@@ -1610,6 +1733,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         generation: int = 2, vhd_size_gb: int = 64, switch_name: str = "",
         confirm: bool = False,
         lease_id: str = "", fencing_token: int = 0,
+        detach: bool = False, idempotency_key: str = "",
     ) -> dict:
         """Create a disposable VM with a fresh VHDX (New-VHD + New-VM). The
         new name must match allowed_vm_patterns so it stays policy-scoped.
@@ -1999,6 +2123,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             processes: list[str] | None = None, timeout_s: int = 300,
             interval_s: int = 3, username: str = "", password: str = "",
             vm_id: str = "",
+        detach: bool = False, idempotency_key: str = "",
         ) -> dict:
             """After a restart, wait (bounded) for PowerShell Direct to
             answer, then verify each named service is Running and each named
@@ -2194,6 +2319,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_name: str = "", services: list[str] | None = None,
             processes: list[str] | None = None, timeout_s: int = 300,
             interval_s: int = 3, vm_id: str = "",
+        detach: bool = False, idempotency_key: str = "",
         ) -> dict:
             """After a restart, wait (bounded) for PowerShell Direct to
             answer, then verify each named service is Running and each named
@@ -2545,6 +2671,74 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 ],
             }
 
+    # ---- issue #24: the durable-operation / event surface ------------------
+    @mcp.tool()
+    def hyperv_op_status(op_id: str) -> dict:
+        """Report the status of one durable operation handle.
+
+        Returns {ok, op_id, tool, status, error_class, poll_interval_ms, ...}.
+        Statuses: working, completed, failed, cancelled (input_required is
+        reserved). An op whose runner heartbeat lapsed reports failed with
+        error_class "interrupted" and notes the VM-side outcome is unknown.
+        Operation ids are scoped to the calling agent: another agent's (or an
+        unknown) id answers exactly the same refusal.
+        """
+        with _audit("hyperv_op_status", "", "operations"):
+            return operations.op_status(_cfg(), op_id, auditlog.current_agent_id() or "")
+
+    @mcp.tool()
+    def hyperv_op_result(op_id: str, cursor: str = "") -> dict:
+        """Read one operation's stored result, cursor-paged.
+
+        Returns {ok, op_id, status, chunk, done, next_cursor}. Pages are at
+        most 64 KiB of the stored (redacted) result text; re-reading from an
+        earlier cursor returns identical bytes, including after a server
+        restart. Refuses while the op is still working.
+        """
+        with _audit("hyperv_op_result", "", "operations"):
+            return operations.op_result(
+                _cfg(), op_id, auditlog.current_agent_id() or "", cursor
+            )
+
+    @mcp.tool()
+    def hyperv_op_cancel(op_id: str) -> dict:
+        """Request cooperative cancellation of a working operation.
+
+        Returns {ok, op_id, status, cancel_requested}. The runner honours the
+        request at its next leg boundary; cancelling a terminal op is a no-op
+        that reports its terminal status. Scoped to the calling agent like
+        every op tool.
+        """
+        with _audit("hyperv_op_cancel", "", "operations"):
+            return operations.op_cancel(_cfg(), op_id, auditlog.current_agent_id() or "")
+
+    @mcp.tool()
+    def hyperv_op_list(include_terminal: bool = False) -> dict:
+        """List the calling agent's operation handles.
+
+        Returns {ok, ops: [{op_id, status, tool, ...}]}. Only the caller's
+        own ops are listed; pass include_terminal=true to see finished ones.
+        """
+        with _audit("hyperv_op_list", "", "operations"):
+            return operations.op_list(
+                _cfg(), auditlog.current_agent_id() or "", include_terminal
+            )
+
+    @mcp.tool()
+    def hyperv_events(after: str = "", limit: int = 100) -> dict:
+        """Read the append-only event log from a cursor.
+
+        Returns {ok, events: [{seq, ts, kind, ref_id, vm_id, data}],
+        next_cursor}. Pass the next_cursor of a previous read as `after` to
+        resume where you left off — across restarts too. A cursor older than
+        the retention window answers {cursor_expired: true, oldest_cursor}.
+        Events are scoped to the calling agent.
+        """
+        with _audit("hyperv_events", "", "operations"):
+            return operations.events_read(
+                _cfg(), auditlog.current_agent_id() or "", after, limit
+            )
+
     _harden_tools(mcp)
 
 
@@ -2853,29 +3047,82 @@ def _harden_tools(mcp: MCPServer) -> None:
             lease_env, lease_reset = _lease_gate(name, arguments or {})
             if lease_env is not None:
                 return _audited_rejection(name, arguments, lease_env)
+            # Issue #24: durable-operation interception - idempotency replay
+            # or conflict refusal, or the detach divert. Gates have already
+            # run, so a denied call never reaches here and never mints an op
+            # row. The runner's context copy happens inside the consult,
+            # BEFORE this finally resets the presented lease, and every exit
+            # below flows through the same reset (plan-critic F4).
             try:
-                return await _run(arguments, context, convert_result=convert_result, **kwargs)
-            except UrlElicitationRequiredError:
-                raise
-            except Exception as exc:
-                # 2.x Tool.run wraps both failure shapes into a ToolError /
-                # UnexpectedToolError whose OWN text drops the original: the
-                # pydantic ValidationError for a declared-but-mistyped
-                # argument, and any tool-body crash. Classify the CAUSE so
-                # validation failures say "invalid" and crashes carry the
-                # real message (1.x ToolError parity).
-                cause = exc.__cause__
-                if cause is not None and not isinstance(cause, ValueError):
-                    # A crash also never reaches the SDK's own crash logger
-                    # once this guard returns an envelope, so log it here.
-                    logger.exception("tool %s raised an unexpected exception", name)
-                env = errors.envelope(cause if cause is not None else exc)
-                return _audited_rejection(name, arguments, env)
+                tool_fn = _tool.fn
+                try:
+                    ops_response, ops_ctx = operations.guard_consult(
+                        _cfg(), name, dict(arguments or {}),
+                        tool_fn, _runner_slots,
+                        preflight=lambda: _operations_preflight(
+                            name, dict(arguments or {}), _tool),
+                    )
+                except UrlElicitationRequiredError:
+                    raise
+                except Exception as preflight_exc:
+                    # Issue #24 (review F2): a preflight refusal
+                    # (confirm/category policy, VM policy, SDK argument
+                    # validation) is an ORDINARY audited rejection - the same
+                    # envelope shape the sync route and the tasks route answer
+                    # - never a raw escape, and it must leave the same audit
+                    # record every other guard refusal writes. (MINOR-13:
+                    # gates answer, they do not raise.)
+                    env = errors.envelope(
+                        preflight_exc.__cause__ or preflight_exc)
+                    return _audited_rejection(name, arguments, env)
+                if ops_response is not None:
+                    if ops_response.get("ok") is False:
+                        return _audited_rejection(name, arguments, ops_response)
+                    return errors.success_result([
+                        TextContent(text=json.dumps(
+                            ops_response, separators=(",", ":"), default=str,
+                        ))
+                    ])
+                try:
+                    result = await _run(arguments, context, convert_result=convert_result, **kwargs)
+                    if ops_ctx is not None:
+                        operations.complete_inline(ops_ctx, result)
+                    return result
+                except UrlElicitationRequiredError as exc:
+                    if ops_ctx is not None:
+                        operations.fail_inline(ops_ctx, exc)
+                    raise
+                except Exception as exc:
+                    # 2.x Tool.run wraps both failure shapes into a ToolError /
+                    # UnexpectedToolError whose OWN text drops the original: the
+                    # pydantic ValidationError for a declared-but-mistyped
+                    # argument, and any tool-body crash. Classify the CAUSE so
+                    # validation failures say "invalid" and crashes carry the
+                    # real message (1.x ToolError parity).
+                    cause = exc.__cause__
+                    if cause is not None and not isinstance(cause, ValueError):
+                        # A crash also never reaches the SDK's own crash logger
+                        # once this guard returns an envelope, so log it here.
+                        logger.exception("tool %s raised an unexpected exception", name)
+                    env = errors.envelope(cause if cause is not None else exc)
+                    if ops_ctx is not None:
+                        operations.fail_inline(ops_ctx, cause if cause is not None else exc)
+                    return _audited_rejection(name, arguments, env)
+                except BaseException as exc:
+                    # Review rb-1: CancelledError (client disconnect / server
+                    # shutdown) is a BaseException - without this arm a sync
+                    # keyed row stays working forever after a disconnect.
+                    # fail_inline records the outcome; the cancellation still
+                    # propagates. This arm MUST come after `except Exception`
+                    # so ordinary tool errors still get the envelope path.
+                    if ops_ctx is not None:
+                        operations.fail_inline(ops_ctx, exc)
+                    raise
             finally:
                 # Issue #23: the presented lease rides only THIS call. The
-                # reset must cover every exit (success, failure, rejection)
-                # or a stale lease id leaks into the next call on the same
-                # request context.
+                # reset must cover every exit (success, failure, rejection,
+                # replay, detach) or a stale lease id leaks into the next call
+                # on the same request context.
                 if lease_reset is not None:
                     leases.reset_presented_lease(lease_reset)
 
@@ -3024,3 +3271,11 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def _operations_task_preflight(name: str, arguments: dict) -> None:
+    """The tasks-interceptor preflight: resolves the registered Tool so the
+    SDK argument validation runs (R13), then the shared synchronous gates."""
+    tools = getattr(get_mcp(), "_tool_manager", None)
+    tool = (getattr(tools, "_tools", {}) or {}).get(name)
+    _operations_preflight(name, arguments, tool)

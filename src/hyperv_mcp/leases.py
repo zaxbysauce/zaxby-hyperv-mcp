@@ -356,6 +356,12 @@ def acquire(
                     ttl_s=ttl, expires_at=now + ttl, kind=kind,
                 )
             )
+    # Issue #24: one event per state transition (best-effort; the frozen AC9
+    # counts one lease.* append per acquire and per release).
+    from . import operations as _ops
+
+    _ops.emit(cfg, "lease.acquired", lease_id, vm_key, agent,
+              {"scopes": wanted, "kind": kind})
     return granted
 
 
@@ -433,9 +439,14 @@ def renew(cfg: Config, lease_id: str, agent: str | None) -> Lease:
 def release(cfg: Config, lease_id: str, agent: str | None) -> None:
     live, expired, _now = _owned_rows(cfg, lease_id, agent)
     store = _store(cfg)
+    vm_key = live[0].vm_key if live else ""
     with store.transaction():
         store.lease_delete_by_id(lease_id)
     _ = (live, expired)
+    # Issue #24: the release transition's own event (best-effort).
+    from . import operations as _ops
+
+    _ops.emit(cfg, "lease.released", lease_id, vm_key, agent, {})
 
 
 def list_leases(cfg: Config, vm_id: str = "", agent: str | None = None) -> list[Lease]:

@@ -931,6 +931,11 @@ def relay_start(
             _relays[relay_id] = entry
         # Registry lock released first: store-lock is the outer order.
         store.relay_upsert(_row(entry, statestore.RELAY_ACTIVE))
+        # Issue #24: the (re-)registration transition's event (best-effort).
+        from . import operations as _ops
+
+        _ops.emit(cfg, "relay.started", entry.get("relay_id", ""),
+                  entry.get("vm_id", ""), entry.get("owner"), {})
         _mark_store_wrote(relay_id)
     except BaseException:
         # No exception between the reservation and the registration may
@@ -1140,6 +1145,10 @@ def relay_stop(cfg: Config, relay_id: str, *, owner: str | None = None) -> dict:
         _store(cfg).relay_upsert(statestore.RelayRow(
             **{**row.as_dict(), "cred_ref": recorded_ref}
         ))
+        # Issue #24: the stop transition's event (best-effort).
+        from . import operations as _ops
+
+        _ops.emit(cfg, "relay.stopped", relay_id, row.vm_id, row.owner, {})
         # PRR-005: the stop WROTE the row, so it is this process's own now —
         # a later eviction may delete it even though a peer started it.
         _mark_store_wrote(relay_id)
