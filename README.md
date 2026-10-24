@@ -430,10 +430,11 @@ Lifecycle after a restart:
   credential error rather than silently substituting whatever credentials the
   environment now holds.
 
-The schema is versioned with `PRAGMA user_version` (this release sets 2; a
+The schema is versioned with `PRAGMA user_version` (this release sets 3; a
 v1 database written by 0.4.x gains the lease tables automatically on first
-open — the migration is additive and transactional) and migrations only go
-forward. A database written by a newer build is refused rather than silently
+open, and a v2 database written by 0.5.x gains the `ops`/`events`/`meta`
+tables the same way — every migration is additive and transactional) and
+migrations only go forward. A database written by a newer build is refused rather than silently
 corrupted; conversely, an OLDER binary refuses any config file that contains
 the `leases` key (unknown config key) — remove the key or upgrade the binary.
 

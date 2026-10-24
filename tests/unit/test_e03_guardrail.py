@@ -529,4 +529,8 @@ def test_in_flight_replay_carries_replayed_marker(tmp_path):
         )
     finally:
         gate.set()
+        # drain WHILE the fake is still patched: the gated runner completes
+        # against it, then the patch is undone (its absence was the leak that
+        # turned every later real-PS leg in the suite into a fake response)
         operations.drain_for_tests(timeout_s=5.0)
+        monkey.undo()
