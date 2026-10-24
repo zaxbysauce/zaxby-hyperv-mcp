@@ -3088,7 +3088,9 @@ def _harden_tools(mcp: MCPServer) -> None:
                     if ops_ctx is not None:
                         operations.complete_inline(ops_ctx, result)
                     return result
-                except UrlElicitationRequiredError:
+                except UrlElicitationRequiredError as exc:
+                    if ops_ctx is not None:
+                        operations.fail_inline(ops_ctx, exc)
                     raise
                 except Exception as exc:
                     # 2.x Tool.run wraps both failure shapes into a ToolError /
@@ -3106,6 +3108,16 @@ def _harden_tools(mcp: MCPServer) -> None:
                     if ops_ctx is not None:
                         operations.fail_inline(ops_ctx, cause if cause is not None else exc)
                     return _audited_rejection(name, arguments, env)
+                except BaseException as exc:
+                    # Review rb-1: CancelledError (client disconnect / server
+                    # shutdown) is a BaseException - without this arm a sync
+                    # keyed row stays working forever after a disconnect.
+                    # fail_inline records the outcome; the cancellation still
+                    # propagates. This arm MUST come after `except Exception`
+                    # so ordinary tool errors still get the envelope path.
+                    if ops_ctx is not None:
+                        operations.fail_inline(ops_ctx, exc)
+                    raise
             finally:
                 # Issue #23: the presented lease rides only THIS call. The
                 # reset must cover every exit (success, failure, rejection,

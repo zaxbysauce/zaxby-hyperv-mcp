@@ -62,11 +62,13 @@ def test_every_detachable_tool_declares_the_coordination_params(tmp_path):
 class _FakePS:
     """Content-dispatched run_ps fake with an optional raising marker."""
 
-    def __init__(self, raise_on: str | None = None, gate: threading.Event | None = None):
+    def __init__(self, raise_on: str | None = None, gate: threading.Event | None = None,
+                 guid: str = GUID):
         self.scripts: list[str] = []
         self._lock = threading.Lock()
         self._raise_on = raise_on
         self._gate = gate
+        self._guid = guid
 
     def __call__(self, script, **kwargs):
         if self._gate is not None:
@@ -79,7 +81,7 @@ class _FakePS:
         if self._raise_on and self._raise_on in script:
             raise pswindows.PowerShellTransportError("guardrail: scripted leg failure")
         if "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget"):
-            return pswindows.PSResult(stdout=GUID, returncode=0)
+            return pswindows.PSResult(stdout=self._guid, returncode=0)
         if "Checkpoint-VM" in script or "Restore-VMSnapshot" in script:
             return pswindows.PSResult(stdout="", returncode=0)
         return pswindows.PSResult(stdout="{}", returncode=0)
@@ -129,7 +131,7 @@ def test_runner_bound_exhaustion_refuses_retryable_busy(tmp_path, monkeypatch):
                   {"vm_name": "test-vm", "checkpoint_name": "one", "detach": True})
     assert first.get("status") == "working", json.dumps(first)[:200]
     busy = _call(mcp, "hyperv_checkpoint_create",
-                 {"vm_name": "test-vm", "checkpoint_name": "two", "detach": True})
+                 {"vm_name": "r10-vm", "checkpoint_name": "two", "detach": True})
     assert busy.get("ok") is False and busy.get("error_class") == "busy", (
         f"R10: the second detached call must be refused busy; got {json.dumps(busy)[:300]}"
     )
@@ -149,7 +151,7 @@ def test_runner_bound_exhaustion_refuses_retryable_busy(tmp_path, monkeypatch):
             break
         time.sleep(0.02)
     third = _call(mcp, "hyperv_checkpoint_create",
-                  {"vm_name": "test-vm", "checkpoint_name": "three", "detach": True})
+                  {"vm_name": "r10-vm", "checkpoint_name": "three", "detach": True})
     assert third.get("status") == "working", json.dumps(third)[:200]
     operations.drain_for_tests(timeout_s=5.0)
 
@@ -164,7 +166,7 @@ def test_detached_body_crash_records_failed_envelope(tmp_path, monkeypatch):
     mcp = mod.get_mcp()
 
     handle = _call(mcp, "hyperv_checkpoint_create",
-                   {"vm_name": "test-vm", "checkpoint_name": "boom", "detach": True})
+                   {"vm_name": "r11-vm", "checkpoint_name": "boom", "detach": True})
     assert handle.get("op_id")
     import time
 
@@ -308,7 +310,7 @@ def test_interceptor_slot_accounting_across_create_reattach_conflict(tmp_path):
 
     mod = _boot(tmp_path, {**UNRESTRICTED, "operations": {"runner_bound": 2}})
     gate = threading.Event()
-    fake = _FakePS(gate=gate)
+    fake = _FakePS(gate=gate, guid="aaaa1111-dcab-438d-9a54-3af74a82b624")
     monkey = pytest.MonkeyPatch()
     try:
         monkey.setattr(pswindows, "run_ps", fake)
@@ -438,7 +440,7 @@ def test_sync_keyed_envelope_refusal_records_failed_with_event(tmp_path):
         monkey.setattr(pswindows, "run_ps", fake)
         mcp = mod.get_mcp()
         refused = _call(mcp, "hyperv_checkpoint_create",
-                        {"vm_name": "test-vm", "checkpoint_name": "fail",
+                        {"vm_name": "q1-vm", "checkpoint_name": "fail",
                          "idempotency_key": "q1-fail"})
         assert refused.get("ok") is False, json.dumps(refused)[:200]
         # locate the row via the idempotency record
@@ -458,7 +460,7 @@ def test_sync_keyed_envelope_refusal_records_failed_with_event(tmp_path):
         )
 
         ok = _call(mcp, "hyperv_checkpoint_create",
-                   {"vm_name": "test-vm", "checkpoint_name": "good",
+                   {"vm_name": "q1-vm", "checkpoint_name": "good",
                     "idempotency_key": "q1-ok"})
         assert ok.get("status") == "created", json.dumps(ok)[:200]
         row_ok = store.op_find_idem("", "hyperv_checkpoint_create", "q1-ok")
@@ -514,11 +516,11 @@ def test_in_flight_replay_carries_replayed_marker(tmp_path):
         monkey.setattr(pswindows, "run_ps", fake)
         mcp = mod.get_mcp()
         first = _call(mcp, "hyperv_checkpoint_create",
-                      {"vm_name": "test-vm", "checkpoint_name": "live",
+                      {"vm_name": "fc-f3-vm", "checkpoint_name": "live",
                        "detach": True, "idempotency_key": "fc-f3"})
         assert first.get("op_id") and first.get("status") == "working"
         retry = _call(mcp, "hyperv_checkpoint_create",
-                      {"vm_name": "test-vm", "checkpoint_name": "live",
+                      {"vm_name": "fc-f3-vm", "checkpoint_name": "live",
                        "detach": True, "idempotency_key": "fc-f3"})
         assert retry.get("op_id") == first["op_id"], (
             f"FC-F3: the retry must re-attach to the same op; got {json.dumps(retry)[:200]}"
