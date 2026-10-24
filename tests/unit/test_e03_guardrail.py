@@ -360,11 +360,17 @@ def test_interceptor_slot_accounting_across_create_reattach_conflict(tmp_path):
 
 
 def test_preflight_refusal_answers_audited_envelope_both_param_shapes(tmp_path):
-    """Review F2: a detached call refused by the synchronous preflight answers
+    """Review F2: a DETACHED call refused by the synchronous preflight answers
     the ordinary ok:false envelope (error_class policy for a missing confirm,
-    invalid for a mistyped confirm) with ZERO op rows — never a raw escape —
-    and leaves the same audit record every other guard refusal writes."""
-    mod = _boot(tmp_path, UNRESTRICTED)
+    invalid for a mistyped confirm) with ZERO op rows - never a raw escape -
+    and leaves the same audit record every other guard refusal writes (the
+    audit_log_path file is read back and the two error_class values are
+    asserted). Both calls carry detach:true so the preflight seam
+    (operations.guard_consult's preflight hook) is ON the call path: this test
+    FAILS if the F2 handler in server.py is reverted to a re-raise."""
+    audit_log = tmp_path / "guardrail-audit.jsonl"
+    mod = _boot(tmp_path, {**UNRESTRICTED,
+                           "audit_log_path": str(audit_log)})
     fake = _FakePS()
     monkey = pytest.MonkeyPatch()
     try:
@@ -372,14 +378,15 @@ def test_preflight_refusal_answers_audited_envelope_both_param_shapes(tmp_path):
         mcp = mod.get_mcp()
 
         refused = _call(mcp, "hyperv_checkpoint_restore",
-                        {"vm_name": "test-vm", "checkpoint_name": "snap"})
+                        {"vm_name": "test-vm", "checkpoint_name": "snap",
+                         "detach": True})
         assert refused.get("ok") is False and refused.get("error_class") == "policy", (
             f"F2: detach without confirm must answer the policy envelope; "
             f"got {json.dumps(refused)[:300]}"
         )
         mistyped = _call(mcp, "hyperv_checkpoint_restore",
                          {"vm_name": "test-vm", "checkpoint_name": "snap",
-                          "confirm": "banana"})
+                          "confirm": "banana", "detach": True})
         assert mistyped.get("ok") is False and mistyped.get("error_class") == "invalid", (
             f"F2: a mistyped confirm must answer invalid; got {json.dumps(mistyped)[:300]}"
         )
@@ -392,5 +399,69 @@ def test_preflight_refusal_answers_audited_envelope_both_param_shapes(tmp_path):
             )
         finally:
             statestore.clear_store_cache_for_tests()
+        # The audit record the docstring promises: one audited rejection per
+        # refusal, carrying the same error_class as the envelope.
+        records = [json.loads(line) for line in
+                   audit_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+        restores = [r for r in records if r.get("tool") == "hyperv_checkpoint_restore"]
+        assert sorted(r.get("error_class") for r in restores) == ["invalid", "policy"], (
+            f"F2: both preflight refusals must leave audit records with their "
+            f"error_class; got {restores}"
+        )
+    finally:
+        monkey.undo()
+
+
+def test_sync_keyed_envelope_refusal_records_failed_with_event(tmp_path):
+    """Review F4 (Q1 pin): a keyed SYNC call whose body returns a tool-level
+    ok:false envelope is recorded FAILED with the envelope's error_class and
+    an op.failed event carrying mode:inline - symmetric with the detached path
+    (operations.complete_inline) - while a succeeding keyed call stays
+    completed. FAILS when the ok:false classification in complete_inline is
+    reverted."""
+    mod = _boot(tmp_path, UNRESTRICTED)
+
+    class LegFailurePS(_FakePS):
+        def __call__(self, script, **kwargs):
+            result = super().__call__(script, **kwargs)
+            # fail ONLY the second create's action leg: the fake's gate-free
+            # fake answers every leg, so keying the two calls apart by
+            # checkpoint name keeps the control (good) succeeding
+            if "Checkpoint-VM" in script and "fail" in script and "good" not in script:
+                return pswindows.PSResult(
+                    stdout="", stderr="simulated leg failure", returncode=1)
+            return result
+
+    fake = LegFailurePS()
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(pswindows, "run_ps", fake)
+        mcp = mod.get_mcp()
+        refused = _call(mcp, "hyperv_checkpoint_create",
+                        {"vm_name": "test-vm", "checkpoint_name": "fail",
+                         "idempotency_key": "q1-fail"})
+        assert refused.get("ok") is False, json.dumps(refused)[:200]
+        # locate the row via the idempotency record
+        store = statestore.store_for(mod.CFG)
+        row = store.op_find_idem("", "hyperv_checkpoint_create", "q1-fail")
+        assert row is not None and row.status == statestore.OP_FAILED, (
+            f"F4: a sync keyed refusal must record failed; got "
+            f"{(row.status, row.error_class) if row else None}"
+        )
+        assert row.error_class == "transport", row.error_class
+        events = [json.loads(r["data_json"]) for r in
+                  store.events_after(row.agent or "", 0, 100)
+                  if r["ref_id"] == row.op_id]
+        assert any(e.get("mode") == "inline" and e.get("error_class") == "transport"
+                   for e in events), (
+            f"F4: the op.failed event must carry mode:inline; got {events}"
+        )
+
+        ok = _call(mcp, "hyperv_checkpoint_create",
+                   {"vm_name": "test-vm", "checkpoint_name": "good",
+                    "idempotency_key": "q1-ok"})
+        assert ok.get("status") == "created", json.dumps(ok)[:200]
+        row_ok = store.op_find_idem("", "hyperv_checkpoint_create", "q1-ok")
+        assert row_ok is not None and row_ok.status == statestore.OP_COMPLETED
     finally:
         monkey.undo()
