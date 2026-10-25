@@ -784,7 +784,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
     @mcp.tool()
     def hyperv_checkpoint_create(
-        vm_name: str = "", checkpoint_name: str = "", vm_id: str = "",
+        vm_name: str = "", checkpoint_name: str = "", vm_id: str = "", checkpoint_type: str = "",
         lease_id: str = "", fencing_token: int = 0,
         detach: bool = False, idempotency_key: str = "",
     ) -> dict:
@@ -794,14 +794,19 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_name:         Name of the VM
             checkpoint_name: Label (auto timestamp if omitted)
             vm_id:           Optional VM GUID; exactly one of vm_name/vm_id must be given
+            checkpoint_type: "standard", "production", "production_only", or "" (default:
+                             the VM's own setting). A Standard checkpoint writes guest memory
+                             to the host checkpoint store — it can persist secrets held in
+                             guest memory (for example an autologon password).
 
-        Returns: {status, vm_name, checkpoint_name}
+        Returns: {status, vm_name, checkpoint_name} (+ checkpoint_type, vm_checkpoint_type
+        when a type was requested)
 
         Failure: {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).        """
         return _run_guest_tool(
             "hyperv_checkpoint_create", vm_name, "checkpoint",
             lifecycle.checkpoint_create, _cfg(), vm_name,
-            checkpoint_name=checkpoint_name, vm_id=vm_id,
+            checkpoint_name=checkpoint_name, vm_id=vm_id, checkpoint_type=checkpoint_type,
         )
 
     @mcp.tool()
@@ -830,7 +835,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         detach: bool = False, idempotency_key: str = "",
     ) -> dict:
         """Restore a VM to a checkpoint. ALL STATE SINCE THE CHECKPOINT IS
-        DISCARDED. The VM ends powered off; call hyperv_start_vm afterwards.
+        DISCARDED. The VM ends in the state the checkpoint captured (Off for
+        Production checkpoints; Saved/Running for Standard); the returned
+        note says which and what to call next.
 
         Args:
             vm_name:         Name of the VM

@@ -148,6 +148,20 @@ def test_parse_reset_vm(monkeypatch, parsed_ps):
 def test_parse_checkpoint_create(monkeypatch, parsed_ps):
     script = _collect(monkeypatch, lifecycle.checkpoint_create, UNRESTRICTED, "vm1", "snap1")
     assert _parse_errors(script) == []
+    # Issue #26 AC10: the checkpoint_type="standard" variant folds Set-VM,
+    # Checkpoint-VM and the restore-finally into one script — it must parse
+    # too. On the pre-fix tree the kwarg raises TypeError before any script
+    # is generated, so there is nothing extra to parse and this stays green.
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        lifecycle.checkpoint_create(
+            UNRESTRICTED, "vm1", "snap1", checkpoint_type="standard"
+        )
+    except Exception:
+        pass  # pre-fix tree: no standard variant exists yet
+    for extra in (s for s in rec.scripts if not _is_resolution_leg(s)):
+        assert _parse_errors(extra) == []
 
 
 def test_parse_checkpoint_list(monkeypatch, parsed_ps):

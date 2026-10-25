@@ -89,7 +89,8 @@ _VM_KEY_ALIASES = {
 _INFO_KEY_ALIASES = {
     **_VM_KEY_ALIASES,
     "generation": "Generation", "dynamic_memory": "DynamicMemory",
-    "checkpoint_count": "CheckpointCount", "com_ports": "ComPorts",
+    "checkpoint_count": "CheckpointCount", "checkpoint_type": "CheckpointType",
+    "com_ports": "ComPorts",
     "network_adapters": "NetworkAdapters", "hard_drives": "HardDrives",
 }
 _SNAPSHOT_KEY_ALIASES = {
@@ -243,6 +244,7 @@ $snaps = (Get-VMSnapshot -VM $vm -ErrorAction Stop | Measure-Object).Count
     cpu_count        = $vm.ProcessorCount
     uptime_seconds   = $vm.Uptime.TotalSeconds
     checkpoint_count = $snaps
+    checkpoint_type  = [string]$vm.CheckpointType
     com_ports        = @($com)
     network_adapters = @($net)
     hard_drives      = @($hdd)
@@ -381,21 +383,68 @@ Start-VM -VM $vm -ErrorAction Stop
 # checkpoints
 # ---------------------------------------------------------------------------
 
-def checkpoint_create(cfg: Config, vm_name: str = "", checkpoint_name: str = "", vm_id: str = "") -> dict:
+# Issue #26: checkpoint_type selection. Checkpoint-VM has no per-call type
+# parameter, so a non-empty type is applied to the VM's CheckpointType setting
+# for the single Checkpoint-VM call and restored in the same script's finally.
+# Caller text never reaches the script: the value maps to a fixed literal.
+_CHECKPOINT_TYPES = {
+    "": "",
+    "standard": "Standard",
+    "production": "Production",
+    "production_only": "ProductionOnly",
+}
+
+
+def checkpoint_create(
+    cfg: Config, vm_name: str = "", checkpoint_name: str = "", vm_id: str = "", checkpoint_type: str = ""
+) -> dict:
+    if not isinstance(checkpoint_type, str) or checkpoint_type not in _CHECKPOINT_TYPES:
+        raise ValueError(
+            f"invalid checkpoint_type {checkpoint_type!r}; must be one of "
+            "standard, production, production_only, or empty (VM's own setting)"
+        )
     if not checkpoint_name:
         checkpoint_name = f"MCP-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     _checked_label(checkpoint_name, "checkpoint_name")
     cn = pswindows.ps_name(checkpoint_name)
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     with vmlocks.vm_lock(ref.id):
-        script = f"""
+        if not checkpoint_type:
+            script = f"""
 {guestexec.vm_target_preamble(ref.id)}
 $vm = Get-VM -Id $vmTarget -ErrorAction Stop
 Checkpoint-VM -VM $vm -SnapshotName {cn} -ErrorAction Stop
 """
+        else:
+            literal = _CHECKPOINT_TYPES[checkpoint_type]
+            script = f"""
+{guestexec.vm_target_preamble(ref.id)}
+$vm = Get-VM -Id $vmTarget -ErrorAction Stop
+$orig = [string]$vm.CheckpointType
+$cpErr = ''
+$restoreErr = ''
+try {{
+    Set-VM -VM $vm -CheckpointType {literal} -ErrorAction Stop
+    Checkpoint-VM -VM $vm -SnapshotName {cn} -ErrorAction Stop
+}} catch {{
+    $cpErr = $_.Exception.Message
+}} finally {{
+    try {{ Set-VM -VM $vm -CheckpointType $orig -ErrorAction Stop }} catch {{ $restoreErr = $_.Exception.Message }}
+}}
+[PSCustomObject]@{{ original_type=$orig; restore_error=$restoreErr }} | ConvertTo-Json -Compress
+if ($cpErr -and $restoreErr) {{ throw (('checkpoint failed: {{0}}; CheckpointType restore also failed (pre-call type {{1}}): {{2}}') -f $cpErr, $orig, $restoreErr) }}
+elseif ($cpErr) {{ throw $cpErr }}
+elseif ($restoreErr) {{ throw (('CheckpointType restore failed (pre-call type {{0}}; it may still be {{1}}): {{2}}') -f $orig, '{literal}', $restoreErr) }}
+"""
         result = _run(cfg, script, timeout_s=300)
         pswindows.check_result(result, f"hyperv_checkpoint_create({vm_name or vm_id})")
-        return {"status": "created", "vm_name": ref.name, "checkpoint_name": checkpoint_name}
+        out = {"status": "created", "vm_name": ref.name, "checkpoint_name": checkpoint_name}
+        if checkpoint_type:
+            rows = _parse_json_objects(result, "checkpoint_create")
+            original = str(rows[0].get("original_type", "")) if rows else ""
+            out["checkpoint_type"] = checkpoint_type
+            out["vm_checkpoint_type"] = original
+        return out
 
 
 def checkpoint_list(cfg: Config, vm_name: str = "", vm_id: str = "") -> list[dict]:
@@ -439,13 +488,28 @@ Restore-VMSnapshot -Name {cn} -VM (Get-VM -Id $vmTarget -ErrorAction Stop) -Conf
         # Restoring a checkpoint whose subtree has descendants merges their
         # differencing disks; the VM can stay in transitional states for many
         # minutes (observed: >120s on a 10-deep tree). Wait generously.
-        final = _wait_for_state(cfg, ref, ["Off", "Saved", "Paused"], timeout_s=600)
+        # "Running" is in the wanted set because a Standard checkpoint can
+        # hand back a VM that resumes straight into Running (issue #26);
+        # without it the wait below would spin for the full timeout.
+        final = _wait_for_state(cfg, ref, ["Off", "Saved", "Paused", "Running"], timeout_s=600)
+        notes = {
+            "Off": "VM is powered off after restore; call hyperv_start_vm to bring it back up.",
+            "Saved": (
+                "Standard checkpoint restored the saved memory state; the VM is saved, not "
+                "off. Call hyperv_start_vm to resume it with memory intact."
+            ),
+            "Paused": (
+                "Checkpoint restored; the VM is paused at the restored state. Call Resume-VM to "
+                "resume it (hyperv_start_vm is for stopped/saved VMs)."
+            ),
+            "Running": "Checkpoint restored; the VM is running the restored state. No start needed.",
+        }
         return {
             "status": "restored",
             "vm_name": ref.name,
             "checkpoint_name": checkpoint_name,
             "state": final,
-            "note": "VM is powered off after restore; call hyperv_start_vm to bring it back up.",
+            "note": notes.get(final, f"VM state after restore: {final}."),
         }
 
 

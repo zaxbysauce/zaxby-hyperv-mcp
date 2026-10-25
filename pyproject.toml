@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hyperv-mcp"
-version = "0.6.0"
+version = "0.7.0"
 description = "MCP server for Hyper-V VM management, checkpoints, kernel debug setup, guest execution, guest access diagnostics/repair, managed guest jobs, HTTP relay, and console evidence capture over PowerShell Direct."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -111,6 +111,11 @@ select = ["E", "F", "W", "I", "UP", "B"]
 ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
+# tests/unit/test_f02_checkpoint_type.py is the byte-locked acceptance-check
+# file of the issue-#26 red checkpoint (manifest blob e0e987f4...): its
+# bytes are frozen by the trace protocol, so its author-era import order
+# cannot be re-sorted by the linter.
+"tests/unit/test_f02_checkpoint_type.py" = ["I001"]
 # tests/unit/test_b01_agent_identity.py is the byte-locked acceptance-check
 # file of the issue-#10 red checkpoint (manifest blob 3008efa1...): its bytes
 # are frozen by the trace protocol, so its author-era import order cannot be

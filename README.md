@@ -226,6 +226,17 @@ definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN <token>` — available from the next logon) and
 the task-spawned controller reads it from the environment.
 
+## 0.7.0 changes
+
+- **`hyperv_checkpoint_create` gains `checkpoint_type`** (issue #26):
+  `standard`, `production`, `production_only`, or `""` (default — the VM's
+  own setting, byte-identical behavior to 0.6.x). Additive; no breaking
+  change. The create result gains `checkpoint_type` and `vm_checkpoint_type`
+  when a type was requested; `hyperv_get_vm_info` gains `checkpoint_type`;
+  the restore `note` is now state-accurate (Saved/Paused/Running restore
+  states no longer claim the VM is powered off). See "Checkpoint types" under
+  Checkpoints for the security and recovery notes.
+
 ## 0.6.0 breaking changes
 
 - **`hyperv_console_click` coordinates:** `x`/`y` now default to `null`
@@ -1054,7 +1065,7 @@ omission is rejected rather than defaulting to a disable.
 | Tool | Parameters | Returns |
 |------|-----------|---------|
 | `hyperv_list_vms` | — | `[{id, name, state, status, memory_mb, cpu_count, uptime_seconds}]` |
-| `hyperv_get_vm_info` | `vm_name` or `vm_id` | `{id, name, state, generation, memory_mb, cpu_count, checkpoint_count, com_ports, network_adapters, hard_drives, ...}` |
+| `hyperv_get_vm_info` | `vm_name` or `vm_id` | `{id, name, state, generation, memory_mb, cpu_count, checkpoint_count, checkpoint_type, com_ports, network_adapters, hard_drives, ...}` |
 | `hyperv_start_vm` | `vm_name` or `vm_id` | `{status: started\|already_running, vm_name, state}` — waits for Running |
 | `hyperv_stop_vm` | `vm_name` or `vm_id`, `method`, `confirm` | `{status, vm_name, method, state}` — waits for final state |
 | `hyperv_reset_vm` | `vm_name` or `vm_id`, `confirm` | `{status, vm_name, state}` — waits for Running |
@@ -1070,15 +1081,44 @@ last observed state.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_checkpoint_create` | `vm_name` or `vm_id`, `checkpoint_name?` | `{status, vm_name, checkpoint_name}` |
+| `hyperv_checkpoint_create` | `vm_name` or `vm_id`, `checkpoint_name?`, `checkpoint_type?` | `{status, vm_name, checkpoint_name}` (+ `checkpoint_type`, `vm_checkpoint_type` when a type is requested) |
 | `hyperv_checkpoint_list` | `vm_name` or `vm_id` | `[{name, type, created, parent_name}]` |
 | `hyperv_checkpoint_restore` | `vm_name` or `vm_id`, `checkpoint_name`, `confirm` | `{status, vm_name, checkpoint_name, state, note}` |
 | `hyperv_checkpoint_remove` | `vm_name` or `vm_id`, `checkpoint_name`, `include_subtree`, `confirm` | `{status, vm_name, checkpoint_name}` |
 
 `checkpoint_name` auto-generates (`MCP-YYYYMMDD-HHMMSS`) only on **create**;
-restore/remove require it. Restore stops the VM (waits up to 600 s for
-Off/Saved/Paused while any checkpoint merge completes) — call
-`hyperv_start_vm` afterwards. Removal merges disks; it cannot be undone.
+restore/remove require it.
+
+**Checkpoint types (0.7.0).** `hyperv_checkpoint_create` accepts
+`checkpoint_type`: `standard`, `production`, `production_only`, or empty
+(default: the VM's own `CheckpointType` setting, unchanged behavior).
+`Checkpoint-VM` has no per-call type parameter, so a requested type is
+applied to the VM-level setting for that one call and restored afterwards —
+the result reports the requested type and the VM's pre-call type
+(`checkpoint_type`, `vm_checkpoint_type`).
+
+- **Standard** captures guest memory: applying it returns the VM to the exact
+  saved moment (a `hyperv_checkpoint_restore` then reports `Saved` or
+  `Running`, with a note saying so, instead of claiming the VM is powered
+  off; only Production restores report `Off`).
+- **Production** takes no memory snapshot (restores to `Off`) and falls back
+  to Standard when the guest cannot take a production checkpoint.
+- **ProductionOnly** fails instead of falling back.
+
+**Security note.** A memory-bearing checkpoint (explicit Standard, or a
+Production fallback) writes guest RAM — potentially including secrets such as
+an autologon password — to the host checkpoint store. Microsoft also warns
+that standard snapshots can cause data-consistency issues for systems that
+replicate data between nodes (for example Active Directory).
+
+**Recovery.** The VM-level `CheckpointType` is visibly changed during the
+whole create call and a forced termination (timeout, hard kill, dropped host
+connection) can leave it stranded at the requested value. Inspect with
+`Get-VM "<name>"` and repair with `Get-VM "<name>" | Set-VM -CheckpointType
+<original>`.
+
+Restore waits up to 600 s for Off/Saved/Paused/Running while any checkpoint
+merge completes. Removal merges disks; it cannot be undone.
 
 ### Kernel Debug Setup
 

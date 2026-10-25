@@ -426,3 +426,93 @@ def test_console_windows_key_opens_start(running_vm):
     assert closed["frame_hash"] != start_hash, (
         "the second win press must leave a frame different from open-Start"
     )
+
+
+# ---------------------------------------------------------------------------
+# issue #26 — Standard checkpoints restore the running desktop
+# ---------------------------------------------------------------------------
+
+def test_standard_checkpoint_restores_running_desktop(it, it_tmp):
+    """AC11 (issue #26): a Standard checkpoint of a RUNNING, logged-on
+    desktop restores straight back to the saved moment. The window is driven
+    through the CONSOLE-INPUT path (PowerShell Direct guest exec may not
+    reach the interactive session), and the checkpoint is created WHILE the
+    window is open, so restoring it brings the closed window back:
+
+    open Notepad -> archive A -> get_vm_info -> checkpoint(standard) ->
+    Alt+F4 -> archive B -> restore(confirm) -> start if Saved -> archive C ->
+    get_vm_info (CheckpointType unchanged).
+
+    Automated oracle: the post-restore frame differs from the closed-window
+    frame; the archived A/B/C PNGs in the trace directory are the named
+    human-visibility oracle (frame hashes alone are necessary, not
+    sufficient). Cleanup removes the test-created checkpoint and leaves the
+    VM running; the standard-variant create restores the VM's own
+    CheckpointType in-script, and the final get_vm_info pins that."""
+    import json
+
+    from hyperv_mcp import console, lifecycle
+
+    cfg, vm = it.cfg, it.vm
+    shots = it_tmp / "ac11"
+    shots.mkdir(exist_ok=True)
+
+    def _shot(label):
+        frame, meta = console.screenshot(cfg, vm, save_path=str(shots / f"{label}.png"))
+        assert meta.get("frame_hash"), meta
+        with open(shots / f"{label}.json", "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, indent=2, default=str)
+        return meta["frame_hash"]
+
+    info_before = lifecycle.get_vm_info(cfg, vm)
+    original_type = info_before["checkpoint_type"]
+
+    _shot("0-desktop")
+    console.key_combo(cfg, vm, ["win", "r"])
+    console.wait_frame_change(cfg, vm, timeout_s=10)
+    console.type_text(cfg, vm, "notepad")
+    console.press_key(cfg, vm, "enter")
+    opened = console.wait_frame_change(cfg, vm, timeout_s=15)
+    assert opened.get("stop_reason") == "changed", opened
+    hash_a = _shot("A-notepad-open")
+
+    name = f"mcp-it-standard-{next(_CHECKPOINT_SEQ)}"
+    created = lifecycle.checkpoint_create(cfg, vm, name, checkpoint_type="standard")
+    try:
+        assert created["checkpoint_type"] == "standard"
+        assert created["vm_checkpoint_type"] == original_type, (
+            "the result must report the captured pre-call VM CheckpointType"
+        )
+
+        console.press_key(cfg, vm, "f4", modifiers=["alt"])
+        closed = console.wait_frame_change(cfg, vm, baseline_hash=hash_a, timeout_s=15)
+        assert closed.get("stop_reason") == "changed", closed
+        hash_b = _shot("B-notepad-closed")
+        assert hash_b != hash_a
+
+        out = lifecycle.checkpoint_restore(cfg, vm, name, confirm=True)
+        assert out["status"] == "restored"
+        assert out["state"] in ("Saved", "Running"), out
+        assert "powered off" not in out["note"] or out["state"] == "Off", (
+            f"state-accurate note required for {out['state']}: {out['note']!r}"
+        )
+        if out["state"] == "Saved":
+            started = lifecycle.start_vm(cfg, vm)
+            assert started["state"] == "Running"
+
+        console.wait_frame_change(cfg, vm, timeout_s=30)
+        hash_c = _shot("C-restored")
+        assert hash_c != hash_b, (
+            "the restored desktop must differ from the closed-window frame "
+            "(see the archived A/B/C PNGs for the human-visibility oracle)"
+        )
+
+        info_after = lifecycle.get_vm_info(cfg, vm)
+        assert info_after["checkpoint_type"] == original_type, (
+            "the VM-level CheckpointType must be restored to its pre-call value"
+        )
+    finally:
+        try:
+            lifecycle.checkpoint_remove(cfg, vm, name, confirm=True)
+        except Exception:
+            pass
