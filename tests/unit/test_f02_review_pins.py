@@ -217,6 +217,25 @@ def test_off_note_is_byte_identical_to_the_legacy_constant():
 
 
 # ---------------------------------------------------------------------------
+# Phase 4.2 guardrail: the note is a pure function of the observed state
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("final", ["Off", "Saved", "Paused", "Running", "Starting"])
+def test_guardrail_note_never_claims_a_state_it_is_not(final):
+    """Issue #26's defect class: the restore note was a CONSTANT claiming Off
+    regardless of the observed state. The note must be derived from the
+    observed state — non-Off states must never be told the VM is powered off,
+    and any unmodeled future state gets a neutral note, not a claim. RED on
+    the original constant note for every non-Off state; GREEN on the map."""
+    note = lifecycle.restore_note(final)
+    if final == "Off":
+        assert note == OFF_NOTE
+    else:
+        assert "powered off" not in note, f"{final}: {note!r}"
+        assert note != OFF_NOTE
+
+
+# ---------------------------------------------------------------------------
 # real-PowerShell error matrix for the standard variant (executing lane)
 # ---------------------------------------------------------------------------
 

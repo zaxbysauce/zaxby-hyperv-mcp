@@ -463,6 +463,27 @@ Get-VMSnapshot -VM $vm -ErrorAction Stop |
     return [_add_legacy_aliases(row, _SNAPSHOT_KEY_ALIASES) for row in _parse_json_objects(result, "checkpoint_list")]
 
 
+_RESTORE_NOTES = {
+    "Off": "VM is powered off after restore; call hyperv_start_vm to bring it back up.",
+    "Saved": (
+        "Standard checkpoint restored the saved memory state; the VM is saved, not "
+        "off. Call hyperv_start_vm to resume it with memory intact."
+    ),
+    "Paused": (
+        "Checkpoint restored; the VM is paused at the restored state. Call Resume-VM to "
+        "resume it (hyperv_start_vm is for stopped/saved VMs)."
+    ),
+    "Running": "Checkpoint restored; the VM is running the restored state. No start needed.",
+}
+
+
+def restore_note(final: str) -> str:
+    """Issue #26 guardrail seam: the note is a pure function of the OBSERVED
+    final state. Kept total — an unmodeled state gets a neutral note instead
+    of a claim (the original defect was a constant note claiming Off)."""
+    return _RESTORE_NOTES.get(final, f"VM state after restore: {final}.")
+
+
 def checkpoint_restore(
     cfg: Config, vm_name: str = "", checkpoint_name: str = "", confirm: bool = False, vm_id: str = ""
 ) -> dict:
@@ -492,24 +513,12 @@ Restore-VMSnapshot -Name {cn} -VM (Get-VM -Id $vmTarget -ErrorAction Stop) -Conf
         # hand back a VM that resumes straight into Running (issue #26);
         # without it the wait below would spin for the full timeout.
         final = _wait_for_state(cfg, ref, ["Off", "Saved", "Paused", "Running"], timeout_s=600)
-        notes = {
-            "Off": "VM is powered off after restore; call hyperv_start_vm to bring it back up.",
-            "Saved": (
-                "Standard checkpoint restored the saved memory state; the VM is saved, not "
-                "off. Call hyperv_start_vm to resume it with memory intact."
-            ),
-            "Paused": (
-                "Checkpoint restored; the VM is paused at the restored state. Call Resume-VM to "
-                "resume it (hyperv_start_vm is for stopped/saved VMs)."
-            ),
-            "Running": "Checkpoint restored; the VM is running the restored state. No start needed.",
-        }
         return {
             "status": "restored",
             "vm_name": ref.name,
             "checkpoint_name": checkpoint_name,
             "state": final,
-            "note": notes.get(final, f"VM state after restore: {final}."),
+            "note": restore_note(final),
         }
 
 
