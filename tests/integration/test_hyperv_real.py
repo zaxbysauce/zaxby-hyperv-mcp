@@ -467,6 +467,10 @@ def test_standard_checkpoint_restores_running_desktop(it, it_tmp):
     info_before = lifecycle.get_vm_info(cfg, vm)
     original_type = info_before["checkpoint_type"]
 
+    # AC12's runbook leg leaves the VM Off (its Production restore); the
+    # desktop flow needs a running, logged-on console. start_vm is idempotent.
+    lifecycle.start_vm(cfg, vm)
+
     _shot("0-desktop")
     console.key_combo(cfg, vm, ["win", "r"])
     console.wait_frame_change(cfg, vm, timeout_s=10)
