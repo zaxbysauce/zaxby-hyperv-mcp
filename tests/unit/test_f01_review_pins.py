@@ -160,3 +160,50 @@ def test_click_schema_type_admits_null():
         )
         assert admits_null, f"P-SCHEMA: {axis} must admit null, got {schema}"
         assert schema.get("default", "absent") is None
+
+
+# ---------------------------------------------------------------------------
+# ITEM 2 (PR #99 review): the unknown-key recovery text must keep the frozen
+# "unknown key ..." shape, list multi-character names comma-separated FIRST,
+# and present the single-character aliases as a space-separated trailing
+# clause (no ", "-separator collision with the "," alias).
+# ---------------------------------------------------------------------------
+
+def test_unknown_key_message_readable_recovery_shape():
+    with pytest.raises(ValueError) as exc:
+        _scancodes_for_key("meta")
+    message = str(exc.value)
+    assert message.startswith("unknown key 'meta'; supported keys: "), (
+        "P-ERRMSG: frozen prefix shape changed"
+    )
+    body = message[len("unknown key 'meta'; supported keys: "):]
+    alias_marker = "; single-char aliases: "
+    assert alias_marker in body, (
+        "P-ERRMSG: single-char aliases must be a separated trailing clause, "
+        f"got {message!r}"
+    )
+    long_part, alias_part = body.split(alias_marker, 1)
+    long_tokens = [t.strip() for t in long_part.split(",")]
+    alias_chars = set("-=[\\];'`,./")
+    assert not alias_chars & set(long_tokens), (
+        "P-ERRMSG: punctuation aliases must live in the trailing clause, "
+        f"not interleaved into the name list, got {long_part!r}"
+    )
+    assert long_tokens[0] == "0", (
+        f"P-ERRMSG: readable names must lead (digits first is fine), "
+        f"got {long_part!r}"
+    )
+    aliases = alias_part.split(" ")
+    assert len(aliases) == 11 and all(len(a) == 1 for a in aliases), (
+        f"P-ERRMSG: expected the 11 single-char aliases, got {aliases!r}"
+    )
+    # every listed alias still resolves to the same bytes as its long name
+    long_names = {
+        "-": "minus", "=": "equals", "[": "leftbracket",
+        "]": "rightbracket", "\\": "backslash", ";": "semicolon",
+        "'": "apostrophe", "`": "grave", ",": "comma", ".": "period",
+        "/": "slash",
+    }
+    assert set(aliases) == set(long_names)
+    for alias, name in long_names.items():
+        assert _scancodes_for_key(alias) == _scancodes_for_key(name), alias

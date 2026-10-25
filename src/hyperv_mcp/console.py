@@ -216,12 +216,17 @@ _KEY_SCANCODES["shift"] = _KEY_SCANCODES["leftshift"]
 _KEY_SCANCODES["win"] = _KEY_SCANCODES["leftwin"]
 _KEY_SCANCODES["menu"] = _KEY_SCANCODES["apps"]
 # Single-character aliases for the punctuation names.
+# Single-character punctuation aliases (populated by the loop below; kept as
+# a set so the recovery message can present them separately from the
+# multi-character names instead of interleaving them under sorted()).
+_PUNCT_ALIASES: set[str] = set()
 for _punct_alias, _punct_name in (
         ("-", "minus"), ("=", "equals"), ("[", "leftbracket"),
         ("]", "rightbracket"), ("\\", "backslash"), (";", "semicolon"),
         ("'", "apostrophe"), ("`", "grave"), (",", "comma"), (".", "period"),
         ("/", "slash")):
     _KEY_SCANCODES[_punct_alias] = _KEY_SCANCODES[_punct_name]
+    _PUNCT_ALIASES.add(_punct_alias)
 del _punct_alias, _punct_name
 
 
@@ -1479,8 +1484,14 @@ def _scancodes_for_key(key: str) -> list[int]:
     name = key.strip().lower()
     entry = _KEY_SCANCODES.get(name)
     if entry is None:
-        known = ", ".join(sorted(_KEY_SCANCODES))
-        raise ValueError(f"unknown key {key!r}; supported keys: {known}")
+        # Recovery surface: multi-character names first (comma-separated,
+        # sorted), then the single-character aliases space-separated — a
+        # ", "-separated "," alias is unreadable inside the list.
+        names = sorted(set(_KEY_SCANCODES) - _PUNCT_ALIASES)
+        raise ValueError(
+            f"unknown key {key!r}; supported keys: {', '.join(names)}; "
+            f"single-char aliases: {' '.join(sorted(_PUNCT_ALIASES))}"
+        )
     make, brk = entry
     if name in _EXTENDED_KEYS:
         return [0xE0, make, 0xE0, brk]
