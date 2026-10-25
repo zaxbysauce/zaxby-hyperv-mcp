@@ -212,8 +212,8 @@ def _position_from_script(script: str) -> tuple[int, int] | None:
                     fh = val or 0
     if not any((x, y, fw, fh)) and "$x =" not in script:
         return None
-    if x == 0 and y == 0:
-        return None  # click at the current position: no positioning leg
+    # (0,0) is a real coordinate (issue #25): a script with a folded $x/$y
+    # positional leg always reports its computed head position.
     if fw or fh:
         hx = round(x * HEAD[0] / fw) if fw else x
         hy = round(y * HEAD[1] / fh) if fh else y
@@ -527,7 +527,7 @@ def test_ps2_fallback_branch_present(monkeypatch, unrestricted_cfg):
     stub = _install(monkeypatch, SpawnCounter())
     console.mouse_button(unrestricted_cfg, "vm1", 1, True)
     console.scroll(unrestricted_cfg, "vm1", 1)
-    console.click(unrestricted_cfg, "vm1", 0, 0)
+    console.click(unrestricted_cfg, "vm1")
     scripts = stub.scripts[-3:]
     assert len(scripts) == 3, "AC14: expected one script per non-positional mouse op"
     for script, method in zip(scripts, ("SetButtonState", "SetScrollPosition", "ClickButton"), strict=True):
@@ -625,3 +625,13 @@ def test_scancode_chunk_expression_delivers_all_codes(monkeypatch, unrestricted_
     assert _executed_chunk_bytes(multi) == [
         list(range(64)), list(range(64, 128)), list(range(128, 192)),
     ]
+
+
+def test_position_from_script_origin_is_real(monkeypatch, unrestricted_cfg):
+    """Issue #25 origin protocol: a folded positional script at (0,0)
+    resolves to head (0,0), not None — _position_from_script discriminates
+    on the positional leg, never on the coordinate values."""
+    stub = _install(monkeypatch, SpawnCounter())
+    console.click(unrestricted_cfg, "vm1", 0, 0,
+                  frame_width=640, frame_height=480)
+    assert _position_from_script(stub.scripts[-1]) == (0, 0)

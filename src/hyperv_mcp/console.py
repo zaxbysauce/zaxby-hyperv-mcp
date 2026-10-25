@@ -182,16 +182,47 @@ _KEY_SCANCODES: dict[str, tuple[int, int]] = {
     "1": (0x02, 0x82), "2": (0x03, 0x83), "3": (0x04, 0x84), "4": (0x05, 0x85),
     "5": (0x06, 0x86), "6": (0x07, 0x87), "7": (0x08, 0x88), "8": (0x09, 0x89),
     "9": (0x0A, 0x8A), "0": (0x0B, 0x8B),
+    # punctuation (set 1 make codes; break = make | 0x80)
+    "minus": (0x0C, 0x8C), "equals": (0x0D, 0x8D),
+    "leftbracket": (0x1A, 0x9A), "rightbracket": (0x1B, 0x9B),
+    "semicolon": (0x27, 0xA7), "apostrophe": (0x28, 0xA8), "grave": (0x29, 0xA9),
+    "backslash": (0x2B, 0xAB),
+    "comma": (0x33, 0xB3), "period": (0x34, 0xB4), "slash": (0x35, 0xB5),
+    # numeric keypad: unprefixed except numdivide/numenter, which the
+    # controller emits with the 0xE0 prefix (see _EXTENDED_KEYS)
+    "num0": (0x52, 0xD2), "num1": (0x4F, 0xCF), "num2": (0x50, 0xD0),
+    "num3": (0x51, 0xD1), "num4": (0x4B, 0xCB), "num5": (0x4C, 0xCC),
+    "num6": (0x4D, 0xCD), "num7": (0x47, 0xC7), "num8": (0x48, 0xC8),
+    "num9": (0x49, 0xC9), "numdecimal": (0x53, 0xD3),
+    "nummultiply": (0x37, 0xB7), "numsubtract": (0x4A, 0xCA),
+    "numadd": (0x4E, 0xCE), "numlock": (0x45, 0xC5),
+    "numdivide": (0x35, 0xB5), "numenter": (0x1C, 0x9C),
+    # Windows (GUI) and Application keys: extended, E0 before make and break
+    "leftwin": (0x5B, 0xDB), "rightwin": (0x5C, 0xDC), "apps": (0x5D, 0xDD),
 }
 # Extended (0xE0-prefixed) keys per the PS/2 set-1 controller stream.
 # rightctrl/rightalt share the left-side make/break bytes but the controller
 # requires the 0xE0 prefix to distinguish them from left-ctrl/left-alt.
+# Membership is keyed by the CALLED name: the aliases win/menu are listed
+# here so they encode with the same E0 prefix as leftwin/apps (issue #25).
 _EXTENDED_KEYS = {"up", "down", "left", "right", "delete", "insert",
-                  "home", "end", "pageup", "pagedown", "rightctrl", "rightalt"}
+                  "home", "end", "pageup", "pagedown", "rightctrl", "rightalt",
+                  "leftwin", "rightwin", "apps", "win", "menu",
+                  "numdivide", "numenter"}
 # Aliases that map onto other entries.
 _KEY_SCANCODES["ctrl"] = _KEY_SCANCODES["leftctrl"]
 _KEY_SCANCODES["alt"] = _KEY_SCANCODES["leftalt"]
 _KEY_SCANCODES["shift"] = _KEY_SCANCODES["leftshift"]
+_KEY_SCANCODES["win"] = _KEY_SCANCODES["leftwin"]
+_KEY_SCANCODES["menu"] = _KEY_SCANCODES["apps"]
+# Single-character aliases for the punctuation names.
+for _punct_alias, _punct_name in (
+        ("-", "minus"), ("=", "equals"), ("[", "leftbracket"),
+        ("]", "rightbracket"), ("\\", "backslash"), (";", "semicolon"),
+        ("'", "apostrophe"), ("`", "grave"), (",", "comma"), (".", "period"),
+        ("/", "slash")):
+    _KEY_SCANCODES[_punct_alias] = _KEY_SCANCODES[_punct_name]
+del _punct_alias, _punct_name
 
 
 class ConsoleError(RuntimeError):
@@ -1456,15 +1487,25 @@ def _scancodes_for_key(key: str) -> list[int]:
     return [make, brk]
 
 
+# Names the combo builder holds as modifiers (everything else in a combo
+# is tapped in order).
+_COMBO_MODIFIERS = frozenset((
+    "ctrl", "alt", "shift", "leftctrl", "rightctrl", "leftalt", "rightalt",
+    "leftshift", "rightshift", "win", "leftwin", "rightwin"))
+
+
 def _scancodes_for_combo(keys: list[str]) -> list[int]:
     """Combo: modifier makes first, then each key in order, modifier breaks last.
     Modifiers go through the same extended-prefix rule as _scancodes_for_key
     (rightctrl/rightalt carry 0xE0 even as combo modifiers)."""
-    mods = [k for k in keys if k.strip().lower() in ("ctrl", "alt", "shift",
-                                                     "leftctrl", "rightctrl",
-                                                     "leftalt", "rightalt",
-                                                     "leftshift", "rightshift")]
+    mods = [k for k in keys if k.strip().lower() in _COMBO_MODIFIERS]
     rest = [k for k in keys if k not in mods]
+    return _combo_codes(mods, rest)
+
+
+def _combo_codes(mods: list[str], rest: list[str]) -> list[int]:
+    """Encode an explicit modifier/rest split (press_key uses this so a
+    modifier-named KEY is tapped, not silently reclassified as held)."""
     if not rest:
         raise ValueError("combo needs at least one non-modifier key")
     codes: list[int] = []
@@ -1812,13 +1853,24 @@ def press_key(
     cfg: Config, vm_name: str = "", key: str = "", modifiers: list[str] | None = None, vm_id: str = "",
 ) -> dict:
     policy.require_category(cfg, "console_input", f"press {key} on '{vm_name}' console")
+    # A bare key press has no modifiers to hold, so it encodes through the
+    # plain key path — otherwise a modifier-named key (win, ctrl, ...) would
+    # be rejected by the combo builder as modifier-only (issue #25: a bare
+    # win press must reach the guest).
+    if not modifiers:
+        codes = _scancodes_for_key(key)
+    else:
+        # The key argument is ALWAYS the tapped key, even when it shares a
+        # name with a modifier (win+ctrl holds ctrl and taps win) — the
+        # modifiers list is what gets held (issue #25 review: role swap).
+        held = [m for m in modifiers if m.strip().lower() in _COMBO_MODIFIERS]
+        tapped = [key] + [m for m in modifiers if m not in held]
+        codes = _combo_codes(held, tapped)
     be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
     if be is not None and ref is not None:
-        codes = _scancodes_for_combo([key] + list(modifiers or []))
         return _send_scancodes_locked(cfg, ref, codes, be=be, connect_ms=connect_ms)
     timing = _PsTiming()
     prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
-    codes = _scancodes_for_combo([key] + list(modifiers or []))
     return _send_scancodes_locked(cfg, ref, codes, timing=timing, prelude=prelude)
 
 
@@ -1959,12 +2011,14 @@ def mouse_move(
 
 
 def click(
-    cfg: Config, vm_name: str = "", x: int = 0, y: int = 0, frame_width: int = 0,
-    frame_height: int = 0, button: int = 1, vm_id: str = "",
+    cfg: Config, vm_name: str = "", x: int | None = None, y: int | None = None,
+    frame_width: int = 0, frame_height: int = 0, button: int = 1, vm_id: str = "",
 ) -> dict:
     policy.require_category(cfg, "console_input", f"click on '{vm_name}' console")
     if button not in (1, 2):
         raise ValueError("button must be 1 (left) or 2 (right)")
+    if (x is None) != (y is None):
+        raise ValueError("x and y must be given together")
     if (frame_width or frame_height) and (frame_width <= 0 or frame_height <= 0):
         raise ValueError("frame_width/frame_height must be positive when given")
     be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
@@ -1972,7 +2026,7 @@ def click(
         try:
             with _input_lock(ref):
                 extra: dict = {}
-                if x or y:
+                if x is not None and y is not None:
                     head, t_head = be.head_resolution(ref.id)
                     hx, hy = _scale_to_head(x, y, frame_width, frame_height, head)
                     _r, t = be.mouse_click(ref.id, button, hx, hy)
@@ -1988,7 +2042,7 @@ def click(
         }
     timing = _PsTiming()
     prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
-    if x or y:
+    if x is not None and y is not None:
         script = _folded_mouse_positional_script(
             prelude, x, y, frame_width, frame_height, click=True, button=button
         )
@@ -2003,7 +2057,8 @@ def click(
             "head_x": hx, "head_y": hy,
             "timings": _ps_timings(timing),
         }
-    # x=0,y=0 means 'click at current position' — no positioning leg at all.
+    # No coordinates means 'click at current position' — no positioning leg
+    # at all; (0,0) is a real coordinate and takes the positional leg.
     call = (
         "$r = Invoke-CimMethod -InputObject $m -MethodName ClickButton "
         + "-ErrorAction Stop -Arguments @{ ButtonIndex = " + str(button) + " }\n"

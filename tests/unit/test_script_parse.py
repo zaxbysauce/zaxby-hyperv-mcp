@@ -361,14 +361,18 @@ def test_parse_console_keyboard_type_text(monkeypatch, parsed_ps):
 
 
 def test_parse_console_keyboard_press_key_all_variants(monkeypatch, parsed_ps):
-    """Named keys (plain + extended 0xE0) and combos — every array shape."""
-    for key in ("enter", "escape", "space", "up", "delete", "f12", "a", "5"):
+    """Named keys (plain + extended 0xE0) and combos — every array shape.
+    Every leg asserts at least one script was emitted, so a key rejected
+    before any spawn cannot pass vacuously (issue #25 review P-B1)."""
+    for key in ("enter", "escape", "space", "up", "delete", "f12", "a", "5",
+                "win", "numenter", "minus"):
         rec = Recorder()
         monkeypatch.setattr(pswindows, "run_ps", rec)
         try:
             console.press_key(UNRESTRICTED, "vm1", key)
         except Exception:
             pass
+        assert rec.scripts, f"press_key({key!r}) emitted no script"
         for script in rec.scripts:
             assert _parse_errors(script) == []
     rec = Recorder()
@@ -377,6 +381,17 @@ def test_parse_console_keyboard_press_key_all_variants(monkeypatch, parsed_ps):
         console.key_combo(UNRESTRICTED, "vm1", ["ctrl", "alt", "delete"])
     except Exception:
         pass
+    assert rec.scripts, "ctrl+alt+delete combo emitted no script"
+    for script in rec.scripts:
+        assert _parse_errors(script) == []
+    # issue #25: the Windows key as a combo modifier parses on the PS lane too
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        console.key_combo(UNRESTRICTED, "vm1", ["win", "r"])
+    except Exception:
+        pass
+    assert rec.scripts, "win+r combo emitted no script"
     for script in rec.scripts:
         assert _parse_errors(script) == []
 
@@ -386,6 +401,8 @@ def test_parse_console_mouse_ops(monkeypatch, parsed_ps):
         lambda: console.mouse_move(UNRESTRICTED, "vm1", 100, 50),
         lambda: console.mouse_move(UNRESTRICTED, "vm1", 100, 50, 640, 480),
         lambda: console.click(UNRESTRICTED, "vm1", 100, 50, 640, 480),
+        # issue #25: the origin IS a positional click and must parse too
+        lambda: console.click(UNRESTRICTED, "vm1", 0, 0, 640, 480),
         lambda: console.click(UNRESTRICTED, "vm1"),
         lambda: console.mouse_button(UNRESTRICTED, "vm1", 1, True),
         lambda: console.scroll(UNRESTRICTED, "vm1", 3),
@@ -396,6 +413,7 @@ def test_parse_console_mouse_ops(monkeypatch, parsed_ps):
             op()
         except Exception:
             pass
+        assert rec.scripts, "mouse op emitted no script"
         for script in rec.scripts:
             assert _parse_errors(script) == []
 

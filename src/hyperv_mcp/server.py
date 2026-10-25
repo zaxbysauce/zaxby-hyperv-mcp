@@ -1484,9 +1484,18 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Press a named key (scan-code make/break pair) with optional
-        modifiers (ctrl/alt/shift). Supported keys: enter, escape, tab,
-        backspace, space, up/down/left/right, delete, home, end, pageup,
-        pagedown, insert, f1-f12, a-z, 0-9. Policy: console_input.
+        modifiers (ctrl/alt/shift incl. right- variants, win/leftwin/
+        rightwin — held while key is tapped). Supported keys: enter, escape
+        (esc), tab, backspace, space, capslock, up/down/left/right, delete,
+        home, end, pageup, pagedown, insert, f1-f12, a-z, 0-9, punctuation
+        (minus, equals, leftbracket, rightbracket, semicolon, apostrophe,
+        grave, backslash, comma, period, slash — single-character aliases
+        - = [ ] \\ ; ' ` , . / map to the same bytes), numpad (num0-num9,
+        numdecimal, nummultiply, numsubtract, numadd, numlock, numdivide,
+        numenter), and the GUI/Application keys win (alias leftwin),
+        rightwin, menu (alias apps) — modifier-named keys are also valid
+        bare presses (press_key(key="win") taps Win alone). Policy:
+        console_input.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
@@ -1503,7 +1512,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Send a key combination: modifier makes first, keys in order,
-        modifier breaks last (e.g. ["ctrl", "alt", "delete"]).
+        modifier breaks last (e.g. ["ctrl", "alt", "delete"], ["win", "r"]).
+        Modifiers: ctrl/alt/shift (incl. right- variants) and win/leftwin/
+        rightwin; every other accepted key name is a tapped key.
         Policy: console_input.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
@@ -1544,8 +1555,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         dimensions) to scale them to display-head space. Without frame dims
         the head resolution must be available, else the tool errors rather
         than clicking blind. x and y are REQUIRED — omission is an invalid
-        call (it never means (0,0); use hyperv_console_click at (0,0) for a
-        click at the current position). Policy: console_input.
+        call (it never means (0,0); call hyperv_console_click with no
+        coordinates for a click at the current position). Policy: console_input.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
@@ -1560,14 +1571,22 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
     @mcp.tool()
     def hyperv_console_click(
-        vm_name: str = "", x: int = 0, y: int = 0, frame_width: int = 0,
-        frame_height: int = 0, button: int = 1, vm_id: str = "",
-        lease_id: str = "", fencing_token: int = 0,
+        vm_name: str = "", x: int | None = None, y: int | None = None,
+        frame_width: int = 0, frame_height: int = 0, button: int = 1,
+        vm_id: str = "", lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Click at frame-space coordinates (optional; positions first when
-        x/y are given, else clicks at the current position). button: 1=left,
-        2=right. Verify placement with a screenshot between steps — never
-        assume focus from a prior frame. Policy: console_input.
+        both x/y are given — (0,0) is a real coordinate and moves the pointer
+        to the frame origin — else clicks at the current position when both
+        are omitted; exactly one raises an error). Coordinates are in the
+        space of the image you observed; frame_width/frame_height (the
+        snapshot dimensions) only scale them — the display head resolution
+        must be resolvable either way, else the tool errors rather than
+        clicking blind, and absolute positioning needs the synthetic mouse
+        (PS/2-fallback guests support only click-at-current-position, i.e.
+        omitting x/y). button: 1=left, 2=right. Verify placement with a
+        screenshot between steps — never assume focus from a prior frame.
+        Policy: console_input.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 

@@ -87,20 +87,37 @@ def test_mouse_ops_zero_spawns_and_shapes(monkeypatch, unrestricted_cfg):
     assert methods["SetScrollPosition"] == {"ScrollPositionDelta": -1}
 
 
-def test_click_at_origin_wmi_no_move_no_head_keys(monkeypatch, unrestricted_cfg):
-    """The preserved PS contract: click(0,0) clicks at the CURRENT position
-    with no SetAbsolutePosition and no head_x/head_y keys (test_console
-    pins the PS side; this pins the WMI side)."""
+def test_click_at_origin_wmi_positions_pointer(monkeypatch, unrestricted_cfg):
+    """Issue #25: click(0,0) is a real coordinate on the WMI transport —
+    the pointer moves to the frame origin before ClickButton and the result
+    carries head_x/head_y == 0."""
     svc = FakeWMIService(head=(320, 240))
     _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
     _ps(monkeypatch)
 
     out = console.click(unrestricted_cfg, "vm1", 0, 0)
     assert out["ok"] is True
+    assert out["head_x"] == 0 and out["head_y"] == 0
+    methods = {m[1]: m[2] for m in svc.methods}
+    assert methods["SetAbsolutePosition"] == {
+        "HorizontalPosition": 0, "VerticalPosition": 0}
+    assert "ClickButton" in methods
+
+
+def test_click_without_coordinates_wmi_clicks_in_place(monkeypatch, unrestricted_cfg):
+    """Issue #25 preservation: omitting x/y keeps the click-at-current-
+    position contract on the WMI transport — no SetAbsolutePosition and no
+    head keys."""
+    svc = FakeWMIService(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    _ps(monkeypatch)
+
+    out = console.click(unrestricted_cfg, "vm1")
+    assert out["ok"] is True
     assert "head_x" not in out and "head_y" not in out
-    names = [m[1] for m in svc.methods]
-    assert "SetAbsolutePosition" not in names
-    assert "ClickButton" in names
+    methods = {m[1]: m[2] for m in svc.methods}
+    assert "SetAbsolutePosition" not in methods
+    assert "ClickButton" in methods
 
 
 def test_get_display_info_wmi_zero_spawns(monkeypatch, unrestricted_cfg):
@@ -305,7 +322,7 @@ def test_f1_mouse_ops_hold_vm_lock(monkeypatch, unrestricted_cfg):
 
     console.mouse_move(unrestricted_cfg, "vm1", 5, 5, frame_width=320, frame_height=240)
     console.click(unrestricted_cfg, "vm1", 10, 10, frame_width=320, frame_height=240)
-    console.click(unrestricted_cfg, "vm1", 0, 0)
+    console.click(unrestricted_cfg, "vm1")
     console.mouse_button(unrestricted_cfg, "vm1", 1, True)
     console.scroll(unrestricted_cfg, "vm1", 1)
 
@@ -474,14 +491,20 @@ def test_frozen_acceptance_file_intact():
     to the bare $vmTarget EMIT (a folded script mentions $vmTarget and must not
     be served the GUID), and PSStub gained the folded capture/display/mouse
     response branches. Assertions untouched; the amendment is the plan-critic
-    -sanctioned refit of the multi-spawn stub protocol."""
+    -sanctioned refit of the multi-spawn stub protocol.
+
+    Hash updated again by issue #25 (trace 25-f1-console-keyboard-click-origin):
+    PSStub's folded positional-mouse branch dropped its "if x or y:" gate so a
+    positional script at (0,0) reports the computed head origin instead of no
+    position (the issue #25 origin contract). Assertions untouched; the
+    amendment is the plan-critic-sanctioned F5 stub-protocol refit."""
     import subprocess
 
     out = subprocess.run(
         ["git", "hash-object", "tests/unit/test_wmiconsole.py"],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
-    assert out == "f4e5d21e57c1489f6ed05284d086b496d51b658c", out
+    assert out == "f005643343016fc3b0165a98d4f402d23c7e5bf1", out
 
 
 def test_capture_guard_no_image_data(monkeypatch, unrestricted_cfg):

@@ -387,3 +387,42 @@ def test_e01_job_survives_server_restart(running_vm, tmp_path, monkeypatch):
         if proc_a.poll() is None:
             proc_a.kill()
             proc_a.wait(timeout=60)
+
+
+# ---------------------------------------------------------------------------
+# console Windows key (issue #25, AC12)
+# ---------------------------------------------------------------------------
+
+def test_console_windows_key_opens_start(running_vm):
+    """AC12: pressing the Windows key opens the Start menu on a real Windows
+    guest — observed as hyperv_console_wait_frame_change reporting
+    stop_reason == 'changed' within 10 s — and a second press closes it
+    (the closing frame differs from the open-Start frame).
+
+    Console input is host-side WMI/PowerShell (no guest credentials of its
+    own), so the shared env gate — HYPERV_MCP_INTEGRATION=1 plus
+    HYPERV_MCP_TEST_VM naming the disposable VM — is all this test needs;
+    the guarded_vm fixture checkpoints before and restores after. Without
+    the gate the whole suite skips (see tests/integration/conftest.py)."""
+    from hyperv_mcp import console
+
+    cfg, vm = running_vm.cfg, running_vm.vm
+
+    # Baseline frame hash before the first press (either stop reason yields
+    # one; a ticking clock changing it early only makes the baseline fresher).
+    pre = console.wait_frame_change(cfg, vm, timeout_s=10)
+    assert pre.get("frame_hash"), pre
+
+    console.press_key(cfg, vm, "win")
+    opened = console.wait_frame_change(
+        cfg, vm, baseline_hash=pre["frame_hash"], timeout_s=10)
+    assert opened["stop_reason"] == "changed", opened
+    start_hash = opened["frame_hash"]
+
+    console.press_key(cfg, vm, "win")
+    closed = console.wait_frame_change(
+        cfg, vm, baseline_hash=start_hash, timeout_s=10)
+    assert closed["stop_reason"] == "changed", closed
+    assert closed["frame_hash"] != start_hash, (
+        "the second win press must leave a frame different from open-Start"
+    )
