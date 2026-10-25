@@ -1484,14 +1484,18 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Press a named key (scan-code make/break pair) with optional
-        modifiers (ctrl/alt/shift, win). Supported keys: enter, escape, tab,
-        backspace, space, up/down/left/right, delete, home, end, pageup,
-        pagedown, insert, f1-f12, a-z, 0-9, punctuation (minus, equals,
-        leftbracket, rightbracket, semicolon, apostrophe, grave, backslash,
-        comma, period, slash — single-character aliases work), numpad
-        (num0-num9, numdecimal, nummultiply, numsubtract, numadd, numlock,
-        numdivide, numenter), and win/menu (the Windows/Application keys).
-        Policy: console_input.
+        modifiers (ctrl/alt/shift incl. right- variants, win/leftwin/
+        rightwin — held while key is tapped). Supported keys: enter, escape
+        (esc), tab, backspace, space, capslock, up/down/left/right, delete,
+        home, end, pageup, pagedown, insert, f1-f12, a-z, 0-9, punctuation
+        (minus, equals, leftbracket, rightbracket, semicolon, apostrophe,
+        grave, backslash, comma, period, slash — single-character aliases
+        - = [ ] \\ ; ' ` , . / map to the same bytes), numpad (num0-num9,
+        numdecimal, nummultiply, numsubtract, numadd, numlock, numdivide,
+        numenter), and the GUI/Application keys win (alias leftwin),
+        rightwin, menu (alias apps) — modifier-named keys are also valid
+        bare presses (press_key(key="win") taps Win alone). Policy:
+        console_input.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
@@ -1509,7 +1513,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     ) -> dict:
         """Send a key combination: modifier makes first, keys in order,
         modifier breaks last (e.g. ["ctrl", "alt", "delete"], ["win", "r"]).
-        Modifiers: ctrl/alt/shift (incl. right- variants) and win.
+        Modifiers: ctrl/alt/shift (incl. right- variants) and win/leftwin/
+        rightwin; every other accepted key name is a tapped key.
         Policy: console_input.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
@@ -1574,10 +1579,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         both x/y are given — (0,0) is a real coordinate and moves the pointer
         to the frame origin — else clicks at the current position when both
         are omitted; exactly one raises an error). Coordinates are in the
-        space of the image you observed; give frame_width/frame_height (the
-        snapshot dimensions) to scale them — without frame dims the head
-        resolution must be available, else the tool errors rather than
-        clicking blind. button: 1=left, 2=right. Verify placement with a
+        space of the image you observed; frame_width/frame_height (the
+        snapshot dimensions) only scale them — the display head resolution
+        must be resolvable either way, else the tool errors rather than
+        clicking blind, and absolute positioning needs the synthetic mouse
+        (PS/2-fallback guests support only click-at-current-position, i.e.
+        omitting x/y). button: 1=left, 2=right. Verify placement with a
         screenshot between steps — never assume focus from a prior frame.
         Policy: console_input.
 

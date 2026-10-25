@@ -222,6 +222,7 @@ for _punct_alias, _punct_name in (
         ("'", "apostrophe"), ("`", "grave"), (",", "comma"), (".", "period"),
         ("/", "slash")):
     _KEY_SCANCODES[_punct_alias] = _KEY_SCANCODES[_punct_name]
+del _punct_alias, _punct_name
 
 
 class ConsoleError(RuntimeError):
@@ -1486,17 +1487,25 @@ def _scancodes_for_key(key: str) -> list[int]:
     return [make, brk]
 
 
+# Names the combo builder holds as modifiers (everything else in a combo
+# is tapped in order).
+_COMBO_MODIFIERS = frozenset((
+    "ctrl", "alt", "shift", "leftctrl", "rightctrl", "leftalt", "rightalt",
+    "leftshift", "rightshift", "win", "leftwin", "rightwin"))
+
+
 def _scancodes_for_combo(keys: list[str]) -> list[int]:
     """Combo: modifier makes first, then each key in order, modifier breaks last.
     Modifiers go through the same extended-prefix rule as _scancodes_for_key
     (rightctrl/rightalt carry 0xE0 even as combo modifiers)."""
-    mods = [k for k in keys if k.strip().lower() in ("ctrl", "alt", "shift",
-                                                     "leftctrl", "rightctrl",
-                                                     "leftalt", "rightalt",
-                                                     "leftshift", "rightshift",
-                                                     "win", "leftwin",
-                                                     "rightwin")]
+    mods = [k for k in keys if k.strip().lower() in _COMBO_MODIFIERS]
     rest = [k for k in keys if k not in mods]
+    return _combo_codes(mods, rest)
+
+
+def _combo_codes(mods: list[str], rest: list[str]) -> list[int]:
+    """Encode an explicit modifier/rest split (press_key uses this so a
+    modifier-named KEY is tapped, not silently reclassified as held)."""
     if not rest:
         raise ValueError("combo needs at least one non-modifier key")
     codes: list[int] = []
@@ -1851,7 +1860,12 @@ def press_key(
     if not modifiers:
         codes = _scancodes_for_key(key)
     else:
-        codes = _scancodes_for_combo([key] + list(modifiers))
+        # The key argument is ALWAYS the tapped key, even when it shares a
+        # name with a modifier (win+ctrl holds ctrl and taps win) — the
+        # modifiers list is what gets held (issue #25 review: role swap).
+        held = [m for m in modifiers if m.strip().lower() in _COMBO_MODIFIERS]
+        tapped = [key] + [m for m in modifiers if m not in held]
+        codes = _combo_codes(held, tapped)
     be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
     if be is not None and ref is not None:
         return _send_scancodes_locked(cfg, ref, codes, be=be, connect_ms=connect_ms)
