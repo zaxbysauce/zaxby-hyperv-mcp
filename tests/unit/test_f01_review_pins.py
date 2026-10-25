@@ -1,12 +1,15 @@
-"""Review-pin tests for PR #99 (swarm-pr-review run pr99-20261024).
+"""Review-pin tests for PR #99 (swarm-pr-review run pr99-20261024) and the
+PR #100 follow-up (run pr100-20261025).
 
-These pins close the coverage gaps the review validated and the critic
+PR #99 pins close the coverage gaps the review validated and the critic
 confirmed (feedback ledger F1/F2/F4 in .zcode/pr-review/pr99-20261024/):
 the single-character alias oracle, the position-before-click ordering on
 BOTH transports, the press_key modifier-present emission branch (incl. the
 role-swap fix), bare modifier-named presses, the schema's null acceptance,
-and a tool-layer numpad emission. This file is NOT part of the issue-25
-checkpoint manifest — it is additive review coverage.
+and a tool-layer numpad emission. PR #100 adds the unknown-key recovery
+message shape pin (review item 2, derived from the production tables).
+This file is NOT part of the issue-25 checkpoint manifest — it is additive
+review coverage.
 """
 
 import asyncio
@@ -164,12 +167,18 @@ def test_click_schema_type_admits_null():
 
 # ---------------------------------------------------------------------------
 # ITEM 2 (PR #99 review): the unknown-key recovery text must keep the frozen
-# "unknown key ..." shape, list multi-character names comma-separated FIRST,
-# and present the single-character aliases as a space-separated trailing
-# clause (no ", "-separator collision with the "," alias).
+# "unknown key ..." shape, list every supported name EXCEPT the punctuation
+# aliases comma-separated in a sorted first clause, and present the
+# punctuation aliases as a space-separated sorted trailing clause (no
+# ", "-separator collision with the "," alias). The pin derives its
+# expectations from the production tables (console._PUNCT_ALIASES and
+# console._KEY_SCANCODES), so table extensions fail it only when they
+# actually change the delivered message.
 # ---------------------------------------------------------------------------
 
 def test_unknown_key_message_readable_recovery_shape():
+    alias_set = set(console._PUNCT_ALIASES)
+    all_names = set(console._KEY_SCANCODES)
     with pytest.raises(ValueError) as exc:
         _scancodes_for_key("meta")
     message = str(exc.value)
@@ -184,18 +193,32 @@ def test_unknown_key_message_readable_recovery_shape():
     )
     long_part, alias_part = body.split(alias_marker, 1)
     long_tokens = [t.strip() for t in long_part.split(",")]
-    alias_chars = set("-=[\\];'`,./")
-    assert not alias_chars & set(long_tokens), (
-        "P-ERRMSG: punctuation aliases must live in the trailing clause, "
-        f"not interleaved into the name list, got {long_part!r}"
+    alias_tokens = alias_part.split(" ")
+
+    # every supported name appears exactly once across the two clauses, and
+    # no single-character token (punctuation alias OR canonical 1-char name)
+    # leaks into the comma-separated clause
+    assert set(long_tokens) | set(alias_tokens) == all_names, (
+        "P-ERRMSG: the message must still list every supported name "
+        f"exactly once; missing={all_names - set(long_tokens) - set(alias_tokens)!r} "
+        f"extra={set(long_tokens + alias_tokens) - all_names!r}"
     )
-    assert long_tokens[0] == "0", (
-        f"P-ERRMSG: readable names must lead (digits first is fine), "
+    assert len(long_tokens) + len(alias_tokens) == len(all_names), (
+        "P-ERRMSG: duplicate name in the message"
+    )
+    assert not any(not t.isalnum() for t in long_tokens), (
+        "P-ERRMSG: punctuation tokens must live in the alias clause "
+        "(only alphanumeric names never collide with the ', ' separator), "
         f"got {long_part!r}"
     )
-    aliases = alias_part.split(" ")
-    assert len(aliases) == 11 and all(len(a) == 1 for a in aliases), (
-        f"P-ERRMSG: expected the 11 single-char aliases, got {aliases!r}"
+
+    # alias clause: exactly the punctuation aliases, space-separated, sorted
+    assert alias_tokens == sorted(alias_set), (
+        "P-ERRMSG: alias clause must be the sorted punctuation aliases "
+        f"space-separated, got {alias_tokens!r}"
+    )
+    assert all(len(a) == 1 for a in alias_tokens), (
+        f"P-ERRMSG: alias clause must hold single-char aliases, got {alias_tokens!r}"
     )
     # every listed alias still resolves to the same bytes as its long name
     long_names = {
@@ -204,6 +227,6 @@ def test_unknown_key_message_readable_recovery_shape():
         "'": "apostrophe", "`": "grave", ",": "comma", ".": "period",
         "/": "slash",
     }
-    assert set(aliases) == set(long_names)
+    assert alias_set == set(long_names)
     for alias, name in long_names.items():
         assert _scancodes_for_key(alias) == _scancodes_for_key(name), alias
