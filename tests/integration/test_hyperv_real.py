@@ -481,8 +481,9 @@ def test_standard_checkpoint_restores_running_desktop(it, it_tmp):
     hash_a = _shot("A-notepad-open")
 
     name = f"mcp-it-standard-{next(_CHECKPOINT_SEQ)}"
-    created = lifecycle.checkpoint_create(cfg, vm, name, checkpoint_type="standard")
+    created = None
     try:
+        created = lifecycle.checkpoint_create(cfg, vm, name, checkpoint_type="standard")
         assert created["checkpoint_type"] == "standard"
         assert created["vm_checkpoint_type"] == original_type, (
             "the result must report the captured pre-call VM CheckpointType"
@@ -516,7 +517,10 @@ def test_standard_checkpoint_restores_running_desktop(it, it_tmp):
             "the VM-level CheckpointType must be restored to its pre-call value"
         )
     finally:
-        try:
-            lifecycle.checkpoint_remove(cfg, vm, name, confirm=True)
-        except Exception:
-            pass
+        if created is not None:
+            # The restore-type-failure path can raise AFTER the checkpoint
+            # exists; only remove when the create actually succeeded.
+            try:
+                lifecycle.checkpoint_remove(cfg, vm, name, confirm=True)
+            except Exception:
+                pass

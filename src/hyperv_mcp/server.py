@@ -835,9 +835,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         detach: bool = False, idempotency_key: str = "",
     ) -> dict:
         """Restore a VM to a checkpoint. ALL STATE SINCE THE CHECKPOINT IS
-        DISCARDED. The VM ends in the state the checkpoint captured (Off for
-        Production checkpoints; Saved/Running for Standard); the returned
-        note says which and what to call next.
+        DISCARDED. The VM ends in the state the checkpoint captured — most
+        often Off for Production checkpoints and Saved/Running for Standard
+        ones, but the reported state (and note) is always what was observed,
+        never inferred from the checkpoint type.
 
         Args:
             vm_name:         Name of the VM

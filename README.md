@@ -1100,7 +1100,10 @@ the result reports the requested type and the VM's pre-call type
 - **Standard** captures guest memory: applying it returns the VM to the exact
   saved moment (a `hyperv_checkpoint_restore` then reports `Saved` or
   `Running`, with a note saying so, instead of claiming the VM is powered
-  off; only Production restores report `Off`).
+  off). A Standard-typed checkpoint captured while the VM was off restores
+  to `Off` like any other; a Production checkpoint that fell back to Standard
+  restores `Saved`/`Running` too — the reported state is what the checkpoint
+  captured, never an assumption from the requested type.
 - **Production** takes no memory snapshot (restores to `Off`) and falls back
   to Standard when the guest cannot take a production checkpoint.
 - **ProductionOnly** fails instead of falling back.
