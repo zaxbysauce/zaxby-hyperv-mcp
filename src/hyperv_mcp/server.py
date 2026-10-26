@@ -697,14 +697,15 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     @mcp.tool()
     def hyperv_get_vm_info(vm_name: str = "", vm_id: str = "") -> dict:
         """Get detailed info about a Hyper-V VM: state, generation, COM ports,
-        network adapters, hard drives, checkpoint count.
+        network adapters, hard drives, checkpoint count, checkpoint type.
 
         Args:
             vm_name: Name of the VM (must match allowed_vm_patterns)
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {id, name, state, generation, memory_mb, cpu_count,
-                  checkpoint_count, com_ports, network_adapters, hard_drives, ...}
+                  checkpoint_count, checkpoint_type, com_ports, network_adapters,
+                  hard_drives, ...}
         """
         return _run_guest_tool(
             "hyperv_get_vm_info", vm_name, "read",

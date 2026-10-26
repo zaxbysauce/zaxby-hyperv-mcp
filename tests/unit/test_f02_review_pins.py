@@ -216,6 +216,23 @@ def test_off_note_is_byte_identical_to_the_legacy_constant():
     assert OFF_NOTE in source
 
 
+def test_typed_path_auto_names_the_checkpoint(monkeypatch):
+    """Final-critic probe 5 survivor: the auto-name contract (MCP-<timestamp>,
+    README 'auto-generates ... only on create') must hold on the TYPED path
+    too. A mutant that skips auto-naming whenever checkpoint_type is set
+    (e.g. `if not checkpoint_name and not checkpoint_type:`) would otherwise
+    emit an empty -SnapshotName and a blank result name, undetected."""
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = lifecycle.checkpoint_create(Config(unrestricted=True), "vm1", checkpoint_type="standard")
+    assert out["checkpoint_name"].startswith("MCP-"), (
+        f"the typed path must auto-name like the default path (got {out['checkpoint_name']!r})"
+    )
+    script = _action_legs(fake.scripts)[-1]
+    assert out["checkpoint_name"] in script, "the auto-generated name must reach -SnapshotName"
+    assert f"SnapshotName {pswindows.ps_name(out['checkpoint_name'])}" in script
+
+
 # ---------------------------------------------------------------------------
 # Phase 4.2 guardrail: the note is a pure function of the observed state
 # ---------------------------------------------------------------------------
