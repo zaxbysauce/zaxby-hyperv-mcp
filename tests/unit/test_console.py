@@ -605,6 +605,94 @@ def test_dimension_bounds_rejected_everywhere(unrestricted):
             console.wait_frame_change(unrestricted, "vm1", **kwargs)
         with pytest.raises(ValueError, match="160..4096"):
             console.capture_sequence(unrestricted, "vm1", **kwargs)
+        # issue #27: the settle wait answers to the same 160..4096 bound
+        with pytest.raises(ValueError, match="160..4096"):
+            console.wait_frame_stable(unrestricted, "vm1", **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# capture_sequence identity pin (issue #82): mixed metadata sequences
+# ---------------------------------------------------------------------------
+
+def _meta_frame_response(guid, w=320, h=240):
+    payload = b"\x01\x02\x03\x04" + b"\x00\x00" * (w * h)
+    body = json.dumps({
+        "returnValue": 0,
+        "imageDataB64": base64.b64encode(payload).decode(),
+    })
+    stdout = (f"VMID={guid}\n{body}") if guid else body
+    return pswindows.PSResult(stdout=stdout, returncode=0)
+
+
+def test_capture_sequence_mixed_metadata_keeps_first_identity(monkeypatch, unrestricted):
+    """A metadata-less frame never clears the first attributed frame's pin:
+    attributed GUID A, then an unattributed frame, must NOT re-arm identity
+    comparison against the unattributed frame's (absent) GUID."""
+
+    class MetaStub:
+        def __init__(self, responses):
+            self.scripts = []
+            self.responses = list(responses)
+
+        def __call__(self, script, **kwargs):
+            self.scripts.append(script)
+            return self.responses.pop(0)
+
+    stub = MetaStub([
+        _meta_frame_response("e953c649-dcab-438d-9a54-3af74a82b624"),
+        _meta_frame_response(None),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    out = console.capture_sequence(
+        unrestricted, "vm1", count=2, interval_s=1, width=320, height=240)
+    assert out["ok"] is True
+    assert out["frames"][0]["vm_id"] == "e953c649-dcab-438d-9a54-3af74a82b624"
+    assert out["frames"][1]["vm_id"] is None
+
+
+def test_capture_sequence_error_context_names_the_sequence(monkeypatch, unrestricted):
+    """The identity abort surfaces as a console capture_sequence error (not a
+    screenshot-context error), so the agent can tell which call failed."""
+
+    class MetaStub:
+        def __init__(self, responses):
+            self.scripts = []
+            self.responses = list(responses)
+
+        def __call__(self, script, **kwargs):
+            self.scripts.append(script)
+            return self.responses.pop(0)
+
+    guid_a = "e953c649-dcab-438d-9a54-3af74a82b624"
+    guid_b = "0f7d1c22-2222-4b3c-8d1e-6a5b4c3d2e1f"
+    stub = MetaStub([_meta_frame_response(guid_a), _meta_frame_response(guid_b)])
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    with pytest.raises(ConsoleError, match="capture_sequence spanned two VM identities"):
+        console.capture_sequence(
+            unrestricted, "vm1", count=2, interval_s=1, width=320, height=240)
+
+
+# ---------------------------------------------------------------------------
+# wait_frame_stable PS-transport script structure (issue #27)
+# ---------------------------------------------------------------------------
+
+def test_wait_frame_stable_script_carries_quiet_window(monkeypatch, unrestricted):
+    """The generated settle script must embed the quiet-window state machine
+    (the $lastChange stamp, the stable comparison, the baseline discriminator)
+    — not just the shared hash form the parse lane pins."""
+    fake = FakePS([pswindows.PSResult(
+        stdout="STOP=deadline POLLS=120 HASH=abc", returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    console.wait_frame_stable(
+        unrestricted, "vm1", stable_ms=1500, timeout_s=30, interval_ms=250,
+        baseline_hash="a" * 64)
+    script = fake.scripts[-1]
+    assert "$lastChange" in script
+    assert "STOP=stable" in script and "STOP=unchanged" in script
+    assert "$moveSeen" in script, (
+        "with a baseline, only the first DIFFERING frame starts the window"
+    )
+    assert "a" * 64 in script
 
 
 # ---------------------------------------------------------------------------
@@ -748,3 +836,19 @@ def test_console_by_id_reports_resolved_name(monkeypatch, unrestricted):
     guid = "e953c649-dcab-438d-9a54-3af74a82b624"
     out = console.press_key(unrestricted, vm_id=guid, key="enter")
     assert out["vm_name"] == name
+
+
+def test_wait_frame_stable_script_zero_poll_deadline(monkeypatch, unrestricted):
+    """Both terminal branches gate unchanged on polls > 0: a deadline that
+    fires before the first poll is a deadline even with a baseline."""
+    fake = FakePS([pswindows.PSResult(
+        stdout="STOP=deadline POLLS=0 HASH=", returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    console.wait_frame_stable(
+        unrestricted, "vm1", stable_ms=1500, timeout_s=30, interval_ms=250,
+        baseline_hash="a" * 64)
+    script = fake.scripts[-1]
+    assert script.count("$polls -gt 0") == 2, (
+        "the top-of-loop and cap terminals must both require an observed poll "
+        "before reporting unchanged"
+    )

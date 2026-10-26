@@ -197,9 +197,10 @@ def test_server_info_tool_registered():
             f"hyperv_server_info is not registered; tool inventory has "
             f"{len(names)} tools, expected 66 including hyperv_server_info"
         )
-        assert len(names) == 66, (
-            f"tool inventory is {len(names)} tools; expected exactly 66 "
-            "(60 existing tools plus hyperv_server_info)"
+        assert len(names) == 67, (
+            f"tool inventory is {len(names)} tools; expected exactly 67 "
+            "(66 including the issue-#24 op/event tools plus hyperv_server_info, "
+            "plus issue #27's hyperv_console_wait_frame_stable)"
         )
     finally:
         importlib.reload(server_module)

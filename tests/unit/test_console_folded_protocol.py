@@ -250,8 +250,10 @@ def test_wait_frame_changed_response_still_decodes(monkeypatch, unrestricted_cfg
 # ---------------------------------------------------------------------------
 
 def test_capture_sequence_frames_are_self_contained(monkeypatch, unrestricted_cfg):
-    """Every frame's script resolves the VM itself (no separate GUID process and
-    no metadata channel between frames) — one folded process per frame."""
+    """Every frame's script resolves the VM itself — one folded process per
+    frame. The frames carry no cross-frame CHANNEL: all coordination stays
+    host-side between independent processes (the per-frame VMID= emission the
+    capture_sequence identity pin adds is per-process output, not a channel)."""
     rec = _ScriptCollector()
 
     def _serve_capture(script: str, timeout_s: float | None = None, stdin_b64: str | None = None):
@@ -278,10 +280,12 @@ def test_capture_sequence_frames_are_self_contained(monkeypatch, unrestricted_cf
     for script in rec.scripts:
         assert "GetVirtualSystemThumbnailImage" in script
         assert "$vmTarget" in script, "each frame's script must bind the VM target itself"
-        # no metadata channel between frames: the identity fork this leaves is
-        # tracked in issue #77's family (a mid-sequence delete+recreate is not
-        # detectable from the payload alone)
-        assert "VMID=" not in script
+        # The VMID=-absence assert this file once carried here was the wrong
+        # owner for the identity fork it cited (#77): per-frame identity is
+        # owned by the capture_sequence identity pin (issue #82), which
+        # freezes its own emission-and-compare contract. This file pins the
+        # self-containment contract: one folded process per frame, each
+        # resolving and binding its own VM target.
 
 
 # ---------------------------------------------------------------------------

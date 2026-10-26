@@ -470,6 +470,10 @@ def _folded_capture_script(prelude: str, width: int, height: int) -> str:
         "}\n",
         "if ($r.ReturnValue -ne 0) { throw ('GetVirtualSystemThumbnailImage failed "
         "with ReturnValue=' + $r.ReturnValue) }\n",
+        # Per-frame identity emission (issue #82): each folded process resolves
+        # the VM by name, so the frame reports the GUID it actually captured
+        # and the host can refuse a sequence that spans two identities.
+        "\"VMID=$($vm.Id)\"\n",
         "[PSCustomObject]@{\n",
         "    returnValue = $r.ReturnValue\n",
         "    imageDataB64 = [Convert]::ToBase64String($r.ImageData)\n",
@@ -529,6 +533,75 @@ def _folded_wait_frame_script(
         "    }\n",
         "    if ($polls -ge " + str(max_polls) + " -or (Get-Date) -ge $deadline) { Write-Output ('STOP=deadline POLLS=' + $polls + ' HASH=' + $hash); break }\n",
         "    Start-Sleep -Milliseconds " + str(interval_s * 1000) + "\n",
+        "}\n",
+    ])
+
+
+# Settle loop: bounded by max_polls (derived from timeout_s*1000/interval_ms).
+# A quiet window of stable_ms must elapse after the most recent CHANGE before
+# the loop reports STOP=stable with that settled frame. Without a supplied
+# baseline the FIRST polled frame starts the window (first-poll-is-baseline,
+# same as the change wait); with a baseline the window starts only at the
+# first frame that DIFFERS from it, so "my input did nothing" (STOP=unchanged)
+# is distinguishable from "already settled" (STOP=stable). HASH is the full
+# lowercase-hex sha256 of the PIXEL payload (bytes after the 4-byte opaque
+# prefix) — byte-identical to the host-side _frame_hash, so a returned
+# frame_hash round-trips as a baseline_hash. A quiet window longer than
+# (max_polls - 1) * interval_ms cannot be observed within the poll cap and
+# honestly reports STOP=deadline.
+def _folded_wait_stable_script(
+    prelude: str, baseline_hash: str, stable_ms: int, width: int, height: int,
+    timeout_s: int, interval_ms: int,
+) -> str:
+    max_polls = math.ceil(timeout_s * 1000 / interval_ms)
+    return "\n".join([
+        prelude,
+        _VM_LOOKUP,
+        "$svc = Get-CimInstance -Namespace '" + _WMI_NS + "' "
+        "-ClassName Msvm_VirtualSystemManagementService\n",
+        "$deadline = (Get-Date).AddSeconds(" + str(int(timeout_s)) + ")\n",
+        "$polls = 0\n",
+        "$baseline = '" + baseline_hash + "'\n",
+        "$refHash = ''\n",
+        "$lastHash = ''\n",
+        "$lastChange = $null\n",
+        "$moveSeen = $false\n",
+        "$sha = New-Object Security.Cryptography.SHA256Managed\n",
+        "while ($polls -lt " + str(max_polls) + ") {\n",
+        "    if ((Get-Date) -ge $deadline) {\n",
+        "        if (($baseline -ne '') -and ($polls -gt 0) -and (-not $moveSeen)) { Write-Output ('STOP=unchanged POLLS=' + $polls + ' HASH=' + $lastHash) }\n",
+        "        else { Write-Output ('STOP=deadline POLLS=' + $polls + ' HASH=' + $lastHash) }\n",
+        "        break\n",
+        "    }\n",
+        "    $r = Invoke-CimMethod -InputObject $svc -MethodName GetVirtualSystemThumbnailImage -ErrorAction Stop -Arguments @{\n",
+        "        TargetSystem = $vm\n",
+        "        WidthPixels  = " + str(width) + "\n",
+        "        HeightPixels = " + str(height) + "\n",
+        "    }\n",
+        "    if ($r.ReturnValue -ne 0) { throw ('GetVirtualSystemThumbnailImage failed with ReturnValue=' + $r.ReturnValue) }\n",
+        "    $polls++\n",
+        # Same payload guard as the change wait: ComputeHash's method error is
+        # NON-terminating, so a truncated payload must be a structured error
+        # rather than a silently stale digest (see the change-wait template).
+        "    $pxLen = 0; if ($r.ImageData -ne $null) { $pxLen = $r.ImageData.Length }\n",
+        "    $pxWant = 4 + (" + str(width) + " * " + str(height) + " * 2)\n",
+        "    if ($pxLen -ne $pxWant) { throw ('thumbnail payload length mismatch: got ' + $pxLen + ' bytes, expected ' + $pxWant) }\n",
+        "    $hash = ([System.BitConverter]::ToString($sha.ComputeHash($r.ImageData, 4, $r.ImageData.Length - 4)) -replace '-','').ToLowerInvariant()\n",
+        "    $lastHash = $hash\n",
+        "    $now = Get-Date\n",
+        "    if ($refHash -eq '') { $refHash = $hash; $lastChange = $now }\n",
+        "    elseif ($hash -ne $refHash) { $refHash = $hash; $lastChange = $now; $moveSeen = $true }\n",
+        "    if (($null -ne $lastChange) -and (((Get-Date) - $lastChange).TotalMilliseconds -ge " + str(stable_ms) + ")) {\n",
+        "        Write-Output ('STOP=stable POLLS=' + $polls + ' HASH=' + $hash + ' STABLE_MS=' + [int]((Get-Date) - $lastChange).TotalMilliseconds)\n",
+        "        Write-Output ('FRAME=' + [Convert]::ToBase64String($r.ImageData))\n",
+        "        break\n",
+        "    }\n",
+        "    if ($polls -ge " + str(max_polls) + " -or (Get-Date) -ge $deadline) {\n",
+        "        if (($baseline -ne '') -and ($polls -gt 0) -and (-not $moveSeen)) { Write-Output ('STOP=unchanged POLLS=' + $polls + ' HASH=' + $hash) }\n",
+        "        else { Write-Output ('STOP=deadline POLLS=' + $polls + ' HASH=' + $hash) }\n",
+        "        break\n",
+        "    }\n",
+        "    Start-Sleep -Milliseconds " + str(interval_ms) + "\n",
         "}\n",
     ])
 
@@ -1430,17 +1503,21 @@ def _finish_screenshot(
     return frame, meta
 
 
-def _capture_raw(
-    cfg: Config, prelude: str, width: int, height: int, timing: _PsTiming | None = None
-) -> bytes:
-    """One self-contained capture: the prelude binds $vmTarget (the PR #4
-    resolver by name or the GUID preamble by id), so a by-name frame resolves
-    inside its own process and no separate GUID spawn is needed."""
+def _capture_raw_with_meta(
+    cfg: Config, prelude: str, width: int, height: int,
+    timing: _PsTiming | None = None, ctx: str = "console screenshot",
+) -> tuple[bytes, dict[str, str]]:
+    """One self-contained capture plus its tagged metadata lines: the prelude
+    binds $vmTarget (the PR #4 resolver by name or the GUID preamble by id),
+    so a by-name frame resolves inside its own process and no separate GUID
+    spawn is needed. The folded capture script reports the GUID it resolved
+    (VMID=, issue #82) so the caller can pin a sequence's identity."""
     script = _folded_capture_script(prelude, width, height)
     result = _run(cfg, script, timeout_s=90, timing=timing)
-    _check_rc(result, "console screenshot")
+    _check_rc(result, ctx)
+    meta, payload_line = _meta_lines(result)
     try:
-        data = json.loads(result.stdout.strip().splitlines()[-1])
+        data = json.loads(payload_line)
         payload = base64.b64decode(data["imageDataB64"], validate=True)
     except (json.JSONDecodeError, KeyError, binascii.Error, ValueError) as exc:
         raise ConsoleError(f"screenshot result parse failed: {exc}") from None
@@ -1449,6 +1526,16 @@ def _capture_raw(
         raise ConsoleError(
             f"thumbnail payload length mismatch: got {len(payload)}, expected {expected}"
         )
+    return payload, meta
+
+
+def _capture_raw(
+    cfg: Config, prelude: str, width: int, height: int, timing: _PsTiming | None = None
+) -> bytes:
+    """One self-contained capture: the prelude binds $vmTarget (the PR #4
+    resolver by name or the GUID preamble by id), so a by-name frame resolves
+    inside its own process and no separate GUID spawn is needed."""
+    payload, _ = _capture_raw_with_meta(cfg, prelude, width, height, timing)
     return payload
 
 
@@ -2296,6 +2383,169 @@ def _wait_frame_change_wmi(
     return out
 
 
+def wait_frame_stable(
+    cfg: Config,
+    vm_name: str = "",
+    stable_ms: int = 1500,
+    timeout_s: int = 30,
+    interval_ms: int = 250,
+    width: int = 640,
+    height: int = 480,
+    baseline_hash: str = "",
+    vm_id: str = "",
+) -> dict:
+    """Poll the console until the frame has been UNCHANGED for stable_ms (the
+    settle wait, issue #27). One PowerShell process for the whole poll loop on
+    the PS transport; the in-process WMI backend mirrors the same state
+    machine. With baseline_hash, the quiet window starts only at the first
+    frame that differs from it, so an input that did nothing reports
+    stop_reason="unchanged" instead of "stable"."""
+    if stable_ms < 1:
+        raise ValueError("stable_ms must be >= 1")
+    if interval_ms < 100:
+        raise ValueError("interval_ms must be >= 100")
+    if timeout_s < 1:
+        raise ValueError("timeout_s must be >= 1")
+    if stable_ms >= timeout_s * 1000:
+        raise ValueError(
+            "stable_ms must be less than timeout_s*1000 or the quiet window "
+            "can never be observed within the deadline"
+        )
+    if not (160 <= width <= 4096 and 160 <= height <= 4096):
+        raise ValueError("width/height must be within 160..4096")
+    if baseline_hash and not re.fullmatch(r"[0-9a-f]{64}", baseline_hash):
+        raise ValueError("baseline_hash must be an empty string or a 64-char hex sha256")
+    be, connect_ms, ref_wmi = _select_backend_and_ref(cfg, vm_name, vm_id)
+    if be is not None and ref_wmi is not None:
+        return _wait_frame_stable_wmi(
+            be, connect_ms, ref_wmi, baseline_hash, stable_ms,
+            width, height, timeout_s, interval_ms,
+        )
+    timing = _PsTiming()
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
+    # The host-side deadline mirrors wait_frame_change: the child is killed at
+    # timeout_s + 15 (a stuck WMI call cannot hold the call open indefinitely).
+    script = _folded_wait_stable_script(
+        prelude, baseline_hash, stable_ms, width, height, timeout_s, interval_ms
+    )
+    started = time.monotonic()
+    result = _run(cfg, script, timeout_s=int(timeout_s) + 15, timing=timing)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    _check_rc(result, "console wait_frame_stable")
+
+    stop_reason, polls, last_hash, stable_ms_reported, frame_b64 = "deadline", 0, "", None, ""
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("STOP="):
+            parts = dict(
+                kv.split("=", 1) for kv in line.split(" ") if "=" in kv
+            )
+            stop_reason = parts.get("STOP", "deadline")
+            polls = int(parts.get("POLLS", "0") or 0)
+            last_hash = parts.get("HASH", "")
+            stable_ms_reported = parts.get("STABLE_MS")
+        elif line.startswith("FRAME="):
+            frame_b64 = line[len("FRAME="):]
+
+    out: dict = {
+        "ok": True,
+        "vm_name": ref.name,
+        "stop_reason": stop_reason,
+        "stable": stop_reason == "stable",
+        "polls": polls,
+        "elapsed_ms": elapsed_ms,
+        "width": width,
+        "height": height,
+        "hash_domain": HASH_DOMAIN,
+        "timings": _ps_timings(timing),
+    }
+    if stable_ms_reported is not None:
+        out["stable_ms_measured"] = int(stable_ms_reported)
+    if last_hash:
+        out["frame_hash"] = last_hash
+    if frame_b64:
+        raw = base64.b64decode(frame_b64)
+        out["image"] = _decode_frame(raw, width, height)
+        out["frame_hash"] = _frame_hash(raw)
+    return out
+
+
+def _wait_frame_stable_wmi(
+    be, connect_ms: float, ref: vmident.VMRef, baseline_hash: str,
+    stable_ms: int, width: int, height: int, timeout_s: int, interval_ms: int,
+) -> dict:
+    """wait_frame_stable over the in-process WMI backend: the same transition
+    table as the PowerShell transport (first-poll window start, supplied
+    baseline moves the window start to the first differing frame, quiet window
+    >= stable_ms -> stable, unchanged only with a never-differed baseline)."""
+    max_polls = math.ceil(timeout_s * 1000 / interval_ms)
+    phase_dicts: list[dict] = []
+    stop_reason, polls = "deadline", 0
+    last_hash: str | None = None
+    # With a supplied baseline the reference STARTS there (the quiet window
+    # may not begin while frames still match it); without one, the first
+    # frame seeds it (first-poll-is-baseline) — the same init the PS template
+    # performs through $refHash = '<baseline>'.
+    ref_hash: str | None = baseline_hash or None
+    last_change: float | None = None
+    move_seen = False
+    raw: bytes | None = None
+    started = time.monotonic()
+    deadline_t = started + timeout_s
+    # "unchanged" means "frames were observed and none moved away from the
+    # baseline": a zero-poll deadline is a deadline, never unchanged.
+    def _terminal() -> str:
+        if baseline_hash and polls > 0 and not move_seen:
+            return "unchanged"
+        return "deadline"
+
+    try:
+        while polls < max_polls:
+            if time.monotonic() >= deadline_t:
+                stop_reason = _terminal()
+                break
+            raw, t = be.capture(ref.id, width, height)
+            phase_dicts.append(t)
+            polls += 1
+            now = time.monotonic()
+            h = _frame_hash(raw)
+            last_hash = h
+            if h != ref_hash:
+                ref_hash = h
+                last_change = now
+                move_seen = True
+            if last_change is not None and (now - last_change) * 1000 >= stable_ms:
+                stop_reason = "stable"
+                break
+            if polls >= max_polls or time.monotonic() >= deadline_t:
+                stop_reason = _terminal()
+                break
+            time.sleep(interval_ms / 1000)
+    except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
+        raise ConsoleError(str(exc)) from None
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    out: dict = {
+        "ok": True,
+        "vm_name": ref.name,
+        "stop_reason": stop_reason,
+        "stable": stop_reason == "stable",
+        "polls": polls,
+        "elapsed_ms": elapsed_ms,
+        "width": width,
+        "height": height,
+        "hash_domain": HASH_DOMAIN,
+        "timings": _wmi_timings(connect_ms, *phase_dicts),
+    }
+    if last_hash:
+        out["frame_hash"] = last_hash
+    if stop_reason == "stable" and last_change is not None:
+        out["stable_ms_measured"] = int((time.monotonic() - last_change) * 1000)
+        if raw is not None:
+            out["image"] = _decode_frame(raw, width, height)
+            out["frame_hash"] = _frame_hash(raw)
+    return out
+
+
 def capture_sequence(
     cfg: Config, vm_name: str = "", count: int = 3, interval_s: int = 2,
     width: int = 640, height: int = 480, vm_id: str = "",
@@ -2314,15 +2564,31 @@ def capture_sequence(
     frames: list[dict] = []
     images: list = []
     prev_raw: bytes | None = None
+    seq_guid: str | None = None
     started = time.monotonic()
     for i in range(count):
         # Each frame is its own self-contained process (the prelude resolves the
         # VM), so there is no separate GUID process — at most one per frame.
-        raw = _capture_raw(cfg, prelude, width, height, timing)
+        raw, meta = _capture_raw_with_meta(
+            cfg, prelude, width, height, timing, ctx="console capture_sequence")
+        # Identity pin (issue #82): a frame that reports a GUID joins the
+        # sequence only under the first attributed frame's identity. A frame
+        # with no VMID= line stays unattributed and never clears the pin.
+        guid: str | None = None
+        if "VMID" in meta:
+            guid = _parse_guid(meta, ref.name)
+            if seq_guid is None:
+                seq_guid = guid
+            elif guid != seq_guid:
+                raise ConsoleError(
+                    f"capture_sequence spanned two VM identities: frame 0 "
+                    f"resolved {seq_guid} but frame {i} resolved {guid}"
+                )
         h = _frame_hash(raw)
         changed_bytes = _changed_pixel_bytes(prev_raw, raw)
         frames.append({
             "index": i,
+            "vm_id": guid,
             "frame_hash": h,
             "changed_bytes_vs_previous": changed_bytes,
             "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
@@ -2364,6 +2630,7 @@ def _capture_sequence_wmi(
             changed_bytes = _changed_pixel_bytes(prev_raw, raw)
             frames.append({
                 "index": i,
+                "vm_id": ref.id,
                 "frame_hash": h,
                 "changed_bytes_vs_previous": changed_bytes,
                 "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),

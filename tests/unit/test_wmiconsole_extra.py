@@ -933,3 +933,174 @@ def test_vm_id_whitespace_only_rejected(monkeypatch, unrestricted_cfg):
     be = wmiconsole.backend(unrestricted_cfg)
     with pytest.raises(ValueError, match="GUID"):
         be.resolve_vm(unrestricted_cfg, vm_name="vm1", vm_id="   ")
+
+
+# ---------------------------------------------------------------------------
+# wait_frame_stable WMI transitions (issue #27)
+# ---------------------------------------------------------------------------
+
+class _SettlingService(FakeWMIService):
+    """One changed frame, then a constant screen: the settle wait must restart
+    its quiet window at the change and report stable only after it."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._tick = 0
+
+    def exec_method(self, obj, name, in_params):
+        if name == "GetVirtualSystemThumbnailImage":
+            width = int(in_params.values["WidthPixels"])
+            height = int(in_params.values["HeightPixels"])
+            self._tick += 1
+            self.captures.append((width, height))
+            pixels = bytearray(b"\x5a\xa5" * (width * height))
+            pixels[0] = 0 if self._tick == 1 else 1
+            from types import SimpleNamespace
+            return SimpleNamespace(ReturnValue=self.method_rc,
+                                   ImageData=b"\x00\x00\x00\x00" + bytes(pixels))
+        return super().exec_method(obj, name, in_params)
+
+
+def test_wait_frame_stable_wmi_stable_after_change_settles(monkeypatch, unrestricted_cfg):
+    """Change on frame 1, then quiet: the window restarts at the change and
+    the call reports stable (never a mid-animation frame). Deterministic fake
+    clock on console's own namespace: each console-side monotonic call ticks
+    +100 ms, so the quiet window completes on the poll after the change
+    regardless of the autouse _no_sleep fixture."""
+    from types import SimpleNamespace
+
+    svc = _SettlingService(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    stub = _ps(monkeypatch)
+    ticks = {"n": 0}
+
+    def fake_monotonic():
+        ticks["n"] += 1
+        return ticks["n"] * 0.1
+
+    monkeypatch.setattr(console, "time", SimpleNamespace(
+        monotonic=fake_monotonic, sleep=lambda s: None))
+    out = console.wait_frame_stable(
+        unrestricted_cfg, "vm1", stable_ms=1, timeout_s=5, interval_ms=100,
+        width=320, height=240)
+    assert stub.scripts == []
+    assert out["stop_reason"] == "stable" and out["stable"] is True
+    assert out["polls"] >= 2, "the quiet window needs a poll after the change"
+    assert out["timings"]["transport"] == "wmi"
+
+
+def test_wait_frame_stable_wmi_baseline_never_differed_is_unchanged(monkeypatch, unrestricted_cfg):
+    """With a baseline the constant screen NEVER moves: the result is
+    stop_reason=unchanged (the input did nothing), not stable. Fake clock on
+    console's namespace drives the loop to its poll cap deterministically."""
+    import hashlib
+    from types import SimpleNamespace
+
+    svc = FakeWMIService(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    ticks = {"n": 0}
+
+    def fake_monotonic():
+        ticks["n"] += 1
+        return ticks["n"] * 0.1
+
+    monkeypatch.setattr(console, "time", SimpleNamespace(
+        monotonic=fake_monotonic, sleep=lambda s: None))
+    baseline = hashlib.sha256(b"\x5a\xa5" * (320 * 240)).hexdigest()
+    out = console.wait_frame_stable(
+        unrestricted_cfg, "vm1", stable_ms=1, timeout_s=1, interval_ms=100,
+        width=320, height=240, baseline_hash=baseline)
+    assert out["stop_reason"] == "unchanged" and out["stable"] is False
+    assert "image" not in out
+    assert out["polls"] >= 1, (
+        "unchanged requires at least one OBSERVED frame (never a zero-poll deadline)"
+    )
+
+
+def test_wait_frame_stable_wmi_window_waits_for_baseline_movement(monkeypatch, unrestricted_cfg):
+    """Frames matching the baseline do NOT start the quiet window: a first
+    frame equal to the baseline must not settle the call on its own — the
+    window only starts on movement AWAY from the baseline. Fake clock as in
+    the sibling tests."""
+    import hashlib
+    from types import SimpleNamespace
+
+    class _BaselineFirstService(FakeWMIService):
+        """Frame 1 == the constant payload (matches the baseline), frame 2+
+        move away, then hold still."""
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self._tick = 0
+
+        def exec_method(self, obj, name, in_params):
+            if name == "GetVirtualSystemThumbnailImage":
+                width = int(in_params.values["WidthPixels"])
+                height = int(in_params.values["HeightPixels"])
+                self._tick += 1
+                self.captures.append((width, height))
+                if self._tick == 1:
+                    pixels = b"\x5a\xa5" * (width * height)
+                else:
+                    pixels = b"\x5a\xa4" * (width * height)
+                return SimpleNamespace(ReturnValue=self.method_rc,
+                                       ImageData=b"\x00\x00\x00\x00" + pixels)
+            return super().exec_method(obj, name, in_params)
+
+    svc = _BaselineFirstService(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    ticks = {"n": 0}
+
+    def fake_monotonic():
+        ticks["n"] += 1
+        return ticks["n"] * 0.1
+
+    monkeypatch.setattr(console, "time", SimpleNamespace(
+        monotonic=fake_monotonic, sleep=lambda s: None))
+    baseline = hashlib.sha256(b"\x5a\xa5" * (320 * 240)).hexdigest()
+    out = console.wait_frame_stable(
+        unrestricted_cfg, "vm1", stable_ms=1, timeout_s=5, interval_ms=100,
+        width=320, height=240, baseline_hash=baseline)
+    # poll 1 matches the baseline (window not started); poll 2 moves away and
+    # starts the window; the quiet window completes from there.
+    assert out["stop_reason"] == "stable"
+    assert out["polls"] >= 3, (
+        "the poll that matches the baseline must not count toward settling"
+    )
+    assert svc.captures[0][0] == 320  # sanity: the fake served real frames
+
+
+def test_wait_frame_stable_wmi_zero_observed_polls_is_deadline(monkeypatch):
+    """A deadline that fires before the FIRST capture is a deadline, never
+    unchanged — "unchanged" means frames were observed and none moved.
+    Drives the WMI helper directly so the fake clock is not consumed by
+    backend selection."""
+    from types import SimpleNamespace
+
+    import hyperv_mcp.vmident as vmident
+
+    class _DirectBackend:
+        def __init__(self):
+            self.calls = 0
+
+        def capture(self, ref_id, width, height):
+            self.calls += 1
+            return b"\x00\x00\x00\x00" + b"\x5a\xa5" * (width * height), {"method_ms": 1.0}
+
+    be = _DirectBackend()
+    ref = vmident.VMRef(id=GUID, name="vm1")
+    ticks = {"n": 0}
+
+    def fake_monotonic():
+        ticks["n"] += 1
+        return 0.0 if ticks["n"] == 1 else 1e12
+
+    monkeypatch.setattr(console, "time", SimpleNamespace(
+        monotonic=fake_monotonic, sleep=lambda s: None))
+    out = console._wait_frame_stable_wmi(
+        be, 0.0, ref, "a" * 64, 500, 320, 240, 1, 100)
+    assert out["stop_reason"] == "deadline", (
+        "a zero-poll deadline must not report unchanged even with a baseline"
+    )
+    assert out["polls"] == 0 and "image" not in out
+    assert be.calls == 0, "the deadline fired before any capture"

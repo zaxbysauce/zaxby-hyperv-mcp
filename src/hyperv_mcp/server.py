@@ -1517,7 +1517,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         numdecimal, nummultiply, numsubtract, numadd, numlock, numdivide,
         numenter), and the GUI/Application keys win (alias leftwin),
         rightwin, menu (alias apps) — modifier-named keys are also valid
-        bare presses (press_key(key="win") taps Win alone). Policy:
+        bare presses (press_key(key="win") taps Win alone). Follow the press
+        with hyperv_console_wait_frame_stable instead of a fixed sleep so the
+        UI transition is allowed to finish. Policy:
         console_input.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
@@ -1608,7 +1610,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         clicking blind, and absolute positioning needs the synthetic mouse
         (PS/2-fallback guests support only click-at-current-position, i.e.
         omitting x/y). button: 1=left, 2=right. Verify placement with a
-        screenshot between steps — never assume focus from a prior frame.
+        screenshot between steps — never assume focus from a prior frame —
+        and follow the click with hyperv_console_wait_frame_stable instead of
+        a fixed sleep so the UI transition is allowed to finish.
         Policy: console_input.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
@@ -1679,6 +1683,51 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 out = console.wait_frame_change(
                     _cfg(), vm_name, baseline_hash, width, height, timeout_s,
                     interval_s, vm_id=vm_id
+                )
+                meta = {k: v for k, v in out.items() if k != "image"}
+                # PRR-004: by-id adoption from the console module's metadata.
+                if not vm_name and meta.get("vm_name"):
+                    op.vm_name = str(meta["vm_name"])
+                if "image" in out:
+                    return errors.success_result(
+                        [Image(data=out["image"].png, format="png").to_image_content(), meta]
+                    )
+                return errors.success_result([meta])
+        except UrlElicitationRequiredError:
+            raise
+        except Exception as exc:
+            return errors.failure_result(errors.envelope(exc))
+
+    @mcp.tool()
+    def hyperv_console_wait_frame_stable(
+        vm_name: str = "", stable_ms: int = 1500, timeout_s: int = 30,
+        interval_ms: int = 250, width: int = 640, height: int = 480,
+        baseline_hash: str = "", vm_id: str = "",
+    ) -> CallToolResult:
+        """Poll the console until the frame has been unchanged for stable_ms
+        (the settle wait: the animation finished, the dialog painted). Bounded:
+        polls = ceil(timeout_s*1000/interval_ms), deadline enforced host-side,
+        interval_ms floor 100. With baseline_hash the quiet window starts only
+        at the first frame that DIFFERS from it — "my input did nothing" is
+        then stop_reason=unchanged, not stable. Returns [ImageContent,
+        meta_text] when settled — {stop_reason: stable|unchanged|deadline,
+        stable, polls, elapsed_ms, frame_hash, stable_ms_measured, width,
+        height} — or a meta-only dict with stable=false otherwise. The returned
+        frame_hash chains into baseline_hash. Never invents screen text:
+        interpret the returned image visually. Follow every click or key press
+        with this instead of a fixed sleep.
+
+        Args:
+            vm_name:        VM name (must match allowed_vm_patterns)
+            vm_id:          Optional VM GUID; exactly one of vm_name/vm_id must be given
+            baseline_hash:  frame_hash from before the input ("" settles on the
+                            current screen — first poll starts the quiet window)
+        """
+        try:
+            with _audit("hyperv_console_wait_frame_stable", vm_name, "read") as op:
+                out = console.wait_frame_stable(
+                    _cfg(), vm_name, stable_ms, timeout_s, interval_ms,
+                    width, height, baseline_hash, vm_id=vm_id,
                 )
                 meta = {k: v for k, v in out.items() if k != "image"}
                 # PRR-004: by-id adoption from the console module's metadata.

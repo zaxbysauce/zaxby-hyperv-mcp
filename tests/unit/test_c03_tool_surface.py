@@ -59,6 +59,7 @@ TOOL_NAMES = {
     "hyperv_console_button",
     "hyperv_console_scroll",
     "hyperv_console_wait_frame_change",
+    "hyperv_console_wait_frame_stable",
     "hyperv_console_capture_sequence",
     "hyperv_vm_create",
     "hyperv_vm_disk_add",
@@ -235,7 +236,7 @@ def test_ac12_tool_inventory_per_credential_mode(tmp_path, fresh_server):
         f"extra={sorted(set(base_schemas) - TOOL_NAMES)}, "
         f"missing={sorted(TOOL_NAMES - set(base_schemas))}"
     )
-    assert len(base_schemas) == len(TOOL_NAMES) == 66, (
+    assert len(base_schemas) == len(TOOL_NAMES) == 67, (
         f"AC12: tool count {len(base_schemas)} != 66 "
         f"(61 through issue #23; 66 with issue #24's five op/event tools)"
     )

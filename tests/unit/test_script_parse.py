@@ -480,6 +480,43 @@ def test_wait_script_hash_is_full_hex_sha256(monkeypatch, parsed_ps):
         assert "$hash -ne $baseline" in script
 
 
+def test_parse_console_wait_frame_stable(monkeypatch, parsed_ps):
+    """Issue #27: the settle-wait script must parse under the Windows
+    PowerShell 5.1 parser and keep the shared hash contract — full lowercase
+    hex sha256 over the PIXEL payload (ImageData from offset 4), the same
+    form as the change-wait template so frame_hash chains across tools — plus
+    the STOP grammar the host parses (stable/unchanged/deadline) and the
+    quiet-window state ($lastChange) that makes settling observable. Runs on
+    windows-latest; skips on Linux like the rest of the parse lane."""
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        console.wait_frame_stable(
+            UNRESTRICTED, "vm1", stable_ms=1500, timeout_s=30,
+            interval_ms=250, width=640, height=480, baseline_hash="ab" * 32,
+        )
+    except Exception:
+        pass
+    wait_scripts = [s for s in rec.scripts if "$baseline" in s and "STOP=" in s]
+    assert wait_scripts, "stable-wait script not generated"
+    for script in wait_scripts:
+        assert _parse_errors(script) == [], (
+            "the stable-wait script must parse under the PS 5.1 parser"
+        )
+        # pixel-only hash: offset 4, full lowercase-hex, no truncation
+        assert "ComputeHash($r.ImageData, 4, $r.ImageData.Length - 4)" in script
+        assert "BitConverter]::ToString" in script
+        assert "ToLowerInvariant()" in script
+        assert "Substring(0, 32)" not in script
+        # the quiet-window state machine and the three stop reasons
+        assert "$lastChange" in script
+        assert "STOP=stable" in script
+        assert "STOP=unchanged" in script
+        assert "STOP=deadline" in script
+        # the supplied baseline is embedded for the first-difference check
+        assert "$baseline = '" + "ab" * 32 + "'" in script
+
+
 # ---------------------------------------------------------------------------
 # media templates
 # ---------------------------------------------------------------------------
