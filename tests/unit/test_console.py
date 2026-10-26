@@ -3,6 +3,7 @@
 import base64
 import json
 import re
+import sys
 
 import pytest
 
@@ -852,3 +853,122 @@ def test_wait_frame_stable_script_zero_poll_deadline(monkeypatch, unrestricted):
         "the top-of-loop and cap terminals must both require an observed poll "
         "before reporting unchanged"
     )
+
+
+
+# ---------------------------------------------------------------------------
+# wait_frame_stable execution-level pin (review F3, round 2 of trace 27):
+# the REAL generated script runs under a REAL powershell.exe with the CIM
+# cmdlets shadowed by functions serving a constant screen, driven through the
+# real console.wait_frame_stable. The frozen C4 serves canned stdout, which
+# cannot fail on the script's actual state machine — this pin can.
+# ---------------------------------------------------------------------------
+
+_SHIM = (
+    "$script:_fakeImg = New-Object byte[] (4 + 320*240*2)\n"
+    "function Get-CimInstance { param($Namespace, $ClassName, $Filter)\n"
+    "    if ($ClassName -eq 'Msvm_VirtualSystemManagementService') { return [pscustomobject]@{ svc = $true } }\n"
+    "    return [pscustomobject]@{ Id = 'e953c649-dcab-438d-9a54-3af74a82b624' }\n"
+    "}\n"
+    "function Invoke-CimMethod { param($InputObject, $MethodName, $ErrorAction, $Arguments)\n"
+    "    return [pscustomobject]@{ ReturnValue = 0; ImageData = $script:_fakeImg }\n"
+    "}\n"
+)
+
+
+def _ps_executor(monkeypatch):
+    """Replace pswindows.run_ps with a REAL powershell.exe run of the script,
+    prefixed by the CIM-shadow functions (constant screen, ReturnValue 0)."""
+    import base64 as _b64
+    import subprocess as _sub
+
+    import hyperv_mcp.pswindows as _pw
+
+    def _run(script, timeout_s=60, stdin_b64=None):
+        wrapped = _SHIM + script
+        encoded = _b64.b64encode(wrapped.encode("utf-16-le")).decode("ascii")
+        proc = _sub.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+            capture_output=True, text=True, timeout=timeout_s + 30,
+        )
+        return _pw.PSResult(stdout=proc.stdout, stderr=proc.stderr,
+                            returncode=proc.returncode)
+
+    monkeypatch.setattr(_pw, "run_ps", _run)
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="executes the real Windows PowerShell 5.1")
+def test_wait_frame_stable_ps_execution_baseline_discrimination(monkeypatch, unrestricted):
+    """Review F3: with a baseline, a screen that never differs must return
+    stop_reason=unchanged (stable False, NO image) — the quiet window may only
+    start on movement AWAY from the baseline. Without a baseline, the first
+    poll starts the window and the same static screen settles (stable). This
+    drives the SHIPPED script through a real powershell.exe, so a state-machine
+    regression (e.g. never seeding the reference from the baseline) fails here
+    even though every canned-stdout unit test stays green. The prelude is the
+    by-id GUID preamble (no host-side resolver spawn); the CIM cmdlets inside
+    the script are shadowed by functions serving a constant screen."""
+    import hyperv_mcp.guestexec as guestexec
+    import hyperv_mcp.vmident as vmident
+
+    def _by_id_prelude(cfg, vm_name, vm_id, timing):
+        ref = vmident.VMRef(id=GUID, name=vm_name)
+        return guestexec.vm_target_preamble(GUID), ref
+
+    monkeypatch.setattr(console, "_vm_prelude", _by_id_prelude)
+    _ps_executor(monkeypatch)
+    # the baseline IS the shim's static screen (all-zero pixel payload), so
+    # "the screen never differs from the baseline" is literally true.
+    import hashlib as _hashlib
+    baseline = _hashlib.sha256(b"\x00" * (320 * 240 * 2)).hexdigest()
+    out = console.wait_frame_stable(
+        unrestricted, "vm1", stable_ms=1, timeout_s=2, interval_ms=100,
+        width=320, height=240, baseline_hash=baseline)
+    assert out["stop_reason"] == "unchanged", out
+    assert out["stable"] is False and "image" not in out
+
+    out_free = console.wait_frame_stable(
+        unrestricted, "vm1", stable_ms=1, timeout_s=2, interval_ms=100,
+        width=320, height=240)
+    assert out_free["stop_reason"] == "stable", out_free
+    assert out_free["stable"] is True and "image" in out_free
+
+
+# ---------------------------------------------------------------------------
+# capture_sequence identity: empty VMID= is a structured error (review F4) —
+# the plan-normative rule is KEY PRESENCE, so this test dies under the
+# truthiness mutant (meta.get("VMID")) that would silently treat a present-
+# but-empty GUID as an unattributed frame.
+# ---------------------------------------------------------------------------
+
+def test_capture_sequence_empty_vmid_is_structured_error(monkeypatch, unrestricted):
+    guid_a = "e953c649-dcab-438d-9a54-3af74a82b624"
+    payload = b"\x01\x02\x03\x04" + b"\x00\x00" * (320 * 240)
+    body = json.dumps({
+        "returnValue": 0,
+        "imageDataB64": base64.b64encode(payload).decode(),
+    })
+
+    class EmptyGuidStub:
+        def __init__(self):
+            self.scripts = []
+
+        def __call__(self, script, **kwargs):
+            self.scripts.append(script)
+            return pswindows.PSResult(
+                stdout=f"VMID={guid_a}\n{body}", returncode=0)
+
+    class EmptyVmidStub(EmptyGuidStub):
+        def __call__(self, script, **kwargs):
+            self.scripts.append(script)
+            n = len(self.scripts)
+            line = f"VMID={guid_a}\n" if n == 1 else "VMID=\n"
+            return pswindows.PSResult(stdout=line + body, returncode=0)
+
+    stub = EmptyVmidStub()
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    with pytest.raises(ConsoleError, match="empty Id"):
+        console.capture_sequence(
+            unrestricted, "vm1", count=2, interval_s=1, width=320, height=240)

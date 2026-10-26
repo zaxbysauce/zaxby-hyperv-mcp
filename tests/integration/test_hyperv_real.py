@@ -585,8 +585,9 @@ def test_console_wait_frame_stable_after_input(running_vm):
     The follow-up hash comparison retries once: a lock-screen clock minute
     tick between the settle and the screenshot would change the hash without
     any assertion-relevant difference."""
-    from hyperv_mcp import console
     import time as _time
+
+    from hyperv_mcp import console
 
     cfg, vm = running_vm.cfg, running_vm.vm
     pre = console.wait_frame_change(cfg, vm, timeout_s=10)

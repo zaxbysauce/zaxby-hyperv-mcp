@@ -562,7 +562,11 @@ def _folded_wait_stable_script(
         "$deadline = (Get-Date).AddSeconds(" + str(int(timeout_s)) + ")\n",
         "$polls = 0\n",
         "$baseline = '" + baseline_hash + "'\n",
-        "$refHash = ''\n",
+        # The reference STARTS at the supplied baseline (empty when none): a
+        # frame that still matches the baseline must NOT start the quiet
+        # window — only the first frame that DIFFERS from it does (the WMI
+        # leg performs the identical init through ref_hash = baseline or None).
+        "$refHash = '" + baseline_hash + "'\n",
         "$lastHash = ''\n",
         "$lastChange = $null\n",
         "$moveSeen = $false\n",
@@ -2565,6 +2569,7 @@ def capture_sequence(
     images: list = []
     prev_raw: bytes | None = None
     seq_guid: str | None = None
+    seq_pin_frame = 0
     started = time.monotonic()
     for i in range(count):
         # Each frame is its own self-contained process (the prelude resolves the
@@ -2579,10 +2584,12 @@ def capture_sequence(
             guid = _parse_guid(meta, ref.name)
             if seq_guid is None:
                 seq_guid = guid
+                seq_pin_frame = i
             elif guid != seq_guid:
                 raise ConsoleError(
-                    f"capture_sequence spanned two VM identities: frame 0 "
-                    f"resolved {seq_guid} but frame {i} resolved {guid}"
+                    f"capture_sequence spanned two VM identities: frame "
+                    f"{seq_pin_frame} resolved {seq_guid} but frame {i} "
+                    f"resolved {guid}"
                 )
         h = _frame_hash(raw)
         changed_bytes = _changed_pixel_bytes(prev_raw, raw)
