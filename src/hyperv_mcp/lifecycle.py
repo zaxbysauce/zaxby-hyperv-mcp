@@ -89,7 +89,8 @@ _VM_KEY_ALIASES = {
 _INFO_KEY_ALIASES = {
     **_VM_KEY_ALIASES,
     "generation": "Generation", "dynamic_memory": "DynamicMemory",
-    "checkpoint_count": "CheckpointCount", "com_ports": "ComPorts",
+    "checkpoint_count": "CheckpointCount", "checkpoint_type": "CheckpointType",
+    "com_ports": "ComPorts",
     "network_adapters": "NetworkAdapters", "hard_drives": "HardDrives",
 }
 _SNAPSHOT_KEY_ALIASES = {
@@ -243,6 +244,7 @@ $snaps = (Get-VMSnapshot -VM $vm -ErrorAction Stop | Measure-Object).Count
     cpu_count        = $vm.ProcessorCount
     uptime_seconds   = $vm.Uptime.TotalSeconds
     checkpoint_count = $snaps
+    checkpoint_type  = [string]$vm.CheckpointType
     com_ports        = @($com)
     network_adapters = @($net)
     hard_drives      = @($hdd)
@@ -381,21 +383,101 @@ Start-VM -VM $vm -ErrorAction Stop
 # checkpoints
 # ---------------------------------------------------------------------------
 
-def checkpoint_create(cfg: Config, vm_name: str = "", checkpoint_name: str = "", vm_id: str = "") -> dict:
+# Issue #26: checkpoint_type selection. Checkpoint-VM has no per-call type
+# parameter, so a non-empty type is applied to the VM's CheckpointType setting
+# for the single Checkpoint-VM call and restored in the same script's finally.
+# Caller text never reaches the script: the value maps to a fixed literal.
+_CHECKPOINT_TYPES = {
+    "": "",
+    "standard": "Standard",
+    "production": "Production",
+    "production_only": "ProductionOnly",
+}
+
+
+def checkpoint_create(
+    cfg: Config, vm_name: str = "", checkpoint_name: str = "", vm_id: str = "", checkpoint_type: str = ""
+) -> dict:
+    if not isinstance(checkpoint_type, str) or checkpoint_type not in _CHECKPOINT_TYPES:
+        raise ValueError(
+            f"invalid checkpoint_type {str(checkpoint_type)[:200]!r}; must be one of "
+            "standard, production, production_only, or empty (VM's own setting)"
+        )
     if not checkpoint_name:
         checkpoint_name = f"MCP-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     _checked_label(checkpoint_name, "checkpoint_name")
     cn = pswindows.ps_name(checkpoint_name)
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     with vmlocks.vm_lock(ref.id):
-        script = f"""
+        if not checkpoint_type:
+            script = f"""
 {guestexec.vm_target_preamble(ref.id)}
 $vm = Get-VM -Id $vmTarget -ErrorAction Stop
 Checkpoint-VM -VM $vm -SnapshotName {cn} -ErrorAction Stop
 """
-        result = _run(cfg, script, timeout_s=300)
-        pswindows.check_result(result, f"hyperv_checkpoint_create({vm_name or vm_id})")
-        return {"status": "created", "vm_name": ref.name, "checkpoint_name": checkpoint_name}
+        else:
+            literal = _CHECKPOINT_TYPES[checkpoint_type]
+            script = f"""
+{guestexec.vm_target_preamble(ref.id)}
+$vm = Get-VM -Id $vmTarget -ErrorAction Stop
+$orig = [string]$vm.CheckpointType
+$cpFailed = $false
+$cpErr = ''
+$restoreErr = ''
+try {{
+    Set-VM -VM $vm -CheckpointType {literal} -ErrorAction Stop
+    Checkpoint-VM -VM $vm -SnapshotName {cn} -ErrorAction Stop
+}} catch {{
+    $cpFailed = $true
+    $cpErr = $_.Exception.Message
+}} finally {{
+    try {{ Set-VM -VM $vm -CheckpointType $orig -ErrorAction Stop }} catch {{ $restoreErr = $_.Exception.Message }}
+}}
+[PSCustomObject]@{{ original_type=$orig; restore_error=$restoreErr; checkpoint_created=(-not $cpFailed) }} | ConvertTo-Json -Compress
+if ($cpFailed -and $restoreErr) {{ throw (('checkpoint failed: {{0}}; CheckpointType restore also failed (pre-call type {{1}}): {{2}}') -f $cpErr, $orig, $restoreErr) }}
+elseif ($cpFailed) {{ throw $cpErr }}
+elseif ($restoreErr) {{ throw (('CheckpointType restore failed (pre-call type {{0}}; it may still be {{1}}): {{2}}') -f $orig, '{literal}', $restoreErr) }}
+"""
+        # PR #101 review: 600s, not 300s — the checkpoint write (and on the
+        # typed path the guest-memory capture) can run long, and a timeout
+        # here kills the tree before the in-script restore runs (stranding
+        # CheckpointType; the restore leg got 600s for the same multi-minute
+        # reason).
+        result = _run(cfg, script, timeout_s=600)
+        out = {"status": "created", "vm_name": ref.name, "checkpoint_name": checkpoint_name}
+        if checkpoint_type:
+            # Parse BEFORE check_result: the script emits its JSON row before
+            # throwing, so a script-surviving failure can name what actually
+            # happened — a restore-only failure must say the checkpoint WAS
+            # created (a blind retry would orphan or name-collide it), while
+            # a checkpoint-phase failure must NOT claim creation. The row is
+            # also the success payload's vm_checkpoint_type. A killed or
+            # garbage-stdout result parses as no rows so check_result below
+            # raises the TRUE transport error — a JSONDecodeError here would
+            # misclassify a host/timeout failure as caller fault ("invalid").
+            try:
+                rows = _parse_json_objects(result, "checkpoint_create")
+            except Exception:
+                rows = []
+            original = str(rows[0].get("original_type", "")) if rows else ""
+            restore_error = str(rows[0].get("restore_error", "")) if rows else ""
+            created = bool(rows[0].get("checkpoint_created")) if rows else False
+            try:
+                pswindows.check_result(result, f"hyperv_checkpoint_create({vm_name or vm_id})")
+            except Exception as exc:
+                if restore_error and created:
+                    raise RuntimeError(
+                        f"hyperv_checkpoint_create({vm_name or vm_id}): checkpoint "
+                        f"'{checkpoint_name}' WAS created, but the VM CheckpointType "
+                        f"restore failed (pre-call type {original}; it may still be "
+                        f"{_CHECKPOINT_TYPES[checkpoint_type]}): {restore_error}"
+                    ) from exc
+                raise
+            out["checkpoint_type"] = checkpoint_type
+            out["vm_checkpoint_type"] = original
+        else:
+            pswindows.check_result(result, f"hyperv_checkpoint_create({vm_name or vm_id})")
+        return out
 
 
 def checkpoint_list(cfg: Config, vm_name: str = "", vm_id: str = "") -> list[dict]:
@@ -412,6 +494,27 @@ Get-VMSnapshot -VM $vm -ErrorAction Stop |
     result = _run(cfg, script, timeout_s=60)
     pswindows.check_result(result, f"hyperv_checkpoint_list({vm_name or vm_id})")
     return [_add_legacy_aliases(row, _SNAPSHOT_KEY_ALIASES) for row in _parse_json_objects(result, "checkpoint_list")]
+
+
+_RESTORE_NOTES = {
+    "Off": "VM is powered off after restore; call hyperv_start_vm to bring it back up.",
+    "Saved": (
+        "A memory-bearing checkpoint restored the saved memory state; the VM is saved, not "
+        "off. Call hyperv_start_vm to resume it with memory intact."
+    ),
+    "Paused": (
+        "Checkpoint restored; the VM is paused at the restored state. No MCP resume tool "
+        "exists — resume out-of-band with PowerShell (Resume-VM)."
+    ),
+    "Running": "Checkpoint restored; the VM is running the restored state. No start needed.",
+}
+
+
+def restore_note(final: str) -> str:
+    """Issue #26 guardrail seam: the note is a pure function of the OBSERVED
+    final state. Kept total — an unmodeled state gets a neutral note instead
+    of a claim (the original defect was a constant note claiming Off)."""
+    return _RESTORE_NOTES.get(final, f"VM state after restore: {final}.")
 
 
 def checkpoint_restore(
@@ -439,13 +542,16 @@ Restore-VMSnapshot -Name {cn} -VM (Get-VM -Id $vmTarget -ErrorAction Stop) -Conf
         # Restoring a checkpoint whose subtree has descendants merges their
         # differencing disks; the VM can stay in transitional states for many
         # minutes (observed: >120s on a 10-deep tree). Wait generously.
-        final = _wait_for_state(cfg, ref, ["Off", "Saved", "Paused"], timeout_s=600)
+        # "Running" is in the wanted set because a Standard checkpoint can
+        # hand back a VM that resumes straight into Running (issue #26);
+        # without it the wait below would spin for the full timeout.
+        final = _wait_for_state(cfg, ref, ["Off", "Saved", "Paused", "Running"], timeout_s=600)
         return {
             "status": "restored",
             "vm_name": ref.name,
             "checkpoint_name": checkpoint_name,
             "state": final,
-            "note": "VM is powered off after restore; call hyperv_start_vm to bring it back up.",
+            "note": restore_note(final),
         }
 
 

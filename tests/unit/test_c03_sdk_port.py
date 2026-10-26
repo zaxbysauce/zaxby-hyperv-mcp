@@ -1,6 +1,6 @@
 """Acceptance checks for issue #16, part 2 — the SDK-generation port pins.
 
-AC7 (pyproject declares mcp>=2.3,<3 and version 0.6.0), AC8 (bootstrapping
+AC7 (pyproject declares mcp>=2.3,<3 and version 0.7.0), AC8 (bootstrapping
 builds an mcp.server.mcpserver.MCPServer), AC9 (call_tool returns a
 CallToolResult). Sibling c03 files: test_c03_tool_concurrency.py (AC1-AC5),
 test_c03_http_entry.py (AC6, AC13), test_c03_tool_surface.py (AC10-AC12).
@@ -44,7 +44,7 @@ def _is_resolution_leg(script: str) -> bool:
 
 def test_ac7_pyproject_declares_mcp2_and_version():
     """AC7: pyproject.toml declares exactly one mcp requirement
-    `mcp>=2.3,<3` and version `0.6.0`."""
+    `mcp>=2.3,<3` and version `0.7.0`."""
     try:
         import tomllib
     except ImportError:  # Python 3.10
@@ -59,8 +59,8 @@ def test_ac7_pyproject_declares_mcp2_and_version():
 
     mcp_reqs = [d for d in deps if req_name(d) == "mcp"]
     assert mcp_reqs == ["mcp>=2.3,<3"], f"AC7: pyproject mcp requirement(s) {mcp_reqs!r} != ['mcp>=2.3,<3']"
-    assert data["project"]["version"] == "0.6.0", (
-        f"AC7: pyproject version {data['project']['version']!r} != '0.6.0'"
+    assert data["project"]["version"] == "0.7.0", (
+        f"AC7: pyproject version {data['project']['version']!r} != '0.7.0'"
     )
 
 

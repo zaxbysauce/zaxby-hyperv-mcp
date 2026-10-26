@@ -697,14 +697,15 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     @mcp.tool()
     def hyperv_get_vm_info(vm_name: str = "", vm_id: str = "") -> dict:
         """Get detailed info about a Hyper-V VM: state, generation, COM ports,
-        network adapters, hard drives, checkpoint count.
+        network adapters, hard drives, checkpoint count, checkpoint type.
 
         Args:
             vm_name: Name of the VM (must match allowed_vm_patterns)
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {id, name, state, generation, memory_mb, cpu_count,
-                  checkpoint_count, com_ports, network_adapters, hard_drives, ...}
+                  checkpoint_count, checkpoint_type, com_ports, network_adapters,
+                  hard_drives, ...}
         """
         return _run_guest_tool(
             "hyperv_get_vm_info", vm_name, "read",
@@ -784,24 +785,43 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
     @mcp.tool()
     def hyperv_checkpoint_create(
-        vm_name: str = "", checkpoint_name: str = "", vm_id: str = "",
+        vm_name: str = "", checkpoint_name: str = "", vm_id: str = "", checkpoint_type: str = "",
         lease_id: str = "", fencing_token: int = 0,
         detach: bool = False, idempotency_key: str = "",
     ) -> dict:
         """Create a checkpoint (snapshot) of a Hyper-V VM.
 
+        With checkpoint_type set, the VM's CheckpointType setting is temporarily
+        changed for the single Checkpoint-VM call and restored in the same
+        script. On a timeout or cancellation the host kills the script before
+        that restore can run: the setting may stay at the requested value, and
+        the pre-call original is then unrecoverable from the tool result —
+        repair from your own records, or set it deliberately with
+        `Get-VM "<name>" | Set-VM -CheckpointType <value>`. A stranded Standard
+        makes every later default (no-type) checkpoint memory-bearing. Both
+        paths share a 600s budget; a large-VM checkpoint can still hit it.
+
         Args:
             vm_name:         Name of the VM
             checkpoint_name: Label (auto timestamp if omitted)
             vm_id:           Optional VM GUID; exactly one of vm_name/vm_id must be given
+            checkpoint_type: "standard", "production", "production_only", or "" (default:
+                             the VM's own setting). Production falls back to Standard on
+                             guests without production-checkpoint support, and ProductionOnly
+                             fails instead. A Standard checkpoint — including a Production
+                             fallback — writes guest memory to the host checkpoint store:
+                             it can persist secrets held in guest memory (for example an
+                             autologon password).
 
-        Returns: {status, vm_name, checkpoint_name}
+        Returns: {status, vm_name, checkpoint_name} (+ checkpoint_type: the type you
+        requested, and vm_checkpoint_type: the VM's pre-call CheckpointType setting, when a
+        type was requested)
 
         Failure: {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).        """
         return _run_guest_tool(
             "hyperv_checkpoint_create", vm_name, "checkpoint",
             lifecycle.checkpoint_create, _cfg(), vm_name,
-            checkpoint_name=checkpoint_name, vm_id=vm_id,
+            checkpoint_name=checkpoint_name, vm_id=vm_id, checkpoint_type=checkpoint_type,
         )
 
     @mcp.tool()
@@ -830,7 +850,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         detach: bool = False, idempotency_key: str = "",
     ) -> dict:
         """Restore a VM to a checkpoint. ALL STATE SINCE THE CHECKPOINT IS
-        DISCARDED. The VM ends powered off; call hyperv_start_vm afterwards.
+        DISCARDED. The VM ends in the state the checkpoint captured — most
+        often Off for Production checkpoints and Saved/Running for Standard
+        ones, but the reported state (and note) is always what was observed,
+        never inferred from the checkpoint type.
 
         Args:
             vm_name:         Name of the VM
