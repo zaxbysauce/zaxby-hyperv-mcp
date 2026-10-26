@@ -791,17 +791,31 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     ) -> dict:
         """Create a checkpoint (snapshot) of a Hyper-V VM.
 
+        With checkpoint_type set, the VM's CheckpointType setting is temporarily
+        changed for the single Checkpoint-VM call and restored in the same
+        script. On a timeout or cancellation the host kills the script before
+        that restore can run: the setting may stay at the requested value, and
+        the pre-call original is then unrecoverable from the tool result —
+        repair from your own records, or set it deliberately with
+        `Get-VM "<name>" | Set-VM -CheckpointType <value>`. A stranded Standard
+        makes every later default (no-type) checkpoint memory-bearing. Both
+        paths share a 600s budget; a large-VM checkpoint can still hit it.
+
         Args:
             vm_name:         Name of the VM
             checkpoint_name: Label (auto timestamp if omitted)
             vm_id:           Optional VM GUID; exactly one of vm_name/vm_id must be given
             checkpoint_type: "standard", "production", "production_only", or "" (default:
-                             the VM's own setting). A Standard checkpoint writes guest memory
-                             to the host checkpoint store — it can persist secrets held in
-                             guest memory (for example an autologon password).
+                             the VM's own setting). Production falls back to Standard on
+                             guests without production-checkpoint support, and ProductionOnly
+                             fails instead. A Standard checkpoint — including a Production
+                             fallback — writes guest memory to the host checkpoint store:
+                             it can persist secrets held in guest memory (for example an
+                             autologon password).
 
-        Returns: {status, vm_name, checkpoint_name} (+ checkpoint_type, vm_checkpoint_type
-        when a type was requested)
+        Returns: {status, vm_name, checkpoint_name} (+ checkpoint_type: the type you
+        requested, and vm_checkpoint_type: the VM's pre-call CheckpointType setting, when a
+        type was requested)
 
         Failure: {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).        """
         return _run_guest_tool(

@@ -498,7 +498,7 @@ def test_standard_checkpoint_restores_running_desktop(it, it_tmp):
         out = lifecycle.checkpoint_restore(cfg, vm, name, confirm=True)
         assert out["status"] == "restored"
         assert out["state"] in ("Saved", "Running"), out
-        assert "powered off" not in out["note"] or out["state"] == "Off", (
+        assert "powered off" not in out["note"], (
             f"state-accurate note required for {out['state']}: {out['note']!r}"
         )
         if out["state"] == "Saved":
@@ -519,8 +519,16 @@ def test_standard_checkpoint_restores_running_desktop(it, it_tmp):
     finally:
         if created is not None:
             # The restore-type-failure path can raise AFTER the checkpoint
-            # exists; only remove when the create actually succeeded.
+            # exists; only remove when the create actually succeeded. Removal
+            # failure is recorded, not swallowed (guarded_vm convention), so a
+            # stranded mcp-it-standard-* checkpoint is visible in the run
+            # transcript instead of silently leaking on the disposable VM.
             try:
                 lifecycle.checkpoint_remove(cfg, vm, name, confirm=True)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - report, don't hide
+                import json
+
+                with open("hyperv-it-cleanup-report.json", "w", encoding="utf-8") as fh:
+                    json.dump(
+                        {"unremoved_checkpoint": name, "vm": vm, "error": str(exc)}, fh
+                    )

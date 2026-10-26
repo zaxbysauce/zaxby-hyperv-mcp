@@ -1110,15 +1110,24 @@ the result reports the requested type and the VM's pre-call type
 
 **Security note.** A memory-bearing checkpoint (explicit Standard, or a
 Production fallback) writes guest RAM — potentially including secrets such as
-an autologon password — to the host checkpoint store. Microsoft also warns
-that standard snapshots can cause data-consistency issues for systems that
-replicate data between nodes (for example Active Directory).
+an autologon password — to the host checkpoint store. The same applies to
+every later **default (no-type) create** if a previous typed call was killed
+mid-flight and stranded the VM's `CheckpointType` at Standard (see Recovery):
+the default path uses the VM's own setting, whatever it now is. Microsoft
+also warns that standard snapshots can cause data-consistency issues for
+systems that replicate data between nodes (for example Active Directory).
 
 **Recovery.** The VM-level `CheckpointType` is visibly changed during the
-whole create call and a forced termination (timeout, hard kill, dropped host
-connection) can leave it stranded at the requested value. Inspect with
-`Get-VM "<name>"` and repair with `Get-VM "<name>" | Set-VM -CheckpointType
-<original>`.
+whole create call (a concurrent `hyperv_get_vm_info` or Hyper-V Manager read
+sees the temporary value, and an external change made inside the window is
+overwritten by the restore), and a forced termination (timeout, client
+cancellation, hard kill, dropped host connection) can leave it stranded at
+the requested value — both create paths share a 600 s budget, but a
+large-VM checkpoint can still exceed it. Inspect with `Get-VM "<name>"` and
+repair with `Get-VM "<name>" | Set-VM -CheckpointType <original>`. After a
+kill the pre-call original is unrecoverable from the tool result (the value
+is captured inside the killed script) — restore it from your own run records
+or set it deliberately.
 
 Restore waits up to 600 s for Off/Saved/Paused/Running while any checkpoint
 merge completes. Removal merges disks; it cannot be undone.

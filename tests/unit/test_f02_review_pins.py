@@ -30,12 +30,12 @@ _REAL_RUN_PS = pswindows.run_ps
 
 OFF_NOTE = "VM is powered off after restore; call hyperv_start_vm to bring it back up."
 SAVED_NOTE = (
-    "Standard checkpoint restored the saved memory state; the VM is saved, not off. "
-    "Call hyperv_start_vm to resume it with memory intact."
+    "A memory-bearing checkpoint restored the saved memory state; the VM is saved, not "
+    "off. Call hyperv_start_vm to resume it with memory intact."
 )
 PAUSED_NOTE = (
-    "Checkpoint restored; the VM is paused at the restored state. Call Resume-VM to "
-    "resume it (hyperv_start_vm is for stopped/saved VMs)."
+    "Checkpoint restored; the VM is paused at the restored state. No MCP resume tool "
+    "exists — resume out-of-band with PowerShell (Resume-VM)."
 )
 RUNNING_NOTE = "Checkpoint restored; the VM is running the restored state. No start needed."
 
@@ -134,8 +134,6 @@ def test_vm_info_emits_the_checkpoint_type_expression(monkeypatch):
     ("production_only", "ProductionOnly"),
 ])
 def test_enum_maps_to_fixed_literals(monkeypatch, value, literal):
-    monkeypatch.setattr(pswindows, "run_ps", FakePS())
-    lifecycle.checkpoint_create(Config(unrestricted=True), "vm1", "base", checkpoint_type=value)
     fake = FakePS()
     monkeypatch.setattr(pswindows, "run_ps", fake)
     lifecycle.checkpoint_create(Config(unrestricted=True), "vm1", "base", checkpoint_type=value)
@@ -263,7 +261,7 @@ function Set-VM { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments
     $t = $null
     for ($i = 0; $i -lt $rest.Count; $i++) { if ($rest[$i] -eq '-CheckpointType') { $t = $rest[$i + 1] } }
     Add-Content -Path $env:F02_SVM_LOG -Value "set:$t"
-    if ($env:F02_SVM_FAIL_ON -and $t -eq $env:F02_SVM_FAIL_ON) { Write-Error 'setvm-failed' -ErrorAction Stop } }
+    if ($env:F02_SVM_FAIL_ON -and ($env:F02_SVM_FAIL_ON.Split(',') -contains $t)) { Write-Error 'setvm-failed' -ErrorAction Stop } }
 function Checkpoint-VM { [CmdletBinding()] param([Parameter(ValueFromRemainingArguments=$true)]$rest)
     if ($env:F02_CP_FAIL -eq '1') { Write-Error 'checkpoint-failed' -ErrorAction Stop } }
 """
@@ -278,7 +276,7 @@ def _run_standard_script_real_ps(monkeypatch, tmp_path, cp_fail="0", svm_fail_on
     pswindows.init(Config(unrestricted=True))
     log = tmp_path / "svm.log"
     composed = (
-        f"$env:F02_SVM_LOG = '{log.as_posix()}'\n"
+        f"$env:F02_SVM_LOG = {pswindows.ps_quote(log.as_posix())}\n"
         f"$env:F02_CP_FAIL = '{cp_fail}'\n"
         f"$env:F02_SVM_FAIL_ON = '{svm_fail_on}'\n"
         + _STUBS + script
@@ -313,9 +311,124 @@ def test_error_matrix_dual_failure_keeps_checkpoint_primary(monkeypatch, tmp_pat
     assert calls == ["set:Standard", "set:Production"]
 
 
+def test_error_matrix_apply_fails_restore_ok(monkeypatch, tmp_path):
+    """PR #101 review TF-001: the apply Set-VM failing (before Checkpoint-VM)
+    must surface the RAW apply error — not the 'checkpoint failed:' composite,
+    which would claim the checkpoint step ran and failed when it never ran."""
+    result, calls = _run_standard_script_real_ps(monkeypatch, tmp_path, svm_fail_on="Standard")
+    assert result.returncode != 0
+    assert "setvm-failed" in result.stderr
+    assert "checkpoint failed:" not in result.stderr, (
+        "apply-phase failure must not be reported as a checkpoint failure"
+    )
+    assert "restore also failed" not in result.stderr, (
+        "the restore leg succeeded — no restore-failure text may appear"
+    )
+    assert calls == ["set:Standard", "set:Production"]
+
+
+def test_error_matrix_apply_and_restore_both_fail(monkeypatch, tmp_path):
+    """PR #101 review TF-001 (second leg): apply + restore both failing keeps
+    the apply error primary (checkpoint-failed prefix) and still names the
+    restore failure and pre-call type."""
+    result, calls = _run_standard_script_real_ps(
+        monkeypatch, tmp_path, cp_fail="1", svm_fail_on="Standard,Production"
+    )
+    assert result.returncode != 0
+    assert "checkpoint failed:" in result.stderr, "composite fires for the dual failure"
+    assert "setvm-failed" in result.stderr and "restore also failed" in result.stderr
+    assert "pre-call type Production" in result.stderr
+    assert calls == ["set:Standard", "set:Production"]
+
+
+def test_error_matrix_success_leg_restores_and_reports(monkeypatch, tmp_path):
+    """PR #101 review MI-C-02: the executing lane never ran the SUCCESS leg,
+    so a mutant conditioning the finally-restore on $cpErr passed every
+    automated pin. Run the fold clean and assert both Set-VM legs ran and the
+    emitted JSON reports the captured pre-call type."""
+    result, calls = _run_standard_script_real_ps(monkeypatch, tmp_path)
+    assert result.returncode == 0, (result.returncode, result.stderr)
+    assert '"original_type":"Production"' in result.stdout, result.stdout
+    assert '"restore_error":""' in result.stdout
+    assert calls == ["set:Standard", "set:Production"], (
+        "the success leg must apply AND restore the CheckpointType"
+    )
+
+
+def test_restore_only_failure_envelope_discloses_created_checkpoint(monkeypatch):
+    """PR #101 review MI-A-06/MI-C-06: when ONLY the CheckpointType restore
+    fails, the checkpoint WAS created — the raised error must say so (a blind
+    retry would orphan it or collide by name), and must carry the pre-call
+    type (MI-B-01: the README repair needs the original)."""
+    fake = FakePS([
+        pswindows.PSResult(
+            stdout=json.dumps({
+                "original_type": "Production",
+                "restore_error": "access denied",
+                "checkpoint_created": True,
+            }),
+            returncode=1,
+            stderr="CheckpointType restore failed",
+        ),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(RuntimeError, match="WAS created") as exc_info:
+        lifecycle.checkpoint_create(Config(unrestricted=True), "vm1", "snap1", checkpoint_type="standard")
+    assert "pre-call type Production" in str(exc_info.value)
+    assert "snap1" in str(exc_info.value)
+
+
+def test_dual_failure_envelope_never_claims_creation(monkeypatch):
+    """Stage-B reviewer catch: the script emits a non-empty restore_error row
+    on the DUAL-fail path too (apply failed AND restore failed), so an
+    envelope rewrap keyed on restore_error alone would claim 'WAS created'
+    for a checkpoint that was never made. The row carries checkpoint_created;
+    the rewrap must key on it. Wire envelope keeps only str(exc), so this is
+    the agent-visible surface."""
+    fake = FakePS([
+        pswindows.PSResult(
+            stdout=json.dumps({
+                "original_type": "Production",
+                "restore_error": "access denied",
+                "checkpoint_created": False,
+            }),
+            returncode=1,
+            stderr="checkpoint failed: setvm-failed; CheckpointType restore also failed",
+        ),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(RuntimeError, match="checkpoint-failed|setvm-failed|checkpoint failed") as exc_info:
+        lifecycle.checkpoint_create(Config(unrestricted=True), "vm1", "snap1", checkpoint_type="standard")
+    assert "WAS created" not in str(exc_info.value)
+
+
+def test_killed_or_garbage_result_surfaces_transport_error_not_jsondecode(monkeypatch):
+    """Closeout-critic probe B: parse-before-check_result must not feed a
+    killed/partial or garbage stdout to json.loads — a raw JSONDecodeError
+    would classify a host/timeout failure as caller fault (error_class
+    invalid). The guarded parse degrades to no rows so check_result raises
+    the TRUE transport error."""
+    fake = FakePS([
+        pswindows.PSResult(
+            stdout='{"original_type":"Produc',  # partial drain after a kill
+            returncode=1,
+            stderr="hyperv_checkpoint_create(vm1): PowerShell timed out",
+            timed_out=True,
+        ),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(Exception) as exc_info:
+        lifecycle.checkpoint_create(Config(unrestricted=True), "vm1", "snap1", checkpoint_type="standard")
+    assert not isinstance(exc_info.value, json.JSONDecodeError), (
+        "a killed/garbage result must surface the transport error, not a parse error"
+    )
+    assert "timed out" in str(exc_info.value)
+
+
 def test_success_path_transport_mock_primary_error(monkeypatch):
-    """Transport-level companion: an action-leg failure surfaces the stub's
-    own checkpoint error text through the envelope, never a restore error."""
+    """Transport-level companion: an action-leg failure with NO parsable row
+    (script killed before emitting) surfaces the transport error unchanged —
+    the envelope branch must not fabricate a created-checkpoint claim."""
     fake = FakePS([
         pswindows.PSResult(stdout="", returncode=1, stderr="checkpoint-failed"),
     ])
@@ -335,7 +448,7 @@ def test_mcp_forwarding_reaches_the_generated_script(monkeypatch, tmp_path):
     doc = {"allowed_vm_patterns": ["*"], "unrestricted": True}
     p = tmp_path / "cfg.json"
     p.write_text(json.dumps(doc), encoding="utf-8")
-    os.environ["HYPERV_MCP_STATE_DB"] = str(tmp_path / "state.db")
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
     mod = importlib.reload(server_module)
     mod.bootstrap({"HYPERV_MCP_CONFIG": str(p)})
     scripts = []
@@ -366,6 +479,41 @@ def test_mcp_forwarding_reaches_the_generated_script(monkeypatch, tmp_path):
     importlib.reload(server_module)
 
 
+def test_mcp_surface_rejects_invalid_checkpoint_type(monkeypatch, tmp_path):
+    """PR #101 review TF-002: the invalid-checkpoint_type rejection is pinned
+    at the lifecycle layer only; drive the registered TOOL with a bad value
+    and pin the wire envelope (ok:false, error_class invalid)."""
+    doc = {"allowed_vm_patterns": ["*"], "unrestricted": True}
+    p = tmp_path / "cfg.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
+    mod = importlib.reload(server_module)
+    mod.bootstrap({"HYPERV_MCP_CONFIG": str(p)})
+    monkeypatch.setattr(pswindows, "run_ps", FakePS())
+    from conftest import content_blocks
+
+    result = asyncio.run(mod.get_mcp().call_tool(
+        "hyperv_checkpoint_create",
+        {"vm_name": "vm1", "checkpoint_type": "STANDARD"},
+    ))
+    texts = [c for c in content_blocks(result) if getattr(c, "type", "") == "text"]
+    envelope = json.loads(texts[0].text)
+    assert envelope.get("ok") is False and envelope.get("error_class") == "invalid", envelope
+    importlib.reload(server_module)
+
+
+def test_typed_path_empty_rows_silently_yields_empty_pre_call_type(monkeypatch):
+    """PR #101 review TF-004/CS-04/CD-03: the empty-rows fallback is exercised
+    by canned-empty stubs but was never asserted — a mutant dropping the key
+    or substituting a sentinel passed the whole suite. Pin the current choice
+    (empty string, no error) so a change is conscious."""
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = lifecycle.checkpoint_create(Config(unrestricted=True), "vm1", "base", checkpoint_type="standard")
+    assert out["vm_checkpoint_type"] == ""
+    assert out["checkpoint_type"] == "standard"
+
+
 def test_tool_description_discloses_host_checkpoint_store():
     mod = importlib.reload(server_module)
     mod.bootstrap({})
@@ -392,7 +540,7 @@ def test_idempotency_fingerprint_distinguishes_checkpoint_type(monkeypatch, tmp_
     doc = {"allowed_vm_patterns": ["*"], "unrestricted": True}
     p = tmp_path / "cfg.json"
     p.write_text(json.dumps(doc), encoding="utf-8")
-    os.environ["HYPERV_MCP_STATE_DB"] = str(tmp_path / "state.db")
+    monkeypatch.setenv("HYPERV_MCP_STATE_DB", str(tmp_path / "state.db"))
     mod = importlib.reload(server_module)
     mod.bootstrap({"HYPERV_MCP_CONFIG": str(p)})
     scripts = []

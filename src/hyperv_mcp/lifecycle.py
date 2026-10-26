@@ -400,7 +400,7 @@ def checkpoint_create(
 ) -> dict:
     if not isinstance(checkpoint_type, str) or checkpoint_type not in _CHECKPOINT_TYPES:
         raise ValueError(
-            f"invalid checkpoint_type {checkpoint_type!r}; must be one of "
+            f"invalid checkpoint_type {str(checkpoint_type)[:200]!r}; must be one of "
             "standard, production, production_only, or empty (VM's own setting)"
         )
     if not checkpoint_name:
@@ -421,29 +421,62 @@ Checkpoint-VM -VM $vm -SnapshotName {cn} -ErrorAction Stop
 {guestexec.vm_target_preamble(ref.id)}
 $vm = Get-VM -Id $vmTarget -ErrorAction Stop
 $orig = [string]$vm.CheckpointType
+$cpFailed = $false
 $cpErr = ''
 $restoreErr = ''
 try {{
     Set-VM -VM $vm -CheckpointType {literal} -ErrorAction Stop
     Checkpoint-VM -VM $vm -SnapshotName {cn} -ErrorAction Stop
 }} catch {{
+    $cpFailed = $true
     $cpErr = $_.Exception.Message
 }} finally {{
     try {{ Set-VM -VM $vm -CheckpointType $orig -ErrorAction Stop }} catch {{ $restoreErr = $_.Exception.Message }}
 }}
-[PSCustomObject]@{{ original_type=$orig; restore_error=$restoreErr }} | ConvertTo-Json -Compress
-if ($cpErr -and $restoreErr) {{ throw (('checkpoint failed: {{0}}; CheckpointType restore also failed (pre-call type {{1}}): {{2}}') -f $cpErr, $orig, $restoreErr) }}
-elseif ($cpErr) {{ throw $cpErr }}
+[PSCustomObject]@{{ original_type=$orig; restore_error=$restoreErr; checkpoint_created=(-not $cpFailed) }} | ConvertTo-Json -Compress
+if ($cpFailed -and $restoreErr) {{ throw (('checkpoint failed: {{0}}; CheckpointType restore also failed (pre-call type {{1}}): {{2}}') -f $cpErr, $orig, $restoreErr) }}
+elseif ($cpFailed) {{ throw $cpErr }}
 elseif ($restoreErr) {{ throw (('CheckpointType restore failed (pre-call type {{0}}; it may still be {{1}}): {{2}}') -f $orig, '{literal}', $restoreErr) }}
 """
-        result = _run(cfg, script, timeout_s=300)
-        pswindows.check_result(result, f"hyperv_checkpoint_create({vm_name or vm_id})")
+        # PR #101 review: 600s, not 300s — the checkpoint write (and on the
+        # typed path the guest-memory capture) can run long, and a timeout
+        # here kills the tree before the in-script restore runs (stranding
+        # CheckpointType; the restore leg got 600s for the same multi-minute
+        # reason).
+        result = _run(cfg, script, timeout_s=600)
         out = {"status": "created", "vm_name": ref.name, "checkpoint_name": checkpoint_name}
         if checkpoint_type:
-            rows = _parse_json_objects(result, "checkpoint_create")
+            # Parse BEFORE check_result: the script emits its JSON row before
+            # throwing, so a script-surviving failure can name what actually
+            # happened — a restore-only failure must say the checkpoint WAS
+            # created (a blind retry would orphan or name-collide it), while
+            # a checkpoint-phase failure must NOT claim creation. The row is
+            # also the success payload's vm_checkpoint_type. A killed or
+            # garbage-stdout result parses as no rows so check_result below
+            # raises the TRUE transport error — a JSONDecodeError here would
+            # misclassify a host/timeout failure as caller fault ("invalid").
+            try:
+                rows = _parse_json_objects(result, "checkpoint_create")
+            except Exception:
+                rows = []
             original = str(rows[0].get("original_type", "")) if rows else ""
+            restore_error = str(rows[0].get("restore_error", "")) if rows else ""
+            created = bool(rows[0].get("checkpoint_created")) if rows else False
+            try:
+                pswindows.check_result(result, f"hyperv_checkpoint_create({vm_name or vm_id})")
+            except Exception as exc:
+                if restore_error and created:
+                    raise RuntimeError(
+                        f"hyperv_checkpoint_create({vm_name or vm_id}): checkpoint "
+                        f"'{checkpoint_name}' WAS created, but the VM CheckpointType "
+                        f"restore failed (pre-call type {original}; it may still be "
+                        f"{_CHECKPOINT_TYPES[checkpoint_type]}): {restore_error}"
+                    ) from exc
+                raise
             out["checkpoint_type"] = checkpoint_type
             out["vm_checkpoint_type"] = original
+        else:
+            pswindows.check_result(result, f"hyperv_checkpoint_create({vm_name or vm_id})")
         return out
 
 
@@ -466,12 +499,12 @@ Get-VMSnapshot -VM $vm -ErrorAction Stop |
 _RESTORE_NOTES = {
     "Off": "VM is powered off after restore; call hyperv_start_vm to bring it back up.",
     "Saved": (
-        "Standard checkpoint restored the saved memory state; the VM is saved, not "
+        "A memory-bearing checkpoint restored the saved memory state; the VM is saved, not "
         "off. Call hyperv_start_vm to resume it with memory intact."
     ),
     "Paused": (
-        "Checkpoint restored; the VM is paused at the restored state. Call Resume-VM to "
-        "resume it (hyperv_start_vm is for stopped/saved VMs)."
+        "Checkpoint restored; the VM is paused at the restored state. No MCP resume tool "
+        "exists — resume out-of-band with PowerShell (Resume-VM)."
     ),
     "Running": "Checkpoint restored; the VM is running the restored state. No start needed.",
 }
