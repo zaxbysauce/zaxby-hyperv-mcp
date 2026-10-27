@@ -2860,8 +2860,9 @@ def _validate_sequence_steps(
                 if not isinstance(key, str) or not key:
                     raise ValueError("key is required")
                 modifiers = step.get("modifiers") or []
-                if not isinstance(modifiers, list):
-                    raise ValueError("modifiers must be a list")
+                if not isinstance(modifiers, list) or not all(
+                        isinstance(m, str) for m in modifiers):
+                    raise ValueError("modifiers must be a list of strings")
                 if modifiers:
                     held = [m for m in modifiers if m.strip().lower() in _COMBO_MODIFIERS]
                     tapped = [key] + [m for m in modifiers if m not in held]
@@ -2871,8 +2872,9 @@ def _validate_sequence_steps(
                 plan.append({"action": "codes", "codes": codes})
             elif action == "key_combo":
                 keys = step.get("keys")
-                if not isinstance(keys, list) or not keys:
-                    raise ValueError("keys list is required")
+                if not isinstance(keys, list) or not keys or not all(
+                        isinstance(k, str) for k in keys):
+                    raise ValueError("keys must be a non-empty list of strings")
                 plan.append({"action": "codes", "codes": _scancodes_for_combo(keys)})
             elif action == "type_text":
                 text = step.get("text")
@@ -2955,7 +2957,7 @@ def _validate_sequence_steps(
                 raise ValueError(f"unknown action {action!r}")
         except ValueError as exc:
             raise _step_fail(i, str(exc)) from None
-        except (TypeError, KeyError) as exc:
+        except (TypeError, KeyError, AttributeError) as exc:
             raise _step_fail(i, f"invalid step fields: {exc}") from None
     return plan
 
@@ -3223,39 +3225,37 @@ def _run_sequence_wmi(
     timeout_s: int, width: int, height: int,
 ) -> dict:
     """run_sequence over the in-process WMI backend: the same contract as the
-    folded script — preconditions under the lock before the first input, one
-    lock acquisition for the whole plan, per-step results, stop-on-failure."""
+    folded script — ONE lock acquisition spanning the boot-epoch read, the
+    preconditions, and every step (nothing a raw input could do can slip
+    between a passed precondition and the first input), per-step results,
+    stop-on-failure."""
     started = time.monotonic()
     phase_dicts: list[dict] = []
-    boot_epoch: int | None = None
-    try:
-        boot_epoch = be.boot_epoch(ref.id)
-    except (wmiconsole.WMIError, AttributeError) as exc:
-        raise ConsoleError(str(exc)) from None
-    if expect_boot_epoch is not None and (
-            boot_epoch is None or abs(boot_epoch - int(expect_boot_epoch)) > 5):
-        return {
-            "ok": False, "error_class": "precondition", "steps": [],
-            "vm_name": ref.name, "boot_epoch": boot_epoch,
-            "timings": _wmi_timings(connect_ms),
-        }
-    if expect_frame_hash:
-        try:
-            with _input_lock(ref):
-                raw, t = be.capture(ref.id, width, height)
-                phase_dicts.append(t)
-        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
-            raise ConsoleError(str(exc)) from None
-        if _frame_hash(raw) != expect_frame_hash:
-            return {
-                "ok": False, "error_class": "precondition", "steps": [],
-                "vm_name": ref.name, "boot_epoch": boot_epoch,
-                "frame_hash": _frame_hash(raw), "hash_domain": HASH_DOMAIN,
-                "timings": _wmi_timings(connect_ms, *phase_dicts),
-            }
     steps_out: list[dict] = []
     try:
         with _input_lock(ref):
+            try:
+                boot_epoch: int | None = be.boot_epoch(ref.id)
+            except (wmiconsole.WMIError, AttributeError) as exc:
+                raise ConsoleError(str(exc)) from None
+            if expect_boot_epoch is not None and (
+                    boot_epoch is None or abs(boot_epoch - int(expect_boot_epoch)) > 5):
+                return {
+                    "ok": False, "error_class": "precondition", "steps": [],
+                    "vm_name": ref.name, "boot_epoch": boot_epoch,
+                    "timings": _wmi_timings(connect_ms),
+                }
+            if expect_frame_hash:
+                raw, t = be.capture(ref.id, width, height)
+                phase_dicts.append(t)
+                actual = _frame_hash(raw)
+                if actual != expect_frame_hash:
+                    return {
+                        "ok": False, "error_class": "precondition", "steps": [],
+                        "vm_name": ref.name, "boot_epoch": boot_epoch,
+                        "frame_hash": actual, "hash_domain": HASH_DOMAIN,
+                        "timings": _wmi_timings(connect_ms, *phase_dicts),
+                    }
             for i, step in enumerate(plan):
                 _r, t = _sequence_wmi_step(be, ref, step, width, height)
                 phase_dicts.append(t)
