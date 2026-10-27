@@ -31,11 +31,13 @@ class StepStdoutPS:
 
     def __init__(self, action_stdout: str, timed_out: bool = False):
         self.scripts: list[str] = []
+        self.kwargs: list[dict] = []
         self.action_stdout = action_stdout
         self.timed_out = timed_out
 
     def __call__(self, script, **kwargs):
         self.scripts.append(script)
+        self.kwargs.append(kwargs)
         if "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget"):
             return pswindows.PSResult(stdout="seq-vm", returncode=0)
         if self.timed_out:
@@ -136,3 +138,91 @@ def test_parse_sequence_steps_ignores_non_step_lines(monkeypatch, unrestricted):
     assert out["boot_epoch"] == 77
     assert [s for s in out["steps"]] == [
         {"index": 0, "ok": True}, {"index": 1, "ok": True}, {"index": 2, "ok": True}]
+
+
+# ---------------------------------------------------------------------------
+# Final-critic round 1 pins (F3 multi-text framing, F5 tolerance emission,
+# F6 stale-hint self-heal retry) — each was mutant-verified: the critic's
+# probes B (newline-join drop), A (tolerance widening), and D (self-heal
+# removal) fail these tests.
+# ---------------------------------------------------------------------------
+
+def test_multi_text_steps_get_one_stdin_line_each(monkeypatch, unrestricted):
+    """Two text steps produce exactly TWO newline-separated stdin payload
+    lines in plan order, and each text step body consumes one ReadLine —
+    a dropped join separator (the critic's probe B) concatenates the lines
+    and fails this pin (final-critic finding F3)."""
+    first, second = "first-text", "second-text"
+    stub = StepStdoutPS("")
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    out = console.run_sequence(unrestricted, "vm1", [
+        {"action": "type_text", "text": first},
+        {"action": "press_key", "key": "enter"},
+        {"action": "type_text", "text": second},
+    ])
+    assert out["ok"] is True
+    stdin_payload = stub.kwargs[-1]["stdin_b64"]
+    assert stdin_payload == (
+        pswindows.utf8_b64(first) + "\n" + pswindows.utf8_b64(second))
+    action_script = stub.scripts[-1]
+    assert action_script.count("[Console]::In.ReadLine()") == 2, (
+        "each text step must consume exactly one stdin line, in plan order")
+
+
+def test_boot_epoch_tolerance_emission_is_pinned(monkeypatch, unrestricted):
+    """The folded script embeds the ±5-second boot-epoch comparison (the
+    critic's probe A widened it to -gt 5000 and nothing noticed — the anchor
+    substring with the closing paren cannot survive that widening;
+    final-critic finding F5's PS half)."""
+    stub = StepStdoutPS("")
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    console.run_sequence(
+        unrestricted, "vm1", STEPS, expect_boot_epoch=12345)
+    script = stub.scripts[-1]
+    assert ") -gt 5) {" in script, (
+        "the folded script must compare the boot epoch with the documented "
+        "±5 s tolerance")
+    assert "12345" in script, "the expected epoch must ride the script"
+
+
+def test_stale_hint_guard_self_heals_on_retry(monkeypatch, unrestricted):
+    """After the identity guard fires, the host refreshes the hint from the
+    guard's own report, so the RETRY locks and embeds the live GUID — the
+    README/docstring self-heal promise (the critic's probe D removed the
+    refresh and nothing noticed; final-critic finding F6)."""
+    from hyperv_mcp import console as con
+    stale = "e953c649-dcab-438d-9a54-3af74a82b624"
+    live = "0f7d1c22-2222-4b3c-8d1e-6a5b4c3d2e1f"
+    name = "t-f6-selfheal-vm"
+    con.note_name_guid_hint(name, stale)
+
+    class GuardFirePS:
+        def __init__(self):
+            self.scripts: list[str] = []
+            self.kwargs: list[dict] = []
+            self.calls = 0
+
+        def __call__(self, script, **kwargs):
+            self.scripts.append(script)
+            self.kwargs.append(kwargs)
+            if "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget"):
+                return pswindows.PSResult(stdout=live, returncode=0)
+            self.calls += 1
+            if stale in script:
+                return pswindows.PSResult(returncode=1, stderr=(
+                    "console press_key: console input precondition: VM identity "
+                    "changed under name '" + name + "': locked " + stale
+                    + " but resolved " + live))
+            return pswindows.PSResult(stdout="RC=0 CHUNK=1/1", returncode=0)
+
+    stub = GuardFirePS()
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    with pytest.raises(console.ConsoleError, match="identity changed"):
+        console.press_key(unrestricted, name, "enter")
+    # the refresh happened: the retry locks on the LIVE identity
+    assert con._hint_for(name) == live
+    console.press_key(unrestricted, name, "enter")
+    retry_script = stub.scripts[-1]
+    assert live in retry_script and stale not in retry_script, (
+        "the retry must embed the refreshed (live) GUID — the mapping "
+        "self-healed from the guard's own report")

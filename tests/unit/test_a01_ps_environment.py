@@ -187,7 +187,7 @@ def test_child_env_carries_no_server_secrets(monkeypatch):
 
 def test_server_info_tool_registered():
     """AC3: a bootstrapped server registers hyperv_server_info and the tool
-    inventory counts exactly 67 tools (66 through issue #24 + hyperv_server_info,
+    inventory counts exactly 68 tools (66 through issue #24 + hyperv_server_info,
     plus issue #27's settle wait)."""
     mod = importlib.reload(server_module)
     try:

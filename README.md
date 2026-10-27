@@ -942,13 +942,16 @@ the caller can see what holds the VM and for how long. Waiting writers are
 admitted before newly arriving readers, so polling reads cannot starve a
 checkpoint restore. Console input runs under a read lock on the VM key
 (guest work proceeds during typing) plus a write lock on a second per-VM
-key, so two agents cannot interleave keystrokes. One residual on the
-by-name PowerShell transport (issue #18): the folded op script resolves the
-VM inside the process, so a by-name console call keys its locks on the
-caller-supplied name rather than the resolved GUID — exclusion holds
-between calls that address the VM the same way, but not across
-name-vs-`vm_id` addressing, nor against a write-scope op, which always
-resolves first and keys on the GUID (tracked in issue #77).
+key, so two agents cannot interleave keystrokes. Both keys derive from the
+resolved GUID on every transport since issue #77: every host operation that
+resolves a VM teaches the name-to-GUID mapping, a by-name console call whose
+name is known locks on the canonical GUID (the same key a by-id caller
+takes) and carries an in-script identity guard that fails closed before any
+input when the mapping is stale (see "Canonical console identity" below).
+The one residual: a by-name console call whose name has no learned mapping
+yet (an input-only caller on a fresh process) stays keyed on the
+caller-supplied name until a feeding read/sequence operation supplies one —
+disclosed in the console-identity section, not tracked as an open defect.
 
 Host PowerShell itself is bounded host-wide (issue #15): every tool leg,
 every relay request, every server process that shares the slot directory, and
@@ -1031,7 +1034,7 @@ claude mcp add hyperv -- hyperv-mcp
 
 ---
 
-## Available Tools (67 total)
+## Available Tools (68 total)
 
 Every registered tool in the tables below returns failures the same way:
 the one-envelope contract (`ok/error/error_class/retryable/retry_after_ms`,
@@ -1045,10 +1048,10 @@ Every tool that takes `vm_name` also takes an optional `vm_id` (the VM's CIM
 GUID); at least one of `vm_name`/`vm_id` is required (both may be given when
 they refer to the same VM). VMs are resolved by GUID end to
 end: operations lock on the resolved GUID (stable across renames;
-the one exception is a by-name console call on the PowerShell
-transport, which locks on the caller-supplied name because issue #18's
-fold resolves the VM inside the op script — see the concurrency note
-above),
+a by-name console call whose name carries a learned mapping locks on the
+same canonical GUID with an in-script identity guard — see "Canonical
+console identity" below and the concurrency note; the unhinted residual is
+disclosed there),
 `hyperv_list_vms` and `hyperv_get_vm_info` report each VM's `id`, and a name
 that matches more than one VM fails closed with an error listing every
 candidate as `name=guid` so the call can be retried with `vm_id`. When both
