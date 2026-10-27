@@ -972,3 +972,23 @@ def test_capture_sequence_empty_vmid_is_structured_error(monkeypatch, unrestrict
     with pytest.raises(ConsoleError, match="empty Id"):
         console.capture_sequence(
             unrestricted, "vm1", count=2, interval_s=1, width=320, height=240)
+
+
+def test_wait_frame_stable_baseline_length_is_exactly_64(unrestricted):
+    """Final-critic F1: the baseline gate is EXACTLY 64 hex chars — a 63-char
+    hex string is a ValueError, not a silently accepted near-miss (kills the
+    {64} -> {63,64} regex mutant, which survived the whole shipped suite)."""
+    stub_calls = []
+
+    def _no_ps(script, **kwargs):
+        stub_calls.append(script)
+        raise AssertionError("no PowerShell may start for a bad baseline")
+
+    from unittest.mock import patch
+
+    import hyperv_mcp.pswindows as _pw
+    with patch.object(_pw, "run_ps", _no_ps):
+        with pytest.raises(ValueError, match="64-char hex"):
+            console.wait_frame_stable(
+                unrestricted, "vm1", baseline_hash="a" * 63)
+    assert stub_calls == []
