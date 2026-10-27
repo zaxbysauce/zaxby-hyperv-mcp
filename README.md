@@ -943,15 +943,18 @@ admitted before newly arriving readers, so polling reads cannot starve a
 checkpoint restore. Console input runs under a read lock on the VM key
 (guest work proceeds during typing) plus a write lock on a second per-VM
 key, so two agents cannot interleave keystrokes. Both keys derive from the
-resolved GUID on every transport since issue #77: every host operation that
-resolves a VM teaches the name-to-GUID mapping, a by-name console call whose
-name is known locks on the canonical GUID (the same key a by-id caller
-takes) and carries an in-script identity guard that fails closed before any
-input when the mapping is stale (see "Canonical console identity" below).
-The one residual: a by-name console call whose name has no learned mapping
-yet (an input-only caller on a fresh process) stays keyed on the
-caller-supplied name until a feeding read/sequence operation supplies one —
-disclosed in the console-identity section, not tracked as an open defect.
+resolved GUID on every transport since issue #77: operations whose stdout
+carries the resolved identity (`VMID=` — screenshot, display info, capture,
+sequences) plus the identity guard's own report teach the host-side
+name-to-GUID mapping, a by-name console call whose name is known locks on
+the canonical GUID (the same key a by-id caller takes) and carries an
+in-script identity guard that fails closed before any input when the mapping
+is stale (see "Canonical console identity" below). The one residual: a
+by-name console call whose name has no learned mapping yet (an input-only
+caller on a fresh process — waits, by-id input, and WMI-transport
+operations neither feed nor need the mapping) stays keyed on the
+caller-supplied name until a feeding operation supplies one — disclosed in
+the console-identity section, not tracked as an open defect.
 
 Host PowerShell itself is bounded host-wide (issue #15): every tool leg,
 every relay request, every server process that shares the slot directory, and
@@ -1575,17 +1578,18 @@ thread for the by-id resolve leg (one spawn, 60 s), the bounded lock wait
 (`vm_lock_wait_s`), and the folded child (`timeout_s + 15`); on the in-process
 WMI transport the provider calls carry no per-call timeout.
 
-Canonical console identity (issue #77): every host operation that resolves a
-VM also learns its name→GUID pair, and a by-name console input whose name is
-known locks and acts on the canonical GUID — the same key a by-id caller
-takes — with an in-script identity guard that fails closed BEFORE any input
-when the VM was deleted and recreated under the same name (the call returns a
-structured identity error and the mapping self-heals from the guard's own
-report). A by-name console input with NO learned mapping yet stays keyed on
-the caller-supplied name until a feeding read/sequence operation supplies
-one; that residual window is disclosed here rather than fixed with an extra
-resolve spawn, which would break the one-PowerShell-process-per-call
-contract.
+Canonical console identity (issue #77): operations whose stdout carries the
+resolved identity (`VMID=` — screenshot, display info, capture, sequences)
+plus the identity guard's own report teach the host-side name→GUID pair, and
+a by-name console input whose name is known locks and acts on the canonical
+GUID — the same key a by-id caller takes — with an in-script identity guard
+that fails closed BEFORE any input when the VM was deleted and recreated
+under the same name (the call returns a structured identity error and the
+mapping self-heals from the guard's own report). A by-name console input
+with NO learned mapping yet stays keyed on the caller-supplied name until a
+feeding operation supplies one; that residual window is disclosed here
+rather than fixed with an extra resolve spawn, which would break the
+one-PowerShell-process-per-call contract.
 
 #### Console transport: in-process WMI or PowerShell (issue #45)
 

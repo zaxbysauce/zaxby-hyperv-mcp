@@ -103,9 +103,15 @@ def _no_sleep(monkeypatch):
 def test_wmi_sequence_one_lock_across_everything(wmi_path, unrestricted, monkeypatch):
     """The round-1 review fix (critic probe C): the WMI path takes the console
     WRITE key exactly ONCE, and the boot-epoch read, the frame precondition
-    capture, and every step all happen INSIDE that single acquisition."""
+    capture, and every step all happen INSIDE that single acquisition. The
+    spy records HOLD-STATE and the fake backend reports it per call, so the
+    enclosure (not merely the entry count) is what is asserted: hoisting the
+    boot read or the step loop outside the lock fails this pin (the delta
+    reviewer's finding — the f1ff285 shape had exactly that hoisted boot
+    read)."""
     be = wmi_path(FakeWMI())
     acquisitions: list[tuple] = []
+    hold_state = {"held": False}
     real = console._input_lock
 
     import contextlib
@@ -114,9 +120,32 @@ def test_wmi_sequence_one_lock_across_everything(wmi_path, unrestricted, monkeyp
     def spy(ref):
         acquisitions.append(ref.id)
         with real(ref):
-            yield
+            hold_state["held"] = True
+            try:
+                yield
+            finally:
+                hold_state["held"] = False
 
     monkeypatch.setattr(console, "_input_lock", spy)
+    # every backend call records whether the console key was held at that moment
+    original_methods = {
+        name: getattr(be, name)
+        for name in ("boot_epoch", "capture", "type_scancodes", "type_text",
+                     "mouse_scroll")
+    }
+
+    def recorded(name):
+        method = original_methods[name]
+
+        def wrapper(*args, **kwargs):
+            be.calls.append((name, hold_state["held"]))
+            return method(*args, **kwargs)
+
+        return wrapper
+
+    for name in original_methods:
+        setattr(be, name, recorded(name))
+    be.calls = []
     out = console.run_sequence(
         unrestricted, "wmi-vm",
         [{"action": "press_key", "key": "enter"},
@@ -128,9 +157,17 @@ def test_wmi_sequence_one_lock_across_everything(wmi_path, unrestricted, monkeyp
     assert acquisitions == [WMI_GUID], (
         "the WMI sequence must take the console key exactly once; saw "
         f"{len(acquisitions)} acquisitions")
-    # precondition-before-input ordering: capture happened before the first input
-    assert be.calls.index("capture") < be.calls.index("type_scancodes")
-    assert be.calls.index("boot_epoch") < be.calls.index("type_scancodes")
+    # ENCLOSURE, not just the count: every preconditions-and-steps call ran
+    # while the single acquisition was held
+    lock_bearing = [entry for entry in be.calls if entry[0] in original_methods]
+    assert lock_bearing, "the fake backend calls must be recorded"
+    unlocked = [entry for entry in lock_bearing if entry[1] is not True]
+    assert unlocked == [], (
+        "boot-epoch read, frame precondition capture, and every step must run "
+        f"INSIDE the single console-key acquisition; ran unlocked: {unlocked}")
+    kinds = [entry[0] for entry in lock_bearing]
+    assert kinds.index("capture") < kinds.index("type_scancodes")
+    assert kinds.index("boot_epoch") < kinds.index("type_scancodes")
 
 
 def test_wmi_frame_precondition_envelope_without_input(wmi_path, unrestricted):

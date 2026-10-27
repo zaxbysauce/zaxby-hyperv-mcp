@@ -42,9 +42,11 @@ _MAX_NAME_LEN = 260
 class VMRef:
     """A resolved VM identity. `id` is the lowercase CIM GUID (the lock key and
     script `$vmTarget` value) for operations that resolve through this module;
-    on the console's folded by-name path (issue #18) it carries the
-    caller-supplied name as the lock key because the GUID is only known after
-    the single process runs. `name` is the ElementName it resolves to (policy
+    on the console's folded by-name path (issue #18) it carries the hinted
+    GUID when the host-side hint map knows the name (issue #77) and the
+    caller-supplied name as the lock key only when no mapping has been learned
+    yet (the disclosed residual — the GUID is otherwise only known after the
+    single process runs). `name` is the ElementName it resolves to (policy
     target and audit display)."""
 
     id: str
