@@ -196,12 +196,13 @@ def test_server_info_tool_registered():
         names = sorted(tool.name for tool in tools)
         assert "hyperv_server_info" in names, (
             f"hyperv_server_info is not registered; tool inventory has "
-            f"{len(names)} tools, expected 67 including hyperv_server_info"
+            f"{len(names)} tools, expected 68 including hyperv_server_info"
         )
-        assert len(names) == 67, (
-            f"tool inventory is {len(names)} tools; expected exactly 67 "
+        assert len(names) == 68, (
+            f"tool inventory is {len(names)} tools; expected exactly 68 "
             "(66 including the issue-#24 op/event tools plus hyperv_server_info, "
-            "plus issue #27's hyperv_console_wait_frame_stable)"
+            "issue #27's hyperv_console_wait_frame_stable, and issue #28's "
+            "hyperv_console_sequence)"
         )
     finally:
         importlib.reload(server_module)

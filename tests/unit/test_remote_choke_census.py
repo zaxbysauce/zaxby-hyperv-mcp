@@ -48,6 +48,8 @@ READLINE_ALLOWLIST = {
     ("pswindows.py", "_remote_parts"),     # composer preamble emission
     ("guestexec.py", "psdirect_prefix"),   # pinned local-mode emission
     ("console.py", "type_text"),           # pinned local-mode inline emission
+    ("console.py", "_sequence_step_block"),  # issue #28: one read per text step
+    ("console.py", "_sequence_script"),    # issue #28: the local read_expr choice
 }
 
 
@@ -121,6 +123,10 @@ READLINE_BUDGETS = {
     ("pswindows.py", "_remote_parts"): 2,      # hostpw line + param-loop f-string
     ("guestexec.py", "psdirect_prefix"): 1,    # pinned local-mode emission
     ("console.py", "type_text"): 1,            # pinned local-mode inline emission
+    # issue #28: the sequence script chooses the local-mode read expression
+    # (one [Console]::In.ReadLine() per text step, read via the read_expr
+    # parameter inside _sequence_step_block — the literal lives here only).
+    ("console.py", "_sequence_script"): 1,
     # issue #21: the pooled worker's OWN stdin channel. The first read takes the
     # credential line the pool writes before any request; the second reads one
     # request frame per call. Neither is a remote-hop preamble, which is what

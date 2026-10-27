@@ -741,3 +741,48 @@ def test_the_two_pooled_loops_agree_on_the_framing_contract():
             f"the placeholder loop drifted from the shipped loop: {needle!r} "
             f"is in _worker_loop but not in _placeholder_loop"
         )
+
+
+def test_parse_console_sequence_every_step_type(monkeypatch, parsed_ps):
+    """Issue #28 AC-28.10: the folded sequence script generated for a plan
+    covering EVERY step type (press_key, key_combo, type_text,
+    type_scancodes, mouse_move, click, mouse_button, scroll,
+    wait_frame_stable) parses under the real Windows PowerShell 5.1 parser.
+    Runs on windows-latest and skips on Linux with the rest of the parse
+    lane. The step grammar is the frozen contract documented in
+    tests/unit/test_f04_sequences.py.
+
+    RED at base for the named reason (console.run_sequence is absent, so the
+    call raises AttributeError naming it), GREEN after the fix. Post-capture
+    validation failures still don't matter — the generated script was
+    already captured — but the missing-surface AttributeError is re-raised
+    so the base leg's error names the absent generator.
+    """
+    steps = [
+        {"action": "press_key", "key": "enter"},
+        {"action": "key_combo", "keys": ["win", "r"]},
+        {"action": "type_text", "text": "notepad"},
+        {"action": "type_scancodes", "scancodes": [0x1C, 0x9C]},
+        {"action": "mouse_move", "x": 100, "y": 50, "frame_width": 640,
+         "frame_height": 480},
+        {"action": "click", "x": 0, "y": 0, "frame_width": 640,
+         "frame_height": 480},
+        {"action": "mouse_button", "button": 1, "is_down": True},
+        {"action": "scroll", "delta": 3},
+        {"action": "wait_frame_stable", "stable_ms": 500, "timeout_s": 5,
+         "interval_ms": 100, "baseline_hash": "ab" * 32},
+    ]
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        console.run_sequence(UNRESTRICTED, "vm1", steps, timeout_s=60)
+    except AttributeError:
+        raise  # the base-tree shape: the sequence surface itself is absent
+    except Exception:
+        pass  # post-capture validation failures don't matter (script captured)
+    seq_scripts = [s for s in rec.scripts if not _is_resolution_leg(s)]
+    assert seq_scripts, "run_sequence produced no action script"
+    for script in seq_scripts:
+        assert _parse_errors(script) == [], (
+            "the generated sequence script must parse under the PS 5.1 parser"
+        )

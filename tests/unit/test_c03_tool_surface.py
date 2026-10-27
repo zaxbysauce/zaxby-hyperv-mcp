@@ -61,6 +61,7 @@ TOOL_NAMES = {
     "hyperv_console_wait_frame_change",
     "hyperv_console_wait_frame_stable",
     "hyperv_console_capture_sequence",
+    "hyperv_console_sequence",
     "hyperv_vm_create",
     "hyperv_vm_disk_add",
     "hyperv_vm_disk_list",
@@ -236,9 +237,10 @@ def test_ac12_tool_inventory_per_credential_mode(tmp_path, fresh_server):
         f"extra={sorted(set(base_schemas) - TOOL_NAMES)}, "
         f"missing={sorted(TOOL_NAMES - set(base_schemas))}"
     )
-    assert len(base_schemas) == len(TOOL_NAMES) == 67, (
-        f"AC12: tool count {len(base_schemas)} != 67 "
-        f"(66 through issue #24; 67 with issue #27's settle wait)"
+    assert len(base_schemas) == len(TOOL_NAMES) == 68, (
+        f"AC12: tool count {len(base_schemas)} != 68 "
+        f"(66 through issue #24; 67 with issue #27's settle wait; "
+        f"68 with issue #28's hyperv_console_sequence)"
     )
     doc = {"allow_inline_credentials": True}
     p = tmp_path / "cfg.json"

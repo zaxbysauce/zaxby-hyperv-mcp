@@ -1533,8 +1533,56 @@ unchanged result is exactly as informative about the request as a changed one.
 | `hyperv_console_wait_frame_change` | `vm_name` or `vm_id`, `baseline_hash=""`, `width=640`, `height=480`, `timeout_s=60`, `interval_s=2` | list[ImageContent(image/png), TextContent({stop_reason: changed\|deadline, polls, elapsed_ms, frame_hash, hash_domain})] or deadline dict |
 | `hyperv_console_wait_frame_stable` | `vm_name` or `vm_id`, `stable_ms=1500` (>= 1 and < timeout_s*1000), `timeout_s=30` (>= 1), `interval_ms=250` (>= 100), `width=640`, `height=480`, `baseline_hash=""` | [ImageContent(image/png), TextContent({stop_reason: stable\|unchanged\|deadline, stable, polls, elapsed_ms, frame_hash, stable_ms_measured, hash_domain})] or meta-only dict with `stable=false` |
 | `hyperv_console_capture_sequence` | `vm_name` or `vm_id`, `count=3`, `interval_s=2`, `width=640`, `height=480` | [first Image, last Image (a single Image when count==1), meta_text(frames[] with per-frame vm_id + hash + changed_bytes_vs_previous)] |
+| `hyperv_console_sequence` | `steps` (1..50 step dicts; grammar below), `vm_name` or `vm_id`, `expect_frame_hash=""`, `expect_boot_epoch=None`, `timeout_s=60`, `request_key=""`, `width=640`, `height=480` | {ok: true, vm_name, boot_epoch, steps: [{index, ok, stop_reason?, error?, skipped?}]} or {ok: false, error_class: "precondition"\|"unknown", ...} |
 
 Console notes: text rides the stdin channel (never in argv/script/errors); non-ASCII input must use type_scancodes; mouse coordinates are in the space of the observed image — pass `frame_width`/`frame_height` matching your screenshot dimensions to scale to head space, or omit them to use head coordinates directly; `wait_frame_change` with `baseline_hash=""` treats the first polled frame as the baseline, and a returned `frame_hash` can be passed back as `baseline_hash` to detect changes across calls (both are the full lowercase-hex sha256 of the PIXEL payload, i.e. the thumbnail bytes after the 4-byte opaque prefix — see the 0.4.0 breaking change above; the tool also returns `hash_domain` so a client can refuse a baseline recorded in a different domain — the same applies to `wait_frame_stable`, whose `baseline_hash` and returned `frame_hash` live in the identical domain and whose result also carries `hash_domain`); `capture_sequence`'s `changed_bytes_vs_previous` counts PIXEL bytes, the same domain `frame_hash` covers (an idle console costs one C-level comparison rather than a per-byte walk, and a change confined to one 64 KiB chunk costs that chunk rather than the whole payload — a change in EVERY chunk walks those chunks, but with `sum(map(operator.ne, ...))` the per-byte work is C-level and executes no Python line events at all, so the cost is a single C walk rather than a Python loop); `capture_sequence`'s `frames[]` entries report `vm_id` — on the PowerShell transport, the GUID that frame's own process actually resolved; on the in-process WMI transport, the GUID the sequence resolved once (`null` means the frame carried no identity metadata, which is legal). Issue #82: a mid-sequence identity change — a delete+recreate under the same name — aborts the sequence with a structured error naming both GUIDs instead of returning a spliced diff); a returned `console.Frame` holds only its encoding until something reads a pixel — the raster is derived from the encoding on first pixel access and cached from then on, so an untouched frame retains no `width*height*3` buffer, and a mutation made after the first access survives; WinPE errors and wizard screens are returned as images for visual interpretation (no OCR is performed).
+
+#### Batched console sequences (issue #28)
+
+`hyperv_console_sequence` composes up to 50 console actions into ONE plan that
+holds the per-VM console lock for its whole duration — no raw input from any
+agent can interleave between its steps, and one audit record replaces the N
+single-step calls. Step grammar (mirrors the single-step tools):
+`{"action": "press_key", "key", "modifiers"?}`, `{"action": "key_combo",
+"keys"}`, `{"action": "type_text", "text"}` (ASCII; rides stdin base64, never
+the script), `{"action": "type_scancodes", "scancodes"}`,
+`{"action": "mouse_move", "x", "y", "frame_width"?, "frame_height"?}`,
+`{"action": "click", "x"?, "y"?, "frame_width"?, "frame_height"?, "button"?}`,
+`{"action": "mouse_button", "button", "is_down"}`,
+`{"action": "scroll", "delta"}`, `{"action": "wait_frame_stable",
+"stable_ms", "timeout_s"?, "interval_ms"?, "baseline_hash"?}`. Every step is
+validated BEFORE anything spawns (a rejection names `step <i>`); at most 50
+steps; every wait budget is capped by the call `timeout_s`, and the PowerShell
+child deadline sits at `timeout_s + 15`. Preconditions run inside the locked
+region BEFORE the first input: `expect_frame_hash` (capture a screenshot at
+the same `width`/`height` first and pass its `frame_hash`) and
+`expect_boot_epoch` (pass `boot_epoch` from `hyperv_console_get_display_info`;
+±5 s tolerance) each return `{ok: false, error_class: "precondition",
+steps: []}` with the actual observed value and send nothing on a mismatch.
+`boot_epoch` is derived from host WMI (`Msvm_ComputerSystem.
+OnTimeInMilliseconds` against the host clock), so it needs no guest
+credentials and is meaningful in firmware and WinPE; pausing the VM shifts it,
+and a mismatch fails closed. With `request_key`, an uncertain post-dispatch
+outcome (a timed-out leg) is recorded once as UNKNOWN with whatever
+executed-step prefix the leg reported, is never automatically replayed, and a
+retry carrying the same key returns the recorded result instead of
+re-driving the guest; a NEW plan requires a fresh explicit request and
+precondition. Admission note (see issue #68): a sequence holds one tool
+thread for the by-id resolve leg (one spawn, 60 s), the bounded lock wait
+(`vm_lock_wait_s`), and the folded child (`timeout_s + 15`); on the in-process
+WMI transport the provider calls carry no per-call timeout.
+
+Canonical console identity (issue #77): every host operation that resolves a
+VM also learns its name→GUID pair, and a by-name console input whose name is
+known locks and acts on the canonical GUID — the same key a by-id caller
+takes — with an in-script identity guard that fails closed BEFORE any input
+when the VM was deleted and recreated under the same name (the call returns a
+structured identity error and the mapping self-heals from the guard's own
+report). A by-name console input with NO learned mapping yet stays keyed on
+the caller-supplied name until a feeding read/sequence operation supplies
+one; that residual window is disclosed here rather than fixed with an extra
+resolve spawn, which would break the one-PowerShell-process-per-call
+contract.
 
 #### Console transport: in-process WMI or PowerShell (issue #45)
 

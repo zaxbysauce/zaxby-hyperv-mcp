@@ -37,7 +37,7 @@ TOOL_NAMES = {
     "hyperv_console_mouse_move", "hyperv_console_click",
     "hyperv_console_button", "hyperv_console_scroll",
     "hyperv_console_wait_frame_change", "hyperv_console_wait_frame_stable",
-    "hyperv_console_capture_sequence",
+    "hyperv_console_capture_sequence", "hyperv_console_sequence",
     # VM / media preparation
     "hyperv_vm_create", "hyperv_vm_disk_add", "hyperv_vm_disk_list",
     "hyperv_vm_media_attach", "hyperv_vm_media_detach", "hyperv_vm_media_list",
@@ -97,8 +97,10 @@ def test_tool_inventory_registered(fresh_server):
     assert set(schemas) == TOOL_NAMES
     # 61 through issue #23; 66 with issue #24's five op/event tools; 67 with
     # issue #27's settle wait (AC9 checkpoint:
-    # tests/unit/test_f03_frame_stable.py::test_tool_registered_without_confirm).
-    assert len(schemas) == 67
+    # tests/unit/test_f03_frame_stable.py::test_tool_registered_without_confirm);
+    # 68 with issue #28's batched console sequence (C287 checkpoint:
+    # tests/unit/test_f04_sequences.py::test_sequence_tool_schema_and_boot_epoch_reporting).
+    assert len(schemas) == 68
 
 
 def test_every_vm_tool_schema_has_vm_id(fresh_server):
@@ -182,7 +184,7 @@ def test_interactive_tools_have_no_confirm_param(fresh_server):
     for name in ("hyperv_console_type_text", "hyperv_console_press_key",
                  "hyperv_console_mouse_move", "hyperv_console_click",
                  "hyperv_vm_media_attach", "hyperv_vm_media_detach",
-                 "hyperv_vm_network_set"):
+                 "hyperv_vm_network_set", "hyperv_console_sequence"):
         props = _schemas(mod)[name].get("properties", {})
         assert "confirm" not in props, name
 

@@ -25,6 +25,19 @@ def _ps_transport_default(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _console_caches_isolated(monkeypatch):
+    """Reset the console module's process-local caches per test (issue #77's
+    hint map and issue #28's UNKNOWN record map): without this, a check that
+    seeds a hint for a name (or records an uncertain outcome) leaks into
+    every later by-name call in the same process and silently changes its
+    lock keys and guard behavior."""
+    from hyperv_mcp import console
+
+    monkeypatch.setattr(console, "_NAME_GUID_HINTS", {})
+    monkeypatch.setattr(console, "_UNKNOWN_RESULTS", {})
+
+
+@pytest.fixture(autouse=True)
 def _state_store_in_tmp(monkeypatch, tmp_path):
     """Point the durable state store at a per-test temp directory (issue #22).
 
