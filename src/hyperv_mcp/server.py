@@ -1712,14 +1712,20 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         then stop_reason=unchanged, not stable. Returns [ImageContent,
         meta_text] when settled — {stop_reason: stable|unchanged|deadline,
         stable, polls, elapsed_ms, frame_hash, stable_ms_measured, width,
-        height} — or a meta-only dict with stable=false otherwise. The returned
-        frame_hash chains into baseline_hash. Never invents screen text:
-        interpret the returned image visually. Follow every click or key press
-        with this instead of a fixed sleep.
+        height, hash_domain} — or a meta-only dict with stable=false otherwise.
+        The returned frame_hash chains into baseline_hash and carries
+        hash_domain (refuse a baseline recorded in a different domain, as with
+        wait_frame_change). A quiet window longer than
+        (polls - 1) * interval_ms cannot be observed within the poll cap and
+        honestly reports deadline. Never invents screen text: interpret the
+        returned image visually. Follow every click or key press with this
+        instead of a fixed sleep.
 
         Args:
             vm_name:        VM name (must match allowed_vm_patterns)
             vm_id:          Optional VM GUID; exactly one of vm_name/vm_id must be given
+            stable_ms:      Required quiet window (>= 1 and < timeout_s*1000)
+            timeout_s:      Overall deadline (>= 1); the host-side child bound is timeout_s + 15
             baseline_hash:  frame_hash from before the input ("" settles on the
                             current screen — first poll starts the quiet window)
         """
@@ -1752,7 +1758,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         and changed-byte counts vs the previous frame (transition evidence,
         not progress inference). Returns [first Image, last Image, meta_text]
         (a single Image when count==1) where meta carries frames[] (index,
-        frame_hash, changed_bytes_vs_previous, captured_at), elapsed_ms, dimensions.
+        vm_id — the GUID that frame actually captured, null when its process
+        emitted no identity; a sequence spanning two identities aborts with a
+        structured error), frame_hash, changed_bytes_vs_previous,
+        captured_at), elapsed_ms, dimensions.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
         """

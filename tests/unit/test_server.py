@@ -528,9 +528,13 @@ def test_wait_frame_stable_audits_read_category(tmp_path, monkeypatch):
     mod = importlib.reload(server_module)
     mod.bootstrap({"HYPERV_MCP_CONFIG": str(cfg_file)})
     mcp = mod.get_mcp()
-    asyncio.run(mcp.call_tool(
+    result = asyncio.run(mcp.call_tool(
         "hyperv_console_wait_frame_stable",
         {"vm_name": "vm1", "stable_ms": 500, "timeout_s": 2, "interval_ms": 100}))
+    text_blocks = [c for c in result.content if getattr(c, "type", "") == "text"]
+    assert text_blocks and '"ok": true' in text_blocks[0].text.replace("True", "true"), (
+        "the audited call must succeed, not merely write a row"
+    )
     rows = [
         json.loads(line)
         for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()

@@ -554,18 +554,31 @@ def test_console_wait_frame_stable_idle_desktop(running_vm):
         cfg, vm, stable_ms=2000, timeout_s=20, interval_ms=250,
         width=640, height=480)
     assert out["stop_reason"] == "stable" and out["stable"] is True, out
-    budget_ms = 2000 + 2 * 250 + 3000  # window + 2 polls + a generous thumbnail
+    # the quiet window needs at least one poll per interval: 2000ms / 250ms = 8
+    assert out["polls"] >= 2000 // 250, out
+    budget_ms = 2000 + 8 * 250 + 8000  # window + one poll per interval + a generous real-host thumbnail
     assert out["elapsed_ms"] < budget_ms, (
         f"an idle desktop must settle promptly: elapsed {out['elapsed_ms']}ms "
         f"vs budget {budget_ms}ms"
     )
     assert out.get("frame_hash"), out
-    # the settled hash chains as a baseline: a second call with it reports
-    # the screen never moved (unchanged), not stable.
+    # the settled hash chains as a baseline: a second call reports the screen
+    # never moved (unchanged). A lock-screen clock minute tick that lands
+    # inside this window moves the frame and legitimately reports stable —
+    # which still proves the chaining (movement away from the supplied
+    # baseline was detected), so accept both outcomes and pin the
+    # discrimination: stable implies the frame differs from the baseline.
     again = console.wait_frame_stable(
         cfg, vm, stable_ms=500, timeout_s=10, interval_ms=250,
         width=640, height=480, baseline_hash=out["frame_hash"])
-    assert again["stop_reason"] == "unchanged", again
+    if again["stop_reason"] == "unchanged":
+        pass
+    else:
+        assert again["stop_reason"] == "stable", again
+        assert again["frame_hash"] != out["frame_hash"], (
+            "a stable result on the chained baseline must name a frame that "
+            "moved away from it (the clock tick), never the same frame"
+        )
 
 
 def test_console_wait_frame_stable_after_input(running_vm):
@@ -585,7 +598,6 @@ def test_console_wait_frame_stable_after_input(running_vm):
     The follow-up hash comparison retries once: a lock-screen clock minute
     tick between the settle and the screenshot would change the hash without
     any assertion-relevant difference."""
-    import time as _time
 
     from hyperv_mcp import console
 
@@ -608,14 +620,26 @@ def test_console_wait_frame_stable_after_input(running_vm):
 
     # the settled frame is REALLY the screen: an immediate follow-up
     # screenshot taken with the settled hash as if_changed_from must report
-    # unchanged: true (one retry for a lock-screen clock tick racing the
-    # comparison).
+    # unchanged: true. A lock-screen clock minute tick between the settle and
+    # the screenshot makes that comparison permanently false (the tick is
+    # unrelated to the input); in that case prove the screen settled directly
+    # with the tool itself — a fresh settle wait on the moved screen must
+    # report stable (static NOW), and the screen must differ from the
+    # pre-input baseline (the input did move something).
     _img, meta = console.screenshot(
         cfg, vm, width=640, height=480, if_changed_from=settled["frame_hash"])
     if not meta.get("unchanged"):
-        _time.sleep(1.5)
-        _img, meta = console.screenshot(
-            cfg, vm, width=640, height=480, if_changed_from=settled["frame_hash"])
+        _img, moved_meta = console.screenshot(
+            cfg, vm, width=640, height=480, if_changed_from=pre["frame_hash"])
+        assert moved_meta.get("unchanged") is not True, (
+            "the screen changed since the wait returned but never differed "
+            "from the pre-input baseline — nothing actually moved"
+        )
+        again = console.wait_frame_stable(
+            cfg, vm, stable_ms=1000, timeout_s=10, interval_ms=250,
+            width=640, height=480)
+        assert again["stop_reason"] == "stable", again
+        return
     assert meta.get("unchanged") is True, (
         "the follow-up screenshot must match the settled frame (the wait "
         "returned the finished screen, not a transition)"

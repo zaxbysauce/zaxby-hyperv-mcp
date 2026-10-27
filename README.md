@@ -644,10 +644,10 @@ numeric or null; nothing in `timing` ever carries script text, arguments or
 credentials.
 
 `hyperv_console_screenshot` is the one console image tool that returns this
-same object as its `timing` metadata key. `hyperv_console_wait_frame_change`
-and `hyperv_console_capture_sequence` still return the legacy `timings` block
-only, so a consumer reading `timing` from them gets nothing — read the audit
-record for those two.
+same object as its `timing` metadata key. `hyperv_console_wait_frame_change`,
+`hyperv_console_wait_frame_stable` and `hyperv_console_capture_sequence`
+still return the legacy `timings` block only, so a consumer reading `timing`
+from them gets nothing — read the audit record for those three.
 
 #### Soak benchmark
 
@@ -1531,10 +1531,10 @@ unchanged result is exactly as informative about the request as a changed one.
 | `hyperv_console_button` | `vm_name` or `vm_id`, `button`, `is_down` | `{ok, operation}` |
 | `hyperv_console_scroll` | `vm_name` or `vm_id`, `delta` | `{ok, operation}` |
 | `hyperv_console_wait_frame_change` | `vm_name` or `vm_id`, `baseline_hash=""`, `width=640`, `height=480`, `timeout_s=60`, `interval_s=2` | list[ImageContent(image/png), TextContent({stop_reason: changed\|deadline, polls, elapsed_ms, frame_hash, hash_domain})] or deadline dict |
-| `hyperv_console_wait_frame_stable` | `vm_name` or `vm_id`, `stable_ms=1500`, `timeout_s=30`, `interval_ms=250`, `width=640`, `height=480`, `baseline_hash=""` | [ImageContent(image/png), TextContent({stop_reason: stable\|unchanged\|deadline, stable, polls, elapsed_ms, frame_hash, stable_ms_measured, hash_domain})] or meta-only dict with `stable=false` |
-| `hyperv_console_capture_sequence` | `vm_name` or `vm_id`, `count=3`, `interval_s=2`, `width=640`, `height=480` | [first Image, last Image (a single Image when count==1), meta_text(frames[] with per-frame hash + changed_bytes_vs_previous)] |
+| `hyperv_console_wait_frame_stable` | `vm_name` or `vm_id`, `stable_ms=1500` (>= 1 and < timeout_s*1000), `timeout_s=30` (>= 1), `interval_ms=250` (>= 100), `width=640`, `height=480`, `baseline_hash=""` | [ImageContent(image/png), TextContent({stop_reason: stable\|unchanged\|deadline, stable, polls, elapsed_ms, frame_hash, stable_ms_measured, hash_domain})] or meta-only dict with `stable=false` |
+| `hyperv_console_capture_sequence` | `vm_name` or `vm_id`, `count=3`, `interval_s=2`, `width=640`, `height=480` | [first Image, last Image (a single Image when count==1), meta_text(frames[] with per-frame vm_id + hash + changed_bytes_vs_previous)] |
 
-Console notes: text rides the stdin channel (never in argv/script/errors); non-ASCII input must use type_scancodes; mouse coordinates are in the space of the observed image — pass `frame_width`/`frame_height` matching your screenshot dimensions to scale to head space, or omit them to use head coordinates directly; `wait_frame_change` with `baseline_hash=""` treats the first polled frame as the baseline, and a returned `frame_hash` can be passed back as `baseline_hash` to detect changes across calls (both are the full lowercase-hex sha256 of the PIXEL payload, i.e. the thumbnail bytes after the 4-byte opaque prefix — see the 0.4.0 breaking change above; the tool also returns `hash_domain` so a client can refuse a baseline recorded in a different domain); `capture_sequence`'s `changed_bytes_vs_previous` counts PIXEL bytes, the same domain `frame_hash` covers (an idle console costs one C-level comparison rather than a per-byte walk, and a change confined to one 64 KiB chunk costs that chunk rather than the whole payload — a change in EVERY chunk walks those chunks, but with `sum(map(operator.ne, ...))` the per-byte work is C-level and executes no Python line events at all, so the cost is a single C walk rather than a Python loop); `capture_sequence`'s `frames[]` entries report `vm_id` — the GUID each per-frame process actually resolved (issue #82: a mid-sequence identity change — a delete+recreate under the same name — aborts the sequence with a structured error naming both GUIDs instead of returning a spliced diff); a returned `console.Frame` holds only its encoding until something reads a pixel — the raster is derived from the encoding on first pixel access and cached from then on, so an untouched frame retains no `width*height*3` buffer, and a mutation made after the first access survives; WinPE errors and wizard screens are returned as images for visual interpretation (no OCR is performed).
+Console notes: text rides the stdin channel (never in argv/script/errors); non-ASCII input must use type_scancodes; mouse coordinates are in the space of the observed image — pass `frame_width`/`frame_height` matching your screenshot dimensions to scale to head space, or omit them to use head coordinates directly; `wait_frame_change` with `baseline_hash=""` treats the first polled frame as the baseline, and a returned `frame_hash` can be passed back as `baseline_hash` to detect changes across calls (both are the full lowercase-hex sha256 of the PIXEL payload, i.e. the thumbnail bytes after the 4-byte opaque prefix — see the 0.4.0 breaking change above; the tool also returns `hash_domain` so a client can refuse a baseline recorded in a different domain — the same applies to `wait_frame_stable`, whose `baseline_hash` and returned `frame_hash` live in the identical domain and whose result also carries `hash_domain`); `capture_sequence`'s `changed_bytes_vs_previous` counts PIXEL bytes, the same domain `frame_hash` covers (an idle console costs one C-level comparison rather than a per-byte walk, and a change confined to one 64 KiB chunk costs that chunk rather than the whole payload — a change in EVERY chunk walks those chunks, but with `sum(map(operator.ne, ...))` the per-byte work is C-level and executes no Python line events at all, so the cost is a single C walk rather than a Python loop); `capture_sequence`'s `frames[]` entries report `vm_id` — on the PowerShell transport, the GUID that frame's own process actually resolved; on the in-process WMI transport, the GUID the sequence resolved once (`null` means the frame carried no identity metadata, which is legal). Issue #82: a mid-sequence identity change — a delete+recreate under the same name — aborts the sequence with a structured error naming both GUIDs instead of returning a spliced diff); a returned `console.Frame` holds only its encoding until something reads a pixel — the raster is derived from the encoding on first pixel access and cached from then on, so an untouched frame retains no `width*height*3` buffer, and a mutation made after the first access survives; WinPE errors and wizard screens are returned as images for visual interpretation (no OCR is performed).
 
 #### Console transport: in-process WMI or PowerShell (issue #45)
 
@@ -1584,8 +1584,10 @@ backend lookup (near-zero on a warm cache — one real DCOM connect per host
 per process, shared by concurrent callers),
 `rebind_ms` the cached-identity re-bind and state check, and `method_ms`
 the operation's WMI work; chunked and polling operations (type_text,
-type_scancodes, wait_frame_change, capture_sequence) SUM these phases
-across their iterations. In-process COM calls have no per-call timeout: a
+type_scancodes, wait_frame_change, wait_frame_stable, capture_sequence)
+SUM these phases across their iterations — for wait_frame_stable one
+`method_ms` entry lands per poll, so the value is the SUM of every
+thumbnail call the settle window took, not one capture. In-process COM calls have no per-call timeout: a
 hung WMI provider blocks that VM's operations until the provider returns,
 where the PowerShell transport's child process is killed at its timeout.
 The screenshot metadata's `capture_method` field names the serving

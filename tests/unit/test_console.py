@@ -651,6 +651,33 @@ def test_capture_sequence_mixed_metadata_keeps_first_identity(monkeypatch, unres
     assert out["frames"][1]["vm_id"] is None
 
 
+def test_capture_sequence_emits_identity_from_vm_target(monkeypatch, unrestricted):
+    """The per-frame script must emit VMID= from $vmTarget — the validated
+    GUID on both addressing paths. Msvm_ComputerSystem has NO Id property
+    (the GUID lives in Name; `$vm.Id` is $null on real hosts), so a wrong-
+    source emission produces a present-but-empty VMID= and breaks every
+    PS-transport sequence. The d18 pin asserts the VMID= prefix, which BOTH
+    forms contain — only this exact-source pin (plus the live leg) separates
+    them (swarm-pr-review W1)."""
+    stub_scripts: list[str] = []
+
+    def _stub(script, **kwargs):
+        stub_scripts.append(script)
+        payload = b"\x01\x02\x03\x04" + b"\x00\x00" * (320 * 240)
+        return pswindows.PSResult(stdout=json.dumps({
+            "returnValue": 0,
+            "imageDataB64": base64.b64encode(payload).decode(),
+        }), returncode=0)
+
+    monkeypatch.setattr(pswindows, "run_ps", _stub)
+    console.capture_sequence(
+        unrestricted, "vm1", count=1, interval_s=1, width=320, height=240)
+    assert "Write-Output ('VMID=' + $vmTarget)" in stub_scripts[0], (
+        "the capture script must emit the identity from $vmTarget (the "
+        "validated GUID), never from the Msvm_ComputerSystem object"
+    )
+
+
 def test_capture_sequence_error_context_names_the_sequence(monkeypatch, unrestricted):
     """The identity abort surfaces as a console capture_sequence error (not a
     screenshot-context error), so the agent can tell which call failed."""
@@ -951,27 +978,20 @@ def test_capture_sequence_empty_vmid_is_structured_error(monkeypatch, unrestrict
         "imageDataB64": base64.b64encode(payload).decode(),
     })
 
-    class EmptyGuidStub:
-        def __init__(self):
-            self.scripts = []
+    scripts: list[str] = []
 
-        def __call__(self, script, **kwargs):
-            self.scripts.append(script)
-            return pswindows.PSResult(
-                stdout=f"VMID={guid_a}\n{body}", returncode=0)
+    def _stub(script, **kwargs):
+        # frame 1 well-formed (a positive control for the pin), frame 2
+        # present-but-empty VMID= — the structured-error path under test
+        scripts.append(script)
+        line = f"VMID={guid_a}\n" if len(scripts) == 1 else "VMID=\n"
+        return pswindows.PSResult(stdout=line + body, returncode=0)
 
-    class EmptyVmidStub(EmptyGuidStub):
-        def __call__(self, script, **kwargs):
-            self.scripts.append(script)
-            n = len(self.scripts)
-            line = f"VMID={guid_a}\n" if n == 1 else "VMID=\n"
-            return pswindows.PSResult(stdout=line + body, returncode=0)
-
-    stub = EmptyVmidStub()
-    monkeypatch.setattr(pswindows, "run_ps", stub)
+    monkeypatch.setattr(pswindows, "run_ps", _stub)
     with pytest.raises(ConsoleError, match="empty Id"):
         console.capture_sequence(
             unrestricted, "vm1", count=2, interval_s=1, width=320, height=240)
+    assert len(scripts) == 2
 
 
 def test_wait_frame_stable_baseline_length_is_exactly_64(unrestricted):

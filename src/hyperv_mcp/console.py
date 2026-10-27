@@ -473,7 +473,11 @@ def _folded_capture_script(prelude: str, width: int, height: int) -> str:
         # Per-frame identity emission (issue #82): each folded process resolves
         # the VM by name, so the frame reports the GUID it actually captured
         # and the host can refuse a sequence that spans two identities.
-        "\"VMID=$($vm.Id)\"\n",
+        # $vmTarget IS the validated GUID on both addressing paths (the PR #4
+        # resolver binds it by name, the preamble binds it by id) —
+        # Msvm_ComputerSystem has no Id property (Name carries the GUID), so
+        # the emission must read $vmTarget like the screenshot script does.
+        "Write-Output ('VMID=' + $vmTarget)\n",
         "[PSCustomObject]@{\n",
         "    returnValue = $r.ReturnValue\n",
         "    imageDataB64 = [Convert]::ToBase64String($r.ImageData)\n",
@@ -592,11 +596,17 @@ def _folded_wait_stable_script(
         "    if ($pxLen -ne $pxWant) { throw ('thumbnail payload length mismatch: got ' + $pxLen + ' bytes, expected ' + $pxWant) }\n",
         "    $hash = ([System.BitConverter]::ToString($sha.ComputeHash($r.ImageData, 4, $r.ImageData.Length - 4)) -replace '-','').ToLowerInvariant()\n",
         "    $lastHash = $hash\n",
+        # ONE clock read per poll, reused for both the window stamp and the
+        # comparison: PS 5.1's DateTime granularity (~15.6 ms) would let a
+        # fresh Get-Date read >= stable_ms on the very poll that OBSERVED the
+        # change (stable_ms=1 is legal), reporting a mid-animation frame as
+        # settled. Reusing $now pins the change poll's elapsed at exactly 0,
+        # which is the WMI leg's behavior by construction.
         "    $now = Get-Date\n",
         "    if ($refHash -eq '') { $refHash = $hash; $lastChange = $now }\n",
         "    elseif ($hash -ne $refHash) { $refHash = $hash; $lastChange = $now; $moveSeen = $true }\n",
-        "    if (($null -ne $lastChange) -and (((Get-Date) - $lastChange).TotalMilliseconds -ge " + str(stable_ms) + ")) {\n",
-        "        Write-Output ('STOP=stable POLLS=' + $polls + ' HASH=' + $hash + ' STABLE_MS=' + [int]((Get-Date) - $lastChange).TotalMilliseconds)\n",
+        "    if (($null -ne $lastChange) -and ((($now) - ($lastChange)).TotalMilliseconds -ge " + str(stable_ms) + ")) {\n",
+        "        Write-Output ('STOP=stable POLLS=' + $polls + ' HASH=' + $hash + ' STABLE_MS=' + [int](($now) - ($lastChange)).TotalMilliseconds)\n",
         "        Write-Output ('FRAME=' + [Convert]::ToBase64String($r.ImageData))\n",
         "        break\n",
         "    }\n",
@@ -1524,11 +1534,12 @@ def _capture_raw_with_meta(
         data = json.loads(payload_line)
         payload = base64.b64decode(data["imageDataB64"], validate=True)
     except (json.JSONDecodeError, KeyError, binascii.Error, ValueError) as exc:
-        raise ConsoleError(f"screenshot result parse failed: {exc}") from None
+        raise ConsoleError(f"{ctx} result parse failed: {exc}") from None
     expected = width * height * 2 + _PREFIX_LEN
     if len(payload) != expected:
         raise ConsoleError(
-            f"thumbnail payload length mismatch: got {len(payload)}, expected {expected}"
+            f"{ctx} thumbnail payload length mismatch: "
+            f"got {len(payload)}, expected {expected}"
         )
     return payload, meta
 

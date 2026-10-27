@@ -213,6 +213,8 @@ def test_capture_sequence_wmi_semantics(monkeypatch, unrestricted_cfg):
     assert stub.scripts == []
     assert out["ok"] is True and len(out["frames"]) == 3
     assert [f["index"] for f in out["frames"]] == [0, 1, 2]
+    # every frame reports the GUID the WMI transport pinned (issue #82)
+    assert [f["vm_id"] for f in out["frames"]] == [GUID] * 3
     # strict-zip byte-diff counts against the equal-length payloads
     assert out["frames"][0]["changed_bytes_vs_previous"] == 0
     assert out["frames"][1]["changed_bytes_vs_previous"] == 1
