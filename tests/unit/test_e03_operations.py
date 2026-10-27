@@ -264,7 +264,8 @@ def test_detach_returns_operation_handle(tmp_path, fresh_server, monkeypatch):
 
 # ---------------------------------------------------------------------------
 # AC4 — the op/event tools are in the inventory (mirrored in test_server.py
-# and test_c03_tool_surface.py, both updated to the 66-tool count)
+# and test_c03_tool_surface.py, both updated to the 66-tool count
+# (67 since issue #27's hyperv_console_wait_frame_stable)
 # ---------------------------------------------------------------------------
 
 

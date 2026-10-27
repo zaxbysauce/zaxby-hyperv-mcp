@@ -36,7 +36,8 @@ TOOL_NAMES = {
     "hyperv_console_key_combo", "hyperv_console_type_scancodes",
     "hyperv_console_mouse_move", "hyperv_console_click",
     "hyperv_console_button", "hyperv_console_scroll",
-    "hyperv_console_wait_frame_change", "hyperv_console_capture_sequence",
+    "hyperv_console_wait_frame_change", "hyperv_console_wait_frame_stable",
+    "hyperv_console_capture_sequence",
     # VM / media preparation
     "hyperv_vm_create", "hyperv_vm_disk_add", "hyperv_vm_disk_list",
     "hyperv_vm_media_attach", "hyperv_vm_media_detach", "hyperv_vm_media_list",
@@ -94,9 +95,10 @@ def test_tool_inventory_registered(fresh_server):
     mod = fresh_server({})
     schemas = _schemas(mod)
     assert set(schemas) == TOOL_NAMES
-    # 61 through issue #23; 66 with issue #24's five op/event tools
-    # (AC4 checkpoint: tests/unit/test_e03_operations.py::test_op_tools_registered).
-    assert len(schemas) == 66
+    # 61 through issue #23; 66 with issue #24's five op/event tools; 67 with
+    # issue #27's settle wait (AC9 checkpoint:
+    # tests/unit/test_f03_frame_stable.py::test_tool_registered_without_confirm).
+    assert len(schemas) == 67
 
 
 def test_every_vm_tool_schema_has_vm_id(fresh_server):
@@ -506,3 +508,38 @@ def test_mouse_move_omission_is_invalid_envelope(unrestricted_server):
     assert envelope["ok"] is False
     assert envelope["error_class"] == "invalid"
     assert "x and y are required" in envelope["error"]
+
+
+def test_wait_frame_stable_audits_read_category(tmp_path, monkeypatch):
+    """Issue #27: the settle wait is a READ tool — its audit row carries the
+    read category, driven through the real call_tool path with a stubbed
+    transport (the input tools' rows say console_input; this one must not)."""
+    from hyperv_mcp import pswindows
+
+    class Fake:
+        def __call__(self, script, **kwargs):
+            return pswindows.PSResult(
+                stdout="STOP=deadline POLLS=1 HASH=abc", returncode=0)
+
+    monkeypatch.setattr(pswindows, "run_ps", Fake())
+    doc = {"unrestricted": True, "audit_log_path": str(tmp_path / "audit.jsonl")}
+    cfg_file = tmp_path / "cfg.json"
+    cfg_file.write_text(json.dumps(doc), encoding="utf-8")
+    mod = importlib.reload(server_module)
+    mod.bootstrap({"HYPERV_MCP_CONFIG": str(cfg_file)})
+    mcp = mod.get_mcp()
+    result = asyncio.run(mcp.call_tool(
+        "hyperv_console_wait_frame_stable",
+        {"vm_name": "vm1", "stable_ms": 500, "timeout_s": 2, "interval_ms": 100}))
+    text_blocks = [c for c in result.content if getattr(c, "type", "") == "text"]
+    assert text_blocks and '"ok": true' in text_blocks[0].text.replace("True", "true"), (
+        "the audited call must succeed, not merely write a row"
+    )
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    wait_rows = [r for r in rows if r.get("tool") == "hyperv_console_wait_frame_stable"]
+    assert wait_rows, f"no audit row for the settle wait: {rows}"
+    assert all(r.get("category") == "read" for r in wait_rows), wait_rows

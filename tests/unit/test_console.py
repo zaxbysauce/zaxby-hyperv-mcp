@@ -3,6 +3,7 @@
 import base64
 import json
 import re
+import sys
 
 import pytest
 
@@ -605,6 +606,121 @@ def test_dimension_bounds_rejected_everywhere(unrestricted):
             console.wait_frame_change(unrestricted, "vm1", **kwargs)
         with pytest.raises(ValueError, match="160..4096"):
             console.capture_sequence(unrestricted, "vm1", **kwargs)
+        # issue #27: the settle wait answers to the same 160..4096 bound
+        with pytest.raises(ValueError, match="160..4096"):
+            console.wait_frame_stable(unrestricted, "vm1", **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# capture_sequence identity pin (issue #82): mixed metadata sequences
+# ---------------------------------------------------------------------------
+
+def _meta_frame_response(guid, w=320, h=240):
+    payload = b"\x01\x02\x03\x04" + b"\x00\x00" * (w * h)
+    body = json.dumps({
+        "returnValue": 0,
+        "imageDataB64": base64.b64encode(payload).decode(),
+    })
+    stdout = (f"VMID={guid}\n{body}") if guid else body
+    return pswindows.PSResult(stdout=stdout, returncode=0)
+
+
+def test_capture_sequence_mixed_metadata_keeps_first_identity(monkeypatch, unrestricted):
+    """A metadata-less frame never clears the first attributed frame's pin:
+    attributed GUID A, then an unattributed frame, must NOT re-arm identity
+    comparison against the unattributed frame's (absent) GUID."""
+
+    class MetaStub:
+        def __init__(self, responses):
+            self.scripts = []
+            self.responses = list(responses)
+
+        def __call__(self, script, **kwargs):
+            self.scripts.append(script)
+            return self.responses.pop(0)
+
+    stub = MetaStub([
+        _meta_frame_response("e953c649-dcab-438d-9a54-3af74a82b624"),
+        _meta_frame_response(None),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    out = console.capture_sequence(
+        unrestricted, "vm1", count=2, interval_s=1, width=320, height=240)
+    assert out["ok"] is True
+    assert out["frames"][0]["vm_id"] == "e953c649-dcab-438d-9a54-3af74a82b624"
+    assert out["frames"][1]["vm_id"] is None
+
+
+def test_capture_sequence_emits_identity_from_vm_target(monkeypatch, unrestricted):
+    """The per-frame script must emit VMID= from $vmTarget — the validated
+    GUID on both addressing paths. Msvm_ComputerSystem has NO Id property
+    (the GUID lives in Name; `$vm.Id` is $null on real hosts), so a wrong-
+    source emission produces a present-but-empty VMID= and breaks every
+    PS-transport sequence. The d18 pin asserts the VMID= prefix, which BOTH
+    forms contain — only this exact-source pin (plus the live leg) separates
+    them (swarm-pr-review W1)."""
+    stub_scripts: list[str] = []
+
+    def _stub(script, **kwargs):
+        stub_scripts.append(script)
+        payload = b"\x01\x02\x03\x04" + b"\x00\x00" * (320 * 240)
+        return pswindows.PSResult(stdout=json.dumps({
+            "returnValue": 0,
+            "imageDataB64": base64.b64encode(payload).decode(),
+        }), returncode=0)
+
+    monkeypatch.setattr(pswindows, "run_ps", _stub)
+    console.capture_sequence(
+        unrestricted, "vm1", count=1, interval_s=1, width=320, height=240)
+    assert "Write-Output ('VMID=' + $vmTarget)" in stub_scripts[0], (
+        "the capture script must emit the identity from $vmTarget (the "
+        "validated GUID), never from the Msvm_ComputerSystem object"
+    )
+
+
+def test_capture_sequence_error_context_names_the_sequence(monkeypatch, unrestricted):
+    """The identity abort surfaces as a console capture_sequence error (not a
+    screenshot-context error), so the agent can tell which call failed."""
+
+    class MetaStub:
+        def __init__(self, responses):
+            self.scripts = []
+            self.responses = list(responses)
+
+        def __call__(self, script, **kwargs):
+            self.scripts.append(script)
+            return self.responses.pop(0)
+
+    guid_a = "e953c649-dcab-438d-9a54-3af74a82b624"
+    guid_b = "0f7d1c22-2222-4b3c-8d1e-6a5b4c3d2e1f"
+    stub = MetaStub([_meta_frame_response(guid_a), _meta_frame_response(guid_b)])
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    with pytest.raises(ConsoleError, match="capture_sequence spanned two VM identities"):
+        console.capture_sequence(
+            unrestricted, "vm1", count=2, interval_s=1, width=320, height=240)
+
+
+# ---------------------------------------------------------------------------
+# wait_frame_stable PS-transport script structure (issue #27)
+# ---------------------------------------------------------------------------
+
+def test_wait_frame_stable_script_carries_quiet_window(monkeypatch, unrestricted):
+    """The generated settle script must embed the quiet-window state machine
+    (the $lastChange stamp, the stable comparison, the baseline discriminator)
+    — not just the shared hash form the parse lane pins."""
+    fake = FakePS([pswindows.PSResult(
+        stdout="STOP=deadline POLLS=120 HASH=abc", returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    console.wait_frame_stable(
+        unrestricted, "vm1", stable_ms=1500, timeout_s=30, interval_ms=250,
+        baseline_hash="a" * 64)
+    script = fake.scripts[-1]
+    assert "$lastChange" in script
+    assert "STOP=stable" in script and "STOP=unchanged" in script
+    assert "$moveSeen" in script, (
+        "with a baseline, only the first DIFFERING frame starts the window"
+    )
+    assert "a" * 64 in script
 
 
 # ---------------------------------------------------------------------------
@@ -748,3 +864,151 @@ def test_console_by_id_reports_resolved_name(monkeypatch, unrestricted):
     guid = "e953c649-dcab-438d-9a54-3af74a82b624"
     out = console.press_key(unrestricted, vm_id=guid, key="enter")
     assert out["vm_name"] == name
+
+
+def test_wait_frame_stable_script_zero_poll_deadline(monkeypatch, unrestricted):
+    """Both terminal branches gate unchanged on polls > 0: a deadline that
+    fires before the first poll is a deadline even with a baseline."""
+    fake = FakePS([pswindows.PSResult(
+        stdout="STOP=deadline POLLS=0 HASH=", returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    console.wait_frame_stable(
+        unrestricted, "vm1", stable_ms=1500, timeout_s=30, interval_ms=250,
+        baseline_hash="a" * 64)
+    script = fake.scripts[-1]
+    assert script.count("$polls -gt 0") == 2, (
+        "the top-of-loop and cap terminals must both require an observed poll "
+        "before reporting unchanged"
+    )
+
+
+
+# ---------------------------------------------------------------------------
+# wait_frame_stable execution-level pin (review F3, round 2 of trace 27):
+# the REAL generated script runs under a REAL powershell.exe with the CIM
+# cmdlets shadowed by functions serving a constant screen, driven through the
+# real console.wait_frame_stable. The frozen C4 serves canned stdout, which
+# cannot fail on the script's actual state machine — this pin can.
+# ---------------------------------------------------------------------------
+
+_SHIM = (
+    "$script:_fakeImg = New-Object byte[] (4 + 320*240*2)\n"
+    "function Get-CimInstance { param($Namespace, $ClassName, $Filter)\n"
+    "    if ($ClassName -eq 'Msvm_VirtualSystemManagementService') { return [pscustomobject]@{ svc = $true } }\n"
+    "    return [pscustomobject]@{ Id = 'e953c649-dcab-438d-9a54-3af74a82b624' }\n"
+    "}\n"
+    "function Invoke-CimMethod { param($InputObject, $MethodName, $ErrorAction, $Arguments)\n"
+    "    return [pscustomobject]@{ ReturnValue = 0; ImageData = $script:_fakeImg }\n"
+    "}\n"
+)
+
+
+def _ps_executor(monkeypatch):
+    """Replace pswindows.run_ps with a REAL powershell.exe run of the script,
+    prefixed by the CIM-shadow functions (constant screen, ReturnValue 0)."""
+    import base64 as _b64
+    import subprocess as _sub
+
+    import hyperv_mcp.pswindows as _pw
+
+    def _run(script, timeout_s=60, stdin_b64=None):
+        wrapped = _SHIM + script
+        encoded = _b64.b64encode(wrapped.encode("utf-16-le")).decode("ascii")
+        proc = _sub.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+            capture_output=True, text=True, timeout=timeout_s + 30,
+        )
+        return _pw.PSResult(stdout=proc.stdout, stderr=proc.stderr,
+                            returncode=proc.returncode)
+
+    monkeypatch.setattr(_pw, "run_ps", _run)
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="executes the real Windows PowerShell 5.1")
+def test_wait_frame_stable_ps_execution_baseline_discrimination(monkeypatch, unrestricted):
+    """Review F3: with a baseline, a screen that never differs must return
+    stop_reason=unchanged (stable False, NO image) — the quiet window may only
+    start on movement AWAY from the baseline. Without a baseline, the first
+    poll starts the window and the same static screen settles (stable). This
+    drives the SHIPPED script through a real powershell.exe, so a state-machine
+    regression (e.g. never seeding the reference from the baseline) fails here
+    even though every canned-stdout unit test stays green. The prelude is the
+    by-id GUID preamble (no host-side resolver spawn); the CIM cmdlets inside
+    the script are shadowed by functions serving a constant screen."""
+    import hyperv_mcp.guestexec as guestexec
+    import hyperv_mcp.vmident as vmident
+
+    def _by_id_prelude(cfg, vm_name, vm_id, timing):
+        ref = vmident.VMRef(id=GUID, name=vm_name)
+        return guestexec.vm_target_preamble(GUID), ref
+
+    monkeypatch.setattr(console, "_vm_prelude", _by_id_prelude)
+    _ps_executor(monkeypatch)
+    # the baseline IS the shim's static screen (all-zero pixel payload), so
+    # "the screen never differs from the baseline" is literally true.
+    import hashlib as _hashlib
+    baseline = _hashlib.sha256(b"\x00" * (320 * 240 * 2)).hexdigest()
+    out = console.wait_frame_stable(
+        unrestricted, "vm1", stable_ms=1, timeout_s=2, interval_ms=100,
+        width=320, height=240, baseline_hash=baseline)
+    assert out["stop_reason"] == "unchanged", out
+    assert out["stable"] is False and "image" not in out
+
+    out_free = console.wait_frame_stable(
+        unrestricted, "vm1", stable_ms=1, timeout_s=2, interval_ms=100,
+        width=320, height=240)
+    assert out_free["stop_reason"] == "stable", out_free
+    assert out_free["stable"] is True and "image" in out_free
+
+
+# ---------------------------------------------------------------------------
+# capture_sequence identity: empty VMID= is a structured error (review F4) —
+# the plan-normative rule is KEY PRESENCE, so this test dies under the
+# truthiness mutant (meta.get("VMID")) that would silently treat a present-
+# but-empty GUID as an unattributed frame.
+# ---------------------------------------------------------------------------
+
+def test_capture_sequence_empty_vmid_is_structured_error(monkeypatch, unrestricted):
+    guid_a = "e953c649-dcab-438d-9a54-3af74a82b624"
+    payload = b"\x01\x02\x03\x04" + b"\x00\x00" * (320 * 240)
+    body = json.dumps({
+        "returnValue": 0,
+        "imageDataB64": base64.b64encode(payload).decode(),
+    })
+
+    scripts: list[str] = []
+
+    def _stub(script, **kwargs):
+        # frame 1 well-formed (a positive control for the pin), frame 2
+        # present-but-empty VMID= — the structured-error path under test
+        scripts.append(script)
+        line = f"VMID={guid_a}\n" if len(scripts) == 1 else "VMID=\n"
+        return pswindows.PSResult(stdout=line + body, returncode=0)
+
+    monkeypatch.setattr(pswindows, "run_ps", _stub)
+    with pytest.raises(ConsoleError, match="empty Id"):
+        console.capture_sequence(
+            unrestricted, "vm1", count=2, interval_s=1, width=320, height=240)
+    assert len(scripts) == 2
+
+
+def test_wait_frame_stable_baseline_length_is_exactly_64(unrestricted):
+    """Final-critic F1: the baseline gate is EXACTLY 64 hex chars — a 63-char
+    hex string is a ValueError, not a silently accepted near-miss (kills the
+    {64} -> {63,64} regex mutant, which survived the whole shipped suite)."""
+    stub_calls = []
+
+    def _no_ps(script, **kwargs):
+        stub_calls.append(script)
+        raise AssertionError("no PowerShell may start for a bad baseline")
+
+    from unittest.mock import patch
+
+    import hyperv_mcp.pswindows as _pw
+    with patch.object(_pw, "run_ps", _no_ps):
+        with pytest.raises(ValueError, match="64-char hex"):
+            console.wait_frame_stable(
+                unrestricted, "vm1", baseline_hash="a" * 63)
+    assert stub_calls == []

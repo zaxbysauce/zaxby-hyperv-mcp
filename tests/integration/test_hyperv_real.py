@@ -532,3 +532,136 @@ def test_standard_checkpoint_restores_running_desktop(it, it_tmp):
                     json.dump(
                         {"unremoved_checkpoint": name, "vm": vm, "error": str(exc)}, fh
                     )
+
+
+# ---------------------------------------------------------------------------
+# console settle wait (issue #27, AC10/AC11) + sequence identity (#82)
+# ---------------------------------------------------------------------------
+
+def test_console_wait_frame_stable_idle_desktop(running_vm):
+    """AC10: on an idle logged-on desktop the settle wait reports
+    stop_reason == 'stable' within about stable_ms + 2*interval_ms + one
+    thumbnail call of elapsed time, and the settled frame's hash matches the
+    host-side pixel-only domain (it chains into baseline_hash).
+
+    Console observation is host-side WMI/PowerShell (no guest credentials of
+    its own), so the shared env gate — HYPERV_MCP_INTEGRATION=1 plus
+    HYPERV_MCP_TEST_VM naming the disposable VM — is all this test needs."""
+    from hyperv_mcp import console
+
+    cfg, vm = running_vm.cfg, running_vm.vm
+    out = console.wait_frame_stable(
+        cfg, vm, stable_ms=2000, timeout_s=20, interval_ms=250,
+        width=640, height=480)
+    assert out["stop_reason"] == "stable" and out["stable"] is True, out
+    # the quiet window needs at least one poll per interval: 2000ms / 250ms = 8
+    assert out["polls"] >= 2000 // 250, out
+    budget_ms = 2000 + 8 * 250 + 8000  # window + one poll per interval + a generous real-host thumbnail
+    assert out["elapsed_ms"] < budget_ms, (
+        f"an idle desktop must settle promptly: elapsed {out['elapsed_ms']}ms "
+        f"vs budget {budget_ms}ms"
+    )
+    assert out.get("frame_hash"), out
+    # the settled hash chains as a baseline: a second call reports the screen
+    # never moved (unchanged). A lock-screen clock minute tick that lands
+    # inside this window moves the frame and legitimately reports stable —
+    # which still proves the chaining (movement away from the supplied
+    # baseline was detected), so accept both outcomes and pin the
+    # discrimination: stable implies the frame differs from the baseline.
+    again = console.wait_frame_stable(
+        cfg, vm, stable_ms=500, timeout_s=10, interval_ms=250,
+        width=640, height=480, baseline_hash=out["frame_hash"])
+    if again["stop_reason"] == "unchanged":
+        pass
+    else:
+        assert again["stop_reason"] == "stable", again
+        assert again["frame_hash"] != out["frame_hash"], (
+            "a stable result on the chained baseline must name a frame that "
+            "moved away from it (the clock tick), never the same frame"
+        )
+
+
+def test_console_wait_frame_stable_after_input(running_vm):
+    """AC11: an input press, then the settle wait with the PRE-INPUT frame as
+    the movement baseline — the wait must return stop_reason == "stable" with
+    a frame that differs from the baseline and matches an immediate follow-up
+    screenshot (the screen really finished drawing; not a mid-animation
+    frame).
+
+    Two host-state legs, because the disposable VM's desktop state is not
+    controlled by this suite:
+    - interactive desktop: the Win key opens the Start menu (the #25 flow);
+    - lock screen (no logged-on session): the Win key is a no-op, so the
+      leg presses Escape instead — any input dismisses the lock clock to the
+      fully drawn credential prompt, which exercises the identical contract
+      (movement away from the baseline, then a settled, fully drawn frame).
+    The follow-up hash comparison retries once: a lock-screen clock minute
+    tick between the settle and the screenshot would change the hash without
+    any assertion-relevant difference."""
+
+    from hyperv_mcp import console
+
+    cfg, vm = running_vm.cfg, running_vm.vm
+    pre = console.wait_frame_change(cfg, vm, timeout_s=10)
+    assert pre.get("frame_hash"), pre
+
+    console.press_key(cfg, vm, "win")
+    settled = console.wait_frame_stable(
+        cfg, vm, stable_ms=1000, timeout_s=20, interval_ms=250,
+        width=640, height=480, baseline_hash=pre["frame_hash"])
+    if settled["stop_reason"] == "unchanged":
+        # no interactive desktop (Win was a no-op): dismiss the lock screen
+        console.press_key(cfg, vm, "escape")
+        settled = console.wait_frame_stable(
+            cfg, vm, stable_ms=1000, timeout_s=20, interval_ms=250,
+            width=640, height=480, baseline_hash=pre["frame_hash"])
+    assert settled["stop_reason"] == "stable", settled
+    assert settled["frame_hash"] != pre["frame_hash"]
+
+    # the settled frame is REALLY the screen: an immediate follow-up
+    # screenshot taken with the settled hash as if_changed_from must report
+    # unchanged: true. A lock-screen clock minute tick between the settle and
+    # the screenshot makes that comparison permanently false (the tick is
+    # unrelated to the input); in that case prove the screen settled directly
+    # with the tool itself — a fresh settle wait on the moved screen must
+    # report stable (static NOW), and the screen must differ from the
+    # pre-input baseline (the input did move something).
+    _img, meta = console.screenshot(
+        cfg, vm, width=640, height=480, if_changed_from=settled["frame_hash"])
+    if not meta.get("unchanged"):
+        _img, moved_meta = console.screenshot(
+            cfg, vm, width=640, height=480, if_changed_from=pre["frame_hash"])
+        assert moved_meta.get("unchanged") is not True, (
+            "the screen changed since the wait returned but never differed "
+            "from the pre-input baseline — nothing actually moved"
+        )
+        again = console.wait_frame_stable(
+            cfg, vm, stable_ms=1000, timeout_s=10, interval_ms=250,
+            width=640, height=480)
+        assert again["stop_reason"] == "stable", again
+        return
+    assert meta.get("unchanged") is True, (
+        "the follow-up screenshot must match the settled frame (the wait "
+        "returned the finished screen, not a transition)"
+    )
+
+    # leave the console where the checkpoint restore expects it: Esc backs
+    # out of the credential prompt to the lock screen; Win closes a Start
+    # menu on an interactive desktop.
+    console.press_key(cfg, vm, "escape")
+
+
+def test_capture_sequence_reports_frame_identity_live(running_vm):
+    """Issue #82 live positive-identity leg: every frame of a real sequence
+    reports the GUID it actually captured, and the sequence stays under one
+    identity end to end (the negative abort is pinned deterministically by
+    tests/unit/test_d18_capture_sequence_identity.py — a live mid-sequence
+    rename-swap of shared VMs is not a safe leg to automate)."""
+    from hyperv_mcp import console, vmident
+
+    cfg, vm = running_vm.cfg, running_vm.vm
+    ref = vmident.resolve(cfg, vm_name=vm)
+    out = console.capture_sequence(
+        cfg, vm, count=3, interval_s=1, width=320, height=240)
+    assert out["ok"] is True
+    assert [f["vm_id"] for f in out["frames"]] == [ref.id] * 3, out["frames"]
