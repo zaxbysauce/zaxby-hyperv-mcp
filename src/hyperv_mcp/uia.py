@@ -909,8 +909,10 @@ def provision_helper(cfg, vm_name="", cred: CredentialSet | None = None,
                     "error_class": "helper_install_failed",
                     "error": str(install_frame)[:500]}
         if autologon:
-            user_line = ("$env:HYPERVMCP_AUTOLOGON_USER = '"
-                         + pswindows.ps_quote(cred.username) + "'")
+            # ps_quote emits the surrounding single quotes itself (with ''
+            # doubling for embedded quotes) — never add another pair.
+            user_line = ("$env:HYPERVMCP_AUTOLOGON_USER = "
+                         + pswindows.ps_quote(cred.username))
             autologon_inner = user_line + "\n" + _AUTOLOGON_INNER
             leg = _frame_leg(cfg, ref, cred, autologon_inner,
                              pswindows.utf8_b64(cred.password),
@@ -918,8 +920,8 @@ def provision_helper(cfg, vm_name="", cred: CredentialSet | None = None,
             frame = json.loads((leg.stdout or "").strip() or "{}")
             results["autologon_configured"] = bool(frame.get("ok"))
             results["reboot_required"] = bool(frame.get("ok"))
-        task_inner = ("$env:HYPERVMCP_AUTOLOGON_USER = '"
-                      + pswindows.ps_quote(cred.username) + "'\n" + _TASK_INNER)
+        task_inner = ("$env:HYPERVMCP_AUTOLOGON_USER = "
+                      + pswindows.ps_quote(cred.username) + "\n" + _TASK_INNER)
         leg = _frame_leg(cfg, ref, cred, task_inner,
                          pswindows.utf8_b64("task"), timeout_ms=60000)
         frame = json.loads((leg.stdout or "").strip() or "{}")
