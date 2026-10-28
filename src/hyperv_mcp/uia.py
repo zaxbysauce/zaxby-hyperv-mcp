@@ -363,9 +363,16 @@ def _run_quser(cfg, ref, cred: CredentialSet) -> dict | None:
     """The PS Direct quser discovery seam: {user, session_id} | None.
 
     Raises UiAError naming ambiguous_session when the credential has more
-    than one Active session (never picks arbitrarily).
+    than one Active session (never picks arbitrarily). quser ERRORS
+    ("No User exists for *") when the guest has no logon sessions — that
+    is "nobody logged on" (None), not a transport failure.
     """
-    text = _ps_guest_text(cfg, ref, cred, "quser")
+    try:
+        text = _ps_guest_text(cfg, ref, cred, "quser")
+    except pswindows.PowerShellTransportError as exc:
+        if "no user exists" in str(exc).lower():
+            return None
+        raise
     return _parse_quser(text, cred.username)
 
 
