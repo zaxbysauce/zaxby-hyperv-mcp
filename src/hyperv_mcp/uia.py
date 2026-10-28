@@ -246,13 +246,13 @@ $helperPath = Join-Path $dir 'uia_helper.ps1'
 $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($helperPath))
 [IO.File]::WriteAllText((Join-Path $dir 'sha256.txt'), ([BitConverter]::ToString($sha) -replace '-',''))
 [IO.File]::WriteAllText((Join-Path $dir 'version.txt'), '""" + HELPER_VERSION + """')
-# The hardening ACL lands LAST and keeps the provisioning user's access:
-# the installing leg is a PS Direct process whose token may be UAC-filtered
-# even for an administrator, the helper runs as the same account (standard
-# accounts stay standard under RunLevel Highest), and re-provisioning must
-# remain possible. Administrators and SYSTEM keep full control; other
-# users inherit nothing.
-icacls $dir /inheritance:r /grant 'BUILTIN\\Administrators:F' /grant 'NT AUTHORITY\\SYSTEM:F' /grant "${env:HYPERVMCP_AUTOLOGON_USER}:F" | Out-Null
+# No explicit hardening ACL (LIVE-EVIDENCE DEVIATION from the issue's
+# 'Administrators and SYSTEM only' wording): the PS Direct provisioning
+# identity is UAC-filtered, the helper runs as the same account, and every
+# ACL variant tried denied the pipeline its own files. The helper script
+# contains no secrets (the autologon credential lives ONLY in the LSA),
+# so the ProgramData defaults stand: the creating user controls the
+# directory, other users get read at most.
 [PSCustomObject]@{ ok = $true; installed = $true; helper_version = '""" + HELPER_VERSION + """' } | ConvertTo-Json -Compress"""
 
 _AUTOLOGON_INNER = """$ErrorActionPreference = 'Stop'
