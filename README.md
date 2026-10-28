@@ -1,7 +1,7 @@
 # hyperv-mcp (hardened fork)
 
 An MCP (Model Context Protocol) server for Hyper-V VM management and guest
-execution. Exposes 61 tools for VM lifecycle, checkpoint management, kernel
+execution. Exposes 76 tools for VM lifecycle, checkpoint management, kernel
 debug setup (KDNET/KDCOM), and guest file transfer/command execution via
 PowerShell Direct (no WinRM required).
 
@@ -560,6 +560,8 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
     "display": true,              // VM display resolution (Set-VMVideo; restart leg needs stop + confirm)
     "guest_repair": true,         // APPLY guest access repairs (dry run needs no switch)
     "relay": true,                // host->guest HTTP relay listener
+    "ui_input": true,             // issue #29: UIA invoke/set_value/focus
+    "ui_provision": true,         // issue #29: UIA helper install + autologon (needs confirm)
     "require_confirm": true       // tools additionally need confirm=true
   },
   "allow_inline_credentials": false,   // expose username/password tool params
@@ -1037,7 +1039,7 @@ claude mcp add hyperv -- hyperv-mcp
 
 ---
 
-## Available Tools (68 total)
+## Available Tools (76 total)
 
 Every registered tool in the tables below returns failures the same way:
 the one-envelope contract (`ok/error/error_class/retryable/retry_after_ms`,
@@ -1504,9 +1506,12 @@ One call pairing the console screenshot with `captured_at` (UTC ISO-8601),
 `vm_id`, capture dimensions, `frame_hash`, and — when `ui_tree=true` — a
 bounded UIAutomation element tree from the guest (depth/element caps;
 requires guest credentials, which the screenshot alone does not). The UI
-tree is best-effort: a PowerShell Direct session may not see an interactive
-desktop, in which case `ui_tree.ok=false` carries the reason while the
-screenshot still ships. On an `unchanged: true` result the tree leg is
+tree is session-honest (issue #29): the walk records the session it ran in,
+a walk whose session does not own the input desktop is refused as
+`ui_tree.ok=false` with `error_class: "no_interactive_session"` and the
+walked session identity in `ui_tree.session`, and when the in-session UIA
+helper is running the tree comes from the helper and `ui_tree.source` is
+"helper". On an `unchanged: true` result the tree leg is
 skipped entirely (it is a credentialed 60 s PowerShell Direct session whose
 only purpose is to describe the frame just captured), and `ui_tree` reports
 `{requested: true, skipped: true, reason}`; a call with `ui_tree=false`
@@ -1522,7 +1527,40 @@ unchanged result is exactly as informative about the request as a changed one.
 
 ---
 
-### VM Console (WMI — works from firmware through WinPE)
+#### In-session UI Automation helper (0.4.0, issue #29)
+
+Eight `hyperv_ui_*` tools drive the guest's interactive desktop BY ELEMENT
+instead of by screen coordinates. They require the `hyperv-mcp-uia-helper`
+PowerShell process running inside the guest's interactive session; it serves
+UI Automation requests on a local named pipe that the host reaches through
+PowerShell Direct.
+
+| Tool | Category | Purpose |
+| --- | --- | --- |
+| `hyperv_ui_inspect` | read | bounded UIA element tree (depth <= 8, 2000 elements) |
+| `hyperv_ui_find` | read | resolve elements by selector or element_id |
+| `hyperv_ui_wait_for` | read | wait for a selector to appear / disappear |
+| `hyperv_ui_session_state` | read | active session, interactive user, locked, foreground window, helper version |
+| `hyperv_ui_invoke` | `ui_input` | Invoke/Toggle/SelectionItem/ExpandCollapse on an element |
+| `hyperv_ui_set_value` | `ui_input` | set a Value-pattern property (result reports the length, never the value) |
+| `hyperv_ui_focus` | `ui_input` | focus an element (locked sessions refuse: `no_interactive_desktop`) |
+| `hyperv_ui_helper_provision` | `ui_provision` + confirm | install + start the helper; optional autologon |
+
+Provisioning (`hyperv_ui_helper_provision(autologon=true, confirm=true)`)
+configures automatic logon for the test account: the password is stored ONLY
+as the LSA secret `DefaultPassword` (never a plain-text registry value) and a
+per-user AtLogOn scheduled task (Interactive, RunLevel Highest, restart 3x/1m)
+starts the helper at logon. This is for DISPOSABLE TEST IMAGES; the server is
+a lab tool.
+
+Session honesty: every request carries its target VM GUID, user SID, and
+interactive session; the helper refuses session-less requests
+(`session_unverified`) and anything addressed to another VM/user/session
+(`target_mismatch`). Element operations the target does not support return
+`unsupported_capability` rather than a coordinate fallback; ambiguous
+selectors fail with `ambiguous_selector` and up to 20 candidates.
+
+## VM Console (WMI — works from firmware through WinPE)
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|

@@ -510,7 +510,11 @@ def ensure_registration(cfg, ref, cred: CredentialSet,
         nonce = helper.get("nonce")
     if session is None:
         cached = _REGISTRATIONS.get((ref.id, -1))
-        for guid, reg in _REGISTRATIONS.items():
+        # The registry is keyed by (vm_guid, session_id) tuples; unpack the
+        # key before comparing, or the scan compares a tuple to the string
+        # ref.id and never finds the cache (every verb call then re-bootstraps
+        # and the broker chain is bypassed — pinned by test_f05_production_path).
+        for (guid, _cached_session), reg in _REGISTRATIONS.items():
             if guid == ref.id:
                 cached = reg
                 break
