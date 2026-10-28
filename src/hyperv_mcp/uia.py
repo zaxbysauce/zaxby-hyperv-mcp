@@ -237,10 +237,13 @@ _INSTALL_INNER = """$dir = 'C:\\ProgramData\\hyperv-mcp\\uia-helper'
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $helperPath = Join-Path $dir 'uia_helper.ps1'
 [IO.File]::WriteAllBytes($helperPath, [Convert]::FromBase64String($reqEnc))
-icacls $dir /inheritance:r /grant 'BUILTIN\\Administrators:F' /grant 'NT AUTHORITY\\SYSTEM:F' | Out-Null
 $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($helperPath))
 [IO.File]::WriteAllText((Join-Path $dir 'sha256.txt'), ([BitConverter]::ToString($sha) -replace '-',''))
 [IO.File]::WriteAllText((Join-Path $dir 'version.txt'), '""" + HELPER_VERSION + """')
+# The Administrators/SYSTEM-only ACL lands LAST: the installing leg itself
+# (a non-elevated PS Direct process) must still read the files it just
+# wrote, and the AtLogOn task runs elevated so the helper can read them.
+icacls $dir /inheritance:r /grant 'BUILTIN\\Administrators:F' /grant 'NT AUTHORITY\\SYSTEM:F' | Out-Null
 [PSCustomObject]@{ ok = $true; installed = $true; helper_version = '""" + HELPER_VERSION + """' } | ConvertTo-Json -Compress"""
 
 _AUTOLOGON_INNER = """$ErrorActionPreference = 'Stop'
