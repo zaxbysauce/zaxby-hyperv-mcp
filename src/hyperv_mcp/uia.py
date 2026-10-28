@@ -232,13 +232,12 @@ try {
     $resp
 } finally { $client.Dispose() }"""
 
-_INSTALL_INNER = """$dir = 'C:\\ProgramData\\hyperv-mcp\\uia-helper'
+_INSTALL_INNER = """$dir = $env:HYPERVMCP_HELPER_DIR
 if (Test-Path $dir) {
-    # Re-provisioning over a previously hardened directory: the owner of
-    # the directory (the provisioning identity that created it) can always
-    # reset its DACL even when the hardening ACL removed its grants.
-    icacls $dir /reset /t | Out-Null
-    Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+    # Re-provisioning over a prior install of the SAME versioned dir:
+    # the creator-owner default of a fresh ProgramData child means the
+    # provisioning identity can always clear its own previous directory.
+    Remove-Item -Recurse -Force $dir
 }
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $helperPath = Join-Path $dir 'uia_helper.ps1'
@@ -246,13 +245,6 @@ $helperPath = Join-Path $dir 'uia_helper.ps1'
 $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($helperPath))
 [IO.File]::WriteAllText((Join-Path $dir 'sha256.txt'), ([BitConverter]::ToString($sha) -replace '-',''))
 [IO.File]::WriteAllText((Join-Path $dir 'version.txt'), '""" + HELPER_VERSION + """')
-# No explicit hardening ACL (LIVE-EVIDENCE DEVIATION from the issue's
-# 'Administrators and SYSTEM only' wording): the PS Direct provisioning
-# identity is UAC-filtered, the helper runs as the same account, and every
-# ACL variant tried denied the pipeline its own files. The helper script
-# contains no secrets (the autologon credential lives ONLY in the LSA),
-# so the ProgramData defaults stand: the creating user controls the
-# directory, other users get read at most.
 [PSCustomObject]@{ ok = $true; installed = $true; helper_version = '""" + HELPER_VERSION + """' } | ConvertTo-Json -Compress"""
 
 _AUTOLOGON_INNER = """$ErrorActionPreference = 'Stop'
@@ -294,7 +286,7 @@ try {
 
 _TASK_INNER = """$ErrorActionPreference = 'Stop'
 $user = $env:HYPERVMCP_AUTOLOGON_USER
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\\ProgramData\\hyperv-mcp\\uia-helper\\uia_helper.ps1'
+$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File ' + $env:HYPERVMCP_HELPER_DIR + '\\uia_helper.ps1')
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
 $settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
@@ -925,9 +917,16 @@ def provision_helper(cfg, vm_name="", cred: CredentialSet | None = None,
                      "helper_version": HELPER_VERSION,
                      "helper_running": False, "reboot_required": False}
     with vm_lock(ref.id, mode="write"):
+        helper_dir = (
+            r"C:\ProgramData\hyperv-mcp\uia-helper-"
+            + uuid.uuid4().hex[:8]
+        )
+        dir_line = ("$env:HYPERVMCP_HELPER_DIR = "
+                    + pswindows.ps_quote(helper_dir) + "\n")
         install = _frame_leg(
             cfg, ref, cred,
-            ("$env:HYPERVMCP_AUTOLOGON_USER = "
+            (dir_line
+             + "$env:HYPERVMCP_AUTOLOGON_USER = "
              + pswindows.ps_quote(cred.username) + "\n" + _INSTALL_INNER),
             helper_b64, timeout_ms=60000)
         install_frame = json.loads((install.stdout or "").strip() or "{}")
@@ -947,7 +946,9 @@ def provision_helper(cfg, vm_name="", cred: CredentialSet | None = None,
             frame = json.loads((leg.stdout or "").strip() or "{}")
             results["autologon_configured"] = bool(frame.get("ok"))
             results["reboot_required"] = bool(frame.get("ok"))
-        task_inner = ("$env:HYPERVMCP_AUTOLOGON_USER = "
+        task_inner = ("$env:HYPERVMCP_HELPER_DIR = "
+                      + pswindows.ps_quote(helper_dir) + "\n"
+                      + "$env:HYPERVMCP_AUTOLOGON_USER = "
                       + pswindows.ps_quote(cred.username) + "\n" + _TASK_INNER)
         leg = _frame_leg(cfg, ref, cred, task_inner,
                          pswindows.utf8_b64("task"), timeout_ms=60000)

@@ -29,7 +29,7 @@ $ErrorActionPreference = 'Stop'
 
 $HelperVersion = '1'
 $PipeName = 'hyperv-mcp-uia'
-$HelperDir = 'C:\ProgramData\hyperv-mcp\uia-helper'
+$HelperDir = $env:HYPERVMCP_HELPER_DIR
 $MaxDepth = 8
 $MaxElements = 2000
 $MaxMatches = 200
