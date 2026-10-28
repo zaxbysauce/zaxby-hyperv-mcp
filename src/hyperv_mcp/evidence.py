@@ -9,8 +9,13 @@ capture dimensions, frame hash, and — when requested — a UIAutomation
 element tree gathered via PowerShell Direct.
 
 The UIA leg is best-effort with explicit error reporting: a PS Direct
-session may not see an interactive desktop, in which case ui_tree carries
-{ok: False, error: ...} while the screenshot still ships. Credentials are
+session may not see the interactive desktop, and since issue #29 the walk
+MEASURES the session it ran in — a walk whose process does not own the
+input desktop is refused as {ok: False, error_class:
+"no_interactive_session"} with the walked session identity carried in
+ui_tree.session, while the screenshot still ships. When the in-session
+helper (hyperv_mcp.uia) is running, the tree comes from the helper's
+inspect verb and ui_tree reports source "helper". Credentials are
 required ONLY for the UI tree leg.
 """
 
@@ -33,6 +38,23 @@ def _uia_script(depth: int, max_elements: int) -> str:
     return f"""
 Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
 Add-Type -AssemblyName UIAutomationTypes -ErrorAction Stop
+$walkSid = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+Add-Type -Namespace HypervMcp.Evidence -Name Native -MemberDefinition @'
+[DllImport("user32.dll", SetLastError = true)] public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool GetUserObjectInformationW(IntPtr hObj, int idx, System.Text.StringBuilder buf, uint len, out uint needed);
+[DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr h);
+'@
+$walkInputDesktop = ''
+$desk = [HypervMcp.Evidence.Native]::OpenInputDesktop(0, $false, 0x0001)
+if ($desk -ne [IntPtr]::Zero) {{
+    try {{
+        $buf = New-Object System.Text.StringBuilder 256
+        $needed = 0
+        if ([HypervMcp.Evidence.Native]::GetUserObjectInformationW($desk, 2, $buf, 256, [ref]$needed)) {{
+            $walkInputDesktop = $buf.ToString()
+        }}
+    }} finally {{ [void][HypervMcp.Evidence.Native]::CloseDesktop($desk) }}
+}}
 $script:seen = 0
 $script:cap = {cap}
 function Walk($el, $depth) {{
@@ -67,9 +89,57 @@ function Walk($el, $depth) {{
 }}
 $root = [System.Windows.Automation.AutomationElement]::RootElement
 $tree = Walk $root {depth}
-[PSCustomObject]@{{ elements = $script:seen; truncated = ($script:seen -ge $script:cap); tree = $tree }} |
+[PSCustomObject]@{{ elements = $script:seen; truncated = ($script:seen -ge $script:cap); tree = $tree; session_id = $walkSid; interactive = ($walkInputDesktop -eq 'Default'); input_desktop = $walkInputDesktop }} |
     ConvertTo-Json -Compress -Depth {_UIA_MAX_DEPTH + 2}
 """.strip()
+
+
+def _uia_via_helper(
+    cfg: Config, ref, cred: CredentialSet, depth: int, max_elements: int
+) -> dict[str, Any] | None:
+    """Prefer the in-session helper's answer over the PS Direct walk.
+
+    Returns the finished ui dict with source "helper" when the helper
+    answers session_state with a running, version-matched helper, or None
+    when any step of the probe fails (the caller falls back to the legacy
+    walk). Module-ATTRIBUTE calls (uia.session_state / uia.inspect) so the
+    frozen C2 stubs can replace either half.
+    """
+    from . import uia
+
+    try:
+        answer = uia.session_state(cfg, ref, cred)
+    except Exception:
+        return None
+    if not isinstance(answer, dict) or not answer.get("ok"):
+        return None
+    helper = answer.get("helper") or {}
+    if not helper.get("running"):
+        return None
+    if str(helper.get("version", "")) != uia.HELPER_VERSION:
+        return None
+    try:
+        tree_result = uia.inspect(
+            cfg, ref, cred, selector=None, depth=depth, max_elements=max_elements,
+        )
+    except Exception:
+        return None
+    if not isinstance(tree_result, dict) or not tree_result.get("ok"):
+        return None
+    return {
+        "requested": True,
+        "ok": True,
+        "elements": tree_result.get("elements"),
+        "truncated": bool(tree_result.get("truncated")),
+        "tree": tree_result.get("tree"),
+        "session": {
+            "session_id": answer.get("active_session_id"),
+            "interactive": not answer.get("locked", False),
+            "locked": answer.get("locked", False),
+            "interactive_user": answer.get("interactive_user"),
+        },
+        "source": "helper",
+    }
 
 
 def capture_evidence(
@@ -153,21 +223,25 @@ def capture_evidence(
             ),
         }
     elif tree_cred is not None:
+        helper_ui = _uia_via_helper(
+            cfg, ref, tree_cred, ui_tree_depth, ui_tree_max_elements)
+        if helper_ui is not None:
+            meta = dict(meta)
+            meta["ui_tree"] = helper_ui
+            collector = timing.current()
+            if collector is not None:
+                meta["timing"] = collector.snapshot()
+            return {"ok": True, "image": image, "meta": meta}
+        ui = {"requested": True, "session": None}
         try:
             outcome = run_guest_inner(
                 cfg, ref.id,
                 _uia_script(ui_tree_depth, ui_tree_max_elements), tree_cred,
                 timeout_ms=60000, mode="read",
             )
-            ui = {
-                "requested": True,
-                "ok": True,
-                "elements": outcome.get("elements"),
-                "truncated": bool(outcome.get("truncated")),
-                "tree": outcome.get("tree"),
-            }
         except Exception as exc:
             from . import errors  # late import: errors pulls the policy tree
+
             ui = {
                 "requested": True, "ok": False,
                 "error": str(exc),
@@ -175,7 +249,40 @@ def capture_evidence(
                 # expiry becomes "busy" here instead of an anonymous string).
                 "error_class": errors.classify(exc),
                 "note": "a PowerShell Direct session may not see an interactive desktop",
+                "session": None,
             }
+        else:
+            session = {
+                "session_id": outcome.get("session_id"),
+                "interactive": outcome.get("interactive"),
+                "input_desktop": outcome.get("input_desktop"),
+            }
+            if outcome.get("interactive") is not True:
+                sid = outcome.get("session_id")
+                if outcome.get("interactive") is None:
+                    reason = "the walker emitted no session identity"
+                else:
+                    reason = (
+                        f"the walk ran in session {sid} which does not own the "
+                        f"input desktop ({outcome.get('input_desktop') or 'none'})"
+                    )
+                ui = {
+                    "requested": True,
+                    "ok": False,
+                    "error_class": "no_interactive_session",
+                    "error": reason,
+                    "session": session,
+                }
+            else:
+                ui = {
+                    "requested": True,
+                    "ok": True,
+                    "elements": outcome.get("elements"),
+                    "truncated": bool(outcome.get("truncated")),
+                    "tree": outcome.get("tree"),
+                    "session": session,
+                    "source": "ps_direct_walk",
+                }
     meta = dict(meta)
     meta["ui_tree"] = ui
     # The screenshot leg snapshotted the collector MID-operation, before this

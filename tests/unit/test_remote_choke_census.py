@@ -26,6 +26,8 @@ SRC = Path(__file__).resolve().parents[2] / "src" / "hyperv_mcp"
 # route through a choke so the remote hop composes above the spawn boundary.
 RUN_PS_ALLOWLIST = {
     ("pswindows.py", "run_ps"),            # the transport itself
+    ("uia.py", "_run_uia_leg"),           # issue #29: the framed two-line UIA choke
+    ("uia.py", "_ps_guest_text"),          # issue #29: quser/LogonUI/whoami discovery legs
     ("pswindows.py", "compose_remote"),    # calls the transport
     ("lifecycle.py", "_run"),
     ("console.py", "_run"),
@@ -121,6 +123,7 @@ READLINE_BUDGETS = {
     ("pswindows.py", "_remote_parts"): 2,      # hostpw line + param-loop f-string
     ("guestexec.py", "psdirect_prefix"): 1,    # pinned local-mode emission
     ("console.py", "type_text"): 1,            # pinned local-mode inline emission
+    ("uia.py", "_uia_guest_script"): 1,       # issue #29: framed payload line (local mode)
     # issue #28: the sequence script chooses the local-mode read expression
     # (one [Console]::In.ReadLine() per text step, read via the read_expr
     # parameter inside _sequence_step_block — the literal lives here only).

@@ -868,7 +868,9 @@ def test_capture_evidence_skips_the_ui_leg_when_the_frame_is_unchanged(
 
     # Prime: a changed frame, which DOES fetch the tree.
     monkeypatch.setattr(evidence, "run_guest_inner",
-                        lambda *a, **k: {"elements": 1, "truncated": False,
+                        lambda *a, **k: {"session_id": 5, "interactive": True,
+                                         "input_desktop": "Default",
+                                         "elements": 1, "truncated": False,
                                          "tree": {"name": "root"}})
     out = evidence.capture_evidence(
         unrestricted, "test-vm-1", 320, 240, ui_tree=True, cred=cred,

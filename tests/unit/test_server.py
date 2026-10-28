@@ -21,6 +21,11 @@ CRED_TOOLS = {
     "hyperv_diagnose_vm_access", "hyperv_repair_guest_access",
     "hyperv_guest_job_start", "hyperv_wait_guest_recovery",
     "hyperv_relay_start", "hyperv_capture_evidence",
+    # issue #29: every hyperv_ui_* tool follows the dual credential
+    # variants (issue #29 AC12)
+    "hyperv_ui_inspect", "hyperv_ui_find", "hyperv_ui_invoke",
+    "hyperv_ui_set_value", "hyperv_ui_wait_for", "hyperv_ui_focus",
+    "hyperv_ui_session_state", "hyperv_ui_helper_provision",
 }
 TOOL_NAMES = {
     "hyperv_list_vms", "hyperv_get_vm_info", "hyperv_start_vm", "hyperv_stop_vm",
@@ -61,6 +66,10 @@ TOOL_NAMES = {
     # issue #24: the durable-operation / event-cursor surface
     "hyperv_op_status", "hyperv_op_result",
     "hyperv_op_cancel", "hyperv_op_list", "hyperv_events",
+    # issue #29: the in-session UIA helper surface
+    "hyperv_ui_inspect", "hyperv_ui_find", "hyperv_ui_invoke",
+    "hyperv_ui_set_value", "hyperv_ui_wait_for", "hyperv_ui_focus",
+    "hyperv_ui_session_state", "hyperv_ui_helper_provision",
 }
 CONFIRM_TOOLS = {
     "hyperv_stop_vm", "hyperv_reset_vm", "hyperv_checkpoint_restore",
@@ -71,6 +80,8 @@ CONFIRM_TOOLS = {
     "hyperv_vm_firmware_set_boot_order", "hyperv_vm_tpm_set",
     "hyperv_vm_secureboot_set", "hyperv_vm_set_resolution",
     "hyperv_repair_guest_access",
+    # issue #29: provisioning is the only confirm-carrying ui tool
+    "hyperv_ui_helper_provision",
 }
 
 
@@ -100,7 +111,7 @@ def test_tool_inventory_registered(fresh_server):
     # tests/unit/test_f03_frame_stable.py::test_tool_registered_without_confirm);
     # 68 with issue #28's batched console sequence (C287 checkpoint:
     # tests/unit/test_f04_sequences.py::test_sequence_tool_schema_and_boot_epoch_reporting).
-    assert len(schemas) == 68
+    assert len(schemas) == 76
 
 
 def test_every_vm_tool_schema_has_vm_id(fresh_server):

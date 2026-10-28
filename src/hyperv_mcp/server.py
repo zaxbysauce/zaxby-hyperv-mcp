@@ -66,6 +66,7 @@ from . import (
     statestore,
     stdio_proxy,
     timing,
+    uia,
     vmident,
     vmlocks,
 )
@@ -2192,6 +2193,373 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     # (credentials were resolved and stored at start time).
 
     if creds_allowed:
+        # ------------------------------------------------------------------
+        # In-session UI Automation helper surface (issue #29, Workstream F
+        # PR 5). Read verbs need only VM policy + guest credentials; the
+        # mutating verbs require destructive.ui_input; provisioning requires
+        # destructive.ui_provision + confirm. All eight follow the dual
+        # credential variants.
+        # ------------------------------------------------------------------
+
+        def _run_ui_tool(tool, vm_name, category, fn, *args, **kwargs):
+            try:
+                with _audit(tool, vm_name, category):
+                    result = fn(*args, **kwargs)
+                if isinstance(result, dict) and not result.get("ok", True):
+                    enriched = errors.enrich_failure(result)
+                    enriched.setdefault("error_class",
+                                        result.get("error_class") or enriched["error_class"])
+                    return errors.failure_result(enriched)
+                return result
+            except UrlElicitationRequiredError:
+                raise
+            except Exception as exc:
+                return errors.failure_result(errors.envelope(exc))
+
+        @mcp.tool()
+        def hyperv_ui_inspect(
+            vm_name: str = "", selector: dict | None = None,
+            depth: int = 3, max_elements: int = 200,
+            username: str = "", password: str = "", vm_id: str = "",
+        ) -> dict:
+            """Bounded UIA element tree from the guest's interactive session
+            through the in-session helper (read verb).
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+            """
+            return _run_ui_tool(
+                "hyperv_ui_inspect", vm_name, "read", uia.inspect,
+                _cfg(), vm_name, _cred_args(username, password),
+                selector=selector, depth=depth, max_elements=max_elements,
+                vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_find(
+            vm_name: str = "", selector: dict | None = None,
+            element_id: str = "",
+            username: str = "", password: str = "", vm_id: str = "",
+        ) -> dict:
+            """Resolve element(s) by UIA selector or element_id through the
+            in-session helper (read verb).
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+            """
+            return _run_ui_tool(
+                "hyperv_ui_find", vm_name, "read", uia.find,
+                _cfg(), vm_name, _cred_args(username, password),
+                selector=selector, element_id=element_id or None, vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_invoke(
+            vm_name: str = "", selector: dict | None = None,
+            element_id: str = "", lease_id: str = "", fencing_token: int = 0,
+            username: str = "", password: str = "", vm_id: str = "",
+        ) -> dict:
+            """Invoke a UIA pattern on the target element. Needs
+            destructive.ui_input; a locked session refuses with
+            no_interactive_desktop.
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+            """
+            return _run_ui_tool(
+                "hyperv_ui_invoke", vm_name, "console_input", uia.invoke,
+                _cfg(), vm_name, _cred_args(username, password),
+                selector=selector, element_id=element_id or None, vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_set_value(
+            vm_name: str = "", selector: dict | None = None, value: str = "",
+            element_id: str = "", lease_id: str = "", fencing_token: int = 0,
+            username: str = "", password: str = "", vm_id: str = "",
+        ) -> dict:
+            """Set a UIA Value-pattern property. The value rides the framed
+            stdin payload (never script text or argv) and the result reports
+            the length set, never the value. Needs destructive.ui_input.
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+            """
+            return _run_ui_tool(
+                "hyperv_ui_set_value", vm_name, "console_input", uia.set_value,
+                _cfg(), vm_name, _cred_args(username, password),
+                selector=selector, value=value,
+                element_id=element_id or None, vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_wait_for(
+            vm_name: str = "", selector: dict | None = None, gone: bool = False,
+            timeout_s: int = 30,
+            username: str = "", password: str = "", vm_id: str = "",
+        ) -> dict:
+            """Wait for a selector to appear (or, with gone=true, disappear).
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+            """
+            return _run_ui_tool(
+                "hyperv_ui_wait_for", vm_name, "read", uia.wait_for,
+                _cfg(), vm_name, _cred_args(username, password),
+                selector=selector, gone=gone, timeout_s=timeout_s, vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_focus(
+            vm_name: str = "", selector: dict | None = None,
+            element_id: str = "", lease_id: str = "", fencing_token: int = 0,
+            username: str = "", password: str = "", vm_id: str = "",
+        ) -> dict:
+            """Focus the target element. Needs destructive.ui_input; a locked
+            session refuses with no_interactive_desktop.
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+            """
+            return _run_ui_tool(
+                "hyperv_ui_focus", vm_name, "console_input", uia.focus,
+                _cfg(), vm_name, _cred_args(username, password),
+                selector=selector, element_id=element_id or None, vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_session_state(
+            vm_name: str = "",
+            username: str = "", password: str = "", vm_id: str = "",
+        ) -> dict:
+            """Session and lock state, foreground window, and helper facts
+            (read verb).
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+            """
+            return _run_ui_tool(
+                "hyperv_ui_session_state", vm_name, "read", uia.session_state,
+                _cfg(), vm_name, _cred_args(username, password), vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_helper_provision(
+            vm_name: str = "", autologon: bool = True, confirm: bool = False,
+            username: str = "", password: str = "", vm_id: str = "",
+        ) -> dict:
+            """Install and start the in-session UIA helper: the helper script
+            ships into a ProgramData directory with an Administrators/SYSTEM
+            ACL, the autologon password stored ONLY as the LSA secret
+            DefaultPassword (no plain-text registry value), and a per-user
+            AtLogOn scheduled task (Interactive, RunLevel Highest).
+            Disposable test images only: provisioning configures automatic
+            logon with the guest credential.
+
+            Args:
+                vm_name: Name of the VM
+                confirm: Must be true (destructive.require_confirm)
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+            """
+            return _run_ui_tool(
+                "hyperv_ui_helper_provision", vm_name, "destructive",
+                uia.provision_helper,
+                _cfg(), vm_name, _cred_args(username, password),
+                autologon=autologon, confirm=confirm, vm_id=vm_id)
+
+    else:
+        # ------------------------------------------------------------------
+        # In-session UI Automation helper surface (issue #29, Workstream F
+        # PR 5). Read verbs need only VM policy + guest credentials; the
+        # mutating verbs require destructive.ui_input; provisioning requires
+        # destructive.ui_provision + confirm. All eight follow the dual
+        # credential variants.
+        # ------------------------------------------------------------------
+
+        def _run_ui_tool(tool, vm_name, category, fn, *args, **kwargs):
+            try:
+                with _audit(tool, vm_name, category):
+                    result = fn(*args, **kwargs)
+                if isinstance(result, dict) and not result.get("ok", True):
+                    enriched = errors.enrich_failure(result)
+                    enriched.setdefault("error_class",
+                                        result.get("error_class") or enriched["error_class"])
+                    return errors.failure_result(enriched)
+                return result
+            except UrlElicitationRequiredError:
+                raise
+            except Exception as exc:
+                return errors.failure_result(errors.envelope(exc))
+
+        @mcp.tool()
+        def hyperv_ui_inspect(  # type: ignore[misc]  # dual registration — see _register_tools
+            vm_name: str = "", selector: dict | None = None,
+            depth: int = 3, max_elements: int = 200,
+            vm_id: str = "",
+        ) -> dict:
+            """Bounded UIA element tree from the guest's interactive session
+            through the in-session helper (read verb).
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+            """
+            return _run_ui_tool(
+                "hyperv_ui_inspect", vm_name, "read", uia.inspect,
+                _cfg(), vm_name, credentials.resolve_guest(),
+                selector=selector, depth=depth, max_elements=max_elements,
+                vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_find(  # type: ignore[misc]  # dual registration — see _register_tools
+            vm_name: str = "", selector: dict | None = None,
+            element_id: str = "",
+            vm_id: str = "",
+        ) -> dict:
+            """Resolve element(s) by UIA selector or element_id through the
+            in-session helper (read verb).
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+            """
+            return _run_ui_tool(
+                "hyperv_ui_find", vm_name, "read", uia.find,
+                _cfg(), vm_name, credentials.resolve_guest(),
+                selector=selector, element_id=element_id or None, vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_invoke(  # type: ignore[misc]  # dual registration — see _register_tools
+            vm_name: str = "", selector: dict | None = None,
+            element_id: str = "", lease_id: str = "", fencing_token: int = 0,
+            vm_id: str = "",
+        ) -> dict:
+            """Invoke a UIA pattern on the target element. Needs
+            destructive.ui_input; a locked session refuses with
+            no_interactive_desktop.
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+            """
+            return _run_ui_tool(
+                "hyperv_ui_invoke", vm_name, "console_input", uia.invoke,
+                _cfg(), vm_name, credentials.resolve_guest(),
+                selector=selector, element_id=element_id or None, vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_set_value(  # type: ignore[misc]  # dual registration — see _register_tools
+            vm_name: str = "", selector: dict | None = None, value: str = "",
+            element_id: str = "", lease_id: str = "", fencing_token: int = 0,
+            vm_id: str = "",
+        ) -> dict:
+            """Set a UIA Value-pattern property. The value rides the framed
+            stdin payload (never script text or argv) and the result reports
+            the length set, never the value. Needs destructive.ui_input.
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+            """
+            return _run_ui_tool(
+                "hyperv_ui_set_value", vm_name, "console_input", uia.set_value,
+                _cfg(), vm_name, credentials.resolve_guest(),
+                selector=selector, value=value,
+                element_id=element_id or None, vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_wait_for(  # type: ignore[misc]  # dual registration — see _register_tools
+            vm_name: str = "", selector: dict | None = None, gone: bool = False,
+            timeout_s: int = 30,
+            vm_id: str = "",
+        ) -> dict:
+            """Wait for a selector to appear (or, with gone=true, disappear).
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+            """
+            return _run_ui_tool(
+                "hyperv_ui_wait_for", vm_name, "read", uia.wait_for,
+                _cfg(), vm_name, credentials.resolve_guest(),
+                selector=selector, gone=gone, timeout_s=timeout_s, vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_focus(  # type: ignore[misc]  # dual registration — see _register_tools
+            vm_name: str = "", selector: dict | None = None,
+            element_id: str = "", lease_id: str = "", fencing_token: int = 0,
+            vm_id: str = "",
+        ) -> dict:
+            """Focus the target element. Needs destructive.ui_input; a locked
+            session refuses with no_interactive_desktop.
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+            """
+            return _run_ui_tool(
+                "hyperv_ui_focus", vm_name, "console_input", uia.focus,
+                _cfg(), vm_name, credentials.resolve_guest(),
+                selector=selector, element_id=element_id or None, vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_session_state(  # type: ignore[misc]  # dual registration — see _register_tools
+            vm_name: str = "",
+            vm_id: str = "",
+        ) -> dict:
+            """Session and lock state, foreground window, and helper facts
+            (read verb).
+
+            Args:
+                vm_name: Name of the VM
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+            """
+            return _run_ui_tool(
+                "hyperv_ui_session_state", vm_name, "read", uia.session_state,
+                _cfg(), vm_name, credentials.resolve_guest(), vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_helper_provision(  # type: ignore[misc]  # dual registration — see _register_tools
+            vm_name: str = "", autologon: bool = True, confirm: bool = False,
+            vm_id: str = "",
+        ) -> dict:
+            """Install and start the in-session UIA helper: the helper script
+            ships into a ProgramData directory with an Administrators/SYSTEM
+            ACL, the autologon password stored ONLY as the LSA secret
+            DefaultPassword (no plain-text registry value), and a per-user
+            AtLogOn scheduled task (Interactive, RunLevel Highest).
+            Disposable test images only: provisioning configures automatic
+            logon with the guest credential.
+
+            Args:
+                vm_name: Name of the VM
+                confirm: Must be true (destructive.require_confirm)
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+            """
+            return _run_ui_tool(
+                "hyperv_ui_helper_provision", vm_name, "destructive",
+                uia.provision_helper,
+                _cfg(), vm_name, credentials.resolve_guest(),
+                autologon=autologon, confirm=confirm, vm_id=vm_id)
+
+
+    if creds_allowed:
 
         @mcp.tool()
         def hyperv_diagnose_vm_access(
@@ -2941,6 +3309,10 @@ TOOL_SCOPES: dict[str, str] = {
     "hyperv_console_mouse_move": "console", "hyperv_console_click": "console",
     "hyperv_console_button": "console", "hyperv_console_scroll": "console",
     "hyperv_console_sequence": "console",
+    "hyperv_ui_invoke": "console",
+    "hyperv_ui_set_value": "console",
+    "hyperv_ui_focus": "console",
+    "hyperv_ui_helper_provision": "console",
 }
 
 

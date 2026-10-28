@@ -198,7 +198,7 @@ def test_server_info_tool_registered():
             f"hyperv_server_info is not registered; tool inventory has "
             f"{len(names)} tools, expected 68 including hyperv_server_info"
         )
-        assert len(names) == 68, (
+        assert len(names) == 76, (
             f"tool inventory is {len(names)} tools; expected exactly 68 "
             "(66 including the issue-#24 op/event tools plus hyperv_server_info, "
             "issue #27's hyperv_console_wait_frame_stable, and issue #28's "

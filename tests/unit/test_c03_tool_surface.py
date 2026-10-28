@@ -94,6 +94,10 @@ TOOL_NAMES = {
     # issue #24: the durable-operation / event-cursor surface
     "hyperv_op_status", "hyperv_op_result",
     "hyperv_op_cancel", "hyperv_op_list", "hyperv_events",
+    # issue #29: the in-session UIA helper surface
+    "hyperv_ui_inspect", "hyperv_ui_find", "hyperv_ui_invoke",
+    "hyperv_ui_set_value", "hyperv_ui_wait_for", "hyperv_ui_focus",
+    "hyperv_ui_session_state", "hyperv_ui_helper_provision",
 }
 CRED_TOOLS = {
     "hyperv_configure_kdnet",
@@ -110,6 +114,15 @@ CRED_TOOLS = {
     "hyperv_wait_guest_recovery",
     "hyperv_relay_start",
     "hyperv_capture_evidence",
+    # issue #29: every hyperv_ui_* tool follows the dual credential variants
+    "hyperv_ui_inspect",
+    "hyperv_ui_find",
+    "hyperv_ui_invoke",
+    "hyperv_ui_set_value",
+    "hyperv_ui_wait_for",
+    "hyperv_ui_focus",
+    "hyperv_ui_session_state",
+    "hyperv_ui_helper_provision",
 }
 
 
@@ -237,8 +250,8 @@ def test_ac12_tool_inventory_per_credential_mode(tmp_path, fresh_server):
         f"extra={sorted(set(base_schemas) - TOOL_NAMES)}, "
         f"missing={sorted(TOOL_NAMES - set(base_schemas))}"
     )
-    assert len(base_schemas) == len(TOOL_NAMES) == 68, (
-        f"AC12: tool count {len(base_schemas)} != 68 "
+    assert len(base_schemas) == len(TOOL_NAMES) == 76, (
+        f"AC12: tool count {len(base_schemas)} != 76 "
         f"(66 through issue #24; 67 with issue #27's settle wait; "
         f"68 with issue #28's hyperv_console_sequence)"
     )
