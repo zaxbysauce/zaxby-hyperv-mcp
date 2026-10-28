@@ -181,6 +181,8 @@ def test_wmi_frame_precondition_envelope_without_input(wmi_path, unrestricted):
     assert out["ok"] is False
     assert out["error_class"] == "precondition"
     assert out["steps"] == []
+    assert out["precondition"] == "frame_hash", (
+        "the WMI envelope must carry the same kind discriminator as the PS lane")
     assert out["frame_hash"] == console._frame_hash(_pixels(640, 480, 7))
     assert out["hash_domain"] == console.HASH_DOMAIN
     assert be.calls.count("type_scancodes") == 0, "no input may execute on a mismatch"
@@ -197,6 +199,8 @@ def test_wmi_boot_epoch_precondition_envelope(wmi_path, unrestricted):
         expect_boot_epoch=1006)  # 6 s drift: outside ±5, inside any widened bound
     assert out["ok"] is False
     assert out["error_class"] == "precondition"
+    assert out["precondition"] == "boot_epoch", (
+        "the WMI envelope must carry the same kind discriminator as the PS lane")
     assert out["boot_epoch"] == 1000
     assert be.calls.count("type_scancodes") == 0
 

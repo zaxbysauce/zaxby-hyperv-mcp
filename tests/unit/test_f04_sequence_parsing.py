@@ -103,6 +103,11 @@ def test_wait_step_carries_stop_reason_and_hash(monkeypatch, unrestricted):
     assert step["ok"] is True
     assert step["stop_reason"] == "stable"
     assert step["frame_hash"] == wait_hash
+    # the emitted wait block carries the unchanged/deadline distinction (the
+    # supplied-baseline, never-differed case is distinguishable from an honest
+    # deadline — PRR-004 parity with the folded script)
+    assert "$waitStop = 'unchanged'" in stub.scripts[-1]
+    assert "not $moveSeen" in stub.scripts[-1]
 
 
 def test_unknown_record_carries_executed_prefix(monkeypatch, unrestricted):

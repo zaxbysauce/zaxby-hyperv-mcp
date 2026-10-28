@@ -1669,14 +1669,19 @@ def _scale_to_head(
     clicking at an unverified position. When frame dims are omitted (0), the
     coordinates are taken as head-space directly — and the head must then be
     available to bound them."""
+    # Defensive against contract-violating backends: head_resolution returns
+    # None per contract, but a (None, None) pair (VM off, head reporting
+    # nothing) must refuse here rather than TypeError mid-arithmetic — BOTH
+    # paths below touch the head (scaling or bound-clamping), and all call
+    # sites share this single guard.
+    if not head or not head[0] or not head[1]:
+        raise ConsoleError(
+            "display head resolution unavailable: pass frame_width/frame_height "
+            "equal to the display resolution to skip scaling"
+        )
     if frame_w or frame_h:
         if frame_w <= 0 or frame_h <= 0:
             raise ValueError("frame_width/frame_height must be positive when given")
-        if head is None:
-            raise ConsoleError(
-                "display head resolution unavailable: pass frame_width/frame_height "
-                "equal to the display resolution to skip scaling"
-            )
         hx = round(x * head[0] / frame_w)
         hy = round(y * head[1] / frame_h)
         return max(0, min(hx, head[0] - 1)), max(0, min(hy, head[1] - 1))
@@ -3322,11 +3327,8 @@ def _sequence_wmi_step(be, ref: vmident.VMRef, step: dict, width: int, height: i
         return {"ok": True}, t
     if action == "mouse_positional":
         head, t_head = be.head_resolution(ref.id)
-        # head_resolution returns None OR a (None, None) pair while the VM is
-        # off / the video head reports no resolution (wmiconsole contract) —
-        # both are the structured refusal, never a scale attempt.
-        if not head or not head[0] or not head[1]:
-            raise ConsoleError("display head resolution unavailable for positional mouse")
+        # head resolution refusal lives in _scale_to_head (single guard for
+        # every call site, including this lane).
         hx, hy = _scale_to_head(step["x"], step["y"], step["fw"], step["fh"], head)
         _r, t = be.mouse_move(ref.id, hx, hy)
         if step["click"]:
