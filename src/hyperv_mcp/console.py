@@ -86,6 +86,7 @@ import math
 import operator
 import os
 import re
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -101,6 +102,79 @@ from .config import Config
 
 _WMI_NS = "root\\virtualization\\v2"
 
+# ---------------------------------------------------------------------------
+# host-side name->GUID hint map (issue #77)
+#
+# The folded one-process transport (issue #18) resolves a by-name caller
+# INSIDE the op script, so the host does not know the GUID before the spawn
+# and the console-input lock key used to be the caller-supplied name — which
+# split the exclusion namespace against every by-id caller. The hint map
+# closes that without giving back the one-process property: every op whose
+# stdout already carries a `VMID=` line feeds it, and a hinted by-name call
+# locks on the GUID and embeds an in-script identity guard that fails closed
+# BEFORE any input when the live resolution disagrees (the stale-hint
+# invalidation rule — the guard plus refresh, never a TTL guess). With no
+# hint the call stays name-keyed until a feeding read/sequence operation
+# supplies one: raw input scripts neither emit nor parse VMID, so an
+# input-only by-name caller stays unhinted (disclosed residual, tracked in
+# the _input_lock docstring). Hints are process-local host-derived facts (a
+# GUID and the name that produced it — no secrets), bounded, and never
+# trusted for action: only the in-script compare against the live $vmTarget
+# decides identity.
+# ---------------------------------------------------------------------------
+
+_HINT_CAP = 512
+_NAME_GUID_HINTS: dict[str, str] = {}
+_HINT_LOCK = threading.Lock()
+
+
+def note_name_guid_hint(vm_name: str, guid: str) -> None:
+    """Record a host-side name->GUID hint (no spawn, no guest effect).
+
+    Called by every consumer of a folded script's `VMID=` stdout line and
+    available as a seam for hosts that already know the mapping. The GUID is
+    shape-validated; an invalid or empty value is ignored, never stored.
+    """
+    try:
+        guid = guestexec.validate_vm_guid(guid).lower()
+    except ValueError:
+        return
+    if not vm_name or not vm_name.strip():
+        return
+    key = vm_name.strip().casefold()
+    with _HINT_LOCK:
+        _NAME_GUID_HINTS.pop(key, None)
+        _NAME_GUID_HINTS[key] = guid
+        while len(_NAME_GUID_HINTS) > _HINT_CAP:
+            _NAME_GUID_HINTS.pop(next(iter(_NAME_GUID_HINTS)))
+
+
+def _hint_for(vm_name: str) -> str | None:
+    if not vm_name:
+        return None
+    with _HINT_LOCK:
+        return _NAME_GUID_HINTS.get(vm_name.strip().casefold())
+
+
+_IDENTITY_MARKER_PREFIX = "console input precondition: VM identity changed under name "
+
+
+def _identity_guard(expected_guid: str, vm_name: str) -> str:
+    """The fail-closed in-script identity check (issue #77): emitted right
+    after the resolver binds $vmTarget and BEFORE any input. On a stale hint
+    the child exits 1 with the marker on stderr before the op script's first
+    action; the host refreshes the hint from the resolved GUID the marker
+    carries (_check_input_rc)."""
+    quoted_name = pswindows.ps_quote(vm_name)
+    return (
+        'if ("$vmTarget" -ne ' + pswindows.ps_quote(expected_guid) + ") {\n"
+        "  [Console]::Error.WriteLine(" + pswindows.ps_quote(_IDENTITY_MARKER_PREFIX) +
+        " + " + quoted_name + " + " +
+        pswindows.ps_quote(": locked " + expected_guid + " but resolved ") + " + $vmTarget)\n"
+        "  exit 1\n"
+        "}\n"
+    )
+
 
 @contextmanager
 def _input_lock(ref: vmident.VMRef) -> Iterator[None]:
@@ -110,14 +184,17 @@ def _input_lock(ref: vmident.VMRef) -> Iterator[None]:
     outermost — no other site takes the console key, so no ordering cycle.
 
     Both keys are derived from ``ref.id``, which is the resolved GUID on the
-    WMI transport and on the by-id PowerShell path — but the caller-supplied
-    NAME on the by-name PowerShell path, where issue #18's fold resolves the
-    VM inside the op script and the GUID is not known host-side before the
-    spawn. Exclusion therefore holds between calls that address the VM the
-    same way; it does NOT span name-vs-GUID addressing, nor a by-name console
-    call against a write-scope op (which always resolves first and keys on
-    the GUID). That residual is disclosed in vmident and tracked in issue
-    #77.
+    WMI transport, on the by-id PowerShell path, and — since issue #77 — on the
+    by-name PowerShell path whenever the host-side hint map knows the name
+    (the ref then carries the hinted GUID and the op script carries the
+    in-script identity guard). With no hint the by-name path still keys on the
+    caller-supplied NAME, where issue #18's fold resolves the VM inside the op
+    script and the GUID is not known host-side before the spawn: the call
+    stays name-keyed until a feeding read/sequence operation supplies a hint
+    (raw input scripts neither emit nor parse VMID). Exclusion therefore spans
+    name-vs-GUID addressing once a hint exists; the unhinted window is the
+    disclosed residual, and the hinted-state guard keeps a stale hint from
+    ever ACTING on the wrong identity.
     """
     with vmlocks.vm_lock(ref.id, mode="read"), vmlocks.vm_lock((ref.id, "console")):
         yield
@@ -248,7 +325,9 @@ class ConsoleError(RuntimeError):
 # and the screenshot fallback chain loop inside the script.
 # ---------------------------------------------------------------------------
 
-def _vm_prelude(cfg: Config, vm_name: str, vm_id: str, timing: _PsTiming) -> tuple[str, vmident.VMRef]:
+def _vm_prelude(
+    cfg: Config, vm_name: str, vm_id: str, timing: _PsTiming, guarded: bool = False,
+) -> tuple[str, vmident.VMRef]:
     """(prelude, ref): the script lines binding $vmTarget, plus the ref the
     caller needs (the console-input lock key and the result's display name).
 
@@ -257,14 +336,23 @@ def _vm_prelude(cfg: Config, vm_name: str, vm_id: str, timing: _PsTiming) -> tup
     the preamble binds the validated GUID directly. By name: the caller-name
     validation and policy.vm_allowed run host-side with no spawn (a denied name
     still starts nothing), the PR #4 resolver is embedded unchanged, and the
-    GUID arrives on stdout when the process runs — so the ref carries the
-    caller-supplied name as its lock key.
-    """
+    GUID arrives on stdout when the process runs. With a host-side hint
+    (issue #77) the ref carries the hinted GUID — the lock keys on the
+    canonical identity — and `guarded=True` embeds the in-script identity
+    guard that fails closed on a stale hint before any input; with no hint the
+    ref carries the caller-supplied name as its lock key (the disclosed cold
+    path)."""
     if vm_id:
         ref = _resolve_ps(cfg, vm_name, vm_id, timing)
         return guestexec.vm_target_preamble(ref.id), ref
     vmident.checked_caller_name(vm_name)
     policy.vm_allowed(cfg, vm_name)
+    hint = _hint_for(vm_name) if guarded else None
+    if hint is not None:
+        return (
+            vmident.resolver_prelude(vm_name) + _identity_guard(hint, vm_name),
+            vmident.VMRef(id=hint, name=vm_name),
+        )
     return vmident.resolver_prelude(vm_name), vmident.VMRef(id=vm_name, name=vm_name)
 
 
@@ -697,6 +785,26 @@ def _check_rc(result: pswindows.PSResult, ctx: str) -> pswindows.PSResult:
         return pswindows.check_result(result, ctx)
     except RuntimeError as exc:
         raise ConsoleError(str(exc)) from None
+
+
+def _check_input_rc(
+    result: pswindows.PSResult, ctx: str, vm_name: str,
+) -> pswindows.PSResult:
+    """_check_rc for console_input ops, plus the issue #77 stale-hint
+    invalidation: when the folded script's identity guard fired (its marker
+    names the GUID the resolver actually produced), refresh the hint map from
+    that live GUID before surfacing the structured error, so the caller's
+    retry locks on the identity the VM really has."""
+    try:
+        return pswindows.check_result(result, ctx)
+    except RuntimeError as exc:
+        message = str(exc)
+        if "VM identity changed under name" in message:
+            match = re.search(
+                r"locked [0-9a-f-]+ but resolved ([0-9a-fA-F-]{36})", message)
+            if match:
+                note_name_guid_hint(vm_name, match.group(1))
+        raise ConsoleError(message) from None
 
 
 # ---------------------------------------------------------------------------
@@ -1561,14 +1669,19 @@ def _scale_to_head(
     clicking at an unverified position. When frame dims are omitted (0), the
     coordinates are taken as head-space directly — and the head must then be
     available to bound them."""
+    # Defensive against contract-violating backends: head_resolution returns
+    # None per contract, but a (None, None) pair (VM off, head reporting
+    # nothing) must refuse here rather than TypeError mid-arithmetic — BOTH
+    # paths below touch the head (scaling or bound-clamping), and all call
+    # sites share this single guard.
+    if not head or not head[0] or not head[1]:
+        raise ConsoleError(
+            "display head resolution unavailable: pass frame_width/frame_height "
+            "equal to the display resolution to skip scaling"
+        )
     if frame_w or frame_h:
         if frame_w <= 0 or frame_h <= 0:
             raise ValueError("frame_width/frame_height must be positive when given")
-        if head is None:
-            raise ConsoleError(
-                "display head resolution unavailable: pass frame_width/frame_height "
-                "equal to the display resolution to skip scaling"
-            )
         hx = round(x * head[0] / frame_w)
         hy = round(y * head[1] / frame_h)
         return max(0, min(hx, head[0] - 1)), max(0, min(hy, head[1] - 1))
@@ -1695,6 +1808,7 @@ def screenshot(
     _check_rc(result, "console screenshot")
     meta_lines, payload_line = _meta_lines(result)
     guid = _parse_guid(meta_lines, vm_name or ref.name)
+    note_name_guid_hint(vm_name or ref.name, guid)
     head = _parse_head(meta_lines)
     used = _parse_size(meta_lines, "USED") or (width, height)
     try:
@@ -1832,6 +1946,10 @@ def get_display_info(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
         _KEYBOARD_LOOKUP_SOFT,
         _MOUSE_SYNTHETIC,
         "$mouse = $m | Select-Object -First 1\n",
+        "$bootMs = $vm.OnTimeInMilliseconds\n",
+        "$bootEpoch = [int]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - "
+        "[int64]($bootMs / 1000))\n",
+        "Write-Output ('EPOCH=' + $bootEpoch)\n",
         "Write-Output ('VMID=' + $vmTarget)\n",
         "[PSCustomObject]@{\n",
         "    enabled_state = $vm.EnabledState\n",
@@ -1847,11 +1965,19 @@ def get_display_info(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
     _check_rc(result, "console display info")
     meta_lines, payload_line = _meta_lines(result)
     guid = _parse_guid(meta_lines, vm_name or ref.name)
+    note_name_guid_hint(vm_name or ref.name, guid)
     try:
         data = json.loads(payload_line)
     except json.JSONDecodeError as exc:
         raise ConsoleError(f"display info parse failed: {exc}") from None
     data["vm_id"] = guid
+    # The host-side boot boundary (issue #28): optional in the parse — folded
+    # responses without the EPOCH= line keep the legacy result shape.
+    if meta_lines.get("EPOCH"):
+        try:
+            data["boot_epoch"] = int(meta_lines["EPOCH"])
+        except ValueError:
+            pass
     data["guest_channel"] = "ps_direct_unverified"
     data["guest_channel_note"] = (
         "console input works from firmware/WinPE; PowerShell Direct requires a "
@@ -1894,7 +2020,7 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
             "timings": _wmi_timings(connect_ms, *phase_dicts),
         }
     timing = _PsTiming()
-    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing, guarded=True)
     chunks = [text[i:i + 512] for i in range(0, len(text), 512)]
     # Text rides stdin as UTF-8 base64 — never in the script, argv, or error
     # records (CLIXML errors quote script lines). Every chunk is one stdin line
@@ -1941,7 +2067,7 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
             payload_lines=len(chunks),
             timing=timing,
         )
-    _check_rc(result, "console type_text")
+    _check_input_rc(result, "console type_text", vm_name)
     return {
         "ok": True, "chunks": len(chunks), "chars": len(text), "vm_name": ref.name,
         "timings": _ps_timings(timing),
@@ -1983,7 +2109,7 @@ def press_key(
     if be is not None and ref is not None:
         return _send_scancodes_locked(cfg, ref, codes, be=be, connect_ms=connect_ms)
     timing = _PsTiming()
-    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing, guarded=True)
     return _send_scancodes_locked(cfg, ref, codes, timing=timing, prelude=prelude)
 
 
@@ -1996,7 +2122,7 @@ def key_combo(cfg: Config, vm_name: str = "", keys: list[str] | None = None, vm_
         codes = _scancodes_for_combo(keys)
         return _send_scancodes_locked(cfg, ref, codes, be=be, connect_ms=connect_ms)
     timing = _PsTiming()
-    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing, guarded=True)
     codes = _scancodes_for_combo(keys)
     return _send_scancodes_locked(cfg, ref, codes, timing=timing, prelude=prelude)
 
@@ -2012,7 +2138,7 @@ def type_scancodes(cfg: Config, vm_name: str = "", scancodes: list[int] | None =
     if be is not None and ref is not None:
         return _send_scancodes_locked(cfg, ref, list(scancodes), be=be, connect_ms=connect_ms)
     timing = _PsTiming()
-    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing, guarded=True)
     return _send_scancodes_locked(cfg, ref, list(scancodes), timing=timing, prelude=prelude)
 
 
@@ -2071,7 +2197,7 @@ def _send_scancodes_locked(
     ])
     with _input_lock(ref):
         result = _run(cfg, script, timeout_s=90, timing=timing)
-    _check_rc(result, "console scancodes")
+    _check_input_rc(result, "console scancodes", ref.name)
     sent = sum(len(chunk) for chunk in chunks)
     out = {"ok": True, "scancodes_sent": sent, "chunks": len(chunks), "vm_name": ref.name}
     if timing is not None:
@@ -2106,13 +2232,13 @@ def mouse_move(
             "timings": _wmi_timings(connect_ms, t_head, t),
         }
     timing = _PsTiming()
-    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing, guarded=True)
     script = _folded_mouse_positional_script(
         prelude, x, y, frame_width, frame_height, click=False, button=1
     )
     with _input_lock(ref):
         result = _run(cfg, script, timeout_s=90, timing=timing)
-    _check_rc(result, "console mouse move")
+    _check_input_rc(result, "console mouse move", vm_name)
     meta_lines, _payload = _meta_lines(result)
     hx = _require_int(meta_lines, "HEADX", "mouse move")
     hy = _require_int(meta_lines, "HEADY", "mouse move")
@@ -2154,14 +2280,14 @@ def click(
             "timings": _wmi_timings(connect_ms, t_head, t), **extra,
         }
     timing = _PsTiming()
-    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing, guarded=True)
     if x is not None and y is not None:
         script = _folded_mouse_positional_script(
             prelude, x, y, frame_width, frame_height, click=True, button=button
         )
         with _input_lock(ref):
             result = _run(cfg, script, timeout_s=90, timing=timing)
-        _check_rc(result, "console mouse click")
+        _check_input_rc(result, "console mouse click", vm_name)
         meta_lines, _payload = _meta_lines(result)
         hx = _require_int(meta_lines, "HEADX", "click")
         hy = _require_int(meta_lines, "HEADY", "click")
@@ -2199,7 +2325,7 @@ def mouse_button(
             "vm_name": ref.name, "timings": _wmi_timings(connect_ms, t),
         }
     timing = _PsTiming()
-    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing, guarded=True)
     return _mouse_op(
         cfg, ref, f"button {button} {'down' if is_down else 'up'}",
         prelude,
@@ -2223,7 +2349,7 @@ def scroll(cfg: Config, vm_name: str = "", delta: int = 0, vm_id: str = "") -> d
             "timings": _wmi_timings(connect_ms, t),
         }
     timing = _PsTiming()
-    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing, guarded=True)
     return _mouse_op(cfg, ref, f"scroll {delta}", prelude,
                      "SetScrollPosition", f"@{{ ScrollPositionDelta = {int(delta)} }}",
                      timing=timing)
@@ -2262,7 +2388,7 @@ def _mouse_op(
     ])
     with _input_lock(ref):
         result = _run(cfg, script, timeout_s=90, timing=timing)
-    _check_rc(result, f"console mouse {detail}")
+    _check_input_rc(result, f"console mouse {detail}", ref.name)
     out = {"ok": True, "operation": detail, "vm_name": ref.name}
     if extra:
         out.update(extra)
@@ -2593,6 +2719,7 @@ def capture_sequence(
         guid: str | None = None
         if "VMID" in meta:
             guid = _parse_guid(meta, ref.name)
+            note_name_guid_hint(ref.name, guid)
             if seq_guid is None:
                 seq_guid = guid
                 seq_pin_frame = i
@@ -2669,4 +2796,732 @@ def _capture_sequence_wmi(
         "width": width,
         "height": height,
         "timings": _wmi_timings(connect_ms, *phase_dicts),
+    }
+
+
+# ---------------------------------------------------------------------------
+# batched console action sequences (issue #28)
+#
+# One call = one validated plan = one lock acquisition = one PowerShell
+# process (after GUID resolution). Steps validate host-side BEFORE anything
+# spawns; preconditions (frame hash / boot epoch) evaluate INSIDE the locked
+# region and exit the script before the first input on a mismatch; text rides
+# stdin base64 exactly like type_text; the per-VM console WRITE key is held
+# for the whole plan, so raw input from any agent cannot interleave (the
+# actor is the lock itself — internal step execution never re-acquires).
+# ---------------------------------------------------------------------------
+
+_MAX_SEQUENCE_STEPS = 50
+
+# Uncertain-dispatch records (issue #28 AC-28.15): a timed-out leg leaves
+# "did the guest get the input?" unknowable, so the outcome is recorded once
+# under the caller's request correlation key and a retry with the same key
+# returns the recorded result instead of re-driving the guest. Process-local
+# by design — a NEW process cannot know the guest state either, and the
+# bounded map keeps a churning key space from growing without limit.
+_UNKNOWN_RESULTS: dict[str, dict] = {}
+_UNKNOWN_LOCK = threading.Lock()
+_UNKNOWN_CAP = 256
+
+
+def _record_unknown(request_key: str, result: dict) -> None:
+    with _UNKNOWN_LOCK:
+        _UNKNOWN_RESULTS.pop(request_key, None)
+        _UNKNOWN_RESULTS[request_key] = result
+        while len(_UNKNOWN_RESULTS) > _UNKNOWN_CAP:
+            _UNKNOWN_RESULTS.pop(next(iter(_UNKNOWN_RESULTS)))
+
+
+def _lookup_unknown(request_key: str) -> dict | None:
+    with _UNKNOWN_LOCK:
+        recorded = _UNKNOWN_RESULTS.get(request_key)
+        return dict(recorded) if recorded is not None else None
+
+
+def _step_fail(index: int, detail: str) -> ValueError:
+    return ValueError(f"step {index}: {detail}")
+
+
+def _validate_sequence_steps(
+    steps: list[dict], call_timeout_s: int,
+) -> list[dict]:
+    """Normalize + validate the whole plan before anything spawns (frozen
+    contract: every rejection names `step <i>`, the count cap names `steps`,
+    and wait budgets are capped by the call timeout). Encoding mirrors the
+    single-step tools so the semantics cannot drift."""
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("steps must be a non-empty list of at most 50 step dicts")
+    if len(steps) > _MAX_SEQUENCE_STEPS:
+        raise ValueError(
+            f"steps is limited to {_MAX_SEQUENCE_STEPS} per sequence; got {len(steps)}")
+    plan: list[dict] = []
+    wait_budget_total = 0
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            raise _step_fail(i, "every step must be a dict")
+        action = step.get("action")
+        try:
+            if action == "press_key":
+                key = step.get("key")
+                if not isinstance(key, str) or not key:
+                    raise ValueError("key is required")
+                modifiers = step.get("modifiers") or []
+                if not isinstance(modifiers, list) or not all(
+                        isinstance(m, str) for m in modifiers):
+                    raise ValueError("modifiers must be a list of strings")
+                if modifiers:
+                    held = [m for m in modifiers if m.strip().lower() in _COMBO_MODIFIERS]
+                    tapped = [key] + [m for m in modifiers if m not in held]
+                    codes = _combo_codes(held, tapped)
+                else:
+                    codes = _scancodes_for_key(key)
+                plan.append({"action": "codes", "codes": codes})
+            elif action == "key_combo":
+                keys = step.get("keys")
+                if not isinstance(keys, list) or not keys or not all(
+                        isinstance(k, str) for k in keys):
+                    raise ValueError("keys must be a non-empty list of strings")
+                plan.append({"action": "codes", "codes": _scancodes_for_combo(keys)})
+            elif action == "type_text":
+                text = step.get("text")
+                if not isinstance(text, str) or not text:
+                    raise ValueError("text is required")
+                if any(ord(c) > 127 for c in text):
+                    raise ValueError("text must be ASCII")
+                plan.append({"action": "text", "text": text})
+            elif action == "type_scancodes":
+                raw_codes = step.get("scancodes")
+                if not isinstance(raw_codes, list) or not raw_codes:
+                    raise ValueError("scancodes list is required")
+                for code in raw_codes:
+                    if type(code) is not int or not (0 <= code <= 255):
+                        raise ValueError(
+                            f"scancodes must be integers 0..255; got {code!r}")
+                plan.append({"action": "codes", "codes": list(raw_codes)})
+            elif action == "mouse_move":
+                x, y = step.get("x"), step.get("y")
+                if x is None or y is None:
+                    raise ValueError("x and y are required")
+                fw = int(step.get("frame_width") or 0)
+                fh = int(step.get("frame_height") or 0)
+                if (fw or fh) and (fw <= 0 or fh <= 0):
+                    raise ValueError("frame_width/frame_height must be positive when given")
+                plan.append({"action": "mouse_positional", "x": int(x), "y": int(y),
+                             "fw": fw, "fh": fh, "click": False, "button": 1})
+            elif action == "click":
+                x, y = step.get("x"), step.get("y")
+                if x is None or y is None:
+                    if x is not None or y is not None:
+                        raise ValueError("x and y must be given together")
+                    button = step.get("button", 1)
+                    if button not in (1, 2):
+                        raise ValueError("button must be 1 (left) or 2 (right)")
+                    plan.append({"action": "mouse_click_here", "button": button})
+                else:
+                    button = step.get("button", 1)
+                    if button not in (1, 2):
+                        raise ValueError("button must be 1 (left) or 2 (right)")
+                    fw = int(step.get("frame_width") or 0)
+                    fh = int(step.get("frame_height") or 0)
+                    if (fw or fh) and (fw <= 0 or fh <= 0):
+                        raise ValueError(
+                            "frame_width/frame_height must be positive when given")
+                    plan.append({"action": "mouse_positional", "x": int(x), "y": int(y),
+                                 "fw": fw, "fh": fh, "click": True, "button": button})
+            elif action == "mouse_button":
+                button = step.get("button", 1)
+                if button not in (1, 2):
+                    raise ValueError("button must be 1 (left) or 2 (right)")
+                plan.append({"action": "button", "button": button,
+                             "is_down": bool(step.get("is_down", False))})
+            elif action == "scroll":
+                if "delta" not in step:
+                    raise ValueError("delta is required")
+                plan.append({"action": "scroll", "delta": int(step["delta"])})
+            elif action == "wait_frame_stable":
+                # PRR-005: the summed wait budgets must fit the call deadline —
+                # a plan whose worst case exceeds it deterministically dies
+                # mid-plan into the non-replayable UNKNOWN class.
+                if wait_budget_total + min(step.get("timeout_s", call_timeout_s) or 0,
+                                           call_timeout_s) > call_timeout_s:
+                    raise ValueError(
+                        f"wait budgets total more than the call timeout_s="
+                        f"{call_timeout_s}; raise timeout_s or shorten the waits")
+                wait_budget_total += min(step.get("timeout_s", call_timeout_s) or 0,
+                                         call_timeout_s)
+                stable_ms = step.get("stable_ms")
+                if type(stable_ms) is not int or stable_ms < 1:
+                    raise ValueError("stable_ms must be a positive integer")
+                timeout = step.get("timeout_s", call_timeout_s)
+                if type(timeout) is not int or timeout < 1:
+                    raise ValueError("timeout_s must be a positive integer")
+                capped = min(timeout, call_timeout_s)
+                if stable_ms >= capped * 1000:
+                    raise ValueError(
+                        "stable_ms must be less than the capped wait timeout or the "
+                        "quiet window can never be observed")
+                interval_ms = step.get("interval_ms", 250)
+                if type(interval_ms) is not int or interval_ms < 1:
+                    raise ValueError("interval_ms must be a positive integer")
+                baseline = step.get("baseline_hash", "")
+                if baseline and not re.fullmatch(r"[0-9a-f]{64}", baseline):
+                    raise ValueError("baseline_hash must be empty or 64-char hex sha256")
+                plan.append({"action": "wait_stable", "stable_ms": stable_ms,
+                             "timeout_s": capped, "interval_ms": interval_ms,
+                             "baseline": baseline})
+            else:
+                raise ValueError(f"unknown action {action!r}")
+        except ValueError as exc:
+            raise _step_fail(i, str(exc)) from None
+        except (TypeError, KeyError, AttributeError) as exc:
+            raise _step_fail(i, f"invalid step fields: {exc}") from None
+    return plan
+
+
+def _sequence_step_block(
+    index: int, step: dict, read_expr: str, seq_width: int, seq_height: int,
+) -> list[str]:
+    """One unrolled step block: guarded by $seqFailed (stop-on-failure; later
+    steps report SKIPPED, never silently dropped), body in try/catch, result
+    on one STEP= stdout line (ERR rides base64 so CLIXML cannot mangle it)."""
+    body: list[str]
+    if step["action"] == "codes":
+        body = [
+            "        $r = Invoke-CimMethod -InputObject $kb -MethodName TypeScancodes "
+            "-ErrorAction Stop -Arguments @{ ScanCodes = [byte[]]@("
+            + ",".join(str(c) for c in step["codes"]) + ") }",
+            "        if ($r.ReturnValue -ne 0) { throw ('TypeScancodes failed with "
+            "ReturnValue=' + $r.ReturnValue) }",
+        ]
+    elif step["action"] == "text":
+        body = [
+            "        $text = [System.Text.Encoding]::UTF8.GetString("
+            "[Convert]::FromBase64String(" + read_expr + "))",
+            "        $r = Invoke-CimMethod -InputObject $kb -MethodName TypeText "
+            "-ErrorAction Stop -Arguments @{ AsciiText = $text }",
+            "        if ($r.ReturnValue -ne 0) { throw ('TypeText failed with "
+            "ReturnValue=' + $r.ReturnValue) }",
+        ]
+    elif step["action"] == "mouse_positional":
+        body = [
+            "        $x = " + str(step["x"]),
+            "        $y = " + str(step["y"]),
+            "        $fw = " + str(step["fw"]),
+            "        $fh = " + str(step["fh"]),
+            "        if ((-not $vh) -or (-not $vh.CurrentHorizontalResolution) "
+            "-or (-not $vh.CurrentVerticalResolution)) { throw 'display head resolution "
+            "unavailable for positional mouse input' }",
+            "        $hw = $vh.CurrentHorizontalResolution",
+            "        $hv = $vh.CurrentVerticalResolution",
+            "        if ($fw -and $fh) {",
+            "            $hx = [math]::Round($x * $hw / $fw)",
+            "            $hy = [math]::Round($y * $hv / $fh)",
+            "        } else { $hx = $x; $hy = $y }",
+            "        $hx = [math]::Max(0, [math]::Min($hx, $hw - 1))",
+            "        $hy = [math]::Max(0, [math]::Min($hy, $hv - 1))",
+            "        $r0 = Invoke-CimMethod -InputObject $m -MethodName SetAbsolutePosition "
+            "-ErrorAction Stop -Arguments @{ HorizontalPosition = $hx; VerticalPosition = $hy }",
+            "        if ($r0.ReturnValue -ne 0) { throw ('SetAbsolutePosition failed with "
+            "ReturnValue=' + $r0.ReturnValue) }",
+        ]
+        if step["click"]:
+            body += [
+                "        $r = Invoke-CimMethod -InputObject $m -MethodName ClickButton "
+                "-ErrorAction Stop -Arguments @{ ButtonIndex = " + str(step["button"]) + " }",
+                "        if ($r.ReturnValue -ne 0) { throw ('ClickButton failed with "
+                "ReturnValue=' + $r.ReturnValue) }",
+            ]
+    elif step["action"] == "mouse_click_here":
+        body = [
+            "        $r = Invoke-CimMethod -InputObject $m -MethodName ClickButton "
+            "-ErrorAction Stop -Arguments @{ ButtonIndex = " + str(step["button"]) + " }",
+            "        if ($r.ReturnValue -ne 0) { throw ('ClickButton failed with "
+            "ReturnValue=' + $r.ReturnValue) }",
+        ]
+    elif step["action"] == "button":
+        body = [
+            "        $r = Invoke-CimMethod -InputObject $m -MethodName SetButtonState "
+            "-ErrorAction Stop -Arguments @{ ButtonIndex = " + str(step["button"])
+            + "; IsDown = $" + ("true" if step["is_down"] else "false") + " }",
+            "        if ($r.ReturnValue -ne 0) { throw ('SetButtonState failed with "
+            "ReturnValue=' + $r.ReturnValue) }",
+        ]
+    elif step["action"] == "scroll":
+        body = [
+            "        $r = Invoke-CimMethod -InputObject $m -MethodName SetScrollPosition "
+            "-ErrorAction Stop -Arguments @{ ScrollPositionDelta = "
+            + str(step["delta"]) + " }",
+            "        if ($r.ReturnValue -ne 0) { throw ('SetScrollPosition failed with "
+            "ReturnValue=' + $r.ReturnValue) }",
+        ]
+    else:  # wait_stable
+        max_polls = math.ceil(step["timeout_s"] * 1000 / step["interval_ms"])
+        body = [
+            "        $deadline = (Get-Date).AddSeconds(" + str(step["timeout_s"]) + ")",
+            "        $polls = 0",
+            "        $baseline = " + pswindows.ps_quote(step["baseline"]),
+            "        $refHash = " + pswindows.ps_quote(step["baseline"]),
+            "        $lastHash = ''",
+            "        $lastChange = $null",
+            "        $moveSeen = $false",
+            "        $sha = New-Object Security.Cryptography.SHA256Managed",
+            "        $waitStop = $null",
+            "        while ($polls -lt " + str(max_polls) + ") {",
+            "            if ((Get-Date) -ge $deadline) {",
+            "                if (($baseline -ne '') -and ($polls -gt 0) -and (-not $moveSeen)) "
+            "{ $waitStop = 'unchanged' } else { $waitStop = 'deadline' }",
+            "                break",
+            "            }",
+            "            $wr = Invoke-CimMethod -InputObject $svc -MethodName "
+            "GetVirtualSystemThumbnailImage -ErrorAction Stop -Arguments @{",
+            "                TargetSystem = $vm",
+            "                WidthPixels  = " + str(seq_width),
+            "                HeightPixels = " + str(seq_height),
+            "            }",
+            "            if ($wr.ReturnValue -ne 0) { throw "
+            "('GetVirtualSystemThumbnailImage failed with ReturnValue=' + $wr.ReturnValue) }",
+            "            $polls++",
+            "            $pxLen = 0; if ($wr.ImageData -ne $null) "
+            "{ $pxLen = $wr.ImageData.Length }",
+            "            $pxWant = 4 + (" + str(seq_width) + " * " + str(seq_height) + " * 2)",
+            "            if ($pxLen -ne $pxWant) { throw ('thumbnail payload length "
+            "mismatch: got ' + $pxLen + ' bytes, expected ' + $pxWant) }",
+            "            $hash = ([System.BitConverter]::ToString("
+            "$sha.ComputeHash($wr.ImageData, 4, $wr.ImageData.Length - 4)) "
+            "-replace '-','').ToLowerInvariant()",
+            "            $lastHash = $hash",
+            "            $now = Get-Date",
+            "            if ($refHash -eq '') { $refHash = $hash; $lastChange = $now }",
+            "            elseif ($hash -ne $refHash) { $refHash = $hash; "
+            "$lastChange = $now; $moveSeen = $true }",
+            "            if (($null -ne $lastChange) -and ((($now) - ($lastChange))"
+            ".TotalMilliseconds -ge " + str(step["stable_ms"]) + ")) "
+            "{ $waitStop = 'stable'; break }",
+            "            if ($polls -ge " + str(max_polls) + " -or (Get-Date) -ge $deadline) {",
+            "                if (($baseline -ne '') -and ($polls -gt 0) -and (-not $moveSeen)) "
+            "{ $waitStop = 'unchanged' } else { $waitStop = 'deadline' }",
+            "                break",
+            "            }",
+            "            Start-Sleep -Milliseconds " + str(step["interval_ms"]),
+            "        }",
+            "        if (-not $waitStop) { $waitStop = 'deadline' }",
+            "        Write-Output ('STEP=" + str(index) + " OK=1 STOP=' + $waitStop "
+            "+ ' HASH=' + $lastHash)",
+        ]
+    lines = ["    if (-not $seqFailed) {", "      try {"]
+    if step["action"] != "wait_stable":
+        lines += body + [f"        Write-Output ('STEP={index} OK=1')"]
+    else:
+        lines += body
+    lines += [
+        "      } catch {",
+        "        $seqFailed = $true",
+        f"        Write-Output ('STEP={index} OK=0 ERR=' + [Convert]::ToBase64String("
+        "[Text.Encoding]::UTF8.GetBytes($_.Exception.Message)))",
+        "      }",
+        f"    }} else {{ Write-Output ('STEP={index} SKIPPED=1') }}",
+    ]
+    return lines
+
+
+def _sequence_script(
+    prelude: str, plan: list[dict], expect_frame_hash: str, expect_boot_epoch: int | None,
+    timeout_s: int, width: int, height: int, remote: bool,
+) -> str:
+    """The one folded sequence process (frozen protocol): prelude(+identity
+    guard) -> lookups -> boot epoch -> VMID=/EPOCH= emission -> preconditions
+    (exit before any input on mismatch) -> the unrolled step blocks."""
+    uses_kb = any(s["action"] in ("codes", "text") for s in plan)
+    uses_mouse = any(s["action"].startswith("mouse") or s["action"] == "button"
+                     or s["action"] == "scroll" for s in plan)
+    uses_positional = any(s["action"] == "mouse_positional" for s in plan)
+    uses_frames = bool(expect_frame_hash) or any(
+        s["action"] == "wait_stable" for s in plan)
+    text_steps = [s for s in plan if s["action"] == "text"]
+    parts = [prelude, _VM_LOOKUP]
+    if uses_kb:
+        parts.append(_KEYBOARD_LOOKUP)
+    if uses_mouse:
+        parts += [
+            _MOUSE_SYNTHETIC,
+            "if (-not $m) {",
+            _MOUSE_PS2,
+            "    if (-not $m) { throw 'no mouse device associated with the VM' }",
+            "}",
+        ]
+    if uses_positional:
+        parts.append(_HEAD_LOOKUP)
+    if uses_frames:
+        parts.append(
+            "$svc = Get-CimInstance -Namespace '" + _WMI_NS + "' "
+            "-ClassName Msvm_VirtualSystemManagementService")
+    # Boot epoch (issue #28): host WMI, credential-free — OnTimeInMilliseconds
+    # relative to the host clock, so it is meaningful in firmware/WinPE.
+    parts += [
+        "$bootMs = $vm.OnTimeInMilliseconds",
+        "$bootEpoch = [int]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - "
+        "[int64]($bootMs / 1000))",
+        "Write-Output ('VMID=' + $vmTarget)",
+        "Write-Output ('EPOCH=' + $bootEpoch)",
+    ]
+    if expect_frame_hash:
+        parts += [
+            "        $r = Invoke-CimMethod -InputObject $svc -MethodName "
+            "GetVirtualSystemThumbnailImage -ErrorAction Stop -Arguments @{",
+            "            TargetSystem = $vm",
+            "            WidthPixels  = " + str(width),
+            "            HeightPixels = " + str(height),
+            "        }",
+            "        if ($r.ReturnValue -ne 0) { throw ('GetVirtualSystemThumbnailImage "
+            "failed with ReturnValue=' + $r.ReturnValue) }",
+            "        $pxLen = 0; if ($r.ImageData -ne $null) { $pxLen = $r.ImageData.Length }",
+            "        $pxWant = 4 + (" + str(width) + " * " + str(height) + " * 2)",
+            "        if ($pxLen -ne $pxWant) { throw ('thumbnail payload length mismatch: "
+            "got ' + $pxLen + ' bytes, expected ' + $pxWant) }",
+            "        $sha0 = New-Object Security.Cryptography.SHA256Managed",
+            "        $hash0 = ([System.BitConverter]::ToString("
+            "$sha0.ComputeHash($r.ImageData, 4, $r.ImageData.Length - 4)) "
+            "-replace '-','').ToLowerInvariant()",
+            "        if ($hash0 -ne " + pswindows.ps_quote(expect_frame_hash) + ") {",
+            "            [Console]::Error.WriteLine('console sequence precondition "
+            "mismatch: frame_hash expected " + expect_frame_hash + " actual ' + $hash0)",
+            "            exit 1",
+            "        }",
+        ]
+    if expect_boot_epoch is not None:
+        parts += [
+            "        if ([math]::Abs($bootEpoch - " + str(int(expect_boot_epoch)) + ") -gt 5) {",
+            "            [Console]::Error.WriteLine('console sequence precondition "
+            "mismatch: boot_epoch expected " + str(int(expect_boot_epoch)) +
+            " actual ' + $bootEpoch)",
+            "            exit 1",
+            "        }",
+        ]
+    # Text rides stdin, one base64 line per text step (the type_text rule).
+    read_expr = "$payloads[$ti]" if remote else "[Console]::In.ReadLine()"
+    if text_steps:
+        if remote:
+            parts.append(
+                "$payloads = @("
+                + ", ".join(f"$__p{i}" for i in range(len(text_steps))) + ")")
+        parts.append("$ti = 0")
+    parts.append("$seqFailed = $false")
+    for i, step in enumerate(plan):
+        parts += _sequence_step_block(i, step, read_expr, width, height)
+        if step["action"] == "text":
+            parts.append("    $ti++")
+    return "\n".join(parts)
+
+
+def _parse_sequence_steps(stdout: str) -> list[dict]:
+    """Repeated STEP= records from RAW stdout lines (the single-value-per-key
+    `_meta_lines` dict cannot carry them)."""
+    steps: list[dict] = []
+    for line in stdout.splitlines():
+        m = re.match(
+            r"STEP=(\d+) (OK=1|OK=0 ERR=([A-Za-z0-9+/=]+)|SKIPPED=1)( STOP=(\w+)"
+            r"( HASH=([0-9a-f]*))?)?", line.strip())
+        if not m:
+            continue
+        entry: dict = {"index": int(m.group(1))}
+        if m.group(3):  # OK=0 ERR=<b64>
+            try:
+                entry["error"] = base64.b64decode(m.group(3)).decode("utf-8", "replace")
+            except Exception:
+                entry["error"] = "step failed"
+            entry["ok"] = False
+        elif "SKIPPED=1" in (m.group(2) or ""):
+            entry["skipped"] = True
+        else:
+            entry["ok"] = True
+        if m.group(5):
+            entry["stop_reason"] = m.group(5)
+        if m.group(7):
+            entry["frame_hash"] = m.group(7)
+        steps.append(entry)
+    return steps
+
+
+def _run_sequence_wmi(
+    be, connect_ms: float, ref: vmident.VMRef, plan: list[dict],
+    expect_frame_hash: str, expect_boot_epoch: int | None,
+    timeout_s: int, width: int, height: int,
+) -> dict:
+    """run_sequence over the in-process WMI backend: the same contract as the
+    folded script — ONE lock acquisition spanning the boot-epoch read, the
+    preconditions, and every step (nothing a raw input could do can slip
+    between a passed precondition and the first input), per-step results,
+    stop-on-failure."""
+    started = time.monotonic()
+    phase_dicts: list[dict] = []
+    steps_out: list[dict] = []
+    try:
+        with _input_lock(ref):
+            try:
+                boot_epoch: int | None = be.boot_epoch(ref.id)
+            except (wmiconsole.WMIError, AttributeError) as exc:
+                raise ConsoleError(str(exc)) from None
+            if expect_boot_epoch is not None and (
+                    boot_epoch is None or abs(boot_epoch - int(expect_boot_epoch)) > 5):
+                return {
+                    "ok": False, "error_class": "precondition", "steps": [],
+                    "precondition": "boot_epoch",
+                    "vm_name": ref.name, "boot_epoch": boot_epoch,
+                    "timings": _wmi_timings(connect_ms),
+                }
+            if expect_frame_hash:
+                raw, t = be.capture(ref.id, width, height)
+                phase_dicts.append(t)
+                actual = _frame_hash(raw)
+                if actual != expect_frame_hash:
+                    return {
+                        "ok": False, "error_class": "precondition", "steps": [],
+                        "precondition": "frame_hash",
+                        "vm_name": ref.name, "boot_epoch": boot_epoch,
+                        "frame_hash": actual, "hash_domain": HASH_DOMAIN,
+                        "timings": _wmi_timings(connect_ms, *phase_dicts),
+                    }
+            for i, step in enumerate(plan):
+                try:
+                    _r, t = _sequence_wmi_step(be, ref, step, width, height)
+                except (ConsoleError, wmiconsole.WMIError,
+                        wmiconsole.BackendUnavailable) as exc:
+                    # Per-step failure (issue-28 contract, both transports): the
+                    # failed step is reported and the rest skipped — never a
+                    # whole-call raise that drops the executed prefix.
+                    phase_dicts.append({})
+                    steps_out.append({"index": i, "ok": False, "error": str(exc)})
+                    for j in range(i + 1, len(plan)):
+                        steps_out.append({"index": j, "skipped": True})
+                    break
+                phase_dicts.append(t)
+                entry: dict = {"index": i, **_r}
+                steps_out.append(entry)
+                if not entry.get("ok", True):
+                    for j in range(i + 1, len(plan)):
+                        steps_out.append({"index": j, "skipped": True})
+                    break
+    except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
+        raise ConsoleError(str(exc)) from None
+    out: dict = {
+        "ok": True, "vm_name": ref.name,
+        "steps": steps_out,
+        "elapsed_ms": int((time.monotonic() - started) * 1000),
+        "timings": _wmi_timings(connect_ms, *phase_dicts),
+    }
+    if boot_epoch is not None:
+        out["boot_epoch"] = boot_epoch
+    return out
+
+
+def _sequence_wmi_step(be, ref: vmident.VMRef, step: dict, width: int, height: int):
+    """One validated plan step over the WMI backend primitives (lock-free:
+    the caller holds the console lock). Waits reuse the frozen stable-poll
+    state machine shape; deadline is a reported stop reason, not a failure."""
+    action = step["action"]
+    if action == "codes":
+        _r, t = be.type_scancodes(ref.id, step["codes"])
+        return {"ok": True}, t
+    if action == "text":
+        _r, t = be.type_text(ref.id, step["text"])
+        return {"ok": True}, t
+    if action == "mouse_positional":
+        head, t_head = be.head_resolution(ref.id)
+        # head resolution refusal lives in _scale_to_head (single guard for
+        # every call site, including this lane).
+        hx, hy = _scale_to_head(step["x"], step["y"], step["fw"], step["fh"], head)
+        _r, t = be.mouse_move(ref.id, hx, hy)
+        if step["click"]:
+            _r2, t2 = be.mouse_click(ref.id, step["button"], hx, hy)
+            return {"ok": True, "head_x": hx, "head_y": hy}, {**t_head, **t2}
+        return {"ok": True, "head_x": hx, "head_y": hy}, {**t_head, **t}
+    if action == "mouse_click_here":
+        _r, t = be.mouse_click(ref.id, step["button"])
+        return {"ok": True}, t
+    if action == "button":
+        _r, t = be.mouse_button(ref.id, step["button"], step["is_down"])
+        return {"ok": True}, t
+    if action == "scroll":
+        _r, t = be.mouse_scroll(ref.id, step["delta"])
+        return {"ok": True}, t
+    # wait_stable: poll be.capture under the same in-lock region, mirroring
+    # _wait_frame_stable_wmi's transition table.
+    max_polls = math.ceil(step["timeout_s"] * 1000 / step["interval_ms"])
+    polls, last_hash, raw = 0, "", None
+    baseline = step["baseline"]
+    ref_hash = baseline
+    last_change: float | None = None
+    move_seen = False
+    started = time.monotonic()
+    stop = "deadline"
+    while polls < max_polls:
+        if time.monotonic() - started >= step["timeout_s"]:
+            stop = "deadline"
+            break
+        raw, t = be.capture(ref.id, width, height)
+        polls += 1
+        h = _frame_hash(raw)
+        last_hash = h
+        now = time.monotonic()
+        if not ref_hash:
+            ref_hash = h
+            last_change = now
+        elif h != ref_hash:
+            ref_hash = h
+            last_change = now
+            move_seen = True
+        if last_change is not None and (now - last_change) * 1000 >= step["stable_ms"]:
+            stop = "stable"
+            break
+        if polls >= max_polls or time.monotonic() - started >= step["timeout_s"]:
+            # Transition table shared with the folded script AND the
+            # in-sequence PS wait block (which emits the same unchanged/
+            # deadline distinction since the PRR-004 fix): "my input did
+            # nothing" (supplied baseline, never differed) is distinguishable
+            # from an honest deadline.
+            if baseline and polls > 0 and not move_seen:
+                stop = "unchanged"
+            else:
+                stop = "deadline"
+            break
+        time.sleep(step["interval_ms"] / 1000.0)
+    entry = {"ok": True, "stop_reason": stop}
+    if last_hash:
+        entry["frame_hash"] = last_hash
+    return entry, {}
+
+
+def run_sequence(
+    cfg: Config, vm_name: str = "", steps: list[dict] | None = None, vm_id: str = "",
+    expect_frame_hash: str = "", expect_boot_epoch: int | None = None,
+    timeout_s: int = 60, request_key: str = "", width: int = 640, height: int = 480,
+) -> dict:
+    """Run a validated batch of console actions as ONE plan: host-side
+    validation of every step before anything spawns, ONE per-VM console lock
+    acquisition for the whole sequence, ONE PowerShell process after GUID
+    resolution, preconditions (frame hash / boot epoch) evaluated inside the
+    locked region before the first input, per-step results with
+    stop-on-failure (later steps reported skipped, never dropped), and text
+    riding stdin base64 exactly like type_text. Bounded: at most 50 steps,
+    every wait budget capped by `timeout_s`, PowerShell child deadline at
+    `timeout_s + 15`. Policy: console_input category; no confirm parameter.
+
+    With `request_key`, an uncertain post-dispatch outcome (a timed-out leg)
+    is recorded once as UNKNOWN and a retry with the same key returns the
+    recorded result instead of re-driving the guest (no automatic replay).
+    request_key is a caller-managed namespace — keep keys unique per plan; the
+    replay lookup runs before addressing/policy checks. UNKNOWN recording and
+    deadline enforcement are PowerShell-transport behaviors (the WMI transport
+    has no per-call timeout and does not record UNKNOWN).
+
+    vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
+    Returns: {ok, vm_name, boot_epoch, steps: [{index, ok, ...}]} or
+    {ok: false, error_class: "precondition"|"unknown", ...}
+    """
+    policy.require_category(cfg, "console_input", f"run {len(steps or [])}-step console sequence on '{vm_name}'")
+    # Name gate only when a name was supplied (issue #8's both-forms contract):
+    # a vm_id-only call is validated through the GUID shape gate in the resolve
+    # leg; an empty name still falls through to that same both-empty check there.
+    if vm_name:
+        vmident.checked_caller_name(vm_name)
+    if expect_frame_hash and not re.fullmatch(r"[0-9a-f]{64}", expect_frame_hash):
+        raise ValueError("expect_frame_hash must be an empty string or a 64-char hex sha256")
+    if expect_boot_epoch is not None and type(expect_boot_epoch) is not int:
+        raise ValueError("expect_boot_epoch must be an integer epoch second value or None")
+    if type(timeout_s) is not int or timeout_s < 1:
+        raise ValueError("timeout_s must be a positive integer")
+    if not (160 <= width <= 4096 and 160 <= height <= 4096):
+        raise ValueError("width/height must be within 160..4096")
+    plan = _validate_sequence_steps(steps or [], timeout_s)
+    if request_key:
+        recorded = _lookup_unknown(request_key)
+        if recorded is not None:
+            return recorded
+    be, connect_ms = _try_backend(cfg)
+    if be is not None:
+        ref_wmi: vmident.VMRef | None = None
+        try:
+            ref_wmi = _wmi_ref(be, cfg, vm_name, vm_id)
+        except wmiconsole.BackendUnavailable:
+            be = None
+        if be is not None:
+            assert ref_wmi is not None
+            return _run_sequence_wmi(
+                be, connect_ms, ref_wmi, plan, expect_frame_hash,
+                expect_boot_epoch, timeout_s, width, height)
+    timing = _PsTiming()
+    prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing, guarded=True)
+    started = time.monotonic()
+    remote = pswindows.hyperv_host(cfg) is not None
+    script = _sequence_script(
+        prelude, plan, expect_frame_hash, expect_boot_epoch, timeout_s,
+        width, height, remote)
+    text_payloads = [pswindows.utf8_b64(s["text"]) for s in plan if s["action"] == "text"]
+    with _input_lock(ref):
+        result = _run(
+            cfg, script,
+            timeout_s=timeout_s + 15,
+            stdin_b64="\n".join(text_payloads) if text_payloads else None,
+            payload_lines=len(text_payloads),
+            timing=timing,
+        )
+    if result.timed_out:
+        out: dict = {
+            "ok": False, "error_class": "unknown", "vm_name": ref.name,
+            "steps": _parse_sequence_steps(result.stdout or ""),
+            "note": ("the sequence leg timed out after input may have been sent; "
+                     "whether the guest received the plan is unknowable — never "
+                     "automatically replayed; a new plan requires a fresh explicit "
+                     "request and precondition"),
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "timings": _ps_timings(timing),
+        }
+        if request_key:
+            _record_unknown(request_key, out)
+        return out
+    if result.returncode not in (0, None):
+        stderr = result.stderr or ""
+        if "console sequence precondition mismatch" in stderr:
+            kind = "boot_epoch" if "boot_epoch expected" in stderr else "frame_hash"
+            actual = ""
+            match = re.search(r"actual (\S+)", stderr)
+            if match:
+                actual = match.group(1)
+            env: dict = {
+                "ok": False, "error_class": "precondition", "steps": [],
+                "vm_name": ref.name, "precondition": kind,
+                "timings": _ps_timings(timing),
+            }
+            if kind == "frame_hash":
+                env["frame_hash"] = actual
+                env["hash_domain"] = HASH_DOMAIN
+            else:
+                with_suppress = None
+                try:
+                    with_suppress = int(actual)
+                except ValueError:
+                    pass
+                env["boot_epoch"] = with_suppress
+            return env
+        _check_input_rc(result, "console sequence", vm_name)
+    meta, _payload = _meta_lines(result)
+    if "VMID" in meta:
+        guid = _parse_guid(meta, vm_name or ref.name)
+        note_name_guid_hint(vm_name or ref.name, guid)
+    boot_epoch = None
+    if meta.get("EPOCH"):
+        try:
+            boot_epoch = int(meta["EPOCH"])
+        except ValueError:
+            boot_epoch = None
+    steps_out = _parse_sequence_steps(result.stdout or "")
+    if not steps_out:
+        steps_out = [{"index": i, "ok": True} for i in range(len(plan))]
+    return {
+        "ok": True, "vm_name": ref.name,
+        **({"boot_epoch": boot_epoch} if boot_epoch is not None else {}),
+        "steps": steps_out,
+        "elapsed_ms": int((time.monotonic() - started) * 1000),
+        "timings": _ps_timings(timing),
     }

@@ -16,13 +16,16 @@ Ordering contract (issue #8):
     that resolved name; when a name was also supplied it must match the
     resolved one, else the call is invalid.
 
-Lock-identity scope (issue #18): the GUID-keyed lock invariant below holds for
-operations that resolve their target HERE, host-side. The console's folded
-single-process transport resolves by-name callers INSIDE the one script it
-spawns, so its console-input lock key is the caller-supplied name on that path
-(the only identity available before the process); the by-id path keeps this
-module's resolve leg and locks on the GUID. The residual cross-form exclusion
-gap is tracked as a follow-up issue.
+Lock-identity scope (issue #18, closed for the hinted path by issue #77): the
+GUID-keyed lock invariant below holds for operations that resolve their target
+HERE, host-side. The console's folded single-process transport resolves by-name
+callers INSIDE the one script it spawns; since issue #77 a host-side name->GUID
+hint map (fed by every op whose stdout carries VMID=) lets a by-name console
+call lock on the canonical GUID with an in-script identity guard that fails
+closed on a stale mapping. The residual: a by-name console call with NO learned
+mapping (an input-only caller on a fresh process) stays keyed on the
+caller-supplied name until a feeding read/sequence operation supplies one — a
+disclosed window, not an open defect.
 """
 
 from __future__ import annotations
@@ -39,9 +42,11 @@ _MAX_NAME_LEN = 260
 class VMRef:
     """A resolved VM identity. `id` is the lowercase CIM GUID (the lock key and
     script `$vmTarget` value) for operations that resolve through this module;
-    on the console's folded by-name path (issue #18) it carries the
-    caller-supplied name as the lock key because the GUID is only known after
-    the single process runs. `name` is the ElementName it resolves to (policy
+    on the console's folded by-name path (issue #18) it carries the hinted
+    GUID when the host-side hint map knows the name (issue #77) and the
+    caller-supplied name as the lock key only when no mapping has been learned
+    yet (the disclosed residual — the GUID is otherwise only known after the
+    single process runs). `name` is the ElementName it resolves to (policy
     target and audit display)."""
 
     id: str

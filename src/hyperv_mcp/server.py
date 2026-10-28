@@ -1473,7 +1473,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         Returns: {ok, enabled_state, head_horizontal, head_vertical,
                   keyboard_present, keyboard_enabled, mouse_present,
-                  mouse_enabled, guest_channel, guest_channel_note, vm_id}
+                  mouse_enabled, boot_epoch, guest_channel, guest_channel_note,
+                  vm_id}
         """
         return _run_console_tool(
             "hyperv_console_get_display_info", vm_name, "read",
@@ -1785,6 +1786,71 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             raise
         except Exception as exc:
             return errors.failure_result(errors.envelope(exc))
+
+    @mcp.tool()
+    def hyperv_console_sequence(
+        steps: list[dict], vm_name: str = "", vm_id: str = "",
+        expect_frame_hash: str = "", expect_boot_epoch: int | None = None,
+        timeout_s: int = 60, request_key: str = "",
+        width: int = 640, height: int = 480,
+        lease_id: str = "", fencing_token: int = 0,
+    ) -> dict:
+        """Run a batched console action sequence as ONE plan under ONE
+        per-VM lock: host-side validation of every step before anything
+        spawns, one PowerShell process after GUID resolution, preconditions
+        evaluated inside the locked region before the first input, per-step
+        results with stop-on-failure (later steps reported skipped, never
+        dropped). Step grammar (mirrors the single-step tools):
+        {"action": "press_key", "key", "modifiers"?},
+        {"action": "key_combo", "keys"},
+        {"action": "type_text", "text"} (ASCII; rides stdin base64, never the
+        script), {"action": "type_scancodes", "scancodes"},
+        {"action": "mouse_move", "x", "y", "frame_width"?, "frame_height"?},
+        {"action": "click", "x"?, "y"?, "frame_width"?, "frame_height"?,
+        "button"?}, {"action": "mouse_button", "button", "is_down"},
+        {"action": "scroll", "delta"}, {"action": "wait_frame_stable",
+        "stable_ms", "timeout_s"?, "interval_ms"?, "baseline_hash"?} (in-sequence
+        wait steps accept interval_ms >= 1; the call timeout_s bounds the whole
+        plan, so the standalone tool's >= 100 floor does not apply). Bounded:
+        at most 50 steps, every wait budget capped by timeout_s, summed wait
+        budgets must fit timeout_s, the PowerShell child deadline at
+        timeout_s + 15. expect_frame_hash (the
+        pixel-only frame_hash captured at the same width/height) and
+        expect_boot_epoch (get_display_info's boot_epoch, ±5 s tolerance) are
+        checked AFTER admission and BEFORE any input; a mismatch returns
+        {ok: false, error_class: "precondition", steps: []} with the actual
+        value and sends nothing. With request_key, an uncertain post-dispatch
+        outcome (timed-out leg) records UNKNOWN once and a retry with the
+        same key returns the recorded result instead of re-driving the guest
+        (no automatic replay). request_key is a caller-managed namespace — keys
+        are not validated against VM or plan, and the replay lookup happens
+        before addressing/policy checks, so keep keys unique per plan. The
+        UNKNOWN record and deadline enforcement are PowerShell-transport
+        behaviors; the WMI transport carries no per-call timeout. One audit
+        record replaces N single-step calls.
+        Policy: console_input category; no confirm parameter.
+
+        Args:
+            steps:             1..50 step dicts (grammar above); invalid steps
+                               raise ValueError naming the step index before
+                               any PowerShell runs
+            vm_name:           VM name (must match allowed_vm_patterns)
+            vm_id:             Optional VM GUID; exactly one of vm_name/vm_id must be given
+            expect_frame_hash: "" or 64-char hex sha256 captured at width x height
+            expect_boot_epoch: integer from hyperv_console_get_display_info, or None
+            timeout_s:         Overall deadline (>= 1); child bound is timeout_s + 15
+            request_key:       Optional correlation key for the UNKNOWN
+                               no-replay contract
+            width:             Capture geometry shared by preconditions and wait steps
+            height:            Capture geometry shared by preconditions and wait steps
+        """
+        return _run_console_tool(
+            "hyperv_console_sequence", vm_name, "console_input",
+            console.run_sequence, _cfg(), vm_name, steps, vm_id=vm_id,
+            expect_frame_hash=expect_frame_hash,
+            expect_boot_epoch=expect_boot_epoch, timeout_s=timeout_s,
+            request_key=request_key, width=width, height=height,
+        )
 
     @mcp.tool()
     def hyperv_wait_vm_state(
@@ -2874,6 +2940,7 @@ TOOL_SCOPES: dict[str, str] = {
     "hyperv_console_key_combo": "console", "hyperv_console_type_scancodes": "console",
     "hyperv_console_mouse_move": "console", "hyperv_console_click": "console",
     "hyperv_console_button": "console", "hyperv_console_scroll": "console",
+    "hyperv_console_sequence": "console",
 }
 
 

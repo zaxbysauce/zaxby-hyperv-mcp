@@ -324,6 +324,7 @@ def test_tool_scopes_map_is_pinned():
         "hyperv_console_type_scancodes": "console",
         "hyperv_console_mouse_move": "console", "hyperv_console_click": "console",
         "hyperv_console_button": "console", "hyperv_console_scroll": "console",
+        "hyperv_console_sequence": "console",
     }
     assert TOOL_SCOPES == expected, (
         "TOOL_SCOPES drifted from the pinned scope map; a wrong scope changes "

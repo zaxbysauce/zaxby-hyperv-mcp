@@ -241,6 +241,23 @@ def _com(operation: str, fn, *args: Any, **kwargs: Any) -> Any:
         raise WMIError(pswindows.redact(f"WMI {operation} failed: {exc}")) from None
 
 
+def _boot_epoch_from_cs(cs: Any) -> int | None:
+    """Whole seconds since the Unix epoch of (now - OnTimeInMilliseconds), or
+    None when the CS reports nothing usable (issue #28's credential-free
+    host-side boot boundary; pausing the VM shifts it and callers fail
+    closed on a mismatch)."""
+    raw = getattr(cs, "OnTimeInMilliseconds", None)
+    if raw is None:
+        return None
+    try:
+        boot_ms = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if boot_ms <= 0:
+        return None
+    return int(time.time() - boot_ms / 1000.0)
+
+
 def _rows(result: Any) -> list:
     """Normalize an ExecQuery result to a list. Real SWbemObjectSet is
     iterable (live-probed via CDispatch); fakes may return a bare object
@@ -690,10 +707,20 @@ class ConsoleWMI:
                 "keyboard_enabled": getattr(kb_obj, "EnabledState", None) if kb_obj else None,
                 "mouse_present": mouse_obj is not None,
                 "mouse_enabled": getattr(mouse_obj, "EnabledState", None) if mouse_obj else None,
+                "boot_epoch": _boot_epoch_from_cs(cs),
             }
             return info, {
                 "connect_ms": 0.0, "rebind_ms": rebind_ms, "method_ms": method_ms,
             }
+
+    def boot_epoch(self, guid: str) -> int | None:
+        """The host-side boot boundary (issue #28): whole seconds since the
+        Unix epoch of (now - Msvm_ComputerSystem.OnTimeInMilliseconds).
+        Credential-free host WMI, so it is meaningful in firmware and WinPE;
+        None when the provider reports nothing usable."""
+        with _com_thread():
+            _entry, cs = self._rebind_cs(guid)
+            return _boot_epoch_from_cs(cs)
 
     # -- identity + cache management ----------------------------------------
 
