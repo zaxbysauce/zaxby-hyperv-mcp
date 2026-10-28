@@ -43,7 +43,7 @@ from pathlib import Path
 import pytest
 from test_script_parse_new import _parse_errors
 
-from hyperv_mcp import pswindows, uia
+from hyperv_mcp import evidence, pswindows, uia
 from hyperv_mcp.config import Config
 from hyperv_mcp.credentials import CredentialSet
 
@@ -392,3 +392,90 @@ def test_parse_provisioning_inner_scripts(parsed_ps):
         ("task", task_inner),
     ):
         assert _parse_errors(script) == [], f"{name} inner script has parse errors"
+
+
+# ---------------------------------------------------------------------------
+# Round-2 reviewer-required pins (4.5 findings 1 + 2)
+# ---------------------------------------------------------------------------
+
+def test_frame_carries_min_version(clean_uia_state, monkeypatch):
+    """4.5 finding 2: every framed request carries min_version so a stale
+    helper refuses before dispatch. The framed stdin line 2 must decode to
+    a request whose min_version equals uia.HELPER_VERSION."""
+    captured = {}
+
+    def leg(cfg, script, *, stdin_b64=None, timeout_s=None, **kw):
+        captured["script"] = script
+        captured["stdin_b64"] = stdin_b64
+        return pswindows.PSResult(
+            stdout=json.dumps({"ok": True, "result": {}, "session": {}}),
+            returncode=0)
+
+    monkeypatch.setattr(uia, "_run_uia_leg", leg)
+    monkeypatch.setattr(pswindows, "run_ps",
+                        lambda s, **k: pswindows.PSResult(
+                            stdout="e953c649-1234-5678-9abc-def012345678",
+                            returncode=0))
+    cfg = Config(unrestricted=True)
+    from hyperv_mcp.credentials import CredentialSet
+
+    uia.session_state(cfg, "test-vm-1", CredentialSet("tester", "pw"))
+    line2 = captured["stdin_b64"].strip().splitlines()[1]
+    import base64
+
+    request = json.loads(base64.b64decode(line2).decode("utf-8"))
+    assert request["min_version"] == uia.HELPER_VERSION
+
+
+def test_session_state_answer_carries_top_level_helper(clean_uia_state,
+                                                       monkeypatch):
+    """4.5 finding 1: a BYTE-EXACT production frame (helper facts in the
+    session block, result without helper) must come back with helper at
+    TOP level, or evidence's helper gate and the frozen AC17 shape starve."""
+    byte_exact = {
+        "ok": True, "id": "abc123",
+        "result": {"active_session_id": 2, "interactive_user": "tester",
+                   "locked": False,
+                   "foreground_window": {"title": None, "process_name": "",
+                                          "pid": 0, "hwnd": 0}},
+        "session": {"session_id": 2, "interactive_user": "tester",
+                    "locked": False,
+                    "helper": {"running": True, "version": uia.HELPER_VERSION,
+                               "capabilities": ["uia", "msaa"], "nonce": ""}},
+    }
+
+    def leg(cfg, script, *, stdin_b64=None, timeout_s=None, **kw):
+        return pswindows.PSResult(stdout=json.dumps(byte_exact), returncode=0)
+
+    monkeypatch.setattr(uia, "_run_uia_leg", leg)
+    monkeypatch.setattr(uia, "_run_quser",
+                        lambda cfg, ref, cred: {"user": "tester",
+                                                "session_id": 2})
+    monkeypatch.setattr(pswindows, "run_ps",
+                        lambda s, **k: pswindows.PSResult(
+                            stdout="e953c649-1234-5678-9abc-def012345678",
+                            returncode=0))
+    cfg = Config(unrestricted=True)
+    from hyperv_mcp.credentials import CredentialSet
+
+    out = uia.session_state(cfg, "test-vm-1", CredentialSet("tester", "pw"))
+    assert out["helper"]["running"] is True
+    assert out["helper"]["version"] == uia.HELPER_VERSION
+
+    # the evidence helper-first gate opens on this exact answer shape
+    from types import SimpleNamespace
+
+    seen = {}
+
+    def fake_inspect(cfg_, ref_, cred_, selector=None, **kw):
+        seen["called"] = True
+        return {"ok": True, "elements": 1, "truncated": False,
+                "tree": {"name": "Desktop"}}
+
+    monkeypatch.setattr(uia, "session_state",
+                        lambda cfg_, vm, cred_: out)
+    monkeypatch.setattr(uia, "inspect", fake_inspect)
+    ref = SimpleNamespace(id="e953c649-1234-5678-9abc-def012345678")
+    ui = evidence._uia_via_helper(cfg, ref, CredentialSet("tester", "pw"),
+                                  3, 200)
+    assert ui is not None and ui["source"] == "helper" and seen["called"]

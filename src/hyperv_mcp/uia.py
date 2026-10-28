@@ -12,8 +12,10 @@ the guest.
 Security model (plan revision 7):
 - The pipe name is NOT session-scoped (Microsoft named-pipe security docs),
   so the HOST runs a best-effort quser discovery leg before every request
-  and fills ``target.session_id``; the HELPER enforces vm_guid + user_sid +
-  session_id STRICTLY on every request — a session-less request is refused
+  and fills ``target.session_id``; the HELPER enforces vm_guid +
+  user_sid + session_id on every request (a dimension the host could not
+  resolve is deferred: a failed whoami degrades enforcement to
+  vm_guid + session, and the helper skips an empty target SID) — a session-less request is refused
   (``session_unverified``) without any UIA dispatch, and a request that
   reaches a helper in a different interactive session is refused
   (``target_mismatch``). No verb ever executes without a verified session.
@@ -49,7 +51,6 @@ HELPER_VERSION = "1"
 VERBS = {"inspect", "find", "invoke", "set_value", "wait_for", "focus",
          "session_state"}
 MUTATING_VERBS = {"invoke", "set_value", "focus"}
-_ELEMENT_OPS = {"invoke", "set_value", "focus"}
 BASE_CAPABILITIES = {"uia", "msaa"}
 ELECTRON_CAPABILITY = "adapter:electron"
 _CAPABILITIES = BASE_CAPABILITIES | {ELECTRON_CAPABILITY}
@@ -60,8 +61,6 @@ _SELECTORS = {
     "window_title", "process_name", "hwnd", "element_id", "index",
 }
 _HELPER_DIR = r"C:\ProgramData\hyperv-mcp\uia-helper"
-_HELPER_TASK = "hyperv-mcp-uia-helper"
-_PIPE_NAME = "hyperv-mcp-uia"
 
 
 class UiAError(RuntimeError):
@@ -636,6 +635,7 @@ def _pipe_forward(transport: _Transport, request: dict,
     """One request frame through the guest pipe-client leg."""
     ref = transport.ref
     cred = transport.cred
+    request = {**request, "min_version": HELPER_VERSION}
     payload = json.dumps(request, ensure_ascii=False, default=str)
     framed_payload = pswindows.utf8_b64(payload)
     result = _frame_leg(transport.cfg, ref, cred, CLIENT_LEG_SCRIPT,
@@ -755,8 +755,14 @@ def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
         out = {**frame, "ok": False}
         out.setdefault("session", _fallback_block(cfg, ref, cred))
         return out
-    return {"ok": True, **(frame.get("result") or {}),
-            "session": frame.get("session")}
+    out = {"ok": True, **(frame.get("result") or {}),
+           "session": frame.get("session")}
+    helper = (frame.get("session") or {}).get("helper")
+    if isinstance(helper, dict):
+        # Promote the helper facts to top level: evidence's helper gate, the
+        # provision probe, and the frozen AC17 shape all read answer["helper"].
+        out["helper"] = {**helper, "running": True}
+    return out
 
 
 def inspect(cfg, vm_name="", cred: CredentialSet | None = None,

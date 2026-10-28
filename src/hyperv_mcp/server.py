@@ -2353,6 +2353,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         @mcp.tool()
         def hyperv_ui_helper_provision(
             vm_name: str = "", autologon: bool = True, confirm: bool = False,
+            lease_id: str = "", fencing_token: int = 0,
             username: str = "", password: str = "", vm_id: str = "",
         ) -> dict:
             """Install and start the in-session UIA helper: the helper script
@@ -2536,6 +2537,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         @mcp.tool()
         def hyperv_ui_helper_provision(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", autologon: bool = True, confirm: bool = False,
+            lease_id: str = "", fencing_token: int = 0,
             vm_id: str = "",
         ) -> dict:
             """Install and start the in-session UIA helper: the helper script
