@@ -233,6 +233,13 @@ try {
 } finally { $client.Dispose() }"""
 
 _INSTALL_INNER = """$dir = 'C:\\ProgramData\\hyperv-mcp\\uia-helper'
+if (Test-Path $dir) {
+    # Re-provisioning over a previously hardened directory: the owner of
+    # the directory (the provisioning identity that created it) can always
+    # reset its DACL even when the hardening ACL removed its grants.
+    icacls $dir /reset /t | Out-Null
+    Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+}
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $helperPath = Join-Path $dir 'uia_helper.ps1'
 [IO.File]::WriteAllBytes($helperPath, [Convert]::FromBase64String($reqEnc))
