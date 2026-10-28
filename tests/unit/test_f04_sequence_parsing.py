@@ -226,3 +226,141 @@ def test_stale_hint_guard_self_heals_on_retry(monkeypatch, unrestricted):
     assert live in retry_script and stale not in retry_script, (
         "the retry must embed the refreshed (live) GUID — the mapping "
         "self-healed from the guard's own report")
+
+
+# ---------------------------------------------------------------------------
+# Feedback round pr107-20261027 (PRR-005/012/014/015/016): validation-arm,
+# remote-mode, ordinary-failure, eviction and rejection pins.
+# ---------------------------------------------------------------------------
+
+def test_summed_wait_budgets_capped_by_call_timeout(monkeypatch, unrestricted):
+    """PRR-005: summed wait budgets must fit the call timeout — a plan whose
+    worst case exceeds it is rejected naming the offending step, before any
+    spawn; the same plan under a raised timeout_s validates."""
+    stub = StepStdoutPS("")
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    waits = [{"action": "wait_frame_stable", "stable_ms": 100, "timeout_s": 60}
+             for _ in range(3)]
+    with pytest.raises(ValueError, match="step 1"):
+        console.run_sequence(unrestricted, "vm1", waits, timeout_s=60)
+    assert stub.scripts == [], "the sum rejection must fire before any spawn"
+    out = console.run_sequence(unrestricted, "vm1", waits, timeout_s=180)
+    assert out.get("ok") is True
+
+
+@pytest.mark.parametrize(
+    "steps,match",
+    [
+        ([{"action": "press_key", "modifiers": [1]}, {"action": "type_text", "text": "x"}],
+         "step 0"),                                # non-string modifier
+        ([{"action": "key_combo", "keys": ["win", 7]}], "step 0"),  # non-string key
+        ([{"action": "type_text"}], "step 0"),    # missing text
+        ([{"action": "type_scancodes", "scancodes": "28"}], "step 0"),  # not a list
+        ([{"action": "click", "x": 1, "y": 2, "button": 5}], "step 0"),  # bad button
+        ([{"action": "mouse_move", "x": 1, "y": 2, "frame_width": -1}], "step 0"),
+        ([{"action": "wait_frame_stable", "stable_ms": 0}], "step 0"),
+        ([{"action": "wait_frame_stable", "stable_ms": 100, "baseline_hash": "zz"}], "step 0"),
+        ([{"action": "scroll"}], "step 0"),       # missing delta
+        ([{"action": "press_key", "key": "enter"}, "not-a-dict"], "step 1"),
+        ([], "steps"),                            # empty plan
+        (None, "steps"),                          # None plan
+    ])
+def test_remaining_validation_arms_reject_with_step_or_steps(
+        monkeypatch, unrestricted, steps, match):
+    """PRR-012: the remaining validator rejection arms each raise the
+    documented error naming the step (or steps for the plan-level caps), with
+    zero PowerShell started."""
+    stub = StepStdoutPS("")
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    with pytest.raises(ValueError, match=match):
+        console.run_sequence(unrestricted, "vm1", steps)
+    assert stub.scripts == []
+
+
+def test_run_sequence_argument_validation(monkeypatch, unrestricted):
+    """PRR-012: the call-level argument gates (frame-hash format, boot-epoch
+    type, timeout range, geometry range) reject before anything spawns."""
+    stub = StepStdoutPS("")
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    bad = [
+        {"expect_frame_hash": "nothex"},
+        {"expect_boot_epoch": "12345"},
+        {"timeout_s": 0},
+        {"width": 100},
+    ]
+    for kwargs in bad:
+        with pytest.raises(ValueError):
+            console.run_sequence(
+                unrestricted, "vm1",
+                [{"action": "press_key", "key": "enter"}], **kwargs)
+    assert stub.scripts == []
+
+
+def test_remote_mode_script_embeds_payload_params(monkeypatch, unrestricted):
+    """PRR-014: with a remote Hyper-V host configured the sequence script
+    carries the $__pN payload parameters instead of local stdin reads, and the
+    run carries payload_lines for the composer."""
+    secret = "remote-secret"
+    stub = StepStdoutPS("")
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    monkeypatch.setattr(pswindows, "hyperv_host", lambda cfg: "remote-host")
+    out = console.run_sequence(unrestricted, "vm1", [
+        {"action": "type_text", "text": secret},
+        {"action": "type_text", "text": "second"},
+    ])
+    assert out["ok"] is True
+    script = stub.scripts[-1]
+    assert "$payloads = @($__p0, $__p1)" in script
+    # remote mode: the step body reads $payloads[$ti]; the ReadLine lives in
+    # the composer preamble's $__pN assignments, never inside the FromBase64
+    # decode of a step body (the local-mode shape)
+    assert "FromBase64String([Console]::In.ReadLine())" not in script
+    assert "FromBase64String($payloads[$ti])" in script
+    # remote mode forwards the payload lines through stdin for the composer
+    stdin_payload = stub.kwargs[-1]["stdin_b64"]
+    assert pswindows.utf8_b64(secret) in stdin_payload
+    assert pswindows.utf8_b64("second") in stdin_payload
+
+
+def test_ordinary_failure_surfaces_via_check_input_rc(monkeypatch, unrestricted):
+    """PRR-015: an ordinary (non-precondition, non-timeout) nonzero exit
+    surfaces as ConsoleError through the input check — and does NOT touch the
+    hint map when the marker is absent."""
+    from hyperv_mcp import console as con
+    name = "t-ordinary-failure-vm"
+    recording = StepStdoutPS("")
+
+    def failer(script, **kwargs):
+        recording.scripts.append(script)
+        if "Get-VM -Id" in script:
+            return pswindows.PSResult(stdout="resolved", returncode=0)
+        return pswindows.PSResult(
+            returncode=1, stderr="SetScrollPosition failed with ReturnValue=11")
+
+    monkeypatch.setattr(pswindows, "run_ps", failer)
+    with pytest.raises(console.ConsoleError, match="ReturnValue=11"):
+        console.run_sequence(
+            unrestricted, name, [{"action": "scroll", "delta": 1}])
+    assert con._hint_for(name) is None, (
+        "an ordinary failure carries no identity marker and must not seed a hint")
+
+
+def test_hint_and_unknown_maps_bounded_and_rejecting(monkeypatch, unrestricted):
+    """PRR-016: the hint map rejects malformed GUIDs and empty names; both
+    maps evict their oldest entry at their caps."""
+    from hyperv_mcp import console as con
+    con.note_name_guid_hint("vm-a", "not-a-guid")
+    assert con._hint_for("vm-a") is None
+    con.note_name_guid_hint("   ", con.SEQ_GUID if hasattr(con, "SEQ_GUID")
+                            else "e953c649-dcab-438d-9a54-3af74a82b624")
+    # fill past the cap and confirm the map stays bounded (oldest evicted)
+    for i in range(con._HINT_CAP + 8):
+        con.note_name_guid_hint(f"churn-{i}", "e953c649-dcab-438d-9a54-3af74a82b624")
+    assert len(con._NAME_GUID_HINTS) <= con._HINT_CAP
+    # unknown-record eviction
+    for i in range(con._UNKNOWN_CAP + 8):
+        con._record_unknown(f"k-{i}", {"n": i})
+    assert len(con._UNKNOWN_RESULTS) <= con._UNKNOWN_CAP
+    assert con._lookup_unknown("k-0") is None, "oldest unknown record evicted"
+    assert con._lookup_unknown(f"k-{con._UNKNOWN_CAP + 7}") == {
+        "n": con._UNKNOWN_CAP + 7}

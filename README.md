@@ -1527,7 +1527,7 @@ unchanged result is exactly as informative about the request as a changed one.
 | Tool | Parameters | Returns |
 |------|-----------|---------|
 | `hyperv_console_screenshot` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `format?` (png\|jpeg/jpg\|webp), `quality?` (1..100), `scale?` (0,1], `crop?` ([left,top,right,bottom]), `if_changed_from?` (frame_hash) | MCP ImageContent + metadata text (`vm_id`, `frame_hash`, `head_resolution`, `scale_note`, `fallback_used`, `capture_method`, `captured_at`, `timings`, `width`, `height`, `vm_name`, `prefix_hex`, plus `format`/`quality`/`scale`/`crop`/`saved_format` only when those options were supplied) — metadata alone when `if_changed_from` matches |
-| `hyperv_console_get_display_info` | `vm_name` or `vm_id` | `{ok, enabled_state, head_horizontal, head_vertical, keyboard_present, keyboard_enabled, mouse_present, mouse_enabled, guest_channel, guest_channel_note, vm_id}` |
+| `hyperv_console_get_display_info` | `vm_name` or `vm_id` | `{ok, enabled_state, head_horizontal, head_vertical, keyboard_present, keyboard_enabled, mouse_present, mouse_enabled, boot_epoch, guest_channel, guest_channel_note, vm_id}` |
 | `hyperv_console_type_text` | `vm_name` or `vm_id`, `text` (ASCII) | `{ok, chunks, chars}` |
 | `hyperv_console_press_key` | `vm_name` or `vm_id`, `key`, `modifiers[]` (ctrl/alt/shift incl. right- variants, win/leftwin/rightwin — held while key taps) — keys: enter, escape (esc), tab, backspace, space, capslock, up/down/left/right, delete, home, end, pageup, pagedown, insert, f1-f12, a-z, 0-9, punctuation (minus/equals/leftbracket/rightbracket/semicolon/apostrophe/grave/backslash/comma/period/slash, single-char aliases `-` `=` `[` `]` `\` `;` `'` `` ` `` `,` `.` `/`), numpad (num0-num9, numdecimal, nummultiply, numsubtract, numadd, numlock, numdivide, numenter), win (alias leftwin), rightwin, menu (alias apps); modifier-named keys are also valid bare presses | `{ok, scancodes_sent, chunks}` |
 | `hyperv_console_key_combo` | `vm_name` or `vm_id`, `keys[]` — modifiers ctrl/alt/shift (incl. right- variants) and win/leftwin/rightwin; every other key name taps in order, e.g. `["win","r"]` | `{ok, scancodes_sent, chunks}` |
@@ -1556,9 +1556,14 @@ the script), `{"action": "type_scancodes", "scancodes"}`,
 `{"action": "click", "x"?, "y"?, "frame_width"?, "frame_height"?, "button"?}`,
 `{"action": "mouse_button", "button", "is_down"}`,
 `{"action": "scroll", "delta"}`, `{"action": "wait_frame_stable",
-"stable_ms", "timeout_s"?, "interval_ms"?, "baseline_hash"?}`. Every step is
+"stable_ms", "timeout_s"?, "interval_ms"?, "baseline_hash"?}` (the in-sequence
+grammar mirrors the single-step tools except that wait steps accept
+`interval_ms >= 1` — the call `timeout_s` bounds the whole plan, so the
+standalone tool's >= 100 floor does not apply). Every step is
 validated BEFORE anything spawns (a rejection names `step <i>`); at most 50
-steps; every wait budget is capped by the call `timeout_s`, and the PowerShell
+steps; every wait budget is capped by the call `timeout_s`, the SUMMED wait
+budgets must fit the call `timeout_s` (a plan whose worst case exceeds it is
+rejected before anything spawns), and the PowerShell
 child deadline sits at `timeout_s + 15`. Preconditions run inside the locked
 region BEFORE the first input: `expect_frame_hash` (capture a screenshot at
 the same `width`/`height` first and pass its `frame_hash`) and
@@ -1573,7 +1578,12 @@ outcome (a timed-out leg) is recorded once as UNKNOWN with whatever
 executed-step prefix the leg reported, is never automatically replayed, and a
 retry carrying the same key returns the recorded result instead of
 re-driving the guest; a NEW plan requires a fresh explicit request and
-precondition. Admission note (see issue #68): a sequence holds one tool
+precondition. `request_key` is a CALLER-MANAGED namespace: keys are not
+validated against VM or plan, so keep them unique per plan — a colliding key
+returns the recorded result for that key (the lookup happens before the
+addressing/policy checks). The UNKNOWN record and the deadline enforcement are
+PowerShell-transport behaviors; the WMI transport carries no per-call timeout
+and completes or raises without an UNKNOWN record. Admission note (see issue #68): a sequence holds one tool
 thread for the by-id resolve leg (one spawn, 60 s), the bounded lock wait
 (`vm_lock_wait_s`), and the folded child (`timeout_s + 15`); on the in-process
 WMI transport the provider calls carry no per-call timeout.

@@ -2850,6 +2850,7 @@ def _validate_sequence_steps(
         raise ValueError(
             f"steps is limited to {_MAX_SEQUENCE_STEPS} per sequence; got {len(steps)}")
     plan: list[dict] = []
+    wait_budget_total = 0
     for i, step in enumerate(steps):
         if not isinstance(step, dict):
             raise _step_fail(i, "every step must be a dict")
@@ -2933,6 +2934,16 @@ def _validate_sequence_steps(
                     raise ValueError("delta is required")
                 plan.append({"action": "scroll", "delta": int(step["delta"])})
             elif action == "wait_frame_stable":
+                # PRR-005: the summed wait budgets must fit the call deadline —
+                # a plan whose worst case exceeds it deterministically dies
+                # mid-plan into the non-replayable UNKNOWN class.
+                if wait_budget_total + min(step.get("timeout_s", call_timeout_s) or 0,
+                                           call_timeout_s) > call_timeout_s:
+                    raise ValueError(
+                        f"wait budgets total more than the call timeout_s="
+                        f"{call_timeout_s}; raise timeout_s or shorten the waits")
+                wait_budget_total += min(step.get("timeout_s", call_timeout_s) or 0,
+                                         call_timeout_s)
                 stable_ms = step.get("stable_ms")
                 if type(stable_ms) is not int or stable_ms < 1:
                     raise ValueError("stable_ms must be a positive integer")
@@ -3051,7 +3062,11 @@ def _sequence_step_block(
             "        $sha = New-Object Security.Cryptography.SHA256Managed",
             "        $waitStop = $null",
             "        while ($polls -lt " + str(max_polls) + ") {",
-            "            if ((Get-Date) -ge $deadline) { $waitStop = 'deadline'; break }",
+            "            if ((Get-Date) -ge $deadline) {",
+            "                if (($baseline -ne '') -and ($polls -gt 0) -and (-not $moveSeen)) "
+            "{ $waitStop = 'unchanged' } else { $waitStop = 'deadline' }",
+            "                break",
+            "            }",
             "            $wr = Invoke-CimMethod -InputObject $svc -MethodName "
             "GetVirtualSystemThumbnailImage -ErrorAction Stop -Arguments @{",
             "                TargetSystem = $vm",
@@ -3077,8 +3092,11 @@ def _sequence_step_block(
             "            if (($null -ne $lastChange) -and ((($now) - ($lastChange))"
             ".TotalMilliseconds -ge " + str(step["stable_ms"]) + ")) "
             "{ $waitStop = 'stable'; break }",
-            "            if ($polls -ge " + str(max_polls) + " -or (Get-Date) -ge $deadline) "
-            "{ $waitStop = 'deadline'; break }",
+            "            if ($polls -ge " + str(max_polls) + " -or (Get-Date) -ge $deadline) {",
+            "                if (($baseline -ne '') -and ($polls -gt 0) -and (-not $moveSeen)) "
+            "{ $waitStop = 'unchanged' } else { $waitStop = 'deadline' }",
+            "                break",
+            "            }",
             "            Start-Sleep -Milliseconds " + str(step["interval_ms"]),
             "        }",
             "        if (-not $waitStop) { $waitStop = 'deadline' }",
@@ -3242,6 +3260,7 @@ def _run_sequence_wmi(
                     boot_epoch is None or abs(boot_epoch - int(expect_boot_epoch)) > 5):
                 return {
                     "ok": False, "error_class": "precondition", "steps": [],
+                    "precondition": "boot_epoch",
                     "vm_name": ref.name, "boot_epoch": boot_epoch,
                     "timings": _wmi_timings(connect_ms),
                 }
@@ -3252,12 +3271,24 @@ def _run_sequence_wmi(
                 if actual != expect_frame_hash:
                     return {
                         "ok": False, "error_class": "precondition", "steps": [],
+                        "precondition": "frame_hash",
                         "vm_name": ref.name, "boot_epoch": boot_epoch,
                         "frame_hash": actual, "hash_domain": HASH_DOMAIN,
                         "timings": _wmi_timings(connect_ms, *phase_dicts),
                     }
             for i, step in enumerate(plan):
-                _r, t = _sequence_wmi_step(be, ref, step, width, height)
+                try:
+                    _r, t = _sequence_wmi_step(be, ref, step, width, height)
+                except (ConsoleError, wmiconsole.WMIError,
+                        wmiconsole.BackendUnavailable) as exc:
+                    # Per-step failure (issue-28 contract, both transports): the
+                    # failed step is reported and the rest skipped — never a
+                    # whole-call raise that drops the executed prefix.
+                    phase_dicts.append({})
+                    steps_out.append({"index": i, "ok": False, "error": str(exc)})
+                    for j in range(i + 1, len(plan)):
+                        steps_out.append({"index": j, "skipped": True})
+                    break
                 phase_dicts.append(t)
                 entry: dict = {"index": i, **_r}
                 steps_out.append(entry)
@@ -3267,12 +3298,15 @@ def _run_sequence_wmi(
                     break
     except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
         raise ConsoleError(str(exc)) from None
-    return {
-        "ok": True, "vm_name": ref.name, "boot_epoch": boot_epoch,
+    out: dict = {
+        "ok": True, "vm_name": ref.name,
         "steps": steps_out,
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "timings": _wmi_timings(connect_ms, *phase_dicts),
     }
+    if boot_epoch is not None:
+        out["boot_epoch"] = boot_epoch
+    return out
 
 
 def _sequence_wmi_step(be, ref: vmident.VMRef, step: dict, width: int, height: int):
@@ -3288,7 +3322,10 @@ def _sequence_wmi_step(be, ref: vmident.VMRef, step: dict, width: int, height: i
         return {"ok": True}, t
     if action == "mouse_positional":
         head, t_head = be.head_resolution(ref.id)
-        if head is None:
+        # head_resolution returns None OR a (None, None) pair while the VM is
+        # off / the video head reports no resolution (wmiconsole contract) —
+        # both are the structured refusal, never a scale attempt.
+        if not head or not head[0] or not head[1]:
             raise ConsoleError("display head resolution unavailable for positional mouse")
         hx, hy = _scale_to_head(step["x"], step["y"], step["fw"], step["fh"], head)
         _r, t = be.mouse_move(ref.id, hx, hy)
@@ -3335,7 +3372,9 @@ def _sequence_wmi_step(be, ref: vmident.VMRef, step: dict, width: int, height: i
             stop = "stable"
             break
         if polls >= max_polls or time.monotonic() - started >= step["timeout_s"]:
-            # Same transition table as the folded script: "my input did
+            # Transition table shared with the folded script AND the
+            # in-sequence PS wait block (which emits the same unchanged/
+            # deadline distinction since the PRR-004 fix): "my input did
             # nothing" (supplied baseline, never differed) is distinguishable
             # from an honest deadline.
             if baseline and polls > 0 and not move_seen:
@@ -3368,6 +3407,10 @@ def run_sequence(
     With `request_key`, an uncertain post-dispatch outcome (a timed-out leg)
     is recorded once as UNKNOWN and a retry with the same key returns the
     recorded result instead of re-driving the guest (no automatic replay).
+    request_key is a caller-managed namespace — keep keys unique per plan; the
+    replay lookup runs before addressing/policy checks. UNKNOWN recording and
+    deadline enforcement are PowerShell-transport behaviors (the WMI transport
+    has no per-call timeout and does not record UNKNOWN).
 
     vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
@@ -3375,7 +3418,11 @@ def run_sequence(
     {ok: false, error_class: "precondition"|"unknown", ...}
     """
     policy.require_category(cfg, "console_input", f"run {len(steps or [])}-step console sequence on '{vm_name}'")
-    vmident.checked_caller_name(vm_name)
+    # Name gate only when a name was supplied (issue #8's both-forms contract):
+    # a vm_id-only call is validated through the GUID shape gate in the resolve
+    # leg; an empty name still falls through to that same both-empty check there.
+    if vm_name:
+        vmident.checked_caller_name(vm_name)
     if expect_frame_hash and not re.fullmatch(r"[0-9a-f]{64}", expect_frame_hash):
         raise ValueError("expect_frame_hash must be an empty string or a 64-char hex sha256")
     if expect_boot_epoch is not None and type(expect_boot_epoch) is not int:

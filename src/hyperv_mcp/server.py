@@ -1473,7 +1473,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         Returns: {ok, enabled_state, head_horizontal, head_vertical,
                   keyboard_present, keyboard_enabled, mouse_present,
-                  mouse_enabled, guest_channel, guest_channel_note, vm_id}
+                  mouse_enabled, boot_epoch, guest_channel, guest_channel_note,
+                  vm_id}
         """
         return _run_console_tool(
             "hyperv_console_get_display_info", vm_name, "read",
@@ -1808,9 +1809,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         {"action": "click", "x"?, "y"?, "frame_width"?, "frame_height"?,
         "button"?}, {"action": "mouse_button", "button", "is_down"},
         {"action": "scroll", "delta"}, {"action": "wait_frame_stable",
-        "stable_ms", "timeout_s"?, "interval_ms"?, "baseline_hash"?}. Bounded:
-        at most 50 steps, every wait budget capped by timeout_s, the
-        PowerShell child deadline at timeout_s + 15. expect_frame_hash (the
+        "stable_ms", "timeout_s"?, "interval_ms"?, "baseline_hash"?} (in-sequence
+        wait steps accept interval_ms >= 1; the call timeout_s bounds the whole
+        plan, so the standalone tool's >= 100 floor does not apply). Bounded:
+        at most 50 steps, every wait budget capped by timeout_s, summed wait
+        budgets must fit timeout_s, the PowerShell child deadline at
+        timeout_s + 15. expect_frame_hash (the
         pixel-only frame_hash captured at the same width/height) and
         expect_boot_epoch (get_display_info's boot_epoch, ±5 s tolerance) are
         checked AFTER admission and BEFORE any input; a mismatch returns
@@ -1818,7 +1822,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         value and sends nothing. With request_key, an uncertain post-dispatch
         outcome (timed-out leg) records UNKNOWN once and a retry with the
         same key returns the recorded result instead of re-driving the guest
-        (no automatic replay). One audit record replaces N single-step calls.
+        (no automatic replay). request_key is a caller-managed namespace — keys
+        are not validated against VM or plan, and the replay lookup happens
+        before addressing/policy checks, so keep keys unique per plan. The
+        UNKNOWN record and deadline enforcement are PowerShell-transport
+        behaviors; the WMI transport carries no per-call timeout. One audit
+        record replaces N single-step calls.
         Policy: console_input category; no confirm parameter.
 
         Args:
@@ -2931,6 +2940,7 @@ TOOL_SCOPES: dict[str, str] = {
     "hyperv_console_key_combo": "console", "hyperv_console_type_scancodes": "console",
     "hyperv_console_mouse_move": "console", "hyperv_console_click": "console",
     "hyperv_console_button": "console", "hyperv_console_scroll": "console",
+    "hyperv_console_sequence": "console",
 }
 
 

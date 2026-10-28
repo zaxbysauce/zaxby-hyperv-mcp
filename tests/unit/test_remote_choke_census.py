@@ -48,8 +48,6 @@ READLINE_ALLOWLIST = {
     ("pswindows.py", "_remote_parts"),     # composer preamble emission
     ("guestexec.py", "psdirect_prefix"),   # pinned local-mode emission
     ("console.py", "type_text"),           # pinned local-mode inline emission
-    ("console.py", "_sequence_step_block"),  # issue #28: one read per text step
-    ("console.py", "_sequence_script"),    # issue #28: the local read_expr choice
 }
 
 
