@@ -239,10 +239,13 @@ $helperPath = Join-Path $dir 'uia_helper.ps1'
 $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($helperPath))
 [IO.File]::WriteAllText((Join-Path $dir 'sha256.txt'), ([BitConverter]::ToString($sha) -replace '-',''))
 [IO.File]::WriteAllText((Join-Path $dir 'version.txt'), '""" + HELPER_VERSION + """')
-# The Administrators/SYSTEM-only ACL lands LAST: the installing leg itself
-# (a non-elevated PS Direct process) must still read the files it just
-# wrote, and the AtLogOn task runs elevated so the helper can read them.
-icacls $dir /inheritance:r /grant 'BUILTIN\\Administrators:F' /grant 'NT AUTHORITY\\SYSTEM:F' | Out-Null
+# The hardening ACL lands LAST and keeps the provisioning user's access:
+# the installing leg is a PS Direct process whose token may be UAC-filtered
+# even for an administrator, the helper runs as the same account (standard
+# accounts stay standard under RunLevel Highest), and re-provisioning must
+# remain possible. Administrators and SYSTEM keep full control; other
+# users inherit nothing.
+icacls $dir /inheritance:r /grant 'BUILTIN\\Administrators:F' /grant 'NT AUTHORITY\\SYSTEM:F' /grant "${env:HYPERVMCP_AUTOLOGON_USER}:F" | Out-Null
 [PSCustomObject]@{ ok = $true; installed = $true; helper_version = '""" + HELPER_VERSION + """' } | ConvertTo-Json -Compress"""
 
 _AUTOLOGON_INNER = """$ErrorActionPreference = 'Stop'
@@ -915,8 +918,11 @@ def provision_helper(cfg, vm_name="", cred: CredentialSet | None = None,
                      "helper_version": HELPER_VERSION,
                      "helper_running": False, "reboot_required": False}
     with vm_lock(ref.id, mode="write"):
-        install = _frame_leg(cfg, ref, cred, _INSTALL_INNER, helper_b64,
-                             timeout_ms=60000)
+        install = _frame_leg(
+            cfg, ref, cred,
+            ("$env:HYPERVMCP_AUTOLOGON_USER = "
+             + pswindows.ps_quote(cred.username) + "\n" + _INSTALL_INNER),
+            helper_b64, timeout_ms=60000)
         install_frame = json.loads((install.stdout or "").strip() or "{}")
         if not install_frame.get("ok"):
             return {"ok": False,
