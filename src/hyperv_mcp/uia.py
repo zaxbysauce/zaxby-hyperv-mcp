@@ -291,7 +291,8 @@ $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
 $settings = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName 'hyperv-mcp-uia-helper' -Action $action -Principal $principal -Trigger $trigger -Settings $settings -Force | Out-Null
 $started = $false
-$loggedOn = quser 2>$null | Select-String -SimpleMatch $user
+try { $loggedOn = quser 2>$null | Select-String -SimpleMatch $user }
+catch { $loggedOn = $null }  # a logged-off guest raises instead of listing
 if ($loggedOn) { Start-ScheduledTask -TaskName 'hyperv-mcp-uia-helper'; $started = $true }
 [PSCustomObject]@{ ok = $true; task_registered = $true; started = $started } | ConvertTo-Json -Compress"""
 

@@ -700,7 +700,11 @@ def test_capture_evidence_ui_tree_session(running_vm):
     # the asserts above are the contract, these prints are the evidence)
     assert isinstance(ui.get("session"), dict), ui
     print(f"observed ui_tree session block: {ui['session']}")
-    quser = guestexec.guest_run_ps(cfg, vm, "quser", cred=running_vm.creds)
+    try:
+        quser = guestexec.guest_run_ps(cfg, vm, "quser", cred=running_vm.creds)
+    except Exception as exc:  # a logged-off guest raises instead of listing
+        print(f"quser leg raised (nobody logged on): {exc}")
+        quser = {"ok": False, "stdout": ""}
     print(
         "observed interactive-session record (quser from PS Direct): "
         f"ok={quser.get('ok')} stdout={quser.get('stdout', '').strip()!r}"
