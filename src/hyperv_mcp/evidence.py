@@ -17,6 +17,17 @@ ui_tree.session, while the screenshot still ships. When the in-session
 helper (hyperv_mcp.uia) is running, the tree comes from the helper's
 inspect verb and ui_tree reports source "helper". Credentials are
 required ONLY for the UI tree leg.
+
+Result-shape contract (PRR-117): whenever a tree was requested, the
+ui_tree block carries BOTH `session` and `source` on every path, and the
+session block carries ONE key set everywhere — {session_id, interactive,
+input_desktop} — with None filling a dimension a path cannot know (the
+helper's session_state answer discloses no input-desktop name, so the
+helper path reports input_desktop None). `source` names which path ran
+or was refused: "helper", "ps_direct_walk" (the walk ran, whether it
+succeeded, refused or failed), or "skipped_unchanged" (no path ran —
+the frame was unchanged). A caller who requested no tree keeps getting
+exactly {"requested": False}.
 """
 
 from __future__ import annotations
@@ -133,10 +144,12 @@ def _uia_via_helper(
         "truncated": bool(tree_result.get("truncated")),
         "tree": tree_result.get("tree"),
         "session": {
+            # The ONE key set every ui_tree path reports (PRR-117): the
+            # helper's session_state answer discloses no input-desktop
+            # name, so this path fills input_desktop None.
             "session_id": answer.get("active_session_id"),
             "interactive": not answer.get("locked", False),
-            "locked": answer.get("locked", False),
-            "interactive_user": answer.get("interactive_user"),
+            "input_desktop": None,
         },
         "source": "helper",
     }
@@ -221,6 +234,10 @@ def capture_evidence(
                 "and an unchanged frame produces no new output image — so there "
                 "is nothing new for the tree to describe"
             ),
+            # The shape contract holds on the skip too: session None (no
+            # session was probed) and a source naming WHY no path ran.
+            "session": None,
+            "source": "skipped_unchanged",
         }
     elif tree_cred is not None:
         helper_ui = _uia_via_helper(
@@ -250,6 +267,7 @@ def capture_evidence(
                 "error_class": errors.classify(exc),
                 "note": "a PowerShell Direct session may not see an interactive desktop",
                 "session": None,
+                "source": "ps_direct_walk",
             }
         else:
             session = {
@@ -272,6 +290,7 @@ def capture_evidence(
                     "error_class": "no_interactive_session",
                     "error": reason,
                     "session": session,
+                    "source": "ps_direct_walk",
                 }
             else:
                 ui = {

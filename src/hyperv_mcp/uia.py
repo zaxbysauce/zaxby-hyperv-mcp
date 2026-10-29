@@ -81,6 +81,14 @@ _ADAPTERS = {"", "electron"}
 _WAIT_SLICE_S = 10
 _WAIT_POLL_S = 0.25
 
+#: The inspect bounds (PRR-117): ONE clamp for BOTH tree paths — the
+#: helper path here and evidence's PS Direct walk (evidence._UIA_MAX_DEPTH
+#: / _UIA_MAX_ELEMENTS carry the same numbers). The tool docstrings
+#: promise 1..6 / 1..500; the host clamps before the request leaves, and
+#: the packaged helper enforces the same ceiling on its side.
+INSPECT_MAX_DEPTH = 6
+INSPECT_MAX_ELEMENTS = 500
+
 
 class UiAError(RuntimeError):
     """Base class for element-surface errors (issue #29)."""
@@ -1206,10 +1214,18 @@ def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
                     return _transport_failure(exc, cfg, ref, cred)
                 out = _frame_out(frame, cfg, ref, cred)
             if deadline is None or _wait_answered(out, gone):
+                if deadline is not None:
+                    # PRR-117: the flag rides BOTH settled outcomes — False
+                    # when the wait was answered (a hit, an error, or a
+                    # gone verdict), True only on the budget-expiry path.
+                    out = {**out, "timed_out": False}
                 return out
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return out
+                # The wait's whole budget expired unanswered: the last
+                # slice's answer ships, now with timed_out True so a caller
+                # can tell an expired empty poll from a settled one.
+                return {**out, "timed_out": True}
             # Poll pace between slices (the console-wait pattern); the VM
             # lock is NOT held here.
             time.sleep(min(_WAIT_POLL_S, remaining))
@@ -1231,8 +1247,9 @@ def inspect(cfg, vm_name="", cred: CredentialSet | None = None,
         raise ValueError(f"unknown adapter: {adapter!r}")
     ref = (vm_name if isinstance(vm_name, vmident.VMRef)
            else vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id))
-    args = {"depth": max(1, min(int(depth), 8)),
-            "max_elements": max(1, min(int(max_elements), 2000))}
+    args = {"depth": max(1, min(int(depth), INSPECT_MAX_DEPTH)),
+            "max_elements": max(1, min(int(max_elements),
+                                       INSPECT_MAX_ELEMENTS))}
     return _verb_request(cfg, ref, cred, "inspect", args, selector=selector,
                          adapter=adapter)
 
@@ -1443,10 +1460,14 @@ def provision_helper(cfg, vm_name="", cred: CredentialSet | None = None,
         # instance holding the fixed-name pipe.
         reset = _frame_leg(cfg, ref, cred, _RESET_INNER,
                            pswindows.utf8_b64("reset"), timeout_ms=60000)
-        if not _provision_leg_frame(reset).get("ok"):
-            return {"ok": False,
+        reset_frame = _provision_leg_frame(reset)
+        if not reset_frame.get("ok"):
+            # PRR-117: the failure result carries the SAME status keys as
+            # success — spread over `results`, so every documented key is
+            # present with the false/empty value it had at failure time.
+            return {**results, "ok": False,
                     "error_class": "helper_install_failed",
-                    "error": str(_provision_leg_frame(reset))[:500]}
+                    "error": str(reset_frame)[:500]}
         _drop_install_facts(ref.id)
         guest_uuid = ""
         try:
@@ -1474,7 +1495,7 @@ def provision_helper(cfg, vm_name="", cred: CredentialSet | None = None,
             helper_b64, timeout_ms=60000)
         install_frame = _provision_leg_frame(install)
         if not install_frame.get("ok"):
-            return {"ok": False,
+            return {**results, "ok": False,
                     "error_class": "helper_install_failed",
                     "error": str(install_frame)[:500]}
         with _REGISTRY_LOCK:

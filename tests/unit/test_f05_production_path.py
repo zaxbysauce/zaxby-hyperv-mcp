@@ -47,6 +47,7 @@ import subprocess
 import threading
 
 import pytest
+from test_f05_interactive_helper import _ps_available, _run_helper_dispatch
 from test_script_parse_new import _parse_errors
 
 from hyperv_mcp import evidence, pswindows, uia
@@ -642,16 +643,21 @@ def test_helper_sha256_integrity_gate(clean_uia_state, monkeypatch):
 
 def test_wait_for_deadline_returns_the_last_slice_answer(clean_uia_state,
                                                          monkeypatch):
-    """F6/F11 (wait_for budget): a wait whose every guest slice answers
-    empty elements EXPIRES its budget and returns the LAST slice's answer
-    (ok with empty elements — the module emits no timed_out flag, so the
-    deadline path is pinned by its bounded return, not a flag), and each
-    slice's request budget never exceeds one _WAIT_SLICE_S slice."""
+    """F6/F11/PRR-117 (wait_for budget): a wait whose every guest slice
+    answers empty elements EXPIRES its budget and returns the LAST slice's
+    answer (ok with empty elements) carrying timed_out True — the flag the
+    review round required on BOTH settled outcomes — and each slice's
+    request budget never exceeds one _WAIT_SLICE_S slice. The hit leg (a
+    slice that ANSWERS) settles with timed_out False."""
     monkeypatch.setattr(pswindows, "run_ps", PSResolveRecorder())
     monkeypatch.setattr(uia, "_run_quser",
                         lambda cfg, ref, cred: {"user": "tester", "session_id": 2})
+
+    answered = {"now": False}
     legs = EchoLegRecorder(frame_for=lambda request: {
-        "ok": True, "result": {"elements": []},
+        "ok": True,
+        "result": ({"elements": [{"element_id": "42:7", "name": "OK"}]}
+                   if answered["now"] else {"elements": []}),
         "session": _helper_session_block()})
     monkeypatch.setattr(uia, "_run_uia_leg", legs)
 
@@ -659,6 +665,10 @@ def test_wait_for_deadline_returns_the_last_slice_answer(clean_uia_state,
                        timeout_s=1)
     assert out["ok"] is True, out
     assert out["elements"] == [], out
+    assert out["timed_out"] is True, (
+        "a wait whose whole budget expired unanswered must carry "
+        "timed_out True"
+    )
     assert legs.requests, "the wait must drive its pipe leg"
     wait_requests = [r for r in legs.requests if r.get("verb") == "wait_for"]
     assert wait_requests, legs.requests
@@ -666,9 +676,15 @@ def test_wait_for_deadline_returns_the_last_slice_answer(clean_uia_state,
                for r in wait_requests), (
         "every wait slice's budget must be bounded by one _WAIT_SLICE_S slice"
     )
-    assert "timed_out" not in out, (
-        "the module defines no timed_out flag; if one is added this pin "
-        "must be updated to assert it on the deadline path"
+
+    # the hit leg: a slice that ANSWERS settles the wait — timed_out False.
+    answered["now"] = True
+    hit = uia.wait_for(UNRESTRICTED, "test-vm-1", CRED, {"name": "OK"},
+                       timeout_s=5)
+    assert hit["ok"] is True, hit
+    assert hit["elements"], hit
+    assert hit["timed_out"] is False, (
+        "an answered wait must carry timed_out False, not a missing flag"
     )
 
 
@@ -737,6 +753,18 @@ def test_provision_install_result_keys_and_failed_branch(clean_uia_state,
                                   autologon=True, confirm=True)
     assert failed["ok"] is False, failed
     assert failed["error_class"] == "helper_install_failed", failed
+    # PRR-117c: the failure result carries the SAME status keys as the
+    # success result (the false/empty values they had at failure time),
+    # never a bare {ok, error_class, error} triple.
+    for key in ("autologon_configured", "task_registered", "helper_version",
+                "helper_running", "reboot_required", "guest_uuid_read",
+                "helper_dir"):
+        assert key in failed, (key, failed)
+    assert failed["helper_version"] == uia.HELPER_VERSION, failed
+    assert failed["autologon_configured"] is False, failed
+    assert failed["task_registered"] is False, failed
+    assert failed["helper_running"] is False, failed
+    assert failed["reboot_required"] is False, failed
 
 
 def test_provision_teardown_result(clean_uia_state, monkeypatch):
@@ -774,3 +802,517 @@ def test_provision_teardown_result(clean_uia_state, monkeypatch):
     assert VM_GUID not in uia._INSTALLS, (
         "teardown drops the recorded install facts for the VM"
     )
+
+
+# ---------------------------------------------------------------------------
+# 8. PRR-112 residual pins: the guest branches that had no behavioural
+#    coverage, driven on the REAL helper script under local PS 5.1 (no VM,
+#    no pipe, no desktop). The harness slices the packaged helper's own
+#    function bodies out of the artifact — the branches under test are the
+#    helper's real code, only the UIA element source is synthetic.
+# ---------------------------------------------------------------------------
+
+PIN_GUID = "11111111-2222-3333-4444-555555555555"
+PIN_SID = "S-1-5-21-1000-2000-3000-1001"
+
+
+def _helper_functions_and_startup_slice() -> str:
+    """The packaged helper's native P/Invoke declarations, its functions,
+    PLUS the startup section that reads version.txt / nonce.txt / uuid.txt
+    from $HelperDir (everything between the `Add-Type -Namespace
+    HypervMcp.Uia -Name Native` block and the serve-loop worker script) —
+    so a scratch HelperDir provisions the identity files the real
+    Read-HelperFile calls consume, and the real Get-LockState /
+    Get-ForegroundWindow legs work (local user32/wtsapi32 only)."""
+    helper = (
+        importlib.resources.files("hyperv_mcp")
+        .joinpath("guest")
+        .joinpath("uia_helper.ps1")
+        .read_text(encoding="utf-8-sig")
+    )
+    start = helper.index("Add-Type -Namespace HypervMcp.Uia -Name Native")
+    end = helper.index("$workerScript = @'")
+    return helper[start:end]
+
+
+def _run_helper_scratch(scratch_dir, cases_ps: str, tmp_path) -> list[dict]:
+    """Run `cases_ps` after the helper's real startup read the provisioned
+    files from `scratch_dir` (the harness sets $HelperDir BEFORE the startup
+    slice); parse one-JSON-per-case stdout. Real powershell.exe only."""
+    ps = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    script = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        "Add-Type -AssemblyName UIAutomationClient",
+        "Add-Type -AssemblyName UIAutomationTypes",
+        "$HelperDir = " + pswindows.ps_quote(str(scratch_dir)),
+        _helper_functions_and_startup_slice(),
+        cases_ps,
+    ])
+    script_file = tmp_path / "helper-scratch-cases.ps1"
+    script_file.write_text(script, encoding="utf-8-sig")
+    proc = subprocess.run(
+        [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(script_file)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, (
+        f"helper scratch harness failed — stdout: {proc.stdout!r} "
+        f"stderr: {proc.stderr[-2000:]!r}"
+    )
+    out = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            out.append(json.loads(line))
+    assert out, f"no case JSON in scratch harness output: {proc.stdout!r}"
+    return out
+
+
+def _scratch_dir(tmp_path, files: dict[str, str]):
+    """A helper directory with the given provisioned files (or none)."""
+    scratch = tmp_path / "helper-home"
+    scratch.mkdir()
+    for name, text in files.items():
+        (scratch / name).write_text(text + "\n", encoding="ascii")
+    return scratch
+
+
+def test_helper_target_and_nonce_refusals_from_provisioned_files(tmp_path):
+    """PRR-112 residual (the security branches, real PS 5.1, scratch dir):
+    the helper's startup REALLY reads version.txt/nonce.txt/uuid.txt from
+    $HelperDir (the packaged Read-HelperFile + startup lines, not a stub),
+    then Invoke-Request enforces the identity gates with those values:
+
+      control      — everything matching serves a read verb (session_state
+                     ok). This is also the round-trip probe leg: refusals
+                     and a successful read verb both served locally.
+      wrong_guid   — a request naming ANOTHER VM's uuid is refused
+                     target_mismatch (the PRR-104 cross-VM protection).
+      wrong_nonce  — a request with the wrong nonce is refused
+                     nonce_mismatch BEFORE any dispatch.
+      no_nonce     — a request carrying no nonce key at all is refused
+                     nonce_mismatch.
+      live_changed — a live SMBIOS uuid that no longer equals the recorded
+                     one is refused target_mismatch (fail closed).
+
+    What this proves: the real file-reading startup feeds the real
+    pre-dispatch gates and each named refusal branch fires with its
+    documented error_class. What it does NOT prove: the pipe serve loop,
+    the dispatch runspace bound, or any guest/VM behaviour — Get-LiveUuid
+    is stubbed after the slice (a local CIM read would return this
+    machine's real SMBIOS uuid, never the scratch recording), and the
+    target carries the harness process's own real sid/session (read from
+    the startup's $identity) so only the named dimension mismatches."""
+    if not _ps_available():
+        pytest.skip("Windows PowerShell 5.1 not available")
+    nonce = "nonce-p112"
+    scratch = _scratch_dir(tmp_path, {
+        "version.txt": "1",
+        "nonce.txt": nonce,
+        "uuid.txt": PIN_GUID,
+    })
+
+    def target_ps(guid="$recordedUuid") -> str:
+        return (f"@{{ vm_guid = {guid}; user_sid = $identity.sid; "
+                f"session_id = $identity.session_id }}")
+
+    cases = "\n".join([
+        # the live SMBIOS read is stubbed to echo the recording (the
+        # live_changed leg below overrides it again — later defs win)
+        "function Get-LiveUuid { $recordedUuid }",
+        "$ok_target = " + target_ps(),
+        # control: every dimension matches -> the read verb succeeds
+        f"$r0 = Invoke-Request @{{ id = 'ctl'; verb = 'session_state'; nonce = '{nonce}'; min_version = '1'; target = $ok_target }}",
+        "@{ case = 'control'; ok = $r0.ok; error_class = $r0.error_class } | ConvertTo-Json -Compress",
+        # a request targeting ANOTHER VM -> target_mismatch
+        "$r1 = Invoke-Request @{ id = 't1'; verb = 'session_state'; nonce = '" + nonce + "'; min_version = '1'; target = " + target_ps("'99999999-9999-9999-9999-999999999999'") + " }",
+        "@{ case = 'wrong_guid'; ok = $r1.ok; error_class = $r1.error_class } | ConvertTo-Json -Compress",
+        # wrong nonce -> nonce_mismatch (before any dispatch)
+        "$r2 = Invoke-Request @{ id = 't2'; verb = 'session_state'; nonce = 'not-the-nonce'; min_version = '1'; target = $ok_target }",
+        "@{ case = 'wrong_nonce'; ok = $r2.ok; error_class = $r2.error_class } | ConvertTo-Json -Compress",
+        # no nonce key at all -> nonce_mismatch
+        "$r3 = Invoke-Request @{ id = 't3'; verb = 'session_state'; min_version = '1'; target = $ok_target }",
+        "@{ case = 'no_nonce'; ok = $r3.ok; error_class = $r3.error_class } | ConvertTo-Json -Compress",
+        # the live uuid drifts from the recording -> target_mismatch
+        "function Get-LiveUuid { 'deadbeef-0000-0000-0000-000000000000' }",
+        f"$r4 = Invoke-Request @{{ id = 't4'; verb = 'session_state'; nonce = '{nonce}'; min_version = '1'; target = $ok_target }}",
+        "@{ case = 'live_changed'; ok = $r4.ok; error_class = $r4.error_class } | ConvertTo-Json -Compress",
+    ])
+    rows = {row["case"]: row for row in _run_helper_scratch(scratch, cases, tmp_path)}
+
+    assert rows["control"]["ok"] is True, rows["control"]
+    for case in ("wrong_guid", "live_changed"):
+        assert rows[case]["ok"] is False, rows[case]
+        assert rows[case]["error_class"] == "target_mismatch", rows[case]
+    for case in ("wrong_nonce", "no_nonce"):
+        assert rows[case]["ok"] is False, rows[case]
+        assert rows[case]["error_class"] == "nonce_mismatch", rows[case]
+
+
+def test_helper_missing_uuid_file_fails_closed(tmp_path):
+    """PRR-112 residual (fail-closed leg): a scratch helper directory with
+    version.txt and nonce.txt but NO uuid.txt must refuse every request as
+    target_mismatch — the recorded-identity dimension is missing, so the
+    helper fails closed instead of serving. Real startup Read-HelperFile
+    calls; proves the missing-record branch of the target gate and NOT the
+    pipe/serve plumbing."""
+    if not _ps_available():
+        pytest.skip("Windows PowerShell 5.1 not available")
+    scratch = _scratch_dir(tmp_path, {"version.txt": "1",
+                                      "nonce.txt": "nonce-p112"})
+    cases = "\n".join([
+        "function Get-LiveUuid { $recordedUuid }",
+        "$target = @{ vm_guid = '" + PIN_GUID + "'; user_sid = $identity.sid; session_id = $identity.session_id }",
+        "$r = Invoke-Request @{ id = 't'; verb = 'session_state'; nonce = 'nonce-p112'; min_version = '1'; target = $target }",
+        "@{ case = 'no_uuid_file'; ok = $r.ok; error_class = $r.error_class; recorded_empty = ([string]::IsNullOrEmpty($recordedUuid)) } | ConvertTo-Json -Compress",
+    ])
+    rows = {row["case"]: row for row in _run_helper_scratch(scratch, cases, tmp_path)}
+    row = rows["no_uuid_file"]
+    assert row["recorded_empty"] is True, (
+        "sanity: the real startup must have read uuid.txt as missing/empty"
+    )
+    assert row["ok"] is False and row["error_class"] == "target_mismatch", row
+
+
+def test_helper_ambiguous_selector_refusal(tmp_path):
+    """PRR-112 residual (ambiguous_selector): a selector matching MORE than
+    one element is refused with error_class ambiguous_selector and the
+    matched CANDIDATES ride the refusal — driven through the REAL
+    Invoke-Request dispatch and the REAL Select-One (the function sliced
+    verbatim from the packaged artifact); only Resolve-Target is stubbed to
+    return two synthetic elements, because a real desktop cannot be
+    arranged deterministically from a unit test. Proves the multi-match
+    branch and its candidates payload; does NOT prove desktop-wide
+    matching itself (that is PRR-108's pinned territory)."""
+    if not _ps_available():
+        pytest.skip("Windows PowerShell 5.1 not available")
+    uuid = PIN_GUID.lower()
+    cases = "\n".join([
+        "$HelperVersion = '1'",
+        "$ownNonce = 'nonce-amb'",
+        f"$recordedUuid = '{uuid}'",
+        "$identity = @{ sid = '" + PIN_SID + "'; user = 'tester'; session_id = 1 }",
+        "$capabilities = @('uia','msaa')",
+        "$MaxMatches = 200; $MaxValueChars = 65536",
+        "function Get-LockState { $false }",
+        f"function Get-LiveUuid {{ '{uuid}' }}",
+        "function Test-OwnsInputDesktop { $true }",
+        "function Get-ForegroundWindow { $null }",
+        "function Get-SessionBlock { @{ session_id = 1 } }",
+        # synthetic matched elements: PSObjects shaped like UIA elements
+        # as far as Select-One reads them (Current.Name /
+        # Current.ControlType.ProgrammaticName / BoundingRectangle)
+        "function New-FakeEl([string]$n) {",
+        "    $ct = New-Object System.Management.Automation.PSObject",
+        "    $ct | Add-Member -MemberType NoteProperty -Name ProgrammaticName -Value 'ControlType.Button'",
+        "    $cur = New-Object System.Management.Automation.PSObject",
+        "    $cur | Add-Member -MemberType NoteProperty -Name Name -Value $n",
+        "    $cur | Add-Member -MemberType NoteProperty -Name ControlType -Value $ct",
+        "    $el = New-Object System.Management.Automation.PSObject",
+        "    $el | Add-Member -MemberType NoteProperty -Name Current -Value $cur",
+        "    $el",
+        "}",
+        "function Resolve-Target { param($selector) @((New-FakeEl 'First'), (New-FakeEl 'Second')) }",
+        f"$target = @{{ vm_guid = '{uuid}'; user_sid = '{PIN_SID}'; session_id = 1 }}",
+        "$r = Invoke-Request @{ id = 'amb'; verb = 'find'; nonce = 'nonce-amb'; min_version = '1'; target = $target; selector = @{ name = 'Duplicate' } }",
+        "@{ case = 'ambiguous'; ok = $r.ok; error_class = $r.error_class; candidates = @($r.candidates).Count; first_name = $r.candidates[0].name } | ConvertTo-Json -Compress",
+    ])
+    rows = {row["case"]: row for row in _run_helper_dispatch(cases, tmp_path)}
+    row = rows["ambiguous"]
+    assert row["ok"] is False, row
+    assert row["error_class"] == "ambiguous_selector", row
+    assert row["candidates"] == 2, row
+    assert row["first_name"] == "First", (
+        "the refusal must carry the matched candidates so a caller can "
+        f"disambiguate: {row}"
+    )
+
+
+def test_helper_msaa_legacy_bridge_fires(tmp_path):
+    """PRR-112 residual (the LegacyIAccessible msaa bridge). EMPIRICAL
+    FINDING pinned here: the in-box .NET Framework UIA wrapper ships NO
+    managed System.Windows.Automation.LegacyIAccessiblePattern type (and
+    AutomationPattern.LookupById(10018) answers null), so the helper's old
+    per-request type literal could never resolve — the bridge was dead
+    code, its TypeNotFound swallowed by the surrounding catch. The helper
+    now probes the pattern object ONCE at startup and skips the fallback
+    cleanly where the type is absent.
+
+    This pin drives the REAL Invoke-Request dispatch with $legacyPattern
+    set to a sentinel object and a synthetic element whose GetCurrentPattern
+    answers the sentinel with a recording fake: set_value routes the text
+    through the bridge's SetValue and reports pattern 'LegacyIAccessible'
+    with the length; invoke fires DoDefaultAction and reports the same
+    pattern. Proves: the fallback ROUTING fires and reports itself (UIA
+    patterns tried first, msaa bridge last). Does NOT prove: any real
+    legacy control end to end — no desktop is driven, the sentinel stands
+    in for a pattern object this .NET build cannot express, and on PS 5.1
+    production the startup probe leaves the branch skipped (the bridge
+    goes live only where the wrapper defines the type)."""
+    if not _ps_available():
+        pytest.skip("Windows PowerShell 5.1 not available")
+    uuid = PIN_GUID.lower()
+    cases = "\n".join([
+        "$HelperVersion = '1'",
+        "$ownNonce = 'nonce-msaa'",
+        f"$recordedUuid = '{uuid}'",
+        "$identity = @{ sid = '" + PIN_SID + "'; user = 'tester'; session_id = 1 }",
+        "$capabilities = @('uia','msaa')",
+        "$MaxMatches = 200; $MaxValueChars = 65536",
+        "function Get-LockState { $false }",
+        f"function Get-LiveUuid {{ '{uuid}' }}",
+        "function Test-OwnsInputDesktop { $true }",
+        "function Get-ForegroundWindow { $null }",
+        "function Get-SessionBlock { @{ session_id = 1 } }",
+        # the startup probe product: where the wrapper has no managed
+        # LegacyIAccessiblePattern this is $null; the sentinel makes the
+        # branch live so its routing is pinnable. (The fake speaks through
+        # $global: names because PowerShell's dynamic scoping would resolve
+        # a bare $legacy inside the ScriptMethod to Invoke-Request's own
+        # local `$legacy = $null` on the call chain.)
+        "$global:LegacySentinel = New-Object System.Management.Automation.PSObject",
+        "$legacyPattern = $global:LegacySentinel",
+        "$global:FakeLegacy = New-Object System.Management.Automation.PSObject",
+        "$global:FakeLegacy | Add-Member -MemberType ScriptMethod -Name SetValue -Value { param($t) $global:LegacySetTo = $t }",
+        "$global:FakeLegacy | Add-Member -MemberType ScriptMethod -Name DoDefaultAction -Value { $global:LegacyFired = $true }",
+        "$fakeEl = New-Object System.Management.Automation.PSObject",
+        "$fakeEl | Add-Member -MemberType ScriptMethod -Name GetCurrentPattern -Value {",
+        "    param($p)",
+        "    if ($p -eq $global:LegacySentinel) { return $global:FakeLegacy }",
+        "    throw (New-Object InvalidOperationException('no UIA pattern on the synthetic legacy element'))",
+        "}",
+        "function Resolve-Target { param($selector) @($fakeEl) }",
+        "function Select-One { param($elements, $selector) $elements[0] }",
+        f"$target = @{{ vm_guid = '{uuid}'; user_sid = '{PIN_SID}'; session_id = 1 }}",
+        # set_value: ValuePattern absent -> the msaa bridge carries the text
+        "$global:LegacySetTo = $null",
+        "$r1 = Invoke-Request @{ id = 'msaa-sv'; verb = 'set_value'; nonce = 'nonce-msaa'; min_version = '1'; target = $target; selector = @{ name = 'LegacyBox' }; args = @{ value = 'legacy-text' } }",
+        "@{ case = 'set_value'; ok = $r1.ok; pattern = $r1.result.pattern; length = $r1.result.length; set_to = $global:LegacySetTo } | ConvertTo-Json -Compress",
+        # invoke: no UIA action pattern -> DoDefaultAction fires
+        "$global:LegacyFired = $false",
+        "$r2 = Invoke-Request @{ id = 'msaa-inv'; verb = 'invoke'; nonce = 'nonce-msaa'; min_version = '1'; target = $target; selector = @{ name = 'LegacyBox' } }",
+        "@{ case = 'invoke'; ok = $r2.ok; pattern = $r2.result.pattern; fired = $global:LegacyFired } | ConvertTo-Json -Compress",
+        # the probe itself, recorded for the run log: on the in-box .NET
+        # Framework wrapper the managed LegacyIAccessiblePattern type does
+        # not exist, so production leaves the bridge skipped there.
+        "$probed = $null",
+        "try { $probed = [System.Windows.Automation.LegacyIAccessiblePattern]::Pattern } catch { $probed = $null }",
+        "@{ case = 'probe'; type_exists = ($null -ne $probed) } | ConvertTo-Json -Compress",
+    ])
+    rows = {row["case"]: row for row in _run_helper_dispatch(cases, tmp_path)}
+
+    set_row = rows["set_value"]
+    assert set_row["ok"] is True, set_row
+    assert set_row["pattern"] == "LegacyIAccessible", set_row
+    assert set_row["length"] == len("legacy-text"), set_row
+    assert set_row["set_to"] == "legacy-text", (
+        "the msaa bridge must actually CARRY the value into "
+        f"LegacyIAccessible.SetValue: {set_row}"
+    )
+
+    inv_row = rows["invoke"]
+    assert inv_row["ok"] is True, inv_row
+    assert inv_row["pattern"] == "LegacyIAccessible", inv_row
+    assert inv_row["fired"] is True, (
+        "DoDefaultAction must actually fire through the bridge: " f"{inv_row}"
+    )
+
+
+def test_helper_session_block_lock_is_per_response_fresh(tmp_path):
+    """PRR-112 residual (per-response session-lock freshness): the REAL
+    Get-SessionBlock (sliced verbatim from the artifact, alongside the real
+    startup that reads the provisioned files) consults the lock state on
+    EVERY call — flipping the lock source between two calls flips the
+    reported `locked` while the session identity stays stable, so the serve
+    loop's per-response `$response.session = Get-SessionBlock` cannot serve
+    a stale lock from helper start. Get-LockState is replaced after the
+    slice with a flippable stub (the real one queries the LOCAL session,
+    which a test cannot lock). Proves: the block is computed per call, not
+    cached. Does NOT prove: the serve loop itself invokes it per response —
+    that wiring is pinned textually below on the packaged worker script."""
+    if not _ps_available():
+        pytest.skip("Windows PowerShell 5.1 not available")
+    scratch = _scratch_dir(tmp_path, {"version.txt": "1"})
+    cases = "\n".join([
+        "$global:LockFlip = $false",
+        "function Get-LockState { $global:LockFlip }",
+        "$b1 = Get-SessionBlock",
+        "$global:LockFlip = $true",
+        "$b2 = Get-SessionBlock",
+        "@{ case = 'freshness'; locked1 = [bool]$b1.locked; locked2 = [bool]$b2.locked; same_session = ($b1.session_id -eq $b2.session_id); version_stable = ($b1.helper.version -eq $b2.helper.version) } | ConvertTo-Json -Compress",
+    ])
+    rows = {row["case"]: row for row in _run_helper_scratch(scratch, cases, tmp_path)}
+    row = rows["freshness"]
+    assert row["locked1"] is False and row["locked2"] is True, (
+        "the lock state must be recomputed per Get-SessionBlock call — a "
+        f"session locked AFTER helper start must be reported locked: {row}"
+    )
+    assert row["same_session"] is True and row["version_stable"] is True, row
+
+    # the serve-loop wiring: every response frame's session block is built
+    # by a fresh Get-SessionBlock call inside the packaged worker script.
+    helper_text = (
+        importlib.resources.files("hyperv_mcp")
+        .joinpath("guest")
+        .joinpath("uia_helper.ps1")
+        .read_text(encoding="utf-8")
+    )
+    assert "$response.session = Get-SessionBlock" in helper_text, (
+        "the worker serve loop must attach a freshly computed session "
+        "block to every response (per-response lock freshness)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 9. PRR-117 shape-contract pins: one clamp, one session key set
+# ---------------------------------------------------------------------------
+
+def test_inspect_clamps_match_the_documented_bounds(clean_uia_state, monkeypatch):
+    """PRR-117d (clamp unification): ONE clamp for both tree paths. The
+    helper path (uia.inspect) clamps its framed request to depth 1..6 and
+    max_elements 1..500 — the numbers the tool docstrings and evidence's
+    PS Direct walk (frozen pins) promise. The old helper-path divergence
+    (1..8 / 1..2000) is gone, and the two modules' constants are pinned
+    EQUAL so they cannot drift apart again."""
+    monkeypatch.setattr(pswindows, "run_ps", PSResolveRecorder())
+    monkeypatch.setattr(uia, "_run_quser",
+                        lambda cfg, ref, cred: {"user": "tester", "session_id": 2})
+    legs = EchoLegRecorder(frame_for=lambda request: {
+        "ok": True, "result": {"elements": 0, "truncated": False, "tree": None},
+        "session": _helper_session_block()})
+    monkeypatch.setattr(uia, "_run_uia_leg", legs)
+
+    out = uia.inspect(UNRESTRICTED, "test-vm-1", CRED, depth=99,
+                      max_elements=99999)
+    assert out["ok"] is True, out
+    inspect_requests = [r for r in legs.requests if r.get("verb") == "inspect"]
+    assert inspect_requests, legs.requests
+    args = inspect_requests[0].get("args") or {}
+    assert args.get("depth") == uia.INSPECT_MAX_DEPTH == 6, args
+    assert args.get("max_elements") == uia.INSPECT_MAX_ELEMENTS == 500, args
+    assert (uia.INSPECT_MAX_DEPTH, uia.INSPECT_MAX_ELEMENTS) == (
+        evidence._UIA_MAX_DEPTH, evidence._UIA_MAX_ELEMENTS), (
+        "the helper path and the PS Direct walk must share ONE clamp"
+    )
+
+
+def test_helper_worker_bounds_the_dispatch_not_just_the_read():
+    """PRR-113/F12 residual pin (artifact text — the serve loop itself
+    cannot run in a unit harness): the packaged worker script bounds the
+    per-request VERB DISPATCH, not only the request read. It must
+    (a) run the dispatch in a fresh child runspace created per request,
+    (b) poll BeginInvoke's completion against a deadline,
+    (c) answer a hung dispatch from the pipe-owning runspace with the
+        dispatch_timeout error class,
+    (d) stop/dispose the abandoned child asynchronously so the accept
+        loop survives, and
+    (e) hand the child ONLY the parsed request hashtable — the raw
+        client stream ($line) and the pipe handle never cross into it.
+    What this does NOT prove: an actual hung UIA call timing out end to
+    end (that needs a live desktop wedged mid-dispatch); the markers pin
+    the bound's presence and shape in the shipped worker script."""
+    helper_text = (
+        importlib.resources.files("hyperv_mcp")
+        .joinpath("guest")
+        .joinpath("uia_helper.ps1")
+        .read_text(encoding="utf-8")
+    )
+    worker_start = helper_text.index("$workerScript = @'")
+    worker_end = helper_text.index("'@", worker_start + 1)
+    worker = helper_text[worker_start:worker_end]
+    # (a) fresh child runspace per request
+    assert "[System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($sessionState)" in worker
+    # (b) the completion poll runs against a deadline
+    assert "BeginInvoke()" in worker and "dispatchDeadline" in worker
+    assert "while (-not $childAsync.IsCompleted)" in worker
+    # (c) the timeout answer names dispatch_timeout
+    assert "dispatch_timeout" in worker
+    # (d) the abandoned child is stopped/disposed asynchronously
+    assert "BeginStop(" in worker and "CloseAsync()" in worker
+    # (e) the child script receives ONLY the parsed request hashtable
+    dispatch_script = "param([hashtable]$Request) Invoke-Request $Request"
+    assert dispatch_script in worker
+    add_script_pos = worker.index(dispatch_script)
+    assert "$line" not in worker[add_script_pos:add_script_pos + len(dispatch_script)]
+    # the read deadline is still in force (the fix must not remove it)
+    assert "$deadline = [DateTime]::UtcNow.AddMilliseconds($RequestTimeoutMs)" in worker
+
+
+def test_evidence_ui_tree_shape_contract(monkeypatch):
+    """PRR-117a (result-shape contract): whenever a tree was requested,
+    ui_tree carries BOTH `session` and `source` on every path, and every
+    session block carries ONE key set — {session_id, interactive,
+    input_desktop} — with None filling a dimension a path cannot know.
+    Pins the helper path (input_desktop None, source "helper"), the
+    unchanged-skip path (session None, source "skipped_unchanged"), the
+    walk failure path (session None, source "ps_direct_walk") and the
+    no_interactive_session refusal (the 3-key session riding the refusal,
+    source "ps_direct_walk"). The frozen test_evidence.py already pins
+    the walk success path's exact shape, so it is not re-pinned here."""
+    cfg = UNRESTRICTED
+
+    def fake_screenshot(cfg_, vm_name="", width=1024, height=768, save_path="",
+                        vm_id="", fmt="", quality=None, scale=None, crop=None,
+                        if_changed_from=""):
+        meta = {"vm_name": "test-vm-1", "vm_id": VM_GUID, "width": 8,
+                "height": 8, "frame_hash": "a" * 64,
+                "captured_at": "2026-10-29T00:00:00.000+00:00",
+                "capture_method": "stub"}
+        if if_changed_from == "a" * 64:
+            return None, {**meta, "unchanged": True}
+        return object(), meta
+
+    monkeypatch.setattr(evidence.console, "screenshot", fake_screenshot)
+    monkeypatch.setattr(pswindows, "run_ps", PSResolveRecorder())
+
+    # helper path: session_state answers a live, version-matched helper
+    monkeypatch.setattr(uia, "session_state", lambda cfg_, ref, cred_: {
+        "ok": True, "active_session_id": 2, "interactive_user": "tester",
+        "locked": False,
+        "helper": {"running": True, "version": uia.HELPER_VERSION}})
+    monkeypatch.setattr(uia, "inspect", lambda cfg_, ref, cred_,
+                        selector=None, **kw: {
+        "ok": True, "elements": 1, "truncated": False,
+        "tree": {"name": "Desktop"}})
+    out = evidence.capture_evidence(cfg, "test-vm-1", ui_tree=True, cred=CRED)
+    ui = out["meta"]["ui_tree"]
+    assert ui["source"] == "helper", ui
+    assert ui["session"] == {"session_id": 2, "interactive": True,
+                             "input_desktop": None}, (
+        "the helper path reports the ONE session key set, None filling the "
+        f"input-desktop dimension its session_state answer cannot know: {ui}"
+    )
+
+    # unchanged frame: the skip still carries session (None) and a source
+    # naming why no path ran
+    out = evidence.capture_evidence(cfg, "test-vm-1", ui_tree=True, cred=CRED,
+                                    if_changed_from="a" * 64)
+    ui = out["meta"]["ui_tree"]
+    assert ui["skipped"] is True and ui["session"] is None, ui
+    assert ui["source"] == "skipped_unchanged", ui
+
+    # walk failure: session None, source ps_direct_walk
+    monkeypatch.setattr(uia, "session_state", lambda *a: {"ok": False})
+
+    def boom(*a, **k):
+        raise RuntimeError("no interactive desktop")
+
+    monkeypatch.setattr(evidence, "run_guest_inner", boom)
+    out = evidence.capture_evidence(cfg, "test-vm-1", ui_tree=True, cred=CRED)
+    ui = out["meta"]["ui_tree"]
+    assert ui["ok"] is False and ui["session"] is None, ui
+    assert ui["source"] == "ps_direct_walk", ui
+
+    # walk refusal: the 3-key session rides the no_interactive_session
+    # refusal with source ps_direct_walk (input_desktop None when the
+    # walker emitted none)
+    monkeypatch.setattr(evidence, "run_guest_inner",
+                        lambda *a, **k: {"session_id": 0, "interactive": False,
+                                         "elements": 1, "truncated": False,
+                                         "tree": {}})
+    out = evidence.capture_evidence(cfg, "test-vm-1", ui_tree=True, cred=CRED)
+    ui = out["meta"]["ui_tree"]
+    assert ui["ok"] is False and ui["error_class"] == "no_interactive_session"
+    assert ui["session"] == {"session_id": 0, "interactive": False,
+                             "input_desktop": None}, ui
+    assert ui["source"] == "ps_direct_walk", ui

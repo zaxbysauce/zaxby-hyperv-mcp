@@ -2265,8 +2265,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                     class_name, window_title, process_name, hwnd, index);
                     with a selector the walk starts at the matched element,
                     without it at the desktop root
-                depth: Walk depth (1..8, default 3)
-                max_elements: Element cap (1..2000, default 200)
+                depth: Walk depth (1..6, default 3; one clamp shared with
+                    evidence's PS Direct walk)
+                max_elements: Element cap (1..500, default 200; the same
+                    clamp as evidence's walk)
                 adapter: "" (default) or "electron" — an Electron adapter
                     request is refused adapter_unapproved unless the helper
                     registration carries the adapter:electron capability
@@ -2598,8 +2600,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                     class_name, window_title, process_name, hwnd, index);
                     with a selector the walk starts at the matched element,
                     without it at the desktop root
-                depth: Walk depth (1..8, default 3)
-                max_elements: Element cap (1..2000, default 200)
+                depth: Walk depth (1..6, default 3; one clamp shared with
+                    evidence's PS Direct walk)
+                max_elements: Element cap (1..500, default 200; the same
+                    clamp as evidence's walk)
                 adapter: "" (default) or "electron" — an Electron adapter
                     request is refused adapter_unapproved unless the helper
                     registration carries the adapter:electron capability

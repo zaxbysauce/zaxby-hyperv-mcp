@@ -36,8 +36,8 @@
 #     user_sid, session_id}; the helper enforces them STRICTLY (an
 #     unknown version refused as helper_version_unknown; a wrong nonce
 #     refused as nonce_mismatch; a stale host refused as
-#     helper_version_mismatch; a session-less request refused as
-#     session_unverified; a mismatched VM/user/session refused as
+#     helper_version_mismatch; a session-less or mismatched SESSION
+#     refused as session_unverified; a mismatched VM/user refused as
 #     target_mismatch) BEFORE any verb dispatch. The session dimension
 #     must be CONCRETE and equal to this helper's own session for every
 #     verb, reads included. Caller text is never evaluated as code:
@@ -64,8 +64,11 @@ if ($env:HYPERVMCP_HELPER_DIR) { $HelperDir = $env:HYPERVMCP_HELPER_DIR }
 
 $PipeName = 'hyperv-mcp-uia'
 $PipeInstanceCount = 4
-$MaxDepth = 8
-$MaxElements = 2000
+# ONE clamp for both tree paths (PRR-117): the host clamps inspect to
+# these same bounds (uia.INSPECT_MAX_DEPTH / INSPECT_MAX_ELEMENTS) before
+# the request leaves; the ceiling here is defense in depth.
+$MaxDepth = 6
+$MaxElements = 500
 $MaxMatches = 200
 $MaxValueChars = 65536
 $MaxRequestBytes = 262144
@@ -719,8 +722,16 @@ function Invoke-Request([hashtable]$req) {
         } else {
             # msaa bridge: the UIA MSAA proxy exposes LegacyIAccessiblePattern
             # for legacy/VB-style controls that carry no UIA Value pattern.
+            # $legacyPattern is probed ONCE at startup: the in-box .NET
+            # Framework UIA wrapper ships no managed
+            # LegacyIAccessiblePattern type, and a per-request type
+            # literal would throw inside this verb and silently disable
+            # the bridge - where the type does not exist the branch is
+            # skipped cleanly instead.
             $legacy = $null
-            try { $legacy = $el.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern) } catch { $legacy = $null }
+            if ($null -ne $legacyPattern) {
+                try { $legacy = $el.GetCurrentPattern($legacyPattern) } catch { $legacy = $null }
+            }
             if ($null -ne $legacy) {
                 try { $legacy.SetValue($text); $fired = 'LegacyIAccessible' } catch { $fired = $null }
             }
@@ -741,8 +752,14 @@ function Invoke-Request([hashtable]$req) {
         if ($null -eq $fired -and $null -ne (Invoke-Pattern $el ([System.Windows.Automation.SelectionItemPattern]::Pattern) 'select' $null)) { $fired = 'SelectionItem' }
         if ($null -eq $fired -and $null -ne (Invoke-Pattern $el ([System.Windows.Automation.ExpandCollapsePattern]::Pattern) 'expand' $null)) { $fired = 'ExpandCollapse' }
         if ($null -eq $fired) {
+            # The msaa LegacyIAccessible bridge rides here too, via
+            # DoDefaultAction - guarded by the startup-probed pattern
+            # object (see the set_value leg for why it is probed, not
+            # spelled as a per-request type literal).
             $legacy = $null
-            try { $legacy = $el.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern) } catch { $legacy = $null }
+            if ($null -ne $legacyPattern) {
+                try { $legacy = $el.GetCurrentPattern($legacyPattern) } catch { $legacy = $null }
+            }
             if ($null -ne $legacy) {
                 try { $legacy.DoDefaultAction(); $fired = 'LegacyIAccessible' } catch { $fired = $null }
             }
@@ -776,6 +793,14 @@ try {
         $ownSha256 = [BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($selfPath))) -replace '-', ''
     }
 } catch { $ownSha256 = '' }
+
+# The msaa bridge pattern object, probed ONCE (PRR-112): the in-box .NET
+# Framework UIA wrapper ships no managed LegacyIAccessiblePattern type, so
+# a per-request type literal throws inside the verb and its catch silently
+# disables the bridge. Where the type exists the bridge is live; where it
+# does not the legacy fallback is skipped cleanly.
+$legacyPattern = $null
+try { $legacyPattern = [System.Windows.Automation.LegacyIAccessiblePattern]::Pattern } catch { $legacyPattern = $null }
 
 # The pipe DACL: GENERIC_ALL for LOCAL_SYSTEM, BUILTIN\Administrators and
 # the running user (the existing New-PipeSecurity intent), expressed as
@@ -834,11 +859,49 @@ while ($true) {
             $line = $line.TrimEnd("`r")
             $response = $null
             $requestId = ''
+            $req = @{}
             try {
-                $req = ConvertTo-HashtableDeep ($line | ConvertFrom-Json)
-                if ($req -isnot [hashtable]) { $req = @{} }
+                $parsed = ConvertTo-HashtableDeep ($line | ConvertFrom-Json)
+                if ($parsed -is [hashtable]) { $req = $parsed }
                 if ($req.ContainsKey('id')) { $requestId = [string]$req['id'] }
-                $response = Invoke-Request $req
+            } catch {
+                $req = @{}
+            }
+            # F12: the verb dispatch runs in a FRESH child runspace per
+            # request, polled against its own deadline. The request-read
+            # budget above bounds only the READ; without this second
+            # budget a hung UIA call (a wedged target app is a common UIA
+            # failure) would wedge this pipe instance forever - four
+            # hangs would exhaust every instance. The child receives ONLY
+            # the parsed request hashtable, never the raw client stream;
+            # this runspace keeps sole ownership of the pipe handle.
+            $dispatchDeadline = [DateTime]::UtcNow.AddMilliseconds($RequestTimeoutMs)
+            $childRunspace = $null
+            $childShell = $null
+            $childAsync = $null
+            $abandoned = $false
+            try {
+                $childRunspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($sessionState)
+                $childRunspace.Open()
+                $childShell = [System.Management.Automation.PowerShell]::Create()
+                $childShell.Runspace = $childRunspace
+                [void]$childShell.AddScript('param([hashtable]$Request) Invoke-Request $Request').AddArgument($req)
+                $childAsync = $childShell.BeginInvoke()
+                while (-not $childAsync.IsCompleted) {
+                    if ([DateTime]::UtcNow -ge $dispatchDeadline) { break }
+                    Start-Sleep -Milliseconds 50
+                }
+                if ($childAsync.IsCompleted) {
+                    $response = $childShell.EndInvoke($childAsync)
+                } else {
+                    # Answer from THIS runspace, which still owns the pipe:
+                    # the wedged call leaks its thread (BeginStop is a
+                    # best-effort asynchronous stop; Close/Dispose can
+                    # block on a busy runspace), never a pipe instance.
+                    $abandoned = $true
+                    try { [void]$childShell.BeginStop($null, $null) } catch { }
+                    $response = @{ ok = $false; error_class = 'dispatch_timeout'; error = "the verb dispatch did not complete within the $($RequestTimeoutMs) ms per-request deadline and was abandoned" }
+                }
             } catch {
                 $response = @{ ok = $false; error_class = 'helper_error'; error = $_.Exception.Message }
             }
@@ -850,6 +913,15 @@ while ($true) {
             $payload = [System.Text.Encoding]::UTF8.GetBytes($json + "`n")
             $written = [uint32]0
             [void][HypervMcp.Uia.Native]::WriteFile($handle, $payload, [uint32]$payload.Length, [ref]$written, [IntPtr]::Zero)
+            if (-not $abandoned) {
+                if ($null -ne $childShell) { try { $childShell.Dispose() } catch { } }
+                if ($null -ne $childRunspace) { try { $childRunspace.Dispose() } catch { } }
+            } elseif ($null -ne $childRunspace) {
+                # Non-blocking close request for the abandoned runspace;
+                # the client already holds its error frame and the accept
+                # loop below recycles this instance either way.
+                try { $childRunspace.CloseAsync() } catch { }
+            }
         }
     } catch {
         Start-Sleep -Milliseconds 250
@@ -901,6 +973,10 @@ $sessionVariables = @{
     MaxRequestBytes = $MaxRequestBytes
     RequestTimeoutMs = $RequestTimeoutMs
     PipeSddl = $PipeSddl
+    legacyPattern = $legacyPattern
+    # The template itself, so each worker's per-request child runspace
+    # (the F12 dispatch bound) is built from the same session state.
+    sessionState = $sessionState
 }
 foreach ($key in @($sessionVariables.Keys)) {
     $sessionState.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($key, $sessionVariables[$key], 'helper state')))
