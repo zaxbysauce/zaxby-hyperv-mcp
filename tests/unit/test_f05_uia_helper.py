@@ -514,6 +514,101 @@ def test_provision_requires_category_and_confirm(monkeypatch):
 # AC10: the provisioning script contract
 # ---------------------------------------------------------------------------
 
+def _split_top_level_args(text: str) -> list[str]:
+    """Split a call's argument text on top-level commas (parens respected)."""
+    args: list[str] = []
+    depth = 0
+    current: list[str] = []
+    for ch in text:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            args.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    tail = "".join(current).strip()
+    if tail:
+        args.append(tail)
+    return args
+
+
+def _eval_int_expr(expr: str):
+    """Evaluate a small integer expression (literals, -bor/|/+/& casts).
+
+    Returns None when the expression is anything richer (a variable, a
+    method call) — the caller then refuses to certify the flag.
+    """
+    import ast
+
+    cleaned = expr.strip()
+    for cast in ("[uint32]", "[int]", "[int64]", "[uint64]"):
+        cleaned = cleaned.replace(cast, "")
+    cleaned = cleaned.replace("-bor", "|").replace("-band", "&").strip()
+    try:
+        tree = ast.parse(cleaned, mode="eval")
+    except SyntaxError:
+        return None
+
+    def visit(node):
+        if isinstance(node, ast.Expression):
+            return visit(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return node.value
+        if isinstance(node, ast.BinOp) and isinstance(
+                node.op, (ast.Add, ast.BitOr, ast.BitAnd)):
+            left, right = visit(node.left), visit(node.right)
+            if left is None or right is None:
+                return None
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.BitOr):
+                return left | right
+            return left & right
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            inner = visit(node.operand)
+            return None if inner is None else -inner
+        return None
+
+    return visit(tree)
+
+
+def _createpipe_dwpipemode(helper_text: str):
+    """The dwPipeMode (3rd argument) of the helper's CreateNamedPipeW call.
+
+    Returns the evaluated integer, or None when the invocation is absent or
+    its mode argument is not a statically resolvable integer expression.
+    """
+    marker = "::CreateNamedPipeW("
+    idx = helper_text.find(marker)
+    while idx != -1:
+        line_start = helper_text.rfind("\n", 0, idx) + 1
+        line = helper_text[line_start:helper_text.find("\n", idx)]
+        if line.lstrip().startswith("#"):
+            idx = helper_text.find(marker, idx + 1)
+            continue
+        open_paren = idx + len(marker) - 1
+        depth = 0
+        end = None
+        for pos in range(open_paren, len(helper_text)):
+            if helper_text[pos] == "(":
+                depth += 1
+            elif helper_text[pos] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = pos
+                    break
+        if end is None:
+            return None
+        args = _split_top_level_args(helper_text[open_paren + 1:end])
+        if len(args) < 3:
+            return None
+        return _eval_int_expr(args[2])
+    return None
+
+
 def test_provision_script_contract(monkeypatch):
     """AC10: the generated provisioning guest legs store the autologon
     password as the LSA secret DefaultPassword via LsaStorePrivateData
@@ -554,7 +649,27 @@ def test_provision_script_contract(monkeypatch):
         .joinpath("uia_helper.ps1")
         .read_text(encoding="utf-8")
     )
-    assert "PIPE_REJECT_REMOTE_CLIENTS" in helper_text
+    # BEHAVIOURAL (F11): the reject-remote guarantee is the dwPipeMode the
+    # helper's CreateNamedPipeW invocation actually passes — the old pin
+    # matched the header COMMENT. Parse the invocation's third argument
+    # (dwPipeMode) and assert it carries the PIPE_REJECT_REMOTE_CLIENTS bit
+    # (0x8), and that the invalid .NET [PipeOptions] cast (0xC threw on
+    # .NET Framework 4.x — the flag set the helper could never apply) is
+    # gone.
+    mode = _createpipe_dwpipemode(helper_text)
+    assert mode is not None, (
+        "the helper must create its pipe through the CreateNamedPipeW "
+        "P/Invoke with a literal dwPipeMode expression"
+    )
+    assert mode & 0x8 == 0x8, (
+        f"dwPipeMode {mode:#x} does not carry PIPE_REJECT_REMOTE_CLIENTS "
+        "(0x8) - the remote-client rejection is not in force"
+    )
+    assert "PipeOptions]0xC" not in helper_text and (
+        "NamedPipeServerStream(" not in helper_text), (
+        "the invalid .NET Framework [PipeOptions]0xC pipe construction must "
+        "not survive beside the raw CreateNamedPipeW path"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -90,6 +90,10 @@ SITE_BUDGETS: dict[tuple[str, str], int] = {
     ("lifecycle.py", "configure_kdcom"): 2,
     ("lifecycle.py", "configure_kdnet"): 2,
     ("psdsessions.py", "_worker_loop"): 1,
+    # issue #29: the UIA surface's two per-call-by-design sites (each emits
+    # exactly one establishment — its leg wrapper / discovery command).
+    ("uia.py", "_uia_guest_script"): 1,
+    ("uia.py", "_ps_guest_text"): 1,
 }
 
 #: A session-establishing emission, not a prose mention of one.

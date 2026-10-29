@@ -1,11 +1,12 @@
 """
 hyperv_mcp.server -- MCP server for Hyper-V VM management (hardened fork).
 
-Exposes 57 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
+Exposes 76 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
 guest execution and file transfer via PowerShell Direct, guest access
 diagnostics/repair and managed guest jobs, reboot recovery verification,
 host-to-guest HTTP relay, console observation and input (WMI), evidence
-capture, VM/media/video provisioning, orchestration waits, and server runtime
+capture, element-level UI Automation through the in-session guest helper,
+VM/media/video provisioning, orchestration waits, and server runtime
 provenance. Security model:
 
   - Credentials resolve from env vars / credential files; username/password
@@ -2201,16 +2202,46 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         # credential variants.
         # ------------------------------------------------------------------
 
-        def _run_ui_tool(tool, vm_name, category, fn, *args, **kwargs):
+        def _run_ui_tool(tool, vm_name, category, fn, *args,
+                         cred_factory=None, ref_arg=False, **kwargs):
+            """Run one UIA tool; every failure leaves as ONE audited envelope.
+
+            The _run_guest_tool pattern: cred_factory resolves guest
+            credentials INSIDE the audited region, so a CredentialError is an
+            audited {ok:false, error_class:"credential"} envelope instead of
+            a raw SDK ToolError, and the policy gates inside the verb run
+            first. op.ok/op.error_class are set from the result dict BEFORE
+            the audited region closes and the failure envelope is returned
+            from INSIDE it, so an audit record's error_class always equals
+            the envelope's. A BY-ID call (vm_name empty, vm_id given)
+            resolves its target inside the region and the audit row adopts
+            the RESOLVED display name (issue #8's audit clause): ref_arg=True
+            verbs take the resolved VMRef in the vm_name slot (every verb but
+            provision_helper accepts one, so no second resolution leg runs);
+            provision_helper takes the resolved NAME (its signature resolves
+            by name/id itself).
+            """
+            op = _audit(tool, vm_name, category)
             try:
-                with _audit(tool, vm_name, category):
+                with op:
+                    if not vm_name and kwargs.get("vm_id"):
+                        ref = vmident.resolve(args[0], vm_id=kwargs.pop("vm_id"))
+                        op.vm_name = ref.name
+                        args = (args[0], ref if ref_arg else ref.name) + args[2:]
+                    if cred_factory is not None:
+                        kwargs["cred"] = cred_factory()
                     result = fn(*args, **kwargs)
-                if isinstance(result, dict) and not result.get("ok", True):
-                    enriched = errors.enrich_failure(result)
-                    enriched.setdefault("error_class",
-                                        result.get("error_class") or enriched["error_class"])
-                    return errors.failure_result(enriched)
-                return result
+                    if isinstance(result, dict):
+                        op.ok = bool(result.get("ok", True))
+                        op.error_class = str(result.get("error_class") or "")
+                        display = result.get("vm_name") or result.get("name")
+                        if not op.vm_name and display:
+                            op.vm_name = str(display)
+                        if not op.ok:
+                            enriched = errors.enrich_failure(result)
+                            op.error_class = enriched["error_class"]
+                            return errors.failure_result(enriched)
+                    return result
             except UrlElicitationRequiredError:
                 raise
             except Exception as exc:
@@ -2220,40 +2251,74 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         def hyperv_ui_inspect(
             vm_name: str = "", selector: dict | None = None,
             depth: int = 3, max_elements: int = 200,
+            adapter: str = "",
             username: str = "", password: str = "", vm_id: str = "",
         ) -> dict:
             """Bounded UIA element tree from the guest's interactive session
-            through the in-session helper (read verb).
+            through the in-session helper (read verb: vm policy + guest
+            credentials; the helper must be provisioned).
 
             Args:
                 vm_name: Name of the VM
+                selector: UIA selector scoping the walk (accepted keys:
+                    automation_id, name, name_contains, control_type,
+                    class_name, window_title, process_name, hwnd, index);
+                    with a selector the walk starts at the matched element,
+                    without it at the desktop root
+                depth: Walk depth (1..8, default 3)
+                max_elements: Element cap (1..2000, default 200)
+                adapter: "" (default) or "electron" — an Electron adapter
+                    request is refused adapter_unapproved unless the helper
+                    registration carries the adapter:electron capability
+                username/password: inline guest credentials (this variant)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, elements, truncated, tree, session, helper?} or
+            {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_ui_tool(
                 "hyperv_ui_inspect", vm_name, "read", uia.inspect,
-                _cfg(), vm_name, _cred_args(username, password),
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(username, password),
+                ref_arg=True,
                 selector=selector, depth=depth, max_elements=max_elements,
-                vm_id=vm_id)
+                adapter=adapter, vm_id=vm_id)
 
         @mcp.tool()
         def hyperv_ui_find(
             vm_name: str = "", selector: dict | None = None,
-            element_id: str = "",
+            element_id: str = "", adapter: str = "",
             username: str = "", password: str = "", vm_id: str = "",
         ) -> dict:
             """Resolve element(s) by UIA selector or element_id through the
-            in-session helper (read verb).
+            in-session helper (read verb: vm policy + guest credentials).
 
             Args:
                 vm_name: Name of the VM
+                selector: UIA selector (accepted keys: automation_id, name,
+                    name_contains, control_type, class_name, window_title,
+                    process_name, hwnd, index)
+                element_id: a RuntimeId from a previous find/inspect
+                    ("42:1024" form) — resolves the live element by id
+                adapter: "" (default) or "electron" — refused
+                    adapter_unapproved unless the registration carries the
+                    adapter:electron capability
+                username/password: inline guest credentials (this variant)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, elements[], session, helper?} (an empty list is a
+            no-match, never the desktop root) or
+            {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_ui_tool(
                 "hyperv_ui_find", vm_name, "read", uia.find,
-                _cfg(), vm_name, _cred_args(username, password),
-                selector=selector, element_id=element_id or None, vm_id=vm_id)
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(username, password),
+                ref_arg=True,
+                selector=selector, element_id=element_id or None,
+                adapter=adapter, vm_id=vm_id)
 
         @mcp.tool()
         def hyperv_ui_invoke(
@@ -2263,16 +2328,32 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         ) -> dict:
             """Invoke a UIA pattern on the target element. Needs
             destructive.ui_input; a locked session refuses with
-            no_interactive_desktop.
+            no_interactive_desktop. The dispatch tries Invoke, Toggle,
+            SelectionItem and ExpandCollapse, then the msaa
+            LegacyIAccessible bridge; the result names the pattern that
+            fired and an unsupported element is refused
+            unsupported_capability naming every pattern tried.
 
             Args:
                 vm_name: Name of the VM
+                selector: UIA selector — address the target by exactly one
+                    of selector= or element_id=
+                element_id: a RuntimeId from a previous find/inspect
+                lease_id: optional lease citation (issue #23) — the lease
+                    gate runs before the body
+                fencing_token: the lease's fencing token, with lease_id
+                username/password: inline guest credentials (this variant)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, invoked, pattern, session, helper?} or
+            {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_ui_tool(
                 "hyperv_ui_invoke", vm_name, "console_input", uia.invoke,
-                _cfg(), vm_name, _cred_args(username, password),
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(username, password),
+                ref_arg=True,
                 selector=selector, element_id=element_id or None, vm_id=vm_id)
 
         @mcp.tool()
@@ -2282,17 +2363,32 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             username: str = "", password: str = "", vm_id: str = "",
         ) -> dict:
             """Set a UIA Value-pattern property. The value rides the framed
-            stdin payload (never script text or argv) and the result reports
-            the length set, never the value. Needs destructive.ui_input.
+            stdin payload (never script text, never argv, never error text)
+            and the result reports the length set, never the value. Needs
+            destructive.ui_input; a locked session refuses with
+            no_interactive_desktop.
 
             Args:
                 vm_name: Name of the VM
+                selector: UIA selector — address the target by exactly one
+                    of selector= or element_id=
+                value: the text to set (<= 64 KiB)
+                element_id: a RuntimeId from a previous find/inspect
+                lease_id: optional lease citation (issue #23) — the lease
+                    gate runs before the body
+                fencing_token: the lease's fencing token, with lease_id
+                username/password: inline guest credentials (this variant)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, length_set, pattern, session, helper?} or
+            {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_ui_tool(
                 "hyperv_ui_set_value", vm_name, "console_input", uia.set_value,
-                _cfg(), vm_name, _cred_args(username, password),
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(username, password),
+                ref_arg=True,
                 selector=selector, value=value,
                 element_id=element_id or None, vm_id=vm_id)
 
@@ -2303,15 +2399,27 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             username: str = "", password: str = "", vm_id: str = "",
         ) -> dict:
             """Wait for a selector to appear (or, with gone=true, disappear).
+            The wait runs as bounded guest-side slices (the per-VM lock is
+            never held across the whole wait); an expired budget returns the
+            last slice's answer (ok with empty elements / gone=false).
 
             Args:
                 vm_name: Name of the VM
+                selector: UIA selector waited for (accepted keys as find)
+                gone: true waits for DISAPPEARANCE instead of appearance
+                timeout_s: wait budget in seconds (1..120, default 30)
+                username/password: inline guest credentials (this variant)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, elements[] | gone, session, helper?} or
+            {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_ui_tool(
                 "hyperv_ui_wait_for", vm_name, "read", uia.wait_for,
-                _cfg(), vm_name, _cred_args(username, password),
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(username, password),
+                ref_arg=True,
                 selector=selector, gone=gone, timeout_s=timeout_s, vm_id=vm_id)
 
         @mcp.tool()
@@ -2325,12 +2433,24 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             Args:
                 vm_name: Name of the VM
+                selector: UIA selector — address the target by exactly one
+                    of selector= or element_id=
+                element_id: a RuntimeId from a previous find/inspect
+                lease_id: optional lease citation (issue #23) — the lease
+                    gate runs before the body
+                fencing_token: the lease's fencing token, with lease_id
+                username/password: inline guest credentials (this variant)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, focused, raised, session, helper?} or
+            {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_ui_tool(
                 "hyperv_ui_focus", vm_name, "console_input", uia.focus,
-                _cfg(), vm_name, _cred_args(username, password),
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(username, password),
+                ref_arg=True,
                 selector=selector, element_id=element_id or None, vm_id=vm_id)
 
         @mcp.tool()
@@ -2339,42 +2459,72 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             username: str = "", password: str = "", vm_id: str = "",
         ) -> dict:
             """Session and lock state, foreground window, and helper facts
-            (read verb).
+            (read verb: vm policy + guest credentials).
 
             Args:
                 vm_name: Name of the VM
+                username/password: inline guest credentials (this variant)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, active_session_id, interactive_user, locked,
+            foreground_window, session, helper} or
+            {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_ui_tool(
                 "hyperv_ui_session_state", vm_name, "read", uia.session_state,
-                _cfg(), vm_name, _cred_args(username, password), vm_id=vm_id)
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(username, password),
+                ref_arg=True, vm_id=vm_id)
 
         @mcp.tool()
         def hyperv_ui_helper_provision(
             vm_name: str = "", autologon: bool = True, confirm: bool = False,
+            teardown: bool = False,
             lease_id: str = "", fencing_token: int = 0,
             username: str = "", password: str = "", vm_id: str = "",
         ) -> dict:
-            """Install and start the in-session UIA helper: the helper script
-            ships into a ProgramData directory with an Administrators/SYSTEM
-            ACL, the autologon password stored ONLY as the LSA secret
-            DefaultPassword (no plain-text registry value), and a per-user
-            AtLogOn scheduled task (Interactive, RunLevel Highest).
+            """Install and start the in-session UIA helper, or — with
+            teardown=true — remove everything it persisted. The helper ships
+            into a fresh versioned ProgramData directory (the directory
+            keeps ProgramData's default ACLs — no extra hardening ACL is
+            applied), the autologon password is stored ONLY as the LSA
+            secret DefaultPassword (no plain-text registry value), and a
+            per-user AtLogOn scheduled task (Interactive, RunLevel Highest)
+            starts the helper at logon. Re-provisioning is idempotent (the
+            running helper and every previous helper directory are removed
+            first); teardown stops the task, removes the helper directories,
+            deletes the LSA secret and restores the Winlogon values.
             Disposable test images only: provisioning configures automatic
             logon with the guest credential.
 
             Args:
                 vm_name: Name of the VM
+                autologon: configure automatic logon for the guest account
+                    (default true; ignored by teardown)
                 confirm: Must be true (destructive.require_confirm)
+                teardown: true removes the helper instead of installing it
+                lease_id: optional lease citation (issue #23) — the lease
+                    gate runs before the body
+                fencing_token: the lease's fencing token, with lease_id
+                username/password: inline guest credentials (this variant)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, autologon_configured, task_registered,
+            helper_version, helper_running, reboot_required, guest_uuid_read,
+            helper_dir} — or, with teardown=true, {ok, torn_down,
+            task_unregistered, helper_directories_removed,
+            lsa_secret_deleted, autologon_restored} — or
+            {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_ui_tool(
                 "hyperv_ui_helper_provision", vm_name, "destructive",
                 uia.provision_helper,
-                _cfg(), vm_name, _cred_args(username, password),
-                autologon=autologon, confirm=confirm, vm_id=vm_id)
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(username, password),
+                autologon=autologon, confirm=confirm, teardown=teardown,
+                vm_id=vm_id)
 
     else:
         # ------------------------------------------------------------------
@@ -2385,16 +2535,46 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         # credential variants.
         # ------------------------------------------------------------------
 
-        def _run_ui_tool(tool, vm_name, category, fn, *args, **kwargs):
+        def _run_ui_tool(tool, vm_name, category, fn, *args,
+                         cred_factory=None, ref_arg=False, **kwargs):
+            """Run one UIA tool; every failure leaves as ONE audited envelope.
+
+            The _run_guest_tool pattern: cred_factory resolves guest
+            credentials INSIDE the audited region, so a CredentialError is an
+            audited {ok:false, error_class:"credential"} envelope instead of
+            a raw SDK ToolError, and the policy gates inside the verb run
+            first. op.ok/op.error_class are set from the result dict BEFORE
+            the audited region closes and the failure envelope is returned
+            from INSIDE it, so an audit record's error_class always equals
+            the envelope's. A BY-ID call (vm_name empty, vm_id given)
+            resolves its target inside the region and the audit row adopts
+            the RESOLVED display name (issue #8's audit clause): ref_arg=True
+            verbs take the resolved VMRef in the vm_name slot (every verb but
+            provision_helper accepts one, so no second resolution leg runs);
+            provision_helper takes the resolved NAME (its signature resolves
+            by name/id itself).
+            """
+            op = _audit(tool, vm_name, category)
             try:
-                with _audit(tool, vm_name, category):
+                with op:
+                    if not vm_name and kwargs.get("vm_id"):
+                        ref = vmident.resolve(args[0], vm_id=kwargs.pop("vm_id"))
+                        op.vm_name = ref.name
+                        args = (args[0], ref if ref_arg else ref.name) + args[2:]
+                    if cred_factory is not None:
+                        kwargs["cred"] = cred_factory()
                     result = fn(*args, **kwargs)
-                if isinstance(result, dict) and not result.get("ok", True):
-                    enriched = errors.enrich_failure(result)
-                    enriched.setdefault("error_class",
-                                        result.get("error_class") or enriched["error_class"])
-                    return errors.failure_result(enriched)
-                return result
+                    if isinstance(result, dict):
+                        op.ok = bool(result.get("ok", True))
+                        op.error_class = str(result.get("error_class") or "")
+                        display = result.get("vm_name") or result.get("name")
+                        if not op.vm_name and display:
+                            op.vm_name = str(display)
+                        if not op.ok:
+                            enriched = errors.enrich_failure(result)
+                            op.error_class = enriched["error_class"]
+                            return errors.failure_result(enriched)
+                    return result
             except UrlElicitationRequiredError:
                 raise
             except Exception as exc:
@@ -2404,40 +2584,72 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         def hyperv_ui_inspect(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", selector: dict | None = None,
             depth: int = 3, max_elements: int = 200,
+            adapter: str = "",
             vm_id: str = "",
         ) -> dict:
             """Bounded UIA element tree from the guest's interactive session
-            through the in-session helper (read verb).
+            through the in-session helper (read verb: vm policy + guest
+            credentials; the helper must be provisioned).
 
             Args:
                 vm_name: Name of the VM
+                selector: UIA selector scoping the walk (accepted keys:
+                    automation_id, name, name_contains, control_type,
+                    class_name, window_title, process_name, hwnd, index);
+                    with a selector the walk starts at the matched element,
+                    without it at the desktop root
+                depth: Walk depth (1..8, default 3)
+                max_elements: Element cap (1..2000, default 200)
+                adapter: "" (default) or "electron" — an Electron adapter
+                    request is refused adapter_unapproved unless the helper
+                    registration carries the adapter:electron capability
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, elements, truncated, tree, session, helper?} or
+            {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_ui_tool(
                 "hyperv_ui_inspect", vm_name, "read", uia.inspect,
-                _cfg(), vm_name, credentials.resolve_guest(),
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(),
+                ref_arg=True,
                 selector=selector, depth=depth, max_elements=max_elements,
-                vm_id=vm_id)
+                adapter=adapter, vm_id=vm_id)
 
         @mcp.tool()
         def hyperv_ui_find(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", selector: dict | None = None,
-            element_id: str = "",
+            element_id: str = "", adapter: str = "",
             vm_id: str = "",
         ) -> dict:
             """Resolve element(s) by UIA selector or element_id through the
-            in-session helper (read verb).
+            in-session helper (read verb: vm policy + guest credentials).
 
             Args:
                 vm_name: Name of the VM
+                selector: UIA selector (accepted keys: automation_id, name,
+                    name_contains, control_type, class_name, window_title,
+                    process_name, hwnd, index)
+                element_id: a RuntimeId from a previous find/inspect
+                    ("42:1024" form) — resolves the live element by id
+                adapter: "" (default) or "electron" — refused
+                    adapter_unapproved unless the registration carries the
+                    adapter:electron capability
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, elements[], session, helper?} (an empty list is a
+            no-match, never the desktop root) or
+            {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_ui_tool(
                 "hyperv_ui_find", vm_name, "read", uia.find,
-                _cfg(), vm_name, credentials.resolve_guest(),
-                selector=selector, element_id=element_id or None, vm_id=vm_id)
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(),
+                ref_arg=True,
+                selector=selector, element_id=element_id or None,
+                adapter=adapter, vm_id=vm_id)
 
         @mcp.tool()
         def hyperv_ui_invoke(  # type: ignore[misc]  # dual registration — see _register_tools
@@ -2447,16 +2659,31 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         ) -> dict:
             """Invoke a UIA pattern on the target element. Needs
             destructive.ui_input; a locked session refuses with
-            no_interactive_desktop.
+            no_interactive_desktop. The dispatch tries Invoke, Toggle,
+            SelectionItem and ExpandCollapse, then the msaa
+            LegacyIAccessible bridge; the result names the pattern that
+            fired and an unsupported element is refused
+            unsupported_capability naming every pattern tried.
 
             Args:
                 vm_name: Name of the VM
+                selector: UIA selector — address the target by exactly one
+                    of selector= or element_id=
+                element_id: a RuntimeId from a previous find/inspect
+                lease_id: optional lease citation (issue #23) — the lease
+                    gate runs before the body
+                fencing_token: the lease's fencing token, with lease_id
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, invoked, pattern, session, helper?} or
+            {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_ui_tool(
                 "hyperv_ui_invoke", vm_name, "console_input", uia.invoke,
-                _cfg(), vm_name, credentials.resolve_guest(),
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(),
+                ref_arg=True,
                 selector=selector, element_id=element_id or None, vm_id=vm_id)
 
         @mcp.tool()
@@ -2466,17 +2693,31 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_id: str = "",
         ) -> dict:
             """Set a UIA Value-pattern property. The value rides the framed
-            stdin payload (never script text or argv) and the result reports
-            the length set, never the value. Needs destructive.ui_input.
+            stdin payload (never script text, never argv, never error text)
+            and the result reports the length set, never the value. Needs
+            destructive.ui_input; a locked session refuses with
+            no_interactive_desktop.
 
             Args:
                 vm_name: Name of the VM
+                selector: UIA selector — address the target by exactly one
+                    of selector= or element_id=
+                value: the text to set (<= 64 KiB)
+                element_id: a RuntimeId from a previous find/inspect
+                lease_id: optional lease citation (issue #23) — the lease
+                    gate runs before the body
+                fencing_token: the lease's fencing token, with lease_id
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, length_set, pattern, session, helper?} or
+            {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_ui_tool(
                 "hyperv_ui_set_value", vm_name, "console_input", uia.set_value,
-                _cfg(), vm_name, credentials.resolve_guest(),
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(),
+                ref_arg=True,
                 selector=selector, value=value,
                 element_id=element_id or None, vm_id=vm_id)
 
@@ -2487,15 +2728,26 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_id: str = "",
         ) -> dict:
             """Wait for a selector to appear (or, with gone=true, disappear).
+            The wait runs as bounded guest-side slices (the per-VM lock is
+            never held across the whole wait); an expired budget returns the
+            last slice's answer (ok with empty elements / gone=false).
 
             Args:
                 vm_name: Name of the VM
+                selector: UIA selector waited for (accepted keys as find)
+                gone: true waits for DISAPPEARANCE instead of appearance
+                timeout_s: wait budget in seconds (1..120, default 30)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, elements[] | gone, session, helper?} or
+            {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_ui_tool(
                 "hyperv_ui_wait_for", vm_name, "read", uia.wait_for,
-                _cfg(), vm_name, credentials.resolve_guest(),
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(),
+                ref_arg=True,
                 selector=selector, gone=gone, timeout_s=timeout_s, vm_id=vm_id)
 
         @mcp.tool()
@@ -2509,12 +2761,23 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             Args:
                 vm_name: Name of the VM
+                selector: UIA selector — address the target by exactly one
+                    of selector= or element_id=
+                element_id: a RuntimeId from a previous find/inspect
+                lease_id: optional lease citation (issue #23) — the lease
+                    gate runs before the body
+                fencing_token: the lease's fencing token, with lease_id
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, focused, raised, session, helper?} or
+            {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_ui_tool(
                 "hyperv_ui_focus", vm_name, "console_input", uia.focus,
-                _cfg(), vm_name, credentials.resolve_guest(),
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(),
+                ref_arg=True,
                 selector=selector, element_id=element_id or None, vm_id=vm_id)
 
         @mcp.tool()
@@ -2523,42 +2786,70 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_id: str = "",
         ) -> dict:
             """Session and lock state, foreground window, and helper facts
-            (read verb).
+            (read verb: vm policy + guest credentials).
 
             Args:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, active_session_id, interactive_user, locked,
+            foreground_window, session, helper} or
+            {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_ui_tool(
                 "hyperv_ui_session_state", vm_name, "read", uia.session_state,
-                _cfg(), vm_name, credentials.resolve_guest(), vm_id=vm_id)
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(),
+                ref_arg=True, vm_id=vm_id)
 
         @mcp.tool()
         def hyperv_ui_helper_provision(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", autologon: bool = True, confirm: bool = False,
+            teardown: bool = False,
             lease_id: str = "", fencing_token: int = 0,
             vm_id: str = "",
         ) -> dict:
-            """Install and start the in-session UIA helper: the helper script
-            ships into a ProgramData directory with an Administrators/SYSTEM
-            ACL, the autologon password stored ONLY as the LSA secret
-            DefaultPassword (no plain-text registry value), and a per-user
-            AtLogOn scheduled task (Interactive, RunLevel Highest).
+            """Install and start the in-session UIA helper, or — with
+            teardown=true — remove everything it persisted. The helper ships
+            into a fresh versioned ProgramData directory (the directory
+            keeps ProgramData's default ACLs — no extra hardening ACL is
+            applied), the autologon password is stored ONLY as the LSA
+            secret DefaultPassword (no plain-text registry value), and a
+            per-user AtLogOn scheduled task (Interactive, RunLevel Highest)
+            starts the helper at logon. Re-provisioning is idempotent (the
+            running helper and every previous helper directory are removed
+            first); teardown stops the task, removes the helper directories,
+            deletes the LSA secret and restores the Winlogon values.
             Disposable test images only: provisioning configures automatic
             logon with the guest credential.
 
             Args:
                 vm_name: Name of the VM
+                autologon: configure automatic logon for the guest account
+                    (default true; ignored by teardown)
                 confirm: Must be true (destructive.require_confirm)
+                teardown: true removes the helper instead of installing it
+                lease_id: optional lease citation (issue #23) — the lease
+                    gate runs before the body
+                fencing_token: the lease's fencing token, with lease_id
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, autologon_configured, task_registered,
+            helper_version, helper_running, reboot_required, guest_uuid_read,
+            helper_dir} — or, with teardown=true, {ok, torn_down,
+            task_unregistered, helper_directories_removed,
+            lsa_secret_deleted, autologon_restored} — or
+            {ok: false, error, error_class, retryable, retry_after_ms}
             """
             return _run_ui_tool(
                 "hyperv_ui_helper_provision", vm_name, "destructive",
                 uia.provision_helper,
-                _cfg(), vm_name, credentials.resolve_guest(),
-                autologon=autologon, confirm=confirm, vm_id=vm_id)
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(),
+                autologon=autologon, confirm=confirm, teardown=teardown,
+                vm_id=vm_id)
 
 
     if creds_allowed:

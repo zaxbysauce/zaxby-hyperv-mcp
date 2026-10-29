@@ -48,11 +48,13 @@ from hyperv_mcp.vmlocks import VMBusy, vm_lock
 _CHILD = Path(__file__).resolve().parent / "_e02_lease_child.py"
 _SRC = Path(__file__).resolve().parents[2] / "src"
 
-# The 36 mutating tools that must grow lease_id + fencing_token (AC3).
+# The 40 mutating tools that must grow lease_id + fencing_token (AC3).
 # RECONCILIATION (recorded in the trace): the issue text says 34 tools; the
 # four enumerated categories (lifecycle / guest_exec / transfer / console)
-# against today's 57-tool surface yield 36 — the enumerated set below IS the
-# contract, verified present on the base surface.
+# against the 57-tool surface of the day yielded 36 — the enumerated set
+# below IS the contract. Issue #29 added the four lease-gated console-scope
+# UI tools (invoke/set_value/focus/helper_provision), bringing the surface
+# to 76 tools and this list to 40.
 LEASED_TOOLS = [
     # lifecycle (17)
     "hyperv_start_vm",
@@ -94,11 +96,16 @@ LEASED_TOOLS = [
     "hyperv_console_click",
     "hyperv_console_button",
     "hyperv_console_scroll",
+    # console-scope UIA mutation (4, issue #29)
+    "hyperv_ui_invoke",
+    "hyperv_ui_set_value",
+    "hyperv_ui_focus",
+    "hyperv_ui_helper_provision",
 ]
 
-# The 16 destructive tools whose `confirm` gate must survive the lease work
-# (AC14, PRESERVING — pinned at base c1da890; probe-verified all 16 declare
-# `confirm` and no other tool does).
+# The 17 destructive tools whose `confirm` gate must survive the lease work
+# (AC14, PRESERVING — pinned at base c1da890 as 16; issue #29's
+# hyperv_ui_helper_provision is the 17th and only later confirm carrier).
 CONFIRM_TOOLS = [
     "hyperv_stop_vm",
     "hyperv_reset_vm",
@@ -116,6 +123,7 @@ CONFIRM_TOOLS = [
     "hyperv_vm_secureboot_set",
     "hyperv_vm_set_resolution",
     "hyperv_repair_guest_access",
+    "hyperv_ui_helper_provision",
 ]
 
 
@@ -284,11 +292,12 @@ def test_unknown_lease_rejected_before_mutation(tmp_path, fresh_server, monkeypa
 
 
 def test_mutating_tools_accept_lease_arguments(fresh_server):
-    """AC3: every one of the 36 enumerated mutating tools must declare
+    """AC3: every one of the 40 enumerated mutating tools must declare
     lease_id and fencing_token, and NO tool may take a caller-identity
     parameter (agent identity comes from auth, never from arguments).
 
-    RED at base: all 36 are missing both arguments (reported in one list)."""
+    RED at base: all 36 pre-UI tools are missing both arguments (reported
+    in one list)."""
     mod = fresh_server({})
     tools = asyncio.run(mod.get_mcp().list_tools())
     schemas = {t.name: _schema_of(t) for t in tools}
@@ -340,7 +349,8 @@ def test_vm_lock_released_after_error():
 
 
 def test_destructive_tools_have_confirm_param(fresh_server):
-    """AC14 (preserving): the 16 destructive tools still gate on confirm."""
+    """AC14 (preserving): the 17 destructive tools still gate on confirm
+    (16 pinned at base; issue #29's hyperv_ui_helper_provision joined)."""
     mod = fresh_server({})
     schemas = {t.name: _schema_of(t) for t in asyncio.run(mod.get_mcp().list_tools())}
     missing = sorted(

@@ -1,7 +1,7 @@
 """Acceptance checks for issue #16, part 4 — the preserved tool surface.
 
 AC10 (credential error envelope at the tool layer), AC11 (screenshot returns
-a real PNG ImageContent block plus metadata), AC12 (same 57-tool inventory
+a real PNG ImageContent block plus metadata), AC12 (same 76-tool inventory
 with the same parameters per credential mode). Sibling c03 files:
 test_c03_tool_concurrency.py (AC1-AC5), test_c03_sdk_port.py (AC7-AC9),
 test_c03_http_entry.py (AC6, AC13).
@@ -26,8 +26,9 @@ from hyperv_mcp.pswindows import PSResult
 
 GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
 
-# The live 57-tool inventory pinned at authoring time (issue #35 added
-# hyperv_server_info on top of the issue text's stale count of 54).
+# The live tool inventory (57 at authoring time; issue #35 added
+# hyperv_server_info on top of the issue text's stale count of 54, and
+# issue #29 brought the surface to 76 with the eight hyperv_ui_* tools).
 TOOL_NAMES = {
     "hyperv_list_vms",
     "hyperv_get_vm_info",
@@ -240,7 +241,7 @@ def test_ac11_screenshot_returns_image_content(monkeypatch, fresh_server):
 
 
 def test_ac12_tool_inventory_per_credential_mode(tmp_path, fresh_server):
-    """AC12: tools listed register the same 57-name inventory with the same
+    """AC12: tools listed register the same 76-name inventory with the same
     parameters per credential mode (inline mode only adds username/password
     to the credential tools)."""
     mod = fresh_server({})
@@ -253,7 +254,8 @@ def test_ac12_tool_inventory_per_credential_mode(tmp_path, fresh_server):
     assert len(base_schemas) == len(TOOL_NAMES) == 76, (
         f"AC12: tool count {len(base_schemas)} != 76 "
         f"(66 through issue #24; 67 with issue #27's settle wait; "
-        f"68 with issue #28's hyperv_console_sequence)"
+        f"68 with issue #28's hyperv_console_sequence; 76 with issue #29's "
+        f"eight hyperv_ui_* tools)"
     )
     doc = {"allow_inline_credentials": True}
     p = tmp_path / "cfg.json"

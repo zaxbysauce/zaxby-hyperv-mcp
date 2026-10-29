@@ -187,8 +187,9 @@ def test_child_env_carries_no_server_secrets(monkeypatch):
 
 def test_server_info_tool_registered():
     """AC3: a bootstrapped server registers hyperv_server_info and the tool
-    inventory counts exactly 68 tools (66 through issue #24 + hyperv_server_info,
-    plus issue #27's settle wait)."""
+    inventory counts exactly 76 tools (66 through issue #24 +
+    hyperv_server_info, issue #27's settle wait, issue #28's batched
+    sequence, and issue #29's eight hyperv_ui_* tools)."""
     mod = importlib.reload(server_module)
     try:
         mod.bootstrap({})
@@ -196,13 +197,12 @@ def test_server_info_tool_registered():
         names = sorted(tool.name for tool in tools)
         assert "hyperv_server_info" in names, (
             f"hyperv_server_info is not registered; tool inventory has "
-            f"{len(names)} tools, expected 68 including hyperv_server_info"
+            f"{len(names)} tools, expected 76 including hyperv_server_info"
         )
         assert len(names) == 76, (
-            f"tool inventory is {len(names)} tools; expected exactly 68 "
-            "(66 including the issue-#24 op/event tools plus hyperv_server_info, "
-            "issue #27's hyperv_console_wait_frame_stable, and issue #28's "
-            "hyperv_console_sequence)"
+            f"tool inventory is {len(names)} tools; expected exactly 76 "
+            "(68 through issue #28's hyperv_console_sequence plus issue #29's "
+            "eight hyperv_ui_* tools)"
         )
     finally:
         importlib.reload(server_module)

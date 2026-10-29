@@ -351,3 +351,187 @@ def test_helper_capability_and_vm_isolation_support_shared_and_per_agent_paths(m
     assert any(
         c["request"].get("adapter") == "electron" for c in pipe.calls
     ), "the approved adapter request must reach its registered helper"
+
+
+# -- AC20 fix-wave supplement: the HELPER's own dispatch, on real PS 5.1 ----
+#
+# The test above drives the broker against a canned _PipeRecorder, so the
+# helper's real pattern dispatch never runs. The pins below extract the
+# packaged helper's function definitions (no startup, no pipe creation, no
+# serve loop) and drive Invoke-Request DIRECTLY on real Windows PowerShell
+# 5.1 with a synthetic element — no VM, no pipe, no desktop (the fake
+# element answers GetCurrentPattern locally), so the helper's own
+# pattern-selection logic is the artifact under test.
+
+
+def _helper_functions_slice() -> str:
+    """The packaged helper's function definitions, sliced verbatim from the
+    artifact: everything between the first `function Read-HelperFile` and
+    the startup section that reads the provisioned files."""
+    import importlib.resources
+
+    helper = (
+        importlib.resources.files("hyperv_mcp")
+        .joinpath("guest")
+        .joinpath("uia_helper.ps1")
+        .read_text(encoding="utf-8-sig")
+    )
+    start = helper.index("function Read-HelperFile")
+    end = helper.index("$HelperVersion = Read-HelperFile 'version.txt'")
+    return helper[start:end]
+
+
+def _ps_available() -> bool:
+    import os
+
+    return os.path.isfile(
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+
+
+def _run_helper_dispatch(cases_ps: str, tmp_path) -> list[dict]:
+    """Run `cases_ps` against the helper's real functions in PS 5.1; parse
+    the one-JSON-per-case stdout into dicts.
+
+    The script travels as a -File (the -Command argv cannot carry the
+    ~30 KiB helper slice past the Windows command-line limit)."""
+    import json as _json
+    import subprocess
+
+    ps = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    script = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        "Add-Type -AssemblyName UIAutomationClient",
+        "Add-Type -AssemblyName UIAutomationTypes",
+        _helper_functions_slice(),
+        cases_ps,
+    ])
+    script_file = tmp_path / "helper-dispatch-cases.ps1"
+    script_file.write_text(script, encoding="utf-8-sig")
+    proc = subprocess.run(
+        [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(script_file)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, (
+        f"helper dispatch harness failed — stdout: {proc.stdout!r} "
+        f"stderr: {proc.stderr[-2000:]!r}"
+    )
+    out = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            out.append(_json.loads(line))
+    assert out, f"no case JSON in harness output: {proc.stdout!r}"
+    return out
+
+
+def test_helper_dispatch_reports_pattern_and_names_the_tried_ones(tmp_path):
+    """AC20 (fix-wave): the HELPER's own invoke dispatch (a) reports the
+    pattern that fired on a supported element and (b) on an unsupported
+    element returns an explicit unsupported_capability refusal naming EVERY
+    pattern it tried — never a coordinate fallback, never a readiness
+    claim. Runs the packaged helper's functions against a synthetic element
+    on real PS 5.1; skips when Windows PowerShell is unavailable."""
+    if not _ps_available():
+        pytest.skip("Windows PowerShell 5.1 not available")
+    uuid = GUID_A.lower()
+    cases = "\n".join([
+        "$HelperVersion = '1'",
+        "$ownNonce = 'nonce-ac20'",
+        f"$recordedUuid = '{uuid}'",
+        "$identity = @{ sid = '" + SID_A + "'; user = 'tester'; session_id = 1 }",
+        "$capabilities = @('uia','msaa')",
+        "$MaxMatches = 200; $MaxValueChars = 65536",
+        "function Get-LockState { $false }",
+        f"function Get-LiveUuid {{ '{uuid}' }}",
+        "function Test-OwnsInputDesktop { $true }",
+        "function Get-ForegroundWindow { $null }",
+        "$fakeInvoke = New-Object System.Management.Automation.PSObject",
+        "$fakeInvoke | Add-Member -MemberType ScriptMethod -Name Invoke -Value { $global:InvokeFired = $true }",
+        "$fakeEl = New-Object System.Management.Automation.PSObject",
+        "$fakeEl | Add-Member -MemberType ScriptMethod -Name GetCurrentPattern -Value {",
+        "    param($p)",
+        "    if ($global:ElementSupportsInvoke -and $p -eq [System.Windows.Automation.InvokePattern]::Pattern) { return $fakeInvoke }",
+        "    throw (New-Object InvalidOperationException('pattern not supported by the synthetic element'))",
+        "}",
+        "function Resolve-Target { param($selector) @($fakeEl) }",
+        "function Select-One { param($elements, $selector) $elements[0] }",
+        "function Get-SessionBlock { @{ session_id = 1 } }",
+        f"$target = @{{ vm_guid = '{uuid}'; user_sid = '{SID_A}'; session_id = 1 }}",
+        # case 1: the element supports InvokePattern -> the dispatch fires it
+        # and REPORTS which pattern fired.
+        "$global:ElementSupportsInvoke = $true; $global:InvokeFired = $false",
+        "$r1 = Invoke-Request @{ id = 'req-1'; verb = 'invoke'; nonce = 'nonce-ac20'; min_version = '1'; target = $target; selector = @{ name = 'FakeButton' } }",
+        "@{ case = 'supported'; fired = $global:InvokeFired; ok = $r1.ok; pattern = $r1.result.pattern } | ConvertTo-Json -Compress",
+        # case 2: the element supports NOTHING -> unsupported_capability
+        # naming every pattern attempted (no coordinate fallback).
+        "$global:ElementSupportsInvoke = $false; $global:InvokeFired = $false",
+        "$r2 = Invoke-Request @{ id = 'req-2'; verb = 'invoke'; nonce = 'nonce-ac20'; min_version = '1'; target = $target; selector = @{ name = 'FakeButton' } }",
+        "@{ case = 'unsupported'; fired = $global:InvokeFired; ok = $r2.ok; error_class = $r2.error_class; error = [string]$r2.error } | ConvertTo-Json -Compress",
+    ])
+    results = {row["case"]: row
+               for row in _run_helper_dispatch(cases, tmp_path)}
+
+    supported = results["supported"]
+    assert supported["ok"] is True, supported
+    assert supported["fired"] is True, (
+        "the supported element's InvokePattern must actually fire"
+    )
+    assert supported["pattern"] == "Invoke", (
+        f"the dispatch must REPORT the pattern that fired: {supported}"
+    )
+
+    unsupported = results["unsupported"]
+    assert unsupported["ok"] is False, unsupported
+    assert unsupported["error_class"] == "unsupported_capability", unsupported
+    for pattern in ("Invoke", "Toggle", "SelectionItem", "ExpandCollapse",
+                    "LegacyIAccessible"):
+        assert pattern in unsupported["error"], (
+            f"the refusal must name every pattern tried — {pattern!r} "
+            f"missing from: {unsupported['error']!r}"
+        )
+    assert unsupported["fired"] is False
+    for key in _COORDINATE_KEYS + _READINESS_KEYS:
+        assert key not in unsupported, (key, unsupported)
+
+
+def test_helper_refuses_sessionless_and_version_mismatched_requests(tmp_path):
+    """Fix-wave pins for the helper's pre-dispatch gates (behavioural, real
+    PS 5.1): a SESSION-LESS request (target.session_id null) is refused
+    session_unverified before any verb dispatch, and a request whose
+    min_version exceeds the helper's version is refused
+    helper_version_mismatch. Skips when Windows PowerShell is unavailable."""
+    if not _ps_available():
+        pytest.skip("Windows PowerShell 5.1 not available")
+    uuid = GUID_A.lower()
+    cases = "\n".join([
+        "$HelperVersion = '1'",
+        "$ownNonce = 'nonce-ver'",
+        f"$recordedUuid = '{uuid}'",
+        "$identity = @{ sid = '" + SID_A + "'; user = 'tester'; session_id = 1 }",
+        "$capabilities = @('uia','msaa')",
+        "$MaxMatches = 200; $MaxValueChars = 65536",
+        "function Get-LockState { $false }",
+        f"function Get-LiveUuid {{ '{uuid}' }}",
+        "function Test-OwnsInputDesktop { $true }",
+        "function Get-ForegroundWindow { $null }",
+        "function Resolve-Target { param($selector) @() }",
+        "function Select-One { param($elements, $selector) $null }",
+        "function Get-SessionBlock { @{ session_id = 1 } }",
+        # a session-LESS target: the helper refuses before any dispatch
+        f"$r1 = Invoke-Request @{{ id = 'req-s'; verb = 'session_state'; nonce = 'nonce-ver'; min_version = '1'; target = @{{ vm_guid = '{uuid}'; user_sid = '{SID_A}'; session_id = $null }} }}",
+        "@{ case = 'sessionless'; ok = $r1.ok; error_class = $r1.error_class } | ConvertTo-Json -Compress",
+        # a min_version the helper cannot serve: refused helper_version_mismatch
+        f"$r2 = Invoke-Request @{{ id = 'req-v'; verb = 'session_state'; nonce = 'nonce-ver'; min_version = '999'; target = @{{ vm_guid = '{uuid}'; user_sid = '{SID_A}'; session_id = 1 }} }}",
+        "@{ case = 'stalehost'; ok = $r2.ok; error_class = $r2.error_class } | ConvertTo-Json -Compress",
+    ])
+    results = {row["case"]: row
+               for row in _run_helper_dispatch(cases, tmp_path)}
+    assert results["sessionless"]["ok"] is False
+    assert results["sessionless"]["error_class"] == "session_unverified", (
+        results["sessionless"]
+    )
+    assert results["stalehost"]["ok"] is False
+    assert results["stalehost"]["error_class"] == "helper_version_mismatch", (
+        results["stalehost"]
+    )

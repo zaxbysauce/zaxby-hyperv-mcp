@@ -228,6 +228,14 @@ the task-spawned controller reads it from the environment.
 
 ## 0.7.0 changes
 
+- **In-session UI Automation helper (issue #29):** eight new
+  `hyperv_ui_*` tools drive the guest's interactive desktop by UI
+  Automation element (inspect, find, invoke, set_value, wait_for, focus,
+  session_state, helper provisioning with a full teardown). The read verbs
+  need only VM policy plus guest credentials; the mutating verbs require
+  the new `destructive.ui_input` category and provisioning the new
+  `destructive.ui_provision` category plus `confirm`. See "In-session UI
+  Automation helper" under Available Tools.
 - **`hyperv_checkpoint_create` gains `checkpoint_type`** (issue #26):
   `standard`, `production`, `production_only`, or `""` (default — the VM's
   own setting, byte-identical behavior to 0.6.x). Additive; no breaking
@@ -928,6 +936,8 @@ These tools refuse to run unless their category is enabled **and** (when
 | `hyperv_vm_media_attach` / `media_detach` / `network_set` | `media` (reversible, no confirm) |
 | `hyperv_vm_create` / `disk_add` / `firmware_set_boot_order` / `tpm_set` / `secureboot_set` | `vm_provision` + `confirm` |
 | `hyperv_vm_set_resolution` | `display` (reversible, no confirm; applies at next start) — its `restart=true` stop/start additionally needs `stop` + `confirm` |
+| `hyperv_ui_invoke` / `hyperv_ui_set_value` / `hyperv_ui_focus` | `ui_input` (no confirm — element-level interactive input; the lease gate runs first) |
+| `hyperv_ui_helper_provision` | `ui_provision` + `confirm` (installs the in-session helper and configures autologon; `teardown=true` runs the same gate) |
 | `hyperv_repair_guest_access` with `apply=true` | `guest_repair` + `confirm` (dry run is read-only) |
 | `hyperv_relay_start` | `relay` (standing loopback listener, no confirm) |
 | `hyperv_repair_guest_access` (dry run) | none (read-only) |
@@ -1527,40 +1537,44 @@ unchanged result is exactly as informative about the request as a changed one.
 
 ---
 
-#### In-session UI Automation helper (0.4.0, issue #29)
+### In-session UI Automation helper (0.7.0, issue #29)
 
 Eight `hyperv_ui_*` tools drive the guest's interactive desktop BY ELEMENT
-instead of by screen coordinates. They require the `hyperv-mcp-uia-helper`
-PowerShell process running inside the guest's interactive session; it serves
-UI Automation requests on a local named pipe that the host reaches through
-PowerShell Direct.
+instead of by screen coordinates. They require guest credentials (like every
+PowerShell Direct tool) and the `hyperv-mcp-uia-helper` PowerShell process
+running inside the guest's interactive session; it serves UI Automation
+requests on a local named pipe that the host reaches through PowerShell
+Direct.
 
-| Tool | Category | Purpose |
+| Tool | Policy | Purpose |
 | --- | --- | --- |
-| `hyperv_ui_inspect` | read | bounded UIA element tree (depth <= 8, 2000 elements) |
-| `hyperv_ui_find` | read | resolve elements by selector or element_id |
-| `hyperv_ui_wait_for` | read | wait for a selector to appear / disappear |
-| `hyperv_ui_session_state` | read | active session, interactive user, locked, foreground window, helper version |
+| `hyperv_ui_inspect` | vm policy + credentials | bounded UIA element tree (depth <= 8, 2000 elements) |
+| `hyperv_ui_find` | vm policy + credentials | resolve elements by selector or element_id |
+| `hyperv_ui_wait_for` | vm policy + credentials | wait for a selector to appear / disappear |
+| `hyperv_ui_session_state` | vm policy + credentials | active session, interactive user, locked, foreground window, helper version |
 | `hyperv_ui_invoke` | `ui_input` | Invoke/Toggle/SelectionItem/ExpandCollapse on an element |
 | `hyperv_ui_set_value` | `ui_input` | set a Value-pattern property (result reports the length, never the value) |
-| `hyperv_ui_focus` | `ui_input` | focus an element (locked sessions refuse: `no_interactive_desktop`) |
-| `hyperv_ui_helper_provision` | `ui_provision` + confirm | install + start the helper; optional autologon |
+| `hyperv_ui_focus` | `ui_input` | focus an element (locked sessions refuse: `no_interactive_desktop` — as do invoke and set_value) |
+| `hyperv_ui_helper_provision` | `ui_provision` + confirm | install + start the helper (`teardown=true` removes it); optional autologon |
 
 Provisioning (`hyperv_ui_helper_provision(autologon=true, confirm=true)`)
 configures automatic logon for the test account: the password is stored ONLY
 as the LSA secret `DefaultPassword` (never a plain-text registry value) and a
 per-user AtLogOn scheduled task (Interactive, RunLevel Highest, restart 3x/1m)
 starts the helper at logon. This is for DISPOSABLE TEST IMAGES; the server is
-a lab tool.
+a lab tool. `teardown=true` is provisioning's inverse: it stops the task,
+removes every helper directory, deletes the LSA secret and restores the
+Winlogon values.
 
-Session honesty: every request carries its target VM GUID, user SID, and
-interactive session; the helper refuses session-less requests
-(`session_unverified`) and anything addressed to another VM/user/session
-(`target_mismatch`). Element operations the target does not support return
-`unsupported_capability` rather than a coordinate fallback; ambiguous
+Session honesty: every request carries its target VM identity (the guest
+SMBIOS UUID recorded at provision time), user SID, and interactive session;
+the helper refuses a session-less or mismatched SESSION as
+`session_unverified`, and a VM/user mismatch as `target_mismatch`. Element
+operations the target does not support return `unsupported_capability`
+(naming every pattern tried) rather than a coordinate fallback; ambiguous
 selectors fail with `ambiguous_selector` and up to 20 candidates.
 
-## VM Console (WMI — works from firmware through WinPE)
+### VM Console (WMI — works from firmware through WinPE)
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|

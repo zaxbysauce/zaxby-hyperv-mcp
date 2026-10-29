@@ -15,14 +15,18 @@ point) and pins the production path:
   2. the first-request gates (#28 shared-mutation gate, adapter approval)
      fire BEFORE any transport leg;
   3. the transported script IS the CLIENT_LEG_SCRIPT pipe leg (the
-     strengthened C6 assertion: 'hyperv-mcp-uia' + 'NamedPipeClientStream'
-     in the recorded inner script);
+     strengthened C6 assertion: 'hyperv-mcp-uia' opened through the raw
+     CreateFileW P/Invoke in the recorded inner script — no remoting
+     shortcut);
   4. the session_unverified contract split (host defers an unknown session
-     dimension; the packaged helper refuses session-less requests) —
-     content-pinned on both artifacts plus a behavioral validate_forward leg;
-  5. RegistryKey.DeleteValue(name, $false) tolerates a missing value on real
-     Windows PowerShell — the .NET API contract _AUTOLOGON_INNER's
-     DeleteValue('DefaultPassword', $false) relies on on a clean image;
+     dimension; the packaged helper refuses session-less requests) — pinned
+     behaviourally on the HOST path (a session-less request surfaces the
+     helper's session_unverified refusal as the returned error_class) and on
+     the packaged helper artifact;
+  5. the PRODUCTION registry tail of _AUTOLOGON_INNER (sliced verbatim from
+     the module text, retargeted to a scratch HKCU key) runs clean on real
+     Windows PowerShell — RegistryKey.DeleteValue(name, $false) must
+     tolerate a value a clean image never had;
   6. PS 5.1 parse coverage (via test_script_parse_new's _parse_errors lane)
      for every PowerShell artifact the module composes: the packaged helper,
      the client leg, the composed LOCAL-mode pipe wrapper, and the three
@@ -33,13 +37,14 @@ No real Hyper-V anywhere; tests 5 and 6 run real powershell.exe only.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import importlib.resources
 import json
 import os
 import shutil
 import subprocess
 import threading
-from pathlib import Path
 
 import pytest
 from test_script_parse_new import _parse_errors
@@ -105,6 +110,45 @@ class UiLegRecorder:
         self.scripts.append(script)
         self.stdin_b64.append(stdin_b64)
         return pswindows.PSResult(stdout=json.dumps(self.frame), returncode=0)
+
+
+class EchoLegRecorder:
+    """uia._run_uia_leg stand-in that correlates like the real helper (F4):
+    it decodes the framed two-line stdin (line 1 the password, line 2 the
+    request JSON), records every decoded request, and answers
+    ``frame_for(request)`` with the REQUEST'S OWN id attached — a canned id
+    like "abc123" can no longer stand in for a response."""
+
+    def __init__(self, frame_for):
+        self.scripts: list[str] = []
+        self.requests: list[dict] = []
+        self.frame_for = frame_for
+
+    def __call__(self, cfg, script, *, stdin_b64=None, timeout_s=None, **kwargs):
+        self.scripts.append(script)
+        request: dict = {}
+        if stdin_b64:
+            lines = stdin_b64.strip().split("\n")
+            if len(lines) >= 2:
+                try:
+                    request = json.loads(
+                        base64.b64decode(lines[1]).decode("utf-8"))
+                except Exception:
+                    request = {}
+        self.requests.append(request)
+        frame = dict(self.frame_for(request))
+        frame.setdefault("id", request.get("id"))
+        return pswindows.PSResult(stdout=json.dumps(frame), returncode=0)
+
+
+def _helper_session_block(sha256: str = "") -> dict:
+    """A helper session block as the helper's Get-SessionBlock emits it."""
+    helper = {"running": True, "version": uia.HELPER_VERSION,
+              "capabilities": ["uia", "msaa"], "nonce": ""}
+    if sha256:
+        helper["sha256"] = sha256
+    return {"session_id": 2, "interactive_user": "tester", "locked": False,
+            "helper": helper}
 
 
 @pytest.fixture()
@@ -229,9 +273,11 @@ def test_pipe_leg_assertion(clean_uia_state, monkeypatch):
     """The strengthened C6 assertion the frozen file cannot carry: a read
     verb (find) with quser stubbed and the transport recording must hand
     _run_uia_leg the CLIENT_LEG_SCRIPT pipe leg — the recorded inner script
-    contains the pipe name 'hyperv-mcp-uia' AND drives it through
-    NamedPipeClientStream (not a Get-Content remoting shortcut, not an
-    Invoke-Expression)."""
+    names the pipe ('hyperv-mcp-uia') and opens it through the raw
+    CreateFileW P/Invoke (GENERIC_READ|GENERIC_WRITE, OPEN_EXISTING) with
+    WriteFile/ReadFile serving the one-line-JSON protocol — not a
+    NamedPipeClientStream constructor, not a Get-Content remoting shortcut,
+    not an Invoke-Expression."""
     legs = UiLegRecorder()
     monkeypatch.setattr(uia, "_run_uia_leg", legs)
     monkeypatch.setattr(pswindows, "run_ps", PSResolveRecorder())
@@ -242,11 +288,20 @@ def test_pipe_leg_assertion(clean_uia_state, monkeypatch):
                    {"process_name": "notepad", "control_type": "Document"})
     assert out["ok"] is True, out
     pipe_legs = [s for s in legs.scripts
-                 if "hyperv-mcp-uia" in s and "NamedPipeClientStream" in s]
+                 if "hyperv-mcp-uia" in s and "CreateFileW" in s]
     assert pipe_legs, (
         "the read verb's transport must include the CLIENT_LEG_SCRIPT pipe "
         "leg: a script naming the helper pipe (hyperv-mcp-uia) opened through "
-        "System.IO.Pipes.NamedPipeClientStream"
+        "the raw CreateFileW P/Invoke"
+    )
+    leg = pipe_legs[0]
+    assert "WriteFile" in leg and "ReadFile" in leg, (
+        "the pipe client must serve the one-line-JSON protocol over raw "
+        "WriteFile/ReadFile, not a remoting shortcut"
+    )
+    assert "NamedPipeClientStream" not in "\n".join(legs.scripts), (
+        "the client leg no longer builds a NamedPipeClientStream (the helper's "
+        "server end is a raw CreateNamedPipeW; the client matches it)"
     )
 
 
@@ -254,21 +309,33 @@ def test_pipe_leg_assertion(clean_uia_state, monkeypatch):
 # 4. the session_unverified contract split
 # ---------------------------------------------------------------------------
 
-def test_session_unverified_is_refused():
-    """A request whose target carries session_id None against a registration
-    with a concrete session: the BROKER DEFERS (validate_forward does not
-    raise — an unknown dimension on either side is the helper's to enforce,
-    because discovery failing on the host must not turn into a fabricated
-    mismatch), while the HELPER REFUSES session-less requests outright as
-    session_unverified before any verb dispatch. Both halves are pinned:
-    the marker string must exist in uia.py (the host documents and maps the
-    refusal) and in the packaged guest/uia_helper.ps1 (the enforcement), and
-    the behavioral leg proves the defer side so the content pins cannot
-    decay into decoration."""
-    source = Path(uia.__file__).read_text(encoding="utf-8")
-    assert "session_unverified" in source, (
-        "uia.py must carry the session_unverified refusal contract"
+def test_session_unverified_is_refused(clean_uia_state, monkeypatch):
+    """A session-less request on the HOST path: discovery finds nobody
+    logged on (quser -> None), so the host forwards the request with
+    target.session_id None (the broker DEFERS — validate_forward does not
+    raise, because discovery failing on the host must not turn into a
+    fabricated mismatch) and the HELPER's refusal comes back as the verb's
+    returned error_class: session_unverified, ok False. The packaged helper
+    artifact still carries the enforcement marker; the behavioural leg
+    above is what keeps the contract from decaying into decoration."""
+    legs = EchoLegRecorder(frame_for=lambda request: {
+        "ok": False, "error_class": "session_unverified",
+        "error": "the request does not carry this helper's interactive "
+                 "session (2)"})
+    monkeypatch.setattr(uia, "_run_uia_leg", legs)
+    monkeypatch.setattr(pswindows, "run_ps", PSResolveRecorder())
+    monkeypatch.setattr(uia, "_run_quser", lambda cfg, ref, cred: None)
+
+    out = uia.session_state(UNRESTRICTED, "test-vm-1", CRED)
+    assert out["ok"] is False, out
+    assert out["error_class"] == "session_unverified", out
+    assert legs.requests, "the session-less request must still be forwarded"
+    pipe_requests = [r for r in legs.requests if r.get("verb") == "session_state"]
+    assert pipe_requests, legs.requests
+    assert pipe_requests[0].get("target", {}).get("session_id") is None, (
+        "the host forwarded the SESSION-LESS target for the helper to refuse"
     )
+
     helper = (
         importlib.resources.files("hyperv_mcp")
         .joinpath("guest")
@@ -280,6 +347,8 @@ def test_session_unverified_is_refused():
         "session_unverified error class before any verb dispatch"
     )
 
+    # the defer side: a request whose target carries session_id None against
+    # a registration with a concrete session does NOT raise locally.
     registration = uia.register_helper(
         vm_guid=VM_GUID, user_sid=USER_SID, session_id=2, capabilities={"uia"})
     request = {
@@ -297,31 +366,47 @@ def test_session_unverified_is_refused():
 # 5. RegistryKey.DeleteValue tolerates a missing value (real PowerShell)
 # ---------------------------------------------------------------------------
 
-def test_deletevalue_tolerates_a_missing_value():
-    r"""The autologon provisioning leg ends with
-    $ku.DeleteValue('DefaultPassword', $false) against a Winlogon key that —
-    on a clean image — never held a DefaultPassword value. This runs that
-    exact .NET API contract on real Windows PowerShell against the CURRENT
-    USER hive (HKLM writes would need admin; HKCU\Software is writable by
-    the test account): a SetValue/DeleteValue round-trip on a scratch name,
-    then DeleteValue of a name that does not exist with $false — which must
-    not throw. HKCU is also where issue #29's guest tests may run without
-    elevation; the API behavior is hive-independent."""
+def test_production_autologon_registry_tail_runs_on_a_scratch_key():
+    r"""F11: the old body re-implemented the DeleteValue call by hand; this
+    one runs the PRODUCTION registry tail sliced verbatim out of
+    uia._AUTOLOGON_INNER. The slice is the module's own text — the ONLY
+    change is the retarget from LocalMachine\...\Winlogon to a scratch
+    CURRENT-USER key (HKLM\Winlogon writes would need admin and must never
+    run from a test; the RegistryKey API is hive-independent). On a clean
+    image the Winlogon key never held DefaultPassword, so the production
+    $ku.DeleteValue('DefaultPassword', $false) must tolerate a missing
+    value without throwing."""
     powershell = shutil.which("powershell")
     if powershell is None:
         pytest.skip(
             "powershell.exe is not on PATH (the RegistryKey.DeleteValue leg "
             "runs on real Windows PowerShell only)"
         )
-    scratch = "hyperv_mcp_f05_scratch"
+    inner = uia._AUTOLOGON_INNER
+    start = inner.index("$ku = [Microsoft.Win32.Registry]")
+    end_marker = "} finally { $ku.Close() }"
+    end = inner.index(end_marker) + len(end_marker)
+    snippet = inner[start:end]
+    # sanity: this IS the production tail, not a re-implementation
+    assert "AutoAdminLogon" in snippet and "DefaultPassword" in snippet
+    assert "DeleteValue('DefaultPassword', $false)" in snippet
+    scratch = "Software\\hyperv_mcp_f05_winlogon"
+    snippet = snippet.replace(
+        "[Microsoft.Win32.Registry]::LocalMachine",
+        "[Microsoft.Win32.Registry]::CurrentUser")
+    snippet = snippet.replace(
+        "'Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon'",
+        f"'{scratch}'")
     script = "\n".join([
-        "$key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software', $true)",
-        "if ($null -eq $key) { throw 'HKCU Software could not be opened for write' }",
+        "$ErrorActionPreference = 'Stop'",
+        "$env:HYPERVMCP_AUTOLOGON_USER = 'tester'",
+        f"[void][Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('{scratch}')",
         "try {",
-        f"    $key.SetValue('{scratch}', 'x', [Microsoft.Win32.RegistryValueKind]::String)",
-        f"    $key.DeleteValue('{scratch}', $false)",
-        "    $key.DeleteValue('DefinitelyMissingValue_xyz', $false)",
-        "} finally { $key.Close() }",
+        snippet,
+        "} finally {",
+        "    try { [void][Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey("
+        f"'{scratch}') }} catch {{ }}",
+        "}",
         "Write-Output 'tolerated'",
     ])
     proc = subprocess.run(
@@ -331,8 +416,9 @@ def test_deletevalue_tolerates_a_missing_value():
     )
     assert proc.returncode == 0, f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
     assert "tolerated" in proc.stdout, (
-        f"DeleteValue(name, $false) must tolerate a missing value — "
-        f"stdout: {proc.stdout!r} stderr: {proc.stderr!r}"
+        f"the production registry tail must tolerate the missing "
+        f"DefaultPassword value — stdout: {proc.stdout!r} "
+        f"stderr: {proc.stderr!r}"
     )
 
 
@@ -366,14 +452,22 @@ def test_parse_client_leg_script(parsed_ps):
     assert _parse_errors(uia.CLIENT_LEG_SCRIPT) == []
 
 
-def test_parse_composed_pipe_leg_wrapper(parsed_ps, monkeypatch):
+def test_parse_composed_pipe_leg_wrapper(parsed_ps):
     """(c) the COMPOSED _uia_guest_script output for a pipe leg in LOCAL
     mode — prefix + stdin line + vm-target preamble + b64 inner script +
-    Invoke-Command -VMId wrapper — parses clean as a whole."""
+    Invoke-Command -VMId wrapper — parses clean as a whole. Self-sufficient:
+    the thread-local leg slot is set DIRECTLY (monkeypatch.setattr on a
+    threading.local raises AttributeError when the attribute is absent, so
+    the old body only passed when an earlier test had already populated the
+    slot) and cleared again, so this test passes in ISOLATION."""
     leg_cred = CredentialSet("u", "p")
-    monkeypatch.setattr(uia._LEG, "guid", VM_GUID)
-    monkeypatch.setattr(uia._LEG, "cred", leg_cred)
-    composed = uia._uia_guest_script(uia.CLIENT_LEG_SCRIPT, leg_cred, None)
+    uia._LEG.guid = VM_GUID
+    uia._LEG.cred = leg_cred
+    try:
+        composed = uia._uia_guest_script(uia.CLIENT_LEG_SCRIPT, leg_cred, None)
+    finally:
+        uia._LEG.guid = None
+        uia._LEG.cred = None
     assert "Invoke-Command -VMId" in composed  # sanity: the wrapper wrapped
     assert _parse_errors(composed) == []
 
@@ -439,23 +533,20 @@ def test_session_state_answer_carries_top_level_helper(clean_uia_state,
                                                        monkeypatch):
     """4.5 finding 1: a BYTE-EXACT production frame (helper facts in the
     session block, result without helper) must come back with helper at
-    TOP level, or evidence's helper gate and the frozen AC17 shape starve."""
-    byte_exact = {
-        "ok": True, "id": "abc123",
-        "result": {"active_session_id": 2, "interactive_user": "tester",
-                   "locked": False,
-                   "foreground_window": {"title": None, "process_name": "",
-                                          "pid": 0, "hwnd": 0}},
-        "session": {"session_id": 2, "interactive_user": "tester",
-                    "locked": False,
-                    "helper": {"running": True, "version": uia.HELPER_VERSION,
-                               "capabilities": ["uia", "msaa"], "nonce": ""}},
-    }
+    TOP level, or evidence's helper gate and the frozen AC17 shape starve.
+    The serving leg CORRELATES (it echoes the request's id — F4 makes a
+    canned id like "abc123" unanswerable), and the mismatch case is pinned:
+    a frame whose id does not correlate with the request is refused as
+    helper_unavailable, never success."""
+    byte_exact_result = {
+        "active_session_id": 2, "interactive_user": "tester", "locked": False,
+        "foreground_window": {"title": None, "process_name": "",
+                              "pid": 0, "hwnd": 0}}
 
-    def leg(cfg, script, *, stdin_b64=None, timeout_s=None, **kw):
-        return pswindows.PSResult(stdout=json.dumps(byte_exact), returncode=0)
-
-    monkeypatch.setattr(uia, "_run_uia_leg", leg)
+    legs = EchoLegRecorder(frame_for=lambda request: {
+        "ok": True, "result": dict(byte_exact_result),
+        "session": _helper_session_block()})
+    monkeypatch.setattr(uia, "_run_uia_leg", legs)
     monkeypatch.setattr(uia, "_run_quser",
                         lambda cfg, ref, cred: {"user": "tester",
                                                 "session_id": 2})
@@ -467,8 +558,23 @@ def test_session_state_answer_carries_top_level_helper(clean_uia_state,
     from hyperv_mcp.credentials import CredentialSet
 
     out = uia.session_state(cfg, "test-vm-1", CredentialSet("tester", "pw"))
+    assert out["ok"] is True, out
     assert out["helper"]["running"] is True
     assert out["helper"]["version"] == uia.HELPER_VERSION
+
+    # the mismatch case: a response whose id does not correlate with the
+    # request id is refused (helper_unavailable), never success.
+    def mismatched(request):
+        frame = {"ok": True, "result": dict(byte_exact_result),
+                 "session": _helper_session_block()}
+        frame["id"] = "not-the-request-id"
+        return frame
+
+    monkeypatch.setattr(uia, "_run_uia_leg",
+                        EchoLegRecorder(frame_for=mismatched))
+    refused = uia.session_state(cfg, "test-vm-1", CredentialSet("tester", "pw"))
+    assert refused["ok"] is False, refused
+    assert refused["error_class"] == "helper_unavailable", refused
 
     # the evidence helper-first gate opens on this exact answer shape
     from types import SimpleNamespace
@@ -487,3 +593,184 @@ def test_session_state_answer_carries_top_level_helper(clean_uia_state,
     ui = evidence._uia_via_helper(cfg, ref, CredentialSet("tester", "pw"),
                                   3, 200)
     assert ui is not None and ui["source"] == "helper" and seen["called"]
+
+
+# ---------------------------------------------------------------------------
+# 7. fix-wave behavioural pins (F11): the paths that had NO coverage
+# ---------------------------------------------------------------------------
+
+def _packaged_helper_bytes() -> bytes:
+    return (
+        importlib.resources.files("hyperv_mcp")
+        .joinpath("guest")
+        .joinpath("uia_helper.ps1")
+        .read_bytes()
+    )
+
+
+def test_helper_sha256_integrity_gate(clean_uia_state, monkeypatch):
+    """F14/F11: the host compares the helper-REPORTED sha256 with the
+    PACKAGED bytes. An ok frame carrying the packaged hash surfaces
+    ``helper.sha256_match: true`` (in the session block AND promoted to top
+    level); an ok frame carrying any OTHER hash is refused — never success —
+    with error_class helper_integrity_mismatch."""
+    correct = hashlib.sha256(_packaged_helper_bytes()).hexdigest()
+    monkeypatch.setattr(pswindows, "run_ps", PSResolveRecorder())
+    monkeypatch.setattr(uia, "_run_quser",
+                        lambda cfg, ref, cred: {"user": "tester", "session_id": 2})
+
+    legs = EchoLegRecorder(frame_for=lambda request: {
+        "ok": True, "result": {},
+        "session": _helper_session_block(sha256=correct)})
+    monkeypatch.setattr(uia, "_run_uia_leg", legs)
+    out = uia.session_state(UNRESTRICTED, "test-vm-1", CRED)
+    assert out["ok"] is True, out
+    assert out["session"]["helper"]["sha256"] == correct
+    assert out["session"]["helper"]["sha256_match"] is True, out
+    assert out["helper"]["sha256_match"] is True, (
+        "the helper facts (with sha256_match) are promoted to top level"
+    )
+
+    legs = EchoLegRecorder(frame_for=lambda request: {
+        "ok": True, "result": {},
+        "session": _helper_session_block(sha256="00" * 32)})
+    monkeypatch.setattr(uia, "_run_uia_leg", legs)
+    refused = uia.session_state(UNRESTRICTED, "test-vm-1", CRED)
+    assert refused["ok"] is False, refused
+    assert refused["error_class"] == "helper_integrity_mismatch", refused
+
+
+def test_wait_for_deadline_returns_the_last_slice_answer(clean_uia_state,
+                                                         monkeypatch):
+    """F6/F11 (wait_for budget): a wait whose every guest slice answers
+    empty elements EXPIRES its budget and returns the LAST slice's answer
+    (ok with empty elements — the module emits no timed_out flag, so the
+    deadline path is pinned by its bounded return, not a flag), and each
+    slice's request budget never exceeds one _WAIT_SLICE_S slice."""
+    monkeypatch.setattr(pswindows, "run_ps", PSResolveRecorder())
+    monkeypatch.setattr(uia, "_run_quser",
+                        lambda cfg, ref, cred: {"user": "tester", "session_id": 2})
+    legs = EchoLegRecorder(frame_for=lambda request: {
+        "ok": True, "result": {"elements": []},
+        "session": _helper_session_block()})
+    monkeypatch.setattr(uia, "_run_uia_leg", legs)
+
+    out = uia.wait_for(UNRESTRICTED, "test-vm-1", CRED, {"name": "OK"},
+                       timeout_s=1)
+    assert out["ok"] is True, out
+    assert out["elements"] == [], out
+    assert legs.requests, "the wait must drive its pipe leg"
+    wait_requests = [r for r in legs.requests if r.get("verb") == "wait_for"]
+    assert wait_requests, legs.requests
+    assert all(r["args"]["timeout_s"] <= uia._WAIT_SLICE_S
+               for r in wait_requests), (
+        "every wait slice's budget must be bounded by one _WAIT_SLICE_S slice"
+    )
+    assert "timed_out" not in out, (
+        "the module defines no timed_out flag; if one is added this pin "
+        "must be updated to assert it on the deadline path"
+    )
+
+
+class ProvisionLegRecorder:
+    """uia._run_uia_leg stand-in for the provisioning path: serves each
+    provision/teardown leg its documented frame, keyed by script markers."""
+
+    def __init__(self, install_ok: bool = True):
+        self.scripts: list[str] = []
+        self.install_ok = install_ok
+
+    def _ps(self, frame: dict) -> pswindows.PSResult:
+        return pswindows.PSResult(stdout=json.dumps(frame), returncode=0)
+
+    def __call__(self, cfg, script, *, stdin_b64=None, timeout_s=None, **kwargs):
+        self.scripts.append(script)
+        if "LsaStorePrivateDataNull" in script:      # _TEARDOWN_WINLOGON_INNER
+            return self._ps({"ok": True, "lsa_secret_deleted": True,
+                             "autologon_restored": True})
+        if "Unregister-ScheduledTask" in script:     # _RESET_INNER
+            return self._ps({"ok": True, "task_unregistered": True,
+                             "directories_removed": 2})
+        if "LsaStorePrivateData" in script:          # _AUTOLOGON_INNER
+            return self._ps({"ok": True, "autologon": True})
+        if "Register-ScheduledTask" in script:       # _TASK_INNER
+            return self._ps({"ok": True, "task_registered": True,
+                             "started": True})
+        if "WriteAllBytes" in script:                # _INSTALL_INNER
+            if not self.install_ok:
+                return self._ps({"ok": False, "error": "disk full (test stub)"})
+            return self._ps({"ok": True, "installed": True,
+                             "helper_version": uia.HELPER_VERSION})
+        # the session_state probe after install (the pipe client leg)
+        return self._ps({"ok": True,
+                         "result": {"active_session_id": 2},
+                         "session": _helper_session_block()})
+
+
+def test_provision_install_result_keys_and_failed_branch(clean_uia_state,
+                                                         monkeypatch):
+    """F11 (provisioning return value): the INSTALL result carries the
+    documented keys, and a failed install leg returns the
+    helper_install_failed branch (ok False with the error_class) instead of
+    a half-populated success dict."""
+    legs = ProvisionLegRecorder()
+    monkeypatch.setattr(uia, "_run_uia_leg", legs)
+    monkeypatch.setattr(pswindows, "run_ps", PSResolveRecorder())
+
+    out = uia.provision_helper(UNRESTRICTED, "test-vm-1", CRED,
+                               autologon=True, confirm=True)
+    assert out["ok"] is True, out
+    assert out["autologon_configured"] is True
+    assert out["task_registered"] is True
+    assert out["helper_version"] == uia.HELPER_VERSION
+    assert out["helper_running"] is True
+    assert out["guest_uuid_read"] is False  # the stub host leg reads no UUID
+    assert out["helper_dir"].startswith(
+        "C:\\ProgramData\\hyperv-mcp\\uia-helper-")
+    assert uia._INSTALLS[VM_GUID]["nonce"], (
+        "the install records a per-install nonce"
+    )
+
+    failing = ProvisionLegRecorder(install_ok=False)
+    monkeypatch.setattr(uia, "_run_uia_leg", failing)
+    failed = uia.provision_helper(UNRESTRICTED, "test-vm-1", CRED,
+                                  autologon=True, confirm=True)
+    assert failed["ok"] is False, failed
+    assert failed["error_class"] == "helper_install_failed", failed
+
+
+def test_provision_teardown_result(clean_uia_state, monkeypatch):
+    """F13/F11 (provisioning's inverse): teardown=True stops the task,
+    removes the helper directories, deletes the LSA secret and restores
+    Winlogon — the result carries the documented teardown keys, the
+    install/task/autologon-store legs never run, and the recorded install
+    facts for the VM are dropped."""
+    legs = ProvisionLegRecorder()
+    monkeypatch.setattr(uia, "_run_uia_leg", legs)
+    monkeypatch.setattr(pswindows, "run_ps", PSResolveRecorder())
+    uia._INSTALLS[VM_GUID] = {
+        "dir": "C:\\ProgramData\\hyperv-mcp\\uia-helper-x",
+        "uuid": "", "nonce": "n", "version": "1"}
+    try:
+        out = uia.provision_helper(UNRESTRICTED, "test-vm-1", CRED,
+                                   autologon=True, confirm=True, teardown=True)
+    finally:
+        uia._INSTALLS.pop(VM_GUID, None)
+    assert out["ok"] is True, out
+    assert out["torn_down"] is True
+    assert out["task_unregistered"] is True
+    assert out["helper_directories_removed"] == 2
+    assert out["lsa_secret_deleted"] is True
+    assert out["autologon_restored"] is True
+    blob = "\n".join(legs.scripts)
+    assert "Register-ScheduledTask" not in blob, (
+        "teardown must not register the helper task"
+    )
+    assert "WriteAllBytes" not in blob, "teardown must not install helper bytes"
+    assert "LsaStorePrivateData " not in blob.replace(
+        "LsaStorePrivateDataNull", ""), (
+        "teardown deletes the LSA secret; it never stores one"
+    )
+    assert VM_GUID not in uia._INSTALLS, (
+        "teardown drops the recorded install facts for the VM"
+    )

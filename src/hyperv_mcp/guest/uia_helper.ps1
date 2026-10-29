@@ -3,37 +3,73 @@
 # Runs in the INTERACTIVE session of the test account (per-user AtLogOn
 # scheduled task, LogonType Interactive, RunLevel Highest), hosts
 # System.Windows.Automation (in-box UIAutomationClient/UIAutomationTypes)
-# and serves ONE newline-JSON request frame at a time on a local named
-# pipe. The host reaches the pipe only through PowerShell Direct.
+# and serves one newline-JSON request frame at a time on a local named
+# pipe. The pipe is created through the CreateNamedPipeW P/Invoke with
+# dwPipeMode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT |
+# PIPE_REJECT_REMOTE_CLIENTS (0x8) - the .NET Framework PipeOptions enum
+# names none of the reject-remote bit, so the server is raw handles all
+# the way (ConnectNamedPipe / ReadFile / WriteFile / DisconnectNamedPipe
+# / CloseHandle). Several instances are served concurrently so read verbs
+# do not collide. The host reaches the pipe only through PowerShell
+# Direct, as a plain CreateFile client on the same name.
+#
+# The helper resolves its OWN directory from the script location (the
+# HYPERVMCP_HELPER_DIR environment variable is an override only, never
+# the primary source) and reads three files the host provisions there:
+#   version.txt  the helper version. There is no hardcoded version: if
+#                the file is missing or unreadable every request is
+#                refused as helper_version_unknown.
+#   nonce.txt    the per-install nonce. A request whose nonce is absent
+#                or does not equal this file is refused as
+#                nonce_mismatch BEFORE any dispatch.
+#   uuid.txt     the guest SMBIOS UUID as RECORDED by the host at
+#                provision time. target.vm_guid must equal the RECORDED
+#                value and the live SMBIOS UUID must match it too, or
+#                the request is refused as target_mismatch - fail
+#                closed when either side of the comparison is missing.
 #
 # Security contract:
-#   - The pipe is created with the PIPE_REJECT_REMOTE_CLIENTS flag (0x8);
-#     its DACL grants ReadWrite to the running user and the built-in
-#     Administrators group only.
-#   - Every request frame carries min_version + target {vm_guid, user_sid,
-#     session_id}; the helper enforces them STRICTLY (stale host refused as
+#   - The pipe DACL (SDDL) grants GENERIC_ALL to LOCAL_SYSTEM,
+#     BUILTIN\Administrators and the running user only; the pipe mode
+#     rejects remote clients.
+#   - Every request frame carries nonce + min_version + target {vm_guid,
+#     user_sid, session_id}; the helper enforces them STRICTLY (an
+#     unknown version refused as helper_version_unknown; a wrong nonce
+#     refused as nonce_mismatch; a stale host refused as
 #     helper_version_mismatch; a session-less request refused as
 #     session_unverified; a mismatched VM/user/session refused as
-#     target_mismatch) BEFORE any verb dispatch. Caller text is never
-#     evaluated as code: verbs are a closed allowlist driving UIA patterns
-#     (Invoke, Toggle, SelectionItem, ExpandCollapse, Value, plus the
-#     LegacyIAccessible bridge) - no Invoke-Expression, no ScriptBlock
-#     creation from request data, no input injection.
-#   - Responses report the length of a set value, never the value; request
-#     secrets never appear in helper logs (the helper writes no logs).
+#     target_mismatch) BEFORE any verb dispatch. The session dimension
+#     must be CONCRETE and equal to this helper's own session for every
+#     verb, reads included. Caller text is never evaluated as code:
+#     verbs are a closed allowlist driving UIA patterns (Invoke, Toggle,
+#     SelectionItem, ExpandCollapse, Value, plus the LegacyIAccessible
+#     bridge) - no Invoke-Expression, no ScriptBlock creation from
+#     request data, no input injection.
+#   - Responses report the length of a set value, never the value; the
+#     nonce never appears in a response (minimization); the helper
+#     writes no logs.
 #
 # Windows PowerShell 5.1 only; in-box assemblies; exits when the session
-# logs off (the AtLogOn task restarts it on the next logon).
+# logs off (the AtLogOn task restarts it on the next logon). The host's
+# teardown stops the task and removes the directory: a missing
+# version.txt / nonce.txt / uuid.txt is refused with a clear error_class
+# on every request, never a terminating crash.
 
 $ErrorActionPreference = 'Stop'
 
-$HelperVersion = '1'
+# The helper's own directory: the SCRIPT location is the primary source;
+# the env var exists only as an override for local probing.
+$HelperDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+if ($env:HYPERVMCP_HELPER_DIR) { $HelperDir = $env:HYPERVMCP_HELPER_DIR }
+
 $PipeName = 'hyperv-mcp-uia'
-$HelperDir = $env:HYPERVMCP_HELPER_DIR
+$PipeInstanceCount = 4
 $MaxDepth = 8
 $MaxElements = 2000
 $MaxMatches = 200
 $MaxValueChars = 65536
+$MaxRequestBytes = 262144
+$RequestTimeoutMs = 30000
 
 Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
 Add-Type -AssemblyName UIAutomationTypes -ErrorAction Stop
@@ -44,26 +80,63 @@ Add-Type -Namespace HypervMcp.Uia -Name Native -MemberDefinition @'
 [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
 [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool GetUserObjectInformationW(IntPtr hObj, int idx, System.Text.StringBuilder buf, uint len, out uint needed);
 [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr h);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
 [DllImport("wtsapi32.dll")] public static extern bool WTSQuerySessionInformationW(IntPtr server, int sessionId, int infoClass, out IntPtr buffer, out uint bytesReturned);
 [DllImport("wtsapi32.dll")] public static extern void WTSFreeMemory(IntPtr buffer);
-[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-[StructLayout(LayoutKind.Sequential)] public struct WTSINFOEX_LEVEL1 { public uint SessionId; public uint State; public int SessionFlags; public string unused; }
+[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] public static extern IntPtr CreateNamedPipeW(string lpName, uint dwOpenMode, uint dwPipeMode, uint nMaxInstances, uint nOutBufferSize, uint nInBufferSize, uint nDefaultTimeOut, IntPtr lpSecurityAttributes);
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool ConnectNamedPipe(IntPtr hNamedPipe, IntPtr lpOverlapped);
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool DisconnectNamedPipe(IntPtr hNamedPipe);
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool PeekNamedPipe(IntPtr hNamedPipe, IntPtr lpBuffer, uint nBufferSize, out uint lpBytesRead, out uint lpTotalBytesAvail, out uint lpBytesLeftThisMessage);
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool ReadFile(IntPtr hFile, byte[] lpBuffer, uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool WriteFile(IntPtr hFile, byte[] lpBuffer, uint nNumberOfBytesToWrite, out uint lpNumberOfBytesWritten, IntPtr lpOverlapped);
+[DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(IntPtr hObject);
+[DllImport("kernel32.dll")] public static extern IntPtr LocalFree(IntPtr hMem);
+[DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] public static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string StringSecurityDescriptor, uint StringSDRevision, out IntPtr SecurityDescriptor, IntPtr CreationFlags);
+[StructLayout(LayoutKind.Sequential)]
+public struct SECURITY_ATTRIBUTES { public int nLength; public IntPtr lpSecurityDescriptor; public bool bInheritHandle; }
 '@
+
+function Read-HelperFile([string]$Name) {
+    # Reads the first line of a provisioned file in the helper directory.
+    # Returns $null when the directory/file is missing or unreadable (the
+    # caller refuses fail closed), '' when the file is empty.
+    if ([string]::IsNullOrEmpty($HelperDir)) { return $null }
+    try {
+        $path = Join-Path $HelperDir $Name
+        if (-not (Test-Path -LiteralPath $path)) { return $null }
+        $line = Get-Content -LiteralPath $path -TotalCount 1 -ErrorAction Stop
+        if ($null -eq $line) { return '' }
+        return ([string]$line).Trim()
+    } catch {
+        return $null
+    }
+}
 
 function Get-OwnIdentity {
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $ownSession = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
-    $ownGuid = ''
-    try {
-        $cs = Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction Stop
-        if ($cs -and $cs.UUID) { $ownGuid = ([string]$cs.UUID).ToLowerInvariant() }
-    } catch { $ownGuid = '' }
     @{
         sid = $identity.User.Value
         user = ($identity.Name -split '\\')[-1]
         session_id = $ownSession
-        vm_guid = $ownGuid
     }
+}
+
+function Get-LiveUuid {
+    # The live SMBIOS UUID. $null = the read failed this attempt (not
+    # cached, retried on the next request, the request at hand refused
+    # fail closed); a string = cached success.
+    if ($null -ne $global:LiveUuid) { return $global:LiveUuid }
+    $uuid = ''
+    try {
+        $cs = Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction Stop
+        if ($cs -and $cs.UUID) { $uuid = ([string]$cs.UUID).Trim().ToLowerInvariant() }
+    } catch {
+        return $null
+    }
+    if ([string]::IsNullOrEmpty($uuid)) { return $null }
+    $global:LiveUuid = $uuid
+    return $uuid
 }
 
 function Test-OwnsInputDesktop {
@@ -80,24 +153,31 @@ function Test-OwnsInputDesktop {
 }
 
 function Get-LockState {
-    # WTSQuerySessionInformationW(WTSSessionInfoEx).SessionFlags:
-    # WTS_SESSIONSTATE_LOCK = 0, WTS_SESSIONSTATE_UNLOCK = 1, inverted on
-    # Windows 7 / Server 2008 R2. Cross-checked with OpenInputDesktop.
-    $locked = $true
+    # WTSQuerySessionInformationW(WTSSessionInfoEx) returns WTSINFOEXW:
+    #   Level@0, then WTSINFOEX_LEVEL1 { SessionId@8, State@12,
+    #   SessionFlags@16 } - SessionFlags sits at ABSOLUTE offset 16
+    #   (a live hexdump confirms it). Values: 0 = locked,
+    #   1 = unlocked, INVERTED on Windows 7 / Server 2008 R2 (6.1).
+    # Anything unreadable falls back to the input-desktop probe.
+    $locked = $null
     $buffer = [IntPtr]::Zero
-    $bytes = 0
+    $bytes = [uint32]0
     $ok = [HypervMcp.Uia.Native]::WTSQuerySessionInformationW([IntPtr]::Zero, -1, 25, [ref]$buffer, [ref]$bytes)
     if ($ok -and $buffer -ne [IntPtr]::Zero) {
         try {
-            # WTSINFOEXW { Level:1, Level1 { Level, WTSINFOEX_LEVEL1 { SessionId, State, SessionFlags(=0 lock / 1 unlock) } } }
-            $sessionFlags = [System.Runtime.InteropServices.Marshal]::ReadInt32($buffer, 8 + 4 + 4 + 8)
-            if ($sessionFlags -eq 1) { $locked = $false } else { $locked = $true }
-        } catch { $locked = -not (Test-OwnsInputDesktop) }
-        [void][HypervMcp.Uia.Native]::WTSFreeMemory($buffer)
-    } else {
-        $locked = -not (Test-OwnsInputDesktop)
+            $flags = [System.Runtime.InteropServices.Marshal]::ReadInt32($buffer, 16)
+            if ($flags -eq 0 -or $flags -eq 1) {
+                $v = [Environment]::OSVersion.Version
+                $isWin7Or2008R2 = ($v.Major -eq 6 -and $v.Minor -eq 1)
+                if ($isWin7Or2008R2) { $locked = ($flags -eq 1) } else { $locked = ($flags -eq 0) }
+            }
+        } catch {
+            $locked = $null
+        } finally {
+            [void][HypervMcp.Uia.Native]::WTSFreeMemory($buffer)
+        }
     }
-    if ($locked -and (Test-OwnsInputDesktop)) { $locked = $false }
+    if ($null -eq $locked) { $locked = -not (Test-OwnsInputDesktop) }
     return $locked
 }
 
@@ -117,6 +197,8 @@ function Get-ForegroundWindow {
 }
 
 function New-PipeSecurity {
+    # Fallback DACL (used only when the SDDL conversion is unavailable):
+    # current user + BUILTIN\Administrators.
     $security = New-Object System.IO.Pipes.PipeSecurity
     $own = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
     $rule = New-Object System.IO.Pipes.PipeAccessRule($own, 'ReadWrite', 'Allow')
@@ -127,70 +209,212 @@ function New-PipeSecurity {
     return $security
 }
 
+function New-SecurityAttributes([string]$Sddl) {
+    # Builds a native SECURITY_ATTRIBUTES for CreateNamedPipeW. Primary
+    # path: ConvertStringSecurityDescriptorToSecurityDescriptorW on the
+    # SDDL string. Fallback: the .NET PipeSecurity binary descriptor
+    # copied into unmanaged memory. Returns $null when both fail (the
+    # pipe would then be created with the default DACL).
+    $sd = [IntPtr]::Zero
+    $ok = $false
+    try {
+        $ok = [HypervMcp.Uia.Native]::ConvertStringSecurityDescriptorToSecurityDescriptorW($Sddl, 1, [ref]$sd, [IntPtr]::Zero)
+    } catch { $ok = $false }
+    if ($ok -and $sd -ne [IntPtr]::Zero) {
+        $sa = New-Object HypervMcp.Uia.Native+SECURITY_ATTRIBUTES
+        $sa.nLength = [System.Runtime.InteropServices.Marshal]::SizeOf([type][HypervMcp.Uia.Native+SECURITY_ATTRIBUTES])
+        $sa.lpSecurityDescriptor = $sd
+        $sa.bInheritHandle = $false
+        return @{ sa = $sa; owner = 'local' }
+    }
+    $bytes = $null
+    try { $bytes = (New-PipeSecurity).GetSecurityDescriptorBinaryForm() } catch { $bytes = $null }
+    if ($null -eq $bytes -or $bytes.Length -eq 0) { return $null }
+    $ptr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($bytes.Length)
+    [System.Runtime.InteropServices.Marshal]::Copy($bytes, 0, $ptr, $bytes.Length)
+    $sa = New-Object HypervMcp.Uia.Native+SECURITY_ATTRIBUTES
+    $sa.nLength = [System.Runtime.InteropServices.Marshal]::SizeOf([type][HypervMcp.Uia.Native+SECURITY_ATTRIBUTES])
+    $sa.lpSecurityDescriptor = $ptr
+    $sa.bInheritHandle = $false
+    return @{ sa = $sa; owner = 'hglobal' }
+}
+
+function Free-SecurityAttributes($Sec) {
+    # The descriptor is freed AFTER CreateNamedPipeW copied it into the
+    # pipe object.
+    if ($null -eq $Sec) { return }
+    try {
+        if ($Sec.owner -eq 'local') {
+            [void][HypervMcp.Uia.Native]::LocalFree($Sec.sa.lpSecurityDescriptor)
+        } elseif ($Sec.owner -eq 'hglobal') {
+            [System.Runtime.InteropServices.Marshal]::FreeHGlobal($Sec.sa.lpSecurityDescriptor)
+        }
+    } catch { }
+}
+
+function New-PipeInstance([int]$UseFirstInstanceFlag) {
+    # CreateNamedPipeW('\\.\pipe\hyperv-mcp-uia'):
+    #   dwOpenMode = PIPE_ACCESS_DUPLEX (0x3), plus
+    #       FILE_FLAG_FIRST_PIPE_INSTANCE (0x00080000) for the very
+    #       first instance of this process only - subsequent instances
+    #       must not carry it or they would fail against each other.
+    #   dwPipeMode  = 0x8 = PIPE_TYPE_BYTE (0x0) | PIPE_READMODE_BYTE
+    #       (0x0) | PIPE_WAIT (0x0) | PIPE_REJECT_REMOTE_CLIENTS (0x8)
+    #       - compatible with a plain CreateFile client.
+    # Returns the handle, or -1 (INVALID_HANDLE_VALUE) on failure.
+    $sec = New-SecurityAttributes $PipeSddl
+    $handle = [IntPtr](-1)
+    try {
+        $saPtr = [IntPtr]::Zero
+        if ($null -ne $sec) {
+            $saPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal([System.Runtime.InteropServices.Marshal]::SizeOf([type][HypervMcp.Uia.Native+SECURITY_ATTRIBUTES]))
+            [System.Runtime.InteropServices.Marshal]::StructureToPtr($sec.sa, $saPtr, $false)
+        }
+        try {
+            $openMode = [uint32]3
+            if ($UseFirstInstanceFlag -ne 0) { $openMode = [uint32]($openMode -bor 0x00080000) }
+            $handle = [HypervMcp.Uia.Native]::CreateNamedPipeW(('\\.\pipe\' + $PipeName), $openMode, [uint32]8, [uint32]$PipeInstanceCount, [uint32]65536, [uint32]65536, [uint32]0, $saPtr)
+        } finally {
+            if ($saPtr -ne [IntPtr]::Zero) { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($saPtr) }
+        }
+    } catch {
+        $handle = [IntPtr](-1)
+    } finally {
+        Free-SecurityAttributes $sec
+    }
+    return $handle
+}
+
+function ConvertTo-HashtableDeep($Value) {
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $table = @{}
+        foreach ($prop in $Value.PSObject.Properties) { $table[$prop.Name] = ConvertTo-HashtableDeep $prop.Value }
+        return $table
+    }
+    if ($Value -is [System.Array]) {
+        $mapped = @()
+        foreach ($item in $Value) { $mapped += ,(ConvertTo-HashtableDeep $item) }
+        return ,@($mapped)
+    }
+    return $Value
+}
+
+function Get-ElementProcessName($el) {
+    # The element's owning process name, lowercase, '.exe' stripped;
+    # $null when the process is gone or the property is unreadable.
+    # Only successes are cached.
+    try { $procId = [int]$el.Current.ProcessId } catch { return $null }
+    if (-not $global:ProcNameCache) { $global:ProcNameCache = @{} }
+    if ($global:ProcNameCache.ContainsKey($procId)) { return $global:ProcNameCache[$procId] }
+    $name = $null
+    try { $name = (Get-Process -Id $procId -ErrorAction Stop).ProcessName.ToLowerInvariant() } catch { $name = $null }
+    if ($null -ne $name) { $global:ProcNameCache[$procId] = $name }
+    return $name
+}
+
 function ConvertTo-Condition([hashtable]$selector) {
+    # PropertyConditions for the direct property selectors. Returns
+    # @{ resolvable = $bool; conditions = <array> }: resolvable $false
+    # means a control_type could not be resolved and the caller yields
+    # NO MATCH - never everything. (An EMPTY array must not be returned
+    # bare: PowerShell collapses it to $null across the call boundary.)
     $conditions = @()
     $direct = @{
         automation_id = [System.Windows.Automation.AutomationElement]::AutomationIdProperty
         name = [System.Windows.Automation.AutomationElement]::NameProperty
-        control_type = $null
         class_name = [System.Windows.Automation.AutomationElement]::ClassNameProperty
     }
     foreach ($key in $direct.Keys) {
-        if ($null -ne $selector[$key] -and $null -ne $direct[$key]) {
-            $conditions += (New-Object System.Windows.Automation.PropertyCondition($direct[$key], $selector[$key]))
+        if ($null -ne $selector[$key] -and ([string]$selector[$key]) -ne '') {
+            $conditions += (New-Object System.Windows.Automation.PropertyCondition($direct[$key], [string]$selector[$key]))
         }
     }
-    if ($null -ne $selector['control_type']) {
-        $ct = [System.Windows.Automation.ControlType]::LookupById([string]$selector['control_type'])
-        if ($null -eq $ct) {
-            $ct = [System.Windows.Automation.ControlType]::$($selector['control_type'])
+    if ($null -ne $selector['control_type'] -and ([string]$selector['control_type']) -ne '') {
+        $raw = [string]$selector['control_type']
+        $ct = $null
+        # Resolve a NAME via the static member; LookupById takes Int32
+        # and throws on a string, so the numeric id is the fallback only.
+        try { $ct = [System.Windows.Automation.ControlType]::$raw } catch { $ct = $null }
+        if ($null -eq $ct -and $raw -match '^[0-9]+$') {
+            try { $ct = [System.Windows.Automation.ControlType]::LookupById([int]$raw) } catch { $ct = $null }
         }
+        if ($null -eq $ct) { return @{ resolvable = $false; conditions = @() } }
         $conditions += (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ct))
     }
-    return $conditions
+    return @{ resolvable = $true; conditions = $conditions }
 }
 
 function Find-WindowScope([hashtable]$selector) {
+    # The element the search is scoped under: an hwnd, or the first
+    # top-level window whose Name equals window_title. $null when an
+    # explicit scope matched NOTHING (the whole selector then yields no
+    # match - never the desktop root as a fake scope).
     $root = [System.Windows.Automation.AutomationElement]::RootElement
-    $scopeCondition = $null
     if ($null -ne $selector['hwnd']) {
-        $byHandle = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr][long]$selector['hwnd'])
-        if ($null -ne $byHandle) { return $byHandle }
+        try {
+            $byHandle = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr][long]$selector['hwnd'])
+            if ($null -ne $byHandle) { return $byHandle }
+        } catch { }
+        return $null
     }
-    $conditions = @()
     if ($selector['window_title']) {
-        $conditions += (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, [string]$selector['window_title']))
-    }
-    if ($conditions.Count -gt 0) {
-        $and = New-Object System.Windows.Automation.AndCondition($conditions)
-        $found = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $and)
-        foreach ($f in $found) { return $f }
+        $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, [string]$selector['window_title'])
+        $found = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)
+        if ($null -ne $found -and $found.Count -gt 0) { return $found[0] }
+        return $null
     }
     return $root
 }
 
 function Resolve-Target([hashtable]$selector) {
-    $scope = Find-WindowScope $selector
-    $conditions = ConvertTo-Condition $selector
-    if ($null -ne $selector['name_contains']) {
-        $matches1 = @()
-        $all = $scope.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-        foreach ($el in $all) {
-            try {
-                if ($el.Current.Name -like ("*" + $selector['name_contains'] + "*")) { $matches1 += $el }
-            } catch { }
-            if ($matches1.Count -ge $MaxMatches) { break }
-        }
-        return $matches1
-    }
-    if ($conditions.Count -eq 0) {
-        $walker = @($scope)
-        return $walker
-    }
-    $and = New-Object System.Windows.Automation.AndCondition($conditions)
-    $found = $scope.FindAll([System.Windows.Automation.TreeScope]::Descendants, $and)
+    # Returns the matched elements (an array, possibly empty). An absent
+    # selector, an unresolvable condition, or nothing matching yields NO
+    # MATCH - never the desktop root element. name_contains is a literal
+    # case-insensitive substring and applies TOGETHER with the other
+    # conditions; process_name matches the owning process by name.
     $list = @()
-    foreach ($el in $found) { $list += $el; if ($list.Count -ge $MaxMatches) { break } }
+    $root = [System.Windows.Automation.AutomationElement]::RootElement
+    if ($null -eq $selector) { return $list }
+    $scope = Find-WindowScope $selector
+    if ($null -eq $scope) { return $list }
+    $condResult = ConvertTo-Condition $selector
+    if ($null -ne $condResult -and -not $condResult.resolvable) { return $list }
+    $conditions = @()
+    if ($null -ne $condResult) { $conditions = @($condResult.conditions) }
+    $nameNeedle = $null
+    if ($null -ne $selector['name_contains'] -and ([string]$selector['name_contains']) -ne '') { $nameNeedle = [string]$selector['name_contains'] }
+    $procNeedle = $null
+    if ($null -ne $selector['process_name'] -and ([string]$selector['process_name']) -ne '') {
+        $procNeedle = ([string]$selector['process_name']).Trim().ToLowerInvariant() -replace '\.exe$', ''
+    }
+    if ($conditions.Count -eq 0 -and $null -eq $nameNeedle -and $null -eq $procNeedle) {
+        # No match condition at all: only an explicitly scoped window
+        # (hwnd / window_title) is itself a match.
+        if (-not [object]::ReferenceEquals($scope, $root)) { $list += $scope }
+        return $list
+    }
+    $cond = [System.Windows.Automation.Condition]::TrueCondition
+    if ($conditions.Count -eq 1) {
+        # AndCondition requires at least two conditions.
+        $cond = $conditions[0]
+    } elseif ($conditions.Count -gt 1) {
+        $cond = New-Object System.Windows.Automation.AndCondition($conditions)
+    }
+    $found = $scope.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+    foreach ($el in $found) {
+        if ($list.Count -ge $MaxMatches) { break }
+        if ($null -ne $nameNeedle) {
+            $nm = $null
+            try { $nm = [string]$el.Current.Name } catch { $nm = $null }
+            if ($null -eq $nm) { continue }
+            if ($nm.IndexOf($nameNeedle, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        }
+        if ($null -ne $procNeedle) {
+            $pn = Get-ElementProcessName $el
+            if ($null -eq $pn -or $pn -ne $procNeedle) { continue }
+        }
+        $list += $el
+    }
     return $list
 }
 
@@ -221,6 +445,14 @@ function Get-ElementResult($el) {
     try { $r = $el.Current.BoundingRectangle; $rect = '{0},{1},{2},{3}' -f [int]$r.X, [int]$r.Y, [int]$r.Width, [int]$r.Height } catch { }
     $runtimeId = @()
     try { $runtimeId = @($el.GetRuntimeId()) } catch { }
+    $focusable = $false
+    try { $focusable = [bool]$el.Current.IsKeyboardFocusable } catch { $focusable = $false }
+    $offscreen = $false
+    try { $offscreen = [bool]$el.Current.IsOffscreen } catch { $offscreen = $false }
+    $patterns = @()
+    try {
+        $patterns = @($el.GetSupportedPatterns() | ForEach-Object { (($_.ProgrammaticName -replace 'Identifiers\.Pattern$', '') -replace 'Pattern$', '') })
+    } catch { $patterns = @() }
     @{
         element_id = ($runtimeId -join ':')
         name = [string]$el.Current.Name
@@ -228,25 +460,52 @@ function Get-ElementResult($el) {
         automation_id = [string]$el.Current.AutomationId
         class_name = [string]$el.Current.ClassName
         enabled = [bool]$el.Current.IsEnabled
+        keyboard_focusable = $focusable
+        offscreen = $offscreen
+        patterns = $patterns
         rect = $rect
     }
 }
 
-function Invoke-Pattern($el, $automationPattern, [string]$action, [object]$argument) {
+function Walk-Tree($el, $d, $cap, [ref]$seen) {
+    if ($seen.Value -ge $cap -or $d -lt 0) { return $null }
+    $seen.Value = $seen.Value + 1
+    $node = Get-ElementResult $el
+    $children = New-Object System.Collections.Generic.List[object]
+    if ($d -gt 0) {
+        $kids = $null
+        try { $kids = $el.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition) } catch { $kids = $null }
+        if ($null -ne $kids) {
+            foreach ($k in $kids) {
+                if ($seen.Value -ge $cap) { break }
+                $child = Walk-Tree $k ($d - 1) $cap $seen
+                if ($null -ne $child) { [void]$children.Add($child) }
+            }
+        }
+    }
+    # NB: '@()' around a List[object] throws on PS 5.1 (build-dependent
+    # "Argument types do not match") - the bracket setter plus ToArray()
+    # is the safe shape.
+    $node['children'] = $children.ToArray()
+    return $node
+}
+
+function Invoke-Pattern($el, $automationPattern, [string]$action, $argument) {
+    $pattern = $null
+    try { $pattern = $el.GetCurrentPattern($automationPattern) } catch { return $null }
+    if ($null -eq $pattern) { return $null }
     try {
-        $pattern = $el.GetCurrentPattern($automationPattern)
+        switch ($action) {
+            'invoke' { [void]$pattern.Invoke() }
+            'toggle' { [void]$pattern.Toggle() }
+            'select' { [void]$pattern.Select() }
+            'expand' { [void]$pattern.Expand() }
+            'collapse' { [void]$pattern.Collapse() }
+            'setvalue' { $pattern.SetValue([string]$argument) }
+            default { return $null }
+        }
     } catch {
         return $null
-    }
-    switch ($action) {
-        'invoke' { $pattern.Invoke(); break }
-        'toggle' { $pattern.Toggle(); break }
-        'select' { $pattern.Select(); break }
-        'expand' { $pattern.Expand(); break }
-        'collapse' { $pattern.Collapse(); break }
-        'setvalue' { $pattern.SetValue([string]$argument); break }
-        'focus' { $pattern.SetFocus(); break }
-        default { return $null }
     }
     return $true
 }
@@ -254,23 +513,52 @@ function Invoke-Pattern($el, $automationPattern, [string]$action, [object]$argum
 function Invoke-Request([hashtable]$req) {
     $verb = [string]$req['verb']
 
+    # version.txt is the ONLY source of the helper's version.
+    if ([string]::IsNullOrEmpty($HelperVersion)) {
+        return @{ ok = $false; error_class = 'helper_version_unknown'; error = 'version.txt is missing or unreadable in the helper directory; the helper refuses to serve' }
+    }
+
+    # The nonce check runs BEFORE any dispatch: the request must carry
+    # the per-install nonce verbatim. A missing nonce.txt also lands
+    # here (fail closed on the install dimension).
+    if ([string]::IsNullOrEmpty($ownNonce) -or -not $req.ContainsKey('nonce') -or $null -eq $req['nonce'] -or ([string]$req['nonce']).Trim() -ne $ownNonce) {
+        return @{ ok = $false; error_class = 'nonce_mismatch'; error = 'the request nonce does not match this install (nonce.txt)' }
+    }
+
     if ($req.ContainsKey('min_version') -and $null -ne $req['min_version'] -and ([string]$req['min_version']) -ne $HelperVersion) {
         return @{ ok = $false; error_class = 'helper_version_mismatch'; error = "helper version $HelperVersion cannot serve min_version $($req['min_version'])" }
     }
 
     $target = $req['target']
-    if ($null -eq $target) {
+    if ($null -eq $target -or $target -isnot [hashtable]) {
         return @{ ok = $false; error_class = 'session_unverified'; error = 'the request carries no target' }
     }
-    $own = Get-OwnIdentity
-    if ($own.vm_guid -and $target['vm_guid'] -and ([string]$target['vm_guid']).ToLowerInvariant() -ne $own.vm_guid) {
-        return @{ ok = $false; error_class = 'target_mismatch'; error = "the request targets VM $($target['vm_guid']) but this helper runs in VM $($own.vm_guid)" }
+
+    # The VM-identity dimension speaks the RECORDED SMBIOS UUID (the
+    # host records it at provision time and echoes it in target.vm_guid)
+    # and FAILS CLOSED: a missing uuid.txt, a mismatched request value,
+    # or a live SMBIOS UUID that differs from the recording all refuse.
+    if ([string]::IsNullOrEmpty($recordedUuid)) {
+        return @{ ok = $false; error_class = 'target_mismatch'; error = 'the recorded VM identity (uuid.txt) is missing; the helper refuses fail closed' }
     }
-    if ($target['user_sid'] -and ([string]$target['user_sid']) -ne $own.sid) {
-        return @{ ok = $false; error_class = 'target_mismatch'; error = "the request targets user $($target['user_sid']) but this helper runs as $($own.sid)" }
+    $reqGuid = ''
+    if ($null -ne $target['vm_guid']) { $reqGuid = ([string]$target['vm_guid']).Trim().ToLowerInvariant() }
+    if ($reqGuid -ne $recordedUuid) {
+        return @{ ok = $false; error_class = 'target_mismatch'; error = 'the request targets a different VM identity than this helper was provisioned for' }
     }
-    if ($null -eq $target['session_id'] -or [int]$target['session_id'] -ne $own.session_id) {
-        return @{ ok = $false; error_class = 'session_unverified'; error = "the request does not carry this helper's interactive session ($($own.session_id))" }
+    $liveUuid = Get-LiveUuid
+    if ([string]::IsNullOrEmpty($liveUuid) -or $liveUuid -ne $recordedUuid) {
+        return @{ ok = $false; error_class = 'target_mismatch'; error = 'the live SMBIOS UUID does not match the recorded identity; the helper refuses fail closed' }
+    }
+
+    if ($null -ne $target['user_sid'] -and ([string]$target['user_sid']) -ne $identity.sid) {
+        return @{ ok = $false; error_class = 'target_mismatch'; error = "the request targets user $($target['user_sid']) but this helper runs as $($identity.sid)" }
+    }
+
+    # The session dimension must be CONCRETE and equal to this helper's
+    # own session for EVERY verb, reads included.
+    if ($null -eq $target['session_id'] -or ([int]$target['session_id']) -ne $identity.session_id) {
+        return @{ ok = $false; error_class = 'session_unverified'; error = "the request does not carry this helper's interactive session ($($identity.session_id))" }
     }
 
     $locked = Get-LockState
@@ -279,8 +567,8 @@ function Invoke-Request([hashtable]$req) {
         return @{
             ok = $true
             result = @{
-                active_session_id = $own.session_id
-                interactive_user = $own.user
+                active_session_id = $identity.session_id
+                interactive_user = $identity.user
                 locked = $locked
                 foreground_window = (Get-ForegroundWindow)
             }
@@ -288,50 +576,52 @@ function Invoke-Request([hashtable]$req) {
     }
 
     $selector = $req['selector']
-    if ($null -eq $selector -and $req.ContainsKey('args') -and $null -ne $req['args']) {
+    if ($null -eq $selector -and $req.ContainsKey('args') -and $null -ne $req['args'] -and $req['args'] -is [hashtable]) {
         $selector = $req['args']['selector']
     }
+    if ($null -ne $selector -and $selector -isnot [hashtable]) { $selector = $null }
 
     if ($verb -eq 'inspect') {
         $depth = 3; $cap = 200
-        if ($null -ne $req['args']) {
+        if ($null -ne $req['args'] -and $req['args'] -is [hashtable]) {
             if ($null -ne $req['args']['depth']) { $depth = [Math]::Min([int]$req['args']['depth'], $MaxDepth) }
             if ($null -ne $req['args']['max_elements']) { $cap = [Math]::Min([int]$req['args']['max_elements'], $MaxElements) }
         }
-        $script:seen = 0
-        $script:cap = $cap
-        $root = [System.Windows.Automation.AutomationElement]::RootElement
-        function Walk($el, $d) {
-            if ($script:seen -ge $script:cap -or $d -lt 0) { return $null }
-            $script:seen++
-            $node = Get-ElementResult $el
-            $node.children = @()
-            if ($d -gt 0) {
-                $kids = $el.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
-                foreach ($k in $kids) {
-                    if ($script:seen -ge $script:cap) { break }
-                    $child = Walk $k ($d - 1)
-                    if ($null -ne $child) { $node.children += $child }
-                }
+        # inspect HONOURS the selector it is given: the walk is scoped to
+        # the matched element; no match (or an ambiguous one) yields an
+        # empty tree, never a walk of the whole desktop by accident.
+        $startEl = [System.Windows.Automation.AutomationElement]::RootElement
+        if ($null -ne $selector) {
+            $elements = @(Resolve-Target $selector)
+            if ($elements.Count -eq 0) {
+                return @{ ok = $true; result = @{ elements = 0; truncated = $false; tree = $null } }
             }
-            $node
+            $one = Select-One $elements $selector
+            if ($null -ne $one -and $one.ambiguous) {
+                return @{ ok = $false; error_class = 'ambiguous_selector'; error = 'the selector matched more than one element'; candidates = $one.candidates }
+            }
+            if ($null -eq $one) {
+                return @{ ok = $true; result = @{ elements = 0; truncated = $false; tree = $null } }
+            }
+            $startEl = $one
         }
-        $tree = Walk $root $depth
-        return @{ ok = $true; result = @{ elements = $script:seen; truncated = ($script:seen -ge $script:cap); tree = $tree } }
+        $seen = 0
+        $tree = Walk-Tree $startEl $depth $cap ([ref]$seen)
+        return @{ ok = $true; result = @{ elements = $seen; truncated = ($seen -ge $cap); tree = $tree } }
     }
 
     if ($verb -eq 'find' -or $verb -eq 'wait_for') {
-        $elements = Resolve-Target $selector
+        $elements = @(Resolve-Target $selector)
         if ($verb -eq 'wait_for') {
             $argsPair = $req['args']
             $gone = $false; $budget = 30
-            if ($null -ne $argsPair) {
+            if ($null -ne $argsPair -and $argsPair -is [hashtable]) {
                 if ($null -ne $argsPair['gone']) { $gone = [bool]$argsPair['gone'] }
                 if ($null -ne $argsPair['timeout_s']) { $budget = [Math]::Min([int]$argsPair['timeout_s'], 120) }
             }
             $deadline = [DateTime]::UtcNow.AddSeconds($budget)
             while ([DateTime]::UtcNow -lt $deadline) {
-                $elements = Resolve-Target $selector
+                $elements = @(Resolve-Target $selector)
                 $present = ($null -ne $elements -and $elements.Count -gt 0)
                 if ($gone -and -not $present) { return @{ ok = $true; result = @{ gone = $true } } }
                 if (-not $gone -and $present) { break }
@@ -365,7 +655,7 @@ function Invoke-Request([hashtable]$req) {
 
     $elementIdWanted = $null
     if ($req.ContainsKey('element_id')) { $elementIdWanted = [string]$req['element_id'] }
-    elseif ($null -ne $req['args'] -and $null -ne $req['args']['element_id']) { $elementIdWanted = [string]$req['args']['element_id'] }
+    elseif ($null -ne $req['args'] -and $req['args'] -is [hashtable] -and $null -ne $req['args']['element_id']) { $elementIdWanted = [string]$req['args']['element_id'] }
 
     $el = $null
     if ($elementIdWanted) {
@@ -379,7 +669,7 @@ function Invoke-Request([hashtable]$req) {
             return @{ ok = $false; error_class = 'element_not_found'; error = "no live element matches element_id $elementIdWanted" }
         }
     } else {
-        $elements = Resolve-Target $selector
+        $elements = @(Resolve-Target $selector)
         $one = Select-One $elements $selector
         if ($null -ne $one -and $one.ambiguous) {
             return @{ ok = $false; error_class = 'ambiguous_selector'; error = 'the selector matched more than one element'; candidates = $one.candidates }
@@ -390,31 +680,32 @@ function Invoke-Request([hashtable]$req) {
         }
     }
 
-    if ($verb -eq 'focus') {
+    # Every mutating verb consults the lock state: the console can still
+    # drive a locked Default desktop, so mutating silently would be wrong.
+    if ($verb -eq 'focus' -or $verb -eq 'invoke' -or $verb -eq 'set_value') {
         if ($locked -or -not (Test-OwnsInputDesktop)) {
-            return @{ ok = $false; error_class = 'no_interactive_desktop'; error = 'the session is locked; focus needs the interactive desktop' }
+            return @{ ok = $false; error_class = 'no_interactive_desktop'; error = 'the session is locked; this verb needs the interactive desktop' }
         }
-        $done = Invoke-Pattern $el ([System.Windows.Automation.AutomationElement]::Equals($null, $null)) 'none' $null
-        $hWnd = [IntPtr]::Zero
+    }
+
+    if ($verb -eq 'focus') {
+        # VERIFY the focus instead of asserting it, and report whether the
+        # best-effort window raise succeeded rather than discarding it.
+        try { $el.SetFocus() } catch { }
+        $focused = $false
+        try { $focused = [bool]$el.Current.HasKeyboardFocus } catch { $focused = $false }
+        $raised = $false
         try {
-            $el.SetFocus()
-            $hwndProp = $el.Current.NativeWindowHandle
-            if ($hwndProp -ne 0 -and $hwndProp -ne [IntPtr]::Zero) { $hWnd = $hwndProp }
-        } catch {
-            return @{ ok = $false; error_class = 'unsupported_capability'; error = 'the element exposes no focus-capable pattern' }
-        }
-        if ($hWnd -ne [IntPtr]::Zero) {
-            # Best-effort raise: a locked/background desktop may refuse; the
-            # element already has focus, so this stays a silent no-op then.
-            [void][HypervMcp.Uia.Native]::SetForegroundWindow($hWnd)
-        }
-        return @{ ok = $true; result = @{ focused = $true } }
+            $hWnd = [IntPtr]$el.Current.NativeWindowHandle
+            if ($hWnd -ne [IntPtr]::Zero) { $raised = [bool][HypervMcp.Uia.Native]::SetForegroundWindow($hWnd) }
+        } catch { $raised = $false }
+        return @{ ok = $true; result = @{ focused = $focused; raised = $raised } }
     }
 
     if ($verb -eq 'set_value') {
         $value = $null
         if ($req.ContainsKey('value')) { $value = $req['value'] }
-        elseif ($null -ne $req['args']) { $value = $req['args']['value'] }
+        elseif ($null -ne $req['args'] -and $req['args'] -is [hashtable]) { $value = $req['args']['value'] }
         if ($null -eq $value) {
             return @{ ok = $false; error_class = 'invalid_request'; error = 'set_value requires a value' }
         }
@@ -422,99 +713,224 @@ function Invoke-Request([hashtable]$req) {
         if ($text.Length -gt $MaxValueChars) {
             return @{ ok = $false; error_class = 'invalid_request'; error = 'the value exceeds the 64 KiB bound' }
         }
-        $done = Invoke-Pattern $el ([System.Windows.Automation.ValuePattern]::Pattern) 'setvalue' $text
-        if ($null -eq $done) {
+        $fired = $null
+        if ($null -ne (Invoke-Pattern $el ([System.Windows.Automation.ValuePattern]::Pattern) 'setvalue' $text)) {
+            $fired = 'Value'
+        } else {
             # msaa bridge: the UIA MSAA proxy exposes LegacyIAccessiblePattern
             # for legacy/VB-style controls that carry no UIA Value pattern.
             $legacy = $null
             try { $legacy = $el.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern) } catch { $legacy = $null }
             if ($null -ne $legacy) {
-                try { $legacy.SetValue($text); $done = $true } catch { $done = $null }
+                try { $legacy.SetValue($text); $fired = 'LegacyIAccessible' } catch { $fired = $null }
             }
         }
-        if ($null -eq $done) {
+        if ($null -eq $fired) {
             return @{ ok = $false; error_class = 'unsupported_capability'; error = 'the element exposes no ValuePattern or the msaa LegacyIAccessible bridge' }
         }
-        return @{ ok = $true; result = @{ length = $text.Length; length_set = $text.Length } }
+        return @{ ok = $true; result = @{ length = $text.Length; length_set = $text.Length; pattern = $fired } }
     }
 
     if ($verb -eq 'invoke') {
-        $done = Invoke-Pattern $el ([System.Windows.Automation.InvokePattern]::Pattern) 'invoke' $null
-        if ($null -eq $done) { $done = Invoke-Pattern $el ([System.Windows.Automation.TogglePattern]::Pattern) 'toggle' $null }
-        if ($null -eq $done) { $done = Invoke-Pattern $el ([System.Windows.Automation.SelectionItemPattern]::Pattern) 'select' $null }
-        if ($null -eq $done) { $done = Invoke-Pattern $el ([System.Windows.Automation.ExpandCollapsePattern]::Pattern) 'expand' $null }
-        if ($null -eq $done) {
-            return @{ ok = $false; error_class = 'unsupported_capability'; error = 'the element exposes no InvokePattern' }
+        # Report WHICH pattern fired; the unsupported refusal names every
+        # pattern that was tried (the msaa LegacyIAccessible bridge rides
+        # here too, via DoDefaultAction).
+        $fired = $null
+        if ($null -ne (Invoke-Pattern $el ([System.Windows.Automation.InvokePattern]::Pattern) 'invoke' $null)) { $fired = 'Invoke' }
+        if ($null -eq $fired -and $null -ne (Invoke-Pattern $el ([System.Windows.Automation.TogglePattern]::Pattern) 'toggle' $null)) { $fired = 'Toggle' }
+        if ($null -eq $fired -and $null -ne (Invoke-Pattern $el ([System.Windows.Automation.SelectionItemPattern]::Pattern) 'select' $null)) { $fired = 'SelectionItem' }
+        if ($null -eq $fired -and $null -ne (Invoke-Pattern $el ([System.Windows.Automation.ExpandCollapsePattern]::Pattern) 'expand' $null)) { $fired = 'ExpandCollapse' }
+        if ($null -eq $fired) {
+            $legacy = $null
+            try { $legacy = $el.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern) } catch { $legacy = $null }
+            if ($null -ne $legacy) {
+                try { $legacy.DoDefaultAction(); $fired = 'LegacyIAccessible' } catch { $fired = $null }
+            }
         }
-        return @{ ok = $true; result = @{ invoked = $true } }
+        if ($null -eq $fired) {
+            return @{ ok = $false; error_class = 'unsupported_capability'; error = 'the element exposes none of the tried patterns: Invoke, Toggle, SelectionItem, ExpandCollapse, LegacyIAccessible (msaa bridge)' }
+        }
+        return @{ ok = $true; result = @{ invoked = $true; pattern = $fired } }
     }
 
     return @{ ok = $false; error_class = 'invalid_request'; error = "unknown verb $verb" }
 }
 
+# ---------------------------------------------------------------------------
+# startup: identity, provisioned files, self hash, then the serve loop
+# ---------------------------------------------------------------------------
+
+$HelperVersion = Read-HelperFile 'version.txt'
+if ($null -eq $HelperVersion) { $HelperVersion = '' }
+$ownNonce = Read-HelperFile 'nonce.txt'
+if ($null -eq $ownNonce) { $ownNonce = '' }
+$recordedUuid = Read-HelperFile 'uuid.txt'
+if ($null -eq $recordedUuid -or $recordedUuid -eq '') { $recordedUuid = '' } else { $recordedUuid = $recordedUuid.ToLowerInvariant() }
 $identity = Get-OwnIdentity
-$nonceFile = Join-Path $HelperDir 'nonce.txt'
 $capabilities = @('uia', 'msaa')
-$ownNonce = ''
-if (Test-Path $nonceFile) { $ownNonce = (Get-Content $nonceFile -TotalCount 1) -as [string] }
-$pipeSecurity = New-PipeSecurity
-# The shipped script's SHA-256, reported so an operator can compare the
-# running helper against the package data that was provisioned.
 $ownSha256 = ''
 try {
     $selfPath = $MyInvocation.MyCommand.Path
-    if (-not $selfPath) { $selfPath = Join-Path $HelperDir 'uia_helper.ps1' }
-    $ownSha256 = [BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($selfPath))) -replace '-', ''
+    if (-not $selfPath -and $HelperDir) { $selfPath = Join-Path $HelperDir 'uia_helper.ps1' }
+    if ($selfPath) {
+        $ownSha256 = [BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($selfPath))) -replace '-', ''
+    }
 } catch { $ownSha256 = '' }
+
+# The pipe DACL: GENERIC_ALL for LOCAL_SYSTEM, BUILTIN\Administrators and
+# the running user (the existing New-PipeSecurity intent), expressed as
+# SDDL for the native path with the .NET ACL as fallback.
+$PipeSddl = 'D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;' + $identity.sid + ')'
+
 function Get-SessionBlock {
     # Lock state is computed per RESPONSE: a session locked after this
-    # helper started must be reported locked on every answer.
+    # helper started must be reported locked on every answer. The nonce
+    # deliberately does NOT appear here (minimization).
     return @{
         session_id = $identity.session_id
         interactive_user = $identity.user
         locked = (Get-LockState)
-        helper = @{ running = $true; version = $HelperVersion; capabilities = $capabilities; nonce = $ownNonce; sha256 = $ownSha256 }
+        helper = @{ running = $true; version = $HelperVersion; capabilities = $capabilities; sha256 = $ownSha256 }
     }
 }
 
+# One serve loop per pipe instance, each on its own runspace so several
+# clients can be handled concurrently. The loop body never leaves the
+# client hanging: on every failure path the instance is disconnected,
+# closed and recreated, and a persistent failure sleeps 250 ms per
+# attempt so it cannot hot-spin (the helper writes no logs).
+$workerScript = @'
+param([IntPtr]$Handle)
+$serve = $Handle
 while ($true) {
-    $pipe = New-Object System.IO.Pipes.NamedPipeServerStream(
-        $PipeName,
-        [System.IO.Pipes.PipeDirection]::InOut,
-        1,
-        [System.IO.Pipes.PipeTransmissionMode]::Byte,
-        # 0xC = Asynchronous (0x4) | 0x8 = PIPE_REJECT_REMOTE_CLIENTS (the
-        # .NET Framework 4.x enum does not name the flag; CreateNamedPipe
-        # honors the raw value).
-        [System.IO.Pipes.PipeOptions]0xC,
-        0, 0, $pipeSecurity)
+    $handle = $serve
     try {
-        $pipe.WaitForConnection()
-        $reader = New-Object System.IO.StreamReader($pipe)
-        $writer = New-Object System.IO.StreamWriter($pipe)
-        $writer.AutoFlush = $true
-        $line = $reader.ReadLine()
-        if ($line) {
+        if ($handle -eq [IntPtr]::Zero -or $handle.ToInt64() -eq -1) { throw 'invalid pipe handle' }
+        $connected = [HypervMcp.Uia.Native]::ConnectNamedPipe($handle, [IntPtr]::Zero)
+        if (-not $connected) {
+            $cerr = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            if ($cerr -ne 535) { throw "ConnectNamedPipe error $cerr" }
+        }
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($RequestTimeoutMs)
+        $acc = New-Object System.Collections.Generic.List[byte]
+        $buf = New-Object byte[] 4096
+        $line = $null
+        while ($null -eq $line) {
+            if ([DateTime]::UtcNow -ge $deadline) { break }
+            $read = [uint32]0; $avail = [uint32]0; $left = [uint32]0
+            if (-not [HypervMcp.Uia.Native]::PeekNamedPipe($handle, [IntPtr]::Zero, 0, [ref]$read, [ref]$avail, [ref]$left)) { break }
+            if ($avail -eq 0) { Start-Sleep -Milliseconds 50; continue }
+            $want = [uint32][Math]::Min([int]$avail, $buf.Length)
+            $got = [uint32]0
+            if (-not [HypervMcp.Uia.Native]::ReadFile($handle, $buf, $want, [ref]$got, [IntPtr]::Zero)) { break }
+            if ($got -eq 0) { break }
+            for ($i = 0; $i -lt $got; $i++) {
+                if ($buf[$i] -eq 10) { $line = [System.Text.Encoding]::UTF8.GetString($acc.ToArray()); break }
+                [void]$acc.Add($buf[$i])
+            }
+            if ($acc.Count -gt $MaxRequestBytes) { break }
+        }
+        if ($null -ne $line) {
+            $line = $line.TrimEnd("`r")
             $response = $null
             $requestId = ''
             try {
-                $request = $line | ConvertFrom-Json
-                $requestId = [string]$request.id
-                $hashtable = @{}
-                foreach ($prop in $request.PSObject.Properties) { $hashtable[$prop.Name] = $prop.Value }
-                $response = Invoke-Request $hashtable
+                $req = ConvertTo-HashtableDeep ($line | ConvertFrom-Json)
+                if ($req -isnot [hashtable]) { $req = @{} }
+                if ($req.ContainsKey('id')) { $requestId = [string]$req['id'] }
+                $response = Invoke-Request $req
             } catch {
                 $response = @{ ok = $false; error_class = 'helper_error'; error = $_.Exception.Message }
             }
-            $response.id = $requestId
-            $response.session = Get-SessionBlock
-            $writer.WriteLine(($response | ConvertTo-Json -Compress -Depth 8))
+            if ($null -eq $response) { $response = @{ ok = $false; error_class = 'helper_error'; error = 'the verb produced no response' } }
+            try { $response.id = $requestId } catch { }
+            try { $response.session = Get-SessionBlock } catch { }
+            $json = ''
+            try { $json = ($response | ConvertTo-Json -Compress -Depth 16) } catch { $json = '{"id":"","ok":false,"error_class":"helper_error","error":"response serialization failed"}' }
+            $payload = [System.Text.Encoding]::UTF8.GetBytes($json + "`n")
+            $written = [uint32]0
+            [void][HypervMcp.Uia.Native]::WriteFile($handle, $payload, [uint32]$payload.Length, [ref]$written, [IntPtr]::Zero)
         }
     } catch {
-        # A broken pipe (client vanished, session ending) loops or exits.
-        if (-not $pipe.IsConnected) { }
+        Start-Sleep -Milliseconds 250
     } finally {
-        try { $pipe.Disconnect() } catch { }
-        $pipe.Dispose()
+        if ($handle -ne [IntPtr]::Zero -and $handle.ToInt64() -ne -1) {
+            try { [void][HypervMcp.Uia.Native]::DisconnectNamedPipe($handle) } catch { }
+            try { [void][HypervMcp.Uia.Native]::CloseHandle($handle) } catch { }
+        }
+    }
+    $next = [IntPtr](-1)
+    try { $next = New-PipeInstance 0 } catch { $next = [IntPtr](-1) }
+    while ($next.ToInt64() -eq -1) {
+        Start-Sleep -Milliseconds 250
+        try { $next = New-PipeInstance 0 } catch { $next = [IntPtr](-1) }
+    }
+    $serve = $next
+}
+'@
+
+$functionNames = @(
+    'Read-HelperFile', 'Get-OwnIdentity', 'Get-LiveUuid', 'Test-OwnsInputDesktop',
+    'Get-LockState', 'Get-ForegroundWindow', 'New-PipeSecurity', 'New-SecurityAttributes',
+    'Free-SecurityAttributes', 'New-PipeInstance', 'ConvertTo-HashtableDeep',
+    'Get-ElementProcessName', 'ConvertTo-Condition', 'Find-WindowScope', 'Resolve-Target',
+    'Select-One', 'Get-ElementResult', 'Walk-Tree', 'Invoke-Pattern', 'Invoke-Request',
+    'Get-SessionBlock'
+)
+$sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+foreach ($name in $functionNames) {
+    $cmd = Get-Command -Name $name -CommandType Function -ErrorAction SilentlyContinue
+    if ($null -ne $cmd) {
+        $sessionState.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($name, $cmd.Definition)))
     }
 }
+$sessionVariables = @{
+    HelperDir = $HelperDir
+    HelperVersion = $HelperVersion
+    ownNonce = $ownNonce
+    recordedUuid = $recordedUuid
+    capabilities = $capabilities
+    ownSha256 = $ownSha256
+    identity = $identity
+    PipeName = $PipeName
+    PipeInstanceCount = $PipeInstanceCount
+    MaxDepth = $MaxDepth
+    MaxElements = $MaxElements
+    MaxMatches = $MaxMatches
+    MaxValueChars = $MaxValueChars
+    MaxRequestBytes = $MaxRequestBytes
+    RequestTimeoutMs = $RequestTimeoutMs
+    PipeSddl = $PipeSddl
+}
+foreach ($key in @($sessionVariables.Keys)) {
+    $sessionState.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($key, $sessionVariables[$key], 'helper state')))
+}
+
+# Create the initial instances INSIDE the loop guard: instance 0 carries
+# FILE_FLAG_FIRST_PIPE_INSTANCE (only one creator may hold it; it fails
+# while any other process holds the name, and is retried cold until the
+# previous helper exits); the rest are plain duplex instances.
+$initialHandles = @()
+for ($i = 0; $i -lt $PipeInstanceCount; $i++) {
+    $h = [IntPtr](-1)
+    while ($h.ToInt64() -eq -1) {
+        $h = New-PipeInstance ($i -eq 0)
+        if ($h.ToInt64() -eq -1) { Start-Sleep -Milliseconds 250 }
+    }
+    $initialHandles += $h
+}
+
+$script:Workers = @()
+for ($i = 0; $i -lt $initialHandles.Count; $i++) {
+    $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($sessionState)
+    $runspace.Open()
+    $shell = [System.Management.Automation.PowerShell]::Create()
+    $shell.Runspace = $runspace
+    [void]$shell.AddScript($workerScript).AddArgument($initialHandles[$i])
+    [void]$shell.BeginInvoke()
+    $script:Workers += $shell
+}
+
+# The engine thread only babysits the workers; the task stops the whole
+# process at logoff or teardown.
+while ($true) { Start-Sleep -Seconds 30 }
