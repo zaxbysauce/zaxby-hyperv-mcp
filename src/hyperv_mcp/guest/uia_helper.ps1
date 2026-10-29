@@ -340,8 +340,10 @@ function Invoke-Request([hashtable]$req) {
         }
         if ($req.ContainsKey('element_id') -and $null -ne $req['element_id']) {
             # element_id IS a UIA RuntimeId: resolve the live element by it,
-            # exactly as the mutating path does (an unknown id is
-            # element_not_found, never an empty success).
+            # exactly as the mutating path does. An unresolvable id answers
+            # like a selector no-match (an empty element list), which is
+            # the find verb's contract; the mutating verbs refuse an
+            # unknown id with element_not_found.
             $idWanted = [string]$req['element_id']
             $elements = @()
             $scan = [System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
@@ -456,8 +458,8 @@ $capabilities = @('uia', 'msaa')
 $ownNonce = ''
 if (Test-Path $nonceFile) { $ownNonce = (Get-Content $nonceFile -TotalCount 1) -as [string] }
 $pipeSecurity = New-PipeSecurity
-# The shipped script's SHA-256: the host compares it against the package
-# data it provisioned, so a modified helper is reported, not trusted.
+# The shipped script's SHA-256, reported so an operator can compare the
+# running helper against the package data that was provisioned.
 $ownSha256 = ''
 try {
     $selfPath = $MyInvocation.MyCommand.Path
@@ -474,7 +476,6 @@ function Get-SessionBlock {
         helper = @{ running = $true; version = $HelperVersion; capabilities = $capabilities; nonce = $ownNonce; sha256 = $ownSha256 }
     }
 }
-$session = Get-SessionBlock
 
 while ($true) {
     $pipe = New-Object System.IO.Pipes.NamedPipeServerStream(
