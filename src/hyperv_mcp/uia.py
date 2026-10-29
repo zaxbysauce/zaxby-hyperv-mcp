@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 import uuid
 from typing import Any, cast
 
@@ -60,7 +61,6 @@ _SELECTORS = {
     "automation_id", "name", "name_contains", "control_type", "class_name",
     "window_title", "process_name", "hwnd", "element_id", "index",
 }
-_HELPER_DIR = r"C:\ProgramData\hyperv-mcp\uia-helper"
 
 
 class UiAError(RuntimeError):
@@ -127,6 +127,14 @@ def _check_element_op(selector: Any, element_id: Any) -> None:
 # transport (PowerShell Direct legs)
 # ---------------------------------------------------------------------------
 
+# The leg wrapper needs the VM GUID + credential; the frozen _run_uia_leg
+# seam signature carries no ref, so callers bind them through this slot.
+# THREAD-LOCAL: tool bodies run concurrently on worker threads and the
+# per-VM lock is per-VM, so a module-global would let one VM's leg (and
+# its framed credential payload) compose toward another VM's GUID.
+_LEG = threading.local()
+
+
 def _run_uia_leg(cfg, script: str, *, stdin_b64: str | None = None,
                  timeout_s: int | None = None) -> pswindows.PSResult:
     """The single transport choke point for every UIA host PowerShell leg.
@@ -139,14 +147,14 @@ def _run_uia_leg(cfg, script: str, *, stdin_b64: str | None = None,
     diagnostics.run_guest_inner: the pooled worker's stdin frame protocol
     cannot carry the second framed payload line, and reusing a pooled
     remoting session for pipe relay legs would couple helper liveness to
-    pool lifetime. Callers hold the per-VM lock; this function only
-    transports. The leg's VM GUID is passed through the ``_LEG_GUID`` slot
-    (the frozen seam signature carries no ref).
+    pool lifetime. The leg's VM GUID and credential arrive through the
+    thread-local ``_LEG`` slot (the frozen seam signature carries no ref),
+    so concurrent calls for different VMs never cross.
     """
     if timeout_s is None:
         timeout_s = max(30, (15_000 // 1000) + guestexec._GRACE_S)
     wrapper = _uia_guest_script(
-        script, cast(CredentialSet, _LEG_GUID["cred"]), cfg)
+        script, cast(CredentialSet, _LEG.cred), cfg)
     if pswindows.hyperv_host(cfg):
         body, payload = pswindows.compose_remote(
             cfg, wrapper, payload_lines=2 if stdin_b64 else 0,
@@ -179,7 +187,7 @@ def _uia_guest_script(inner_script: str, cred: CredentialSet,
         guestexec.psdirect_prefix(cred, cfg),
         req_line,
         "$secRaw = $null",
-        guestexec.vm_target_preamble(cast(str, _LEG_GUID["guid"])),
+        guestexec.vm_target_preamble(cast(str, _LEG.guid)),
         "$enc = '" + pswindows.utf8_b64(inner_script) + "'",
         "$out = Invoke-Command -VMId $vmTarget -Credential $cred "
         "-ErrorAction Stop -ScriptBlock {",
@@ -188,13 +196,6 @@ def _uia_guest_script(inner_script: str, cred: CredentialSet,
         "} -ArgumentList $enc, $reqEnc",
         "$out",
     ])
-
-
-# The leg wrapper needs the VM GUID; the frozen _run_uia_leg seam carries no
-# ref, so callers bind it (plus the credential for the prefix) through this
-# slot immediately before each leg. Callers already hold the per-VM lock, so
-# the slot never interleaves across VMs.
-_LEG_GUID: dict[str, object] = {"guid": "", "cred": None}
 
 
 def _frame_leg(cfg, ref, cred: CredentialSet, inner_script: str,
@@ -208,8 +209,8 @@ def _frame_leg(cfg, ref, cred: CredentialSet, inner_script: str,
         pswindows.utf8_b64(cred.password),
         payload_b64,
     ])
-    _LEG_GUID["guid"] = ref.id
-    _LEG_GUID["cred"] = cred
+    _LEG.guid = ref.id
+    _LEG.cred = cred
     return _run_uia_leg(cfg, inner_script, stdin_b64=framed,
                         timeout_s=max(30, timeout_ms // 1000
                                       + guestexec._GRACE_S))
@@ -245,6 +246,7 @@ $helperPath = Join-Path $dir 'uia_helper.ps1'
 $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($helperPath))
 [IO.File]::WriteAllText((Join-Path $dir 'sha256.txt'), ([BitConverter]::ToString($sha) -replace '-',''))
 [IO.File]::WriteAllText((Join-Path $dir 'version.txt'), '""" + HELPER_VERSION + """')
+[IO.File]::WriteAllText((Join-Path $dir 'nonce.txt'), $env:HYPERVMCP_HELPER_NONCE)
 [PSCustomObject]@{ ok = $true; installed = $true; helper_version = '""" + HELPER_VERSION + """' } | ConvertTo-Json -Compress"""
 
 _AUTOLOGON_INNER = """$ErrorActionPreference = 'Stop'
@@ -280,6 +282,7 @@ if ($null -eq $ku) { throw 'the Winlogon key could not be opened for write' }
 try {
     $ku.SetValue('AutoAdminLogon', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
     $ku.SetValue('DefaultUserName', $env:HYPERVMCP_AUTOLOGON_USER, [Microsoft.Win32.RegistryValueKind]::String)
+    $ku.SetValue('DefaultDomainName', $env:COMPUTERNAME, [Microsoft.Win32.RegistryValueKind]::String)
     $ku.DeleteValue('DefaultPassword', $false)
 } finally { $ku.Close() }
 [PSCustomObject]@{ ok = $true; autologon = $true } | ConvertTo-Json -Compress"""
@@ -689,6 +692,9 @@ def _front_door(cfg, vm, cred: CredentialSet, request: dict) -> dict:
         "user_sid": _sid_for(cfg, ref, cred),
         "session_id": None,
     }
+    reg_nonce = (registration or {}).get("nonce") or ""
+    if reg_nonce:
+        request["nonce"] = reg_nonce
     try:
         session_id, _status = _bootstrap_session(cfg, ref, cred)
     except UiAError as exc:
@@ -763,7 +769,8 @@ def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
     if isinstance(helper, dict):
         # Promote the helper facts to top level: evidence's helper gate, the
         # provision probe, and the frozen AC17 shape all read answer["helper"].
-        out["helper"] = {**helper, "running": True}
+        # The frame's own running value is preserved (never forced true).
+        out["helper"] = dict(helper)
     return out
 
 
@@ -923,9 +930,12 @@ def provision_helper(cfg, vm_name="", cred: CredentialSet | None = None,
         )
         dir_line = ("$env:HYPERVMCP_HELPER_DIR = "
                     + pswindows.ps_quote(helper_dir) + "\n")
+        helper_nonce = uuid.uuid4().hex
         install = _frame_leg(
             cfg, ref, cred,
             (dir_line
+             + "$env:HYPERVMCP_HELPER_NONCE = "
+             + pswindows.ps_quote(helper_nonce) + "\n"
              + "$env:HYPERVMCP_AUTOLOGON_USER = "
              + pswindows.ps_quote(cred.username) + "\n" + _INSTALL_INNER),
             helper_b64, timeout_ms=60000)

@@ -339,7 +339,17 @@ function Invoke-Request([hashtable]$req) {
             }
         }
         if ($req.ContainsKey('element_id') -and $null -ne $req['element_id']) {
+            # element_id IS a UIA RuntimeId: resolve the live element by it,
+            # exactly as the mutating path does (an unknown id is
+            # element_not_found, never an empty success).
+            $idWanted = [string]$req['element_id']
             $elements = @()
+            $scan = [System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+            foreach ($candidate in $scan) {
+                $rid = ''
+                try { $rid = (@($candidate.GetRuntimeId()) -join ':') } catch { }
+                if ($rid -eq $idWanted) { $elements = @($candidate); break }
+            }
         }
         if ($null -eq $elements -or $elements.Count -eq 0) {
             return @{ ok = $true; result = @{ elements = @() } }
@@ -383,8 +393,18 @@ function Invoke-Request([hashtable]$req) {
             return @{ ok = $false; error_class = 'no_interactive_desktop'; error = 'the session is locked; focus needs the interactive desktop' }
         }
         $done = Invoke-Pattern $el ([System.Windows.Automation.AutomationElement]::Equals($null, $null)) 'none' $null
-        try { $el.SetFocus() } catch {
+        $hWnd = [IntPtr]::Zero
+        try {
+            $el.SetFocus()
+            $hwndProp = $el.Current.NativeWindowHandle
+            if ($hwndProp -ne 0 -and $hwndProp -ne [IntPtr]::Zero) { $hWnd = $hwndProp }
+        } catch {
             return @{ ok = $false; error_class = 'unsupported_capability'; error = 'the element exposes no focus-capable pattern' }
+        }
+        if ($hWnd -ne [IntPtr]::Zero) {
+            # Best-effort raise: a locked/background desktop may refuse; the
+            # element already has focus, so this stays a silent no-op then.
+            [void][HypervMcp.Uia.Native]::SetForegroundWindow($hWnd)
         }
         return @{ ok = $true; result = @{ focused = $true } }
     }
@@ -402,7 +422,16 @@ function Invoke-Request([hashtable]$req) {
         }
         $done = Invoke-Pattern $el ([System.Windows.Automation.ValuePattern]::Pattern) 'setvalue' $text
         if ($null -eq $done) {
-            return @{ ok = $false; error_class = 'unsupported_capability'; error = 'the element exposes no ValuePattern' }
+            # msaa bridge: the UIA MSAA proxy exposes LegacyIAccessiblePattern
+            # for legacy/VB-style controls that carry no UIA Value pattern.
+            $legacy = $null
+            try { $legacy = $el.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern) } catch { $legacy = $null }
+            if ($null -ne $legacy) {
+                try { $legacy.SetValue($text); $done = $true } catch { $done = $null }
+            }
+        }
+        if ($null -eq $done) {
+            return @{ ok = $false; error_class = 'unsupported_capability'; error = 'the element exposes no ValuePattern or the msaa LegacyIAccessible bridge' }
         }
         return @{ ok = $true; result = @{ length = $text.Length; length_set = $text.Length } }
     }
@@ -427,12 +456,25 @@ $capabilities = @('uia', 'msaa')
 $ownNonce = ''
 if (Test-Path $nonceFile) { $ownNonce = (Get-Content $nonceFile -TotalCount 1) -as [string] }
 $pipeSecurity = New-PipeSecurity
-$session = @{
-    session_id = $identity.session_id
-    interactive_user = $identity.user
-    locked = (Get-LockState)
-    helper = @{ running = $true; version = $HelperVersion; capabilities = $capabilities; nonce = $ownNonce }
+# The shipped script's SHA-256: the host compares it against the package
+# data it provisioned, so a modified helper is reported, not trusted.
+$ownSha256 = ''
+try {
+    $selfPath = $MyInvocation.MyCommand.Path
+    if (-not $selfPath) { $selfPath = Join-Path $HelperDir 'uia_helper.ps1' }
+    $ownSha256 = [BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($selfPath))) -replace '-', ''
+} catch { $ownSha256 = '' }
+function Get-SessionBlock {
+    # Lock state is computed per RESPONSE: a session locked after this
+    # helper started must be reported locked on every answer.
+    return @{
+        session_id = $identity.session_id
+        interactive_user = $identity.user
+        locked = (Get-LockState)
+        helper = @{ running = $true; version = $HelperVersion; capabilities = $capabilities; nonce = $ownNonce; sha256 = $ownSha256 }
+    }
 }
+$session = Get-SessionBlock
 
 while ($true) {
     $pipe = New-Object System.IO.Pipes.NamedPipeServerStream(
@@ -464,7 +506,7 @@ while ($true) {
                 $response = @{ ok = $false; error_class = 'helper_error'; error = $_.Exception.Message }
             }
             $response.id = $requestId
-            $response.session = $session
+            $response.session = Get-SessionBlock
             $writer.WriteLine(($response | ConvertTo-Json -Compress -Depth 8))
         }
     } catch {

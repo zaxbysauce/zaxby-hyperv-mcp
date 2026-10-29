@@ -38,6 +38,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -370,11 +371,18 @@ def test_parse_composed_pipe_leg_wrapper(parsed_ps, monkeypatch):
     mode — prefix + stdin line + vm-target preamble + b64 inner script +
     Invoke-Command -VMId wrapper — parses clean as a whole."""
     leg_cred = CredentialSet("u", "p")
-    monkeypatch.setitem(uia._LEG_GUID, "guid", VM_GUID)
-    monkeypatch.setitem(uia._LEG_GUID, "cred", leg_cred)
+    monkeypatch.setattr(uia._LEG, "guid", VM_GUID)
+    monkeypatch.setattr(uia._LEG, "cred", leg_cred)
     composed = uia._uia_guest_script(uia.CLIENT_LEG_SCRIPT, leg_cred, None)
     assert "Invoke-Command -VMId" in composed  # sanity: the wrapper wrapped
     assert _parse_errors(composed) == []
+
+
+def test_leg_slot_is_thread_local():
+    """Round-3 critic BLOCKER: the leg slot must be thread-local so
+    concurrent calls for different VMs never cross (tool bodies run on
+    worker threads and vm_lock is per-VM)."""
+    assert isinstance(uia._LEG, threading.local)
 
 
 def test_parse_provisioning_inner_scripts(parsed_ps):
