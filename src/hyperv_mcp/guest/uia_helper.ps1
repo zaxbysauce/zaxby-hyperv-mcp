@@ -906,6 +906,15 @@ while ($true) {
                 $response = @{ ok = $false; error_class = 'helper_error'; error = $_.Exception.Message }
             }
             if ($null -eq $response) { $response = @{ ok = $false; error_class = 'helper_error'; error = 'the verb produced no response' } }
+            # EndInvoke yields the child's output as a PSDataCollection, not
+            # the response object itself: unwrap the single element before
+            # the id/session attaches, which must land on the hashtable. A
+            # property set on the collection throws and the tolerant catch
+            # would silently ship the frame without either key.
+            if ($response -isnot [string] -and $response -isnot [System.Collections.IDictionary] -and $response -is [System.Collections.IEnumerable]) {
+                $collected = @($response)
+                if ($collected.Count -ge 1) { $response = $collected[0] }
+            }
             try { $response.id = $requestId } catch { }
             try { $response.session = Get-SessionBlock } catch { }
             $json = ''

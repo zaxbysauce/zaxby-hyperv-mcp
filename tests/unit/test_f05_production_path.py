@@ -1316,3 +1316,106 @@ def test_evidence_ui_tree_shape_contract(monkeypatch):
     assert ui["session"] == {"session_id": 0, "interactive": False,
                              "input_desktop": None}, ui
     assert ui["source"] == "ps_direct_walk", ui
+
+
+# ---------------------------------------------------------------------------
+# 10. NEW-R2-1 behavioural pin: the real serve loop answers id + session
+# ---------------------------------------------------------------------------
+
+def test_serve_loop_ok_frame_carries_id_and_session(tmp_path):
+    """NEW-R2-1 (reviewer round 2, Critical): EndInvoke yields the child's
+    output as a PSDataCollection, and the id/session attaches throw on a
+    collection while the tolerant catches hide it — every ok frame shipped
+    WITHOUT its correlation id and session block, silently killing the
+    host's frame correlation, the sha256 integrity gate, evidence's
+    helper-first path, registration seeding, and helper_running reporting
+    while every stubbed gate stayed green. The pin starts the PACKAGED
+    helper as a real process over a real local pipe (this desktop is the
+    'guest'; no VM, no credential prompt) and asserts the ok frame carries
+    BOTH keys plus the sha256 the host's integrity gate reads."""
+    ps = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    if not os.path.isfile(ps):
+        pytest.skip("powershell.exe is not present")
+    helper_path = str(
+        importlib.resources.files("hyperv_mcp")
+        .joinpath("guest")
+        .joinpath("uia_helper.ps1")
+    )
+    scratch = tmp_path / "helper-home"
+    scratch.mkdir()
+    nonce = "nonce-" + os.urandom(6).hex()
+    req_id = "ctl-" + os.urandom(4).hex()
+    child = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        "Add-Type -AssemblyName UIAutomationClient",
+        "Add-Type -AssemblyName UIAutomationTypes",
+        "$scratch = " + pswindows.ps_quote(str(scratch)),
+        "$nonce = " + pswindows.ps_quote(nonce),
+        # provision the helper's facts beside the script, in the scratch
+        # dir the env override points at ($PSScriptRoot stays the package
+        # dir, so the override is what the helper reads)
+        "Set-Content -Path (Join-Path $scratch 'version.txt') -Value '1'",
+        "Set-Content -Path (Join-Path $scratch 'nonce.txt') -Value $nonce",
+        "$uuid = (Get-CimInstance -ClassName Win32_ComputerSystemProduct).UUID.Trim().ToLowerInvariant()",
+        "Set-Content -Path (Join-Path $scratch 'uuid.txt') -Value $uuid",
+        "Set-Item -Path Env:HYPERVMCP_HELPER_DIR -Value $scratch",
+        "$helperProc = Start-Process -FilePath 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' "
+        "-ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',"
+        + pswindows.ps_quote(helper_path) + " -PassThru -WindowStyle Hidden",
+        "function RoundTrip($req, $connectTimeoutMs, $readTimeoutMs) {",
+        "  $c = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'hyperv-mcp-uia', [System.IO.Pipes.PipeDirection]::InOut)",
+        "  try {",
+        "    $c.Connect($connectTimeoutMs)",
+        "    $json = ($req | ConvertTo-Json -Compress -Depth 8)",
+        "    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json + \"`n\")",
+        "    $c.Write($bytes, 0, $bytes.Length)",
+        "    $c.Flush()",
+        "    $reader = New-Object System.IO.StreamReader($c, [System.Text.Encoding]::UTF8)",
+        "    $task = $reader.ReadLineAsync()",
+        "    if (-not $task.Wait($readTimeoutMs)) { return $null }",
+        "    return ($task.Result | ConvertFrom-Json)",
+        "  } finally { $c.Dispose() }",
+        "}",
+        "$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+        "$sess = [System.Diagnostics.Process]::GetCurrentProcess().SessionId",
+        "$target = @{ vm_guid = $uuid; user_sid = $sid; session_id = $sess }",
+        "$ctl = $null",
+        "for ($i = 0; $i -lt 30; $i++) {",
+        "  try { $ctl = RoundTrip @{ id = " + pswindows.ps_quote(req_id) + "; verb = 'session_state'; nonce = $nonce; min_version = '1'; target = $target } 10000 20000 } catch { Start-Sleep -Milliseconds 500 }",
+        "  if ($null -ne $ctl) { break }",
+        "  Start-Sleep -Milliseconds 500",
+        "}",
+        "if ($null -eq $ctl) { Write-Output 'NOFRAME'; exit 1 }",
+        "($ctl | ConvertTo-Json -Compress -Depth 12)",
+        "if ($helperProc -and -not $helperProc.HasExited) { Stop-Process -Id $helperProc.Id -Force -ErrorAction SilentlyContinue }",
+    ])
+    script_file = tmp_path / "serve-loop-pin.ps1"
+    script_file.write_text(child, encoding="utf-8-sig")
+    proc = subprocess.run(
+        [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(script_file)],
+        capture_output=True, text=True, timeout=180,
+    )
+    frames = [json.loads(ln) for ln in proc.stdout.splitlines()
+              if ln.strip().startswith("{")]
+    assert frames, (
+        f"serve-loop pin produced no frame — rc={proc.returncode} "
+        f"stdout: {proc.stdout[-800:]!r} stderr: {proc.stderr[-800:]!r}"
+    )
+    frame = frames[0]
+    assert frame.get("ok") is True, (
+        f"the control read verb did not succeed: {frame!r}"
+    )
+    assert frame.get("id") == req_id, (
+        "the ok frame lost its correlation id — the EndInvoke unwrap "
+        f"before the id/session attach is broken: {frame!r}"
+    )
+    session = frame.get("session")
+    assert isinstance(session, dict), (
+        "the ok frame lost its session block — the EndInvoke unwrap before "
+        f"the id/session attach is broken: {frame!r}"
+    )
+    sha = (session.get("helper") or {}).get("sha256")
+    assert isinstance(sha, str) and len(sha) == 64, (
+        f"the session block carries no usable helper sha256: {session!r}"
+    )
