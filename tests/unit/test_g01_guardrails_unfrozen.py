@@ -28,6 +28,8 @@ import importlib
 import json
 from pathlib import Path
 
+import pytest
+
 from hyperv_mcp import credentials
 from hyperv_mcp.config import Config
 
@@ -131,3 +133,68 @@ def test_inline_capture_evidence_resolves_for_target_vm(monkeypatch):
         importlib.reload(server_module)
         credentials.init(Config())
     _ = json  # keep the import honest for the envelope debugging leg
+
+
+def test_victim_resolution_fail_closed_arms(monkeypatch):
+    """GUARD3/GUARD4 (final-critic round 1, F2): resolve_victim's two
+    fail-closed arms — pinned by no frozen check because C3/C4's bodies carry
+    no victim assertions — ship pinned here:
+
+    GUARD3 (ambiguity): a VM matching TWO profiles refuses victim resolution
+    naming both profiles, exactly like the admin arm — a victim leg can
+    never silently pick one of two matching admin profiles.
+
+    GUARD4 (missing victim secret): a matched profile whose victim secret is
+    unset refuses NAMING THE PROFILE and never falls back to the global
+    victim credential, even with the global victim variables set.
+    """
+    from hyperv_mcp.credentials import CredentialError
+
+    monkeypatch.setenv("LAB_A_PW", "lab-a-pass-123")
+    monkeypatch.setenv("LAB_B_PW", "lab-b-pass-456")
+    lab_b = dict(LAB_A_PROFILE, name="lab-b", vm_patterns=["lab-b-*"],
+                 username="LabAdminB", password_env="LAB_B_PW")
+    # GUARD3: an overlapping wildcard makes BOTH profiles match lab-a-01
+    overlapping = Config.from_dict({
+        "unrestricted": True,
+        "credential_profiles": [
+            LAB_A_PROFILE, dict(lab_b, vm_patterns=["*"]),
+        ],
+    })
+    credentials.init(overlapping)
+    with pytest.raises(CredentialError) as excinfo:
+        credentials.resolve_victim(vm_name="lab-a-01")
+    message = str(excinfo.value)
+    assert "lab-a" in message and "lab-b" in message, (
+        f"the victim ambiguity refusal must name BOTH profiles; got "
+        f"{message!r}"
+    )
+
+    # GUARD4: matched profile without victim fields -> global victim env;
+    # matched profile WITH victim fields but the secret unset -> refuse
+    # naming the profile, never the global fallback (global victim vars SET
+    # so a silent fallback would succeed and fail the refusal assert).
+    monkeypatch.setenv("HYPERV_GUEST_VICTIM_USERNAME", "GlobalVictim")
+    monkeypatch.setenv("HYPERV_GUEST_VICTIM_PASSWORD", "global-victim-pass")
+    victim_profile = dict(
+        LAB_A_PROFILE,
+        victim_username="LabVictimA",
+        victim_password_env="LAB_A_VICTIM_PW",
+    )
+    credentials.init(Config.from_dict({
+        "unrestricted": True, "credential_profiles": [victim_profile],
+    }))
+    with pytest.raises(CredentialError) as excinfo:
+        credentials.resolve_victim(vm_name="lab-a-01")
+    message = str(excinfo.value)
+    assert "lab-a" in message, (
+        f"the missing-victim-secret refusal must name the profile; got "
+        f"{message!r}"
+    )
+    # positive control: the same profile with the secret set resolves the
+    # victim identity
+    monkeypatch.setenv("LAB_A_VICTIM_PW", "victim-pass-789")
+    cred = credentials.resolve_victim(vm_name="lab-a-01")
+    assert cred.username == "LabVictimA" and cred.profile == "lab-a", (
+        f"positive control: the victim identity must resolve; got {cred!r}"
+    )
