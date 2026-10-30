@@ -1385,9 +1385,14 @@ def test_serve_loop_ok_frame_carries_id_and_session(tmp_path):
         "  if ($null -ne $ctl) { break }",
         "  Start-Sleep -Milliseconds 500",
         "}",
-        "if ($null -eq $ctl) { Write-Output 'NOFRAME'; exit 1 }",
-        "($ctl | ConvertTo-Json -Compress -Depth 12)",
-        "if ($helperProc -and -not $helperProc.HasExited) { Stop-Process -Id $helperProc.Id -Force -ErrorAction SilentlyContinue }",
+        # reap the helper on EVERY exit path (a failing pin run must not
+        # leak a process holding the hyperv-mcp-uia pipe name)
+        "try {",
+        "  if ($null -eq $ctl) { Write-Output 'NOFRAME'; exit 1 }",
+        "  ($ctl | ConvertTo-Json -Compress -Depth 12)",
+        "} finally {",
+        "  if ($helperProc -and -not $helperProc.HasExited) { Stop-Process -Id $helperProc.Id -Force -ErrorAction SilentlyContinue }",
+        "}",
     ])
     script_file = tmp_path / "serve-loop-pin.ps1"
     script_file.write_text(child, encoding="utf-8-sig")
