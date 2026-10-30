@@ -486,7 +486,7 @@ def test_metadata_timing_agrees_with_the_audit_row(monkeypatch, fresh_server, tm
         # the production leg does. Without it the leg is free and the metadata
         # and the audit row agree trivially.
         pswindows.PSResult(stdout="{}", returncode=0, duration_ms=7)
-        return {"elements": 1, "truncated": False, "tree": {"name": "root"}}
+        return {"session_id": 5, "interactive": True, "input_desktop": "Default", "elements": 1, "truncated": False, "tree": {"name": "root"}}
 
     monkeypatch.setattr(evidence, "run_guest_inner", _fake_guest_leg)
     monkeypatch.setattr(
@@ -514,7 +514,7 @@ def test_metadata_timing_agrees_with_the_audit_row(monkeypatch, fresh_server, tm
         )
     # And the UI-tree leg's own spawn must be in BOTH, not just the audit row:
     # 3 legs before it (resolve, resolve, capture) plus its own.
-    assert audit_timing["ps_spawns"] == 4, (
+    assert audit_timing["ps_spawns"] == 5, (  # issue #29 adds the helper-probe discovery leg
         f"PRR-007: the UI-tree leg spawns, so both sides must count 4; got "
         f"{audit_timing}"
     )

@@ -35,6 +35,11 @@ SRC = Path(__file__).resolve().parents[2] / "src" / "hyperv_mcp"
 #: Every emission that is deliberately NOT pooled, with the reason. The pool's
 #: own establishment is added separately because it is the fix, not an exemption.
 PER_CALL_BY_DESIGN: dict[tuple[str, str], str] = {
+    # issue #29: the UIA helper surface is per-call by design - the pooled
+    # worker stdin frame protocol cannot carry the second framed payload
+    # line, and helper liveness must not be coupled to pool lifetime.
+    ("uia.py", "_uia_guest_script"): "framed two-line pipe/leg wrapper",
+    ("uia.py", "_ps_guest_text"): "quser/LogonUI/whoami discovery legs",
     # The per-call wrapper. Still the path of record for flag-off, no-pool,
     # remote-host mode and every direct module call in unit tests.
     ("guestexec.py", "_host_script"): "the per-call path the pooled branch falls back to",
@@ -85,6 +90,10 @@ SITE_BUDGETS: dict[tuple[str, str], int] = {
     ("lifecycle.py", "configure_kdcom"): 2,
     ("lifecycle.py", "configure_kdnet"): 2,
     ("psdsessions.py", "_worker_loop"): 1,
+    # issue #29: the UIA surface's two per-call-by-design sites (each emits
+    # exactly one establishment — its leg wrapper / discovery command).
+    ("uia.py", "_uia_guest_script"): 1,
+    ("uia.py", "_ps_guest_text"): 1,
 }
 
 #: A session-establishing emission, not a prose mention of one.

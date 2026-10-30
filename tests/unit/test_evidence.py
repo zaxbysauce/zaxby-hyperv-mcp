@@ -134,15 +134,23 @@ def test_ui_tree_with_credentials_merges_tree(fake_screenshot, monkeypatch):
 
     def fake_run(cfg_, vm, inner, cred_, timeout_ms=60000, mode="write"):
         captured["script"] = inner
-        return {"elements": 7, "truncated": False,
+        return {"session_id": 5, "interactive": True, "input_desktop": "Default",
+                "elements": 7, "truncated": False,
                 "tree": {"name": "Desktop", "control_type": "Pane", "children": []}}
 
     monkeypatch.setattr(evidence, "run_guest_inner", fake_run)
     out = evidence.capture_evidence(cfg, "test-vm", ui_tree=True, cred=CRED)
     ui = out["meta"]["ui_tree"]
+    # Issue #29: the walk now records the session it ran in and the answer's
+    # source. The helper probe cannot start here (no helper is provisioned
+    # and every host leg is stubbed), so the tree comes from the PS Direct
+    # walk itself.
     assert ui == {
         "requested": True, "ok": True, "elements": 7, "truncated": False,
         "tree": {"name": "Desktop", "control_type": "Pane", "children": []},
+        "session": {"session_id": 5, "interactive": True,
+                    "input_desktop": "Default"},
+        "source": "ps_direct_walk",
     }
     # The UIA leg is bounded and parseable: markers for the bounded walker.
     assert "UIAutomationClient" in captured["script"]
@@ -173,7 +181,8 @@ def test_bounds_and_depth_clamped(fake_screenshot, monkeypatch):
 
     def fake_run(cfg_, vm, inner, cred_, timeout_ms=60000, mode="write"):
         captured["script"] = inner
-        return {"elements": 1, "truncated": True, "tree": {}}
+        return {"session_id": 5, "interactive": True, "input_desktop": "Default",
+                "elements": 1, "truncated": True, "tree": {}}
 
     monkeypatch.setattr(evidence, "run_guest_inner", fake_run)
     out = evidence.capture_evidence(

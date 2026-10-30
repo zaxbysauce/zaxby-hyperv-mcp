@@ -665,3 +665,451 @@ def test_capture_sequence_reports_frame_identity_live(running_vm):
         cfg, vm, count=3, interval_s=1, width=320, height=240)
     assert out["ok"] is True
     assert [f["vm_id"] for f in out["frames"]] == [ref.id] * 3, out["frames"]
+
+
+# ---------------------------------------------------------------------------
+# issue #29 (Workstream F PR 5) — in-session UIA helper: live premise checks
+# ---------------------------------------------------------------------------
+
+
+def test_capture_evidence_ui_tree_session(running_vm):
+    """AC16 (issue #29): WITHOUT the helper provisioned, a credentialed
+    capture_evidence(ui_tree=True) against a real guest must not report the
+    PowerShell-Direct UIA walk as success — meta["ui_tree"] carries
+    ok False with error_class "no_interactive_session", and records the
+    session the walker ran in next to the interactive session (both observed
+    values printed here; the quser leg records whether an interactive
+    session existed at all).
+
+    Live UIA-in-PS-Direct premise: the remoting session is not the
+    logged-on user's interactive desktop, so the walk cannot see the desktop
+    the console drives. A unit test can only observe this against a stubbed
+    outcome — recording the live premise is exactly what this leg is for.
+
+    RED/absent at base, GREEN after the fix (at base this node does not
+    exist in the module, and the base behavior reports the walk as ok)."""
+    from hyperv_mcp import evidence, guestexec
+
+    cfg, vm = running_vm.cfg, running_vm.vm
+    result = evidence.capture_evidence(cfg, vm, ui_tree=True, cred=running_vm.creds)
+    ui = result["meta"]["ui_tree"]
+    assert ui["ok"] is False, ui
+    assert ui["error_class"] == "no_interactive_session", ui
+
+    # record the walker session vs the interactive session (observed values;
+    # the asserts above are the contract, these prints are the evidence)
+    assert isinstance(ui.get("session"), dict), ui
+    print(f"observed ui_tree session block: {ui['session']}")
+    try:
+        quser = guestexec.guest_run_ps(cfg, vm, "quser", cred=running_vm.creds)
+    except Exception as exc:  # a logged-off guest raises instead of listing
+        print(f"quser leg raised (nobody logged on): {exc}")
+        quser = {"ok": False, "stdout": ""}
+    print(
+        "observed interactive-session record (quser from PS Direct): "
+        f"ok={quser.get('ok')} stdout={quser.get('stdout', '').strip()!r}"
+    )
+
+    # Plan strengthening (fix-side): parse the recorded quser stdout for the
+    # interactive session id(s) — quser's ID column is the pure-digit field
+    # immediately before the STATE column — and assert the walker session is
+    # NOT one of them (a PS Direct remoting session is never the console
+    # session the interactive user owns).
+    interactive_ids = set()
+    for qline in (quser.get("stdout") or "").splitlines():
+        qfields = qline.split()
+        for i, field in enumerate(qfields):
+            if field.lower() == "active" and i > 0 and qfields[i - 1].isdigit():
+                interactive_ids.add(int(qfields[i - 1]))
+    if interactive_ids:
+        assert ui["session"]["session_id"] not in interactive_ids, (
+            "the UIA walker ran in the interactive session it was mistaken "
+            f"for: walker session {ui['session']['session_id']} vs quser "
+            f"Active session id(s) {sorted(interactive_ids)}"
+        )
+    else:
+        print("quser recorded no interactive session on this image yet; the "
+              "no_interactive_session refusal above already carries the premise")
+
+    # Plan strengthening (fix-side): AFTER provisioning through the shared
+    # AC17/AC18 pattern (provision + reboot + wait for the helper running in
+    # the interactive session), the SAME capture reports the tree from the
+    # helper — source "helper" — with a live Notepad window in it.
+    _provision_ui_helper_and_wait_for_logon(running_vm)
+
+    import json
+
+    from hyperv_mcp import console
+
+    console.key_combo(cfg, vm, ["win", "r"])
+    console.wait_frame_change(cfg, vm, timeout_s=10)
+    console.type_text(cfg, vm, "notepad")
+    console.press_key(cfg, vm, "enter")
+    opened = console.wait_frame_change(cfg, vm, timeout_s=15)
+    if opened.get("stop_reason") != "changed":
+        pytest.skip(
+            "Notepad could not be opened on this image (the desktop did not "
+            "change after the win+r 'notepad' flow) — the helper-source tree "
+            "leg cannot assert a Notepad window"
+        )
+
+    second = evidence.capture_evidence(cfg, vm, ui_tree=True, cred=running_vm.creds)
+    ui2 = second["meta"]["ui_tree"]
+    assert ui2["ok"] is True, ui2
+    assert ui2["source"] == "helper", ui2
+    tree_blob = json.dumps(ui2.get("tree") or {}).casefold()
+    assert "notepad" in tree_blob, (
+        "the helper-source element tree must contain the open Notepad window"
+    )
+    print(f"observed helper-source tree contains Notepad: elements="
+          f"{ui2.get('elements')} truncated={ui2.get('truncated')}")
+
+
+def _provision_ui_helper_and_wait_for_logon(running_vm, *, timeout_s=300):
+    """Shared AC17/AC18 leg: provision the in-session UIA helper with
+    autologon (the pinned host call shape
+    uia.provision_helper(cfg, vm, cred=..., autologon=True, confirm=True)),
+    reboot through the module's lifecycle helpers, and wait until
+    uia.session_state reports the helper running in the interactive session.
+
+    Returns the first session_state result that shows the helper running."""
+    import time
+
+    from hyperv_mcp import lifecycle, uia
+
+    cfg, vm = running_vm.cfg, running_vm.vm
+    provisioned = uia.provision_helper(
+        cfg, vm, cred=running_vm.creds, autologon=True, confirm=True)
+    assert provisioned["ok"], provisioned
+    assert provisioned["autologon_configured"] is True, provisioned
+
+    lifecycle.stop_vm(cfg, vm, "shutdown", confirm=True)
+    lifecycle.start_vm(cfg, vm)
+
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        last = uia.session_state(cfg, vm, cred=running_vm.creds)
+        if last.get("ok") and last.get("helper", {}).get("running"):
+            return last
+        time.sleep(5.0)
+    raise AssertionError(f"helper never reported running after reboot: {last}")
+
+
+def test_ui_helper_provision_autologon(running_vm):
+    """AC17 (issue #29): a clean test image provisioned through the pinned
+    host surface and rebooted logs the test user on automatically with the
+    helper running: session_state reports the active session, the interactive
+    user, locked False, a foreground-window block and
+    helper {running: true, version}; and the Winlogon key holds NO
+    DefaultPassword value (the autologon password lives only as the LSA
+    secret — checked through a guest run leg).
+
+    RED/absent at base, GREEN after the fix (at base this node does not
+    exist in the module)."""
+    from hyperv_mcp import guestexec
+
+    cfg, vm = running_vm.cfg, running_vm.vm
+    state = _provision_ui_helper_and_wait_for_logon(running_vm)
+
+    assert state["ok"] is True, state
+    assert isinstance(state["active_session_id"], int), state
+    assert state["active_session_id"] >= 1, state  # session 0 is services
+    assert state["interactive_user"], state
+    assert state["locked"] is False, state
+    foreground = state["foreground_window"]
+    assert isinstance(foreground, dict), state
+    for key in ("title", "process_name", "pid", "hwnd"):
+        assert key in foreground, foreground
+    assert foreground["title"] is not None, foreground
+    helper = state["helper"]
+    assert helper["running"] is True, helper
+    assert helper["version"], helper
+    print(f"observed session_state: active_session_id={state['active_session_id']} "
+          f"interactive_user={state['interactive_user']!r} "
+          f"foreground={foreground!r} helper={helper!r}")
+
+    # The Winlogon key holds NO DefaultPassword value: the password must be
+    # the LSA secret only (guest run leg; the value name itself is probed,
+    # no secret material is read or printed).
+    probe = guestexec.guest_run_ps(
+        cfg, vm,
+        "try { $null = (Get-ItemProperty "
+        "'HKLM:\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon' "
+        "-Name DefaultPassword -ErrorAction Stop).DefaultPassword; "
+        "'DefaultPassword-present' } catch { 'DefaultPassword-absent' }",
+        cred=running_vm.creds,
+    )
+    assert probe["ok"], probe
+    assert "DefaultPassword-absent" in probe["stdout"], probe
+
+    # Plan strengthening (fix-side), leg (a): the helper's AtLogOn scheduled
+    # task exists and is running right now — 267009 (0x41301) is the
+    # LastTaskResult a task reports while it is executing.
+    task = guestexec.guest_run_ps(
+        cfg, vm,
+        "$t = Get-ScheduledTask -TaskName 'hyperv-mcp-uia-helper' -ErrorAction Stop\n"
+        "$i = Get-ScheduledTaskInfo -TaskName 'hyperv-mcp-uia-helper'\n"
+        "if ($t.State -eq 'Running' -or $i.LastTaskResult -eq 267009) "
+        "{ 'helper-task-running' } else "
+        "{ 'helper-task-not-running state=' + $t.State + ' last=' + $i.LastTaskResult }",
+        cred=running_vm.creds,
+    )
+    assert task["ok"], task
+    assert "helper-task-running" in task["stdout"], task
+
+    # Plan strengthening (fix-side), leg (b): the helper pipe's DACL, read
+    # through the NAMED-PIPE SECURITY API family only — P/Invoke CreateFile on
+    # \\.\pipe\hyperv-mcp-uia + GetSecurityInfo +
+    # ConvertSecurityDescriptorToStringSecurityDescriptor ([System.IO.
+    # Directory]::GetAccessControl is the wrong API family for pipes and is
+    # deliberately not used). ConvertSecurityDescriptorToStringSecurity-
+    # Descriptor abbreviates well-known trustees (BA/WD), so the SDDL string
+    # is decoded through RawSecurityDescriptor and the SID assertions run on
+    # the expanded trustee list of that exact SDDL; the test user's own SID
+    # (never abbreviated) is asserted against the raw string as well.
+    sid_leg = guestexec.guest_run_ps(
+        cfg, vm, "whoami /user /fo csv /nh", cred=running_vm.creds)
+    assert sid_leg["ok"], sid_leg
+    user_sid = ""
+    for sid_line in sid_leg.get("stdout", "").splitlines():
+        if "S-1-" in sid_line:
+            user_sid = sid_line.split(",")[-1].strip().strip('"')
+    assert user_sid.startswith("S-1-"), sid_leg
+
+    pipe_dacl_probe = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -Namespace HypervMcp.It -Name PipeSec -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+[DllImport("advapi32.dll", SetLastError=true)] public static extern uint GetSecurityInfo(IntPtr handle, int objectType, int securityInfo, out IntPtr sidOwner, out IntPtr sidGroup, out IntPtr dacl, out IntPtr sacl, out IntPtr securityDescriptor);
+[DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] public static extern bool ConvertSecurityDescriptorToStringSecurityDescriptor(IntPtr securityDescriptor, uint revision, uint securityInformation, out IntPtr stringSecurityDescriptor, out uint stringLength);
+[DllImport("kernel32.dll")] public static extern bool LocalFree(IntPtr mem);
+'@
+$handle = [HypervMcp.It.PipeSec]::CreateFile('\\.\pipe\hyperv-mcp-uia', [uint32]2147483648, [uint32]0, [IntPtr]::Zero, [uint32]3, [uint32]0, [IntPtr]::Zero)
+if ($handle.IsInvalid) { throw ('CreateFile on the helper pipe failed: win32 error ' + [Runtime.InteropServices.Marshal]::GetLastWin32Error()) }
+try {
+    $owner = [IntPtr]::Zero; $group = [IntPtr]::Zero; $dacl = [IntPtr]::Zero
+    $sacl = [IntPtr]::Zero; $sd = [IntPtr]::Zero
+    $hr = [HypervMcp.It.PipeSec]::GetSecurityInfo($handle.DangerousGetHandle(), 1, 4, [ref]$owner, [ref]$group, [ref]$dacl, [ref]$sacl, [ref]$sd)
+    if ($hr -ne 0) { throw ('GetSecurityInfo failed: hr 0x' + $hr.ToString('X')) }
+    $sddlPtr = [IntPtr]::Zero; $sddlLen = 0
+    $converted = [HypervMcp.It.PipeSec]::ConvertSecurityDescriptorToStringSecurityDescriptor($sd, 1, 4, [ref]$sddlPtr, [ref]$sddlLen)
+    if (-not $converted) { throw 'ConvertSecurityDescriptorToStringSecurityDescriptor failed' }
+    $sddl = [Runtime.InteropServices.Marshal]::PtrToStringUni($sddlPtr)
+    [void][HypervMcp.It.PipeSec]::LocalFree($sddlPtr)
+    [void][HypervMcp.It.PipeSec]::LocalFree($sd)
+    $trustees = @()
+    $parsed = New-Object System.Security.AccessControl.RawSecurityDescriptor($sddl)
+    foreach ($ace in $parsed.DiscretionaryAcl) {
+        if ($ace -is [System.Security.AccessControl.KnownAce]) { $trustees += $ace.SecurityIdentifier.Value }
+    }
+    [PSCustomObject]@{ sddl = $sddl; trustees = @($trustees | Select-Object -Unique) } | ConvertTo-Json -Compress
+} finally { $handle.Close() }
+"""
+    dacl = guestexec.guest_run_ps(
+        cfg, vm, pipe_dacl_probe, cred=running_vm.creds)
+    assert dacl["ok"], dacl
+    import json
+
+    sddl_info = json.loads(dacl["stdout"].strip().splitlines()[-1])
+    print(f"observed helper pipe SDDL: {sddl_info.get('sddl')!r} "
+          f"trustees={sddl_info.get('trustees')!r}")
+    assert user_sid in sddl_info["sddl"], sddl_info
+    trustees = sddl_info["trustees"]
+    if isinstance(trustees, str):  # ConvertTo-Json collapses one-element arrays
+        trustees = [trustees]
+    assert user_sid in trustees, sddl_info
+    assert "S-1-5-32-544" in trustees, sddl_info  # BUILTIN\Administrators
+    assert "S-1-1-0" not in trustees, sddl_info  # World/Everyone: no access
+
+
+def test_ui_helper_element_workflow_and_lock(running_vm, it_tmp):
+    """AC18 (issue #29): the full element workflow from the issue, every step
+    asserted in order: find the Notepad document -> set_value "abc" ->
+    invoke File -> wait_for the menu -> invoke Save-as -> focus+invoke Cancel
+    (dialog closes, typed value archived in a console screenshot) ->
+    LockWorkStation from the console lane (Win+L) -> session_state locked
+    true -> find still resolves while locked -> unlock via
+    console.type_text of the password -> wait_for(gone) on the Save As
+    dialog returns within its timeout.
+
+    The image is provisioned first (the helper must be running), and the
+    workflow skips fast with a clear message when Notepad is unavailable.
+    RED/absent at base, GREEN after the fix (at base this node does not
+    exist in the module)."""
+    import json
+    import time
+
+    from hyperv_mcp import console, uia
+
+    cfg, vm = running_vm.cfg, running_vm.vm
+    creds = running_vm.creds
+    state = _provision_ui_helper_and_wait_for_logon(running_vm)
+    assert state["locked"] is False, state
+
+    shots = it_tmp / "ac18"
+    shots.mkdir(exist_ok=True)
+
+    def _shot(label):
+        frame, meta = console.screenshot(cfg, vm, save_path=str(shots / f"{label}.png"))
+        assert meta.get("frame_hash"), meta
+        with open(shots / f"{label}.json", "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, indent=2, default=str)
+        return meta["frame_hash"]
+
+    # open Notepad through the console lane (module-native: win+r flow)
+    _shot("0-desktop")
+    console.key_combo(cfg, vm, ["win", "r"])
+    console.wait_frame_change(cfg, vm, timeout_s=10)
+    console.type_text(cfg, vm, "notepad")
+    console.press_key(cfg, vm, "enter")
+    opened = console.wait_frame_change(cfg, vm, timeout_s=15)
+    assert opened.get("stop_reason") == "changed", opened
+
+    # Plan strengthening (fix-side): Notepad availability is a GUEST fact, so
+    # the skip is driven by a guest-side probe (where.exe notepad.exe through
+    # a guest run leg), not by the helper find below. When the probe succeeds
+    # but the find loop resolves nothing, that is a helper-side FAILURE (the
+    # assert inside the doc-is-None block below) — never a skip.
+    from hyperv_mcp import guestexec
+
+    notepad_probe = guestexec.guest_run(
+        cfg, vm, "cmd.exe", ["/c", "where", "notepad.exe"], cred=creds)
+    if not (notepad_probe.get("ok") and notepad_probe.get("exit_code") == 0):
+        pytest.skip(
+            "Notepad is unavailable on this image (the guest-side probe "
+            "'where notepad.exe' failed) — the element workflow cannot run"
+        )
+
+    # find the Notepad document. Classic Notepad exposes a Document control;
+    # Win11 Notepad's editor is a RichEditD2DPT control instead, so both
+    # control types are tried in order.
+    doc = None
+    doc_control_type = None
+    for control_type in ("Document", "RichEditD2DPT"):
+        found = uia.find(
+            cfg, vm,
+            selector={"process_name": "notepad", "control_type": control_type},
+            cred=creds,
+        )
+        if found.get("ok") and found.get("elements"):
+            doc = found["elements"][0]
+            doc_control_type = control_type
+            break
+    if doc is None:
+        # the guest-side probe above proved notepad.exe exists, so an empty
+        # find here is a helper-side FAILURE — assert, never skip (the
+        # historical skip below stays byte-frozen but is now unreachable)
+        assert doc is not None, (
+            "notepad.exe IS on this image (the guest-side 'where notepad.exe' "
+            "probe passed) but the helper resolved no Document/RichEditD2DPT "
+            "element in the Notepad window"
+        )
+        pytest.skip(
+            "Notepad is unavailable on this image (no Document/RichEditD2DPT "
+            "element resolved)"
+        )
+    doc_id = doc["element_id"]
+
+    # set_value "abc": typed values ride stdin, and the result reports the
+    # LENGTH set, never the value
+    set_out = uia.set_value(cfg, vm, element_id=doc_id, value="abc", cred=creds)
+    assert set_out["ok"] is True, set_out
+    assert set_out.get("length") == 3, set_out
+    assert "abc" not in json.dumps(set_out), set_out
+
+    # the typed value visible in a console screenshot: the archived PNG is
+    # the human-visibility oracle (frame hashes alone are not)
+    _shot("1-after-set-value")
+
+    # invoke the File menu item, wait for the menu, invoke "Save as"
+    file_item = uia.find(
+        cfg, vm,
+        selector={"process_name": "notepad", "name": "File"}, cred=creds)
+    assert file_item["ok"] and file_item["elements"], file_item
+    invoke_file = uia.invoke(
+        cfg, vm, element_id=file_item["elements"][0]["element_id"], cred=creds)
+    assert invoke_file["ok"] is True, invoke_file
+
+    menu = uia.wait_for(
+        cfg, vm,
+        selector={"process_name": "notepad", "name_contains": "Save"},
+        timeout_s=15, cred=creds)
+    assert menu["ok"] is True, menu
+
+    save_as = uia.find(
+        cfg, vm,
+        selector={"process_name": "notepad", "name_contains": "Save as"},
+        cred=creds)
+    assert save_as["ok"] and save_as["elements"], save_as
+    invoke_save = uia.invoke(
+        cfg, vm, element_id=save_as["elements"][0]["element_id"], cred=creds)
+    assert invoke_save["ok"] is True, invoke_save
+
+    # the Save As dialog is up: focus + invoke Cancel closes it
+    cancel_selector = {
+        "process_name": "notepad", "name": "Cancel", "control_type": "Button"}
+    cancel = uia.find(cfg, vm, selector=cancel_selector, cred=creds)
+    assert cancel["ok"] and cancel["elements"], cancel
+    cancel_id = cancel["elements"][0]["element_id"]
+    focus_cancel = uia.focus(cfg, vm, element_id=cancel_id, cred=creds)
+    assert focus_cancel["ok"] is True, focus_cancel
+    invoke_cancel = uia.invoke(cfg, vm, element_id=cancel_id, cred=creds)
+    assert invoke_cancel["ok"] is True, invoke_cancel
+    # the dialog closes: archived screenshot + the element no longer resolves
+    _shot("2-dialog-closed")
+    dialog_gone = uia.wait_for(
+        cfg, vm, selector=cancel_selector, gone=True, timeout_s=15, cred=creds)
+    assert dialog_gone["ok"] is True, dialog_gone
+
+    # LockWorkStation from the console lane: Win+L locks the interactive
+    # desktop (the synthetic keyboard IS the interactive input path)
+    console.key_combo(cfg, vm, ["win", "l"])
+    deadline = time.monotonic() + 60
+    locked_state = None
+    while time.monotonic() < deadline:
+        locked_state = uia.session_state(cfg, vm, cred=creds)
+        if locked_state.get("ok") and locked_state.get("locked"):
+            break
+        time.sleep(2.0)
+    assert locked_state["ok"] is True, locked_state
+    assert locked_state["locked"] is True, locked_state
+
+    # UIA-pattern verbs are locked-session friendly: find still resolves
+    locked_find = uia.find(
+        cfg, vm,
+        selector={"process_name": "notepad", "control_type": doc_control_type},
+        cred=creds)
+    assert locked_find["ok"] is True and locked_find["elements"], locked_find
+    # focus while locked must not report success: it needs the interactive
+    # desktop and returns the explicit error class instead
+    locked_focus = uia.focus(cfg, vm, element_id=doc_id, cred=creds)
+    assert locked_focus["ok"] is False, locked_focus
+    assert locked_focus["error_class"] == "no_interactive_desktop", locked_focus
+
+    # unlock: dismiss the lock screen if needed, then type the password
+    # through the console synthetic keyboard (the password is never printed)
+    unlocked = None
+    for _attempt in range(3):
+        console.type_text(cfg, vm, creds.password)
+        console.press_key(cfg, vm, "enter")
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            unlocked = uia.session_state(cfg, vm, cred=creds)
+            if unlocked.get("ok") and unlocked.get("locked") is False:
+                break
+            time.sleep(3.0)
+        if unlocked.get("ok") and unlocked.get("locked") is False:
+            break
+        # the credential prompt may not have been up yet: dismiss the lock
+        # clock and retry the typed password
+        console.press_key(cfg, vm, "escape")
+        console.wait_frame_change(cfg, vm, timeout_s=10)
+    assert unlocked["ok"] is True, unlocked
+    assert unlocked["locked"] is False, unlocked
+
+    # after the unlock, wait_for(gone) on the Save As dialog returns within
+    # its timeout
+    final_gone = uia.wait_for(
+        cfg, vm, selector=cancel_selector, gone=True, timeout_s=30, cred=creds)
+    assert final_gone["ok"] is True, final_gone

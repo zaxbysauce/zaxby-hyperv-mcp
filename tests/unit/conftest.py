@@ -38,6 +38,31 @@ def _console_caches_isolated(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _uia_caches_isolated(monkeypatch):
+    """Reset the uia module's process-local caches per test (issue #29,
+    PR-#109 F11/F18): the broker registrations (_REGISTRATIONS, keyed by
+    (vm_guid, session_id)), the SID cache, the recorded-install cache
+    (_INSTALLS) and the thread-local leg slot. Without this, one test's
+    seeded registration (or its resolved SID / install facts) routes a later
+    test's bootstrap request through a stale row, and a pooled worker thread
+    keeps the leg slot's credential past the call that used it. The dicts
+    are replaced monkeypatch-style (auto-restored, so a test's writes are
+    discarded with it); the thread-local slot is nulled directly —
+    monkeypatch.setattr on a threading.local raises AttributeError when the
+    attribute has never been set on this thread."""
+    from hyperv_mcp import uia
+
+    monkeypatch.setattr(uia, "_REGISTRATIONS", {})
+    monkeypatch.setattr(uia, "_SID_CACHE", {})
+    monkeypatch.setattr(uia, "_INSTALLS", {})
+    uia._LEG.guid = None
+    uia._LEG.cred = None
+    uia._CALL.cfg = None
+    uia._CALL.ref = None
+    uia._CALL.cred = None
+
+
+@pytest.fixture(autouse=True)
 def _state_store_in_tmp(monkeypatch, tmp_path):
     """Point the durable state store at a per-test temp directory (issue #22).
 

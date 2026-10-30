@@ -117,6 +117,11 @@ class DestructivePolicy:
     display: bool = False
     guest_repair: bool = False
     relay: bool = False
+    # Issue #29: element-level UI actions through the in-session UIA helper
+    # (invoke/set_value/focus) and helper provisioning (autologon secret +
+    # scheduled task) each carry their own deny-by-default switch.
+    ui_input: bool = False
+    ui_provision: bool = False
     require_confirm: bool = True
 
 
