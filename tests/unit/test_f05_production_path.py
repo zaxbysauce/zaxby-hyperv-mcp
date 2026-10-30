@@ -69,7 +69,8 @@ HELPER_FRAME = {
         "interactive_user": "tester",
         "locked": False,
         "helper": {"running": True, "version": uia.HELPER_VERSION,
-                   "capabilities": ["uia", "msaa"], "nonce": ""},
+                   "capabilities": ["uia", "msaa"], "nonce": "",
+                   "sha256": uia._packaged_helper_sha256()},
     },
 }
 
@@ -110,7 +111,19 @@ class UiLegRecorder:
     def __call__(self, cfg, script, *, stdin_b64=None, timeout_s=None, **kwargs):
         self.scripts.append(script)
         self.stdin_b64.append(stdin_b64)
-        return pswindows.PSResult(stdout=json.dumps(self.frame), returncode=0)
+        frame = json.loads(json.dumps(self.frame))
+        # correlate like the real helper: the served frame carries the
+        # REQUEST's id unless the test supplied an explicit one
+        if stdin_b64:
+            lines = stdin_b64.strip().split("\n")
+            if len(lines) >= 2:
+                try:
+                    request = json.loads(
+                        base64.b64decode(lines[1]).decode("utf-8"))
+                    frame.setdefault("id", request.get("id"))
+                except Exception:
+                    pass
+        return pswindows.PSResult(stdout=json.dumps(frame), returncode=0)
 
 
 class EchoLegRecorder:
@@ -142,12 +155,14 @@ class EchoLegRecorder:
         return pswindows.PSResult(stdout=json.dumps(frame), returncode=0)
 
 
-def _helper_session_block(sha256: str = "") -> dict:
-    """A helper session block as the helper's Get-SessionBlock emits it."""
+def _helper_session_block(sha256: str | None = None) -> dict:
+    """A helper session block as Get-SessionBlock emits it. Defaults to the
+    packaged sha256 so served frames satisfy the fail-closed integrity
+    contract; pass "" to omit the key or a value to simulate a mismatch."""
     helper = {"running": True, "version": uia.HELPER_VERSION,
               "capabilities": ["uia", "msaa"], "nonce": ""}
-    if sha256:
-        helper["sha256"] = sha256
+    helper["sha256"] = (uia._packaged_helper_sha256() if sha256 is None
+                        else sha256)
     return {"session_id": 2, "interactive_user": "tester", "locked": False,
             "helper": helper}
 
@@ -696,7 +711,18 @@ class ProvisionLegRecorder:
         self.scripts: list[str] = []
         self.install_ok = install_ok
 
-    def _ps(self, frame: dict) -> pswindows.PSResult:
+    def _ps(self, frame: dict, stdin_b64: str | None = None) -> pswindows.PSResult:
+        # correlate like the real helper: a framed stdin carries the request
+        # JSON on line 2; the served frame echoes its id
+        if stdin_b64:
+            lines = stdin_b64.strip().split("\n")
+            if len(lines) >= 2:
+                try:
+                    request = json.loads(
+                        base64.b64decode(lines[1]).decode("utf-8"))
+                    frame = {**frame, "id": request.get("id")}
+                except Exception:
+                    pass
         return pswindows.PSResult(stdout=json.dumps(frame), returncode=0)
 
     def __call__(self, cfg, script, *, stdin_b64=None, timeout_s=None, **kwargs):
@@ -720,7 +746,7 @@ class ProvisionLegRecorder:
         # the session_state probe after install (the pipe client leg)
         return self._ps({"ok": True,
                          "result": {"active_session_id": 2},
-                         "session": _helper_session_block()})
+                         "session": _helper_session_block()}, stdin_b64)
 
 
 def test_provision_install_result_keys_and_failed_branch(clean_uia_state,
@@ -1424,3 +1450,151 @@ def test_serve_loop_ok_frame_carries_id_and_session(tmp_path):
     assert isinstance(sha, str) and len(sha) == 64, (
         f"the session block carries no usable helper sha256: {session!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 11. NEW-FC fixes: fail-closed frames + a real LSA entry point
+# ---------------------------------------------------------------------------
+
+def test_parse_helper_frame_fails_closed_on_missing_fields():
+    """NEW-FC-2 (final critic): the frame contract fails closed — an ok
+    frame with an ABSENT correlation id raises (only MISMATCHED ids were
+    rejected before), and an ok frame whose helper digest is absent or
+    empty refuses helper_integrity_mismatch instead of passing unverified.
+    A valid correlated, matching-digest frame passes."""
+    import hyperv_mcp.uia as uia
+
+    good_helper = {"running": True, "version": "1", "capabilities": ["uia"],
+                   "sha256": uia._packaged_helper_sha256()}
+    good = {"ok": True, "id": "r1", "result": {"elements": []},
+            "session": {"session_id": 1, "helper": dict(good_helper)}}
+    request = {"id": "r1"}
+
+    # control: a valid frame parses and reports the match
+    parsed = uia._parse_helper_frame(
+        pswindows.PSResult(stdout=json.dumps(good), returncode=0), request)
+    assert parsed["ok"] is True and parsed["session"]["helper"]["sha256_match"] is True
+
+    # absent id -> raise (was: silently accepted)
+    no_id = json.loads(json.dumps(good))
+    del no_id["id"]
+    with pytest.raises(uia.UiAError, match="no correlation id"):
+        uia._parse_helper_frame(
+            pswindows.PSResult(stdout=json.dumps(no_id), returncode=0),
+            request)
+
+    # mismatched id still raises
+    wrong_id = json.loads(json.dumps(good))
+    wrong_id["id"] = "other"
+    with pytest.raises(uia.UiAError, match="does not correlate"):
+        uia._parse_helper_frame(
+            pswindows.PSResult(stdout=json.dumps(wrong_id), returncode=0),
+            request)
+
+    # ok frame, no session block at all -> integrity refusal (fail closed)
+    no_session = {"ok": True, "id": "r1", "result": {}}
+    out = uia._parse_helper_frame(
+        pswindows.PSResult(stdout=json.dumps(no_session), returncode=0),
+        request)
+    assert out["ok"] is False and out["error_class"] == "helper_integrity_mismatch"
+
+    # ok frame, helper block without a digest -> integrity refusal
+    no_digest = json.loads(json.dumps(good))
+    del no_digest["session"]["helper"]["sha256"]
+    out = uia._parse_helper_frame(
+        pswindows.PSResult(stdout=json.dumps(no_digest), returncode=0),
+        request)
+    assert out["ok"] is False and out["error_class"] == "helper_integrity_mismatch"
+
+    # ok frame, empty-string digest -> integrity refusal
+    empty_digest = json.loads(json.dumps(good))
+    empty_digest["session"]["helper"]["sha256"] = ""
+    out = uia._parse_helper_frame(
+        pswindows.PSResult(stdout=json.dumps(empty_digest), returncode=0),
+        request)
+    assert out["ok"] is False and out["error_class"] == "helper_integrity_mismatch"
+
+    # wrong digest on an ok frame -> integrity refusal (pre-existing path)
+    bad_digest = json.loads(json.dumps(good))
+    bad_digest["session"]["helper"]["sha256"] = "0" * 64
+    out = uia._parse_helper_frame(
+        pswindows.PSResult(stdout=json.dumps(bad_digest), returncode=0),
+        request)
+    assert out["ok"] is False and out["error_class"] == "helper_integrity_mismatch"
+
+    # a REFUSAL frame tolerates an unusable digest (documented weaker
+    # contract) and keeps its error class
+    refusal = {"ok": False, "id": "r1", "error_class": "nonce_mismatch",
+               "session": {"session_id": 1, "helper": {"running": True}}}
+    out = uia._parse_helper_frame(
+        pswindows.PSResult(stdout=json.dumps(refusal), returncode=0), request)
+    assert out["ok"] is False and out["error_class"] == "nonce_mismatch"
+
+
+def test_teardown_binds_a_real_lsa_entry_point(tmp_path):
+    """NEW-FC-1 (final critic): the teardown's P/Invoke binds the REAL
+    advapi32 export. `LsaStorePrivateDataNull` exists nowhere in
+    advapi32.dll — without `EntryPoint = "LsaStorePrivateData"` the call
+    throws EntryPointNotFoundException AFTER LsaOpenPolicy succeeds, so
+    the secret was never deleted and the Winlogon restore never ran. The
+    structural pin requires the EntryPoint alias, and a real PS 5.1 probe
+    invokes the shipped declaration with a zero policy handle (no policy
+    opened, no system state touched): the export must resolve and answer
+    an NTSTATUS error, not EntryPointNotFoundException."""
+    ps = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    if not os.path.isfile(ps):
+        pytest.skip("powershell.exe is not present")
+    import hyperv_mcp.uia as uia
+
+    inner = uia._TEARDOWN_WINLOGON_INNER
+    # structural pin: the managed alias must carry the real entry point
+    decl = [ln for ln in inner.splitlines() if "LsaStorePrivateDataNull" in ln
+            and "DllImport" in ln]
+    assert len(decl) == 1, decl
+    assert 'EntryPoint="LsaStorePrivateData"' in decl[0], (
+        "the LsaStorePrivateDataNull declaration lost its EntryPoint alias"
+    )
+
+    # extract the Add-Type member block from the shipped script and probe
+    # the export resolution with a zero policy handle on real PS 5.1
+    start = inner.index("Add-Type -Namespace HypervMcp.Uia.LsaTeardown")
+    member_start = inner.index("@'", start) + 2
+    member_end = inner.index("'@", member_start)
+    members = inner[member_start:member_end]
+    child = "\n".join([
+        "$ErrorActionPreference = 'Stop'",
+        "Add-Type -Namespace HypervMcp.Uia.LsaTeardown -Name Lsa -MemberDefinition @'",
+        members,
+        "'@",
+        "$attrs = New-Object HypervMcp.Uia.LsaTeardown.Lsa+LSA_OBJECT_ATTRIBUTES",
+        "$attrs.Length = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf($attrs)",
+        "$policyPtr = [IntPtr]::Zero",
+        "$secret = New-Object HypervMcp.Uia.LsaTeardown.Lsa+LSA_UNICODE_STRING",
+        "try {",
+        "  $hr = [HypervMcp.Uia.LsaTeardown.Lsa]::LsaStorePrivateDataNull([IntPtr]::Zero, [ref]$secret, [IntPtr]::Zero)",
+        "  Write-Output (\"NTSTATUS=\" + $hr)",
+        "} catch [System.EntryPointNotFoundException] {",
+        "  Write-Output 'ENTRY_POINT_NOT_FOUND'",
+        "} catch {",
+        "  Write-Output (\"OTHER=\" + $_.Exception.GetType().Name)",
+        "}",
+    ])
+    script_file = tmp_path / "lsa-entry-point-probe.ps1"
+    script_file.write_text(child, encoding="ascii")
+    proc = subprocess.run(
+        [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(script_file)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, (
+        f"LSA entry-point probe failed: {proc.stderr[-800:]!r}"
+    )
+    out = proc.stdout.strip()
+    assert out.startswith("NTSTATUS="), (
+        f"the shipped declaration does not resolve a real advapi32 export: "
+        f"{out!r}"
+    )
+    # a zero handle must be refused with an NTSTATUS (nonzero), proving the
+    # call reached the real export
+    status = int(out.split("=", 1)[1])
+    assert status != 0, "a zero policy handle unexpectedly succeeded"

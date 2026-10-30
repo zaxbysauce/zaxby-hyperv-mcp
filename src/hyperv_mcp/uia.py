@@ -422,7 +422,7 @@ if (Test-Path -LiteralPath $root) {
 _TEARDOWN_WINLOGON_INNER = """$ErrorActionPreference = 'Stop'
 Add-Type -Namespace HypervMcp.Uia.LsaTeardown -Name Lsa -MemberDefinition @'
 [DllImport("advapi32.dll", SetLastError=true)] public static extern uint LsaOpenPolicy(IntPtr system, ref LSA_OBJECT_ATTRIBUTES attrs, uint access, out IntPtr policy);
-[DllImport("advapi32.dll", CharSet=CharSet.Unicode)] public static extern uint LsaStorePrivateDataNull(IntPtr policy, ref LSA_UNICODE_STRING name, IntPtr data);
+[DllImport("advapi32.dll", CharSet=CharSet.Unicode, EntryPoint="LsaStorePrivateData")] public static extern uint LsaStorePrivateDataNull(IntPtr policy, ref LSA_UNICODE_STRING name, IntPtr data);
 [DllImport("advapi32.dll")] public static extern uint LsaClose(IntPtr policy);
 [StructLayout(LayoutKind.Sequential)] public struct LSA_UNICODE_STRING { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
 [StructLayout(LayoutKind.Sequential)] public struct LSA_OBJECT_ATTRIBUTES { public uint Length; public IntPtr RootDirectory; public IntPtr ObjectName; public uint Attributes; public IntPtr SecurityDescriptor; public IntPtr SecurityQualityOfService; }
@@ -971,14 +971,19 @@ def _pipe_forward(transport: _Transport | None, request: dict,
 
 
 def _parse_helper_frame(result: pswindows.PSResult, request: dict) -> dict:
-    """F4: a degraded frame is NEVER success.
+    """F4: a degraded frame is NEVER success — the contract fails closed.
 
-    Empty stdout, a non-object, a missing/non-boolean ``ok``, or a response
-    id that does not correlate with the request id raise (mapped to
-    helper_unavailable by the verb layer). A helper-reported sha256 is
-    compared with the packaged bytes: exposed as
-    ``session.helper.sha256_match`` and a mismatch on an ok frame refuses
-    with ``helper_integrity_mismatch``.
+    Empty stdout, a non-object, a missing/non-boolean ``ok``, an absent or
+    non-correlating response id, or a mismatched id raise (mapped to
+    helper_unavailable by the verb layer). The helper attaches id and a
+    session block to EVERY frame, so their absence is itself degradation.
+    Integrity fails closed on ok frames: a helper-reported sha256 is
+    compared with the packaged bytes (exposed as
+    ``session.helper.sha256_match``), and an ok frame whose digest is
+    absent, empty, or mismatching refuses with
+    ``helper_integrity_mismatch``. Refusal frames tolerate an unusable
+    digest — they are already not success, and the weaker contract is
+    explicit here.
     """
     text = (result.stdout or "").strip()
     try:
@@ -990,24 +995,32 @@ def _parse_helper_frame(result: pswindows.PSResult, request: dict) -> dict:
     if not isinstance(frame.get("ok"), bool):
         raise UiAError("degraded helper response: no explicit ok")
     response_id = frame.get("id")
-    if response_id is not None and response_id != request.get("id"):
+    if response_id is None:
+        raise UiAError("degraded helper response: no correlation id")
+    if response_id != request.get("id"):
         raise UiAError(
             "helper response id does not correlate with the request id")
     session = frame.get("session")
     helper = session.get("helper") if isinstance(session, dict) else None
-    if isinstance(helper, dict):
-        reported = helper.get("sha256")
-        if isinstance(reported, str) and reported:
-            expected = _packaged_helper_sha256()
-            match = (isinstance(expected, str)
-                     and expected.lower() == reported.lower())
-            helper["sha256_match"] = match
-            if frame["ok"] and not match:
-                return {"ok": False,
-                        "error_class": "helper_integrity_mismatch",
-                        "error": "the running helper's sha256 does not match "
-                                 "the packaged helper bytes",
-                        "session": session}
+    reported = helper.get("sha256") if isinstance(helper, dict) else None
+    usable = isinstance(reported, str) and bool(reported)
+    if usable and isinstance(helper, dict):
+        expected = _packaged_helper_sha256()
+        match = (isinstance(expected, str)
+                 and expected.lower() == str(reported).lower())
+        helper["sha256_match"] = match
+        if frame["ok"] and not match:
+            return {"ok": False,
+                    "error_class": "helper_integrity_mismatch",
+                    "error": "the running helper's sha256 does not match "
+                             "the packaged helper bytes",
+                    "session": session}
+    if frame["ok"] and not usable:
+        return {"ok": False,
+                "error_class": "helper_integrity_mismatch",
+                "error": "the helper response carries no usable sha256 to "
+                         "verify against the packaged helper bytes",
+                "session": session}
     return frame
 
 
