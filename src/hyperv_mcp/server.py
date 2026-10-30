@@ -72,6 +72,7 @@ from . import (
     vmlocks,
 )
 from .config import Config, ConfigError
+from .credentials import CredentialError
 
 __all__ = ["mcp", "main", "bootstrap", "configure_http_auth"]  # noqa: F822 (mcp: module __getattr__)
 
@@ -551,10 +552,46 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     """
     creds_allowed = cfg.allow_inline_credentials
 
-    def _cred_args(u: str = "", p: str = "") -> credentials.CredentialSet:
+    def _vm_key(vm_name: str = "", vm_id: str = "") -> str:
+        """The profile-match key for a call's target VM (issue #30).
+
+        The caller's vm_name when given; else, for a GUID-only call, the
+        canonical display name resolved from the GUID (the same resolution
+        the guest leg itself performs). Fail-closed: when profiles ARE
+        configured, an unresolvable GUID raises CredentialError instead of
+        silently running the global admin against a profiled VM (a GUID
+        string could even match a wildcard pattern, and a transient lookup
+        failure followed by a successful guest resolution would otherwise
+        swap identities mid-call). With ZERO profiles the degenerate case
+        falls back exactly as at base — byte-identical legacy behavior
+        (pinned by C26 both arms). A GUID that resolves to an empty name is
+        treated as unresolvable.
+        """
+        if (vm_name or "").strip():
+            return vm_name
+        if not (vm_id or "").strip():
+            return ""
+        try:
+            resolved_name = str(vmident.resolve(_cfg(), vm_id=vm_id).name or "")
+        except Exception:
+            resolved_name = ""
+        if resolved_name:
+            return resolved_name
+        if _cfg().credential_profiles:
+            raise CredentialError(
+                f"cannot resolve the canonical VM name for GUID {vm_id!r}; "
+                "credential profiles are configured, so the call refuses "
+                "rather than run the global admin against a profiled VM — "
+                "address the VM by name or fix the host metadata"
+            )
+        return vm_id
+
+    def _cred_args(
+        vm: str, u: str = "", p: str = "",
+    ) -> credentials.CredentialSet:
         if creds_allowed and (u or p):
-            return credentials.resolve_guest(u, p)
-        return credentials.resolve_guest()
+            return credentials.resolve_guest(vm_name=vm, username=u, password=p)
+        return credentials.resolve_guest(vm_name=vm)
 
     def _audit(tool: str, vm: str, category: str, lease_ref: str | None = None):
         return auditlog.operation(tool=tool, vm_name=vm, category=category,
@@ -934,7 +971,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 lifecycle.configure_kdnet, _cfg(), vm_name,
                 host_ip=host_ip, port=port, key=key, reboot=reboot,
                 confirm=confirm, vm_id=vm_id,
-                cred_factory=lambda: _cred_args(username, password),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
             )
 
         @mcp.tool()
@@ -965,7 +1002,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 lifecycle.configure_kdcom, _cfg(), vm_name,
                 pipe_name=pipe_name, com_port=com_port, reboot=reboot,
                 confirm=confirm, vm_id=vm_id,
-                cred_factory=lambda: _cred_args(username, password),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
             )
 
     else:
@@ -999,7 +1036,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 lifecycle.configure_kdnet, _cfg(), vm_name,
                 host_ip=host_ip, port=port, key=key, reboot=reboot,
                 confirm=confirm, vm_id=vm_id,
-                cred_factory=credentials.resolve_guest,
+                cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
             )
 
         @mcp.tool()
@@ -1029,7 +1066,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 lifecycle.configure_kdcom, _cfg(), vm_name,
                 pipe_name=pipe_name, com_port=com_port, reboot=reboot,
                 confirm=confirm, vm_id=vm_id,
-                cred_factory=credentials.resolve_guest,
+                cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
             )
 
     # ---- guest execution ------------------------------------------------
@@ -1061,7 +1098,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_guest_run_ps", vm_name, "exec",
                 guestexec.guest_run_ps, _cfg(), vm_name, script,
                 timeout_ms=timeout_ms, elevated=elevated, confirm=confirm,
-                vm_id=vm_id, cred_factory=lambda: _cred_args(username, password),
+                vm_id=vm_id, cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
             )
 
         @mcp.tool()
@@ -1089,7 +1126,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_guest_run", vm_name, "exec",
                 guestexec.guest_run, _cfg(), vm_name, command, args, cwd,
                 timeout_ms=timeout_ms, elevated=elevated, confirm=confirm,
-                vm_id=vm_id, cred_factory=lambda: _cred_args(username, password),
+                vm_id=vm_id, cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
             )
 
         @mcp.tool()
@@ -1116,7 +1153,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_guest_put", vm_name, "transfer",
                 filetransfer.guest_put, _cfg(), vm_name, local_path, remote_path,
                 confirm=confirm, verify=verify, vm_id=vm_id,
-                cred_factory=lambda: _cred_args(username, password),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
             )
 
         @mcp.tool()
@@ -1142,7 +1179,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_guest_get", vm_name, "transfer",
                 filetransfer.guest_get, _cfg(), vm_name, remote_path, local_path,
                 verify=verify, vm_id=vm_id,
-                cred_factory=lambda: _cred_args(username, password),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
             )
 
         @mcp.tool()
@@ -1164,7 +1201,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_guest_tool(
                 "hyperv_guest_read_file", vm_name, "transfer",
                 filetransfer.guest_read_file, _cfg(), vm_name, remote_path, max_bytes,
-                vm_id=vm_id, cred_factory=lambda: _cred_args(username, password),
+                vm_id=vm_id, cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
             )
 
         @mcp.tool()
@@ -1185,7 +1222,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_guest_tool(
                 "hyperv_guest_list_dir", vm_name, "transfer",
                 filetransfer.guest_list_dir, _cfg(), vm_name, remote_path,
-                vm_id=vm_id, cred_factory=lambda: _cred_args(username, password),
+                vm_id=vm_id, cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
             )
 
     else:
@@ -1212,7 +1249,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_guest_run_ps", vm_name, "exec",
                 guestexec.guest_run_ps, _cfg(), vm_name, script,
                 timeout_ms=timeout_ms, elevated=elevated, confirm=confirm,
-                vm_id=vm_id, cred_factory=credentials.resolve_guest,
+                vm_id=vm_id, cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
             )
 
         @mcp.tool()
@@ -1238,7 +1275,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_guest_run", vm_name, "exec",
                 guestexec.guest_run, _cfg(), vm_name, command, args, cwd,
                 timeout_ms=timeout_ms, elevated=elevated, confirm=confirm,
-                vm_id=vm_id, cred_factory=credentials.resolve_guest,
+                vm_id=vm_id, cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
             )
 
         @mcp.tool()
@@ -1261,7 +1298,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_guest_put", vm_name, "transfer",
                 filetransfer.guest_put, _cfg(), vm_name, local_path, remote_path,
                 confirm=confirm, verify=verify, vm_id=vm_id,
-                cred_factory=credentials.resolve_guest,
+                cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
             )
 
         @mcp.tool()
@@ -1282,7 +1319,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_guest_tool(
                 "hyperv_guest_get", vm_name, "transfer",
                 filetransfer.guest_get, _cfg(), vm_name, remote_path, local_path,
-                verify=verify, vm_id=vm_id, cred_factory=credentials.resolve_guest,
+                verify=verify, vm_id=vm_id, cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
             )
 
         @mcp.tool()
@@ -1301,7 +1338,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_guest_tool(
                 "hyperv_guest_read_file", vm_name, "transfer",
                 filetransfer.guest_read_file, _cfg(), vm_name, remote_path, max_bytes,
-                vm_id=vm_id, cred_factory=credentials.resolve_guest,
+                vm_id=vm_id, cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
             )
 
         @mcp.tool()
@@ -1316,7 +1353,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_guest_tool(
                 "hyperv_guest_list_dir", vm_name, "transfer",
                 filetransfer.guest_list_dir, _cfg(), vm_name, remote_path,
-                vm_id=vm_id, cred_factory=credentials.resolve_guest,
+                vm_id=vm_id, cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
             )
 
     # ---- victim execution (env-only credentials, never elevated) --------
@@ -1340,7 +1377,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             "hyperv_victim_run", vm_name, "victim",
             guestexec.victim_run, _cfg(), vm_name, command, args, cwd,
             timeout_ms=timeout_ms, vm_id=vm_id,
-            cred_factory=credentials.resolve_victim,
+            cred_factory=lambda: credentials.resolve_victim(vm_name=_vm_key(vm_name, vm_id)),
         )
 
     @mcp.tool()
@@ -1360,7 +1397,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             "hyperv_victim_run_ps", vm_name, "victim",
             guestexec.victim_run_ps, _cfg(), vm_name, script,
             timeout_ms=timeout_ms, vm_id=vm_id,
-            cred_factory=credentials.resolve_victim,
+            cred_factory=lambda: credentials.resolve_victim(vm_name=_vm_key(vm_name, vm_id)),
         )
 
     # ---- console (WMI screenshot / keyboard / mouse) --------------------
@@ -2282,7 +2319,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_ui_tool(
                 "hyperv_ui_inspect", vm_name, "read", uia.inspect,
                 _cfg(), vm_name,
-                cred_factory=lambda: _cred_args(username, password),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 ref_arg=True,
                 selector=selector, depth=depth, max_elements=max_elements,
                 adapter=adapter, vm_id=vm_id)
@@ -2317,7 +2354,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_ui_tool(
                 "hyperv_ui_find", vm_name, "read", uia.find,
                 _cfg(), vm_name,
-                cred_factory=lambda: _cred_args(username, password),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 ref_arg=True,
                 selector=selector, element_id=element_id or None,
                 adapter=adapter, vm_id=vm_id)
@@ -2354,7 +2391,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_ui_tool(
                 "hyperv_ui_invoke", vm_name, "console_input", uia.invoke,
                 _cfg(), vm_name,
-                cred_factory=lambda: _cred_args(username, password),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 ref_arg=True,
                 selector=selector, element_id=element_id or None, vm_id=vm_id)
 
@@ -2389,7 +2426,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_ui_tool(
                 "hyperv_ui_set_value", vm_name, "console_input", uia.set_value,
                 _cfg(), vm_name,
-                cred_factory=lambda: _cred_args(username, password),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 ref_arg=True,
                 selector=selector, value=value,
                 element_id=element_id or None, vm_id=vm_id)
@@ -2420,7 +2457,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_ui_tool(
                 "hyperv_ui_wait_for", vm_name, "read", uia.wait_for,
                 _cfg(), vm_name,
-                cred_factory=lambda: _cred_args(username, password),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 ref_arg=True,
                 selector=selector, gone=gone, timeout_s=timeout_s, vm_id=vm_id)
 
@@ -2451,7 +2488,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_ui_tool(
                 "hyperv_ui_focus", vm_name, "console_input", uia.focus,
                 _cfg(), vm_name,
-                cred_factory=lambda: _cred_args(username, password),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 ref_arg=True,
                 selector=selector, element_id=element_id or None, vm_id=vm_id)
 
@@ -2476,7 +2513,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_ui_tool(
                 "hyperv_ui_session_state", vm_name, "read", uia.session_state,
                 _cfg(), vm_name,
-                cred_factory=lambda: _cred_args(username, password),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 ref_arg=True, vm_id=vm_id)
 
         @mcp.tool()
@@ -2524,7 +2561,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_ui_helper_provision", vm_name, "destructive",
                 uia.provision_helper,
                 _cfg(), vm_name,
-                cred_factory=lambda: _cred_args(username, password),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 autologon=autologon, confirm=confirm, teardown=teardown,
                 vm_id=vm_id)
 
@@ -2616,7 +2653,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_ui_tool(
                 "hyperv_ui_inspect", vm_name, "read", uia.inspect,
                 _cfg(), vm_name,
-                cred_factory=lambda: _cred_args(),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
                 ref_arg=True,
                 selector=selector, depth=depth, max_elements=max_elements,
                 adapter=adapter, vm_id=vm_id)
@@ -2650,7 +2687,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_ui_tool(
                 "hyperv_ui_find", vm_name, "read", uia.find,
                 _cfg(), vm_name,
-                cred_factory=lambda: _cred_args(),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
                 ref_arg=True,
                 selector=selector, element_id=element_id or None,
                 adapter=adapter, vm_id=vm_id)
@@ -2686,7 +2723,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_ui_tool(
                 "hyperv_ui_invoke", vm_name, "console_input", uia.invoke,
                 _cfg(), vm_name,
-                cred_factory=lambda: _cred_args(),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
                 ref_arg=True,
                 selector=selector, element_id=element_id or None, vm_id=vm_id)
 
@@ -2720,7 +2757,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_ui_tool(
                 "hyperv_ui_set_value", vm_name, "console_input", uia.set_value,
                 _cfg(), vm_name,
-                cred_factory=lambda: _cred_args(),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
                 ref_arg=True,
                 selector=selector, value=value,
                 element_id=element_id or None, vm_id=vm_id)
@@ -2750,7 +2787,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_ui_tool(
                 "hyperv_ui_wait_for", vm_name, "read", uia.wait_for,
                 _cfg(), vm_name,
-                cred_factory=lambda: _cred_args(),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
                 ref_arg=True,
                 selector=selector, gone=gone, timeout_s=timeout_s, vm_id=vm_id)
 
@@ -2780,7 +2817,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_ui_tool(
                 "hyperv_ui_focus", vm_name, "console_input", uia.focus,
                 _cfg(), vm_name,
-                cred_factory=lambda: _cred_args(),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
                 ref_arg=True,
                 selector=selector, element_id=element_id or None, vm_id=vm_id)
 
@@ -2804,7 +2841,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_ui_tool(
                 "hyperv_ui_session_state", vm_name, "read", uia.session_state,
                 _cfg(), vm_name,
-                cred_factory=lambda: _cred_args(),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
                 ref_arg=True, vm_id=vm_id)
 
         @mcp.tool()
@@ -2851,7 +2888,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_ui_helper_provision", vm_name, "destructive",
                 uia.provision_helper,
                 _cfg(), vm_name,
-                cred_factory=lambda: _cred_args(),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
                 autologon=autologon, confirm=confirm, teardown=teardown,
                 vm_id=vm_id)
 
@@ -2880,7 +2917,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_diagnose_vm_access", vm_name, "read",
                 diagnostics.diagnose_vm_access, _cfg(), vm_name,
                 timeout_ms=timeout_ms, vm_id=vm_id,
-                cred_factory=lambda: _cred_args(username, password),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
             )
 
         @mcp.tool()
@@ -2909,7 +2946,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_repair_guest_access", vm_name, "guest_repair",
                 repair.repair_guest_access, _cfg(), vm_name,
                 apply=apply, confirm=confirm, vm_id=vm_id,
-                cred_factory=lambda: _cred_args(username, password),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
             )
 
         @mcp.tool()
@@ -2944,7 +2981,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_guest_job_start", vm_name, "exec",
                 guestjobs.job_start, _cfg(), vm_name, command, args, cwd,
                 timeout_ms=timeout_ms, vm_id=vm_id,
-                cred_factory=lambda: _cred_args(username, password),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 owner=auditlog.current_agent_id(),
             )
 
@@ -2970,7 +3007,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_wait_guest_recovery", vm_name, "read",
                 diagnostics.wait_guest_recovery, _cfg(), vm_name,
                 services, processes, timeout_s=timeout_s, interval_s=interval_s,
-                vm_id=vm_id, cred_factory=lambda: _cred_args(username, password),
+                vm_id=vm_id, cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
             )
 
         @mcp.tool()
@@ -2998,7 +3035,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_relay_start", vm_name, "relay",
                 relay.relay_start, _cfg(), vm_name, guest_port,
                 host_port=host_port, vm_id=vm_id,
-                cred_factory=lambda: _cred_args(username, password),
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 owner=auditlog.current_agent_id(),
             )
 
@@ -3083,7 +3120,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_diagnose_vm_access", vm_name, "read",
                 diagnostics.diagnose_vm_access, _cfg(), vm_name,
                 timeout_ms=timeout_ms, vm_id=vm_id,
-                cred_factory=credentials.resolve_guest,
+                cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
             )
 
         @mcp.tool()
@@ -3109,7 +3146,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_repair_guest_access", vm_name, "guest_repair",
                 repair.repair_guest_access, _cfg(), vm_name,
                 apply=apply, confirm=confirm, vm_id=vm_id,
-                cred_factory=credentials.resolve_guest,
+                cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
             )
 
         @mcp.tool()
@@ -3141,7 +3178,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_guest_job_start", vm_name, "exec",
                 guestjobs.job_start, _cfg(), vm_name, command, args, cwd,
                 timeout_ms=timeout_ms, vm_id=vm_id,
-                cred_factory=credentials.resolve_guest,
+                cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
                 owner=auditlog.current_agent_id(),
             )
 
@@ -3165,7 +3202,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_wait_guest_recovery", vm_name, "read",
                 diagnostics.wait_guest_recovery, _cfg(), vm_name,
                 services, processes, timeout_s=timeout_s, interval_s=interval_s,
-                vm_id=vm_id, cred_factory=credentials.resolve_guest,
+                vm_id=vm_id, cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
             )
 
         @mcp.tool()
@@ -3191,7 +3228,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_relay_start", vm_name, "relay",
                 relay.relay_start, _cfg(), vm_name, guest_port,
                 host_port=host_port, vm_id=vm_id,
-                cred_factory=credentials.resolve_guest,
+                cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
                 owner=auditlog.current_agent_id(),
             )
 
@@ -3240,7 +3277,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             """
             try:
                 with _audit("hyperv_capture_evidence", vm_name, "read"):
-                    cred = credentials.resolve_guest() if ui_tree else None
+                    cred = (
+                        credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id))
+                        if ui_tree else None
+                    )
                     result = evidence.capture_evidence(
                         _cfg(), vm_name, width, height, save_path,
                         ui_tree=ui_tree, ui_tree_depth=ui_tree_depth,
@@ -4006,6 +4046,31 @@ def main(argv: list[str] | None = None) -> int:
         print(cfg.policy_summary())
         host_target = cfg.hyperv.host
         print(f"hyperv.target {'remote host ' + host_target if host_target else 'local host'}")
+        # Issue #30: each configured profile's name, VM patterns and secret
+        # SOURCE name (+ set/not-set) — never the secret value itself.
+        for profile in cfg.credential_profiles:
+            src_name = profile.password_env or profile.password_file
+            is_file = bool(profile.password_file)
+            status = (
+                ("present" if os.path.isfile(src_name) else "missing")
+                if is_file
+                else ("set" if src_name in os.environ else "not set")
+            )
+            print(f"profile {profile.name:28}{','.join(profile.vm_patterns)}")
+            print(
+                f"  admin={profile.username} secret_source={src_name} [{status}]"
+            )
+            if profile.victim_username:
+                vsrc = profile.victim_password_env or profile.victim_password_file
+                vstatus = (
+                    ("present" if os.path.isfile(vsrc) else "missing")
+                    if profile.victim_password_file
+                    else ("set" if vsrc in os.environ else "not set")
+                )
+                print(
+                    f"  victim={profile.victim_username} "
+                    f"secret_source={vsrc} [{vstatus}]"
+                )
         for name in (
             "HYPERV_GUEST_USERNAME", "HYPERV_GUEST_PASSWORD", "HYPERV_GUEST_PASSWORD_FILE",
             "HYPERV_GUEST_VICTIM_USERNAME", "HYPERV_GUEST_VICTIM_PASSWORD",
@@ -4105,13 +4170,20 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
 
-if __name__ == "__main__":
-    sys.exit(main())
-
-
 def _operations_task_preflight(name: str, arguments: dict) -> None:
     """The tasks-interceptor preflight: resolves the registered Tool so the
     SDK argument validation runs (R13), then the shared synchronous gates."""
     tools = getattr(get_mcp(), "_tool_manager", None)
     tool = (getattr(tools, "_tools", {}) or {}).get(name)
     _operations_preflight(name, arguments, tool)
+
+
+if __name__ == "__main__":
+    # Deliberately the LAST executable statement: running via
+    # `python -m hyperv_mcp.server` (the --check-env diagnostic path and the
+    # issue-#30 acceptance argv) executes top-to-bottom, so everything main()
+    # can reach — including the bootstrap()'s tasks-extension preflight above
+    # — must already be defined. A def placed after this block used to
+    # NameError on exactly the configs that loaded far enough to register
+    # tools (masked at base only because the bad-config run died earlier).
+    sys.exit(main())

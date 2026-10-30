@@ -119,14 +119,15 @@ class SessionKey(NamedTuple):
 
 
 def credential_profile(cred: CredentialSet) -> str:
-    """The credential-profile component of a session key.
+    """The credential-profile component of a session key (issue #30).
 
-    Workstream G PR 1 (issue #30) owns real per-VM credential profiles and is
-    still open, so no profile name exists in the tree yet. Until it lands there
-    is exactly one global credential set per process, and the profile is
-    derived from the credential IDENTITY: the username, for debuggability, plus
-    16 hex characters of an HMAC-SHA-256 over the username and password under
-    the process-local :data:`_PROFILE_KEY`.
+    A NAMED credential profile (``cred.profile`` set by the resolver) is the
+    component verbatim: the profile name is the stable, readable identity the
+    key exists to carry. The ``"default"`` sentinel keeps the interim
+    behavior: the component is derived from the credential IDENTITY — the
+    username, for debuggability, plus 16 hex characters of an HMAC-SHA-256
+    over the username and password under the process-local
+    :data:`_PROFILE_KEY`.
 
     Why not a plain digest of the password: a truncated SHA-256 of the password
     is an offline dictionary verifier — anyone who reads a pool key out of a
@@ -134,14 +135,20 @@ def credential_profile(cred: CredentialSet) -> str:
     ``Administrator:6b1f…``". Keying the HMAC with a per-process random secret
     removes that: the same credential produces a different string in a
     different process, so an observed value verifies nothing anywhere else.
+    A named profile needs none of that — the name is not secret material.
 
-    Discriminating today: two credentials that share a username and differ only
-    by password get different profiles, so a rotated password can never inherit
-    a session opened under the old one. Stable within a process, so a caller
-    that re-resolves the same credential reuses its session.
-
-    When Workstream G lands, this function is the one place that changes.
+    Discriminating: two default-profile credentials that share a username and
+    differ only by password get different components, so a rotated password
+    can never inherit a session opened under the old one. Role separation
+    rides the guestexec composition (``#victim`` suffix), not here: this
+    function answers "which credential identity", the caller answers "which
+    role".
     """
+    # Issue #30: a named profile IS the component — the stable, readable
+    # identity the key exists to carry. The "default" sentinel keeps the
+    # interim identity HMAC (rotated-password discrimination preserved).
+    if getattr(cred, "profile", "default") not in ("", "default"):
+        return cred.profile
     digest = hmac.new(
         _PROFILE_KEY,
         f"{cred.username}\0{cred.password}".encode(),

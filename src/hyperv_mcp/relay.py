@@ -55,7 +55,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from . import consolebench, credentials, policy, pswindows, statestore, vmident
+from . import consolebench, guestjobs, policy, pswindows, statestore, vmident
 from .config import Config
 from .credentials import CredentialError, CredentialSet
 from .diagnostics import build_guest_script
@@ -114,6 +114,7 @@ def _cred_ref(cred: CredentialSet | None) -> str:
 def _row(entry: dict[str, Any], state: str) -> statestore.RelayRow:
     """Project a registry entry onto a store row. The per-relay secret and the
     live credential are deliberately absent: neither is ever persisted."""
+    cred = entry.get("context", {}).get("cred")
     return statestore.RelayRow(
         relay_id=str(entry["relay_id"]),
         vm_name=str(entry.get("vm_name") or ""),
@@ -123,8 +124,17 @@ def _row(entry: dict[str, Any], state: str) -> statestore.RelayRow:
         host_port=int(entry.get("host_port") or 0),
         started_at=str(entry.get("started_at") or ""),
         state=state,
-        cred_ref=str(entry.get("cred_ref") or _cred_ref(entry.get("context", {}).get("cred"))),
+        cred_ref=str(entry.get("cred_ref") or _cred_ref(cred)),
         owner=entry.get("owner"),
+        # Issue #30: the credential IDENTITY (never the secret). '' profile =
+        # the global credential sentinel; restore binds on both fields.
+        cred_profile=str(
+            entry.get("cred_profile")
+            or guestjobs._cred_profile_label(cred)
+        ),
+        cred_username=str(
+            entry.get("cred_username") or getattr(cred, "username", "") or ""
+        ),
     )
 
 
@@ -158,13 +168,22 @@ def _restored_entry(cfg: Config, row: statestore.RelayRow,
         return None
     cred = None
     if row.cred_ref != "inline":
+        # Issue #30: the shared binding helper re-resolves through the
+        # NAMED PROFILE the relay started with (or the recorded username for
+        # a pre-profile row) and refuses on any identity drift. A restored
+        # relay's credential is only needed to STOP it, and a stop of an
+        # interrupted relay performs no guest leg — a CredentialError here
+        # leaves cred None, so the identity refusal surfaces if (and only
+        # if) something actually needs the credential.
         try:
-            cred = credentials.resolve_guest()
+            cred = guestjobs._restored_credential(cfg, {
+                "job_id": row.relay_id,
+                "vm_name": row.vm_name,
+                "cred_ref": row.cred_ref,
+                "cred_profile": row.cred_profile,
+                "cred_username": row.cred_username,
+            })
         except CredentialError:
-            # A restored relay's credential is only needed to STOP it, and a
-            # stop of an interrupted relay performs no guest leg. Leave it None
-            # and let the request path (which no longer exists) be the only
-            # thing that would have needed it.
             cred = None
     context: dict[str, Any] = {
         "cfg": cfg,
@@ -193,6 +212,8 @@ def _restored_entry(cfg: Config, row: statestore.RelayRow,
         "stopped": row.state == statestore.RELAY_STOPPED,
         "row_state": row.state,
         "cred_ref": row.cred_ref,
+        "cred_profile": row.cred_profile,
+        "cred_username": row.cred_username,
     }
     if entry["row_state"] == statestore.RELAY_ACTIVE:
         # A row not in the local registry has no listener HERE: its listener
@@ -926,6 +947,10 @@ def relay_start(
             "owner": owner,
             "started_at": _utc_now_iso(),
             "stopped": False,
+            # Issue #30: the credential identity rides the entry so the row
+            # persists it (never the secret) and restore binds on it.
+            "cred_profile": guestjobs._cred_profile_label(cred),
+            "cred_username": str(getattr(cred, "username", "") or ""),
         }
         with _relays_lock:
             _relays[relay_id] = entry

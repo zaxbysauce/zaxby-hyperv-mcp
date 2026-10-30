@@ -235,7 +235,9 @@ def test_v2_store_migrates_forward_to_v3_with_all_tables(tmp_path):
     store = statestore.open(str(db))
     try:
         version = sqlite3.connect(str(db)).execute("PRAGMA user_version").fetchone()[0]
-        assert version == statestore.SCHEMA_VERSION == 3, version
+        # Issue #30: SCHEMA_VERSION moved 3 -> 4 (cred_profile/cred_username);
+        # a v2 store migrates all the way to the current version.
+        assert version == statestore.SCHEMA_VERSION == 4, version
         names = {
             row[0] for row in sqlite3.connect(str(db)).execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")

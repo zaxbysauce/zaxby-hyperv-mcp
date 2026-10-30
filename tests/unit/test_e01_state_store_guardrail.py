@@ -51,10 +51,15 @@ _REQUIRED_JOB_COLUMNS = {
     "job_id", "vm_name", "vm_id", "pid", "start_time_ticks", "job_dir",
     "out_path", "err_path", "exit_path", "started_at", "state", "cred_ref",
     "owner",
+    # Issue #30: the credential identity a job started with (never the
+    # secret). '' profile = the global credential sentinel.
+    "cred_profile", "cred_username",
 }
 _REQUIRED_RELAY_COLUMNS = {
     "relay_id", "vm_name", "vm_id", "guest_port", "bind", "host_port",
     "started_at", "state", "cred_ref", "owner",
+    # Issue #30: same identity binding as the jobs table.
+    "cred_profile", "cred_username",
 }
 # Issue #23. The fencing counter columns are named *_seq (NOT *_token)
 # deliberately: "token" is a forbidden fragment, and narrowing that list to
