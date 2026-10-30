@@ -3086,7 +3086,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             """
             try:
                 with _audit("hyperv_capture_evidence", vm_name, "read"):
-                    cred = _cred_args(username, password) if ui_tree else None
+                    cred = (
+                        _cred_args(_vm_key(vm_name, vm_id), username, password)
+                        if ui_tree else None
+                    )
                     result = evidence.capture_evidence(
                         _cfg(), vm_name, width, height, save_path,
                         ui_tree=ui_tree, ui_tree_depth=ui_tree_depth,
