@@ -755,24 +755,28 @@ class Config:
             victim_username = entry.get("victim_username", "")
             victim_env = entry.get("victim_password_env", "")
             victim_file = entry.get("victim_password_file", "")
+            secret_v = ("", "")
             if victim_username or victim_env or victim_file:
                 if not isinstance(victim_username, str) or not victim_username.strip():
                     raise ConfigError(
                         f"credential_profiles[{name}].victim_username must be a "
                         "non-empty string when victim credentials are configured"
                     )
-                self._set_profile_secret(
+                secret_v = self._set_profile_secret(
                     name, entry, "victim_password_env", "victim_password_file",
                 )
             profiles.append(CredentialProfile(
                 name=name.strip(),
-                vm_patterns=tuple(patterns),
+                vm_patterns=tuple(p.strip() for p in patterns),
                 username=username.strip(),
                 password_env=secret[0],
                 password_file=secret[1],
                 victim_username=str(victim_username or "").strip(),
-                victim_password_env=str(victim_env or "").strip(),
-                victim_password_file=str(victim_file or "").strip(),
+                # The VALIDATED/normalized values from _set_profile_secret,
+                # not a re-derivation from the raw entry (PRR-015): the two
+                # paths normalized differently (env stripped vs file not).
+                victim_password_env=secret_v[0],
+                victim_password_file=secret_v[1],
             ))
         object.__setattr__(self, "credential_profiles", tuple(profiles))
 
@@ -813,7 +817,7 @@ class Config:
                     f"credential_profiles[{name}].{file_key} must be a non-empty "
                     "string path"
                 )
-            chosen_file = file_val
+            chosen_file = file_val.strip()
         return chosen_env, chosen_file
 
 

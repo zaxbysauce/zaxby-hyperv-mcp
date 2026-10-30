@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-from hyperv_mcp import credentials
+from hyperv_mcp import credentials, vmident
 from hyperv_mcp.config import Config
 
 LAB_A_PROFILE = {
@@ -96,6 +96,13 @@ def test_inline_capture_evidence_resolves_for_target_vm(monkeypatch):
 
     monkeypatch.setenv("LAB_A_PW", "lab-a-pass-123")
     monkeypatch.setattr(credentials, "resolve_guest", recorder)
+    # PRR-009: stub vmident at the boundary so the unit test never spawns a
+    # real host powershell.exe (execution-verified spawn without this).
+    monkeypatch.setattr(
+        vmident, "resolve",
+        lambda cfg_arg, vm_name="", vm_id="": vmident.VMRef(
+            id=vm_id or GUID, name=vm_name or "lab-a-01"),
+    )
 
     mod = importlib.reload(server_module)
     try:

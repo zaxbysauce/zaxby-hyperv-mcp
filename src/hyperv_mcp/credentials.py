@@ -184,7 +184,7 @@ def resolve_guest(
             p = _read_profile_password_file(profile)
             p_source = f"profile {profile.name} password_file"
         else:
-            p = env.get(profile.password_env, "")
+            p = _env_get(env, profile.password_env)
             p_source = f"profile {profile.name} {profile.password_env}"
         if not u or not p:
             raise CredentialError(
@@ -221,6 +221,21 @@ def _match_profiles(vm_name: str) -> list[CredentialProfile]:
     ]
 
 
+def _env_get(env: dict[str, str], name: str, default: str = "") -> str:
+    """Case-tolerant env lookup for operator-chosen names (PRR-001).
+
+    Windows materializes os.environ with upper-cased keys, so a configured
+    mixed-case secret-source name can never be found by plain dict lookup
+    even though the variable is set (and check-env's os.environ membership
+    test reports it as set). Exact hit first, then a case-insensitive
+    fallback — on case-sensitive hosts the mapping is exact, so behavior
+    there is unchanged.
+    """
+    if name in env:
+        return env[name]
+    return env.get(name.upper(), default)
+
+
 def _read_profile_password_file(profile: CredentialProfile) -> str:
     path = profile.password_file
     try:
@@ -230,6 +245,13 @@ def _read_profile_password_file(profile: CredentialProfile) -> str:
         raise CredentialError(
             f"credential profile {profile.name!r} password file {path!r} "
             f"unreadable: {exc}"
+        ) from None
+    except UnicodeDecodeError as exc:
+        # A non-UTF-8 secret file (UTF-16 is common on Windows) must surface
+        # as a credential error, not a raw ValueError (PRR-010).
+        raise CredentialError(
+            f"credential profile {profile.name!r} password file {path!r} is "
+            f"not decodable as UTF-8: {exc}"
         ) from None
 
 
@@ -303,7 +325,7 @@ def resolve_victim(
                     p = _read_profile_password_file_victim(profile)
                     p_source = f"profile {profile.name} victim_password_file"
                 else:
-                    p = env.get(profile.victim_password_env, "")
+                    p = _env_get(env, profile.victim_password_env)
                     p_source = f"profile {profile.name} {profile.victim_password_env}"
                 if not p:
                     raise CredentialError(

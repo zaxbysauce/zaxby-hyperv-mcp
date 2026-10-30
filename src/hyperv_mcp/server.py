@@ -568,23 +568,35 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         treated as unresolvable.
         """
         if (vm_name or "").strip():
-            return vm_name
+            return vm_name.strip()
+        # Profiles-first (PRR-008): with no profiles configured nothing can
+        # match, so skip the extra canonical-name resolution entirely — the
+        # zero-profile path keeps base behavior byte-identically, including
+        # its host-PowerShell cost.
+        if not _cfg().credential_profiles:
+            return vm_id
         if not (vm_id or "").strip():
             return ""
+        # Deliberately NARROW (PRR-003): a policy denial or a host fault is
+        # not a credential problem — let vmident's own exceptions carry their
+        # true error_class (policy/busy/transport) instead of masking them as
+        # a credential refusal.
         try:
-            resolved_name = str(vmident.resolve(_cfg(), vm_id=vm_id).name or "")
-        except Exception:
-            resolved_name = ""
+            resolved = vmident.resolve(_cfg(), vm_id=vm_id)
+        except ValueError:
+            # A genuinely unknown GUID is the credential-shaped unresolvable;
+            # PolicyDenied/PowerShellBusy/transport propagate with their true
+            # error_class instead of being masked as "credential" (PRR-003).
+            resolved = None
+        resolved_name = str(getattr(resolved, "name", "") or "").strip()
         if resolved_name:
             return resolved_name
-        if _cfg().credential_profiles:
-            raise CredentialError(
-                f"cannot resolve the canonical VM name for GUID {vm_id!r}; "
-                "credential profiles are configured, so the call refuses "
-                "rather than run the global admin against a profiled VM — "
-                "address the VM by name or fix the host metadata"
-            )
-        return vm_id
+        raise CredentialError(
+            f"cannot resolve the canonical VM name for GUID {vm_id!r}; "
+            "credential profiles are configured, so the call refuses "
+            "rather than run the global admin against a profiled VM — "
+            "address the VM by name or fix the host metadata"
+        )
 
     def _cred_args(
         vm: str, u: str = "", p: str = "",

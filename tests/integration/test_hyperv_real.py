@@ -1157,9 +1157,24 @@ def test_credential_profiles_two_vms_two_admins():
         )
 
     user_a = os.environ["HYPERV_GUEST_USERNAME"]
+    # PRR-013: the conftest gate accepts a PASSWORD_FILE host, but a profile
+    # can only carry ONE secret source. Mirror the gate here: prefer the env
+    # variable, fall back to the file (path kept in the env so the resolver
+    # finds it), and skip when the host's global credential shape cannot be
+    # expressed as a profile secret source.
+    user_a = os.environ["HYPERV_GUEST_USERNAME"].strip()
+    if os.environ.get("HYPERV_GUEST_PASSWORD_FILE", "").strip():
+        pw_a_source = ("password_file",
+                       os.environ["HYPERV_GUEST_PASSWORD_FILE"].strip())
+    elif os.environ.get("HYPERV_GUEST_PASSWORD", "").strip():
+        pw_a_source = ("password_env", "HYPERV_GUEST_PASSWORD")
+    else:
+        pytest.skip("global credential is neither HYPERV_GUEST_PASSWORD nor "
+                    "HYPERV_GUEST_PASSWORD_FILE; a profile needs exactly one "
+                    "secret source")
     profile_a = {
         "name": "vm-a-admin", "vm_patterns": [vm_a], "username": user_a,
-        "password_env": "HYPERV_GUEST_PASSWORD",
+        pw_a_source[0]: pw_a_source[1],
     }
     profile_b = {
         "name": "vm-b-admin", "vm_patterns": [vm_b], "username": user_b,

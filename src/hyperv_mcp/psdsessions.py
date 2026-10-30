@@ -118,6 +118,19 @@ class SessionKey(NamedTuple):
         )
 
 
+def _cred_fp(cred: CredentialSet) -> str:
+    """In-memory credential fingerprint for retire-on-change (PRR-004).
+
+    A truncated SHA-256 over the username and password. Never persisted,
+    never logged, never compared across processes — it exists only so an
+    acquire() can tell that the credential behind a same-named-profile key
+    has changed and retire the stale session.
+    """
+    return hashlib.sha256(
+        f"{cred.username}{chr(0)}{cred.password}".encode()
+    ).hexdigest()[:16]
+
+
 def credential_profile(cred: CredentialSet) -> str:
     """The credential-profile component of a session key (issue #30).
 
@@ -160,14 +173,25 @@ def credential_profile(cred: CredentialSet) -> str:
 class _Entry:
     """One pooled session: its worker, its checkout state and its idle clock."""
 
-    __slots__ = ("key", "worker", "in_use", "last_used", "doomed", "open_ms")
+    __slots__ = ("key", "worker", "in_use", "last_used", "doomed", "open_ms",
+                 "cred_fp")
 
-    def __init__(self, key: SessionKey, worker: Any, open_ms: int | None = None) -> None:
+    def __init__(self, key: SessionKey, worker: Any, open_ms: int | None = None,
+                 cred_fp: str = "") -> None:
         self.key = key
         self.worker = worker
         self.in_use = False
         self.last_used = 0.0
         self.doomed = False
+        # Issue #30 / PRR-004: for a NAMED profile the key component is the
+        # profile NAME, which is invariant under a username change or a
+        # password rotation — so the key alone can no longer detect identity
+        # drift. The entry carries an in-memory fingerprint (never persisted,
+        # never logged) of the credential it was established WITH; acquire
+        # retires the worker when the fingerprint of the incoming credential
+        # differs, restoring the pre-#30 rotation guarantee for named
+        # profiles.
+        self.cred_fp = cred_fp
         #: Milliseconds spent spawning this worker and establishing its session.
         #: Reported once, on the call that opened it, and never again.
         self.open_ms = open_ms
@@ -260,9 +284,18 @@ class SessionPool:
                     raise SessionBusy("the session pool is closed")
                 entry = self._entries.get(key)
                 if entry is not None and not entry.doomed and not entry.in_use:
-                    entry.in_use = True
-                    entry.last_used = self._clock()
-                    return entry.worker
+                    # PRR-004: a named-profile key does not move when the
+                    # credential rotates; a fingerprint mismatch means the
+                    # stored worker authenticates with a superseded identity —
+                    # retire it (idle-TTL/cap eviction is not enough) and let
+                    # the create path below open a fresh session with the
+                    # incoming credential.
+                    if cred is not None and entry.cred_fp and entry.cred_fp != _cred_fp(cred):
+                        entry.doomed = True
+                    else:
+                        entry.in_use = True
+                        entry.last_used = self._clock()
+                        return entry.worker
                 # Only take the create path when nothing is closing this VM's
                 # sessions: see `_invalidating`.
                 gate = (
@@ -277,6 +310,11 @@ class SessionPool:
                 # correct response.
                 with gate:
                     worker = self._create_locked(key, cred)
+                    if worker is not None and cred is not None:
+                        with self._mu:
+                            held = self._entries.get(key)
+                            if held is not None and held.worker is worker:
+                                held.cred_fp = _cred_fp(cred)
                     if worker is not None:
                         # A close for this VM may have landed while the factory
                         # ran. Re-check under the lock so a session the pool has

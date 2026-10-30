@@ -300,7 +300,7 @@ All guest-facing tools authenticate to the guest via PowerShell Direct.
 Resolution order:
 
 1. **A matching credential profile** (0.7.0, issue #30) — see
-   [Per-VM credential profiles](#per-vm-credential-profiles-07-0-issue-30)
+   [Per-VM credential profiles](#per-vm-credential-profiles-070-issue-30)
    below. When several profiles match one VM the server refuses to start the
    leg (fail-closed); when none matches, the global variables apply.
 2. `HYPERV_GUEST_USERNAME` + one of:
@@ -351,6 +351,9 @@ to a named credential profile:
 ```
 
 Rules:
+
+- The key must carry at least one profile: an explicit empty list is a
+  load error. Omit the key entirely for the zero-profile behavior.
 
 - Matching is case-insensitive fnmatch against the target VM's canonical
   name — the same semantics as `allowed_vm_patterns`. A profile never grants
@@ -519,7 +522,9 @@ What the store holds, and what it never holds:
 
 - **Holds** — `job_id`, VM name and GUID, PID and its start-time identity,
   the job directory and stream paths, `started_at`, lifecycle state, the
-  owning agent, and a *credential reference* (`env`, `file`, or `inline`).
+  owning agent, and a *credential reference* (`env`, `file`, or `inline`) plus, for rows
+  written since the identity binding shipped, the recorded *credential
+  identity* (`cred_profile`/`cred_username` — never the secret).
 - **Never holds** — no password, no password-file content, no command text,
   no argument text, and no relay capability secret. A restored job re-resolves
   its credential from the source it was started with, which registers the
@@ -539,7 +544,7 @@ Lifecycle after a restart:
   credential error rather than silently substituting whatever credentials the
   environment now holds.
 
-The schema is versioned with `PRAGMA user_version` (this release sets 3; a
+The schema is versioned with `PRAGMA user_version` (this release sets 4; a
 v1 database written by 0.4.x gains the lease tables automatically on first
 open, and a v2 database written by 0.5.x gains the `ops`/`events`/`meta`
 tables the same way — every migration is additive and transactional) and
@@ -1325,8 +1330,11 @@ What the pool does and does not touch:
 
 Invalidation. A session is closed when the VM is
 checkpoint-restored, checkpoint-removed, stopped, reset or started, when a
-debugging configuration reboots the guest, and when its credential profile is
-rotated. Each lifecycle tool invalidates
+debugging configuration reboots the guest, and when the credential behind a
+profiled session changes (a rotated password or changed username under the
+same profile name is detected by the session pool's in-memory credential
+fingerprint and the stale session is retired; across a server restart the
+restore-time identity binding refuses instead). Each lifecycle tool invalidates
 after the action **succeeds** — a failed action leaves the guest as it was and
 invalidates nothing. A session is also closed when it reports itself Broken or
 Closed, and on a transport error during use. The next call then retries once on a fresh session, but only

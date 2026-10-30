@@ -175,6 +175,7 @@ def _restored_entry(cfg: Config, row: statestore.RelayRow,
         # interrupted relay performs no guest leg — a CredentialError here
         # leaves cred None, so the identity refusal surfaces if (and only
         # if) something actually needs the credential.
+        drift = False
         try:
             cred = guestjobs._restored_credential(cfg, {
                 "job_id": row.relay_id,
@@ -184,7 +185,26 @@ def _restored_entry(cfg: Config, row: statestore.RelayRow,
                 "cred_username": row.cred_username,
             })
         except CredentialError:
+            # PRR-006: the refusal cannot reach an operator surface from here
+            # (an interrupted relay has no listener and stopping it performs
+            # no guest leg), but the drift must not stay silent AND the row
+            # must not keep advertising an identity that no longer resolves.
+            # Emit a durable event and blank the stale labels; the next
+            # relay_stop re-persists the row with cred_profile/cred_username
+            # cleared, so the store stops asserting a binding that failed.
+            drift = True
             cred = None
+        if drift:
+            try:
+                from . import operations as _ops
+
+                _ops.emit(cfg, "relay.identity_drift", row.relay_id,
+                          row.vm_id, row.owner, {
+                              "cred_profile": row.cred_profile,
+                              "cred_username": row.cred_username,
+                          })
+            except Exception:
+                pass  # best-effort, matching every other _ops.emit site
     context: dict[str, Any] = {
         "cfg": cfg,
         "vm_name": row.vm_name,
@@ -853,7 +873,13 @@ def relay_start(
                     relay_id=relay_id, vm_name=ref.name, vm_id=ref.id,
                     guest_port=int(guest_port), bind=bind,
                     started_at=started_at, state=statestore.RELAY_ACTIVE,
-                    cred_ref=_cred_ref(cred), owner=owner,
+                    # cred_ref="inline" (PRR-006, matching the job
+                    # placeholder): a relay that died between this
+                    # reservation and the registration upsert must REFUSE
+                    # re-attach, never silently bind the global credential —
+                    # the identity columns are only persisted with the
+                    # registration row.
+                    cred_ref="inline", owner=owner,
                 ))
                 _mark_store_wrote(relay_id)
         except BaseException:

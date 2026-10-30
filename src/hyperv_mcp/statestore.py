@@ -1632,6 +1632,19 @@ def open(path: str) -> Store:
             with store._lock:  # noqa: SLF001 - open() owns construction
                 store._begin()  # noqa: SLF001
                 try:
+                    # PRR-002 (pr111 review): the version read at the top of
+                    # the loop predates BEGIN IMMEDIATE, so on a shared store
+                    # a peer's committed v3->v4 migration could leave THIS
+                    # opener holding a stale `found` — and the v4 ALTERs are
+                    # the first non-idempotent migrations in this module
+                    # (plain ADD COLUMN), surfacing as an unretryable
+                    # "duplicate column name". Re-read the version under the
+                    # write lock; the earlier read still drives the
+                    # newer-store pre-check above.
+                    found_locked = int(
+                        con.execute("PRAGMA user_version").fetchone()[0]
+                    )
+                    found = found_locked
                     if found == SCHEMA_VERSION and not _tables_present(con):
                         # A store claiming the CURRENT version with none of
                         # its tables is corrupt (hand-stamped, truncated
