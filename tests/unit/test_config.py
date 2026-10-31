@@ -29,6 +29,9 @@ def test_defaults_deny_every_axis():
     # issue #29: the UIA helper axes default denied
     assert not cfg.destructive.ui_input
     assert not cfg.destructive.ui_provision
+    # issues #31/#33: VM removal and offline harvest default denied
+    assert not cfg.destructive.vm_remove
+    assert not cfg.destructive.offline_harvest
     assert cfg.destructive.require_confirm
     assert not cfg.allow_inline_credentials
 
