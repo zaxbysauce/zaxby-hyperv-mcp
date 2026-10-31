@@ -199,6 +199,14 @@ def vm_create(
         "  throw\n"
         "}",
     ]
+    # Issue #94: the validated cpu_count must reach the created VM. A separate
+    # Set-VMProcessor leg after the New-VM try/catch (matching the issue's
+    # CORRECTED wording) keeps the orphan-cleanup contract pre-New-VM only: a
+    # failure here leaves the created VM in place, the same post-creation
+    # failure semantics as the switch connect below.
+    lines.append(
+        f"Set-VMProcessor -VM $vm -Count {int(cpu_count)} -ErrorAction Stop"
+    )
     if switch_name:
         lines.append(
             f"Connect-VMNetworkAdapter -VMNetworkAdapter (Get-VMNetworkAdapter -VM $vm) "

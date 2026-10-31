@@ -1823,7 +1823,7 @@ served transport and exits non-zero if the WMI plane could not serve.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_vm_create` | `name`, `vhd_path`, `memory_mb=2048`, `cpu_count=1`, `generation=2`, `vhd_size_gb=64`, `switch_name?`, `confirm` | `{ok, id, name, state, generation}` |
+| `hyperv_vm_create` | `name`, `vhd_path`, `memory_mb=2048`, `cpu_count=1` (applied to the new VM via `Set-VMProcessor`), `generation=2`, `vhd_size_gb=64`, `switch_name?`, `confirm` | `{ok, id, name, state, generation}` |
 | `hyperv_vm_disk_add` | `vm_name` or `vm_id`, `path`, `size_gb`, `controller_type=SCSI`, `confirm` | `{ok, vhd_path, disk_count}` (`disk_count` is `null` if the post-add read failed) |
 | `hyperv_vm_disk_list` | `vm_name` or `vm_id` | `{ok, disks[]}` |
 | `hyperv_vm_media_attach` | `vm_name` or `vm_id`, `iso_path` | `{ok, iso_path, attached}` (`attached` is `null` if the post-attach read failed) |
