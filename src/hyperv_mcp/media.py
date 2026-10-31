@@ -269,6 +269,9 @@ def vm_clone(
     # vm_create/vm_disk_add aimed at it), silently breaking every child —
     # lock it read-only before the first child exists. stat.S_IWRITE
     # reflects the Windows read-only attribute and also works on Linux CI.
+    # Review M8: a refused clone must not leave the mutation behind — any
+    # failure after the chmod restores the previous attribute (success keeps
+    # the parent locked, by design).
     made_read_only = False
     if os.stat(parent).st_mode & stat.S_IWRITE:
         os.chmod(parent, os.stat(parent).st_mode & ~stat.S_IWRITE)
@@ -319,7 +322,14 @@ def vm_clone(
     with vmlocks.vm_lock(name):
         if os.path.isfile(child):
             raise MediaError(f"VHD already exists: {child} (refusing to overwrite)")
-        result = _run(cfg, "\n".join(lines), f"vm_clone({name})", timeout_s=300)
+        try:
+            result = _run(cfg, "\n".join(lines), f"vm_clone({name})", timeout_s=300)
+        except Exception:
+            if made_read_only:
+                # M8: the clone was refused — undo the attribute lock so a
+                # refused call is side-effect free.
+                os.chmod(parent, os.stat(parent).st_mode | stat.S_IWRITE)
+            raise
     out = _json_out(result, "vm_clone")
     base = {"ok": True, **out} if isinstance(out, dict) else {"ok": True}
     base.update({
@@ -351,6 +361,9 @@ def vm_remove(
         cfg, "vm_remove", confirm, f"remove VM '{vm_name or vm_id}'"
         + (" and its own disk files" if delete_disks else ""))
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    # operations imports media transitively (runner bodies); import lazily to
+    # avoid the cycle — the cancel hook is a no-op outside detached ops.
+    from . import operations
     with vmlocks.vm_lock(ref.id):
         # State gate on its own leg BEFORE any removal script is generated: a
         # saved VM's unflushed cache lives in its saved-state file, and removal
@@ -367,7 +380,15 @@ def vm_remove(
         # One removal script: collect owned candidates + ancestors (the
         # ownership walk stops at the VM's own base disk; every ParentPath
         # beyond it is NOT owned), then Remove-VM bound to the resolved GUID.
+        # M9: the script RE-ASSERTS Off on the same $vm object it removes —
+        # the standalone state gate above cannot bind an out-of-band actor
+        # (Hyper-V Manager / another state DB) that starts the VM between
+        # the two PowerShell processes, and Remove-VM -Force would remove a
+        # running VM, exactly what the gate exists to prevent.
         removal = _resolve_vm_prefix(ref) + (
+            "if ([string]$vm.State -ne 'Off') { throw ('vm_remove requires "
+            "state Off; VM is ' + [string]$vm.State + ' (use hyperv_stop_vm "
+            "first)') }\n"
             "$owned = New-Object System.Collections.Generic.List[string]\n"
             "$anc = New-Object System.Collections.Generic.List[string]\n"
             "foreach ($d in (Get-VMHardDiskDrive -VM $vm -ErrorAction Stop)) {\n"
@@ -392,16 +413,43 @@ def vm_remove(
             "[PSCustomObject]@{ status = 'removed'; disks = @($owned); ancestors = @($anc) }"
             " | ConvertTo-Json -Compress\n"
         )
+        operations.raise_if_cancelled()
         out = _json_out(
             _run(cfg, removal, f"vm_remove({ref.name})", timeout_s=300), "vm_remove")
         out = out if isinstance(out, dict) else {}
-        disks = [str(p) for p in (out.get("disks") or [])]
+        # L6: dedupe candidates preserving order (two drives can resolve to
+        # the same base path; deleting twice would misreport already_gone).
+        disks = list(dict.fromkeys(str(p) for p in (out.get("disks") or [])))
         ancestors = [str(p) for p in (out.get("ancestors") or [])]
         if not delete_disks:
             return {"ok": True, "status": str(out.get("status") or "removed"),
                     "vm_name": ref.name}
 
         kept: list[dict] = [{"path": p, "reason": "not_owned_ancestor"} for p in ancestors]
+
+        def _cleanup_failed(exc: Exception, pending: list[str]) -> dict:
+            # M25: after Remove-VM has run, a failed post-removal leg must
+            # never surface as a bare error envelope — report the removal,
+            # keep every candidate with a reason, and mark retryable so the
+            # operator re-runs the cleanup path deliberately.
+            kept.extend({"path": p, "reason": "merge_pending"} for p in pending)
+            kept.extend(
+                {"path": p, "reason": f"cleanup_leg_failed: {exc}"}
+                for p in disks
+                if os.path.normcase(os.path.normpath(p)) not in {
+                    os.path.normcase(os.path.normpath(k["path"])) for k in kept})
+            return {
+                "ok": False,
+                "error_class": "timeout",
+                "retryable": True,
+                "error": (
+                    f"VM '{ref.name}' was removed but the post-removal "
+                    f"cleanup leg failed: {exc}"),
+                "status": str(out.get("status") or "removed"),
+                "vm_name": ref.name,
+                "deleted": [],
+                "kept": kept,
+            }
 
         # Bounded merge wait: poll until no collected .avhdx candidate remains.
         avhdx = [p for p in disks if p.lower().endswith(".avhdx")]
@@ -424,21 +472,33 @@ def vm_remove(
                     "kept": kept,
                 }
             quoted = ",".join(pswindows.ps_quote(p) for p in pending_paths)
-            poll_out = _run(
-                cfg,
-                f"$left = @({quoted}) | Where-Object {{ Test-Path -LiteralPath $_ }}\n"
-                "if (@($left).Count -gt 0) { 'merge_pending' } else { 'merge_complete' }\n",
-                f"vm_remove_merge({ref.name})", timeout_s=60,
-            ).stdout.strip()
+            operations.raise_if_cancelled()
+            try:
+                poll_out = _run(
+                    cfg,
+                    f"$left = @({quoted}) | Where-Object {{ Test-Path -LiteralPath $_ }}\n"
+                    "if (@($left).Count -gt 0) { 'merge_pending' } else { 'merge_complete' }\n",
+                    f"vm_remove_merge({ref.name})", timeout_s=60,
+                ).stdout.strip()
+            except MediaError as exc:
+                # M25: poll failure = merge state UNKNOWN — report the
+                # removal with the inventory instead of a bare error.
+                return _cleanup_failed(exc, pending_paths)
             pending_paths = [p for p in pending_paths] if poll_out == "merge_pending" else []
             merged = poll_out != "merge_pending"
-            if not merged:
+            # L18: no trailing sleep past the deadline.
+            if not merged and time.monotonic() < deadline:
                 time.sleep(_MERGE_POLL_S)
 
         # Usage leg: paths (drives AND ancestors) still referenced by other
-        # registered VMs — a second, independent keep reason.
-        usage_out = _json_out(_run(
-            cfg,
+        # registered VMs — a second, independent keep reason. The preamble
+        # binds $vmTarget (H4/UR-10: the self-exclusion guard compared
+        # against an unbound variable before). H4: with exactly one element
+        # ConvertTo-Json emits a SCALAR string, not an array — normalize it
+        # or the in_use set collapses to empty exactly in the one-other-VM
+        # case and a referenced disk gets deleted.
+        operations.raise_if_cancelled()
+        usage_script = guestexec.vm_target_preamble(ref.id) + "\n" + (
             "$usage = New-Object System.Collections.Generic.List[string]\n"
             "foreach ($other in (Get-VM -ErrorAction Stop)) {\n"
             "  if ('' + $other.Id.ToString() -eq $vmTarget) { continue }\n"
@@ -449,10 +509,19 @@ def vm_remove(
             " $u = Get-VHD -Path $u.ParentPath -ErrorAction SilentlyContinue }\n"
             "  }\n"
             "}\n"
-            "@($usage) | ConvertTo-Json -Compress\n",
-            f"vm_remove_usage({ref.name})", timeout_s=120,
-        ), "vm_remove_usage")
-        in_use = {os.path.normcase(str(p)) for p in (usage_out if isinstance(usage_out, list) else [])}
+            "@($usage) | ConvertTo-Json -Compress\n"
+        )
+        try:
+            usage_raw = _run(cfg, usage_script,
+                             f"vm_remove_usage({ref.name})", timeout_s=120)
+        except MediaError as exc:
+            return _cleanup_failed(exc, [])
+        usage_out = _json_out(usage_raw, "vm_remove_usage")
+        if isinstance(usage_out, str):
+            usage_out = [usage_out]
+        elif not isinstance(usage_out, list):
+            usage_out = []
+        in_use = {os.path.normcase(str(p)) for p in usage_out}
 
         deleted: list[str] = []
         for p in disks:

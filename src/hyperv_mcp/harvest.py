@@ -60,7 +60,13 @@ _TOTAL_MAX_BYTES = 2 * 1024 * 1024 * 1024
 
 
 class HarvestError(RuntimeError):
-    """Structured offline-harvest refusal/failure."""
+    """Structured offline-harvest refusal/failure (caller/vm-state faults:
+    not Off, remote-host mode — classified "invalid", never "transport")."""
+
+
+class HarvestPrivilegeError(HarvestError):
+    """The SeBackupPrivilege precheck refusal (issue #33 AC13: classified
+    "privilege", deterministic and non-retryable)."""
 
 
 def _run(cfg: Config, script: str, ctx: str, timeout_s: int = 600) -> pswindows.PSResult:
@@ -85,7 +91,17 @@ def _privilege_ok(listing: str) -> bool:
 
 def _action_script(guid: str, dest: str, mnt_root: str) -> str:
     """The ONE aggregate action script: mount → access-path → robocopy /B →
-    hash → finally dismount, for every disk, emitting one JSON result."""
+    hash → finally dismount, for every disk, emitting one JSON result.
+
+    Shape notes (each pinned by review rounds): the final emission uses
+    ``.ToArray()`` because ``@()`` around a ``List[object]`` throws
+    "Argument types do not match" on PS 5.1 (the hazard documented in
+    guest/uia_helper.ps1); robocopy is fully qualified (the same PATH-
+    shadowing class as the whoami live-leg catch) and its exit code is
+    inspected (>= 8 = real failure; 1 = "files copied" is success); glob
+    entries are enumerated after the copy so every copied file is hashed,
+    capped and manifested.
+    """
     dest_q = pswindows.ps_quote(dest)
     mnt_q = pswindows.ps_quote(mnt_root)
     logs = ",".join(pswindows.ps_quote(p) for p in sorted(LOG_PATHS))
@@ -122,36 +138,72 @@ def _action_script(guid: str, dest: str, mnt_root: str) -> str:
         "          $name = Split-Path $src -Leaf",
         "          $dst = Join-Path $dest $rel",
         "          $dstDir = Split-Path $dst -Parent",
-        "          if ($name -like '*[*?]*') {",
-        "            if (-not (Test-Path -LiteralPath $srcDir)) { continue }",
+        "          $isGlob = $name -like '*[*?]*'",
+        "          if ($isGlob) {",
+        "            if (-not (Test-Path -LiteralPath $srcDir)) {",
+        "              $skipped.Add([PSCustomObject]@{ path = $rel; reason = 'missing' })",
+        "              continue",
+        "            }",
         "          } elseif (-not (Test-Path -LiteralPath $src)) {",
         "            $skipped.Add([PSCustomObject]@{ path = $rel; reason = 'missing' })",
         "            continue",
         "          }",
         "          New-Item -ItemType Directory -Force -Path $dstDir | Out-Null",
-        "          robocopy $srcDir $dstDir $name /B /R:0 /W:0 /MAX:$fileMax /NFL /NDL /NJH /NJS /NP | Out-Null",
-        "          $copied = Join-Path $dstDir $name",
-        "          if (Test-Path -LiteralPath $copied) {",
-        "            $len = (Get-Item -LiteralPath $copied).Length",
+        "          # A stale copy from an earlier run must never be hashed as",
+        "          # this run's result: clear the destination match(es) first.",
+        "          if ($isGlob) {",
+        "            Get-ChildItem -LiteralPath $dstDir -Filter $name -File -ErrorAction SilentlyContinue |",
+        "              Remove-Item -Force -ErrorAction SilentlyContinue",
+        "          } else {",
+        "            Remove-Item -LiteralPath (Join-Path $dstDir $name) -Force -ErrorAction SilentlyContinue",
+        "          }",
+        "          & $env:SystemRoot\\System32\\robocopy.exe $srcDir $dstDir $name /B /XJ /R:0 /W:0 /MAX:$fileMax /NFL /NDL /NJH /NJS /NP | Out-Null",
+        "          if ($LASTEXITCODE -ge 8) {",
+        "            $skipped.Add([PSCustomObject]@{ path = $rel; reason = ('copy_failed: robocopy exit ' + $LASTEXITCODE) })",
+        "            continue",
+        "          }",
+        "          if ($isGlob) {",
+        "            $copiedList = Get-ChildItem -LiteralPath $dstDir -Filter $name -File -ErrorAction SilentlyContinue",
+        "          } else {",
+        "            $copiedList = @(Get-Item -LiteralPath (Join-Path $dstDir $name) -ErrorAction SilentlyContinue)",
+        "          }",
+        "          foreach ($copied in @($copiedList)) {",
+        "            $len = $copied.Length",
         "            if (($total + $len) -gt $totalMax) {",
-        "              Remove-Item -LiteralPath $copied -Force -ErrorAction SilentlyContinue",
+        "              Remove-Item -LiteralPath $copied.FullName -Force -ErrorAction SilentlyContinue",
         "              $skipped.Add([PSCustomObject]@{ path = $rel; reason = 'cap_exceeded' })",
         "              continue",
         "            }",
         "            $total = $total + $len",
-        "            $h = (Get-FileHash -LiteralPath $copied -Algorithm SHA256 -ErrorAction Stop).Hash",
+        "            $h = (Get-FileHash -LiteralPath $copied.FullName -Algorithm SHA256 -ErrorAction Stop).Hash",
         "            $files.Add([PSCustomObject]@{ path = $rel; bytes = [int]$len; sha256 = $h })",
         "          }",
         "        }",
         "      } finally {",
         "        Remove-PartitionAccessPath -Partition $part -AccessPath $ap -ErrorAction SilentlyContinue",
+        "        Remove-Item -LiteralPath $ap -Recurse -Force -ErrorAction SilentlyContinue",
         "      }",
         "    }",
         "  } finally {",
         "    if ($mounted) { Dismount-VHD -Path $p -ErrorAction Stop }",
         "  }",
         "}",
-        "[PSCustomObject]@{ files = @($files); skipped = @($skipped) } | ConvertTo-Json -Compress -Depth 4",
+        "[PSCustomObject]@{ files = $files.ToArray(); skipped = $skipped.ToArray() } | ConvertTo-Json -Compress -Depth 4",
+    ])
+
+
+def _recovery_script(guid: str) -> str:
+    """Best-effort dismount of every disk of the VM (M6: a killed action
+    process never runs its in-script finally, so the Python side dismounts
+    in a FRESH process after any action-script failure)."""
+    return guestexec.vm_target_preamble(guid) + "\n" + "\n".join([
+        "$vm = Get-VM -Id $vmTarget -ErrorAction SilentlyContinue",
+        "if ($vm) {",
+        "  foreach ($d in @(Get-VMHardDiskDrive -VM $vm -ErrorAction SilentlyContinue)) {",
+        "    Dismount-VHD -Path $d.Path -ErrorAction SilentlyContinue",
+        "  }",
+        "}",
+        "'recovery-done'",
     ])
 
 
@@ -207,7 +259,7 @@ def harvest_offline_logs(cfg: Config, vm_name: str = "", vm_id: str = "", dest_d
             cfg, "& $env:SystemRoot\\System32\\whoami.exe /priv",
             f"harvest_priv({ref.name})", timeout_s=30).stdout
         if not _privilege_ok(listing):
-            raise HarvestError(
+            raise HarvestPrivilegeError(
                 "offline log harvest requires SeBackupPrivilege (an elevated "
                 "token) for backup-semantics copying of guest ACL'd files; "
                 "this session does not hold it — refusing before any mount. "
@@ -216,10 +268,22 @@ def harvest_offline_logs(cfg: Config, vm_name: str = "", vm_id: str = "", dest_d
         mnt_root = os.path.join(dest, ".mnt")
         os.makedirs(mnt_root, exist_ok=True)
         try:
-            out = json.loads(_run(
-                cfg, _action_script(ref.id, dest, mnt_root),
-                f"harvest({ref.name})", timeout_s=900,
-            ).stdout.strip() or "{}")
+            try:
+                out = json.loads(_run(
+                    cfg, _action_script(ref.id, dest, mnt_root),
+                    f"harvest({ref.name})", timeout_s=720,
+                ).stdout.strip() or "{}")
+            except Exception:
+                # M6 recovery: a killed action process (timeout/cancel) never
+                # runs its in-script finally, so the VHD can stay mounted.
+                # Best-effort dismount from a FRESH process; never masks the
+                # original error.
+                try:
+                    _run(cfg, _recovery_script(ref.id),
+                         f"harvest_recovery({ref.name})", timeout_s=120)
+                except Exception:
+                    pass
+                raise
         finally:
             try:
                 os.rmdir(mnt_root)

@@ -54,6 +54,12 @@ def parse_kvp_items(items: list[str] | None) -> dict[str, str]:
         total += len(raw)
         if total > _KVP_TOTAL_MAX:
             break
+        if "<!DOCTYPE" in raw[:200] or "<!ENTITY" in raw[:200]:
+            # M27 (PR #112 review): internal-entity expansion is unbounded on
+            # expat < 2.6 and the caps bound only RAW bytes. A KVP item is
+            # host-serialized CIM-XML and never legitimately carries a DTD —
+            # skip the item instead of handing the parser an entity bomb.
+            continue
         try:
             root = ET.fromstring(raw)
         except ET.ParseError:
@@ -113,13 +119,13 @@ def _action_script(guid: str) -> str:
     ])
 
 
-def _run(cfg: Config, script: str, timeout_s: int = 60) -> pswindows.PSResult:
+def _run(cfg: Config, script: str, timeout_s: int = 60, ctx: str = "readiness") -> pswindows.PSResult:
     script, stdin = pswindows.compose_remote(cfg, script.strip())
     if stdin is None:
         result = pswindows.run_ps(script, timeout_s=timeout_s)
     else:
         result = pswindows.run_ps(script, timeout_s=timeout_s, stdin_b64=stdin)
-    return pswindows.check_result(result)
+    return pswindows.check_result(result, ctx)
 
 
 def heartbeat_status(cfg: Config, ref: vmident.VMRef) -> str:
@@ -136,7 +142,16 @@ def deployment_status(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
     credentials are never resolved on any path of this function.
     """
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
-    rows = json.loads(_run(cfg, _action_script(ref.id)).stdout.strip() or "{}")
+    raw = _run(cfg, _action_script(ref.id), timeout_s=60,
+               ctx=f"deployment_status({ref.name})").stdout.strip()
+    try:
+        rows = json.loads(raw or "{}")
+    except json.JSONDecodeError as exc:
+        # L13: a host-output fault must name its leg, not surface as a bare
+        # "invalid" JSONDecodeError.
+        raise RuntimeError(
+            f"deployment_status({ref.name}): output parse failed: {exc} "
+            f"| raw: {raw[:200]!r}") from None
     if not isinstance(rows, dict):
         rows = {}
     state = str(rows.get("state") or "")

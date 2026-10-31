@@ -13,7 +13,17 @@ import json
 
 import pytest
 
-from hyperv_mcp import console, filetransfer, guestexec, harvest, lifecycle, media, pswindows, vmident
+from hyperv_mcp import (
+    console,
+    filetransfer,
+    guestexec,
+    harvest,
+    lifecycle,
+    media,
+    pswindows,
+    readiness,
+    vmident,
+)
 from hyperv_mcp.config import Config
 from hyperv_mcp.credentials import CredentialSet
 
@@ -843,7 +853,11 @@ def test_parse_media_vm_remove_scripts(monkeypatch, parsed_ps, tmp_path):
             UNRESTRICTED, vm_name="test-vm-1", delete_disks=True, confirm=True)
     except Exception:
         pass
-    assert len(rec.scripts) >= 4, "vm_remove produced too few legs"
+    # L10: exact leg set (resolve, state, removal, merge-poll, usage) — a
+    # dropped leg must reduce coverage instead of silently passing
+    assert len(rec.scripts) == 5, (
+        f"vm_remove legs changed: got {len(rec.scripts)}, expected 5 "
+        "(resolve, state gate, removal, merge poll, usage)")
     for script in rec.scripts:
         assert _parse_errors(script) == []
 
@@ -868,7 +882,12 @@ def test_parse_harvest_action_script(monkeypatch, parsed_ps, tmp_path):
 
 
 def test_parse_readiness_wait_and_status(monkeypatch, parsed_ps):
-    # the wait tool's heartbeat leg
+    # Review M13: the heartbeat leg lives in the SERVER tool
+    # (readiness.heartbeat_script), not in lifecycle.wait_for_vm_state_ref —
+    # parse BOTH the readiness action script and the heartbeat script
+    # directly so a PS 5.1 syntax error in either cannot ship. (The old
+    # version drove the lifecycle call, never produced a heartbeat leg, and
+    # left the queued "OK" response dead.)
     rec = _QueuePS([
         pswindows.PSResult(stdout=VM_GUID, returncode=0),
         pswindows.PSResult(stdout=json.dumps({"final_state": "Running"}), returncode=0),
@@ -879,5 +898,22 @@ def test_parse_readiness_wait_and_status(monkeypatch, parsed_ps):
         lifecycle.wait_for_vm_state_ref(UNRESTRICTED, "test-vm-1", ["Running"], 5)
     except Exception:
         pass
+    assert rec.scripts, "the wait flow produced no scripts"
     for script in rec.scripts:
+        assert _parse_errors(script) == []
+    # the heartbeat leg itself (server.py calls readiness.heartbeat_status)
+    assert _parse_errors(readiness.heartbeat_script(VM_GUID)) == []
+    # and the deployment_status action script stays parsed (M13 sibling)
+    rec2 = _QueuePS([
+        pswindows.PSResult(stdout=VM_GUID, returncode=0),
+        pswindows.PSResult(stdout='{"state": "Running", "uptime_s": 1, "heartbeat": "OK", "kvp_items": []}', returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", rec2)
+    try:
+        readiness.deployment_status(UNRESTRICTED, "test-vm-1")
+    except Exception:
+        pass
+    actions = [s for s in rec2.scripts if not _is_resolution_leg(s)]
+    assert actions, "deployment_status produced no action script"
+    for script in rec2.scripts:
         assert _parse_errors(script) == []

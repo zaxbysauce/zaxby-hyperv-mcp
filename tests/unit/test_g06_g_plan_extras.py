@@ -15,7 +15,6 @@ tests that could not live in the frozen files.
 import contextlib
 import json
 import os
-import time
 
 import pytest
 
@@ -162,17 +161,20 @@ def test_vm_remove_deletes_base_child_when_attached_path_is_avhdx(monkeypatch, t
 
 def test_lease_for_other_vm_does_not_authorize_clone(fresh_server, tmp_path):
     """A lease granted on VM 'gold-image' must NOT authorize cloning under
-    the name 'test-clone-1': the name hint makes authorize VM-specific (the
-    pre-extension gate treated every lease row as matching any name-keyed
-    tool)."""
+    the name 'test-clone-1': the name hint makes authorize VM-specific.
+    Review H5: the pin must reach matches_hint — the lease holder is the
+    SAME principal the gate presents in-process (None), so ownership passes
+    and the VM-mismatch is what refuses; the assertion demands the exact
+    different-VM conflict text. (Mutant check 2026-10-31: reverting the
+    name-fallback makes this gate PASS the call — the test fails.)"""
     import hyperv_mcp.leases as leases
 
-    doc = {"allowed_vm_patterns": ["test-*", "gold-*"], "leases": {"required": True}}
+    doc = {"allowed_vm_patterns": ["test-*", "gold-*"], "leases": {"required": False}}
     cfg_file = tmp_path / "lease-cfg.json"
     cfg_file.write_text(json.dumps(doc), encoding="utf-8")
     mod = fresh_server({"HYPERV_MCP_CONFIG": str(cfg_file)})
     rows = leases.acquire(
-        mod._cfg(), "gold-image", ["lifecycle"], "agent-a", vm_name="gold-image")
+        mod._cfg(), "gold-image", ["lifecycle"], None, vm_name="gold-image")
     row = rows[0]
     env, _present = mod._lease_gate("hyperv_vm_clone", {
         "name": "test-clone-1", "confirm": True,
@@ -181,27 +183,33 @@ def test_lease_for_other_vm_does_not_authorize_clone(fresh_server, tmp_path):
     assert env is not None and env.get("ok") is False, (
         "a lease for another VM must not authorize this clone"
     )
-    assert "lease" in str(env.get("error", "")).lower()
+    assert "different VM" in str(env.get("error", "")), (
+        f"the refusal must be the hint mismatch, not another refusal: "
+        f"{env.get('error')!r}")
 
 
 def test_unleased_clone_conflicts_with_lifecycle_lease(fresh_server, tmp_path):
-    """Without a presented lease, cloning under a name whose lifecycle lease
-    someone else holds must fail the gate (assert_unleased sees the name
-    hint); with leases not required the gate stays open as configured."""
+    """Without a presented lease (and with leases NOT required, so the
+    required short-circuit cannot answer for us), cloning under a name whose
+    lifecycle lease is held must fail via assert_unleased seeing the NAME
+    HINT (review H5: the old pin short-circuited at lease_required and the
+    hint path was never executed; reverting the name-fallback makes this
+    gate pass the call and the test fail)."""
     import hyperv_mcp.leases as leases
 
-    doc = {"allowed_vm_patterns": ["test-*"], "leases": {"required": True}}
+    doc = {"allowed_vm_patterns": ["test-*"], "leases": {"required": False}}
     cfg_file = tmp_path / "lease-cfg2.json"
     cfg_file.write_text(json.dumps(doc), encoding="utf-8")
     mod = fresh_server({"HYPERV_MCP_CONFIG": str(cfg_file)})
     leases.acquire(
-        mod._cfg(), "test-clone-1", ["lifecycle"], "agent-a",
+        mod._cfg(), "test-clone-1", ["lifecycle"], None,
         vm_name="test-clone-1")
     env, _present = mod._lease_gate("hyperv_vm_clone", {
         "name": "test-clone-1", "confirm": True})
     assert env is not None and env.get("ok") is False, (
         "an unleased clone must conflict with the target name's lifecycle lease"
     )
+    assert "different VM" not in str(env.get("error", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +227,12 @@ def test_vm_remove_out_of_root_candidate_is_kept_not_deleted(monkeypatch, tmp_pa
     child = tmp_path / "vms" / "disk.vhdx"
     child.parent.mkdir(parents=True, exist_ok=True)
     child.write_bytes(b"x")
-    out_of_root = tmp_path.parent / f"vm-remove-out-of-root-{int(time.time() * 1000)}.vhdx"
+    # L9 (review): per-test out-of-root location — OUTSIDE host_write_roots
+    # (that is the point of the pin) but uniquely named for THIS test
+    # (tmp_path.name is unique per test; the old fixed name collided across
+    # runs in the shared session dir). tmp_path.parent is the session temp
+    # root, never inside the write root.
+    out_of_root = tmp_path.parent / (tmp_path.name + "-out-of-root.vhdx")
     out_of_root.write_bytes(b"x")  # materialized: an unguarded delete would remove it
     cfg = Config(allowed_vm_patterns=["test-*"], host_write_roots=[str(tmp_path)])
     cfg.destructive.vm_remove = True
@@ -349,3 +362,227 @@ def test_deployment_status_drops_stale_kvp_when_heartbeat_not_ok(monkeypatch):
     assert out["kvp"]["items"] == {}, "stale KVP pairs must be suppressed"
     assert out["guest"]["ipv4"] == [], "stale addresses must not surface"
     assert out["guest"]["os_name"] == ""
+def test_vm_clone_applies_cpu_count(monkeypatch, unrestricted, tmp_path):
+    """Review M14: the clone path honors cpu_count exactly like vm_create —
+    the leg must be present, carry the requested count, and sit after
+    New-VM (a hard-coded count or a dropped leg both fail)."""
+    parent = tmp_path / "gold.vhdx"
+    parent.write_bytes(b"x")
+    fake = FakePS([pswindows.PSResult(
+        stdout='{"id": "G-9", "name": "test-vm-9", "state": "Off", "generation": 2}',
+        returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    media.vm_clone(unrestricted, "test-vm-9", str(parent), str(tmp_path / "c.vhdx"),
+                   cpu_count=4, confirm=True)
+    script = fake.scripts[0]
+    assert "Set-VMProcessor" in script
+    assert " -Count 4 " in script, (
+        "the applied count must be the requested 4 (exact token, not a prefix)")
+    assert script.index("New-VM -Name") < script.index("Set-VMProcessor")
+
+
+def test_deployment_status_degraded_phase_end_to_end(monkeypatch):
+    """Review M15: Running + heartbeat OK + NO KVP must classify degraded
+    through the assembled result (not just the pure function)."""
+    import json as _json
+
+    from hyperv_mcp import readiness as _readiness
+    fake = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout=_json.dumps({
+            "state": "Running", "uptime_s": 60, "heartbeat": "OK",
+            "kvp_items": [],
+        }), returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = _readiness.deployment_status(Config(unrestricted=True), vm_name="test-vm-1")
+    assert out["phase"] == "degraded", out["phase"]
+    assert out["heartbeat"] == "OK" and out["kvp"]["available"] is False
+
+
+def test_deployment_status_skips_dtd_items(monkeypatch):
+    """Review M27: a KVP item carrying an internal DTD is hostile input (the
+    CIM provider never emits one) — it is skipped, never handed to the
+    parser, and the well-formed siblings still parse."""
+    import json as _json
+
+    from hyperv_mcp import readiness as _readiness
+    bomb = ('<!DOCTYPE INSTANCE [<!ENTITY a "aaaaaaaaaa">'
+            '<!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">]>'
+            '<INSTANCE CLASSNAME="Msvm_KvpExchangeDataItem">'
+            '<PROPERTY NAME="Name"><VALUE>OSName</VALUE></PROPERTY>'
+            '<PROPERTY NAME="Data"><VALUE>&b;</VALUE></PROPERTY></INSTANCE>')
+    good = ('<INSTANCE CLASSNAME="Msvm_KvpExchangeDataItem">'
+            '<PROPERTY NAME="Name"><VALUE>OSBuildNumber</VALUE></PROPERTY>'
+            '<PROPERTY NAME="Data"><VALUE>19045</VALUE></PROPERTY></INSTANCE>')
+    fake = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout=_json.dumps({
+            "state": "Running", "uptime_s": 1, "heartbeat": "OK",
+            "kvp_items": [bomb, good],
+        }), returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = _readiness.deployment_status(Config(unrestricted=True), vm_name="test-vm-1")
+    assert out["kvp"]["items"] == {"OSBuildNumber": "19045"}
+    assert "OSName" not in out["kvp"]["items"], "the DTD item must be skipped"
+
+
+def test_wait_vm_state_non_ok_heartbeat_channel(fresh_server, tmp_path, monkeypatch):
+    """Review M18: a Running final with a NON-OK heartbeat reports
+    guest_channel == "no_guest_signal" (exact equality, not just != constant)
+    with the real status text in heartbeat."""
+    import asyncio
+    import json as _json
+
+
+    doc = {"allowed_vm_patterns": ["test-*"]}
+    cfg_file = tmp_path / "wait-cfg2.json"
+    cfg_file.write_text(_json.dumps(doc), encoding="utf-8")
+    mod = fresh_server({"HYPERV_MCP_CONFIG": str(cfg_file)})
+
+    class _Router:
+        def __init__(self):
+            self.scripts = []
+
+        def __call__(self, script, **kwargs):
+            self.scripts.append(script)
+            if "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget"):
+                return pswindows.PSResult(stdout=GUID, returncode=0)
+            if "final_state" in script:
+                return pswindows.PSResult(
+                    stdout=_json.dumps({"final_state": "Running"}), returncode=0)
+            if "Heartbeat" in script:
+                return pswindows.PSResult(stdout="No Contact", returncode=0)
+            return pswindows.PSResult(stdout="{}", returncode=0)
+
+    router = _Router()
+    monkeypatch.setattr(pswindows, "run_ps", router)
+    result = asyncio.run(
+        mod.get_mcp()._tool_manager.call_tool(
+            "hyperv_wait_vm_state",
+            {"vm_name": "test-vm-1", "states": ["Running"], "timeout_s": 5},
+            context=None))
+    texts = None
+    if not isinstance(result, dict):
+        content = result[0] if isinstance(result, tuple) else result
+        if hasattr(content, "content"):
+            texts = [c.text for c in content.content if getattr(c, "type", "") == "text"]
+    if texts:
+        result = _json.loads(texts[0])
+    assert result["ok"] and result["final_state"] == "Running"
+    assert result["heartbeat"] == "No Contact"
+    assert result["guest_channel"] == "no_guest_signal"
+
+
+def test_vm_remove_usage_scalar_shape_keeps_referenced_disk(monkeypatch, tmp_path):
+    """Review H4 (the fix's own pin): the removed VM's OWN disk is still
+    referenced by the ONE other registered VM, so the usage leg collects
+    exactly one path — and ConvertTo-Json emits a bare JSON STRING for a
+    1-element array (probed on PS 5.1). The consumer must normalize the
+    scalar or in_use collapses to empty and the referenced disk is DELETED.
+    The queued response is the real scalar shape."""
+    import json as _json
+    child = tmp_path / "vms" / "disk.vhdx"
+    child.parent.mkdir(parents=True, exist_ok=True)
+    child.write_bytes(b"x")
+    cfg = Config(allowed_vm_patterns=["test-*"], host_write_roots=[str(tmp_path)])
+    cfg.destructive.vm_remove = True
+    disks_json = _json.dumps({
+        "status": "removed", "disks": [str(child)], "ancestors": []})
+    fake = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout="Off", returncode=0),
+        pswindows.PSResult(stdout=disks_json, returncode=0),
+        # no .avhdx candidate -> no merge-poll leg; the usage leg is next and
+        # returns the REAL one-element shape: a bare JSON string
+        pswindows.PSResult(stdout=_json.dumps(str(child)), returncode=0),
+    ])
+    deleted = []
+    real_remove = os.remove
+
+    def spy_remove(path, *args, **kwargs):
+        deleted.append(os.path.normcase(str(path)))
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    monkeypatch.setattr(media.os, "remove", spy_remove)
+    out = media.vm_remove(cfg, vm_name="test-vm-1", delete_disks=True, confirm=True)
+    nc = lambda q: os.path.normcase(os.path.normpath(str(q)))  # noqa: E731
+    assert nc(child) not in deleted, (
+        "a disk still referenced by the one other VM must NEVER be deleted "
+        "(the scalar usage shape must normalize)")
+    assert os.path.isfile(child), "the referenced disk must survive on disk"
+    kept_reasons = {nc(k["path"]): k["reason"] for k in out["kept"]}
+    assert kept_reasons.get(nc(child)) == "in_use_by_other_vm"
+    # the usage script binds $vmTarget (the self-exclusion guard, UR-10)
+    usage_script = fake.scripts[-1]
+    assert "$vmTarget = '" in usage_script
+
+
+def test_vm_remove_post_removal_failure_keeps_inventory(monkeypatch, tmp_path):
+    """Review M25: a merge-poll leg failure after Remove-VM reports the
+    removal with a full kept inventory (retryable), never a bare error."""
+    import json as _json
+    child = tmp_path / "disk.vhdx"
+    child.write_bytes(b"x")
+    avhdx = tmp_path / "disk.avhdx"
+    avhdx.write_bytes(b"x")
+    cfg = Config(unrestricted=True)
+    cfg.destructive.vm_remove = True
+    disks_json = _json.dumps({
+        "status": "removed", "disks": [str(child), str(avhdx)], "ancestors": []})
+    fake = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout="Off", returncode=0),
+        pswindows.PSResult(stdout=disks_json, returncode=0),
+        # merge-poll leg FAILS (transport)
+        pswindows.PSResult(returncode=1, stderr="Call cancelled"),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    monkeypatch.setattr(media.os, "remove", lambda *a, **k: None)
+    out = media.vm_remove(cfg, vm_name="test-vm-1", delete_disks=True, confirm=True)
+    assert out["ok"] is False and out["retryable"] is True
+    assert "removed" in out.get("status", "")
+    kept_reasons = {k["reason"] for k in out["kept"]}
+    assert "merge_pending" in kept_reasons
+    assert any(r.startswith("cleanup_leg_failed") for r in kept_reasons), (
+        f"the un-deleted candidate must carry the failed-leg reason: {kept_reasons}")
+    assert not out["deleted"]
+
+
+def test_vm_remove_cancel_requested_before_deletion(monkeypatch, tmp_path):
+    """Review M24: a cancel-requested op stops the deletion pass (the hook
+    raises OperationCancelled before os.remove runs)."""
+    import json as _json
+    child = tmp_path / "disk.vhdx"
+    child.write_bytes(b"x")
+    cfg = Config(unrestricted=True)
+    cfg.destructive.vm_remove = True
+    disks_json = _json.dumps({
+        "status": "removed", "disks": [str(child)], "ancestors": []})
+    fake = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout="Off", returncode=0),
+        pswindows.PSResult(stdout=disks_json, returncode=0),
+        pswindows.PSResult(stdout="merge_complete", returncode=0),
+        pswindows.PSResult(stdout="[]", returncode=0),
+    ])
+    deleted = []
+    real_remove = os.remove
+
+    def spy_remove(path, *args, **kwargs):
+        deleted.append(str(path))
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    monkeypatch.setattr(media.os, "remove", spy_remove)
+    from hyperv_mcp import operations as _operations
+    monkeypatch.setattr(
+        _operations, "raise_if_cancelled",
+        lambda: (_ for _ in ()).throw(_operations.OperationCancelled("op-1")))
+    # OperationCancelled inherits BaseException (issue #24: envelope
+    # wrappers must not swallow it) — raise it, never Exception.
+    with pytest.raises(_operations.OperationCancelled):
+        media.vm_remove(cfg, vm_name="test-vm-1", delete_disks=True, confirm=True)
+    assert deleted == [], "a cancelled removal must not delete anything"

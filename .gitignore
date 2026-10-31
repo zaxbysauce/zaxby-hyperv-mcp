@@ -38,3 +38,6 @@ desktop.ini
 graphify-out/
 .swarm/
 hyperv-it-cleanup-report.json
+# L14 (review): trace evidence is machine-local (live logs carry host
+# paths/GUIDs) — exclude in the REPO, not just .git/info/exclude.
+.agents/issue-traces/

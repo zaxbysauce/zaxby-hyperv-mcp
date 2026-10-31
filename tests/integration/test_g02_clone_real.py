@@ -20,7 +20,6 @@ Legs:
 
 import hashlib
 import os
-import time
 
 import pytest
 
@@ -53,8 +52,8 @@ def _wait_state(cfg: Config, name: str, states: list[str], timeout_s: int = 300)
 def test_clone_boots_and_full_remove(it, tmp_path):
     golden = _golden_vhd()
     before = _digest(golden)
-    stamp = int(time.time())
-    name = f"test-clone-{stamp}"
+    import uuid
+    name = f"test-clone-{uuid.uuid4().hex[:8]}"
     child = str(tmp_path / f"{name}.vhdx")
     out = media.vm_clone(
         it.cfg, name, golden, child, memory_mb=512, switch_name="", confirm=True)
@@ -65,11 +64,17 @@ def test_clone_boots_and_full_remove(it, tmp_path):
         lifecycle.stop_vm(it.cfg, name, "shutdown-force", confirm=True)
         _wait_state(it.cfg, name, ["Off"], timeout_s=180)
     finally:
+        # M19 (review): the cleanup's vm_remove refuses a non-Off VM, so a
+        # failed boot/stop leg would leave the clone running AND mask the
+        # original error — force-stop first, and never raise from cleanup.
+        try:
+            lifecycle.stop_vm(it.cfg, name, "turnoff", confirm=True)
+            _wait_state(it.cfg, name, ["Off"], timeout_s=180)
+        except Exception:
+            pass
         removed = media.vm_remove(
             it.cfg, vm_name=name, delete_disks=True, confirm=True)
         assert removed["ok"], removed
-    assert os.path.normcase(child) not in {
-        os.path.normcase(p) for p in removed["deleted"]} or not os.path.isfile(child)
     assert not os.path.isfile(child), "clone child disk must be deleted"
     after = _digest(golden)
     assert after == before, "golden parent must be byte- and mtime-identical"
@@ -77,7 +82,8 @@ def test_clone_boots_and_full_remove(it, tmp_path):
 
 def test_remove_clone_with_checkpoint(it, tmp_path):
     golden = _golden_vhd()
-    name = f"test-clone-cp-{int(time.time())}"
+    import uuid
+    name = f"test-clone-cp-{uuid.uuid4().hex[:8]}"
     child = str(tmp_path / f"{name}.vhdx")
     out = media.vm_clone(it.cfg, name, golden, child, confirm=True)
     assert out["ok"], out
@@ -85,6 +91,11 @@ def test_remove_clone_with_checkpoint(it, tmp_path):
         _wait_state(it.cfg, name, ["Running", "Off"], timeout_s=180)
         lifecycle.checkpoint_create(it.cfg, name, "pre-remove", timeout_s=600)
     finally:
+        try:
+            lifecycle.stop_vm(it.cfg, name, "turnoff", confirm=True)
+            _wait_state(it.cfg, name, ["Off"], timeout_s=180)
+        except Exception:
+            pass
         removed = media.vm_remove(
             it.cfg, vm_name=name, delete_disks=True, confirm=True)
         assert removed["ok"], removed

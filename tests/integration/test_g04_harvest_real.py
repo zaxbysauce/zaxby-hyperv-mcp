@@ -15,7 +15,7 @@ each skips with a reason naming the missing env var (prior-trace pattern).
   * test_harvest_checkpointed_vm (33-AC12): with a checkpoint present, the
     CURRENT .avhdx chain is read (needs HYPERV_MCP_TEST_CHECKPOINT=1; skips
     otherwise).
-  * test_harvest_non_elevated_token (33-AC13): re-run the precheck leg from
+  * test_harvest_elevation_observed (33-AC13 elevated half): the harness
     a non-elevated context is operator-driven (the harness itself runs
     elevated on this host); the unit-level SeBackup refusal is pinned by
     frozen C15 — this leg records the elevated observation only.
@@ -72,11 +72,12 @@ def test_harvest_checkpointed_vm(it, it_tmp):
 
 
 def test_harvest_elevation_observed(it, it_tmp):
-    """33-AC13 elevated half: this harness runs elevated on the host, so the
-    SeBackup precheck passes and the harvest completes — recorded as the
-    observed elevated result. The non-elevated refusal is pinned by frozen
-    C15 (unit) and remains operator-runbook material for a shell-level
-    re-run."""
+    """33-AC13 elevated half. On a host where this harness runs elevated the
+    SeBackup precheck passes and the harvest would complete; in the trace
+    session the shell was NOT elevated, so the live evidence is the
+    non-elevated REFUSAL (repro/live-legs-run.log) and this leg records the
+    elevated attempt only when run from an elevated deployment. The
+    non-elevated refusal itself is pinned by frozen C15 (unit)."""
     cfg, vm = it.cfg, it.vm
     lifecycle.stop_vm(cfg, vm, "shutdown", confirm=True)
     lifecycle.wait_for_vm_state(cfg, vm, ["Off"], 300)

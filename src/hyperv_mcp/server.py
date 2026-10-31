@@ -116,7 +116,7 @@ _OPERATIONS_DESTRUCTIVE_GATES: dict[str, Callable[[Config, dict], None]] = {
         cfg, "checkpoint_remove", bool(a.get("confirm")),
         f"remove checkpoint '{a.get('checkpoint_name')}' from VM '{a.get('vm_name') or a.get('vm_id')}'"),
     "hyperv_vm_create": lambda cfg, a: policy.require_destructive(
-        cfg, "vm_provision", bool(a.get("confirm")), f"create VM '{a.get('vm_name')}'"),
+        cfg, "vm_provision", bool(a.get("confirm")), f"create VM '{a.get('name')}'"),
     "hyperv_vm_remove": lambda cfg, a: policy.require_destructive(
         cfg, "vm_remove", bool(a.get("confirm")),
         f"remove VM '{a.get('vm_name') or a.get('vm_id')}'"),
@@ -1948,7 +1948,13 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             if final != "Running":
                 return {"ok": True, "final_state": final,
                         "guest_channel": "no_guest_signal"}
-            heartbeat = readiness.heartbeat_status(_cfg(), ref)
+            # M2 (PR #112 review): a transient heartbeat-leg failure must not
+            # void an ACCOMPLISHED wait — fall back to the unknown-signal
+            # shape instead of losing final_state to a transport envelope.
+            try:
+                heartbeat = readiness.heartbeat_status(_cfg(), ref)
+            except Exception:
+                heartbeat = ""
             channel = "os_heartbeat_ok" if heartbeat == "OK" else "no_guest_signal"
             return {"ok": True, "final_state": final, "heartbeat": heartbeat,
                     "guest_channel": channel}
@@ -3833,7 +3839,13 @@ def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]
         # neither name nor id cannot be screened here; the body's own
         # resolution raises the authoritative invalid/policy error.
         if vm_name:
-            vmident.checked_caller_name(vm_name)
+            try:
+                vmident.checked_caller_name(vm_name)
+            except ValueError as exc:
+                # M10 (PR #112 review): the name fallback feeds create-style
+                # `name` arguments through here; a blank/>260-char name must
+                # get the audited invalid envelope, not an escaping raise.
+                return {"ok": False, "error": str(exc), "error_class": "invalid"}, None
             policy.vm_allowed(cfg, vm_name)
         if lease_id:
             leases.authorize(cfg, lease_id, token, agent, scope,

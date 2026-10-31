@@ -201,8 +201,8 @@ def test_server_info_tool_registered():
         )
         assert len(names) == 80, (
             f"tool inventory is {len(names)} tools; expected exactly 80 "
-            "(68 through issue #28's hyperv_console_sequence plus issue #29's "
-            "eight hyperv_ui_* tools)"
+            "(76 through issue #29's eight hyperv_ui_* tools, plus issue #112's "
+            "four Workstream G tools)"
         )
     finally:
         importlib.reload(server_module)

@@ -27,7 +27,10 @@ def test_boot_sequence_reports_os_ready(it):
     phases = []
     last = {}
     lifecycle.start_vm(cfg, vm)
-    for _ in range(120):
+    # M19 (review): the poll budget must fit INSIDE the harness timeout
+    # (INTEGRATION_TIMEOUT_S=900 incl. the stop/wait legs above) — 60 x 5s
+    # = 300s of polling, never os._exit'd mid-test with the VM left running.
+    for _ in range(60):
         out = readiness.deployment_status(cfg, vm)
         assert out["ok"], out
         phases.append(out["phase"])
@@ -51,7 +54,12 @@ def test_boot_sequence_reports_os_ready(it):
         f"os_build {last['guest']['os_build']!r} != in-guest {rows['build']!r}")
     guest_ips = {ip.strip() for ip in rows["ips"]}
     status_ips = {ip for ip in last["guest"]["ipv4"]}
-    assert status_ips and status_ips.issubset(guest_ips | status_ips), (
+    # M17 (review): the old assertion was a tautology (X ⊆ X∪Y); the KVP
+    # addresses must actually appear in the guest's own view. (Known live
+    # caveat: newer integration services replace NetworkAddressIPv4 with a
+    # deprecation banner — that surfaces as the PR-body RECORD row, and the
+    # subset assert then fails loudly, which is the honest outcome.)
+    assert status_ips and status_ips.issubset(guest_ips), (
         f"ipv4 mismatch: status={sorted(status_ips)} guest={sorted(guest_ips)}")
 
 
