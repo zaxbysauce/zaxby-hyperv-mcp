@@ -394,6 +394,7 @@ def vm_remove(
         )
         out = _json_out(
             _run(cfg, removal, f"vm_remove({ref.name})", timeout_s=300), "vm_remove")
+        out = out if isinstance(out, dict) else {}
         disks = [str(p) for p in (out.get("disks") or [])]
         ancestors = [str(p) for p in (out.get("ancestors") or [])]
         if not delete_disks:
