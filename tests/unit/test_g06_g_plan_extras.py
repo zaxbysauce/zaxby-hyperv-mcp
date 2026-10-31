@@ -12,12 +12,14 @@ tests that could not live in the frozen files.
     lease row as matching any name-keyed tool).
 """
 
+import contextlib
 import json
 import os
+import time
 
 import pytest
 
-from hyperv_mcp import media, pswindows
+from hyperv_mcp import harvest, media, pswindows
 from hyperv_mcp.config import Config
 
 GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
@@ -200,3 +202,117 @@ def test_unleased_clone_conflicts_with_lifecycle_lease(fresh_server, tmp_path):
     assert env is not None and env.get("ok") is False, (
         "an unleased clone must conflict with the target name's lifecycle lease"
     )
+
+
+# ---------------------------------------------------------------------------
+# Implementation-review round 1 (reviewer findings 1+2): pins for the
+# delete-time host_write_roots recheck and the harvest caps.
+# ---------------------------------------------------------------------------
+
+def test_vm_remove_out_of_root_candidate_is_kept_not_deleted(monkeypatch, tmp_path):
+    """Reviewer finding 1: the frozen C5 fixture never materializes its
+    out-of-root candidate, so removing the delete-time root recheck read
+    already_gone and the truthy-reason assert still passed. This pin
+    MATERIALIZES the file and asserts the exact keep reason AND that it
+    survives on disk."""
+    import json as _json
+    child = tmp_path / "vms" / "disk.vhdx"
+    child.parent.mkdir(parents=True, exist_ok=True)
+    child.write_bytes(b"x")
+    out_of_root = tmp_path.parent / f"vm-remove-out-of-root-{int(time.time() * 1000)}.vhdx"
+    out_of_root.write_bytes(b"x")  # materialized: an unguarded delete would remove it
+    cfg = Config(allowed_vm_patterns=["test-*"], host_write_roots=[str(tmp_path)])
+    cfg.destructive.vm_remove = True
+    disks_json = _json.dumps({
+        "status": "removed",
+        "disks": [str(child), str(out_of_root)],
+        "ancestors": [],
+    })
+    fake = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout="Off", returncode=0),
+        pswindows.PSResult(stdout=disks_json, returncode=0),
+        # no .avhdx candidate -> no merge-poll leg; the usage leg is next
+        pswindows.PSResult(stdout="[]", returncode=0),
+    ])
+    deleted = []
+    real_remove = os.remove
+
+    def spy_remove(path, *args, **kwargs):
+        deleted.append(os.path.normcase(str(path)))
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    monkeypatch.setattr(media.os, "remove", spy_remove)
+    out = media.vm_remove(cfg, vm_name="test-vm-1", delete_disks=True, confirm=True)
+    nc = lambda q: os.path.normcase(os.path.normpath(str(q)))  # noqa: E731
+    assert nc(child) in deleted
+    assert nc(out_of_root) not in deleted, "an out-of-root candidate must never be deleted"
+    assert out_of_root.exists(), "the out-of-root file must survive on disk"
+    kept_reasons = {nc(k["path"]): k["reason"] for k in out["kept"]}
+    assert kept_reasons[nc(out_of_root)] == "outside_host_write_roots"
+
+
+def test_harvest_caps_are_pinned(monkeypatch, tmp_path):
+    """Reviewer finding 2: all three cap layers (robocopy /MAX, the in-script
+    running total, the Python re-check) were removable with a green suite.
+    This pin asserts the action script carries the per-file and total guards
+    and that an over-total payload demotes every file to skipped/cap_exceeded."""
+    import json as _json
+    cfg = Config(unrestricted=True)
+    big = [
+        {"path": f"Windows/Panther/setupact.log.{i}", "bytes": 2 * 1024 * 1024 * 1024,
+         "sha256": "0" * 64}
+        for i in range(3)
+    ]
+    fake = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout="Off", returncode=0),
+        pswindows.PSResult(stdout="SeBackupPrivilege", returncode=0),
+        pswindows.PSResult(stdout=_json.dumps({"files": big, "skipped": []}), returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = harvest.harvest_offline_logs(
+        cfg, vm_name="test-vm-1", dest_dir=str(tmp_path / "out"))
+    # the script-level guards are present in the captured action script
+    action = next(s for s in fake.scripts if "Mount-VHD" in s)
+    assert "/MAX:$fileMax" in action, "robocopy must carry the per-file /MAX cap"
+    assert "-gt $totalMax" in action, "the in-script running-total guard must be present"
+    # the Python re-check demotes the over-total tail: with a 2 GiB total
+    # cap, the first 2 GiB file fits (boundary inclusive) and the remaining
+    # two are demoted to skipped/cap_exceeded
+    assert out["ok"] is True
+    assert len(out["files"]) == 1, (
+        f"only the first in-budget file may survive: {out['files']}")
+    reasons = [s["reason"] for s in out["skipped"]]
+    assert reasons.count("cap_exceeded") == 2, (
+        f"the over-budget tail must be skipped as cap_exceeded: {reasons}")
+
+
+def test_harvest_missing_reason_for_absent_fixed_entries(monkeypatch, tmp_path):
+    """Plan-promised 'missing' skip reason (reviewer question): a fixed
+    (non-glob) LOG_PATHS entry that does not exist on the volume is reported
+    under skipped with reason 'missing' rather than vanishing."""
+    cfg = Config(unrestricted=True)
+    events = []
+    real_lock = harvest.vmlocks.vm_lock
+
+    @contextlib.contextmanager
+    def spy_lock(key, *args, **kwargs):
+        events.append(("lock", key))
+        with real_lock(key, *args, **kwargs):
+            yield
+
+    monkeypatch.setattr(harvest.vmlocks, "vm_lock", spy_lock)
+    fake = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout="Off", returncode=0),
+        pswindows.PSResult(stdout="SeBackupPrivilege", returncode=0),
+        pswindows.PSResult(stdout='{"files": [], "skipped": []}', returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    harvest.harvest_offline_logs(
+        cfg, vm_name="test-vm-1", dest_dir=str(tmp_path / "out"))
+    action = next(s for s in fake.scripts if "Mount-VHD" in s)
+    assert "reason = 'missing'" in action, (
+        "the action script must emit the 'missing' skip reason for absent fixed entries")

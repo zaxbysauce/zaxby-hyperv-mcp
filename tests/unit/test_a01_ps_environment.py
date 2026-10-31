@@ -197,10 +197,10 @@ def test_server_info_tool_registered():
         names = sorted(tool.name for tool in tools)
         assert "hyperv_server_info" in names, (
             f"hyperv_server_info is not registered; tool inventory has "
-            f"{len(names)} tools, expected 76 including hyperv_server_info"
+            f"{len(names)} tools, expected 80 including hyperv_server_info"
         )
         assert len(names) == 80, (
-            f"tool inventory is {len(names)} tools; expected exactly 76 "
+            f"tool inventory is {len(names)} tools; expected exactly 80 "
             "(68 through issue #28's hyperv_console_sequence plus issue #29's "
             "eight hyperv_ui_* tools)"
         )

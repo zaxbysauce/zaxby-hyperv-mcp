@@ -2018,8 +2018,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         (bounded, timeout reported as retryable). Policy: vm_remove
         category + confirm=true.
 
-        Returns: {ok, status, vm_name, deleted[], kept[{path, reason}]} or
-        the failure envelope (+ holder on busy).
+        Returns: {ok, status, vm_name} (deleted[]/kept[{path, reason}]
+        additionally present with delete_disks=true) or the failure
+        envelope (+ holder on busy).
         """
         return _run_guest_tool(
             "hyperv_vm_remove", vm_name, "vm_remove",
