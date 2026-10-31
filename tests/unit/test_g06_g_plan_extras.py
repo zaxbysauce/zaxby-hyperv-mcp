@@ -316,3 +316,36 @@ def test_harvest_missing_reason_for_absent_fixed_entries(monkeypatch, tmp_path):
     action = next(s for s in fake.scripts if "Mount-VHD" in s)
     assert "reason = 'missing'" in action, (
         "the action script must emit the 'missing' skip reason for absent fixed entries")
+
+
+def test_deployment_status_drops_stale_kvp_when_heartbeat_not_ok(monkeypatch):
+    """Final-critic round-1 (FC3): the heartbeat-gated KVP view is the entire
+    'no stale KVP after a WinPE reboot' mechanism (#32 AC11) — a guest whose
+    KVP service stopped can leave the previous OS's pairs lingering while the
+    heartbeat reads No Contact. This pin drives that state directly: KVP
+    items exist, heartbeat is not OK -> nothing stale may surface."""
+    import json as _json
+
+    from hyperv_mcp import readiness as _readiness
+    kvp_items = [
+        '<INSTANCE CLASSNAME="Msvm_KvpExchangeDataItem">'
+        '<PROPERTY NAME="Name"><VALUE>OSName</VALUE></PROPERTY>'
+        '<PROPERTY NAME="Data"><VALUE>Windows Previous OS</VALUE></PROPERTY></INSTANCE>',
+        '<INSTANCE CLASSNAME="Msvm_KvpExchangeDataItem">'
+        '<PROPERTY NAME="Name"><VALUE>NetworkAddressIPv4</VALUE></PROPERTY>'
+        '<PROPERTY NAME="Data"><VALUE>10.9.9.9</VALUE></PROPERTY></INSTANCE>',
+    ]
+    fake = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout=_json.dumps({
+            "state": "Running", "uptime_s": 5, "heartbeat": "No Contact",
+            "kvp_items": kvp_items,
+        }), returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = _readiness.deployment_status(Config(unrestricted=True), vm_name="test-vm-1")
+    assert out["phase"] == "no_guest_signal"
+    assert out["kvp"]["available"] is False, "stale KVP must not read as available"
+    assert out["kvp"]["items"] == {}, "stale KVP pairs must be suppressed"
+    assert out["guest"]["ipv4"] == [], "stale addresses must not surface"
+    assert out["guest"]["os_name"] == ""

@@ -1871,7 +1871,7 @@ width/height/frame dimensions when you need head-sized captures.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_wait_vm_state` | `vm_name` or `vm_id`, `states[]` (Off/Running/Saved/Paused/...), `timeout_s=300` | `{ok, final_state, guest_channel: "ps_direct_unverified"}` |
+| `hyperv_wait_vm_state` | `vm_name` or `vm_id`, `states[]` (Off/Running/Saved/Paused/...), `timeout_s=300` | `{ok, final_state, guest_channel, [heartbeat]}` — `guest_channel` is derived from the Heartbeat integration service on Running finals (`os_heartbeat_ok` / `no_guest_signal`); non-Running finals run no heartbeat query |
 
 ### Server Provenance (0.3.0)
 
