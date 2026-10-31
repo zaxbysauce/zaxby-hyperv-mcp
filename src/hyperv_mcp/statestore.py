@@ -360,7 +360,17 @@ def _migrate_to(con: sqlite3.Connection, found: int) -> None:
                     f"{table} table; refusing to open it"
                 )
         for statement in statements:
-            con.execute(statement)
+            try:
+                con.execute(statement)
+            except sqlite3.OperationalError as exc:
+                # PRR-002: the v4 ALTERs are the first non-idempotent
+                # migration statements (earlier versions are CREATE IF NOT
+                # EXISTS). A concurrent opener that committed the same step
+                # makes this opener's ALTER a no-op ("duplicate column
+                # name"), which must read as success — the column IS there,
+                # which is all the migration guarantees.
+                if "duplicate column name" not in str(exc):
+                    raise
         version += 1
     con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 

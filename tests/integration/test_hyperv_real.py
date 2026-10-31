@@ -1162,19 +1162,20 @@ def test_credential_profiles_two_vms_two_admins():
     # variable, fall back to the file (path kept in the env so the resolver
     # finds it), and skip when the host's global credential shape cannot be
     # expressed as a profile secret source.
-    user_a = os.environ["HYPERV_GUEST_USERNAME"].strip()
     if os.environ.get("HYPERV_GUEST_PASSWORD_FILE", "").strip():
-        pw_a_source = ("password_file",
-                       os.environ["HYPERV_GUEST_PASSWORD_FILE"].strip())
-    elif os.environ.get("HYPERV_GUEST_PASSWORD", "").strip():
-        pw_a_source = ("password_env", "HYPERV_GUEST_PASSWORD")
-    else:
+        # PRR-013: a profile carries exactly ONE secret source, so a
+        # PASSWORD_FILE host cannot express the swapped leg. Skip, as the
+        # finding specified - never error mid-test on this host class.
+        pytest.skip("global credential is PASSWORD_FILE-based; the two-VM "
+                    "profile swap needs an env-variable secret")
+    if not os.environ.get("HYPERV_GUEST_PASSWORD", "").strip():
         pytest.skip("global credential is neither HYPERV_GUEST_PASSWORD nor "
                     "HYPERV_GUEST_PASSWORD_FILE; a profile needs exactly one "
                     "secret source")
+    user_a = os.environ["HYPERV_GUEST_USERNAME"].strip()
     profile_a = {
         "name": "vm-a-admin", "vm_patterns": [vm_a], "username": user_a,
-        pw_a_source[0]: pw_a_source[1],
+        "password_env": "HYPERV_GUEST_PASSWORD",
     }
     profile_b = {
         "name": "vm-b-admin", "vm_patterns": [vm_b], "username": user_b,

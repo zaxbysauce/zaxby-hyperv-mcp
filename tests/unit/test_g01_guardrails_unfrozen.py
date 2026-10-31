@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-from hyperv_mcp import credentials, vmident
+from hyperv_mcp import credentials, pswindows, statestore, vmident
 from hyperv_mcp.config import Config
 
 LAB_A_PROFILE = {
@@ -102,6 +102,13 @@ def test_inline_capture_evidence_resolves_for_target_vm(monkeypatch):
         vmident, "resolve",
         lambda cfg_arg, vm_name="", vm_id="": vmident.VMRef(
             id=vm_id or GUID, name=vm_name or "lab-a-01"),
+    )
+    # PRR-009 (reviewer round 2): vmident was not the spawn site —
+    # console._run -> pswindows.run_ps is. Stub it so ZERO real host
+    # powershell.exe spawns happen (oracle stays the resolver recorder).
+    monkeypatch.setattr(
+        pswindows, "run_ps",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stub: no spawn")),
     )
 
     mod = importlib.reload(server_module)
@@ -205,3 +212,91 @@ def test_victim_resolution_fail_closed_arms(monkeypatch):
     assert cred.username == "LabVictimA" and cred.profile == "lab-a", (
         f"positive control: the victim identity must resolve; got {cred!r}"
     )
+
+
+def test_mixed_case_password_env_resolves(monkeypatch):
+    """PRR-001 pin (feedback round 2): Windows upper-cases dict(os.environ)
+    keys, so a mixed-case password_env must resolve via the case-tolerant
+    lookup — and the resolved value must be the secret, not the missing arm."""
+    cfg = Config.from_dict({"unrestricted": True, "credential_profiles": [
+        dict(LAB_A_PROFILE, password_env="Mixed_Case_PW"),
+    ]})
+    credentials.init(cfg)
+    monkeypatch.setenv("mixed_case_pw", "case-pass-123")
+    cred = credentials.resolve_guest(vm_name="lab-a-01")
+    assert cred.username == "LabAdminA", cred
+    assert getattr(cred, "profile", None) == "lab-a"
+
+
+def test_concurrent_first_open_of_v3_store_migrates_cleanly(tmp_path):
+    """PRR-002 pin (feedback round 2): two concurrent openers of a v3 store
+    must both succeed (the migration re-reads user_version under the write
+    lock, so the loser no longer re-runs non-idempotent ALTERs)."""
+    import sqlite3
+    import threading
+
+    import hyperv_mcp.statestore as ss
+
+    db = tmp_path / "v3.db"
+    con = sqlite3.connect(str(db))
+    for stmt in ss._SCHEMA_STATEMENTS[: ss._V3_STATEMENTS[1]]:
+        con.execute(stmt)
+    con.execute("PRAGMA user_version=3")
+    con.commit()
+    con.close()
+
+    statestore.clear_store_cache_for_tests()
+    errors = []
+    barrier = threading.Barrier(2, timeout=30)
+
+    def opener():
+        barrier.wait()
+        try:
+            ss.open(str(db))
+        except Exception as exc:  # noqa: BLE001 - the pin collects failures
+            errors.append(exc)
+
+    threads = [threading.Thread(target=opener) for _ in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(60)
+    assert not errors, f"concurrent open failed: {errors}"
+    version = sqlite3.connect(str(db)).execute(
+        "PRAGMA user_version").fetchone()[0]
+    assert version == ss.SCHEMA_VERSION == 4, version
+    statestore.clear_store_cache_for_tests()
+
+
+def test_pooled_session_retired_on_credential_change(monkeypatch):
+    """PRR-004 pin (feedback round 2, the reviewer's falsifier): after a
+    credential rotation under a same-named profile, the NEXT acquire creates
+    a SECOND worker and the first is closed — no SessionBusy wedge, no
+    leaked worker."""
+    from hyperv_mcp import psdsessions as pss
+
+    admin1 = credentials.CredentialSet("LabAdminA", "pass-one-123", "env",
+                                       "lab-a")
+    admin2 = credentials.CredentialSet("LabAdminA", "pass-two-456", "env",
+                                       "lab-a")
+    made: list[object] = []
+    closed: list[int] = []
+
+    class _W:
+        def close(self):
+            closed.append(1)
+
+    def factory(key, script, stdin_b64=None, **kw):
+        made.append(_W())
+        return _W()
+
+    pool = pss.SessionPool(worker_factory=factory, max_sessions=8)
+    key = pss.SessionKey(vm_guid="g", cred_profile="lab-a", agent_id=None,
+                         boot_epoch=None)
+    w1 = pool.acquire(key, 1.0, cred=admin1)
+    pool.release(w1)
+    w2 = pool.acquire(key, 1.0, cred=admin2)
+    assert made and len(made) == 2, (
+        f"rotation must open a fresh pooled session; made {len(made)}")
+    assert closed, "the stale session must be closed, not leaked"
+    assert w1 is not w2

@@ -571,8 +571,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return vm_name.strip()
         # Profiles-first (PRR-008): with no profiles configured nothing can
         # match, so skip the extra canonical-name resolution entirely — the
-        # zero-profile path keeps base behavior byte-identically, including
-        # its host-PowerShell cost.
+        # zero-profile path keeps base behavior byte-identically in outcome
+        # and saves the host-PowerShell spawn the earlier draft added.
         if not _cfg().credential_profiles:
             return vm_id
         if not (vm_id or "").strip():

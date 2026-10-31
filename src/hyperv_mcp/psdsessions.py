@@ -263,10 +263,11 @@ class SessionPool:
     ) -> Any:
         """Check out the session for ``key``, creating it if needed.
 
-        ``cred`` is consulted ONLY when a worker must be created: it supplies
-        the username for the establishment script and the base64 password that
-        crosses to the worker on stdin. It is ignored on reuse, because the key
-        already determines the session.
+        ``cred`` supplies the username/password for a NEW worker's
+        establishment, and its fingerprint guards REUSE: for a named-profile
+        key the component is the profile name (invariant under rotation), so
+        a credential whose fingerprint differs from the stored worker's is
+        retired and replaced rather than reused (issue #30, PRR-004).
 
         Returns the worker. The caller MUST pass it to :meth:`release` (or
         :meth:`discard`) in a ``finally``.
@@ -279,6 +280,7 @@ class SessionPool:
         key = _as_key(key)
         deadline = self._clock() + max(0.0, float(wait_s))
         while True:
+            stale: list[Any] = []
             with self._mu:
                 if self._closed:
                     raise SessionBusy("the session pool is closed")
@@ -286,23 +288,37 @@ class SessionPool:
                 if entry is not None and not entry.doomed and not entry.in_use:
                     # PRR-004: a named-profile key does not move when the
                     # credential rotates; a fingerprint mismatch means the
-                    # stored worker authenticates with a superseded identity —
-                    # retire it (idle-TTL/cap eviction is not enough) and let
-                    # the create path below open a fresh session with the
-                    # incoming credential.
+                    # stored worker authenticates with a superseded identity.
+                    # RETIRE = remove from the table (so the create gate below
+                    # fires) AND close the worker outside _mu — dooming alone
+                    # would wedge the key: a doomed entry blocks the create
+                    # gate and nothing ever closes it.
                     if cred is not None and entry.cred_fp and entry.cred_fp != _cred_fp(cred):
+                        del self._entries[key]
                         entry.doomed = True
+                        stale.append(entry)
                     else:
                         entry.in_use = True
                         entry.last_used = self._clock()
                         return entry.worker
                 # Only take the create path when nothing is closing this VM's
-                # sessions: see `_invalidating`.
+                # sessions: see `_invalidating`. After a PRR-004 retirement the
+                # entry is absent, so the create gate fires and
+                # `_create_locked` opens a fresh session with the incoming
+                # credential.
                 gate = (
                     self._gates.setdefault(key, threading.Lock())
                     if entry is None and _norm_guid(key.vm_guid) not in self._invalidating
                     else None
                 )
+            if stale:
+                # Close outside _mu (the pattern _close_entries uses); the
+                # create path below already started for the replacement.
+                for entry in stale:
+                    try:
+                        entry.worker.close()
+                    except Exception:
+                        pass
             if gate is not None:
                 # A failure to CREATE is fatal for this call, not a reason to
                 # wait: retrying it would burn the whole bounded wait on a spawn

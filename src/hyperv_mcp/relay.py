@@ -147,6 +147,31 @@ class _DeadThread:
         return False
 
 
+# Relay ids whose identity-drift event has already been emitted (PRR-006).
+_drift_emitted: set[str] = set()
+_drift_emitted_lock = threading.Lock()
+
+
+def _emit_identity_drift_once(cfg: Config, row: statestore.RelayRow) -> None:
+    """Emit relay.identity_drift exactly once per relay id (bounded)."""
+    with _drift_emitted_lock:
+        if row.relay_id in _drift_emitted:
+            return
+        if len(_drift_emitted) >= 4096:
+            _drift_emitted.clear()  # bounded; worst case a rare re-emit
+        _drift_emitted.add(row.relay_id)
+    try:
+        from . import operations as _ops
+
+        _ops.emit(cfg, "relay.identity_drift", row.relay_id,
+                  row.vm_id, row.owner, {
+                      "cred_profile": row.cred_profile,
+                      "cred_username": row.cred_username,
+                  })
+    except Exception:
+        pass  # best-effort, matching every other _ops.emit site
+
+
 def _restored_entry(cfg: Config, row: statestore.RelayRow,
                     owner: str | None) -> dict[str, Any] | None:
     """Rebuild a process-local entry from a persisted row (issue #22).
@@ -167,6 +192,7 @@ def _restored_entry(cfg: Config, row: statestore.RelayRow,
     if (row.owner or None) != owner:
         return None
     cred = None
+    drift = False
     if row.cred_ref != "inline":
         # Issue #30: the shared binding helper re-resolves through the
         # NAMED PROFILE the relay started with (or the recorded username for
@@ -195,16 +221,10 @@ def _restored_entry(cfg: Config, row: statestore.RelayRow,
             drift = True
             cred = None
         if drift:
-            try:
-                from . import operations as _ops
-
-                _ops.emit(cfg, "relay.identity_drift", row.relay_id,
-                          row.vm_id, row.owner, {
-                              "cred_profile": row.cred_profile,
-                              "cred_username": row.cred_username,
-                          })
-            except Exception:
-                pass  # best-effort, matching every other _ops.emit site
+            # operations.emit is a one-call-per-TRANSITION append unit: a
+            # status poller reading a drifted row must not append a duplicate
+            # event per read, so the emission is keyed once per relay id.
+            _emit_identity_drift_once(cfg, row)
     context: dict[str, Any] = {
         "cfg": cfg,
         "vm_name": row.vm_name,
@@ -232,8 +252,11 @@ def _restored_entry(cfg: Config, row: statestore.RelayRow,
         "stopped": row.state == statestore.RELAY_STOPPED,
         "row_state": row.state,
         "cred_ref": row.cred_ref,
-        "cred_profile": row.cred_profile,
-        "cred_username": row.cred_username,
+        # PRR-006: on identity drift the restored entry must not keep
+        # asserting a binding that failed — blank the stale labels so the
+        # next row write (stop re-persists) no longer carries them.
+        "cred_profile": "" if drift else row.cred_profile,
+        "cred_username": "" if drift else row.cred_username,
     }
     if entry["row_state"] == statestore.RELAY_ACTIVE:
         # A row not in the local registry has no listener HERE: its listener

@@ -119,6 +119,10 @@ def _read_password_file(path_env: str, environ: dict[str, str]) -> str:
             return fh.read().rstrip("\r\n")
     except OSError as exc:
         raise CredentialError(f"credential file {path_env} unreadable: {exc}") from None
+    except UnicodeDecodeError as exc:
+        raise CredentialError(
+            f"credential file {path_env} is not decodable as UTF-8: {exc}"
+        ) from None
 
 
 def _validated_password(password: str, source: str) -> str:
@@ -383,6 +387,11 @@ def _read_profile_password_file_victim(profile: CredentialProfile) -> str:
         raise CredentialError(
             f"credential profile {profile.name!r} victim password file "
             f"{path!r} unreadable: {exc}"
+        ) from None
+    except UnicodeDecodeError as exc:
+        raise CredentialError(
+            f"credential profile {profile.name!r} victim password file "
+            f"{path!r} is not decodable as UTF-8: {exc}"
         ) from None
 
 
