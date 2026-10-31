@@ -173,7 +173,8 @@ def harvest_offline_logs(cfg: Config, vm_name: str = "", vm_id: str = "", dest_d
             "this release: the disk is mounted on the Hyper-V host, not the "
             "agent box. Run this operation in local mode (server on the "
             "Hyper-V host).")
-    dest = str(policy.check_host_write(cfg, os.path.normpath(os.path.abspath(dest_dir))))
+    dest = policy.check_host_write(
+        cfg, os.path.normpath(os.path.abspath(dest_dir))).normalized
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     with vmlocks.vm_lock(ref.id):
         # State gate (Saved refused too: the unflushed guest cache lives in
