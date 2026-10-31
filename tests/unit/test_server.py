@@ -44,7 +44,9 @@ TOOL_NAMES = {
     "hyperv_console_wait_frame_change", "hyperv_console_wait_frame_stable",
     "hyperv_console_capture_sequence", "hyperv_console_sequence",
     # VM / media preparation
-    "hyperv_vm_create", "hyperv_vm_disk_add", "hyperv_vm_disk_list",
+    "hyperv_vm_create", "hyperv_vm_clone", "hyperv_vm_remove",
+    "hyperv_harvest_offline_logs", "hyperv_deployment_status",
+    "hyperv_vm_disk_add", "hyperv_vm_disk_list",
     "hyperv_vm_media_attach", "hyperv_vm_media_detach", "hyperv_vm_media_list",
     "hyperv_vm_firmware_get", "hyperv_vm_firmware_set_boot_order",
     "hyperv_vm_tpm_set", "hyperv_vm_secureboot_set", "hyperv_vm_network_set",
@@ -76,7 +78,8 @@ CONFIRM_TOOLS = {
     "hyperv_checkpoint_remove", "hyperv_configure_kdnet",
     "hyperv_configure_kdcom", "hyperv_guest_run_ps", "hyperv_guest_run",
     "hyperv_guest_put",
-    "hyperv_vm_create", "hyperv_vm_disk_add",
+    "hyperv_vm_create", "hyperv_vm_clone", "hyperv_vm_remove",
+    "hyperv_vm_disk_add",
     "hyperv_vm_firmware_set_boot_order", "hyperv_vm_tpm_set",
     "hyperv_vm_secureboot_set", "hyperv_vm_set_resolution",
     "hyperv_repair_guest_access",
@@ -112,7 +115,7 @@ def test_tool_inventory_registered(fresh_server):
     # 68 with issue #28's batched console sequence (C287 checkpoint:
     # tests/unit/test_f04_sequences.py::test_sequence_tool_schema_and_boot_epoch_reporting);
     # 76 with issue #29's eight hyperv_ui_* tools.
-    assert len(schemas) == 76
+    assert len(schemas) == 80
 
 
 def test_every_vm_tool_schema_has_vm_id(fresh_server):

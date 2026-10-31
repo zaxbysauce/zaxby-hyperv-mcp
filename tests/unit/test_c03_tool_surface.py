@@ -63,7 +63,8 @@ TOOL_NAMES = {
     "hyperv_console_wait_frame_stable",
     "hyperv_console_capture_sequence",
     "hyperv_console_sequence",
-    "hyperv_vm_create",
+    "hyperv_vm_create", "hyperv_vm_clone", "hyperv_vm_remove",
+    "hyperv_deployment_status", "hyperv_harvest_offline_logs",
     "hyperv_vm_disk_add",
     "hyperv_vm_disk_list",
     "hyperv_vm_media_attach",
@@ -251,7 +252,7 @@ def test_ac12_tool_inventory_per_credential_mode(tmp_path, fresh_server):
         f"extra={sorted(set(base_schemas) - TOOL_NAMES)}, "
         f"missing={sorted(TOOL_NAMES - set(base_schemas))}"
     )
-    assert len(base_schemas) == len(TOOL_NAMES) == 76, (
+    assert len(base_schemas) == len(TOOL_NAMES) == 80, (
         f"AC12: tool count {len(base_schemas)} != 76 "
         f"(66 through issue #24; 67 with issue #27's settle wait; "
         f"68 with issue #28's hyperv_console_sequence; 76 with issue #29's "

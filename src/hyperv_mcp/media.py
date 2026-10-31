@@ -292,7 +292,7 @@ def vm_clone(
         f" | Where-Object {{ $_.Path -eq {parent_q} }})",
         "if ($attached.Count -gt 0) { throw ('golden parent is attached to another VM"
         " (vm ids: ' + (($attached | ForEach-Object { $_.Id.ToString() }) -join ', ')"
-        + ") — refusing to clone from an in-use parent') }",
+        " + ' - refusing to clone from an in-use parent') }",
         # Differencing child of the golden parent: no -SizeBytes of its own.
         f"$vhd = New-VHD -Path {child_q} -ParentPath {parent_q} -Differencing -ErrorAction Stop",
         # If New-VM fails the fresh child would orphan on the host — same
