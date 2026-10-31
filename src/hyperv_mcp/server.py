@@ -58,6 +58,7 @@ from . import (
     leases,
     lifecycle,
     media,
+    readiness,
     operations,
     policy,
     psdsessions,
@@ -1912,15 +1913,17 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         """Wait (bounded) until the VM reaches one of the requested states.
         states must be from: Off, Running, Saved, Paused, Starting, Stopping,
         Resuming, Pausing. Reports guest-channel readiness for handoff:
-        console input works in firmware/WinPE, PowerShell Direct only after
-        Windows boots — verify hyperv_console_get_display_info before
-        switching channels.
+        console input works from firmware/WinPE; when the final state is
+        Running the Heartbeat integration service is queried (issue #32) and
+        guest_channel is derived from it — os_heartbeat_ok means an OS booted
+        and is responding, never that PowerShell Direct credentials work.
+        Poll hyperv_deployment_status for the full credential-free picture.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, final_state, guest_channel} — {ok: false, error_class:
-        "transport"} carrying the last observed state if the deadline
-        expires first.
+        Returns: {ok, final_state, guest_channel[, heartbeat]} — {ok: false,
+        error_class: "transport"} carrying the last observed state if the
+        deadline expires first. Non-Running finals run no heartbeat query.
         """
 
         def _wait() -> dict:
@@ -1932,13 +1935,19 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                         f"invalid state {s!r}; must be one of {lifecycle.VALID_STATES} "
                         "(strict validation: no shell metacharacters possible)"
                     )
-            final = lifecycle.wait_for_vm_state(
+            # The ref-returning variant resolves the identity ONCE so the
+            # optional heartbeat leg reuses it (issue #32): resolve + wait,
+            # plus exactly one heartbeat process on a Running final.
+            final, ref = lifecycle.wait_for_vm_state_ref(
                 _cfg(), vm_name, list(states), timeout_s, vm_id=vm_id
             )
-            # wait_for_vm_state returns the bare state string; by-id waits
-            # audit under the empty caller name (documented PRR-005 fallback —
-            # no fabricated name).
-            return {"ok": True, "final_state": final, "guest_channel": "ps_direct_unverified"}
+            if final != "Running":
+                return {"ok": True, "final_state": final,
+                        "guest_channel": "no_guest_signal"}
+            heartbeat = readiness.heartbeat_status(_cfg(), ref)
+            channel = "os_heartbeat_ok" if heartbeat == "OK" else "no_guest_signal"
+            return {"ok": True, "final_state": final, "heartbeat": heartbeat,
+                    "guest_channel": channel}
 
         return _run_guest_tool("hyperv_wait_vm_state", vm_name, "read", _wait)
 
