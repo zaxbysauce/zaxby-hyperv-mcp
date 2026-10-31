@@ -1,7 +1,7 @@
 """Acceptance checks for issue #16, part 4 — the preserved tool surface.
 
 AC10 (credential error envelope at the tool layer), AC11 (screenshot returns
-a real PNG ImageContent block plus metadata), AC12 (same 76-tool inventory
+a real PNG ImageContent block plus metadata), AC12 (same 80-tool inventory
 with the same parameters per credential mode). Sibling c03 files:
 test_c03_tool_concurrency.py (AC1-AC5), test_c03_sdk_port.py (AC7-AC9),
 test_c03_http_entry.py (AC6, AC13).
@@ -63,7 +63,8 @@ TOOL_NAMES = {
     "hyperv_console_wait_frame_stable",
     "hyperv_console_capture_sequence",
     "hyperv_console_sequence",
-    "hyperv_vm_create",
+    "hyperv_vm_create", "hyperv_vm_clone", "hyperv_vm_remove",
+    "hyperv_deployment_status", "hyperv_harvest_offline_logs",
     "hyperv_vm_disk_add",
     "hyperv_vm_disk_list",
     "hyperv_vm_media_attach",
@@ -241,7 +242,7 @@ def test_ac11_screenshot_returns_image_content(monkeypatch, fresh_server):
 
 
 def test_ac12_tool_inventory_per_credential_mode(tmp_path, fresh_server):
-    """AC12: tools listed register the same 76-name inventory with the same
+    """AC12: tools listed register the same 80-name inventory with the same
     parameters per credential mode (inline mode only adds username/password
     to the credential tools)."""
     mod = fresh_server({})
@@ -251,8 +252,8 @@ def test_ac12_tool_inventory_per_credential_mode(tmp_path, fresh_server):
         f"extra={sorted(set(base_schemas) - TOOL_NAMES)}, "
         f"missing={sorted(TOOL_NAMES - set(base_schemas))}"
     )
-    assert len(base_schemas) == len(TOOL_NAMES) == 76, (
-        f"AC12: tool count {len(base_schemas)} != 76 "
+    assert len(base_schemas) == len(TOOL_NAMES) == 80, (
+        f"AC12: tool count {len(base_schemas)} != 80 "
         f"(66 through issue #24; 67 with issue #27's settle wait; "
         f"68 with issue #28's hyperv_console_sequence; 76 with issue #29's "
         f"eight hyperv_ui_* tools)"

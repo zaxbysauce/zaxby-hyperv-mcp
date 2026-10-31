@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from hyperv_mcp import console, filetransfer, guestexec, lifecycle, media, pswindows, vmident
+from hyperv_mcp import console, filetransfer, guestexec, harvest, lifecycle, media, pswindows, vmident
 from hyperv_mcp.config import Config
 from hyperv_mcp.credentials import CredentialSet
 
@@ -786,3 +786,98 @@ def test_parse_console_sequence_every_step_type(monkeypatch, parsed_ps):
         assert _parse_errors(script) == [], (
             "the generated sequence script must parse under the PS 5.1 parser"
         )
+
+
+# --- Workstream G (issues #31/#32/#33): new-tool generated scripts ----------
+
+class _QueuePS:
+    """Content-serving recorder for multi-leg flows (g0x idiom)."""
+
+    def __init__(self, responses):
+        self.scripts = []
+        self._r = list(responses)
+
+    def __call__(self, script, **kwargs):
+        self.scripts.append(script)
+        item = self._r.pop(0) if self._r else pswindows.PSResult(stdout="", returncode=0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def test_parse_media_vm_clone(monkeypatch, parsed_ps, tmp_path):
+    parent = tmp_path / "gold.vhdx"
+    parent.write_bytes(b"gold")
+    rec = Recorder()
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        media.vm_clone(
+            UNRESTRICTED, "test-vm-1", str(parent),
+            str(tmp_path / "child.vhdx"), switch_name="LabSwitch", confirm=True,
+        )
+    except Exception:
+        pass
+    assert rec.scripts, "vm_clone produced no script"
+    for script in rec.scripts:
+        assert _parse_errors(script) == []
+
+
+def test_parse_media_vm_remove_scripts(monkeypatch, parsed_ps, tmp_path):
+    disks = json.dumps({
+        "status": "removed",
+        "disks": [str(tmp_path / "disk.vhdx"), str(tmp_path / "disk.avhdx")],
+        "ancestors": [str(tmp_path / "gold.vhdx")],
+    })
+    rec = _QueuePS([
+        pswindows.PSResult(stdout=VM_GUID, returncode=0),
+        pswindows.PSResult(stdout="Off", returncode=0),
+        pswindows.PSResult(stdout=disks, returncode=0),
+        pswindows.PSResult(stdout="merge_complete", returncode=0),
+        pswindows.PSResult(stdout="[]", returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    for p in ("disk.vhdx", "disk.avhdx"):
+        (tmp_path / p).write_bytes(b"x")
+    try:
+        media.vm_remove(
+            UNRESTRICTED, vm_name="test-vm-1", delete_disks=True, confirm=True)
+    except Exception:
+        pass
+    assert len(rec.scripts) >= 4, "vm_remove produced too few legs"
+    for script in rec.scripts:
+        assert _parse_errors(script) == []
+
+
+def test_parse_harvest_action_script(monkeypatch, parsed_ps, tmp_path):
+    rec = _QueuePS([
+        pswindows.PSResult(stdout=VM_GUID, returncode=0),
+        pswindows.PSResult(stdout="Off", returncode=0),
+        pswindows.PSResult(stdout="SeBackupPrivilege", returncode=0),
+        pswindows.PSResult(stdout='{"files": [], "skipped": []}', returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        harvest.harvest_offline_logs(
+            UNRESTRICTED, vm_name="test-vm-1", dest_dir=str(tmp_path / "out"))
+    except Exception:
+        pass
+    actions = [s for s in rec.scripts if "Mount-VHD" in s]
+    assert actions, "harvest produced no action script"
+    for script in rec.scripts:
+        assert _parse_errors(script) == []
+
+
+def test_parse_readiness_wait_and_status(monkeypatch, parsed_ps):
+    # the wait tool's heartbeat leg
+    rec = _QueuePS([
+        pswindows.PSResult(stdout=VM_GUID, returncode=0),
+        pswindows.PSResult(stdout=json.dumps({"final_state": "Running"}), returncode=0),
+        pswindows.PSResult(stdout="OK", returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", rec)
+    try:
+        lifecycle.wait_for_vm_state_ref(UNRESTRICTED, "test-vm-1", ["Running"], 5)
+    except Exception:
+        pass
+    for script in rec.scripts:
+        assert _parse_errors(script) == []

@@ -117,6 +117,14 @@ class DestructivePolicy:
     display: bool = False
     guest_repair: bool = False
     relay: bool = False
+    # Issue #31: removing a VM (and optionally its own disk files) is
+    # irreversible and a different risk class from vm_provision (create,
+    # attach, firmware) — its own deny-by-default switch.
+    vm_remove: bool = False
+    # Issue #33: reading a guest disk from the host bypasses guest credentials
+    # and guest_read_roots, so offline log harvest must be opted into
+    # explicitly (read-only like media: no confirm leg).
+    offline_harvest: bool = False
     # Issue #29: element-level UI actions through the in-session UIA helper
     # (invoke/set_value/focus) and helper provisioning (autologon secret +
     # scheduled task) each carry their own deny-by-default switch.

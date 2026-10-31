@@ -19,7 +19,10 @@ SRC = Path(__file__).resolve().parents[2] / "src" / "hyperv_mcp"
 # vm_lock keys that are NOT a resolved VM identity, with the reason each is
 # safe (vm_create locks the not-yet-existing name; the in-script guard makes
 # duplicates unreachable). Anything else must be a GUID.
-ALLOWED_LOCK_KEYS = {"vm_create"}
+# vm_create/vm_clone lock the not-yet-existing name; the shared in-script
+# duplicate-name guard makes name collisions unreachable (issue #31 carries
+# the same disclosed residual as vm_create).
+ALLOWED_LOCK_KEYS = {"vm_create", "vm_clone"}
 
 
 

@@ -1,7 +1,7 @@
 """
 hyperv_mcp.server -- MCP server for Hyper-V VM management (hardened fork).
 
-Exposes 76 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
+Exposes 80 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
 guest execution and file transfer via PowerShell Direct, guest access
 diagnostics/repair and managed guest jobs, reboot recovery verification,
 host-to-guest HTTP relay, console observation and input (WMI), evidence
@@ -55,6 +55,7 @@ from . import (
     filetransfer,
     guestexec,
     guestjobs,
+    harvest,
     leases,
     lifecycle,
     media,
@@ -62,6 +63,7 @@ from . import (
     policy,
     psdsessions,
     pswindows,
+    readiness,
     relay,
     repair,
     statestore,
@@ -115,6 +117,9 @@ _OPERATIONS_DESTRUCTIVE_GATES: dict[str, Callable[[Config, dict], None]] = {
         f"remove checkpoint '{a.get('checkpoint_name')}' from VM '{a.get('vm_name') or a.get('vm_id')}'"),
     "hyperv_vm_create": lambda cfg, a: policy.require_destructive(
         cfg, "vm_provision", bool(a.get("confirm")), f"create VM '{a.get('vm_name')}'"),
+    "hyperv_vm_remove": lambda cfg, a: policy.require_destructive(
+        cfg, "vm_remove", bool(a.get("confirm")),
+        f"remove VM '{a.get('vm_name') or a.get('vm_id')}'"),
     "hyperv_guest_put": lambda cfg, a: policy.require_destructive(
         cfg, "guest_write", bool(a.get("confirm")),
         f"write '{a.get('remote_path')}' on '{a.get('vm_name') or a.get('vm_id')}'"),
@@ -1912,15 +1917,17 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         """Wait (bounded) until the VM reaches one of the requested states.
         states must be from: Off, Running, Saved, Paused, Starting, Stopping,
         Resuming, Pausing. Reports guest-channel readiness for handoff:
-        console input works in firmware/WinPE, PowerShell Direct only after
-        Windows boots — verify hyperv_console_get_display_info before
-        switching channels.
+        console input works from firmware/WinPE; when the final state is
+        Running the Heartbeat integration service is queried (issue #32) and
+        guest_channel is derived from it — os_heartbeat_ok means an OS booted
+        and is responding, never that PowerShell Direct credentials work.
+        Poll hyperv_deployment_status for the full credential-free picture.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
-        Returns: {ok, final_state, guest_channel} — {ok: false, error_class:
-        "transport"} carrying the last observed state if the deadline
-        expires first.
+        Returns: {ok, final_state, guest_channel[, heartbeat]} — {ok: false,
+        error_class: "transport"} carrying the last observed state if the
+        deadline expires first. Non-Running finals run no heartbeat query.
         """
 
         def _wait() -> dict:
@@ -1932,13 +1939,19 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                         f"invalid state {s!r}; must be one of {lifecycle.VALID_STATES} "
                         "(strict validation: no shell metacharacters possible)"
                     )
-            final = lifecycle.wait_for_vm_state(
+            # The ref-returning variant resolves the identity ONCE so the
+            # optional heartbeat leg reuses it (issue #32): resolve + wait,
+            # plus exactly one heartbeat process on a Running final.
+            final, ref = lifecycle.wait_for_vm_state_ref(
                 _cfg(), vm_name, list(states), timeout_s, vm_id=vm_id
             )
-            # wait_for_vm_state returns the bare state string; by-id waits
-            # audit under the empty caller name (documented PRR-005 fallback —
-            # no fabricated name).
-            return {"ok": True, "final_state": final, "guest_channel": "ps_direct_unverified"}
+            if final != "Running":
+                return {"ok": True, "final_state": final,
+                        "guest_channel": "no_guest_signal"}
+            heartbeat = readiness.heartbeat_status(_cfg(), ref)
+            channel = "os_heartbeat_ok" if heartbeat == "OK" else "no_guest_signal"
+            return {"ok": True, "final_state": final, "heartbeat": heartbeat,
+                    "guest_channel": channel}
 
         return _run_guest_tool("hyperv_wait_vm_state", vm_name, "read", _wait)
 
@@ -1965,6 +1978,96 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             memory_mb=memory_mb, cpu_count=cpu_count, generation=generation,
             vhd_path=vhd_path, vhd_size_gb=vhd_size_gb, switch_name=switch_name,
             confirm=confirm,
+        )
+
+    @mcp.tool()
+    def hyperv_vm_clone(
+        name: str, parent_vhd_path: str, vhd_path: str,
+        memory_mb: int = 2048, cpu_count: int = 1, generation: int = 2,
+        switch_name: str = "", confirm: bool = False,
+        lease_id: str = "", fencing_token: int = 0,
+    ) -> dict:
+        """Create a disposable VM on a differencing disk over a read-only
+        golden image (New-VHD -Differencing + New-VM; issue #31). A writable
+        parent is locked read-only first, a parent attached to any VM is
+        refused, and a failed New-VM cleans up the staged child.
+        Policy: vm_provision category + confirm=true.
+
+        Returns: {ok, id, name, state, generation, vhd_path,
+        parent_vhd_path, parent_made_read_only} or the failure envelope.
+        """
+        return _run_guest_tool(
+            "hyperv_vm_clone", name, "vm_provision",
+            media.vm_clone, _cfg(), name, parent_vhd_path, vhd_path,
+            memory_mb=memory_mb, cpu_count=cpu_count, generation=generation,
+            switch_name=switch_name, confirm=confirm,
+        )
+
+    @mcp.tool()
+    def hyperv_vm_remove(
+        vm_name: str = "", delete_disks: bool = False, confirm: bool = False,
+        vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
+        detach: bool = False, idempotency_key: str = "",
+    ) -> dict:
+        """Remove a stopped VM by GUID, optionally deleting its OWN disk
+        files (issue #31). Requires state Off (hyperv_stop_vm otherwise).
+        Differencing ancestors (the golden parent) and anything outside
+        host_write_roots are NEVER deleted — every kept path is reported
+        with a reason; the post-removal checkpoint merge is waited out
+        (bounded, timeout reported as retryable). Policy: vm_remove
+        category + confirm=true.
+
+        Returns: {ok, status, vm_name} (deleted[]/kept[{path, reason}]
+        additionally present with delete_disks=true) or the failure
+        envelope (+ holder on busy).
+        """
+        return _run_guest_tool(
+            "hyperv_vm_remove", vm_name, "vm_remove",
+            media.vm_remove, _cfg(), vm_name,
+            delete_disks=delete_disks, confirm=confirm, vm_id=vm_id,
+        )
+
+    @mcp.tool()
+    def hyperv_deployment_status(
+        vm_name: str = "", vm_id: str = "",
+    ) -> dict:
+        """Credential-free deployment readiness from host-side signals
+        (issue #32): VM state + the Heartbeat integration service + KVP
+        GuestIntrinsicExchangeItems (OSName, OSBuildNumber,
+        NetworkAddressIPv4) combined into one phase answer — off /
+        no_guest_signal / os_ready / degraded. Never resolves guest
+        credentials; os_ready never means PowerShell Direct credentials
+        work. Read-only: no category, no confirm.
+
+        Returns: {ok, phase, vm{state, uptime_s}, heartbeat,
+        guest{os_name, os_build, ipv4[]}, kvp{available, items}, vm_name}.
+        """
+        return _run_guest_tool(
+            "hyperv_deployment_status", vm_name, "read",
+            readiness.deployment_status, _cfg(), vm_name, vm_id=vm_id,
+        )
+
+    @mcp.tool()
+    def hyperv_harvest_offline_logs(
+        vm_name: str = "", dest_dir: str = "", vm_id: str = "",
+    ) -> dict:
+        """Harvest deployment logs from a stopped VM's virtual disk when the
+        guest never boots (issue #33): mounts the Off VM's disk chain
+        read-only (Mount-VHD -ReadOnly -NoDriveLetter), copies the FIXED
+        documented log set (Panther setupact/setuperr, BDD.log, smsts.log
+        variants) with backup semantics into dest_dir under
+        host_write_roots, SHA-256 hashes every file and always dismounts.
+        Requires SeBackupPrivilege (elevated). Policy: offline_harvest
+        category (read-only, no confirm); no guest credentials.
+
+        Returns: {ok, dest_dir, files[{path, bytes, sha256}],
+        skipped[{path, reason}], vm_name}.
+        """
+        return _run_guest_tool(
+            "hyperv_harvest_offline_logs", vm_name, "offline_harvest",
+            harvest.harvest_offline_logs, _cfg(), vm_name,
+            dest_dir=dest_dir, vm_id=vm_id,
         )
 
     @mcp.tool()
@@ -3641,7 +3744,8 @@ TOOL_SCOPES: dict[str, str] = {
     "hyperv_reset_vm": "lifecycle", "hyperv_checkpoint_create": "lifecycle",
     "hyperv_checkpoint_restore": "lifecycle", "hyperv_checkpoint_remove": "lifecycle",
     "hyperv_configure_kdnet": "lifecycle", "hyperv_configure_kdcom": "lifecycle",
-    "hyperv_vm_create": "lifecycle", "hyperv_vm_disk_add": "lifecycle",
+    "hyperv_vm_create": "lifecycle", "hyperv_vm_clone": "lifecycle",
+    "hyperv_vm_remove": "lifecycle", "hyperv_vm_disk_add": "lifecycle",
     "hyperv_vm_media_attach": "lifecycle", "hyperv_vm_media_detach": "lifecycle",
     "hyperv_vm_network_set": "lifecycle",
     "hyperv_vm_firmware_set_boot_order": "lifecycle",
@@ -3710,6 +3814,14 @@ def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]
         return errors.enrich_failure(env), None
     vm_hint = str(arguments.get("vm_id") or "")
     vm_name = str(arguments.get("vm_name") or "")
+    if not vm_name:
+        # create/clone-style tools address a not-yet-existing VM by `name`
+        # (issue #31): without this fallback the hint is empty, authorize
+        # treats every lease row as matching, and assert_unleased checks
+        # nothing — the degenerate gate vm_create has shipped with. Feeding
+        # the name through vm_name keeps the policy pre-screen below in the
+        # loop for these tools too (PRR-006 ordering).
+        vm_name = str(arguments.get("name") or "")
     vm_name_hint = vm_name
     try:
         # Review PRR-006: policy runs BEFORE any lease logic, matching

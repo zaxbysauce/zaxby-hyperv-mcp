@@ -1,7 +1,7 @@
 # hyperv-mcp (hardened fork)
 
 An MCP (Model Context Protocol) server for Hyper-V VM management and guest
-execution. Exposes 76 tools for VM lifecycle, checkpoint management, kernel
+execution. Exposes 80 tools for VM lifecycle, checkpoint management, kernel
 debug setup (KDNET/KDCOM), and guest file transfer/command execution via
 PowerShell Direct (no WinRM required).
 
@@ -640,7 +640,9 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
     "guest_write": true,
     "console_input": true,        // virtual keyboard + mouse input
     "media": true,                // ISO attach/detach, network connect
-    "vm_provision": true,         // VM create, disk add, firmware, TPM, SecureBoot
+    "vm_provision": true,         // VM create/clone, disk add, firmware, TPM, SecureBoot
+    "vm_remove": false,           // VM removal (+ own-disk deletion with delete_disks)
+    "offline_harvest": false,     // offline log harvest from a stopped VM's disk
     "display": true,              // VM display resolution (Set-VMVideo; restart leg needs stop + confirm)
     "guest_repair": true,         // APPLY guest access repairs (dry run needs no switch)
     "relay": true,                // host->guest HTTP relay listener
@@ -1018,6 +1020,9 @@ These tools refuse to run unless their category is enabled **and** (when
 | `hyperv_console_type_text` / `press_key` / `key_combo` / `type_scancodes` / `mouse_move` / `click` / `button` / `scroll` | `console_input` (no confirm — non-destructive interactive input) |
 | `hyperv_vm_media_attach` / `media_detach` / `network_set` | `media` (reversible, no confirm) |
 | `hyperv_vm_create` / `disk_add` / `firmware_set_boot_order` / `tpm_set` / `secureboot_set` | `vm_provision` + `confirm` |
+| `hyperv_vm_clone` | `vm_provision` + `confirm` (creates a VM on a differencing disk over a read-only golden image) |
+| `hyperv_vm_remove` | `vm_remove` + `confirm` (removes the stopped VM's registration; `delete_disks=true` additionally deletes only its own disk files) |
+| `hyperv_harvest_offline_logs` | `offline_harvest` (read-only, no confirm — mounts the guest disk read-only and copies the fixed log set) |
 | `hyperv_vm_set_resolution` | `display` (reversible, no confirm; applies at next start) — its `restart=true` stop/start additionally needs `stop` + `confirm` |
 | `hyperv_ui_invoke` / `hyperv_ui_set_value` / `hyperv_ui_focus` | `ui_input` (no confirm — element-level interactive input; the lease gate runs first) |
 | `hyperv_ui_helper_provision` | `ui_provision` + `confirm` (installs the in-session helper and configures autologon; `teardown=true` runs the same gate) |
@@ -1132,7 +1137,7 @@ claude mcp add hyperv -- hyperv-mcp
 
 ---
 
-## Available Tools (76 total)
+## Available Tools (80 total)
 
 Every registered tool in the tables below returns failures the same way:
 the one-envelope contract (`ok/error/error_class/retryable/retry_after_ms`,
@@ -1823,7 +1828,11 @@ served transport and exits non-zero if the WMI plane could not serve.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_vm_create` | `name`, `vhd_path`, `memory_mb=2048`, `cpu_count=1`, `generation=2`, `vhd_size_gb=64`, `switch_name?`, `confirm` | `{ok, id, name, state, generation}` |
+| `hyperv_vm_create` | `name`, `vhd_path`, `memory_mb=2048`, `cpu_count=1` (applied to the new VM via `Set-VMProcessor`), `generation=2`, `vhd_size_gb=64`, `switch_name?`, `confirm` | `{ok, id, name, state, generation}` |
+| `hyperv_vm_clone` | `name`, `parent_vhd_path`, `vhd_path`, `memory_mb=2048`, `cpu_count=1` (applied), `generation=2`, `switch_name?`, `confirm` | `{ok, id, name, state, generation, vhd_path, parent_vhd_path, parent_made_read_only}` |
+| `hyperv_vm_remove` | `vm_name` or `vm_id`, `delete_disks=false`, `confirm` | `{ok, status, vm_name, deleted[], kept[{path, reason}]}` — refuses non-Off (use `hyperv_stop_vm`); with `delete_disks=true` deletes only the VM's own disks (never differencing ancestors, never outside `host_write_roots`), waiting out the post-removal checkpoint merge (bounded) |
+| `hyperv_deployment_status` | `vm_name` or `vm_id` | `{ok, phase, vm{state, uptime_s}, heartbeat, guest{os_name, os_build, ipv4[]}, kvp{available, items}, vm_name}` — credential-free readiness from the Heartbeat integration service + KVP; phases: `off` / `no_guest_signal` / `os_ready` / `degraded` |
+| `hyperv_harvest_offline_logs` | `vm_name` or `vm_id`, `dest_dir` | `{ok, dest_dir, files[{path, bytes, sha256}], skipped[{path, reason}], vm_name}` — requires state Off + SeBackupPrivilege (elevated); mounts the disk read-only and copies the fixed documented log set (Panther/MDT/SMSTS); `offline_harvest` category |
 | `hyperv_vm_disk_add` | `vm_name` or `vm_id`, `path`, `size_gb`, `controller_type=SCSI`, `confirm` | `{ok, vhd_path, disk_count}` (`disk_count` is `null` if the post-add read failed) |
 | `hyperv_vm_disk_list` | `vm_name` or `vm_id` | `{ok, disks[]}` |
 | `hyperv_vm_media_attach` | `vm_name` or `vm_id`, `iso_path` | `{ok, iso_path, attached}` (`attached` is `null` if the post-attach read failed) |
@@ -1862,7 +1871,7 @@ width/height/frame dimensions when you need head-sized captures.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_wait_vm_state` | `vm_name` or `vm_id`, `states[]` (Off/Running/Saved/Paused/...), `timeout_s=300` | `{ok, final_state, guest_channel: "ps_direct_unverified"}` |
+| `hyperv_wait_vm_state` | `vm_name` or `vm_id`, `states[]` (Off/Running/Saved/Paused/...), `timeout_s=300` | `{ok, final_state, guest_channel, [heartbeat]}` — `guest_channel` is derived from the Heartbeat integration service on Running finals (`os_heartbeat_ok` / `no_guest_signal`); non-Running finals run no heartbeat query |
 
 ### Server Provenance (0.3.0)
 
@@ -1874,14 +1883,14 @@ width/height/frame dimensions when you need head-sized captures.
 
 1. **Identify** — `hyperv_list_vms`; pick a disposable VM matching allowed_vm_patterns.
 2. **Verify media** — `hyperv_vm_media_list` on the VM or known-good ISO path; confirm freshness.
-3. **Checkpoint/recreate** — `hyperv_checkpoint_create` (restore later) or `hyperv_vm_create` + `hyperv_vm_disk_add` (multi-disk: separate OS and data disks).
+3. **Checkpoint/clone/recreate** — `hyperv_checkpoint_create` (restore later), `hyperv_vm_clone` + `hyperv_vm_disk_add` (golden-image differencing clone: fast, parent stays pristine), or `hyperv_vm_create` for a blank disk; finish with `hyperv_vm_remove` (`delete_disks=true` cleans up the clone's own disks, never the golden parent).
 4. **Attach media** — `hyperv_vm_media_attach` with the LiteTouch ISO.
 5. **Boot** — `hyperv_vm_firmware_set_boot_order` (Drive for blank-disk fallthrough, or Network for PXE) then `hyperv_start_vm`.
 6. **Observe** — `hyperv_console_screenshot` then `hyperv_console_wait_frame_change` (chain via `frame_hash`). WinPE errors appear as images — interpret visually, never answer blindly.
 7. **Answer wizard** — `hyperv_console_click` (coordinates from the screenshot) then `hyperv_console_type_text` for harmless fields. For the disk-selection step: verify which disk you are targeting against `hyperv_vm_disk_list` — an early cleanup prompt and the later "Select OS Disk" step are DIFFERENT stages; never target the deployment-media disk.
 8. **Monitor** — repeated `wait_frame_change` (static frame = no progress, not success), or after any console input call `hyperv_console_wait_frame_stable` — it returns once the screen has been UNCHANGED for `stable_ms` (default 1500, `interval_ms` floor 100, bounded by `timeout_s`), so an animation or wizard repaint is allowed to finish before the next step instead of guessing a sleep length. With `baseline_hash` from before the input, "the input did nothing" reports `stop_reason: unchanged` rather than `stable`.
-9. **Switch channels** — once Windows is up and an admin account exists, switch to `hyperv_guest_run_ps` / `filetransfer` tools. PS Direct failures during WinPE are expected, not evidence the VM is down. Report the switch explicitly.
-10. **Collect** — guest logs: `C:\Windows\Temp\DeploymentLogs\SMSTS.log`, `...\BDD.log`. Results.xml lives on the deployment share (host-side) — inspect via host_read_roots, not guest_get. RetVal=0 does not mean zero errors.
+9. **Switch channels** — poll `hyperv_deployment_status` until `phase: "os_ready"` (credential-free: heartbeat + KVP; `hyperv_wait_vm_state` also reports the real heartbeat on Running finals). Once an admin account exists, switch to `hyperv_guest_run_ps` / `filetransfer` tools. PS Direct failures during WinPE are expected, not evidence the VM is down. Report the switch explicitly.
+10. **Collect** — guest logs: `C:\Windows\Temp\DeploymentLogs\SMSTS.log`, `...\BDD.log`. Results.xml lives on the deployment share (host-side) — inspect via host_read_roots, not guest_get. RetVal=0 does not mean zero errors. If the deployment died before Windows booted (WinPE crash, specialize-pass failure), `hyperv_stop_vm(method=turnoff)` then `hyperv_harvest_offline_logs` reads Panther setupact/setuperr, BDD.log and smsts.log straight from the stopped VM's disk — no guest credentials needed.
 11. **Classify & restore** — success/prompt/error from the final image; `hyperv_checkpoint_restore` or recreate the VM.
 
 ## Typical Workflow — Kernel Debugging a Hyper-V VM

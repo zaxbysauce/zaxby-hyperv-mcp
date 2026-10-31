@@ -46,7 +46,7 @@ def test_every_detachable_tool_declares_the_coordination_params(tmp_path):
     mod.bootstrap({"HYPERV_MCP_CONFIG": str(p)})
     tools = {t.name: t for t in asyncio.run(mod.get_mcp().list_tools())}
 
-    assert len(operations.DETACHABLE_TOOLS) == 13
+    assert len(operations.DETACHABLE_TOOLS) == 14
     missing = []
     for name in sorted(operations.DETACHABLE_TOOLS):
         props = (getattr(tools[name], "input_schema", None) or {}).get("properties", {})
