@@ -20,9 +20,12 @@ from __future__ import annotations
 
 import json
 import os
+import stat
+import time
 
 from . import guestexec, lifecycle, policy, pswindows, vmident, vmlocks
 from .config import Config
+from .policy import PolicyDenied
 
 _BOOT_TYPES = ("Drive", "Network", "File")
 
@@ -172,18 +175,8 @@ def vm_create(
             + " -ErrorAction Stop\n"
         )
     lines = [pre] if pre else []
+    lines += _new_name_guard(name)
     lines += [
-        # Refuse to shadow an existing VM of the same name BEFORE creating
-        # anything. The predicate mirrors guestexec.psdirect_vm_target exactly
-        # (literal ElementName -eq via ps_quote AND a GUID-shaped Name), so a
-        # host or non-VM computer system sharing the name is not falsely
-        # refused and "same name" is the resolver's notion.
-        "if (@(Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem"
-        " -ErrorAction Stop | Where-Object { ($_.ElementName -eq "
-        + pswindows.ps_quote(name)
-        + ") -and ($_.Name -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
-        "-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') }).Count)"
-        " { throw 'VM name already exists' }",
         f"$vhd = New-VHD -Path {pswindows.ps_quote(vhd)} -SizeBytes ({int(vhd_size_gb)}GB) -Fixed:$false -ErrorAction Stop",
         # If New-VM fails the fresh VHDX would orphan on the host and wedge
         # every retry against the exists-refusal below — clean it up first.
@@ -222,6 +215,264 @@ def vm_create(
         result = _run(cfg, "\n".join(lines), f"vm_create({name})", timeout_s=300)
     out = _json_out(result, "vm_create")
     return {"ok": True, **out} if isinstance(out, dict) else {"ok": True}
+
+
+def _new_name_guard(name: str) -> list[str]:
+    """The duplicate-name CIM guard shared by vm_create and vm_clone.
+
+    Refuse to shadow an existing VM of the same name BEFORE creating
+    anything. The predicate mirrors guestexec.psdirect_vm_target exactly
+    (literal ElementName -eq via ps_quote AND a GUID-shaped Name), so a
+    host or non-VM computer system sharing the name is not falsely
+    refused and "same name" is the resolver's notion.
+    """
+    return [
+        "if (@(Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem"
+        " -ErrorAction Stop | Where-Object { ($_.ElementName -eq "
+        + pswindows.ps_quote(name)
+        + ") -and ($_.Name -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+        "-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') }).Count)"
+        " { throw 'VM name already exists' }",
+    ]
+
+
+def vm_clone(
+    cfg: Config, name: str, parent_vhd_path: str, vhd_path: str,
+    memory_mb: int = 2048, cpu_count: int = 1, generation: int = 2,
+    switch_name: str = "", confirm: bool = False,
+) -> dict:
+    """Create a VM on a differencing disk over a read-only golden image
+    (issue #31; ENH-13). The parent is locked read-only before the first
+    child exists, a parent attached to any registered VM is refused, and a
+    failed New-VM cleans up the staged child (vm_create's pattern).
+
+    Lock residual (disclosed, plan PS3): the lock key is the pre-creation
+    NAME (the VM does not exist yet), mirroring vm_create; vm_remove locks
+    the resolved GUID, so the two do not mutually exclude. Golden-parent
+    safety comes from vm_remove's ownership rule, not cross-key exclusion.
+    """
+    _checked_new_name(cfg, name)
+    policy.require_destructive(cfg, "vm_provision", confirm, f"clone VM '{name}'")
+    if memory_mb < 32 or memory_mb > 64 * 1024:
+        raise ValueError("memory_mb must be within 32..65536")
+    if not (1 <= cpu_count <= 64):
+        raise ValueError("cpu_count must be within 1..64")
+    if generation not in (1, 2):
+        raise ValueError("generation must be 1 or 2")
+    _reject_remote_file_ops(cfg, "vm_clone (VHD paths)")
+    parent = _checked_file_path(cfg, parent_vhd_path, write=False, must_exist=True, extensions=(".vhdx", ".vhd"))
+    child = _checked_file_path(cfg, vhd_path, write=True, must_exist=False, extensions=(".vhdx", ".vhd"))
+    if os.path.splitext(parent)[1].lower() != os.path.splitext(child)[1].lower():
+        raise ValueError("parent and child must share the VHD extension (.vhdx with .vhdx, .vhd with .vhd)")
+
+    # A writable parent can be modified by anyone (or by a mistaken
+    # vm_create/vm_disk_add aimed at it), silently breaking every child —
+    # lock it read-only before the first child exists. stat.S_IWRITE
+    # reflects the Windows read-only attribute and also works on Linux CI.
+    made_read_only = False
+    if os.stat(parent).st_mode & stat.S_IWRITE:
+        os.chmod(parent, os.stat(parent).st_mode & ~stat.S_IWRITE)
+        made_read_only = True
+
+    parent_q = pswindows.ps_quote(parent)
+    child_q = pswindows.ps_quote(child)
+    pre = ""
+    if switch_name:
+        pre = (
+            "$vmsw = Get-VMSwitch -Name " + pswindows.ps_name(switch_name)
+            + " -ErrorAction Stop\n"
+        )
+    lines = [pre] if pre else []
+    lines += _new_name_guard(name)
+    lines += [
+        # A golden parent attached to any registered VM cannot be a template:
+        # writing the child's block allocations would corrupt the running
+        # differencing chain. Refuse, naming the owning VM.
+        "$attached = @(Get-VM -ErrorAction Stop | Get-VMHardDiskDrive -ErrorAction Stop"
+        f" | Where-Object {{ $_.Path -eq {parent_q} }})",
+        "if ($attached.Count -gt 0) { throw ('golden parent is attached to another VM"
+        " (vm ids: ' + (($attached | ForEach-Object { $_.Id.ToString() }) -join ', ')"
+        + ") — refusing to clone from an in-use parent') }",
+        # Differencing child of the golden parent: no -SizeBytes of its own.
+        f"$vhd = New-VHD -Path {child_q} -ParentPath {parent_q} -Differencing -ErrorAction Stop",
+        # If New-VM fails the fresh child would orphan on the host — same
+        # cleanup contract as vm_create.
+        "try {\n"
+        f"  $vm = New-VM -Name {pswindows.ps_quote(name)} -MemoryStartupBytes ({int(memory_mb)}MB) "
+        f"-Generation {generation} -VHDPath $vhd.Path -ErrorAction Stop\n"
+        "} catch {\n"
+        f"  Remove-Item -LiteralPath {child_q} -Force -ErrorAction SilentlyContinue\n"
+        "  throw\n"
+        "}",
+        # The clone honors the requested cpu_count exactly like vm_create.
+        f"Set-VMProcessor -VM $vm -Count {int(cpu_count)} -ErrorAction Stop",
+    ]
+    if switch_name:
+        lines.append(
+            f"Connect-VMNetworkAdapter -VMNetworkAdapter (Get-VMNetworkAdapter -VM $vm) "
+            f"-SwitchName {pswindows.ps_quote(switch_name)} -ErrorAction Stop"
+        )
+    lines.append(
+        "[PSCustomObject]@{ id = $vm.Id.ToString(); name = $vm.Name; state = [string]$vm.State; "
+        "generation = $vm.Generation } | ConvertTo-Json -Compress"
+    )
+    with vmlocks.vm_lock(name):
+        if os.path.isfile(child):
+            raise MediaError(f"VHD already exists: {child} (refusing to overwrite)")
+        result = _run(cfg, "\n".join(lines), f"vm_clone({name})", timeout_s=300)
+    out = _json_out(result, "vm_clone")
+    base = {"ok": True, **out} if isinstance(out, dict) else {"ok": True}
+    base.update({
+        "vhd_path": child,
+        "parent_vhd_path": parent,
+        "parent_made_read_only": made_read_only,
+    })
+    return base
+
+
+# vm_remove merge-wait bounds: Remove-VM deletes only the VM's configuration;
+# checkpoint .avhdx files are merged into the disk files AFTER the removal
+# (Remove-VM.md). Deletion must wait that merge out (bounded) — deleting into
+# an in-flight merge fails with a sharing violation.
+_MERGE_POLL_S = 2.0
+_MERGE_WAIT_S = 600.0
+
+
+def vm_remove(
+    cfg: Config, vm_name: str = "", vm_id: str = "", delete_disks: bool = False,
+    confirm: bool = False,
+) -> dict:
+    """Remove a stopped VM by GUID, optionally deleting its OWN disk files
+    (issue #31; ENH-13). Never deletes the VM's differencing ancestors (the
+    golden parent is by construction an ancestor it never owns) or anything
+    outside host_write_roots; every kept path is reported with a reason.
+    """
+    policy.require_destructive(
+        cfg, "vm_remove", confirm, f"remove VM '{vm_name or vm_id}'"
+        + (" and its own disk files" if delete_disks else ""))
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    with vmlocks.vm_lock(ref.id):
+        # State gate on its own leg BEFORE any removal script is generated: a
+        # saved VM's unflushed cache lives in its saved-state file, and removal
+        # of anything but Off is refused with a pointer at the stop tool.
+        state = _run(
+            cfg, _resolve_vm_prefix(ref) + "[string]$vm.State",
+            f"vm_remove_state({ref.name})", timeout_s=60,
+        ).stdout.strip()
+        if state != "Off":
+            raise MediaError(
+                f"VM '{ref.name}' is in state {state or 'unknown'}: vm_remove "
+                "requires state Off (use hyperv_stop_vm first)")
+
+        # One removal script: collect owned candidates + ancestors (the
+        # ownership walk stops at the VM's own base disk; every ParentPath
+        # beyond it is NOT owned), then Remove-VM bound to the resolved GUID.
+        removal = _resolve_vm_prefix(ref) + (
+            "$owned = New-Object System.Collections.Generic.List[string]\n"
+            "$anc = New-Object System.Collections.Generic.List[string]\n"
+            "foreach ($d in (Get-VMHardDiskDrive -VM $vm -ErrorAction Stop)) {\n"
+            "  $node = $d.Path\n"
+            "  $base = $null\n"
+            "  while ($node) {\n"
+            "    $vhdInfo = Get-VHD -Path $node -ErrorAction SilentlyContinue\n"
+            "    if (-not $vhdInfo) { break }\n"
+            "    if ($node -like '*.avhdx') { $owned.Add($node); $node = $vhdInfo.ParentPath; continue }\n"
+            "    $base = $node; break\n"
+            "  }\n"
+            "  if ($base) {\n"
+            "    $owned.Add($base)\n"
+            "    $ancInfo = Get-VHD -Path $base -ErrorAction SilentlyContinue\n"
+            "    while ($ancInfo -and $ancInfo.ParentPath) {\n"
+            "      $anc.Add($ancInfo.ParentPath)\n"
+            "      $ancInfo = Get-VHD -Path $ancInfo.ParentPath -ErrorAction SilentlyContinue\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+            "Remove-VM -VM $vm -Force -ErrorAction Stop\n"
+            "[PSCustomObject]@{ status = 'removed'; disks = @($owned); ancestors = @($anc) }"
+            " | ConvertTo-Json -Compress\n"
+        )
+        out = _json_out(
+            _run(cfg, removal, f"vm_remove({ref.name})", timeout_s=300), "vm_remove")
+        disks = [str(p) for p in (out.get("disks") or [])]
+        ancestors = [str(p) for p in (out.get("ancestors") or [])]
+        if not delete_disks:
+            return {"ok": True, "status": str(out.get("status") or "removed"),
+                    "vm_name": ref.name}
+
+        kept: list[dict] = [{"path": p, "reason": "not_owned_ancestor"} for p in ancestors]
+
+        # Bounded merge wait: poll until no collected .avhdx candidate remains.
+        avhdx = [p for p in disks if p.lower().endswith(".avhdx")]
+        pending_paths = list(avhdx)
+        deadline = time.monotonic() + _MERGE_WAIT_S
+        merged = not pending_paths
+        while not merged:
+            if time.monotonic() >= deadline:
+                kept.extend({"path": p, "reason": "merge_pending"} for p in pending_paths)
+                return {
+                    "ok": False,
+                    "error_class": "timeout",
+                    "retryable": True,
+                    "error": (
+                        f"post-removal checkpoint merge still pending after "
+                        f"{int(_MERGE_WAIT_S)}s; nothing was deleted"),
+                    "status": str(out.get("status") or "removed"),
+                    "vm_name": ref.name,
+                    "deleted": [],
+                    "kept": kept,
+                }
+            quoted = ",".join(pswindows.ps_quote(p) for p in pending_paths)
+            poll_out = _run(
+                cfg,
+                f"$left = @({quoted}) | Where-Object {{ Test-Path -LiteralPath $_ }}\n"
+                "if (@($left).Count -gt 0) { 'merge_pending' } else { 'merge_complete' }\n",
+                f"vm_remove_merge({ref.name})", timeout_s=60,
+            ).stdout.strip()
+            pending_paths = [p for p in pending_paths] if poll_out == "merge_pending" else []
+            merged = poll_out != "merge_pending"
+            if not merged:
+                time.sleep(_MERGE_POLL_S)
+
+        # Usage leg: paths (drives AND ancestors) still referenced by other
+        # registered VMs — a second, independent keep reason.
+        usage_out = _json_out(_run(
+            cfg,
+            "$usage = New-Object System.Collections.Generic.List[string]\n"
+            "foreach ($other in (Get-VM -ErrorAction Stop)) {\n"
+            "  if ('' + $other.Id.ToString() -eq $vmTarget) { continue }\n"
+            "  foreach ($d in (Get-VMHardDiskDrive -VM $other -ErrorAction SilentlyContinue)) {\n"
+            "    $usage.Add($d.Path)\n"
+            "    $u = Get-VHD -Path $d.Path -ErrorAction SilentlyContinue\n"
+            "    while ($u -and $u.ParentPath) { $usage.Add($u.ParentPath);"
+            " $u = Get-VHD -Path $u.ParentPath -ErrorAction SilentlyContinue }\n"
+            "  }\n"
+            "}\n"
+            "@($usage) | ConvertTo-Json -Compress\n",
+            f"vm_remove_usage({ref.name})", timeout_s=120,
+        ), "vm_remove_usage")
+        in_use = {os.path.normcase(str(p)) for p in (usage_out if isinstance(usage_out, list) else [])}
+
+        deleted: list[str] = []
+        for p in disks:
+            nc = os.path.normcase(os.path.normpath(p))
+            if nc in {os.path.normcase(os.path.normpath(k["path"])) for k in kept}:
+                continue
+            if nc in in_use:
+                kept.append({"path": p, "reason": "in_use_by_other_vm"})
+                continue
+            try:
+                policy.check_host_write(cfg, os.path.normpath(p))
+            except PolicyDenied:
+                kept.append({"path": p, "reason": "outside_host_write_roots"})
+                continue
+            try:
+                os.remove(p)
+                deleted.append(p)
+            except OSError as exc:
+                kept.append({"path": p, "reason": f"delete_failed: {exc}"})
+        return {"ok": True, "status": str(out.get("status") or "removed"),
+                "vm_name": ref.name, "deleted": deleted, "kept": kept}
 
 
 def vm_disk_add(
