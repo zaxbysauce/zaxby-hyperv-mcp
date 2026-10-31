@@ -194,9 +194,13 @@ def harvest_offline_logs(cfg: Config, vm_name: str = "", vm_id: str = "", dest_d
         # SeBackupPrivilege precheck BEFORE any mount: guest files under
         # Windows\Panther carry ACLs for the guest's Administrators/SYSTEM,
         # and only backup-semantics copying under an elevated token reads
-        # every log — fail fast instead of returning a partial result.
-        listing = _run(cfg, "whoami /priv", f"harvest_priv({ref.name})",
-                       timeout_s=30).stdout
+        # every log — fail fast instead of returning a partial result. The
+        # fully-qualified whoami.exe matters: a bare `whoami` can resolve
+        # GNU whoami from a Git-Bash PATH ahead of System32 (live-leg catch,
+        # 2026-10-31) and die on "/priv".
+        listing = _run(
+            cfg, "& $env:SystemRoot\\System32\\whoami.exe /priv",
+            f"harvest_priv({ref.name})", timeout_s=30).stdout
         if not _privilege_ok(listing):
             raise HarvestError(
                 "offline log harvest requires SeBackupPrivilege (an elevated "

@@ -469,6 +469,11 @@ def vm_remove(
             try:
                 os.remove(p)
                 deleted.append(p)
+            except FileNotFoundError:
+                # The post-removal merge can consume the .avhdx itself before
+                # our deletion pass reaches it (live-leg observation): the
+                # outcome the caller wants — the file is gone — already holds.
+                kept.append({"path": p, "reason": "already_gone"})
             except OSError as exc:
                 kept.append({"path": p, "reason": f"delete_failed: {exc}"})
         return {"ok": True, "status": str(out.get("status") or "removed"),
