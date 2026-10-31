@@ -178,6 +178,28 @@ class OperationsPolicy:
     key_env: str = ""
 
 
+@dataclass(frozen=True)
+class CredentialProfile:
+    """One named per-VM admin (and optional victim) identity (issue #30).
+
+    ``vm_patterns`` are matched case-insensitively against the target VM's
+    canonical name with the same fnmatch semantics as
+    ``policy.vm_allowed``. The secret never lives in the config: it comes
+    from ``password_env`` (an environment variable NAME) or ``password_file``
+    (a path read at resolve time). The optional victim fields follow the
+    same rules for the unprivileged (Medium-IL) account.
+    """
+
+    name: str
+    vm_patterns: tuple[str, ...]
+    username: str
+    password_env: str = ""
+    password_file: str = ""
+    victim_username: str = ""
+    victim_password_env: str = ""
+    victim_password_file: str = ""
+
+
 @dataclass
 class Config:
     allowed_vm_patterns: list[str] = field(default_factory=list)
@@ -237,6 +259,12 @@ class Config:
     # Issue #24: durable operation handles (op rows, events, idempotency).
     # Appended last for the same positional-compat reason as the fields above.
     operations: OperationsPolicy = field(default_factory=OperationsPolicy)
+    # Issue #30 (FND-21/ENH-17): named per-VM credential profiles. Tuple so
+    # the declared order is preserved and the config stays immutable in
+    # spirit; empty means "one global credential" — behavior byte-identical
+    # to the pre-profile server. Appended last for the same positional-compat
+    # reason as the fields above.
+    credential_profiles: tuple[CredentialProfile, ...] = ()
 
     # -- loading ---------------------------------------------------------
 
@@ -458,6 +486,9 @@ class Config:
             f"operations.runner_bound={self.operations.runner_bound or self.max_host_powershell}",
             f"operations.event_retention_s={self.operations.event_retention_s}",
             f"operations.event_max_rows={self.operations.event_max_rows}",
+            # Issue #30: profile posture is an operator axis too — names,
+            # patterns and secret SOURCES are surfaced; secret values never.
+            f"credential_profiles={[p.name for p in self.credential_profiles] or '[] (single global credential)'}",
         ]
         return "; ".join(lines)
 
@@ -660,6 +691,135 @@ class Config:
             raise ConfigError(f"operations.{name} must be between {low} and {high}")
         object.__setattr__(target, name, value)
 
+    def _set_credential_profiles(self, value: Any) -> None:
+        """Validate the credential_profiles list (issue #30, FND-21/ENH-17).
+
+        Each entry maps VM-name patterns to one named admin identity whose
+        secret comes from an environment variable or a file — NEVER from the
+        config itself: a literal ``password`` key (or any unknown key,
+        application-account-shaped or otherwise) is refused with an error
+        naming the key. Env references must be environment-variable NAMES so
+        a pasted secret value can never be echoed by a validation error
+        (same contract as http.token_env, PRR-016). The name ``default`` is
+        reserved: it is the sentinel the resolver reports for the global
+        credential, and a profile by that name would make persisted
+        credential records ambiguous.
+        """
+        if not isinstance(value, list) or not value:
+            raise ConfigError("credential_profiles must be a non-empty list")
+        profiles: list[CredentialProfile] = []
+        seen: set[str] = set()
+        for idx, entry in enumerate(value):
+            if not isinstance(entry, dict):
+                raise ConfigError(f"credential_profiles[{idx}] must be an object")
+            allowed = {
+                "name", "vm_patterns", "username",
+                "password_env", "password_file",
+                "victim_username", "victim_password_env", "victim_password_file",
+            }
+            unknown = set(entry) - allowed
+            if unknown:
+                raise ConfigError(
+                    f"unknown credential_profiles key(s): {sorted(unknown)}"
+                )
+            name = entry.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ConfigError(f"credential_profiles[{idx}].name must be a non-empty string")
+            if name.strip().casefold() == "default":
+                raise ConfigError(
+                    f"credential_profiles name {name!r} is reserved: 'default' names "
+                    "the global (unprofiled) credential"
+                )
+            folded = name.strip().casefold()
+            if folded in seen:
+                raise ConfigError(
+                    f"credential_profiles name {name!r} is declared more than once"
+                )
+            seen.add(folded)
+            patterns = entry.get("vm_patterns")
+            if (
+                not isinstance(patterns, list)
+                or not patterns
+                or not all(isinstance(p, str) and p.strip() for p in patterns)
+            ):
+                raise ConfigError(
+                    f"credential_profiles[{name}].vm_patterns must be a non-empty "
+                    "list of non-empty strings"
+                )
+            username = entry.get("username")
+            if not isinstance(username, str) or not username.strip():
+                raise ConfigError(
+                    f"credential_profiles[{name}].username must be a non-empty string"
+                )
+            secret = self._set_profile_secret(name, entry, "password_env", "password_file")
+            victim_username = entry.get("victim_username", "")
+            victim_env = entry.get("victim_password_env", "")
+            victim_file = entry.get("victim_password_file", "")
+            secret_v = ("", "")
+            if victim_username or victim_env or victim_file:
+                if not isinstance(victim_username, str) or not victim_username.strip():
+                    raise ConfigError(
+                        f"credential_profiles[{name}].victim_username must be a "
+                        "non-empty string when victim credentials are configured"
+                    )
+                secret_v = self._set_profile_secret(
+                    name, entry, "victim_password_env", "victim_password_file",
+                )
+            profiles.append(CredentialProfile(
+                name=name.strip(),
+                vm_patterns=tuple(p.strip() for p in patterns),
+                username=username.strip(),
+                password_env=secret[0],
+                password_file=secret[1],
+                victim_username=str(victim_username or "").strip(),
+                # The VALIDATED/normalized values from _set_profile_secret,
+                # not a re-derivation from the raw entry (PRR-015): the two
+                # paths normalized differently (env stripped vs file not).
+                victim_password_env=secret_v[0],
+                victim_password_file=secret_v[1],
+            ))
+        object.__setattr__(self, "credential_profiles", tuple(profiles))
+
+    @staticmethod
+    def _set_profile_secret(
+        name: str,
+        entry: dict[str, Any],
+        env_key: str,
+        file_key: str,
+    ) -> tuple[str, str]:
+        """Exactly one of env/file secret sources; env must be a NAME."""
+        env_val = entry.get(env_key)
+        file_val = entry.get(file_key)
+        both = env_val is not None and file_val is not None
+        neither = env_val is None and file_val is None
+        if both or neither:
+            raise ConfigError(
+                f"credential_profiles[{name}] must carry exactly one of "
+                f"{env_key} or {file_key}"
+            )
+        chosen_env = ""
+        chosen_file = ""
+        if env_val is not None:
+            if not isinstance(env_val, str) or not env_val.strip():
+                raise ConfigError(
+                    f"credential_profiles[{name}].{env_key} must be a non-empty string"
+                )
+            if not _ENV_NAME_RE.fullmatch(env_val.strip()):
+                raise ConfigError(
+                    f"credential_profiles[{name}].{env_key} must be a valid "
+                    "environment variable name (values are never printed — a "
+                    "pasted secret value is refused rather than echoed)"
+                )
+            chosen_env = env_val.strip()
+        else:
+            if not isinstance(file_val, str) or not file_val.strip():
+                raise ConfigError(
+                    f"credential_profiles[{name}].{file_key} must be a non-empty "
+                    "string path"
+                )
+            chosen_file = file_val.strip()
+        return chosen_env, chosen_file
+
 
 Config._FIELD_MAP = {  # type: ignore[attr-defined]
     "allowed_vm_patterns": lambda c, v: c._set_str_list("allowed_vm_patterns", v),
@@ -685,4 +845,5 @@ Config._FIELD_MAP = {  # type: ignore[attr-defined]
     "http": lambda c, v: c._set_http(v),
     "leases": lambda c, v: c._set_leases(v),
     "operations": lambda c, v: c._set_operations(v),
+    "credential_profiles": lambda c, v: c._set_credential_profiles(v),
 }

@@ -47,7 +47,7 @@ from typing import Any
 
 from .config import Config, default_state_db_path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 BUSY_TIMEOUT_MS = 5000
 
 # Lease scopes (issue #23). `lifecycle` is exclusive against every other
@@ -116,6 +116,12 @@ _SCHEMA_STATEMENTS = (
         state TEXT NOT NULL DEFAULT 'starting'
             CHECK (state IN ('starting','active','stopped','orphaned')),
         cred_ref TEXT NOT NULL DEFAULT 'inline',
+        -- Issue #30: the credential IDENTITY a job started with. cred_ref is
+        -- the source KIND; these two pin the identity so a restored job can
+        -- never silently re-attach under a different account. '' = pre-v4 row
+        -- (no recorded identity) or a reservation placeholder.
+        cred_profile TEXT NOT NULL DEFAULT '',
+        cred_username TEXT NOT NULL DEFAULT '',
         owner TEXT
     )
     """,
@@ -131,6 +137,9 @@ _SCHEMA_STATEMENTS = (
         state TEXT NOT NULL DEFAULT 'active'
             CHECK (state IN ('active','stopped','interrupted')),
         cred_ref TEXT NOT NULL DEFAULT 'inline',
+        -- Issue #30: same identity binding as the jobs table.
+        cred_profile TEXT NOT NULL DEFAULT '',
+        cred_username TEXT NOT NULL DEFAULT '',
         owner TEXT
     )
     """,
@@ -250,9 +259,20 @@ _V3_STATEMENTS = (7, 13)
 # (issue #23 localization finding C7). Each entry is (from_version, statements).
 _V2_STATEMENTS = _SCHEMA_STATEMENTS[2:7]
 _V3_TABLE_STATEMENTS = _SCHEMA_STATEMENTS[7:13]
+# -- v4 (issue #30): the credential identity columns. The fresh-schema CREATE
+# TABLE statements already carry them; this migration is the additive ALTER
+# pair-of-pairs for stores created at v3 or earlier. Same naming rule as the
+# rest of the schema: no guardrail-forbidden fragments.
+_V4_COLUMN_STATEMENTS = (
+    "ALTER TABLE jobs ADD COLUMN cred_profile TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE relays ADD COLUMN cred_profile TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE jobs ADD COLUMN cred_username TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE relays ADD COLUMN cred_username TEXT NOT NULL DEFAULT ''",
+)
 _MIGRATIONS: dict[int, tuple[str, ...]] = {
     1: _V2_STATEMENTS,
     2: _V3_TABLE_STATEMENTS,
+    3: _V4_COLUMN_STATEMENTS,
 }
 
 
@@ -308,15 +328,28 @@ def _migrate_to(con: sqlite3.Connection, found: int) -> None:
                 "state store migration pin broken: the v2->v3 migration must be "
                 "exactly the v3 statements (ops .. meta)"
             )
+        if _MIGRATIONS[3] != _V4_COLUMN_STATEMENTS or not _MIGRATIONS[3]:
+            raise StateStoreError(
+                "state store migration pin broken: the v3->v4 migration must be "
+                "exactly the v4 statements (cred_profile/cred_username ALTERs)"
+            )
         # The migration is additive CREATE ... IF NOT EXISTS, so it must not
         # paper over a schema that is missing the versions BELOW it: a store
         # stamped `user_version=1` with no jobs/relays tables is corrupt, and
         # stamping it 2 over that would hide the corruption behind a clean
-        # version number. The same guard covers the v2 tables before the
-        # v2 -> v3 step (plan-critic F5).
-        required_below = ("jobs", "relays") if version == 1 else (
-            "jobs", "relays", "leases", "fence_counters",
-        )
+        # version number. The required set is exactly the tables the versions
+        # BELOW the current step created (plan-critic F5, extended to the
+        # v3 -> v4 boundary by issue #30): the step's OWN tables are not
+        # required — it creates them.
+        if version == 1:
+            required_below: tuple[str, ...] = ("jobs", "relays")
+        elif version == 2:
+            required_below = ("jobs", "relays", "leases", "fence_counters")
+        else:
+            required_below = (
+                "jobs", "relays", "leases", "fence_counters", "ops", "events",
+                "meta",
+            )
         for table in required_below:
             present = con.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
@@ -327,7 +360,17 @@ def _migrate_to(con: sqlite3.Connection, found: int) -> None:
                     f"{table} table; refusing to open it"
                 )
         for statement in statements:
-            con.execute(statement)
+            try:
+                con.execute(statement)
+            except sqlite3.OperationalError as exc:
+                # PRR-002: the v4 ALTERs are the first non-idempotent
+                # migration statements (earlier versions are CREATE IF NOT
+                # EXISTS). A concurrent opener that committed the same step
+                # makes this opener's ALTER a no-op ("duplicate column
+                # name"), which must read as success — the column IS there,
+                # which is all the migration guarantees.
+                if "duplicate column name" not in str(exc):
+                    raise
         version += 1
     con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -451,6 +494,10 @@ class JobRow:
     state: str = JOB_STARTING
     cred_ref: str = "inline"
     owner: str | None = None
+    # Issue #30: the credential identity the job started with ('' = pre-v4
+    # row or a reservation placeholder). Never the secret itself.
+    cred_profile: str = ""
+    cred_username: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -467,6 +514,8 @@ class JobRow:
             "state": self.state,
             "cred_ref": self.cred_ref,
             "owner": self.owner,
+            "cred_profile": self.cred_profile,
+            "cred_username": self.cred_username,
         }
 
 
@@ -484,6 +533,10 @@ class RelayRow:
     state: str = RELAY_ACTIVE
     cred_ref: str = "inline"
     owner: str | None = None
+    # Issue #30: the credential identity the relay started with ('' = pre-v4
+    # row or a reservation placeholder). Never the secret itself.
+    cred_profile: str = ""
+    cred_username: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -497,6 +550,8 @@ class RelayRow:
             "state": self.state,
             "cred_ref": self.cred_ref,
             "owner": self.owner,
+            "cred_profile": self.cred_profile,
+            "cred_username": self.cred_username,
         }
 
 
@@ -515,6 +570,8 @@ def _row_to_job(values: tuple) -> JobRow:
         state=str(values[10] or JOB_STARTING),
         cred_ref=str(values[11] or "inline"),
         owner=None if values[12] is None else str(values[12]),
+        cred_profile=str(values[13] or ""),
+        cred_username=str(values[14] or ""),
     )
 
 
@@ -530,16 +587,19 @@ def _row_to_relay(values: tuple) -> RelayRow:
         state=str(values[7] or RELAY_ACTIVE),
         cred_ref=str(values[8] or "inline"),
         owner=None if values[9] is None else str(values[9]),
+        cred_profile=str(values[10] or ""),
+        cred_username=str(values[11] or ""),
     )
 
 
 _JOB_COLUMNS = (
     "job_id, vm_name, vm_id, pid, start_time_ticks, job_dir, out_path, "
-    "err_path, exit_path, started_at, state, cred_ref, owner"
+    "err_path, exit_path, started_at, state, cred_ref, owner, "
+    "cred_profile, cred_username"
 )
 _RELAY_COLUMNS = (
     "relay_id, vm_name, vm_id, guest_port, bind, host_port, started_at, "
-    "state, cred_ref, owner"
+    "state, cred_ref, owner, cred_profile, cred_username"
 )
 
 
@@ -727,19 +787,22 @@ class Store:
             try:
                 self._connect().execute(
                     "INSERT INTO jobs (" + _JOB_COLUMNS + ") "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(job_id) DO UPDATE SET "
                     "vm_name=excluded.vm_name, vm_id=excluded.vm_id, "
                     "pid=excluded.pid, start_time_ticks=excluded.start_time_ticks, "
                     "job_dir=excluded.job_dir, out_path=excluded.out_path, "
                     "err_path=excluded.err_path, exit_path=excluded.exit_path, "
                     "started_at=excluded.started_at, state=excluded.state, "
-                    "cred_ref=excluded.cred_ref, owner=excluded.owner",
+                    "cred_ref=excluded.cred_ref, owner=excluded.owner, "
+                    "cred_profile=excluded.cred_profile, "
+                    "cred_username=excluded.cred_username",
                     (
                         row.job_id, row.vm_name, row.vm_id, row.pid,
                         row.start_time_ticks, row.job_dir, row.out_path,
                         row.err_path, row.exit_path, row.started_at, row.state,
                         row.cred_ref, row.owner,
+                        row.cred_profile, row.cred_username,
                     ),
                 )
                 self._commit()
@@ -779,17 +842,19 @@ class Store:
             try:
                 self._connect().execute(
                     "INSERT INTO relays (" + _RELAY_COLUMNS + ") "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(relay_id) DO UPDATE SET "
                     "vm_name=excluded.vm_name, vm_id=excluded.vm_id, "
                     "guest_port=excluded.guest_port, bind=excluded.bind, "
                     "host_port=excluded.host_port, started_at=excluded.started_at, "
                     "state=excluded.state, cred_ref=excluded.cred_ref, "
-                    "owner=excluded.owner",
+                    "owner=excluded.owner, cred_profile=excluded.cred_profile, "
+                    "cred_username=excluded.cred_username",
                     (
                         row.relay_id, row.vm_name, row.vm_id, row.guest_port,
                         row.bind, row.host_port, row.started_at, row.state,
                         row.cred_ref, row.owner,
+                        row.cred_profile, row.cred_username,
                     ),
                 )
                 self._commit()
@@ -1577,6 +1642,19 @@ def open(path: str) -> Store:
             with store._lock:  # noqa: SLF001 - open() owns construction
                 store._begin()  # noqa: SLF001
                 try:
+                    # PRR-002 (pr111 review): the version read at the top of
+                    # the loop predates BEGIN IMMEDIATE, so on a shared store
+                    # a peer's committed v3->v4 migration could leave THIS
+                    # opener holding a stale `found` — and the v4 ALTERs are
+                    # the first non-idempotent migrations in this module
+                    # (plain ADD COLUMN), surfacing as an unretryable
+                    # "duplicate column name". Re-read the version under the
+                    # write lock; the earlier read still drives the
+                    # newer-store pre-check above.
+                    found_locked = int(
+                        con.execute("PRAGMA user_version").fetchone()[0]
+                    )
+                    found = found_locked
                     if found == SCHEMA_VERSION and not _tables_present(con):
                         # A store claiming the CURRENT version with none of
                         # its tables is corrupt (hand-stamped, truncated

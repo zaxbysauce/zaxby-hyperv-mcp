@@ -118,15 +118,29 @@ class SessionKey(NamedTuple):
         )
 
 
-def credential_profile(cred: CredentialSet) -> str:
-    """The credential-profile component of a session key.
+def _cred_fp(cred: CredentialSet) -> str:
+    """In-memory credential fingerprint for retire-on-change (PRR-004).
 
-    Workstream G PR 1 (issue #30) owns real per-VM credential profiles and is
-    still open, so no profile name exists in the tree yet. Until it lands there
-    is exactly one global credential set per process, and the profile is
-    derived from the credential IDENTITY: the username, for debuggability, plus
-    16 hex characters of an HMAC-SHA-256 over the username and password under
-    the process-local :data:`_PROFILE_KEY`.
+    A truncated SHA-256 over the username and password. Never persisted,
+    never logged, never compared across processes — it exists only so an
+    acquire() can tell that the credential behind a same-named-profile key
+    has changed and retire the stale session.
+    """
+    return hashlib.sha256(
+        f"{cred.username}{chr(0)}{cred.password}".encode()
+    ).hexdigest()[:16]
+
+
+def credential_profile(cred: CredentialSet) -> str:
+    """The credential-profile component of a session key (issue #30).
+
+    A NAMED credential profile (``cred.profile`` set by the resolver) is the
+    component verbatim: the profile name is the stable, readable identity the
+    key exists to carry. The ``"default"`` sentinel keeps the interim
+    behavior: the component is derived from the credential IDENTITY — the
+    username, for debuggability, plus 16 hex characters of an HMAC-SHA-256
+    over the username and password under the process-local
+    :data:`_PROFILE_KEY`.
 
     Why not a plain digest of the password: a truncated SHA-256 of the password
     is an offline dictionary verifier — anyone who reads a pool key out of a
@@ -134,14 +148,20 @@ def credential_profile(cred: CredentialSet) -> str:
     ``Administrator:6b1f…``". Keying the HMAC with a per-process random secret
     removes that: the same credential produces a different string in a
     different process, so an observed value verifies nothing anywhere else.
+    A named profile needs none of that — the name is not secret material.
 
-    Discriminating today: two credentials that share a username and differ only
-    by password get different profiles, so a rotated password can never inherit
-    a session opened under the old one. Stable within a process, so a caller
-    that re-resolves the same credential reuses its session.
-
-    When Workstream G lands, this function is the one place that changes.
+    Discriminating: two default-profile credentials that share a username and
+    differ only by password get different components, so a rotated password
+    can never inherit a session opened under the old one. Role separation
+    rides the guestexec composition (``#victim`` suffix), not here: this
+    function answers "which credential identity", the caller answers "which
+    role".
     """
+    # Issue #30: a named profile IS the component — the stable, readable
+    # identity the key exists to carry. The "default" sentinel keeps the
+    # interim identity HMAC (rotated-password discrimination preserved).
+    if getattr(cred, "profile", "default") not in ("", "default"):
+        return cred.profile
     digest = hmac.new(
         _PROFILE_KEY,
         f"{cred.username}\0{cred.password}".encode(),
@@ -153,14 +173,25 @@ def credential_profile(cred: CredentialSet) -> str:
 class _Entry:
     """One pooled session: its worker, its checkout state and its idle clock."""
 
-    __slots__ = ("key", "worker", "in_use", "last_used", "doomed", "open_ms")
+    __slots__ = ("key", "worker", "in_use", "last_used", "doomed", "open_ms",
+                 "cred_fp")
 
-    def __init__(self, key: SessionKey, worker: Any, open_ms: int | None = None) -> None:
+    def __init__(self, key: SessionKey, worker: Any, open_ms: int | None = None,
+                 cred_fp: str = "") -> None:
         self.key = key
         self.worker = worker
         self.in_use = False
         self.last_used = 0.0
         self.doomed = False
+        # Issue #30 / PRR-004: for a NAMED profile the key component is the
+        # profile NAME, which is invariant under a username change or a
+        # password rotation — so the key alone can no longer detect identity
+        # drift. The entry carries an in-memory fingerprint (never persisted,
+        # never logged) of the credential it was established WITH; acquire
+        # retires the worker when the fingerprint of the incoming credential
+        # differs, restoring the pre-#30 rotation guarantee for named
+        # profiles.
+        self.cred_fp = cred_fp
         #: Milliseconds spent spawning this worker and establishing its session.
         #: Reported once, on the call that opened it, and never again.
         self.open_ms = open_ms
@@ -232,10 +263,11 @@ class SessionPool:
     ) -> Any:
         """Check out the session for ``key``, creating it if needed.
 
-        ``cred`` is consulted ONLY when a worker must be created: it supplies
-        the username for the establishment script and the base64 password that
-        crosses to the worker on stdin. It is ignored on reuse, because the key
-        already determines the session.
+        ``cred`` supplies the username/password for a NEW worker's
+        establishment, and its fingerprint guards REUSE: for a named-profile
+        key the component is the profile name (invariant under rotation), so
+        a credential whose fingerprint differs from the stored worker's is
+        retired and replaced rather than reused (issue #30, PRR-004).
 
         Returns the worker. The caller MUST pass it to :meth:`release` (or
         :meth:`discard`) in a ``finally``.
@@ -248,21 +280,45 @@ class SessionPool:
         key = _as_key(key)
         deadline = self._clock() + max(0.0, float(wait_s))
         while True:
+            stale: list[Any] = []
             with self._mu:
                 if self._closed:
                     raise SessionBusy("the session pool is closed")
                 entry = self._entries.get(key)
                 if entry is not None and not entry.doomed and not entry.in_use:
-                    entry.in_use = True
-                    entry.last_used = self._clock()
-                    return entry.worker
+                    # PRR-004: a named-profile key does not move when the
+                    # credential rotates; a fingerprint mismatch means the
+                    # stored worker authenticates with a superseded identity.
+                    # RETIRE = remove from the table (so the create gate below
+                    # fires) AND close the worker outside _mu — dooming alone
+                    # would wedge the key: a doomed entry blocks the create
+                    # gate and nothing ever closes it.
+                    if cred is not None and entry.cred_fp and entry.cred_fp != _cred_fp(cred):
+                        del self._entries[key]
+                        entry.doomed = True
+                        stale.append(entry)
+                    else:
+                        entry.in_use = True
+                        entry.last_used = self._clock()
+                        return entry.worker
                 # Only take the create path when nothing is closing this VM's
-                # sessions: see `_invalidating`.
+                # sessions: see `_invalidating`. After a PRR-004 retirement the
+                # entry is absent, so the create gate fires and
+                # `_create_locked` opens a fresh session with the incoming
+                # credential.
                 gate = (
                     self._gates.setdefault(key, threading.Lock())
                     if entry is None and _norm_guid(key.vm_guid) not in self._invalidating
                     else None
                 )
+            if stale:
+                # Close outside _mu (the pattern _close_entries uses); the
+                # create path below already started for the replacement.
+                for entry in stale:
+                    try:
+                        entry.worker.close()
+                    except Exception:
+                        pass
             if gate is not None:
                 # A failure to CREATE is fatal for this call, not a reason to
                 # wait: retrying it would burn the whole bounded wait on a spawn
@@ -270,6 +326,11 @@ class SessionPool:
                 # correct response.
                 with gate:
                     worker = self._create_locked(key, cred)
+                    if worker is not None and cred is not None:
+                        with self._mu:
+                            held = self._entries.get(key)
+                            if held is not None and held.worker is worker:
+                                held.cred_fp = _cred_fp(cred)
                     if worker is not None:
                         # A close for this VM may have landed while the factory
                         # ran. Re-check under the lock so a session the pool has

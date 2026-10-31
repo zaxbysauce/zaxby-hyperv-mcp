@@ -491,7 +491,10 @@ def test_metadata_timing_agrees_with_the_audit_row(monkeypatch, fresh_server, tm
     monkeypatch.setattr(evidence, "run_guest_inner", _fake_guest_leg)
     monkeypatch.setattr(
         _creds, "resolve_guest",
-        lambda: _creds.CredentialSet(username="u", password="p"),
+        # Issue #30: the resolver now takes the target VM (issue-pinned); the
+        # stub accepts the call shape so the timing pin under test is
+        # unchanged.
+        lambda *args, **kwargs: _creds.CredentialSet(username="u", password="p"),
     )
     images, texts = _split(_call(mcp, "hyperv_capture_evidence", {
         "vm_name": "test-vm-1", "width": 320, "height": 240, "ui_tree": True,

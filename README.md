@@ -299,20 +299,94 @@ Console scripts: `hyperv-mcp` (default: proxy to the shared controller;
 All guest-facing tools authenticate to the guest via PowerShell Direct.
 Resolution order:
 
-1. `HYPERV_GUEST_USERNAME` + one of:
+1. **A matching credential profile** (0.7.0, issue #30) — see
+   [Per-VM credential profiles](#per-vm-credential-profiles-070-issue-30)
+   below. When several profiles match one VM the server refuses to start the
+   leg (fail-closed); when none matches, the global variables apply.
+2. `HYPERV_GUEST_USERNAME` + one of:
    - `HYPERV_GUEST_PASSWORD`
    - `HYPERV_GUEST_PASSWORD_FILE` (path to a UTF-8 file holding just the
      password; preferred — put it in a profile directory with a restrictive
      ACL)
-2. `HYPERV_GUEST_VICTIM_USERNAME` + `HYPERV_GUEST_VICTIM_PASSWORD` /
-   `HYPERV_GUEST_VICTIM_PASSWORD_FILE` for the Medium-IL victim tools.
-3. Optional, remote-host mode only: `HYPERV_HOST_USERNAME` +
+3. `HYPERV_GUEST_VICTIM_USERNAME` + `HYPERV_GUEST_VICTIM_PASSWORD` /
+   `HYPERV_GUEST_VICTIM_PASSWORD_FILE` for the Medium-IL victim tools. A
+   profile may also carry the victim identity (`victim_username` plus
+   `victim_password_env`/`victim_password_file`); it wins for VMs it matches.
+4. Optional, remote-host mode only: `HYPERV_HOST_USERNAME` +
    `HYPERV_HOST_PASSWORD` / `HYPERV_HOST_PASSWORD_FILE` authenticates the
    WS-Man hop to the remote Hyper-V host. When unset, the hop uses the
    current user's implicit credentials (works for domain or matching local
    accounts; workgroup boxes typically need the explicit pair or
    TrustedHosts). The host password rides the same stdin channel as guest
    passwords and is redacted everywhere.
+
+Inline `username`/`password` tool arguments (only present when
+`allow_inline_credentials: true`) keep their historical precedence: they beat
+profiles and global variables for that call — a per-call identity is never
+replaced by the VM's profile.
+
+### Per-VM credential profiles (0.7.0, issue #30)
+
+A lab whose VMs use different local admin accounts (a golden image per OS
+family, a domain-joined VM next to workgroup boxes) maps each VM-name pattern
+to a named credential profile:
+
+```json
+{
+  "credential_profiles": [
+    {
+      "name": "lab-a",
+      "vm_patterns": ["lab-a-*", "LABA-*"],
+      "username": "LabAdminA",
+      "password_env": "LAB_A_PW"
+    },
+    {
+      "name": "lab-b",
+      "vm_patterns": ["lab-b-*"],
+      "username": "LabAdminB",
+      "password_file": "C:/lab/secrets/lab-b.txt"
+    }
+  ]
+}
+```
+
+Rules:
+
+- The key must carry at least one profile: an explicit empty list is a
+  load error. Omit the key entirely for the zero-profile behavior.
+
+- Matching is case-insensitive fnmatch against the target VM's canonical
+  name — the same semantics as `allowed_vm_patterns`. A profile never grants
+  VM access; `allowed_vm_patterns` stays the only VM gate.
+- Precedence is fixed: inline arguments (policy-gated) → the single matching
+  profile → the global `HYPERV_GUEST_*` variables. With zero profiles
+  configured, behavior is byte-identical to pre-profile releases.
+- **Secrets never live in the config.** Each profile names an environment
+  variable (`password_env`) or a file path (`password_file`). A literal
+  `password` key — or any unknown key, application-account-shaped or
+  otherwise — is refused at load with an error naming the key, and an env
+  reference that is not a valid variable name is refused without echoing the
+  value. The name `default` is reserved (it is the sentinel the server
+  reports for the global credential).
+- Fail-closed shapes: two matching profiles → the leg refuses naming both; a
+  matched profile whose secret is missing → the leg refuses naming the
+  profile (no global fallback).
+- GUID-only calls (`vm_id` without `vm_name`) resolve the VM's canonical
+  name first so profile matching still applies. When profiles are configured
+  and the name cannot be resolved, the leg refuses instead of silently using
+  the global admin; with zero profiles the lookup failure falls back exactly
+  as before.
+- The pooled PowerShell Direct session key separates the admin and victim
+  identities of one profile (a victim call can never inherit an admin
+  session), and every guest session key is still redacted in errors and
+  logs.
+- Managed guest jobs and relays record the credential **identity** (profile
+  name + username, never the secret) they started with, and a restore after
+  a server restart re-resolves through that identity — a changed environment
+  or a renamed profile refuses instead of silently switching accounts.
+
+`--check-env` lists each configured profile's name, VM patterns, and secret
+source (variable name or file path, plus set/missing) — never the value.
 
 Hardening properties:
 
@@ -448,7 +522,9 @@ What the store holds, and what it never holds:
 
 - **Holds** — `job_id`, VM name and GUID, PID and its start-time identity,
   the job directory and stream paths, `started_at`, lifecycle state, the
-  owning agent, and a *credential reference* (`env`, `file`, or `inline`).
+  owning agent, and a *credential reference* (`env`, `file`, or `inline`) plus, for rows
+  written since the identity binding shipped, the recorded *credential
+  identity* (`cred_profile`/`cred_username` — never the secret).
 - **Never holds** — no password, no password-file content, no command text,
   no argument text, and no relay capability secret. A restored job re-resolves
   its credential from the source it was started with, which registers the
@@ -468,7 +544,7 @@ Lifecycle after a restart:
   credential error rather than silently substituting whatever credentials the
   environment now holds.
 
-The schema is versioned with `PRAGMA user_version` (this release sets 3; a
+The schema is versioned with `PRAGMA user_version` (this release sets 4; a
 v1 database written by 0.4.x gains the lease tables automatically on first
 open, and a v2 database written by 0.5.x gains the `ops`/`events`/`meta`
 tables the same way — every migration is additive and transactional) and
@@ -573,6 +649,13 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
     "require_confirm": true       // tools additionally need confirm=true
   },
   "allow_inline_credentials": false,   // expose username/password tool params
+  // issue #30: per-VM credential profiles — secrets from env/files only, never here.
+  // See "Per-VM credential profiles" under "Credential model" for the full rules.
+  "credential_profiles": [
+    { "name": "lab-a", "vm_patterns": ["lab-a-*"], "username": "LabAdminA",
+      "password_env": "LAB_A_PW",
+      "victim_username": "LabVictimA", "victim_password_env": "LAB_A_VICTIM_PW" }
+  ],
   "unrestricted": false,               // explicit research mode: allow all
   "audit_log_path": "C:\\Lab\\audit.jsonl",  // default: one line per op on stderr
   "max_output_bytes": 1048576,         // guest output cap (applied after capture; truncated flag)
@@ -1214,10 +1297,15 @@ and each component is load-bearing, with one caveat on the fourth:
 
 - **VM GUID** — the identity the caller already resolved, so a renamed VM can
   never silently re-target a pooled session.
-- **credential profile** — derived from the credential identity (username plus
-  an HMAC of the password under a per-process random key). Two credentials that
-  share a username but differ by password never share a session, so a rotated
-  password cannot inherit a session opened under the old one.
+- **credential profile** — the credential identity the call resolved (issue
+  #30). A named credential profile contributes its NAME; the admin and
+  victim identities of one profile never share a session (the victim role
+  widens the component to `<profile>#victim`); a global (unprofiled)
+  credential keeps the pre-#30 identity derivation (username plus an HMAC of
+  the password under a per-process random key), so two credentials that
+  share a username but differ by password still never share a session and a
+  rotated password cannot inherit a session opened under the old one. The
+  component is never shown verbatim in an error, log, or audit row.
 - **agent id** — the authenticated bearer-token `client_id`. Microsoft documents
   that persistent PowerShell Direct sessions retain state (variables, imported
   modules, location), so a session is never handed to a caller that is not the
@@ -1242,8 +1330,11 @@ What the pool does and does not touch:
 
 Invalidation. A session is closed when the VM is
 checkpoint-restored, checkpoint-removed, stopped, reset or started, when a
-debugging configuration reboots the guest, and when its credential profile is
-rotated. Each lifecycle tool invalidates
+debugging configuration reboots the guest, and when the credential behind a
+profiled session changes (a rotated password or changed username under the
+same profile name is detected by the session pool's in-memory credential
+fingerprint and the stale session is retired; across a server restart the
+restore-time identity binding refuses instead). Each lifecycle tool invalidates
 after the action **succeeds** — a failed action leaves the guest as it was and
 invalidates nothing. A session is also closed when it reports itself Broken or
 Closed, and on a transport error during use. The next call then retries once on a fresh session, but only

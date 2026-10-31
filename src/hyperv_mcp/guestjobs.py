@@ -76,6 +76,17 @@ def _cred_ref(cred: CredentialSet | None) -> str:
     return str(getattr(cred, "source", "inline") or "inline")
 
 
+def _cred_profile_label(cred: CredentialSet | None) -> str:
+    """The durable cred_profile label for a credential ('' = global/none).
+
+    The ``default`` sentinel is recorded as '' so a pre-profile row and a
+    global-credential row share one shape and restore takes the same
+    global-only branch for both.
+    """
+    label = str(getattr(cred, "profile", "") or "")
+    return "" if label == "default" else label
+
+
 def _row(entry: dict[str, Any], state: str) -> statestore.JobRow:
     """Project a registry entry onto a store row. command/args/cred are
     deliberately absent: the store holds no secret and no command text."""
@@ -93,24 +104,69 @@ def _row(entry: dict[str, Any], state: str) -> statestore.JobRow:
         state=state,
         cred_ref=str(entry.get("cred_ref") or _cred_ref(entry.get("cred"))),
         owner=entry.get("owner"),
+        cred_profile=str(entry.get("cred_profile") or _cred_profile_label(entry.get("cred"))),
+        cred_username=str(
+            entry.get("cred_username") or getattr(entry.get("cred"), "username", "") or ""
+        ),
     )
 
 
 def _restored_credential(cfg: Config, entry: dict[str, Any]) -> CredentialSet:
-    """Re-resolve the credential a restored job started WITH.
+    """Re-resolve the credential a restored job or relay started WITH.
 
-    An `env`/`file` reference re-resolves through credentials.resolve_guest(),
-    which registers the secret for redaction exactly as at start. An `inline`
-    reference is not re-resolvable: substituting a different identity would run
-    guest legs as the wrong account, so it fails honestly instead.
+    Issue #30 binds the IDENTITY, not just the source kind. Four branches:
+
+    1. ``cred_ref == "inline"``: never persisted, never re-resolvable —
+       refuses as it always has (a reservation placeholder row records
+       exactly this reference).
+    2. ``cred_profile`` set: re-resolve THROUGH THAT PROFILE for the row's
+       VM; the resolved profile and username must equal the recorded ones —
+       any drift (profile renamed, patterns moved, username changed) refuses
+       naming both identities instead of silently switching accounts.
+    3. ``cred_profile`` empty but ``cred_username`` recorded: re-resolve
+       from the recorded source KIND with profile matching OFF
+       (``global_only=True``); a changed username refuses.
+    4. neither recorded (a pre-v4 row): ref-based re-resolution exactly as
+       before this issue — the historical substitution window applies only
+       to rows that never recorded an identity.
+
+    An `env`/`file` reference re-resolves through the shared helper, which
+    registers the secret for redaction exactly as at start.
     """
     ref = str(entry.get("cred_ref") or "inline")
-    if ref != "inline":
-        return credentials.resolve_guest()
-    raise CredentialError(
-        f"job {entry.get('job_id')!r} was started with inline credentials, "
-        "which are never persisted; it cannot be re-attached after a restart"
-    )
+    if ref == "inline":
+        raise CredentialError(
+            f"job {entry.get('job_id')!r} was started with inline credentials, "
+            "which are never persisted; it cannot be re-attached after a restart"
+        )
+    recorded_profile = str(entry.get("cred_profile") or "")
+    recorded_username = str(entry.get("cred_username") or "")
+    vm_name = str(entry.get("vm_name") or "")
+    if recorded_profile:
+        resolved = credentials.resolve_guest(vm_name=vm_name)
+        resolved_profile = getattr(resolved, "profile", "default")
+        if resolved_profile != recorded_profile or (
+            resolved.username != recorded_username
+        ):
+            raise CredentialError(
+                f"job {entry.get('job_id')!r} on VM {vm_name!r} was started as "
+                f"{recorded_username!r} under profile {recorded_profile!r} "
+                f"but re-resolves as {resolved.username!r} under profile "
+                f"{resolved_profile!r}; refusing to run a guest leg under a "
+                "different account"
+            )
+        return resolved
+    if recorded_username:
+        resolved = credentials.resolve_guest(vm_name=vm_name, global_only=True)
+        if resolved.username != recorded_username:
+            raise CredentialError(
+                f"job {entry.get('job_id')!r} on VM {vm_name!r} was started as "
+                f"{recorded_username!r} but the environment now resolves "
+                f"{resolved.username!r}; refusing to run a guest leg under a "
+                "different account"
+            )
+        return resolved
+    return credentials.resolve_guest(vm_name=vm_name, global_only=True)
 
 
 def _entry_credential(cfg: Config, entry: dict[str, Any]) -> CredentialSet:
@@ -152,6 +208,8 @@ def _restore_entry(cfg: Config, job_id: str, owner: str | None) -> dict[str, Any
         "stopped": row.state == statestore.JOB_STOPPED,
         "row_state": row.state,
         "cred_ref": row.cred_ref,
+        "cred_profile": row.cred_profile,
+        "cred_username": row.cred_username,
         "cred": None,
     }
 
@@ -737,6 +795,11 @@ def job_start(
         "exit_path": f"{job_dir}\\exitcode.txt" if job_dir else "",
         "started_at": _utc_now_iso(),
         "cred": cred,
+        # Issue #30: record the credential IDENTITY (never the secret) so a
+        # restored job re-resolves through the same profile/account or
+        # refuses. '' profile = the global credential sentinel.
+        "cred_profile": _cred_profile_label(cred),
+        "cred_username": str(getattr(cred, "username", "") or ""),
         "owner": owner,
         "stopped": False,
     }

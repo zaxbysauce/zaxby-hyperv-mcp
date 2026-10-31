@@ -55,7 +55,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from . import consolebench, credentials, policy, pswindows, statestore, vmident
+from . import consolebench, guestjobs, policy, pswindows, statestore, vmident
 from .config import Config
 from .credentials import CredentialError, CredentialSet
 from .diagnostics import build_guest_script
@@ -114,6 +114,7 @@ def _cred_ref(cred: CredentialSet | None) -> str:
 def _row(entry: dict[str, Any], state: str) -> statestore.RelayRow:
     """Project a registry entry onto a store row. The per-relay secret and the
     live credential are deliberately absent: neither is ever persisted."""
+    cred = entry.get("context", {}).get("cred")
     return statestore.RelayRow(
         relay_id=str(entry["relay_id"]),
         vm_name=str(entry.get("vm_name") or ""),
@@ -123,8 +124,17 @@ def _row(entry: dict[str, Any], state: str) -> statestore.RelayRow:
         host_port=int(entry.get("host_port") or 0),
         started_at=str(entry.get("started_at") or ""),
         state=state,
-        cred_ref=str(entry.get("cred_ref") or _cred_ref(entry.get("context", {}).get("cred"))),
+        cred_ref=str(entry.get("cred_ref") or _cred_ref(cred)),
         owner=entry.get("owner"),
+        # Issue #30: the credential IDENTITY (never the secret). '' profile =
+        # the global credential sentinel; restore binds on both fields.
+        cred_profile=str(
+            entry.get("cred_profile")
+            or guestjobs._cred_profile_label(cred)
+        ),
+        cred_username=str(
+            entry.get("cred_username") or getattr(cred, "username", "") or ""
+        ),
     )
 
 
@@ -135,6 +145,31 @@ class _DeadThread:
 
     def is_alive(self) -> bool:
         return False
+
+
+# Relay ids whose identity-drift event has already been emitted (PRR-006).
+_drift_emitted: set[str] = set()
+_drift_emitted_lock = threading.Lock()
+
+
+def _emit_identity_drift_once(cfg: Config, row: statestore.RelayRow) -> None:
+    """Emit relay.identity_drift exactly once per relay id (bounded)."""
+    with _drift_emitted_lock:
+        if row.relay_id in _drift_emitted:
+            return
+        if len(_drift_emitted) >= 4096:
+            _drift_emitted.clear()  # bounded; worst case a rare re-emit
+        _drift_emitted.add(row.relay_id)
+    try:
+        from . import operations as _ops
+
+        _ops.emit(cfg, "relay.identity_drift", row.relay_id,
+                  row.vm_id, row.owner, {
+                      "cred_profile": row.cred_profile,
+                      "cred_username": row.cred_username,
+                  })
+    except Exception:
+        pass  # best-effort, matching every other _ops.emit site
 
 
 def _restored_entry(cfg: Config, row: statestore.RelayRow,
@@ -157,15 +192,39 @@ def _restored_entry(cfg: Config, row: statestore.RelayRow,
     if (row.owner or None) != owner:
         return None
     cred = None
+    drift = False
     if row.cred_ref != "inline":
+        # Issue #30: the shared binding helper re-resolves through the
+        # NAMED PROFILE the relay started with (or the recorded username for
+        # a pre-profile row) and refuses on any identity drift. A restored
+        # relay's credential is only needed to STOP it, and a stop of an
+        # interrupted relay performs no guest leg — a CredentialError here
+        # leaves cred None, so the identity refusal surfaces if (and only
+        # if) something actually needs the credential.
+        drift = False
         try:
-            cred = credentials.resolve_guest()
+            cred = guestjobs._restored_credential(cfg, {
+                "job_id": row.relay_id,
+                "vm_name": row.vm_name,
+                "cred_ref": row.cred_ref,
+                "cred_profile": row.cred_profile,
+                "cred_username": row.cred_username,
+            })
         except CredentialError:
-            # A restored relay's credential is only needed to STOP it, and a
-            # stop of an interrupted relay performs no guest leg. Leave it None
-            # and let the request path (which no longer exists) be the only
-            # thing that would have needed it.
+            # PRR-006: the refusal cannot reach an operator surface from here
+            # (an interrupted relay has no listener and stopping it performs
+            # no guest leg), but the drift must not stay silent AND the row
+            # must not keep advertising an identity that no longer resolves.
+            # Emit a durable event and blank the stale labels; the next
+            # relay_stop re-persists the row with cred_profile/cred_username
+            # cleared, so the store stops asserting a binding that failed.
+            drift = True
             cred = None
+        if drift:
+            # operations.emit is a one-call-per-TRANSITION append unit: a
+            # status poller reading a drifted row must not append a duplicate
+            # event per read, so the emission is keyed once per relay id.
+            _emit_identity_drift_once(cfg, row)
     context: dict[str, Any] = {
         "cfg": cfg,
         "vm_name": row.vm_name,
@@ -193,6 +252,11 @@ def _restored_entry(cfg: Config, row: statestore.RelayRow,
         "stopped": row.state == statestore.RELAY_STOPPED,
         "row_state": row.state,
         "cred_ref": row.cred_ref,
+        # PRR-006: on identity drift the restored entry must not keep
+        # asserting a binding that failed — blank the stale labels so the
+        # next row write (stop re-persists) no longer carries them.
+        "cred_profile": "" if drift else row.cred_profile,
+        "cred_username": "" if drift else row.cred_username,
     }
     if entry["row_state"] == statestore.RELAY_ACTIVE:
         # A row not in the local registry has no listener HERE: its listener
@@ -832,7 +896,13 @@ def relay_start(
                     relay_id=relay_id, vm_name=ref.name, vm_id=ref.id,
                     guest_port=int(guest_port), bind=bind,
                     started_at=started_at, state=statestore.RELAY_ACTIVE,
-                    cred_ref=_cred_ref(cred), owner=owner,
+                    # cred_ref="inline" (PRR-006, matching the job
+                    # placeholder): a relay that died between this
+                    # reservation and the registration upsert must REFUSE
+                    # re-attach, never silently bind the global credential —
+                    # the identity columns are only persisted with the
+                    # registration row.
+                    cred_ref="inline", owner=owner,
                 ))
                 _mark_store_wrote(relay_id)
         except BaseException:
@@ -926,6 +996,10 @@ def relay_start(
             "owner": owner,
             "started_at": _utc_now_iso(),
             "stopped": False,
+            # Issue #30: the credential identity rides the entry so the row
+            # persists it (never the secret) and restore binds on it.
+            "cred_profile": guestjobs._cred_profile_label(cred),
+            "cred_username": str(getattr(cred, "username", "") or ""),
         }
         with _relays_lock:
             _relays[relay_id] = entry

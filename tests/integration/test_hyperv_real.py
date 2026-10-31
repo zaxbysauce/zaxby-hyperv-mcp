@@ -1113,3 +1113,101 @@ def test_ui_helper_element_workflow_and_lock(running_vm, it_tmp):
     final_gone = uia.wait_for(
         cfg, vm, selector=cancel_selector, gone=True, timeout_s=30, cred=creds)
     assert final_gone["ok"] is True, final_gone
+
+
+# ---------------------------------------------------------------------------
+# per-VM credential profiles (issue #30, AC14)
+# ---------------------------------------------------------------------------
+
+
+def test_credential_profiles_two_vms_two_admins():
+    """AC14 (issue #30): two disposable VMs, two per-VM credential profiles.
+
+    Profile A names VM A (the shared gate's HYPERV_MCP_TEST_VM) with its
+    admin from the gate's global credential; profile B names VM B
+    (HYPERV_MCP_TEST_VM_B) with HYPERV_MCP_TEST_VM_B_USERNAME /
+    _PASSWORD. Positive leg: guest_run_ps on BOTH VMs resolves through its
+    own profile and reports ok. Swapped leg: the same two patterns carry
+    each OTHER VM's admin, and both calls fail with error_class
+    'transport' (a wrong-account PowerShell Direct logon is a
+    session-establishment failure — never a silent fallback to the global
+    credential).
+
+    The shared env gate (HYPERV_MCP_INTEGRATION=1 + HYPERV_MCP_TEST_VM +
+    guest credentials) is enforced for the whole file by
+    tests/integration/conftest.py; the second VM's variables are checked
+    here and skip with a reason when absent, so this leg never runs on a
+    one-VM host. No checkpoint is taken: the only guest legs are a
+    Write-Output script and failed logons, which mutate no guest state."""
+    import os
+
+    from hyperv_mcp import credentials, guestexec, lifecycle
+    from hyperv_mcp.config import Config
+
+    vm_a = os.environ["HYPERV_MCP_TEST_VM"].strip()
+    vm_b = os.environ.get("HYPERV_MCP_TEST_VM_B", "").strip()
+    user_b = os.environ.get("HYPERV_MCP_TEST_VM_B_USERNAME", "").strip()
+    pw_b_env = "HYPERV_MCP_TEST_VM_B_PASSWORD"
+    if not (vm_b and user_b and os.environ.get(pw_b_env, "")):
+        pytest.skip(
+            "two-VM credential-profile leg needs HYPERV_MCP_TEST_VM_B, "
+            "HYPERV_MCP_TEST_VM_B_USERNAME and HYPERV_MCP_TEST_VM_B_PASSWORD "
+            "(VM A is the shared HYPERV_MCP_TEST_VM with the gate's global "
+            "admin credential)"
+        )
+
+    user_a = os.environ["HYPERV_GUEST_USERNAME"]
+    # PRR-013: the conftest gate accepts a PASSWORD_FILE host, but a profile
+    # can only carry ONE secret source. Mirror the gate here: prefer the env
+    # variable, fall back to the file (path kept in the env so the resolver
+    # finds it), and skip when the host's global credential shape cannot be
+    # expressed as a profile secret source.
+    if os.environ.get("HYPERV_GUEST_PASSWORD_FILE", "").strip():
+        # PRR-013: a profile carries exactly ONE secret source, so a
+        # PASSWORD_FILE host cannot express the swapped leg. Skip, as the
+        # finding specified - never error mid-test on this host class.
+        pytest.skip("global credential is PASSWORD_FILE-based; the two-VM "
+                    "profile swap needs an env-variable secret")
+    if not os.environ.get("HYPERV_GUEST_PASSWORD", "").strip():
+        pytest.skip("global credential is neither HYPERV_GUEST_PASSWORD nor "
+                    "HYPERV_GUEST_PASSWORD_FILE; a profile needs exactly one "
+                    "secret source")
+    user_a = os.environ["HYPERV_GUEST_USERNAME"].strip()
+    profile_a = {
+        "name": "vm-a-admin", "vm_patterns": [vm_a], "username": user_a,
+        "password_env": "HYPERV_GUEST_PASSWORD",
+    }
+    profile_b = {
+        "name": "vm-b-admin", "vm_patterns": [vm_b], "username": user_b,
+        "password_env": pw_b_env,
+    }
+    cfg = Config.from_dict({
+        "unrestricted": True,
+        "credential_profiles": [profile_a, profile_b],
+    })
+    credentials.init(cfg)
+    lifecycle.start_vm(cfg, vm_a)
+    lifecycle.start_vm(cfg, vm_b)
+
+    script = "Write-Output 'profile-ok'"
+    for vm in (vm_a, vm_b):
+        out = guestexec.guest_run_ps(
+            cfg, vm, script, cred=credentials.resolve_guest(vm_name=vm))
+        assert out["ok"], out
+
+    swapped = Config.from_dict({
+        "unrestricted": True,
+        "credential_profiles": [
+            dict(profile_a, username=user_b, password_env=pw_b_env),
+            dict(profile_b, username=user_a,
+                 password_env="HYPERV_GUEST_PASSWORD"),
+        ],
+    })
+    credentials.init(swapped)
+    for vm in (vm_a, vm_b):
+        out = guestexec.guest_run_ps(
+            swapped, vm, script, cred=credentials.resolve_guest(vm_name=vm))
+        assert out["ok"] is False, (
+            f"a swapped (wrong-account) profile must fail: vm={vm} out={out}"
+        )
+        assert out["error_class"] == "transport", out

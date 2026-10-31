@@ -333,17 +333,27 @@ def _pooled_pool(cfg: Config):
     return pool if pool is not None and not pool.stats().get("closed") else None
 
 
-def _session_key(vm_id: str, cred: CredentialSet) -> psdsessions.SessionKey:
+def _session_key(
+    vm_id: str, cred: CredentialSet, role: str = "guest",
+) -> psdsessions.SessionKey:
     """The pool key for one guest call: (VM GUID, credential profile, agent id,
     boot epoch). The agent id is the authenticated bearer-token client_id and is
     None on the paths that carry no identity — README.md:906-909 documents that
     in those modes all callers form one local principal, so None is one bucket
-    rather than a blocker."""
+    rather than a blocker.
+
+    ``role`` separates the admin and victim identities (issue #30): both
+    resolve through the SAME named profile on one VM, so the role must widen
+    the credential-profile component or a victim call could inherit an admin
+    session (pinned by C19/C27 as ``<profile>#victim``)."""
     from . import auditlog
 
+    component = psdsessions.credential_profile(cred)
+    if role == "victim":
+        component = f"{component}#victim"
     return psdsessions.SessionKey(
         vm_guid=vm_id,
-        cred_profile=psdsessions.credential_profile(cred),
+        cred_profile=component,
         agent_id=auditlog.current_agent_id(),
         boot_epoch=None,
     )
@@ -357,6 +367,7 @@ def _run_pooled_raw(
     cred: CredentialSet,
     timeout_ms: int,
     elevated: bool = False,
+    session_role: str = "guest",
 ):
     """Run one inner script over a REUSED PowerShell Direct session.
 
@@ -378,7 +389,7 @@ def _run_pooled_raw(
     """
     if pool is None:
         return None
-    key = _session_key(vm_id, cred)
+    key = _session_key(vm_id, cred, role=session_role)
     # Bounded by the VM-lock budget, not the host-PowerShell one: this wait runs
     # INSIDE `vm_lock(mode="read")`, and a 60 s park here would hold the read
     # lock far past the `vm_lock_wait_s` a queued lifecycle writer is prepared
@@ -549,9 +560,12 @@ def _run_pooled(
     cred: CredentialSet,
     timeout_ms: int,
     elevated: bool,
+    session_role: str = "guest",
 ) -> dict | None:
     """The `_run_inner` envelope over a pooled call, or None to fall back."""
-    result = _run_pooled_raw(cfg, pool, vm_id, inner_script, cred, timeout_ms, elevated)
+    result = _run_pooled_raw(
+        cfg, pool, vm_id, inner_script, cred, timeout_ms, elevated, session_role,
+    )
     if result is None:
         return None
     return _pooled_envelope(cfg, result, elevated, timeout_ms)
@@ -619,6 +633,7 @@ def _run_inner(
     timeout_ms: int,
     elevated: bool,
     vm_name: str = "",
+    session_role: str = "guest",
 ) -> dict:
     """Run one inner script on the VM identified by the pre-resolved GUID.
 
@@ -630,7 +645,9 @@ def _run_inner(
     """
     pool = _pooled_pool(cfg)
     if pool is not None:
-        pooled = _run_pooled(cfg, pool, vm_id, inner_script, cred, timeout_ms, elevated)
+        pooled = _run_pooled(
+            cfg, pool, vm_id, inner_script, cred, timeout_ms, elevated, session_role,
+        )
         if pooled is not None:
             if vm_name:
                 pooled["vm_name"] = vm_name
@@ -708,6 +725,7 @@ def guest_run_ps(
     confirm: bool = False,
     cred: CredentialSet | None = None,
     vm_id: str = "",
+    session_role: str = "guest",
 ) -> dict:
     if (not vm_name and not vm_id) or not script:
         raise ValueError("vm_name (or vm_id) and script are required")
@@ -718,7 +736,10 @@ def guest_run_ps(
         policy.require_destructive(cfg, "elevated_exec", confirm, f"run an elevated script on '{ref.name}'")
     with vmlocks.vm_lock(ref.id, mode="read"):
         inner = f"{_LE_RESET}\n{script}\n{_EXIT_PROPAGATION}"
-        return _run_inner(cfg, ref.id, inner, cred, timeout_ms, elevated, vm_name=ref.name)
+        return _run_inner(
+            cfg, ref.id, inner, cred, timeout_ms, elevated,
+            vm_name=ref.name, session_role=session_role,
+        )
 
 
 def guest_run(
@@ -733,6 +754,7 @@ def guest_run(
     confirm: bool = False,
     cred: CredentialSet | None = None,
     vm_id: str = "",
+    session_role: str = "guest",
 ) -> dict:
     if (not vm_name and not vm_id) or not command:
         raise ValueError("vm_name (or vm_id) and command are required")
@@ -762,7 +784,10 @@ def guest_run(
     else:
         lines.append(_EXIT_PROPAGATION)
     with vmlocks.vm_lock(ref.id, mode="read"):
-        return _run_inner(cfg, ref.id, "\n".join(lines), cred, timeout_ms, elevated, vm_name=ref.name)
+        return _run_inner(
+            cfg, ref.id, "\n".join(lines), cred, timeout_ms, elevated,
+            vm_name=ref.name, session_role=session_role,
+        )
 
 
 def victim_run_ps(
@@ -781,7 +806,10 @@ def victim_run_ps(
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     with vmlocks.vm_lock(ref.id, mode="read"):
         inner = f"{_LE_RESET}\n{script}\n{_EXIT_PROPAGATION}"
-        return _run_inner(cfg, ref.id, inner, cred, timeout_ms, elevated=False, vm_name=ref.name)
+        return _run_inner(
+            cfg, ref.id, inner, cred, timeout_ms, elevated=False,
+            vm_name=ref.name, session_role="victim",
+        )
 
 
 def victim_run(
@@ -800,7 +828,11 @@ def victim_run(
     if (not vm_name and not vm_id) or not command:
         raise ValueError("vm_name (or vm_id) and command are required")
     # guest_run resolves once (VM policy included) — no double resolution.
+    # The victim role rides the delegation so the pooled session key stays
+    # victim-separated from an admin session on the same VM/profile (issue
+    # #30, pinned by C19/C27).
     return guest_run(
         cfg, vm_name, command, args, cwd,
         timeout_ms=timeout_ms, elevated=False, confirm=False, cred=cred, vm_id=vm_id,
+        session_role="victim",
     )
