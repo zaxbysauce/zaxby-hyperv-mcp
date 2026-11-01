@@ -690,8 +690,11 @@ def test_harvest_action_script_review_pins(monkeypatch, tmp_path):
         "C1: the final emission must use the ToArray shape (PS 5.1 throws "
         "on @() around List[object])")
     assert "@($files)" not in action and "@($skipped)" not in action
-    assert "Get-ChildItem -LiteralPath $dstDir -Filter $name" in action, (
-        "M4: glob copies must be enumerated so they are hashed and capped")
+    assert "$copiedList = Get-ChildItem -LiteralPath $dstDir -Filter $name" in action, (
+        "M4: glob copies must be ENUMERATED into copiedList so they are "
+        "hashed and capped (round-2 reviewer: the stale-clear line emits the "
+        "same Get-ChildItem substring, so the pin must name the enumeration "
+        "assignment uniquely)")
     assert "$LASTEXITCODE -ge 8" in action and "copy_failed" in action, (
         "M5: a failed robocopy must be reported, never silently dropped")
     assert "Remove-Item -LiteralPath $ap -Recurse -Force" in action, (
@@ -723,11 +726,13 @@ def test_harvest_recovery_leg_runs_after_action_failure(monkeypatch, tmp_path):
     with pytest.raises(harvest.HarvestError):
         harvest.harvest_offline_logs(
             cfg, vm_name="test-vm-1", dest_dir=str(tmp_path / "out"))
-    recovery = [s for s in fake.scripts if "Dismount-VHD" in s and "Get-VMHardDiskDrive" in s]
-    assert recovery, (
+    # Round-2 reviewer: the FAILED action script itself contains both
+    # "Dismount-VHD" and "Get-VMHardDiskDrive", so the old filter was
+    # satisfied without any recovery leg — pin the recovery-only literal
+    # (harvest._recovery_script is the ONLY emitter of 'recovery-done').
+    assert any("recovery-done" in s for s in fake.scripts), (
         "the recovery dismount leg must run after an action-script failure "
         "(the killed process never ran its in-script finally)")
-    assert any("recovery" in s or "SilentlyContinue" in s for s in recovery)
 
 
 def test_vm_clone_restores_parent_attribute_on_refusal(monkeypatch, unrestricted, tmp_path):

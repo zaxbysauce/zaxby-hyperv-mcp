@@ -61,7 +61,12 @@ _TOTAL_MAX_BYTES = 2 * 1024 * 1024 * 1024
 
 class HarvestError(RuntimeError):
     """Structured offline-harvest refusal/failure (caller/vm-state faults:
-    not Off, remote-host mode — classified "invalid", never "transport")."""
+    not Off, remote-host mode — classified "invalid", never "transport").
+    NOTE (M20 doctrine, recorded at review round 2): ``_run`` wraps every
+    ``check_result`` transport failure in this class, so a genuine harvest
+    leg timeout also classifies "invalid" — the shipped MediaError
+    precedent (errors.py), deliberate: harvest failures are operation-
+    scoped, and the wrapping context names the leg."""
 
 
 class HarvestPrivilegeError(HarvestError):
