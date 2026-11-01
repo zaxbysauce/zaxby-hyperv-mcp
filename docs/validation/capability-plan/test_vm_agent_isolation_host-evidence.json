@@ -1,0 +1,16 @@
+{
+  "record": "issue #31 supplement AC16 (per-agent VM lifecycle, live seam leg)",
+  "status": "NOT-EXECUTED - PENDING",
+  "named_by": "the 2026-10-26 supplement's own approval language (plan critic approves this named host-evidence substitution; executing this gate requires a disposable approved lab; no host proof was run during planning)",
+  "executed": false,
+  "host_proof": null,
+  "evidence_required_when_run": [
+    "host/tool versions",
+    "topology",
+    "synthetic fixture",
+    "command transcript",
+    "measured result",
+    "cleanup readback"
+  ],
+  "note": "This file is the NAMED placeholder the supplement reserves for the live seam leg. It is not a pass, a claim, or a partial result: the live leg has NOT been run. The seam itself ships unit-proven (tests/unit/test_vm_agent_isolation.py incl. the C14 wiring check)."
+}

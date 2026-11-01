@@ -290,8 +290,6 @@ class Config:
     credential_profiles: tuple[CredentialProfile, ...] = ()
     # Issue #31 supplement: the optional per-agent cleanup-provider seam.
     agent_isolation: AgentIsolationPolicy = field(default_factory=AgentIsolationPolicy)
-    # Issue #31 supplement: the optional per-agent cleanup-provider seam.
-    agent_isolation: AgentIsolationPolicy = field(default_factory=AgentIsolationPolicy)
 
     # -- loading ---------------------------------------------------------
 
