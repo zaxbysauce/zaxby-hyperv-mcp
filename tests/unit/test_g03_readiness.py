@@ -59,6 +59,8 @@ STATUS_ACTION = json.dumps({
     "state": "Running",
     "uptime_s": 300,
     "heartbeat": "OK",
+    "heartbeat_enabled": True,
+    "heartbeat_secondary": "OK",
     "kvp_items": [KVP_OSNAME, KVP_BUILD, KVP_IPV4, "<not-xml"],
 })
 
@@ -269,10 +271,13 @@ def test_deployment_status_needs_no_credentials(monkeypatch):
     action = fake.scripts[1]
     assert "Get-VMIntegrationService" in action and "Heartbeat" in action
     assert "Msvm_KvpExchangeComponent" in action
-    # assembled result contract
+    # assembled result contract (issue #32 AC4 richer shape)
     assert out["phase"] == "os_ready"
-    assert out["vm"]["state"] == "Running" and out["vm"]["uptime_s"] == 300
-    assert out["heartbeat"] == "OK"
+    assert out["state"] == "Running" and out["uptime_s"] == 300
+    assert out["heartbeat"]["primary_status"] == "OK"
+    assert out["heartbeat"]["enabled"] is True
+    assert out["heartbeat"]["application_status"] == "OK"
+    assert out["vm_id"] == GUID
     assert out["guest"]["os_name"] == "Windows 10 Enterprise"
     assert out["guest"]["os_build"] == "19045"
     ipv4 = out["guest"]["ipv4"]
@@ -289,20 +294,20 @@ def test_deployment_status_needs_no_credentials(monkeypatch):
 # AC11 — classify_phase table; the status script keys on the GUID
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("state,heartbeat,kvp,expected", [
-    ("Off", "OK", True, "off"),          # Off wins regardless of signals
-    ("Off", None, False, "off"),
-    ("Running", "OK", True, "os_ready"),
-    ("Running", "OK", False, "degraded"),
-    ("Running", "No Contact", True, "no_guest_signal"),
-    ("Running", None, False, "no_guest_signal"),
-    ("Starting", "OK", True, "no_guest_signal"),  # not Off, not os_ready/degraded
-    ("Saved", None, False, "no_guest_signal"),
+@pytest.mark.parametrize("state,hb_enabled,hb_primary,kvp,expected", [
+    ("Off", True, "OK", True, "off"),          # Off wins regardless of signals
+    ("Off", False, "", False, "off"),
+    ("Running", True, "OK", True, "os_ready"),
+    ("Running", True, "No Contact", True, "no_guest_signal"),
+    ("Starting", True, "OK", True, "no_guest_signal"),  # transition: no guest signal
+    ("Stopping", True, "OK", True, "no_guest_signal"),
 ])
-def test_classify_phase(state, heartbeat, kvp, expected):
+def test_classify_phase(state, hb_enabled, hb_primary, kvp, expected):
     """RED/ERROR at base (ImportError: readiness), GREEN after the fix:
-    the pure classification table from the issue."""
-    assert readiness.classify_phase(state, heartbeat, kvp) == expected
+    transition and precedence rows complementing test_phase_classification_v2
+    (issue #32 AC5 richer signature)."""
+    assert readiness.classify_phase(
+        state, hb_enabled, hb_primary, kvp) == expected
 
 
 def test_status_script_keys_on_guid(monkeypatch):
