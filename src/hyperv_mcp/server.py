@@ -45,6 +45,7 @@ from mcp.shared.exceptions import UrlElicitationRequiredError
 from mcp.types import LATEST_PROTOCOL_VERSION, CallToolResult, TextContent
 from pydantic import AnyHttpUrl
 
+from . import __version__ as _pkg_version
 from . import (
     auditlog,
     console,
@@ -73,7 +74,6 @@ from . import (
     vmident,
     vmlocks,
 )
-from . import __version__ as _pkg_version
 from .config import Config, ConfigError
 from .credentials import CredentialError
 

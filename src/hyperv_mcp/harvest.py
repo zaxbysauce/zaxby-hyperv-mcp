@@ -25,10 +25,9 @@ files + hashes, never interpolated into PowerShell.
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
-
 import json
 import os
+from pathlib import Path
 
 from . import guestexec, policy, pswindows, vmident, vmlocks
 from .config import Config

@@ -23,8 +23,7 @@ import os
 import stat
 import time
 
-from . import guestexec, lifecycle, policy, pswindows, vmident, vmlocks
-from . import agent_isolation
+from . import agent_isolation, guestexec, lifecycle, policy, pswindows, vmident, vmlocks
 from .config import Config
 from .policy import PolicyDenied
 
