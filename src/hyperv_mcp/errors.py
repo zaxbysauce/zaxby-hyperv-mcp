@@ -86,6 +86,16 @@ def classify(exc: BaseException) -> str:
     if isinstance(exc, pswindows.PowerShellBusy):
         # Issue #15: pool saturation is busy/retryable, same as a busy VM.
         return "busy"
+    from .harvest import HarvestError, HarvestPrivilegeError  # late import: errors -> harvest -> guestexec
+
+    if isinstance(exc, HarvestPrivilegeError):
+        # Issue #33 AC13: the non-elevated refusal is a privilege fault,
+        # reported (and audited) as its own class, never "transport".
+        return "privilege"
+    if isinstance(exc, HarvestError):
+        # PRR-020: caller/vm-state faults (not Off, remote-host mode), not
+        # transport — same doctrine as MediaError below.
+        return "invalid"
     if isinstance(exc, MediaError):
         # PRR-020: caller/vm-state faults, not transport — matches the
         # shipped envelope contract (test_media_error_envelope_maps_invalid).
@@ -107,6 +117,8 @@ def retry_fields(error_class: str) -> tuple[bool, int | None]:
         return True, BUSY_RETRY_MS
     if error_class == "lease_conflict":
         return True, None
+    if error_class == "privilege":
+        return False, None
     return False, None
 
 
@@ -160,9 +172,16 @@ def enrich_failure(env: dict[str, Any]) -> dict[str, Any]:
     out = dict(env)
     error_class = str(out.get("error_class") or "transport")
     out["error_class"] = error_class
-    retryable, retry_after_ms = retry_fields(error_class)
-    out["retryable"] = retryable
-    out["retry_after_ms"] = retry_after_ms
+    if "retryable" in out:
+        # M1 (PR #112 review): a module envelope that EXPLICITLY sets
+        # retryable knows its own retry semantics (e.g. vm_remove's bounded
+        # merge wait is retryable by design, though raised timeouts are
+        # deliberately not) — explicit beats derived.
+        out["retry_after_ms"] = out.get("retry_after_ms")
+    else:
+        retryable, retry_after_ms = retry_fields(error_class)
+        out["retryable"] = retryable
+        out["retry_after_ms"] = retry_after_ms
     # Parity with envelope(): a module-built busy dict that carries holder
     # metadata keeps it (defensive; modules currently don't set it).
     if isinstance(out.get("holder"), dict):

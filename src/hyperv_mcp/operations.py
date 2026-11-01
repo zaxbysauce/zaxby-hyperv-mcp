@@ -69,7 +69,7 @@ DETACHABLE_TOOLS = frozenset({
     "hyperv_start_vm", "hyperv_stop_vm", "hyperv_reset_vm",
     "hyperv_checkpoint_create", "hyperv_checkpoint_restore",
     "hyperv_checkpoint_remove", "hyperv_wait_vm_state",
-    "hyperv_wait_guest_recovery", "hyperv_vm_create",
+    "hyperv_wait_guest_recovery", "hyperv_vm_create", "hyperv_vm_remove",
     "hyperv_guest_run", "hyperv_guest_run_ps",
     "hyperv_guest_put", "hyperv_guest_get",
 })

@@ -123,6 +123,18 @@ class DestructivePolicy:
     ui_input: bool = False
     ui_provision: bool = False
     require_confirm: bool = True
+    # Issues #31/#33: appended after EVERY pre-existing field (including
+    # require_confirm — review round 2: the interim placement before it still
+    # shifted require_confirm's positional binding) so positional
+    # constructions of the pre-#112 dataclass keep their argument order.
+    # Issue #31: removing a VM (and optionally its own disk files) is
+    # irreversible and a different risk class from vm_provision (create,
+    # attach, firmware) — its own deny-by-default switch.
+    vm_remove: bool = False
+    # Issue #33: reading a guest disk from the host bypasses guest credentials
+    # and guest_read_roots, so offline log harvest must be opted into
+    # explicitly (read-only like media: no confirm leg).
+    offline_harvest: bool = False
 
 
 @dataclass

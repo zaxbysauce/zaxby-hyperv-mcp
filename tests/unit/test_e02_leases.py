@@ -48,13 +48,13 @@ from hyperv_mcp.vmlocks import VMBusy, vm_lock
 _CHILD = Path(__file__).resolve().parent / "_e02_lease_child.py"
 _SRC = Path(__file__).resolve().parents[2] / "src"
 
-# The 40 mutating tools that must grow lease_id + fencing_token (AC3).
+# The 42 mutating tools that must grow lease_id + fencing_token (AC3).
 # RECONCILIATION (recorded in the trace): the issue text says 34 tools; the
 # four enumerated categories (lifecycle / guest_exec / transfer / console)
 # against the 57-tool surface of the day yielded 36 — the enumerated set
 # below IS the contract. Issue #29 added the four lease-gated console-scope
 # UI tools (invoke/set_value/focus/helper_provision), bringing the surface
-# to 76 tools and this list to 40.
+# to 80 tools and this list to 42.
 LEASED_TOOLS = [
     # lifecycle (17)
     "hyperv_start_vm",
@@ -65,7 +65,7 @@ LEASED_TOOLS = [
     "hyperv_checkpoint_remove",
     "hyperv_configure_kdnet",
     "hyperv_configure_kdcom",
-    "hyperv_vm_create",
+    "hyperv_vm_create", "hyperv_vm_clone", "hyperv_vm_remove",
     "hyperv_vm_disk_add",
     "hyperv_vm_media_attach",
     "hyperv_vm_media_detach",
@@ -103,9 +103,9 @@ LEASED_TOOLS = [
     "hyperv_ui_helper_provision",
 ]
 
-# The 17 destructive tools whose `confirm` gate must survive the lease work
+# The 19 destructive tools whose `confirm` gate must survive the lease work
 # (AC14, PRESERVING — pinned at base c1da890 as 16; issue #29's
-# hyperv_ui_helper_provision is the 17th and only later confirm carrier).
+# hyperv_ui_helper_provision is the 17th; issues #31's clone/remove are 18-19).
 CONFIRM_TOOLS = [
     "hyperv_stop_vm",
     "hyperv_reset_vm",
@@ -116,7 +116,7 @@ CONFIRM_TOOLS = [
     "hyperv_guest_run",
     "hyperv_guest_run_ps",
     "hyperv_guest_put",
-    "hyperv_vm_create",
+    "hyperv_vm_create", "hyperv_vm_clone", "hyperv_vm_remove",
     "hyperv_vm_disk_add",
     "hyperv_vm_firmware_set_boot_order",
     "hyperv_vm_tpm_set",

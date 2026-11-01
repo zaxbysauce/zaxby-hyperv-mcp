@@ -151,12 +151,16 @@ VALID_STATES = ("Off", "Running", "Saved", "Paused", "Starting", "Stopping", "Re
 _VALID_STATES = VALID_STATES
 
 
-def wait_for_vm_state(
+def wait_for_vm_state_ref(
     cfg: Config, vm_name: str = "", states: list[str] | None = None, timeout_s: int = 300, vm_id: str = ""
-) -> str:
-    """Public bounded wait used by hyperv_wait_vm_state. States are validated
-    STRICTLY against the Hyper-V state enum (caller strings must never reach
-    the generated script unvalidated)."""
+) -> tuple[str, vmident.VMRef]:
+    """The bounded wait, returning the final state AND the resolved ref.
+
+    Issue #32: hyperv_wait_vm_state's heartbeat leg needs the already-resolved
+    identity (one resolution total); the public ``wait_for_vm_state`` keeps
+    its bare-string contract as a thin wrapper over this. States are
+    validated STRICTLY against the Hyper-V state enum (caller strings must
+    never reach the generated script unvalidated)."""
     if not states:
         raise ValueError("states list is required")
     for state in states:
@@ -165,7 +169,14 @@ def wait_for_vm_state(
     if timeout_s < 1:
         raise ValueError("timeout_s must be >= 1")
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
-    return _wait_for_state(cfg, ref, list(states), timeout_s)
+    return _wait_for_state(cfg, ref, list(states), timeout_s), ref
+
+
+def wait_for_vm_state(
+    cfg: Config, vm_name: str = "", states: list[str] | None = None, timeout_s: int = 300, vm_id: str = ""
+) -> str:
+    """Public bounded wait used by hyperv_wait_vm_state (bare state string)."""
+    return wait_for_vm_state_ref(cfg, vm_name, states, timeout_s, vm_id)[0]
 
 
 # ---------------------------------------------------------------------------

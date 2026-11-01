@@ -33,6 +33,8 @@ RUN_PS_ALLOWLIST = {
     ("console.py", "_run"),
     ("vmident.py", "_run"),
     ("media.py", "_run"),
+    ("readiness.py", "_run"),            # issue #32: credential-free status legs
+    ("harvest.py", "_run"),              # issue #33: offline-harvest legs (local-only)
     ("diagnostics.py", "_run"),
     ("filetransfer.py", "_run"),
     ("filetransfer.py", "_run_transfer"),
