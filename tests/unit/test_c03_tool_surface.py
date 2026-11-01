@@ -27,8 +27,9 @@ from hyperv_mcp.pswindows import PSResult
 GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
 
 # The live tool inventory (57 at authoring time; issue #35 added
-# hyperv_server_info on top of the issue text's stale count of 54, and
-# issue #29 brought the surface to 76 with the eight hyperv_ui_* tools).
+# hyperv_server_info on top of the issue text's stale count of 54, issue
+# #29 brought the surface to 76 with the eight hyperv_ui_* tools, and PR
+# #112 brought it to 80 with the four Workstream G tools).
 TOOL_NAMES = {
     "hyperv_list_vms",
     "hyperv_get_vm_info",
