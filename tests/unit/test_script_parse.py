@@ -903,6 +903,10 @@ def test_parse_readiness_wait_and_status(monkeypatch, parsed_ps):
         assert _parse_errors(script) == []
     # the heartbeat leg itself (server.py calls readiness.heartbeat_status)
     assert _parse_errors(readiness.heartbeat_script(VM_GUID)) == []
+    # Behavioral content pin (review round-2 nit): the heartbeat leg must
+    # gate on the service Enabled flag — a stale "OK" primary reading on a
+    # DISABLED service must read '' (os_heartbeat_ok would otherwise leak).
+    assert "$hb -and $hb.Enabled" in readiness.heartbeat_script(VM_GUID)
     # and the deployment_status action script stays parsed (M13 sibling)
     rec2 = _QueuePS([
         pswindows.PSResult(stdout=VM_GUID, returncode=0),

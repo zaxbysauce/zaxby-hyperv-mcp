@@ -90,7 +90,13 @@ def reconcile_before_remove(cfg: Any, vm_guid: str) -> None:
     outcome: dict[str, Any] = {}
 
     def _call() -> None:
-        outcome["status"] = provider.reconcile(vm_guid)
+        # Capture, don't re-raise: a raise here would print an unhandled-
+        # thread traceback and the caller would lose the provider's own
+        # failure detail (review round 2) — the caller re-raises it.
+        try:
+            outcome["status"] = provider.reconcile(vm_guid)
+        except BaseException as exc:  # noqa: BLE001 - captured for the caller
+            outcome["error"] = exc
 
     # Bound the provider call (review F5): the consult runs under the VM's
     # exclusive write scope, so a hung provider must surface as a refusal,
@@ -104,13 +110,13 @@ def reconcile_before_remove(cfg: Any, vm_guid: str) -> None:
             f"cleanup provider did not return within {_RECONCILE_TIMEOUT_S:.0f}s "
             f"for {vm_guid}: refusing rather than holding the VM lock"
         )
-    try:
-        status = outcome["status"]
-    except CleanupRefusal:
-        raise
-    except Exception as exc:  # noqa: BLE001 - fail-closed contract conversion
+    error = outcome.get("error")
+    if error is not None:
+        # The provider's own failure reaches the operator verbatim (review
+        # round 2: the pre-bound conversion must survive the threading).
         raise CleanupRefusal(
-            f"cleanup provider failed for {vm_guid}: {exc}") from exc
+            f"cleanup provider failed for {vm_guid}: {error}") from error
+    status = outcome.get("status")
     if status != CLEAN:
         raise CleanupRefusal(
             f"cleanup provider reports {status!r} for {vm_guid}: "

@@ -179,7 +179,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (the pyproject literal — 0.7.0 today) instead of
+  package's version (0.7.0 today) instead of
   the SDK's.
 - **In-process embedders see the 2.x call shape.** `call_tool()` returns a
   `CallToolResult` (`.content`, `.structured_content`, `.is_error`) instead

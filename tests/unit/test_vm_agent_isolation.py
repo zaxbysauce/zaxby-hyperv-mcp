@@ -306,11 +306,13 @@ def test_vm_remove_consults_cleanup_provider_before_removal(monkeypatch):
         _run_remove(_wiring_cfg(WIRING_PROVIDER_NAME))
     assert _first_removal_script_pos() == -1
 
-    # (d) a provider that itself raises -> MediaError (fail-closed).
+    # (d) a provider that itself raises -> MediaError (fail-closed), with
+    # the provider's own failure detail preserved in the message (review
+    # round 2: the threading conversion must not swallow it).
     journal.clear()
     provider._verdicts.pop(GUID_B, None)
     provider.raise_for.add(GUID_B)
-    with pytest.raises(media.MediaError):
+    with pytest.raises(media.MediaError, match="synthetic provider failure"):
         _run_remove(_wiring_cfg(WIRING_PROVIDER_NAME))
     assert _first_removal_script_pos() == -1
     provider.raise_for.clear()
