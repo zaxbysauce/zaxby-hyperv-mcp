@@ -20,6 +20,7 @@ import pytest
 
 from hyperv_mcp import harvest, media, pswindows
 from hyperv_mcp.config import Config
+from hyperv_mcp.media import MediaError
 
 GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
 
@@ -586,3 +587,240 @@ def test_vm_remove_cancel_requested_before_deletion(monkeypatch, tmp_path):
     with pytest.raises(_operations.OperationCancelled):
         media.vm_remove(cfg, vm_name="test-vm-1", delete_disks=True, confirm=True)
     assert deleted == [], "a cancelled removal must not delete anything"
+# ---------------------------------------------------------------------------
+# Reviewer round 2 (pr112-20261031): one discriminating pin per fix — each
+# named revert mutant below was executed against the suite and survived
+# before its pin existed; each pin now fails under that mutant.
+# ---------------------------------------------------------------------------
+
+def test_enrich_failure_preserves_explicit_retryable():
+    """M1: a module envelope that explicitly sets retryable keeps it
+    (vm_remove's bounded merge wait is retryable by design); one without
+    the key still derives from retry_fields."""
+    from hyperv_mcp import errors as _errors
+    env = _errors.enrich_failure({
+        "ok": False, "error": "merge pending", "error_class": "timeout",
+        "retryable": True})
+    assert env["retryable"] is True, (
+        "an explicit retryable must survive enrich_failure (the server "
+        "boundary must not clobber it to False)")
+    env2 = _errors.enrich_failure({
+        "ok": False, "error": "x", "error_class": "timeout"})
+    assert env2["retryable"] is False
+    env3 = _errors.enrich_failure({
+        "ok": False, "error": "x", "error_class": "invalid",
+        "retryable": False})
+    assert env3["retryable"] is False and env3["retry_after_ms"] is None
+
+
+def test_wait_vm_state_heartbeat_leg_failure_keeps_final_state(fresh_server, tmp_path, monkeypatch):
+    """M2: a heartbeat-leg EXCEPTION must not void an accomplished wait —
+    final_state survives with the unknown-signal shape (heartbeat "")."""
+    import asyncio
+    import json as _json
+    doc = {"allowed_vm_patterns": ["test-*"]}
+    cfg_file = tmp_path / "wait-cfg3.json"
+    cfg_file.write_text(_json.dumps(doc), encoding="utf-8")
+    mod = fresh_server({"HYPERV_MCP_CONFIG": str(cfg_file)})
+
+    class _Router:
+        def __call__(self, script, **kwargs):
+            if "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget"):
+                return pswindows.PSResult(stdout=GUID, returncode=0)
+            if "final_state" in script:
+                return pswindows.PSResult(
+                    stdout=_json.dumps({"final_state": "Running"}), returncode=0)
+            if "Heartbeat" in script:
+                # the transient failure the M2 fix exists for
+                return pswindows.PSResult(returncode=1, stderr="Call cancelled")
+            return pswindows.PSResult(stdout="{}", returncode=0)
+
+    monkeypatch.setattr(pswindows, "run_ps", _Router())
+    result = asyncio.run(
+        mod.get_mcp()._tool_manager.call_tool(
+            "hyperv_wait_vm_state",
+            {"vm_name": "test-vm-1", "states": ["Running"], "timeout_s": 5},
+            context=None))
+    if not isinstance(result, dict):
+        content = result[0] if isinstance(result, tuple) else result
+        texts = [c.text for c in content.content if getattr(c, "type", "") == "text"]
+        result = _json.loads(texts[0])
+    assert result["ok"] is True, (
+        "a heartbeat-leg failure must not void the accomplished wait")
+    assert result["final_state"] == "Running"
+    assert result["heartbeat"] == ""
+    assert result["guest_channel"] == "no_guest_signal"
+
+
+def _harvest_action_script_for_pins(monkeypatch, tmp_path):
+    """Capture the harvest action script (helper shared by the script-shape
+    pins; the frozen g04 convention: resolve -> Off -> privilege -> action)."""
+    cfg = Config(unrestricted=True)
+    fake = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout="Off", returncode=0),
+        pswindows.PSResult(stdout="SeBackupPrivilege", returncode=0),
+        pswindows.PSResult(stdout='{"files": [], "skipped": []}', returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    import contextlib
+    real_lock = harvest.vmlocks.vm_lock
+
+    @contextlib.contextmanager
+    def spy_lock(key, *a, **kw):
+        with real_lock(key, *a, **kw):
+            yield
+
+    monkeypatch.setattr(harvest.vmlocks, "vm_lock", spy_lock)
+    harvest.harvest_offline_logs(
+        cfg, vm_name="test-vm-1", dest_dir=str(tmp_path / "out"))
+    return next(s for s in fake.scripts if "Mount-VHD" in s)
+
+
+def test_harvest_action_script_review_pins(monkeypatch, tmp_path):
+    """C1/M4/M5/M7 script-shape pins (script-text level: the unit suite
+    never executes PS, so the emitted shape is the contract):
+    C1  - the final emission uses the PS-5.1-safe ToArray() shape and never
+          the @()-around-List[object] shape that throws;
+    M4  - glob entries are enumerated after the copy;
+    M5  - the robocopy exit code is inspected and copy failures reported;
+    M7  - the access-path directory is removed after the access path."""
+    action = _harvest_action_script_for_pins(monkeypatch, tmp_path)
+    assert "$files.ToArray()" in action and "$skipped.ToArray()" in action, (
+        "C1: the final emission must use the ToArray shape (PS 5.1 throws "
+        "on @() around List[object])")
+    assert "@($files)" not in action and "@($skipped)" not in action
+    assert "Get-ChildItem -LiteralPath $dstDir -Filter $name" in action, (
+        "M4: glob copies must be enumerated so they are hashed and capped")
+    assert "$LASTEXITCODE -ge 8" in action and "copy_failed" in action, (
+        "M5: a failed robocopy must be reported, never silently dropped")
+    assert "Remove-Item -LiteralPath $ap -Recurse -Force" in action, (
+        "M7: the access-path directory must be removed (os.rmdir cannot)")
+
+
+def test_harvest_recovery_leg_runs_after_action_failure(monkeypatch, tmp_path):
+    """M6: an action-leg failure must trigger the fresh-process dismount
+    recovery leg (a killed action process never runs its PS finally) —
+    the original error still propagates."""
+    cfg = Config(unrestricted=True)
+    fake = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout="Off", returncode=0),
+        pswindows.PSResult(stdout="SeBackupPrivilege", returncode=0),
+        # the action leg dies (transport)
+        pswindows.PSResult(returncode=1, stderr="harvest script exploded"),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    import contextlib
+    real_lock = harvest.vmlocks.vm_lock
+
+    @contextlib.contextmanager
+    def spy_lock(key, *a, **kw):
+        with real_lock(key, *a, **kw):
+            yield
+
+    monkeypatch.setattr(harvest.vmlocks, "vm_lock", spy_lock)
+    with pytest.raises(harvest.HarvestError):
+        harvest.harvest_offline_logs(
+            cfg, vm_name="test-vm-1", dest_dir=str(tmp_path / "out"))
+    recovery = [s for s in fake.scripts if "Dismount-VHD" in s and "Get-VMHardDiskDrive" in s]
+    assert recovery, (
+        "the recovery dismount leg must run after an action-script failure "
+        "(the killed process never ran its in-script finally)")
+    assert any("recovery" in s or "SilentlyContinue" in s for s in recovery)
+
+
+def test_vm_clone_restores_parent_attribute_on_refusal(monkeypatch, unrestricted, tmp_path):
+    """M8: a refused clone (attached-parent throw) must leave the golden
+    parent's attribute exactly as found — no permanent mutation on a
+    refusal path."""
+    import os as _os
+    import stat as _stat
+    parent = tmp_path / "gold.vhdx"
+    parent.write_bytes(b"x")
+    assert _os.stat(parent).st_mode & _stat.S_IWRITE, "fixture starts writable"
+    fake = FakePS([pswindows.PSResult(
+        returncode=1,
+        stderr="Get-VMHardDiskDrive : 'gold.vhdx' is already attached to VM 'gold-vm'",
+    )])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(MediaError, match="gold-vm"):
+        media.vm_clone(
+            unrestricted, "test-vm-2", str(parent), str(tmp_path / "c.vhdx"),
+            confirm=True)
+    assert _os.stat(parent).st_mode & _stat.S_IWRITE, (
+        "the refused clone must RESTORE the writable attribute (M8)")
+
+
+def test_vm_remove_removal_script_reasserts_off(monkeypatch, unrestricted):
+    """M9: the removal script itself re-asserts Off on the same $vm object
+    it removes (the standalone state gate cannot bind an out-of-band actor
+    starting the VM between the two PS processes)."""
+    fake = FakePS([
+        pswindows.PSResult(stdout=GUID, returncode=0),
+        pswindows.PSResult(stdout="Off", returncode=0),
+        pswindows.PSResult(
+            stdout='{"status": "removed", "disks": [], "ancestors": []}',
+            returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = media.vm_remove(unrestricted, vm_name="test-vm-1", confirm=True)
+    assert out["ok"] is True
+    removal = fake.scripts[-1]
+    assert "vm_remove requires state Off" in removal, (
+        "the removal script must re-assert Off before Remove-VM -Force")
+    assert removal.index("requires state Off") < removal.index("Remove-VM -VM")
+
+
+def test_lease_gate_invalid_name_envelope(fresh_server, tmp_path):
+    """M10: a blank or >260-char create-style name gets the audited invalid
+    ENVELOPE from the gate — never an escaping ValueError (MINOR-13)."""
+    doc = {"allowed_vm_patterns": ["test-*"]}
+    cfg_file = tmp_path / "gate-cfg.json"
+    cfg_file.write_text(json.dumps(doc), encoding="utf-8")
+    mod = fresh_server({"HYPERV_MCP_CONFIG": str(cfg_file)})
+    for bad in ("   ", "x" * 261):
+        env, _present = mod._lease_gate("hyperv_vm_clone", {
+            "name": bad, "confirm": True})
+        assert env is not None and env.get("ok") is False, (
+            f"a blank/>260-char name must be refused by the gate: {bad[:20]!r}")
+        assert env.get("error_class") == "invalid", env.get("error_class")
+
+
+def test_harvest_error_classification():
+    """M20: deterministic harvest refusals classify as their own classes —
+    never the transport catch-all."""
+    from hyperv_mcp import errors as _errors
+    assert _errors.classify(harvest.HarvestPrivilegeError("no SeBackupPrivilege")) == "privilege"
+    assert _errors.classify(harvest.HarvestError("requires state Off")) == "invalid"
+    assert _errors.classify(harvest.HarvestError("remote host mode")) == "invalid"
+
+
+def test_destructive_policy_field_order_frozen():
+    """M22 (completed): the two new fields sit AFTER every pre-existing
+    field, so pre-#112 positional constructions keep their bindings
+    (require_confirm was still shifted by the first reorder attempt)."""
+    import dataclasses
+
+    from hyperv_mcp.config import DestructivePolicy
+    names = [f.name for f in dataclasses.fields(DestructivePolicy)]
+    assert names[:16] == [
+        "stop", "reset", "checkpoint_restore", "checkpoint_remove",
+        "kd_reboot", "elevated_exec", "guest_write", "console_input",
+        "media", "vm_provision", "display", "guest_repair", "relay",
+        "ui_input", "ui_provision", "require_confirm",
+    ], f"pre-#112 positional bindings moved: {names}"
+    assert names[16:] == ["vm_remove", "offline_harvest"]
+
+
+def test_vm_create_detached_gate_names_the_vm():
+    """M23: the detached preflight for vm_create reads the `name` argument
+    (the tool's actual parameter), so refusals name the VM instead of
+    'None'."""
+    from hyperv_mcp import policy as _policy
+    from hyperv_mcp.server import _OPERATIONS_DESTRUCTIVE_GATES
+    cfg = Config(allowed_vm_patterns=["test-*"])
+    with pytest.raises(_policy.PolicyDenied, match="create VM 'test-vm-1'") as excinfo:
+        _OPERATIONS_DESTRUCTIVE_GATES["hyperv_vm_create"](
+            cfg, {"name": "test-vm-1", "confirm": False})
+    assert "'None'" not in str(excinfo.value)

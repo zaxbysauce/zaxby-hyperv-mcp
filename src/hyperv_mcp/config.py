@@ -122,9 +122,11 @@ class DestructivePolicy:
     # scheduled task) each carry their own deny-by-default switch.
     ui_input: bool = False
     ui_provision: bool = False
-    # Issues #31/#33: appended AFTER the pre-existing fields (repo convention,
-    # config.py positional-stability note) so positional constructions of the
-    # pre-#112 dataclass keep their argument order.
+    require_confirm: bool = True
+    # Issues #31/#33: appended after EVERY pre-existing field (including
+    # require_confirm — review round 2: the interim placement before it still
+    # shifted require_confirm's positional binding) so positional
+    # constructions of the pre-#112 dataclass keep their argument order.
     # Issue #31: removing a VM (and optionally its own disk files) is
     # irreversible and a different risk class from vm_provision (create,
     # attach, firmware) — its own deny-by-default switch.
@@ -133,7 +135,6 @@ class DestructivePolicy:
     # and guest_read_roots, so offline log harvest must be opted into
     # explicitly (read-only like media: no confirm leg).
     offline_harvest: bool = False
-    require_confirm: bool = True
 
 
 @dataclass
