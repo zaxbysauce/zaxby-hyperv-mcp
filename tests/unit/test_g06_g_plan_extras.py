@@ -829,3 +829,168 @@ def test_vm_create_detached_gate_names_the_vm():
         _OPERATIONS_DESTRUCTIVE_GATES["hyperv_vm_create"](
             cfg, {"name": "test-vm-1", "confirm": False})
     assert "'None'" not in str(excinfo.value)
+# ---------------------------------------------------------------------------
+# Critic round-2 closure: L11 pin-strength batch + M16 residual reason pins.
+# ---------------------------------------------------------------------------
+
+def test_harvest_privilege_leg_uses_system32_whoami(monkeypatch, tmp_path):
+    """L11/TEST-08: the precheck must invoke the FULLY-QUALIFIED System32
+    whoami.exe (live-leg catch: a bare `whoami` resolves GNU whoami from a
+    Git-Bash PATH and dies on /priv) — reverting to the bare form fails."""
+    cfg = Config(unrestricted=True)
+    fake = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout="Off", returncode=0),
+        pswindows.PSResult(stdout="SeBackupPrivilege", returncode=0),
+        pswindows.PSResult(stdout='{"files": [], "skipped": []}', returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    import contextlib
+    real_lock = harvest.vmlocks.vm_lock
+
+    @contextlib.contextmanager
+    def spy_lock(key, *a, **kw):
+        with real_lock(key, *a, **kw):
+            yield
+
+    monkeypatch.setattr(harvest.vmlocks, "vm_lock", spy_lock)
+    harvest.harvest_offline_logs(
+        cfg, vm_name="test-vm-1", dest_dir=str(tmp_path / "out"))
+    priv = next(s for s in fake.scripts if "whoami" in s)
+    assert "System32" in priv and "/priv" in priv, (
+        "the privilege precheck must use the System32-qualified whoami "
+        "(bare whoami resolves GNU whoami from a Git-Bash PATH)")
+
+
+def test_harvest_action_script_volume_locked_and_cap_constants(monkeypatch, tmp_path):
+    """L11/TEST-12 + TEST-13: the volume_locked skip reason exists in the
+    script, and the per-file cap carries the real 64 MiB magnitude (not any
+    number)."""
+    action = _harvest_action_script_for_pins(monkeypatch, tmp_path)
+    assert "volume_locked" in action
+    assert f"$fileMax = {64 * 1024 * 1024}" in action, (
+        "the per-file cap must be the documented 64 MiB")
+    assert f"$totalMax = {2 * 1024 * 1024 * 1024}" in action, (
+        "the total cap must be the documented 2 GiB")
+    # M5's stale-clear + enumeration both present (pair integrity)
+    assert action.count("Get-ChildItem -LiteralPath $dstDir -Filter $name") == 2
+
+
+def test_harvest_dismount_lives_in_the_finally(monkeypatch, tmp_path):
+    """L11/TEST-07: the Dismount-VHD statement must sit INSIDE the disk's
+    finally block (structural, not two independent substring checks)."""
+    action = _harvest_action_script_for_pins(monkeypatch, tmp_path)
+    lines = action.splitlines()
+    # the DISK-level finally is the LAST "} finally {" (the per-partition
+    # finally that precedes it closes earlier)
+    finally_idx = max(i for i, ln in enumerate(lines) if ln.strip() == "} finally {")
+    dismount_idx = next(i for i, ln in enumerate(lines) if "Dismount-VHD" in ln)
+    closing_idx = min(i for i, ln in enumerate(lines) if i > finally_idx and ln.strip() == "}")
+    assert finally_idx < dismount_idx < closing_idx, (
+        "the Dismount-VHD must live inside the disk-level finally block "
+        f"(finally@{finally_idx}, dismount@{dismount_idx}, close@{closing_idx})")
+
+
+def test_vm_create_cpu_count_exact_second_value(monkeypatch, unrestricted, tmp_path):
+    """L11/TEST-14: a SECOND requested value proves the count tracks the
+    request (and the exact-token assert cannot match a prefix like -Count 8)."""
+    parent = tmp_path / "g.vhdx"
+    parent.write_bytes(b"x")
+    fake = FakePS([pswindows.PSResult(
+        stdout='{"id": "G-3", "name": "test-vm-3", "state": "Off", "generation": 2}',
+        returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    media.vm_create(unrestricted, "test-vm-3", cpu_count=12,
+                    vhd_path=str(tmp_path / "d.vhdx"), confirm=True)
+    script = fake.scripts[0]
+    assert " -Count 12 " in script, "the count must track the request (12)"
+    assert " -Count 8 " not in script
+
+
+def test_vm_remove_delete_disks_false_never_deletes(monkeypatch, tmp_path):
+    """L11/TEST-11: with delete_disks=False no Python-side deletion runs at
+    all (spy os.remove AND assert it was never invoked with any candidate)."""
+    import json as _json
+    child = tmp_path / "disk.vhdx"
+    child.write_bytes(b"x")
+    cfg = Config(unrestricted=True)
+    cfg.destructive.vm_remove = True
+    disks_json = _json.dumps({
+        "status": "removed", "disks": [str(child)], "ancestors": []})
+    fake = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout="Off", returncode=0),
+        pswindows.PSResult(stdout=disks_json, returncode=0),
+    ])
+    deleted = []
+    real_remove = os.remove
+
+    def spy_remove(path, *args, **kwargs):
+        deleted.append(str(path))
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    monkeypatch.setattr(media.os, "remove", spy_remove)
+    out = media.vm_remove(cfg, vm_name="test-vm-1", delete_disks=False, confirm=True)
+    assert out["ok"] is True and out["status"] == "removed"
+    assert deleted == [], "delete_disks=False must run no deletion leg"
+
+
+def test_vm_remove_already_gone_and_delete_failed_reasons(monkeypatch, tmp_path):
+    """M16: the already_gone (merge consumed the file first) and
+    delete_failed (OSError) keep reasons are pinned exactly."""
+    import json as _json
+    child = tmp_path / "vms" / "disk.vhdx"
+    child.parent.mkdir(parents=True, exist_ok=True)
+    child.write_bytes(b"x")
+    locked = tmp_path / "vms" / "locked.avhdx"
+    locked.write_bytes(b"x")
+    cfg = Config(allowed_vm_patterns=["test-*"], host_write_roots=[str(tmp_path)])
+    cfg.destructive.vm_remove = True
+    disks_json = _json.dumps({
+        "status": "removed",
+        "disks": [str(child), str(locked)],
+        "ancestors": [],
+    })
+    fake = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout="Off", returncode=0),
+        pswindows.PSResult(stdout=disks_json, returncode=0),
+        pswindows.PSResult(stdout="merge_complete", returncode=0),
+        pswindows.PSResult(stdout="[]", returncode=0),
+    ])
+    calls = []
+    real_remove = os.remove
+
+    def flaky_remove(path, *args, **kwargs):
+        calls.append(str(path))
+        if str(path).endswith("locked.avhdx"):
+            raise PermissionError(32, "The process cannot access the file")
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+
+    class _Gone:
+        def __enter__(self):
+            _os_remove_ref = os.remove
+
+            def gone_first(path, *a, **kw):
+                if str(path).endswith("disk.vhdx"):
+                    raise FileNotFoundError(path)
+                return flaky_remove(path, *a, **kw)
+            os.remove = gone_first
+            return self
+
+        def __exit__(self, *a):
+            os.remove = flaky_remove
+            return False
+
+    monkeypatch.setattr(media.os, "remove", flaky_remove)
+    # already_gone leg: the child vanished before our pass (merge consumed it)
+    with _Gone():
+        out = media.vm_remove(cfg, vm_name="test-vm-1", delete_disks=True, confirm=True)
+    nc = lambda q: os.path.normcase(os.path.normpath(str(q)))  # noqa: E731
+    kept_reasons = {nc(k["path"]): k["reason"] for k in out["kept"]}
+    assert kept_reasons.get(nc(child)) == "already_gone", kept_reasons
+    assert kept_reasons.get(nc(locked)) == "delete_failed: [Errno 32] The process cannot access the file", (
+        f"the OSError path must surface as delete_failed: {kept_reasons}")

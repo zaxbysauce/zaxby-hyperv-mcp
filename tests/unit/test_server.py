@@ -114,7 +114,8 @@ def test_tool_inventory_registered(fresh_server):
     # tests/unit/test_f03_frame_stable.py::test_tool_registered_without_confirm);
     # 68 with issue #28's batched console sequence (C287 checkpoint:
     # tests/unit/test_f04_sequences.py::test_sequence_tool_schema_and_boot_epoch_reporting);
-    # 76 with issue #29's eight hyperv_ui_* tools.
+    # 76 with issue #29's eight hyperv_ui_* tools; 80 with PR #112's four
+    # Workstream G tools (vm_clone, vm_remove, deployment_status, harvest).
     assert len(schemas) == 80
 
 

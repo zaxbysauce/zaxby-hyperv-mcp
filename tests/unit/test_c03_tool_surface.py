@@ -255,7 +255,8 @@ def test_ac12_tool_inventory_per_credential_mode(tmp_path, fresh_server):
     assert len(base_schemas) == len(TOOL_NAMES) == 80, (
         f"AC12: tool count {len(base_schemas)} != 80 "
         f"(66 through issue #24; 67 with issue #27's settle wait; "
-        f"68 with issue #28's hyperv_console_sequence; 76 with issue #29's "
+        f"76 with issue #29's eight hyperv_ui_* tools; 80 with PR #112's "
+        f"four Workstream G tools (was: 68 with issue #28's hyperv_console_sequence; "
         f"eight hyperv_ui_* tools)"
     )
     doc = {"allow_inline_credentials": True}
