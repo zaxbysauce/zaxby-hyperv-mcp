@@ -627,6 +627,13 @@ async def _run_proxy(
             finally:
                 upstream.clear()  # no sends on a stream the unwound context closed
                 tg.cancel_scope.cancel()
+        # Graceful-EOF exit contract (issue #55): mcp's stdio_server waits for
+        # its stdout_writer child after its yield, and that child ends only
+        # when the yielded send side closes (EndOfStream). The transport-
+        # failure paths os._exit before reaching this line, so it runs only on
+        # the client-EOF unwind; closing the send side lets the context return
+        # and the process exit 0. Nothing may print to stdout after this close.
+        client_write.close()
         return 0
 
 

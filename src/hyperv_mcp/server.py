@@ -73,12 +73,17 @@ from . import (
     vmident,
     vmlocks,
 )
+from . import __version__ as _pkg_version
 from .config import Config, ConfigError
 from .credentials import CredentialError
 
 __all__ = ["mcp", "main", "bootstrap", "configure_http_auth"]  # noqa: F822 (mcp: module __getattr__)
 
-VERSION = "0.4.0"
+# Issue #108: one source of truth. pyproject.toml is the release-time literal;
+# the package binds it as __version__, and every user-visible version string
+# (CLI banner, --version, --check-env, initialize serverInfo) derives from it
+# here. test_version_consistency.py pins the three sites together.
+VERSION = _pkg_version
 
 #: Issue #24: the detached-op runner admission bound, sized once per
 #: bootstrap (operations.runner_bound, defaulting to max_host_powershell).
