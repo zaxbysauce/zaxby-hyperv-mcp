@@ -250,7 +250,9 @@ def test_check_env_exit_zero(fresh_server, capsys):
     rc = mod.main(["--check-env"])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "hyperv-mcp 0.4.0" in out
+    import hyperv_mcp as _pkg
+
+    assert f"hyperv-mcp {_pkg.__version__}" in out
     assert "DENY ALL" in out
 
 
@@ -427,7 +429,9 @@ def test_version_flag(fresh_server, capsys):
     with pytest.raises(SystemExit) as exc:
         mod.main(["--version"])
     assert exc.value.code == 0
-    assert "0.4.0" in capsys.readouterr().out
+    import hyperv_mcp as _pkg2
+
+    assert _pkg2.__version__ in capsys.readouterr().out
 
 
 def test_mcp_compat_import_bootstraps(fresh_server):

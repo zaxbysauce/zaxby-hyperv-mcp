@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 
 from . import guestexec, pswindows, vmident
 from .config import Config
@@ -76,20 +77,39 @@ def parse_kvp_items(items: list[str] | None) -> dict[str, str]:
     return out
 
 
-def classify_phase(state: str, heartbeat: str | None, kvp_available: bool) -> str:
-    """Map (VM state, heartbeat, KVP) to the deployment phase.
+def classify_phase(
+    state: str, hb_enabled: bool, hb_primary: str | None, kvp_available: bool
+) -> str:
+    """Map (VM state, heartbeat-service enabled, heartbeat primary status,
+    KVP presence) to the deployment phase.
 
+    The seven-phase vocabulary (issue #32 AC5 + the retained 7th row):
     ``off`` — the VM is Off; readiness questions do not arise.
-    ``os_ready`` — Running, heartbeat OK and KVP published: an OS booted and
-    is responding; PowerShell Direct may still need credentials.
-    ``degraded`` — Running with heartbeat OK but no KVP (integration
-    services late, absent, or the guest is not Windows).
-    ``no_guest_signal`` — anything else: firmware, WinPE, booting, paused...
+    ``suspended`` — Saved or Paused: suspended, not a live guest signal.
+    ``heartbeat_disabled`` — Running but the Heartbeat integration service
+    is absent or disabled on the host; the host cannot vouch for the guest
+    (a disabled service beats even a primary "OK" reading, which a stale
+    service object can carry).
+    ``os_ready`` — Running, service enabled, heartbeat OK and KVP published.
+    ``degraded`` — Running, service enabled, heartbeat OK, no KVP
+    (integration services late, absent, or the guest is not Windows) — the
+    retained 7th row, a documented superset over AC5's six.
+    ``os_unresponsive`` — Running, service enabled, heartbeat Lost
+    Communication or Error: the OS was contacted and is not responding.
+    ``no_guest_signal`` — everything else (No Contact covers firmware,
+    WinPE and an early boot; Starting/Stopping transitions).
     """
     if state == "Off":
         return "off"
-    if state == "Running" and heartbeat == "OK":
-        return "os_ready" if kvp_available else "degraded"
+    if state in ("Saved", "Paused"):
+        return "suspended"
+    if state == "Running":
+        if not hb_enabled:
+            return "heartbeat_disabled"
+        if hb_primary == "OK":
+            return "os_ready" if kvp_available else "degraded"
+        if hb_primary in ("Lost Communication", "Error"):
+            return "os_unresponsive"
     return "no_guest_signal"
 
 
@@ -103,7 +123,8 @@ def heartbeat_script(guid: str) -> str:
 
 
 def _action_script(guid: str) -> str:
-    """The ONE action script: VM state + uptime + heartbeat + KVP, GUID-keyed."""
+    """The ONE action script: VM state + uptime + heartbeat (enabled,
+    primary and secondary status) + KVP, GUID-keyed."""
     return guestexec.vm_target_preamble(guid) + "\n" + "\n".join([
         "$vm = Get-VM -Id $vmTarget -ErrorAction Stop",
         "$hb = Get-VMIntegrationService -VM $vm -Name Heartbeat -ErrorAction SilentlyContinue",
@@ -113,7 +134,9 @@ def _action_script(guid: str) -> str:
         "[PSCustomObject]@{",
         "  state = [string]$vm.State",
         "  uptime_s = [int]$vm.Uptime.TotalSeconds",
+        "  heartbeat_enabled = [bool]($hb -and $hb.Enabled)",
         "  heartbeat = if ($hb) { [string]$hb.PrimaryStatusDescription } else { '' }",
+        "  heartbeat_secondary = if ($hb) { [string]$hb.SecondaryStatusDescription } else { '' }",
         "  kvp_items = @($kvp.GuestIntrinsicExchangeItems)",
         "} | ConvertTo-Json -Compress",
     ])
@@ -139,7 +162,11 @@ def deployment_status(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
     """Credential-free readiness: state + heartbeat + KVP in one phase.
 
     Exactly ONE action PowerShell process after vmident resolution; guest
-    credentials are never resolved on any path of this function.
+    credentials are never resolved on any path of this function. Result is
+    the issue #32 AC4 richer shape: top-level state/uptime_s, vm_id, the
+    heartbeat struct {enabled, primary_status, application_status},
+    guest.fqdn/ipv6 from the KVP pairs, phase_basis naming the producing
+    signals, and checked_at (UTC ISO-8601 Z).
     """
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     raw = _run(cfg, _action_script(ref.id), timeout_s=60,
@@ -155,22 +182,56 @@ def deployment_status(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
     if not isinstance(rows, dict):
         rows = {}
     state = str(rows.get("state") or "")
-    heartbeat = str(rows.get("heartbeat") or "")
-    # A heartbeat that is not OK invalidates KVP: the guest's KVP service may
-    # be down while stale pairs from the previous OS linger (issue #32 AC11).
+    hb_enabled = bool(rows.get("heartbeat_enabled"))
+    hb_primary = str(rows.get("heartbeat") or "")
+    app_status = str(rows.get("heartbeat_secondary") or "")
     kvp_all = parse_kvp_items(rows.get("kvp_items") or [])
-    kvp = kvp_all if heartbeat == "OK" else {}
-    ipv4 = [s.strip() for s in str(kvp.get("NetworkAddressIPv4") or "").split(";") if s.strip()]
+    # classify receives the RAW KVP presence; the OUTPUT kvp view stays
+    # heartbeat-gated (a not-OK or disabled heartbeat invalidates stale
+    # pairs the guest may still publish — issue #32 AC11).
+    kvp_gated = kvp_all if (hb_enabled and hb_primary == "OK") else {}
+    phase = classify_phase(state, hb_enabled, hb_primary, bool(kvp_all))
+    if hb_enabled:
+        basis = (
+            f"state={state}; heartbeat={hb_primary or 'absent'}; "
+            f"kvp={'present' if kvp_all else 'absent'}"
+        )
+    else:
+        basis = (
+            f"state={state}; heartbeat={hb_primary or 'absent'}; "
+            f"heartbeat_enabled={str(hb_enabled).lower()}; "
+            f"kvp={'present' if kvp_all else 'absent'}"
+        )
+    checked_at = (
+        datetime.now(timezone.utc).isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+    def _split(value: str) -> list[str]:
+        return [s.strip() for s in str(value or "").split(";") if s.strip()]
+
     return {
         "ok": True,
-        "phase": classify_phase(state, heartbeat, bool(kvp)),
-        "vm": {"state": state, "uptime_s": int(rows.get("uptime_s") or 0)},
-        "heartbeat": heartbeat,
-        "guest": {
-            "os_name": str(kvp.get("OSName") or ""),
-            "os_build": str(kvp.get("OSBuildNumber") or ""),
-            "ipv4": ipv4,
+        "phase": phase,
+        "phase_basis": basis,
+        "vm_id": ref.id,
+        "state": state,
+        "uptime_s": int(rows.get("uptime_s") or 0),
+        "heartbeat": {
+            "enabled": hb_enabled,
+            "primary_status": hb_primary,
+            "application_status": app_status,
         },
-        "kvp": {"available": bool(kvp), "items": kvp},
+        # guest.* read the heartbeat-GATED view: stale pairs from a previous
+        # OS must never surface as the guest's identity (issue #32 AC11).
+        "guest": {
+            "os_name": str(kvp_gated.get("OSName") or ""),
+            "os_build": str(kvp_gated.get("OSBuildNumber") or ""),
+            "fqdn": str(kvp_gated.get("FullyQualifiedDomainName") or ""),
+            "ipv4": _split(kvp_gated.get("NetworkAddressIPv4")),
+            "ipv6": _split(kvp_gated.get("NetworkAddressIPv6")),
+        },
+        "kvp": {"available": bool(kvp_gated), "items": kvp_gated},
+        "checked_at": checked_at,
         "vm_name": ref.name,
     }

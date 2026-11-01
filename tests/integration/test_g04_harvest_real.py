@@ -39,11 +39,11 @@ def test_harvest_off_vm_and_restart(it, it_tmp):
     out = harvest.harvest_offline_logs(cfg, vm_name=vm, dest_dir=dest)
     assert out["ok"], out
     for f in out["files"]:
-        local = os.path.join(dest, f["path"])
+        local = f["dest"]
         assert os.path.isfile(local), f"manifest lists a missing file: {f}"
         with open(local, "rb") as fh:
             digest = hashlib.sha256(fh.read()).hexdigest().upper()
-        assert digest == f["sha256"].upper(), f"hash mismatch for {f['path']}"
+        assert digest == f["sha256"].upper(), f"hash mismatch for {f['source']}"
     # the VM must still start after the dismount
     lifecycle.start_vm(cfg, vm)
     final = lifecycle.wait_for_vm_state(cfg, vm, ["Running"], 300)
