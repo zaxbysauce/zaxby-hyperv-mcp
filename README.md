@@ -179,7 +179,8 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.4.0) instead of the SDK's.
+  package's version (the pyproject literal — 0.7.0 today) instead of
+  the SDK's.
 - **In-process embedders see the 2.x call shape.** `call_tool()` returns a
   `CallToolResult` (`.content`, `.structured_content`, `.is_error`) instead
   of the 1.x `(content_list, structured)` tuple, and `list_tools()` exposes
@@ -228,6 +229,25 @@ the task-spawned controller reads it from the environment.
 
 ## 0.7.0 changes
 
+- **`hyperv_deployment_status` result shape (richer contract, issue #32):**
+  `vm{state, uptime_s}` flattens to top-level `state` / `uptime_s` with
+  `vm_id` added; `heartbeat` (a bare string) becomes a struct
+  `{enabled, primary_status, application_status}`; `guest` gains `fqdn` and
+  `ipv6[]`; new `phase_basis` (the producing signals) and UTC `checked_at`.
+  The vocabulary grows to seven phases (`off` / `suspended` /
+  `heartbeat_disabled` / `no_guest_signal` / `os_ready` / `os_unresponsive`
+  / `degraded` — the Running+enabled+OK-heartbeat+no-KVP row retained from
+  the reviewed table). `guest.*` and `kvp.*` always read the heartbeat-gated
+  view (stale pairs never surface as the guest's identity).
+- **`hyperv_harvest_offline_logs` manifest (evidence contract, issue #33):**
+  `files[]` rows are now `{volume, source, dest, size, sha256,
+  last_write_utc}` (was `{path, bytes, sha256}`) with `source` the
+  guest-relative log path; `skipped[]` rows are `{volume, reason}` (was
+  `{path, reason}`); absent fixed-log entries surface under the new
+  `missing[]` instead of `skipped`; per-file over-cap sources are named
+  individually and in-budget glob siblings still copy; `sha256` and `size`
+  are re-derived in Python from the copied bytes; new `vm_id` and
+  `truncated` (any engaged per-file/total cap).
 - **In-session UI Automation helper (issue #29):** eight new
   `hyperv_ui_*` tools drive the guest's interactive desktop by UI
   Automation element (inspect, find, invoke, set_value, wait_for, focus,
@@ -669,10 +689,10 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
   "host_powershell_wait_s": 60,        // oversubscribed-leg bounded wait, 0..600 s, int or float
                                        // (0 = fail immediately with a busy error)
   "ps_slot_dir": null,                 // slot lock-file directory; ABSOLUTE path or null. Default
-  "agent_isolation": { "cleanup_provider": "none" },  // optional per-agent cleanup seam (issue #31 supplement): a named registered provider is consulted before hyperv_vm_remove deletes (CLEAN proceeds; PENDING/UNKNOWN/FAILED refuse); "none" = default = no consult
                                        // %ProgramData%\hyperv-mcp\ps-slots (shared per host); a shared
                                        // temp dir when ProgramData is unset (per-account on Windows).
                                        // All servers on a host must use the same value and cap
+  "agent_isolation": { "cleanup_provider": "none" },  // optional per-agent cleanup seam (issue #31 supplement): a named registered provider is consulted before hyperv_vm_remove deletes (CLEAN proceeds; PENDING/UNKNOWN/FAILED refuse); "none" = default = no consult
   "psdirect_session_reuse": true,      // reuse PowerShell Direct sessions across calls (issue #21).
                                        // See "PowerShell Direct session reuse" below
  "state_db_path": null,                // durable state store location (issue #22); null = the
@@ -896,7 +916,7 @@ usual guest credentials:
 
 ```text
 $ hyperv-mcp --check-env
-hyperv-mcp 0.4.0
+hyperv-mcp 0.7.0
 hyperv.target remote host nuc01
 HYPERV_HOST_USERNAME                set
 HYPERV_HOST_PASSWORD                not set

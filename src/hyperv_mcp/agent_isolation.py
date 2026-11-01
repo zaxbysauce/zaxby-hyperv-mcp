@@ -24,6 +24,10 @@ from __future__ import annotations
 from typing import Any
 
 CLEAN = "clean"
+
+#: Bound on one provider reconcile call (review F5) — see
+#: reconcile_before_remove.
+_RECONCILE_TIMEOUT_S = 30.0
 PENDING = "pending"
 UNKNOWN = "unknown"
 FAILED = "failed"
@@ -56,7 +60,9 @@ def resolve_cleanup_provider(cfg: Any) -> Any | None:
     disable of the safety seam.
     """
     policy = getattr(cfg, "agent_isolation", None)
-    name = str(getattr(policy, "cleanup_provider", "none") or "none")
+    # No falsy fallback (review F6): a misconfigured empty value must fail
+    # closed at the registry lookup, never silently disable the seam.
+    name = str(getattr(policy, "cleanup_provider", "none"))
     if name == "none":
         return None
     provider = _PROVIDERS.get(name)
@@ -79,8 +85,27 @@ def reconcile_before_remove(cfg: Any, vm_guid: str) -> None:
     provider = resolve_cleanup_provider(cfg)
     if provider is None:
         return None
+    import threading
+
+    outcome: dict[str, Any] = {}
+
+    def _call() -> None:
+        outcome["status"] = provider.reconcile(vm_guid)
+
+    # Bound the provider call (review F5): the consult runs under the VM's
+    # exclusive write scope, so a hung provider must surface as a refusal,
+    # never an indefinite hold. On expiry the daemon worker is left running
+    # (it holds no lock of ours) and the removal refuses.
+    worker = threading.Thread(target=_call, daemon=True)
+    worker.start()
+    worker.join(_RECONCILE_TIMEOUT_S)
+    if worker.is_alive():
+        raise CleanupRefusal(
+            f"cleanup provider did not return within {_RECONCILE_TIMEOUT_S:.0f}s "
+            f"for {vm_guid}: refusing rather than holding the VM lock"
+        )
     try:
-        status = provider.reconcile(vm_guid)
+        status = outcome["status"]
     except CleanupRefusal:
         raise
     except Exception as exc:  # noqa: BLE001 - fail-closed contract conversion

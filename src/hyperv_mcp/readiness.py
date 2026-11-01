@@ -118,7 +118,10 @@ def heartbeat_script(guid: str) -> str:
     return guestexec.vm_target_preamble(guid) + "\n" + "\n".join([
         "$vm = Get-VM -Id $vmTarget -ErrorAction Stop",
         "$hb = Get-VMIntegrationService -VM $vm -Name Heartbeat -ErrorAction SilentlyContinue",
-        "if ($hb) { [string]$hb.PrimaryStatusDescription } else { '' }",
+        # A disabled service beats even a stale "OK" primary reading (the
+        # same rule deployment_status enforces): a disabled Heartbeat must
+        # not read os_heartbeat_ok on the wait/console handoff path.
+        "if ($hb -and $hb.Enabled) { [string]$hb.PrimaryStatusDescription } else { '' }",
     ])
 
 

@@ -166,10 +166,15 @@ def _action_script(guid: str, dest: str, mnt_root: str) -> str:
         "          } else {",
         "            $screen = @(Get-Item -LiteralPath $src -ErrorAction SilentlyContinue)",
         "          }",
-        "          foreach ($s in @($screen | Where-Object { $_.Length -gt $fileMax })) {",
-        "            $skipped.Add([PSCustomObject]@{ volume = $vol; reason = ('cap_exceeded: ' + $rel) })",
+        "          # Per-file cap rows (review F3): each over-cap source is named",
+        "          # (for globs, by file name — not the pattern) and in-budget",
+        "          # glob siblings STILL copy, so a directory loses nothing the",
+        "          # base robocopy /MAX behavior collected.",
+        "          foreach ($o in @($screen | Where-Object { $_.Length -gt $fileMax })) {",
+        "            $capName = if ($isGlob) { $o.Name } else { $rel }",
+        "            $skipped.Add([PSCustomObject]@{ volume = $vol; reason = ('cap_exceeded: ' + $capName) })",
         "          }",
-        "          if (@($screen | Where-Object { $_.Length -gt $fileMax }).Count -gt 0) { continue }",
+        "          if (-not $isGlob -and @($screen | Where-Object { $_.Length -gt $fileMax }).Count -gt 0) { continue }",
         "          New-Item -ItemType Directory -Force -Path $dstDir | Out-Null",
         "          # A stale copy from an earlier run must never be hashed as",
         "          # this run's result: clear the destination match(es) first.",
@@ -198,7 +203,11 @@ def _action_script(guid: str, dest: str, mnt_root: str) -> str:
         "            }",
         "            $total = $total + $len",
         "            $h = (Get-FileHash -LiteralPath $copied.FullName -Algorithm SHA256 -ErrorAction Stop).Hash",
-        "            $files.Add([PSCustomObject]@{ volume = $vol; source = (Join-Path $srcDir $copied.Name); dest = $copied.FullName; size = [int]$len; last_write_utc = $copied.LastWriteTimeUtc.ToString('o'); sha256 = $h })",
+        "            # Guest-relative source (review F9): correlatable with the",
+        "            # fixed LOG_PATHS set and missing[], unlike the ephemeral",
+        "            # .mnt mount path the raw copy emits.",
+        "            $guestRel = if ($isGlob) { Join-Path (Split-Path $rel -Parent) $copied.Name } else { $rel }",
+        "            $files.Add([PSCustomObject]@{ volume = $vol; source = $guestRel; dest = $copied.FullName; size = [int]$len; last_write_utc = $copied.LastWriteTimeUtc.ToString('o'); sha256 = $h })",
         "          }",
         "        }",
         "      } finally {",
@@ -325,11 +334,22 @@ def harvest_offline_logs(cfg: Config, vm_name: str = "", vm_id: str = "", dest_d
         for f in list(out.get("files") or []):
             if not isinstance(f, dict):
                 continue
-            size = int(f.get("size") or 0)
             rel = str(f.get("source") or "")
             vol = str(f.get("volume") or "")
             dest_path = str(f.get("dest") or "")
             lw = str(f.get("last_write_utc") or "")
+            try:
+                # The manifest's size is re-derived from the bytes actually
+                # hashed (review F4): the PS-reported size is never trusted,
+                # so cap enforcement and the size/sha256 pair stay true.
+                data = Path(dest_path).read_bytes()
+            except OSError:
+                # A copy that cannot be re-read must never pass as evidence.
+                # NOT a cap engagement: truncated stays cap-semantics only.
+                skipped_out.append({"volume": vol, "reason": f"unreadable_copy: {rel}"})
+                continue
+            size = len(data)
+            digest = hashlib.sha256(data).hexdigest()
             # Independent per-file + total cap recheck (the in-script guards
             # demote first; this pass keeps the promise even if the script
             # shape drifts).
@@ -338,13 +358,6 @@ def harvest_offline_logs(cfg: Config, vm_name: str = "", vm_id: str = "", dest_d
                 truncated = True
                 continue
             total += size
-            try:
-                digest = hashlib.sha256(Path(dest_path).read_bytes()).hexdigest()
-            except OSError:
-                # A copy that cannot be re-read must never pass as evidence.
-                skipped_out.append({"volume": vol, "reason": f"unreadable_copy: {rel}"})
-                truncated = True
-                continue
             files_out.append({
                 "volume": vol,
                 "source": rel,
