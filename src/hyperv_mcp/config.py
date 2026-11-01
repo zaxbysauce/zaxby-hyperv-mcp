@@ -573,17 +573,6 @@ class Config:
                 "agent_isolation.cleanup_provider must be a non-empty string")
         object.__setattr__(self, "agent_isolation", AgentIsolationPolicy(cleanup_provider=provider))
 
-    def _set_agent_isolation(self, value: Any) -> None:
-        if not isinstance(value, dict):
-            raise ConfigError("agent_isolation must be an object")
-        unknown = set(value) - set(AgentIsolationPolicy.__dataclass_fields__)
-        if unknown:
-            raise ConfigError(f"unknown agent_isolation key(s): {sorted(unknown)}")
-        provider = value.get("cleanup_provider", "none")
-        if not isinstance(provider, str) or not provider:
-            raise ConfigError(
-                "agent_isolation.cleanup_provider must be a non-empty string")
-        object.__setattr__(self, "agent_isolation", AgentIsolationPolicy(cleanup_provider=provider))
 
     def _set_http(self, value: Any) -> None:
         if not isinstance(value, dict):
