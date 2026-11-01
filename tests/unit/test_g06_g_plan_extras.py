@@ -268,29 +268,46 @@ def test_vm_remove_out_of_root_candidate_is_kept_not_deleted(monkeypatch, tmp_pa
 
 
 def test_harvest_caps_are_pinned(monkeypatch, tmp_path):
-    """Reviewer finding 2: all three cap layers (robocopy /MAX, the in-script
-    running total, the Python re-check) were removable with a green suite.
-    This pin asserts the action script carries the per-file and total guards
-    and that an over-total payload demotes every file to skipped/cap_exceeded."""
+    """Reviewer finding 2 (migrated to the derived-size design at the PR-113
+    feedback round): all three cap layers (robocopy /MAX, the in-script
+    running total, the Python re-check over the DERIVED sizes) were
+    removable with a green suite. The module caps are monkeypatched small
+    (10/25 bytes) and the dest payloads are REAL bytes, so the demotions are
+    driven by the sizes Python derives from the hashed copies — never by a
+    PS-reported size. Per-file demotion: an 11-byte file over a 10-byte cap.
+    Total demotion: a fourth 9-byte file pushes the running total past 25.
+    The cap_exceeded reasons name the skipped source and truncated is set."""
     import json as _json
     cfg = Config(unrestricted=True)
-    big = [
-        {"volume": "\\\\?\\\\Volume{55108000-0000-0000-0000-00000000000}\\\\",
-         "source": f"Windows/Panther/setupact.log.{i}",
-         "dest": str(tmp_path / "copies" / f"copy-{i}.bin"),
-         "size": 64 * 1024 * 1024,
-         "last_write_utc": "2026-10-01T00:00:00Z",
-         "sha256": "0" * 64}
-        for i in range(33)
+    monkeypatch.setattr(harvest, "_FILE_MAX_BYTES", 10)
+    monkeypatch.setattr(harvest, "_TOTAL_MAX_BYTES", 25)
+    vol = "\\\\?\\Volume{55108000-0000-0000-0000-00000000000}\\"
+    # (rel, real payload): over-file is over the PER-FILE cap; two in-budget
+    # 9-byte files; over-total is per-file fine but pushes total 27 > 25.
+    entries = [
+        ("Windows/Panther/setupact.overfile", b"x" * 11),   # per-file cap
+        ("Windows/Panther/setupact.ok1", b"x" * 9),
+        ("Windows/Panther/setupact.ok2", b"x" * 9),
+        ("Windows/Panther/setupact.overtotal", b"x" * 9),   # total cap
     ]
-    (tmp_path / "copies").mkdir()
-    for i in range(33):
-        (tmp_path / "copies" / f"copy-{i}.bin").write_bytes(b"copy-leg-55-108")
+    rows = []
+    for rel, payload in entries:
+        target = tmp_path / "copies" / rel.replace("/", "_")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+        rows.append({
+            "volume": vol,
+            "source": rel,
+            "dest": str(target),
+            "size": 1,  # a LIE: the derived size (never this) drives caps
+            "last_write_utc": "2026-10-01T00:00:00Z",
+            "sha256": "0" * 64,
+        })
     fake = FakePS([
         _guid_res(),
         pswindows.PSResult(stdout="Off", returncode=0),
         pswindows.PSResult(stdout="SeBackupPrivilege", returncode=0),
-        pswindows.PSResult(stdout=_json.dumps({"files": big, "skipped": []}), returncode=0),
+        pswindows.PSResult(stdout=_json.dumps({"files": rows, "skipped": []}), returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = harvest.harvest_offline_logs(
@@ -299,18 +316,27 @@ def test_harvest_caps_are_pinned(monkeypatch, tmp_path):
     action = next(s for s in fake.scripts if "Mount-VHD" in s)
     assert "/MAX:$fileMax" in action, "robocopy must carry the per-file /MAX cap"
     assert "-gt $totalMax" in action, "the in-script running-total guard must be present"
-    # the Python re-check keeps the promise: 33 files of exactly the
-    # per-file cap (64 MiB each) fill the 2 GiB total budget exactly at
-    # file 32 (boundary inclusive); file 33 is demoted to skipped with the
-    # cap_exceeded reason naming the source.
+    # the Python re-check keeps the promise on DERIVED sizes: only the two
+    # in-budget files survive; the per-file and total demotions both fire,
+    # each cap_exceeded reason names its skipped source, truncated is set.
     assert out["ok"] is True
-    assert len(out["files"]) == 32, (
-        f"exactly the in-budget files may survive: {len(out['files'])}")
-    reasons = [s["reason"] for s in out["skipped"]]
-    assert len(reasons) == 1 and "cap_exceeded" in reasons[0], (
-        f"the over-budget tail must be skipped as cap_exceeded: {reasons}")
-    assert "setupact.log.32" in reasons[0], (
-        f"the cap_exceeded reason must name the skipped source: {reasons}")
+    assert sorted(f["source"] for f in out["files"]) == [
+        "Windows/Panther/setupact.ok1", "Windows/Panther/setupact.ok2"], (
+        f"exactly the in-budget files may survive: "
+        f"{sorted(f['source'] for f in out['files'])}")
+    for f in out["files"]:
+        assert f["size"] == 9, (
+            f"size must be DERIVED from the hashed bytes, not the canned "
+            f"row: {f!r}")
+    reasons = {s["reason"] for s in out["skipped"]}
+    assert any(
+        "cap_exceeded" in r and "setupact.overfile" in r for r in reasons), (
+        f"the per-file demotion must be skipped as cap_exceeded naming the "
+        f"source: {sorted(reasons)}")
+    assert any(
+        "cap_exceeded" in r and "setupact.overtotal" in r for r in reasons), (
+        f"the total-cap demotion must be skipped as cap_exceeded naming the "
+        f"source: {sorted(reasons)}")
     assert out["truncated"] is True
 
 

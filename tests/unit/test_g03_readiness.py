@@ -636,3 +636,16 @@ def test_phase_classification_v2(state, hb_enabled, hb_primary,
         "the heartbeat_disabled basis must name heartbeat_enabled as the "
         f"producing signal; got {out2.get('phase_basis')!r}"
     )
+    # Gated view (PR-113 feedback round): a disabled Heartbeat service must
+    # invalidate KVP even when the primary reading is "OK" and one pair is
+    # present — guest identity and the kvp view read the heartbeat-GATED
+    # dict, so a gate that only checks hb_primary would surface stale pairs.
+    assert out2["guest"]["os_name"] == "", (
+        "the gated view must drop KVP pairs when the Heartbeat service is "
+        f"disabled even with a primary OK reading; got "
+        f"os_name={out2['guest']['os_name']!r}"
+    )
+    assert out2["kvp"]["items"] == {} and out2["kvp"]["available"] is False, (
+        "kvp must report the heartbeat-gated view (empty items, unavailable) "
+        f"for a disabled service; got {out2['kvp']!r}"
+    )

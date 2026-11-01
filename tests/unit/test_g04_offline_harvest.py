@@ -310,36 +310,46 @@ def test_harvest_requires_backup_privilege(monkeypatch, tmp_path):
 # #33 AC7 — the RICHER evidence-grade manifest (trace
 # 55-108-31-32-33-collated; appended by the arm's-length acceptance-check
 # author; the functions above are untouched). Frozen canned-row convention
-# for the ONE aggregate action script's stdout (the richer provenance shape):
+# for the ONE aggregate action script's stdout (the richer provenance shape;
+# reviewed at the PR-113 feedback round — sizes in the PS rows are NEVER
+# trusted: the Python assembly re-derives size from the bytes it hashes):
 #   {"vm_id": <guid>,
-#    "files": [{"volume", "source", "dest", "size", "last_write_utc",
-#               "sha256"}],       # sha256 here is PS-side and NOT trusted
+#    "files": [{"volume", "source" (GUEST-RELATIVE path), "dest", "size"
+#               (a lie on purpose), "last_write_utc", "sha256" (also a
+#               lie on purpose)}],
 #    "missing": [<guest-relative source paths>],
 #    "skipped": [{"volume", "reason"}]}
-# The manifest's files[].sha256 must be RECOMPUTED IN PYTHON over the copied
-# host files (hashlib over the bytes at files[].dest), per-file/total caps
+# The manifest's files[].sha256 AND files[].size must be RECOMPUTED IN
+# PYTHON over the copied host bytes at files[].dest; per-file/total caps
+# (monkeypatched small in the over-cap legs — the caps are module privates)
 # demote over-budget files to skipped{reason: cap_exceeded} and set the
-# manifest-level `truncated` flag.
+# manifest-level `truncated` flag (cap-semantics only: an unreadable copy
+# demotes to unreadable_copy WITHOUT setting truncated).
 # ---------------------------------------------------------------------------
 
 
-def _ac7_rows(dest, entries, missing=(), skipped=(), size_override=None):
+def _ac7_rows(dest, entries, missing=(), skipped=(), extra_files=()):
     """Canned aggregate-script stdout rows: `entries` are (source_rel,
-    payload_bytes) pairs; real files are expected to exist at dest/<rel>."""
+    payload_bytes) pairs whose REAL files must exist at dest/<rel> (the
+    derived-size contract hashes those bytes); `extra_files` are pre-built
+    row dicts appended verbatim (the unreadable_copy leg's dest is
+    deliberately absent). The canned size and sha256 are LIES: neither may
+    survive into the manifest."""
     import json as _json
 
     files = []
-    for rel, payload in entries:
+    for rel, _payload in entries:
         files.append({
             "volume": "\\\\?\\Volume{55108000-0000-0000-0000-000000000001}\\",
             "source": rel,
             "dest": str(dest / rel),
-            "size": size_override if size_override is not None else len(payload),
+            "size": 1,
             "last_write_utc": "2026-10-01T00:00:00Z",
             # Deliberately WRONG: the PS-side hash is what the manifest must
             # NOT carry — Python recomputation is the contract under test.
             "sha256": "ps-side-hash-not-trusted-" + rel,
         })
+    files.extend(extra_files)
     return _json.dumps({
         "vm_id": GUID,
         "files": files,
@@ -351,18 +361,25 @@ def _ac7_rows(dest, entries, missing=(), skipped=(), size_override=None):
 def test_harvest_manifest_hashes_match_copies(monkeypatch, tmp_path):
     """#33 AC7: the manifest is evidence-grade — richer keys (vm_id,
     missing, truncated), per-file volume/source/dest/size/last_write_utc
-    provenance, and sha256 recomputed IN PYTHON over the copied host files
-    (the canned PS-side hashes are deliberately wrong, so a manifest that
-    merely forwards them fails); over-cap files land in skipped with reason
-    cap_exceeded and the manifest reports truncated."""
+    provenance with the GUEST-RELATIVE source path, and sha256 + size
+    recomputed IN PYTHON over the copied host bytes (the canned PS-side
+    hashes and sizes are deliberately wrong, so a manifest that merely
+    forwards either fails); over-cap files land in skipped with reason
+    cap_exceeded and truncated=True; an unreadable copy lands in skipped as
+    unreadable_copy WITHOUT engaging truncated."""
     import hashlib
 
     dest = tmp_path / "out"
     rel1 = "Windows\\Panther\\setupact.log"
     rel2 = "MININT\\SMSOSD\\OSDLOGS\\BDD.log"
+    # a glob-resolved source: the pattern's parent joined with the copied
+    # file's name — the guest-relative shape the post-fix script emits
+    glob_rel = "Windows\\Temp\\DeploymentLogs\\bdd.log"
     payload1 = b"setupact-content-55-108\n"
     payload2 = b"bdd-content-55-108\n"
-    for rel, payload in ((rel1, payload1), (rel2, payload2)):
+    payload3 = b"deployment-logs-glob-55-108\n"
+    for rel, payload in ((rel1, payload1), (rel2, payload2),
+                         (glob_rel, payload3)):
         target = dest / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(payload)
@@ -377,7 +394,7 @@ def test_harvest_manifest_hashes_match_copies(monkeypatch, tmp_path):
         pswindows.PSResult(stdout="SeBackupPrivilege SeShutdownPrivilege",
                            returncode=0),
         pswindows.PSResult(stdout=_ac7_rows(
-            dest, [(rel1, payload1), (rel2, payload2)],
+            dest, [(rel1, payload1), (rel2, payload2), (glob_rel, payload3)],
             missing=[missing_rel], skipped=[locked]), returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
@@ -390,18 +407,34 @@ def test_harvest_manifest_hashes_match_copies(monkeypatch, tmp_path):
     assert out["vm_name"] == "test-vm-1"
 
     listed = {f["source"] for f in out["files"]}
-    assert listed == {rel1, rel2}, f"both copied files must be listed: {listed!r}"
+    assert listed == {rel1, rel2, glob_rel}, (
+        f"both literals AND the glob-resolved copy must be listed: {listed!r}"
+    )
+    rows = {f["source"]: f for f in out["files"]}
+    # Guest-relative source for BOTH shapes: literals carry their fixed
+    # guest path, the glob-resolved row carries parent-joined file name —
+    # never the ephemeral .mnt mount path.
+    assert rows[glob_rel]["source"] == glob_rel, (
+        "glob-resolved rows must carry the guest-relative source "
+        f"(pattern parent + copied name), got {rows[glob_rel]['source']!r}"
+    )
     for row in out["files"]:
         for field in ("volume", "source", "dest", "size", "sha256",
                       "last_write_utc"):
             assert field in row, (
                 f"files rows must carry {field!r} provenance: {row!r}"
             )
-        real = hashlib.sha256(_read(row["dest"])).hexdigest()
+        data = _read(row["dest"])
+        real = hashlib.sha256(data).hexdigest()
         assert row["sha256"] == real, (
             f"sha256 must be recomputed in Python over the copied host file "
             f"({row['source']}); manifest carries {row['sha256']!r} while the "
             f"real copy hashes to {real!r}"
+        )
+        assert row["size"] == len(data), (
+            f"size must be DERIVED from the hashed bytes ({row['source']}); "
+            f"manifest carries {row['size']} while the real copy is "
+            f"{len(data)} bytes (the PS-reported size is never trusted)"
         )
 
     assert missing_rel in out["missing"], (
@@ -414,15 +447,18 @@ def test_harvest_manifest_hashes_match_copies(monkeypatch, tmp_path):
     assert any(s["reason"] == "volume_locked" for s in out["skipped"])
     assert out["truncated"] is False
 
-    # --- action-script contract (plan-critic round-1 finding 3) ---
+    # --- action-script contract (plan-critic round-1 finding 3 + PR-113
+    # feedback round F3/F9) ---
     # The script is captured from the recorded PS spy leg (the seam the
     # existing lock test uses — it stays valid whatever builder shape the
     # implementation settles on): the aggregate script must (i) enumerate
     # source sizes over the per-file cap BEFORE any copy runs and emit
-    # volume-bearing cap_exceeded skip rows, (ii) emit the per-file
-    # provenance fields, and (iii) still carry Get-FileHash (Python
-    # recomputes the hash and ignores the PS-side value — the recompute
-    # assertions above prove it is not trusted).
+    # PER-FILE volume-bearing cap_exceeded rows (for globs the over-cap
+    # FILE NAME, not the pattern) while in-budget glob siblings still copy
+    # (the entry-level continue is literals-only), (ii) derive the
+    # guest-relative source for the emission rows, (iii) emit the per-file
+    # provenance fields, and (iv) still carry Get-FileHash (Python
+    # recomputes the hash and ignores the PS-side value).
     import re as _re
 
     action = next(s for s in fake.scripts if "Mount-VHD" in s)
@@ -452,21 +488,38 @@ def test_harvest_manifest_hashes_match_copies(monkeypatch, tmp_path):
     assert _re.search(r"volume\s*=", lowered), (
         "cap_exceeded skip rows must carry the volume they were skipped for"
     )
+    # per-file cap rows name the over-cap source (globs: the file name)
+    assert "capname" in lowered, (
+        "the screening block must emit PER-FILE cap rows naming the over-cap "
+        "source (for globs the file name, not the pattern)"
+    )
+    # in-budget glob siblings still copy: the entry-level skip is literals-only
+    assert "-not $isglob" in lowered, (
+        "only literal entries may skip wholesale on an over-cap screen; "
+        "in-budget glob siblings must still copy"
+    )
+    # guest-relative source derivation for the emission rows
+    assert "join-path (split-path $rel -parent)" in lowered, (
+        "the emission source must be derived guest-relative "
+        "(Join-Path (Split-Path $rel -Parent) <copied name> for globs)"
+    )
 
-    # Over-cap file: an oversized reported size is demoted to skipped with
-    # reason cap_exceeded and the manifest reports truncated=True.
+    # Over-cap file (cheap caps): with the module cap monkeypatched small,
+    # a REAL 11-byte dest file is over the 10-byte per-file cap — the
+    # derived size (never the canned one) drives the demotion.
+    monkeypatch.setattr(harvest, "_FILE_MAX_BYTES", 10)
+    monkeypatch.setattr(harvest, "_TOTAL_MAX_BYTES", 2000)
     oversized_rel = "Windows\\INF\\setupapi.dev.log"
     tiny = dest / oversized_rel
     tiny.parent.mkdir(parents=True, exist_ok=True)
-    tiny.write_bytes(b"tiny\n")
+    tiny.write_bytes(b"eleven-bytes")  # 11 bytes > 10-byte per-file cap
     fake2 = FakePS([
         _guid_res(),
         pswindows.PSResult(stdout="Off", returncode=0),
         pswindows.PSResult(stdout="SeBackupPrivilege SeShutdownPrivilege",
                            returncode=0),
         pswindows.PSResult(stdout=_ac7_rows(
-            dest, [(oversized_rel, b"tiny\n")],
-            size_override=128 * 1024 * 1024), returncode=0),
+            dest, [(oversized_rel, b"eleven-bytes")]), returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake2)
     out2 = harvest.harvest_offline_logs(
@@ -474,12 +527,51 @@ def test_harvest_manifest_hashes_match_copies(monkeypatch, tmp_path):
     assert [f["source"] for f in out2["files"]] == [], (
         "an over-cap file must not appear in files[]"
     )
-    assert any(
-        "cap_exceeded" in s["reason"] for s in out2["skipped"]), (
-        f"the over-cap file must land in skipped with reason cap_exceeded: "
-        f"{out2['skipped']!r}"
+    cap_rows = [s for s in out2["skipped"] if "cap_exceeded" in s["reason"]]
+    assert cap_rows and oversized_rel in cap_rows[0]["reason"], (
+        f"the over-cap file must land in skipped as cap_exceeded naming the "
+        f"source: {out2['skipped']!r}"
     )
     assert out2["truncated"] is True
+
+    # Unreadable copy: a canned row whose dest does NOT exist is demoted to
+    # skipped with reason unreadable_copy — NOT a cap engagement, so the
+    # manifest-level truncated flag stays False.
+    monkeypatch.setattr(harvest, "_FILE_MAX_BYTES", 64 * 1024 * 1024)
+    monkeypatch.setattr(harvest, "_TOTAL_MAX_BYTES", 2 * 1024 * 1024 * 1024)
+    unreadable_rel = "Windows\\Panther\\UnattendGC\\setupact.log"
+    unreadable_row = {
+        "volume": "\\\\?\\Volume{55108000-0000-0000-0000-000000000001}\\",
+        "source": unreadable_rel,
+        "dest": str(tmp_path / "never-copied" / "setupact.log"),
+        "size": 1,
+        "last_write_utc": "2026-10-01T00:00:00Z",
+        "sha256": "ps-side-hash-not-trusted-" + unreadable_rel,
+    }
+    fake3 = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout="Off", returncode=0),
+        pswindows.PSResult(stdout="SeBackupPrivilege SeShutdownPrivilege",
+                           returncode=0),
+        pswindows.PSResult(stdout=_ac7_rows(
+            dest, [], extra_files=[unreadable_row]), returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake3)
+    out3 = harvest.harvest_offline_logs(
+        cfg, vm_name="test-vm-1", dest_dir=str(dest))
+    assert unreadable_rel not in [f["source"] for f in out3["files"]], (
+        "a copy that cannot be re-read must never pass as evidence"
+    )
+    unreadable_rows = [s for s in out3["skipped"]
+                       if s["reason"].startswith("unreadable_copy")]
+    assert unreadable_rows and unreadable_rel in unreadable_rows[0]["reason"], (
+        f"the unreadable copy must land in skipped as unreadable_copy naming "
+        f"the source: {out3['skipped']!r}"
+    )
+    assert out3["truncated"] is False, (
+        "unreadable_copy is not a cap engagement; truncated must stay "
+        "cap-semantics only"
+    )
 
 
 def _read(path):

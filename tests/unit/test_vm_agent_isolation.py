@@ -74,11 +74,16 @@ class JournalProvider:
 
 
 def test_fault_profile_reconciles_before_owned_clone_delete():
-    """#31 AC14: with a cleanup provider configured, deletion of an owned
-    clone is refused while the provider reports PENDING (and for UNKNOWN /
-    FAILED / a raising provider — fail-closed), a CLEAN clone proceeds with
-    the consult recorded BEFORE the delete marker, and the OTHER owned
-    fixture is unaffected."""
+    """#31 AC14 (pure-seam leg): with a cleanup provider configured,
+    reconcile_before_remove is refused while the provider reports PENDING
+    (and for UNKNOWN / FAILED / a raising provider — fail-closed), returns
+    for CLEAN, and the OTHER owned fixture is unaffected. ORDER PROOF
+    SCOPE: the journal below MODELS the caller (the delete marker is
+    appended by the test after the consult returns) — the REAL
+    reconcile-before-Remove-VM order proof against production code is the
+    C14 wiring row, test_vm_remove_consults_cleanup_provider_before_removal,
+    which journals the provider consult and the actual removal PowerShell
+    into one timeline."""
     journal: list = []
     provider = JournalProvider(journal, {
         GUID_A: agent_isolation.PENDING,
@@ -125,8 +130,9 @@ def test_fault_profile_reconciles_before_owned_clone_delete():
     assert ("delete", GUID_A) not in journal
 
     # CLEAN for VM B -> the consult returns None and deletion may proceed.
-    # ORDER pin: the reconcile record strictly precedes the delete marker
-    # the caller appends only after reconcile_before_remove returns.
+    # Caller-model order note: the delete marker below is appended by the
+    # TEST (modeling vm_remove's proceed-after-consult); the production
+    # reconcile-before-Remove-VM order is proven by the C14 wiring row.
     assert agent_isolation.reconcile_before_remove(cfg, GUID_B) is None
     journal.append(("delete", GUID_B))
     assert journal.index(("reconcile", GUID_B)) < journal.index(("delete", GUID_B)), (
@@ -234,7 +240,6 @@ def test_vm_remove_consults_cleanup_provider_before_removal(monkeypatch):
     import json as _json
 
     from hyperv_mcp import media, pswindows
-    from hyperv_mcp.config import ConfigError
 
     journal: list = []
     provider = JournalProvider(journal, {})
@@ -310,14 +315,16 @@ def test_vm_remove_consults_cleanup_provider_before_removal(monkeypatch):
     assert _first_removal_script_pos() == -1
     provider.raise_for.clear()
 
-    # (e) an unknown configured provider name fails closed (ConfigError or
-    # MediaError) BEFORE any PowerShell leg at all.
+    # (e) an unknown configured provider name fails closed with MediaError —
+    # and the config is built OUTSIDE the raises block so a config-layer
+    # rejection cannot satisfy the contract (the refusal must come from the
+    # seam's fail-closed resolve) — BEFORE any PowerShell leg at all.
     journal.clear()
     spy = _WiringSpyPS(journal, _removal_responses())
     monkeypatch.setattr(pswindows, "run_ps", spy)
-    with pytest.raises((ConfigError, media.MediaError)):
-        media.vm_remove(
-            _wiring_cfg("ghost"), vm_name="test-vm-2", confirm=True)
+    ghost_cfg = _wiring_cfg("ghost")
+    with pytest.raises(media.MediaError):
+        media.vm_remove(ghost_cfg, vm_name="test-vm-2", confirm=True)
     assert spy.scripts == [], (
         "an unknown provider name must refuse before ANY PowerShell leg"
     )
