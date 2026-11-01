@@ -207,7 +207,7 @@ def deployment_status(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
         .replace("+00:00", "Z")
     )
 
-    def _split(value: str) -> list[str]:
+    def _split(value: str | None) -> list[str]:
         return [s.strip() for s in str(value or "").split(";") if s.strip()]
 
     return {
