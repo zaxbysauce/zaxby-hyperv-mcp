@@ -35,7 +35,19 @@ from hyperv_mcp.config import Config, ConfigError
 
 
 def test_shareless_unc_guest_roots_rejected():
-    for root in ("\\\\server", "\\\\server\\", "\\\\?\\UNC\\srv\\share"):
+    # The share-less spellings in EVERY separator form: Windows accepts
+    # forward slashes, so "//srv//" is the same root as "\\srv\\" and must
+    # be rejected too (implementation-review round 4: the forward-slash
+    # form skipped the pair check and widened the guest boundary to every
+    # share on that server).
+    for root in (
+        "\\\\server",
+        "\\\\server\\",
+        "\\\\?\\UNC\\srv\\share",
+        "//server",
+        "//server//",
+        "//server/",
+    ):
         cfg = Config()
         cfg.guest_write_roots = [root]
         with pytest.raises(ConfigError):
@@ -43,10 +55,32 @@ def test_shareless_unc_guest_roots_rejected():
 
 
 def test_wellformed_unc_guest_roots_accepted():
-    for root in ("\\\\srv\\share", "\\\\srv\\share\\sub"):
+    # The well-formed pair in every separator form (Windows accepts both).
+    for root in (
+        "\\\\srv\\share",
+        "\\\\srv\\share\\sub",
+        "//srv/share",
+        "//srv/share/sub",
+        "\\\\srv//share",
+        "//srv\\\\share",
+        "//srv//share",
+    ):
         cfg = Config()
         cfg.guest_write_roots = [root]
         cfg.validate()  # must not raise ConfigError
+
+
+def test_shareless_unc_root_does_not_widen_the_guest_boundary():
+    """The IMPACT of the share-less form: with it configured, the policy
+    must not admit paths under OTHER shares of the same server."""
+    from hyperv_mcp.policy import check_guest_write
+
+    cfg = Config()
+    cfg.guest_write_roots = ["//srv//"]
+    with pytest.raises(ConfigError):
+        cfg.validate()
+    # (If a future policy ever accepts such a root, the boundary check
+    # below must fail - the pair requirement is what prevents it.)
 
 
 def test_makedirs_tracked_failure_prunes_husks(tmp_path):

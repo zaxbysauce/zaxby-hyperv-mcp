@@ -25,7 +25,6 @@ import os
 import queue
 import re
 import subprocess
-import sys
 import threading
 import time
 from ctypes import wintypes
@@ -35,7 +34,7 @@ from typing import Protocol, TypeVar
 
 import anyio
 
-from . import timing
+from . import logemit, timing
 from .config import Config, HttpPolicy
 
 if os.name == "nt":
@@ -525,18 +524,16 @@ def _harden_slot_dir_acl(directory: Path) -> None:
             proc.communicate()
             raise
         if proc.returncode != 0:
-            print(
+            logemit.log_line(
                 "pswindows: slot-dir ACL hardening failed (continuing): "
                 + redact((err_b or b"").decode("utf-8", "replace").strip()),
-                file=sys.stderr,
             )
     except (OSError, subprocess.TimeoutExpired) as exc:
         # Type + message only: a TimeoutExpired stringifies as the whole
         # command line (slot-directory path and account name included).
-        print(
+        logemit.log_line(
             f"pswindows: slot-dir ACL hardening failed (continuing): "
-            f"{type(exc).__name__}: {redact(str(exc)) if not isinstance(exc, subprocess.TimeoutExpired) else 'timed out after 30s'}",
-            file=sys.stderr,
+            f"{type(exc).__name__}: {redact(str(exc)) if not isinstance(exc, subprocess.TimeoutExpired) else 'timed out after 30s'}"
         )
 
 

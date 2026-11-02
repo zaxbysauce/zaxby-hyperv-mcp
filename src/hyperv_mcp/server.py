@@ -225,12 +225,11 @@ def __getattr__(name: str):
     if name == "mcp":
         instance = get_mcp()
         if not _compat_warning_shown:
-            print(
+            logemit.log_line(
                 "[hyperv-mcp] WARNING: compat import of `server.mcp` yields an "
                 "MCPServer instance WITHOUT bearer-token auth; serving it over "
                 "streamable-http exposes an unauthenticated endpoint. Prefer "
-                "the `hyperv-mcp-http` entry point.",
-                file=sys.stderr,
+                "the `hyperv-mcp-http` entry point."
             )
             globals()["_compat_warning_shown"] = True
         return instance
@@ -3976,11 +3975,10 @@ def _harden_tools(mcp: MCPServer) -> None:
     if not tools:
         # PRR-015: a silent no-op would revert unknown-argument handling to
         # pydantic's extra="ignore" fail-open. Make the SDK coupling loud.
-        print(
+        logemit.log_line(
             "[hyperv-mcp] WARNING: _harden_tools found no registered tools; "
             "unknown-argument rejection and additionalProperties stamping "
-            "were NOT installed (mcp SDK shape changed?)",
-            file=sys.stderr,
+            "were NOT installed (mcp SDK shape changed?)"
         )
         return
     for tool in tools:
@@ -4049,10 +4047,9 @@ def _harden_tools(mcp: MCPServer) -> None:
             except Exception as audit_exc:  # noqa: BLE001 - best-effort: a
                 # broken audit sink must not turn a rejection into a raw
                 # exception with no envelope (issue #9 review PRR-014).
-                print(
+                logemit.log_line(
                     f"[hyperv-mcp] WARNING: audit write failed for a "
-                    f"rejected call on {name}: {audit_exc}",
-                    file=sys.stderr,
+                    f"rejected call on {name}: {audit_exc}"
                 )
             return errors.failure_result(env)
 

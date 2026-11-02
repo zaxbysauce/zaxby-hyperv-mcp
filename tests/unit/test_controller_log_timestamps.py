@@ -235,6 +235,76 @@ def test_audit_stream_lines_carry_the_timestamp(monkeypatch, capsys):
     )
 
 
+def test_no_unprefixed_stderr_writers_in_the_package():
+    """Package-wide guardrail (the general form of the #57 requirement).
+
+    Every print() that can reach the CONTROLLER's redirected per-user log
+    must go through the shared timestamped emitter. The controller process
+    is the `hyperv-mcp-http` entry point (http_entry.main) plus everything
+    it calls (server.bootstrap -> _startup_banner, the audit sink, the
+    PowerShell slot pool).
+
+    Documented exclusions (each writes to a DIFFERENT stream):
+      - http_entry._handle_logon_task: the interactive install path, whose
+        output goes to the operator's terminal;
+      - server.main: the STDIO server CLI, whose stderr is the MCP
+        CLIENT's stderr;
+      - stdio_proxy: the client-side proxy, whose stderr is the operator's
+        terminal;
+      - consolebench: a development benchmark tool.
+
+    A NEW module (or a new function in an in-scope module) that prints to
+    stderr would fail here - the round-3 gap (server banner / audit
+    stream) was exactly that shape, and a per-module check could not see
+    it."""
+    import ast
+    from pathlib import Path
+
+    package = Path(http_entry.__file__).resolve().parent
+    emitter = package / "logemit.py"
+    # module -> fully excluded function names
+    excluded_functions = {
+        "http_entry.py": {"_handle_logon_task"},
+        "server.py": {"main"},
+    }
+    # modules whose stderr never reaches the controller log
+    excluded_modules = {"stdio_proxy.py", "consolebench.py"}
+    offenders = []
+    for module in sorted(package.glob("*.py")):
+        if module == emitter or module.name in excluded_modules:
+            continue
+        skip_funcs = excluded_functions.get(module.name, set())
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        for func in [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]:
+            if func.name in skip_funcs:
+                continue
+            for node in ast.walk(func):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "print"
+                ):
+                    continue
+                stderr = False
+                for kw in node.keywords:
+                    if kw.arg == "file":
+                        stderr = isinstance(kw.value, ast.Attribute) and (
+                            kw.value.attr == "stderr"
+                        )
+                if stderr or not node.keywords:
+                    offenders.append(
+                        f"{module.name}:{func.name}:{node.lineno}"
+                    )
+    assert not offenders, (
+        "these print() calls can reach the controller's redirected log "
+        f"unprefixed: {offenders}"
+    )
+
+
 def test_refusal_paths_never_carry_the_token_value(monkeypatch, capsys):
     """Implementation-review round 1+2: the seam-level no-leak floor does
     not prove the REAL refusal sites are safe. Drive the serve-path

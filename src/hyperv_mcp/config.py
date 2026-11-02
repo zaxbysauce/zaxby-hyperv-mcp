@@ -451,29 +451,40 @@ class Config:
         ("\\g-write", "C:sub") would anchor the boundary to a guest cwd the
         host cannot see. Reject it loudly at load time instead.
         """
-        drive, rest = ntpath.splitdrive(root)
-        if not drive:
-            raise ConfigError(f"{key} entries must be absolute Windows paths: {root!r}")
-        if drive.startswith("\\\\"):  # UNC or device-form UNC
-            # Issue #37: splitdrive truthiness alone accepts share-less UNC
-            # roots (\\server, \\server\ -> truthy drive), which widens the
-            # lexical guest boundary to EVERY share on that server. The
-            # \\server\share PAIR lives in the drive component itself (for a
-            # bare \\srv\share splitdrive returns the whole UNC as drive
-            # with empty rest), so parse the pair out of the drive and
-            # require both components. The \\?\UNC\... device form is
-            # rejected outright (well-formed but unsupported here; its
-            # drive component carries no separable pair on Python 3.11).
-            if drive.upper().startswith("\\\\?\\UNC"):
+        normalized = root.replace("/", "\\")
+        if normalized.startswith("\\\\"):
+            # Issue #37: a UNC root must name the \\server\share PAIR.
+            # splitdrive truthiness alone accepts share-less roots (\\server,
+            # \\server\ -> truthy drive), which widens the lexical guest
+            # boundary to EVERY share on that server.
+            #
+            # The pair is parsed from the NORMALIZED root rather than from
+            # splitdrive's drive: (a) the separators are normalized FIRST,
+            # because Windows accepts both and the forward-slash spelling of
+            # a share-less root ("//srv//") otherwise skipped this branch
+            # entirely and widened the boundary (implementation-review
+            # round 4); (b) splitdrive stops at a DOUBLE separator
+            # ("\\srv\\share" -> drive "\\srv\", rest "\share"), so a
+            # well-formed mixed spelling was wrongly rejected.
+            #
+            # Empty segments are dropped (Windows collapses them), so the
+            # share is the SECOND non-empty segment; a root with fewer than
+            # two is share-less and is rejected.
+            if normalized.upper().startswith("\\\\?\\UNC"):
                 raise ConfigError(
                     f"{key} device-form UNC roots are not supported: {root!r}"
                 )
-            components = drive[2:].replace("/", "\\").split("\\")
-            if len(components) < 2 or not components[0] or not components[1]:
+            components = [
+                part for part in normalized[2:].split("\\") if part
+            ]
+            if len(components) < 2:
                 raise ConfigError(
                     f"{key} UNC roots must name a share (\\\\server\\share): {root!r}"
                 )
             return
+        drive, rest = ntpath.splitdrive(normalized)
+        if not drive:
+            raise ConfigError(f"{key} entries must be absolute Windows paths: {root!r}")
         if rest[:1] not in ("\\", "/"):
             raise ConfigError(f"{key} entries must be absolute Windows paths: {root!r}")
 
