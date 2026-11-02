@@ -5,8 +5,8 @@ At base the version lives in three independent literals with no pin between
 them — ``src/hyperv_mcp/server.py`` ``VERSION = "0.4.0"`` (the source of the
 CLI banner/``--version``/``--check-env`` strings AND of the MCP initialize
 ``serverInfo.version`` via ``MCPServer(..., version=VERSION)``),
-``src/hyperv_mcp/__init__.py`` ``__version__ = "0.7.0"``, and
-``pyproject.toml`` ``version = "0.7.0"`` — so every release bump desyncs the
+``src/hyperv_mcp/__init__.py`` ``__version__ = "0.8.0"``, and
+``pyproject.toml`` ``version = "0.8.0"`` — so every release bump desyncs the
 user-visible strings from the installed package. These checks are
 import-level and deterministic (no CLI subprocess, no network): they pin
 every user-visible version source to the installed distribution metadata
