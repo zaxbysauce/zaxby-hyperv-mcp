@@ -268,22 +268,46 @@ def test_vm_remove_out_of_root_candidate_is_kept_not_deleted(monkeypatch, tmp_pa
 
 
 def test_harvest_caps_are_pinned(monkeypatch, tmp_path):
-    """Reviewer finding 2: all three cap layers (robocopy /MAX, the in-script
-    running total, the Python re-check) were removable with a green suite.
-    This pin asserts the action script carries the per-file and total guards
-    and that an over-total payload demotes every file to skipped/cap_exceeded."""
+    """Reviewer finding 2 (migrated to the derived-size design at the PR-113
+    feedback round): all three cap layers (robocopy /MAX, the in-script
+    running total, the Python re-check over the DERIVED sizes) were
+    removable with a green suite. The module caps are monkeypatched small
+    (10/25 bytes) and the dest payloads are REAL bytes, so the demotions are
+    driven by the sizes Python derives from the hashed copies — never by a
+    PS-reported size. Per-file demotion: an 11-byte file over a 10-byte cap.
+    Total demotion: a fourth 9-byte file pushes the running total past 25.
+    The cap_exceeded reasons name the skipped source and truncated is set."""
     import json as _json
     cfg = Config(unrestricted=True)
-    big = [
-        {"path": f"Windows/Panther/setupact.log.{i}", "bytes": 2 * 1024 * 1024 * 1024,
-         "sha256": "0" * 64}
-        for i in range(3)
+    monkeypatch.setattr(harvest, "_FILE_MAX_BYTES", 10)
+    monkeypatch.setattr(harvest, "_TOTAL_MAX_BYTES", 25)
+    vol = "\\\\?\\Volume{55108000-0000-0000-0000-00000000000}\\"
+    # (rel, real payload): over-file is over the PER-FILE cap; two in-budget
+    # 9-byte files; over-total is per-file fine but pushes total 27 > 25.
+    entries = [
+        ("Windows/Panther/setupact.overfile", b"x" * 11),   # per-file cap
+        ("Windows/Panther/setupact.ok1", b"x" * 9),
+        ("Windows/Panther/setupact.ok2", b"x" * 9),
+        ("Windows/Panther/setupact.overtotal", b"x" * 9),   # total cap
     ]
+    rows = []
+    for rel, payload in entries:
+        target = tmp_path / "copies" / rel.replace("/", "_")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+        rows.append({
+            "volume": vol,
+            "source": rel,
+            "dest": str(target),
+            "size": 1,  # a LIE: the derived size (never this) drives caps
+            "last_write_utc": "2026-10-01T00:00:00Z",
+            "sha256": "0" * 64,
+        })
     fake = FakePS([
         _guid_res(),
         pswindows.PSResult(stdout="Off", returncode=0),
         pswindows.PSResult(stdout="SeBackupPrivilege", returncode=0),
-        pswindows.PSResult(stdout=_json.dumps({"files": big, "skipped": []}), returncode=0),
+        pswindows.PSResult(stdout=_json.dumps({"files": rows, "skipped": []}), returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = harvest.harvest_offline_logs(
@@ -292,15 +316,28 @@ def test_harvest_caps_are_pinned(monkeypatch, tmp_path):
     action = next(s for s in fake.scripts if "Mount-VHD" in s)
     assert "/MAX:$fileMax" in action, "robocopy must carry the per-file /MAX cap"
     assert "-gt $totalMax" in action, "the in-script running-total guard must be present"
-    # the Python re-check demotes the over-total tail: with a 2 GiB total
-    # cap, the first 2 GiB file fits (boundary inclusive) and the remaining
-    # two are demoted to skipped/cap_exceeded
+    # the Python re-check keeps the promise on DERIVED sizes: only the two
+    # in-budget files survive; the per-file and total demotions both fire,
+    # each cap_exceeded reason names its skipped source, truncated is set.
     assert out["ok"] is True
-    assert len(out["files"]) == 1, (
-        f"only the first in-budget file may survive: {out['files']}")
-    reasons = [s["reason"] for s in out["skipped"]]
-    assert reasons.count("cap_exceeded") == 2, (
-        f"the over-budget tail must be skipped as cap_exceeded: {reasons}")
+    assert sorted(f["source"] for f in out["files"]) == [
+        "Windows/Panther/setupact.ok1", "Windows/Panther/setupact.ok2"], (
+        f"exactly the in-budget files may survive: "
+        f"{sorted(f['source'] for f in out['files'])}")
+    for f in out["files"]:
+        assert f["size"] == 9, (
+            f"size must be DERIVED from the hashed bytes, not the canned "
+            f"row: {f!r}")
+    reasons = {s["reason"] for s in out["skipped"]}
+    assert any(
+        "cap_exceeded" in r and "setupact.overfile" in r for r in reasons), (
+        f"the per-file demotion must be skipped as cap_exceeded naming the "
+        f"source: {sorted(reasons)}")
+    assert any(
+        "cap_exceeded" in r and "setupact.overtotal" in r for r in reasons), (
+        f"the total-cap demotion must be skipped as cap_exceeded naming the "
+        f"source: {sorted(reasons)}")
+    assert out["truncated"] is True
 
 
 def test_harvest_missing_reason_for_absent_fixed_entries(monkeypatch, tmp_path):
@@ -322,14 +359,22 @@ def test_harvest_missing_reason_for_absent_fixed_entries(monkeypatch, tmp_path):
         _guid_res(),
         pswindows.PSResult(stdout="Off", returncode=0),
         pswindows.PSResult(stdout="SeBackupPrivilege", returncode=0),
-        pswindows.PSResult(stdout='{"files": [], "skipped": []}', returncode=0),
+        pswindows.PSResult(
+            stdout='{"files": [], "missing": ["Windows\\\\Panther\\\\setuperr.log"],'
+                   ' "skipped": []}', returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
-    harvest.harvest_offline_logs(
+    out = harvest.harvest_offline_logs(
         cfg, vm_name="test-vm-1", dest_dir=str(tmp_path / "out"))
     action = next(s for s in fake.scripts if "Mount-VHD" in s)
-    assert "reason = 'missing'" in action, (
-        "the action script must emit the 'missing' skip reason for absent fixed entries")
+    assert "$missing.Add($rel)" in action, (
+        "the action script must route absent fixed entries to the separate "
+        "missing[] list (issue #33 AC7 shape)")
+    assert "Windows\\Panther\\setuperr.log" in out["missing"], (
+        f"the absent fixed entry must surface under manifest missing[]: "
+        f"{out['missing']!r}")
+    assert out["skipped"] == [], "an absent entry is missing, not skipped"
+    assert out["truncated"] is False
 
 
 def test_deployment_status_drops_stale_kvp_when_heartbeat_not_ok(monkeypatch):
@@ -353,6 +398,7 @@ def test_deployment_status_drops_stale_kvp_when_heartbeat_not_ok(monkeypatch):
         _guid_res(),
         pswindows.PSResult(stdout=_json.dumps({
             "state": "Running", "uptime_s": 5, "heartbeat": "No Contact",
+            "heartbeat_enabled": True,
             "kvp_items": kvp_items,
         }), returncode=0),
     ])
@@ -392,13 +438,16 @@ def test_deployment_status_degraded_phase_end_to_end(monkeypatch):
         _guid_res(),
         pswindows.PSResult(stdout=_json.dumps({
             "state": "Running", "uptime_s": 60, "heartbeat": "OK",
+            "heartbeat_enabled": True,
             "kvp_items": [],
         }), returncode=0),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = _readiness.deployment_status(Config(unrestricted=True), vm_name="test-vm-1")
     assert out["phase"] == "degraded", out["phase"]
-    assert out["heartbeat"] == "OK" and out["kvp"]["available"] is False
+    assert out["heartbeat"]["primary_status"] == "OK"
+    assert out["heartbeat"]["enabled"] is True
+    assert out["kvp"]["available"] is False
 
 
 def test_deployment_status_skips_dtd_items(monkeypatch):
@@ -420,6 +469,7 @@ def test_deployment_status_skips_dtd_items(monkeypatch):
         _guid_res(),
         pswindows.PSResult(stdout=_json.dumps({
             "state": "Running", "uptime_s": 1, "heartbeat": "OK",
+            "heartbeat_enabled": True,
             "kvp_items": [bomb, good],
         }), returncode=0),
     ])

@@ -317,3 +317,142 @@ def test_install_script_rejects_single_host_or_port_flag():
         http_entry._install_script(host="10.0.0.5")
     with pytest.raises(ValueError, match="BOTH --host and --port"):
         http_entry._install_script(port="9999")
+
+
+# ---------------------------------------------------------------------------
+# issue #55 (trace 55-108-31-32-33-collated): graceful client-EOF exit.
+# Appended by the arm's-length acceptance-check author — existing functions
+# above are untouched.
+# ---------------------------------------------------------------------------
+
+#: Distinct per-AC sentinel (the file's convention): asserted absent from
+#: the child's stdout/stderr, never echoed in assertion messages.
+AC55_EOF_TOKEN = "sentinel-ac55-eof-6d17"
+
+#: The issue's contract bound: the child must terminate within 10 s of the
+#: client's stdin reaching EOF, without the parent killing it.
+AC55_EOF_DEADLINE_S = 10.0
+
+
+def _ac55_child_env(token: str) -> dict:
+    """Spawn environment for the EOF probe: the tree-under-test's src
+    importable, every inherited HYPERV_MCP_* variable scrubbed (the
+    _probe_env() discipline, extended to the whole HYPERV_MCP_ namespace so
+    no operator/session variable leaks into the child), then exactly this
+    probe's controller token set."""
+    import os
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    for key in [k for k in env if k.startswith("HYPERV_MCP_")]:
+        env.pop(key, None)
+    env["PYTHONPATH"] = str(repo_root / "src")
+    env["HYPERV_MCP_HTTP_TOKEN"] = token
+    return env
+
+
+def test_proxy_exits_after_client_stdin_eof(monkeypatch, tmp_path):
+    """A proxy child whose client closes stdin AFTER a successful
+    initialize round trip must terminate on its own within 10 s with rc 0
+    and no token noise on stderr (issue #55 AC1).
+
+    The child is a REAL proxy (``python -m hyperv_mcp --proxy <url>``) and
+    the controller is a REAL one spun up in-process exactly the way
+    test_b03_stdio_proxy.py's ``controller`` fixture does it
+    (configure_http_auth(verifier) BEFORE bootstrap(), bootstrap(),
+    get_mcp(), uvicorn serves mcp.streamable_http_app() on an ephemeral
+    loopback port) — this row exercises the GRACEFUL success path
+    (initialize delivered + reply received), never the os._exit failure
+    paths. The test is bounded: if the child does not exit within the
+    deadline it is terminated and the test FAILS (the pre-fix signature),
+    so the red leg can never hang the suite.
+    """
+    import importlib
+    import json
+    import subprocess as sp
+    import threading
+
+    # Sibling module (prepend import mode): reuse the real-controller
+    # machinery rather than duplicating it.
+    import test_b03_stdio_proxy as proxy_tests
+
+    server_module = proxy_tests.server_module
+
+    port = proxy_tests._free_port()
+    audit_path = tmp_path / "ac55-controller-audit.jsonl"
+    config_path = tmp_path / "ac55-controller-cfg.json"
+    config_path.write_text(
+        json.dumps({"http": {"port": port}, "audit_log_path": str(audit_path)}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HYPERV_MCP_CONFIG", str(config_path))
+    monkeypatch.setenv("HYPERV_MCP_HTTP_TOKEN", AC55_EOF_TOKEN)
+
+    importlib.reload(server_module)
+    server_module.configure_http_auth(
+        proxy_tests.http_entry._StaticTokenVerifier(AC55_EOF_TOKEN))
+    server_module.bootstrap()
+    mcp = server_module.get_mcp()
+    import uvicorn
+
+    controller = uvicorn.Server(
+        uvicorn.Config(
+            mcp.streamable_http_app(),
+            host="127.0.0.1",
+            port=port,
+            log_level="warning",
+        )
+    )
+    thread = threading.Thread(
+        target=controller.run, daemon=True, name="b03-ac55-controller")
+    thread.start()
+    try:
+        assert proxy_tests._wait_listening(port, 15.0), (
+            "the in-process controller never listened on "
+            f"127.0.0.1:{port} (precondition, not the EOF contract)"
+        )
+        probe = proxy_tests._ProxyProbe(
+            ["--proxy", f"http://127.0.0.1:{port}/mcp"],
+            _ac55_child_env(AC55_EOF_TOKEN),
+        )
+        try:
+            # Graceful-path precondition: a real initialize round trip.
+            probe.request_initialize()
+            reply = probe.await_reply(proxy_tests.REQUEST_DEADLINE_S)
+            assert reply is not None and "result" in reply, (
+                "precondition failed: no initialize result within "
+                f"{proxy_tests.REQUEST_DEADLINE_S:.0f}s (reply={reply!r}) — "
+                "not the EOF-exit contract under test"
+            )
+            # The client's stdin reaching EOF is the ONLY remaining
+            # graceful exit trigger: close it and bound the wait.
+            try:
+                assert probe.proc.stdin is not None
+                probe.proc.stdin.close()
+            except (OSError, ValueError):
+                pass  # child already exited; wait() observes it below
+            try:
+                rc = probe.proc.wait(timeout=AC55_EOF_DEADLINE_S)
+            except sp.TimeoutExpired:
+                pytest.fail(
+                    "the proxy child must exit within 10 s of client stdin "
+                    "EOF (#55 AC1); the child hung on graceful-EOF teardown "
+                    "and had to be terminated by the test"
+                )
+            stderr = probe.stderr_text()
+            assert rc == 0, (
+                "graceful EOF exit must be rc 0, got "
+                f"{rc}; stderr tail: {stderr[-400:]!r}"
+            )
+            assert AC55_EOF_TOKEN not in stderr + "".join(probe.lines), (
+                "the token value leaked into the proxy child's output"
+            )
+        finally:
+            probe.close()
+    finally:
+        controller.should_exit = True
+        thread.join(timeout=15.0)
+        # Un-bootstrap for later tests (the controller-fixture teardown
+        # idiom from test_b03_stdio_proxy.py).
+        importlib.reload(server_module)

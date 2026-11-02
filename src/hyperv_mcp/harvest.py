@@ -24,8 +24,10 @@ files + hashes, never interpolated into PowerShell.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+from pathlib import Path
 
 from . import guestexec, policy, pswindows, vmident, vmlocks
 from .config import Config
@@ -119,6 +121,7 @@ def _action_script(guid: str, dest: str, mnt_root: str) -> str:
         f"$totalMax = {int(_TOTAL_MAX_BYTES)}",
         "$files = New-Object System.Collections.Generic.List[object]",
         "$skipped = New-Object System.Collections.Generic.List[object]",
+        "$missing = New-Object System.Collections.Generic.List[string]",
         "$total = 0",
         "$disks = @(Get-VMHardDiskDrive -VM $vm -ErrorAction Stop | ForEach-Object { $_.Path })",
         "for ($i = 0; $i -lt $disks.Count; $i++) {",
@@ -129,11 +132,12 @@ def _action_script(guid: str, dest: str, mnt_root: str) -> str:
         "    $diskObj = Mount-VHD -Path $p -ReadOnly -NoDriveLetter -Passthru -ErrorAction Stop",
         "    $mounted = $true",
         "    foreach ($part in @($diskObj | Get-Disk -ErrorAction Stop | Get-Partition -ErrorAction SilentlyContinue)) {",
-        "      New-Item -ItemType Directory -Force -Path $ap | Out-Null",
+        "      $vol = [string]$part.VolumeId",
+      "      New-Item -ItemType Directory -Force -Path $ap | Out-Null",
         "      try {",
         "        Add-PartitionAccessPath -Partition $part -AccessPath $ap -ErrorAction Stop",
         "      } catch {",
-        "        $skipped.Add([PSCustomObject]@{ path = $ap; reason = 'volume_locked' })",
+        "        $skipped.Add([PSCustomObject]@{ volume = $vol; reason = 'volume_locked' })",
         "        continue",
         "      }",
         "      try {",
@@ -146,13 +150,31 @@ def _action_script(guid: str, dest: str, mnt_root: str) -> str:
         "          $isGlob = $name -like '*[*?]*'",
         "          if ($isGlob) {",
         "            if (-not (Test-Path -LiteralPath $srcDir)) {",
-        "              $skipped.Add([PSCustomObject]@{ path = $rel; reason = 'missing' })",
+        "              $missing.Add($rel)",
         "              continue",
         "            }",
         "          } elseif (-not (Test-Path -LiteralPath $src)) {",
-        "            $skipped.Add([PSCustomObject]@{ path = $rel; reason = 'missing' })",
+        "            $missing.Add($rel)",
         "            continue",
         "          }",
+        "          # Pre-copy screening (issue #33 AC7 + plan-critic r1 finding 3):",
+        "          # source sizes are enumerated BEFORE any copy runs so an",
+        "          # over-cap source is skipped up front - robocopy /MAX would",
+        "          # otherwise exclude it silently with no row to demote.",
+        "          if ($isGlob) {",
+        "            $screen = @(Get-ChildItem -LiteralPath $srcDir -Filter $name -File -ErrorAction SilentlyContinue)",
+        "          } else {",
+        "            $screen = @(Get-Item -LiteralPath $src -ErrorAction SilentlyContinue)",
+        "          }",
+        "          # Per-file cap rows (review F3): each over-cap source is named",
+        "          # (for globs, by file name — not the pattern) and in-budget",
+        "          # glob siblings STILL copy, so a directory loses nothing the",
+        "          # base robocopy /MAX behavior collected.",
+        "          foreach ($o in @($screen | Where-Object { $_.Length -gt $fileMax })) {",
+        "            $capName = if ($isGlob) { $o.Name } else { $rel }",
+        "            $skipped.Add([PSCustomObject]@{ volume = $vol; reason = ('cap_exceeded: ' + $capName) })",
+        "          }",
+        "          if (-not $isGlob -and @($screen | Where-Object { $_.Length -gt $fileMax }).Count -gt 0) { continue }",
         "          New-Item -ItemType Directory -Force -Path $dstDir | Out-Null",
         "          # A stale copy from an earlier run must never be hashed as",
         "          # this run's result: clear the destination match(es) first.",
@@ -164,7 +186,7 @@ def _action_script(guid: str, dest: str, mnt_root: str) -> str:
         "          }",
         "          & $env:SystemRoot\\System32\\robocopy.exe $srcDir $dstDir $name /B /XJ /R:0 /W:0 /MAX:$fileMax /NFL /NDL /NJH /NJS /NP | Out-Null",
         "          if ($LASTEXITCODE -ge 8) {",
-        "            $skipped.Add([PSCustomObject]@{ path = $rel; reason = ('copy_failed: robocopy exit ' + $LASTEXITCODE) })",
+        "            $skipped.Add([PSCustomObject]@{ volume = $vol; reason = ('copy_failed: robocopy exit ' + $LASTEXITCODE) })",
         "            continue",
         "          }",
         "          if ($isGlob) {",
@@ -176,12 +198,16 @@ def _action_script(guid: str, dest: str, mnt_root: str) -> str:
         "            $len = $copied.Length",
         "            if (($total + $len) -gt $totalMax) {",
         "              Remove-Item -LiteralPath $copied.FullName -Force -ErrorAction SilentlyContinue",
-        "              $skipped.Add([PSCustomObject]@{ path = $rel; reason = 'cap_exceeded' })",
+        "              $skipped.Add([PSCustomObject]@{ volume = $vol; reason = ('cap_exceeded: ' + $rel) })",
         "              continue",
         "            }",
         "            $total = $total + $len",
         "            $h = (Get-FileHash -LiteralPath $copied.FullName -Algorithm SHA256 -ErrorAction Stop).Hash",
-        "            $files.Add([PSCustomObject]@{ path = $rel; bytes = [int]$len; sha256 = $h })",
+        "            # Guest-relative source (review F9): correlatable with the",
+        "            # fixed LOG_PATHS set and missing[], unlike the ephemeral",
+        "            # .mnt mount path the raw copy emits.",
+        "            $guestRel = if ($isGlob) { Join-Path (Split-Path $rel -Parent) $copied.Name } else { $rel }",
+        "            $files.Add([PSCustomObject]@{ volume = $vol; source = $guestRel; dest = $copied.FullName; size = [int]$len; last_write_utc = $copied.LastWriteTimeUtc.ToString('o'); sha256 = $h })",
         "          }",
         "        }",
         "      } finally {",
@@ -193,7 +219,7 @@ def _action_script(guid: str, dest: str, mnt_root: str) -> str:
         "    if ($mounted) { Dismount-VHD -Path $p -ErrorAction Stop }",
         "  }",
         "}",
-        "[PSCustomObject]@{ files = $files.ToArray(); skipped = $skipped.ToArray() } | ConvertTo-Json -Compress -Depth 4",
+        "[PSCustomObject]@{ vm_id = [string]$vm.Id; files = $files.ToArray(); missing = $missing.ToArray(); skipped = $skipped.ToArray() } | ConvertTo-Json -Compress -Depth 4",
     ])
 
 
@@ -296,32 +322,65 @@ def harvest_offline_logs(cfg: Config, vm_name: str = "", vm_id: str = "", dest_d
                 pass
         if not isinstance(out, dict):
             out = {}
-        files = list(out.get("files") or [])
-        skipped = list(out.get("skipped") or [])
-        # Python-side total re-enforcement (the in-script guard demotes per
-        # file; this pass keeps the promise even if the script shape drifts).
+        # Issue #33 AC7 assembly: evidence-grade manifest — provenance rows,
+        # sha256 recomputed IN PYTHON over the copied host files (the PS-side
+        # Get-FileHash value is deliberately not trusted), separate missing[],
+        # volume-shaped skipped rows, and caps enforced with a truncated flag.
+        files_out: list[dict] = []
+        skipped_out: list[dict] = []
+        missing_out = [str(m) for m in (out.get("missing") or []) if str(m)]
+        truncated = False
         total = 0
-        kept_files: list[dict] = []
-        for f in files:
+        for f in list(out.get("files") or []):
             if not isinstance(f, dict):
                 continue
-            total += int(f.get("bytes") or 0)
-            if total > _TOTAL_MAX_BYTES:
-                skipped.append({"path": str(f.get("path") or ""), "reason": "cap_exceeded"})
+            rel = str(f.get("source") or "")
+            vol = str(f.get("volume") or "")
+            dest_path = str(f.get("dest") or "")
+            lw = str(f.get("last_write_utc") or "")
+            try:
+                # The manifest's size is re-derived from the bytes actually
+                # hashed (review F4): the PS-reported size is never trusted,
+                # so cap enforcement and the size/sha256 pair stay true.
+                data = Path(dest_path).read_bytes()
+            except OSError:
+                # A copy that cannot be re-read must never pass as evidence.
+                # NOT a cap engagement: truncated stays cap-semantics only.
+                skipped_out.append({"volume": vol, "reason": f"unreadable_copy: {rel}"})
                 continue
-            kept_files.append({
-                "path": str(f.get("path") or ""),
-                "bytes": int(f.get("bytes") or 0),
-                "sha256": str(f.get("sha256") or ""),
+            size = len(data)
+            digest = hashlib.sha256(data).hexdigest()
+            # Independent per-file + total cap recheck (the in-script guards
+            # demote first; this pass keeps the promise even if the script
+            # shape drifts).
+            if size > _FILE_MAX_BYTES or (total + size) > _TOTAL_MAX_BYTES:
+                skipped_out.append({"volume": vol, "reason": f"cap_exceeded: {rel}"})
+                truncated = True
+                continue
+            total += size
+            files_out.append({
+                "volume": vol,
+                "source": rel,
+                "dest": dest_path,
+                "size": size,
+                "sha256": digest,
+                "last_write_utc": lw,
             })
+        for s in list(out.get("skipped") or []):
+            if not isinstance(s, dict):
+                skipped_out.append({"volume": "", "reason": str(s)})
+                continue
+            reason = str(s.get("reason") or "unknown")
+            skipped_out.append({"volume": str(s.get("volume") or ""), "reason": reason})
+            if "cap_exceeded" in reason:
+                truncated = True
         return {
             "ok": True,
-            "dest_dir": dest,
-            "files": kept_files,
-            "skipped": [
-                {"path": str(s.get("path") or ""), "reason": str(s.get("reason") or "unknown")}
-                if isinstance(s, dict) else {"path": str(s), "reason": "unknown"}
-                for s in skipped
-            ],
+            "vm_id": ref.id,
             "vm_name": ref.name,
+            "dest_dir": dest,
+            "files": files_out,
+            "missing": missing_out,
+            "skipped": skipped_out,
+            "truncated": truncated,
         }

@@ -294,3 +294,16 @@ def _restore_bootstrap_module_globals():
     _srv._RUNNER_SLOTS = saved[("server", "_RUNNER_SLOTS")]
     _ops.reset_for_tests()
 
+
+
+@pytest.fixture(autouse=True)
+def _agent_isolation_registry_isolated(monkeypatch):
+    """Reset the agent_isolation provider registry between tests (trace
+    55-108-31-32-33-collated, PR-113 feedback round): a synthetic
+    registration from one test must never leak into a later test's
+    resolve_cleanup_provider — the default 'none' no-op contract and every
+    per-test provider name stay deterministic."""
+    from hyperv_mcp import agent_isolation
+
+    saved = dict(agent_isolation._PROVIDERS)
+    monkeypatch.setattr(agent_isolation, "_PROVIDERS", saved)

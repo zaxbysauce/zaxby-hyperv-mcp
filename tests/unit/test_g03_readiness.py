@@ -59,6 +59,8 @@ STATUS_ACTION = json.dumps({
     "state": "Running",
     "uptime_s": 300,
     "heartbeat": "OK",
+    "heartbeat_enabled": True,
+    "heartbeat_secondary": "OK",
     "kvp_items": [KVP_OSNAME, KVP_BUILD, KVP_IPV4, "<not-xml"],
 })
 
@@ -269,10 +271,13 @@ def test_deployment_status_needs_no_credentials(monkeypatch):
     action = fake.scripts[1]
     assert "Get-VMIntegrationService" in action and "Heartbeat" in action
     assert "Msvm_KvpExchangeComponent" in action
-    # assembled result contract
+    # assembled result contract (issue #32 AC4 richer shape)
     assert out["phase"] == "os_ready"
-    assert out["vm"]["state"] == "Running" and out["vm"]["uptime_s"] == 300
-    assert out["heartbeat"] == "OK"
+    assert out["state"] == "Running" and out["uptime_s"] == 300
+    assert out["heartbeat"]["primary_status"] == "OK"
+    assert out["heartbeat"]["enabled"] is True
+    assert out["heartbeat"]["application_status"] == "OK"
+    assert out["vm_id"] == GUID
     assert out["guest"]["os_name"] == "Windows 10 Enterprise"
     assert out["guest"]["os_build"] == "19045"
     ipv4 = out["guest"]["ipv4"]
@@ -289,20 +294,20 @@ def test_deployment_status_needs_no_credentials(monkeypatch):
 # AC11 — classify_phase table; the status script keys on the GUID
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("state,heartbeat,kvp,expected", [
-    ("Off", "OK", True, "off"),          # Off wins regardless of signals
-    ("Off", None, False, "off"),
-    ("Running", "OK", True, "os_ready"),
-    ("Running", "OK", False, "degraded"),
-    ("Running", "No Contact", True, "no_guest_signal"),
-    ("Running", None, False, "no_guest_signal"),
-    ("Starting", "OK", True, "no_guest_signal"),  # not Off, not os_ready/degraded
-    ("Saved", None, False, "no_guest_signal"),
+@pytest.mark.parametrize("state,hb_enabled,hb_primary,kvp,expected", [
+    ("Off", True, "OK", True, "off"),          # Off wins regardless of signals
+    ("Off", False, "", False, "off"),
+    ("Running", True, "OK", True, "os_ready"),
+    ("Running", True, "No Contact", True, "no_guest_signal"),
+    ("Starting", True, "OK", True, "no_guest_signal"),  # transition: no guest signal
+    ("Stopping", True, "OK", True, "no_guest_signal"),
 ])
-def test_classify_phase(state, heartbeat, kvp, expected):
+def test_classify_phase(state, hb_enabled, hb_primary, kvp, expected):
     """RED/ERROR at base (ImportError: readiness), GREEN after the fix:
-    the pure classification table from the issue."""
-    assert readiness.classify_phase(state, heartbeat, kvp) == expected
+    transition and precedence rows complementing test_phase_classification_v2
+    (issue #32 AC5 richer signature)."""
+    assert readiness.classify_phase(
+        state, hb_enabled, hb_primary, kvp) == expected
 
 
 def test_status_script_keys_on_guid(monkeypatch):
@@ -380,3 +385,267 @@ def test_parse_readiness_script(monkeypatch, parsed_ps):
     actions = [s for s in fake.scripts if not _is_resolution_leg(s)]
     assert actions, "deployment_status produced no action script"
     assert _parse_errors(actions[0]) == []
+
+
+# ---------------------------------------------------------------------------
+# #32 AC4 / AC5 — the RICHER v2 contract (trace 55-108-31-32-33-collated;
+# appended by the arm's-length acceptance-check author; the functions above
+# are untouched). The shipped (PR #112) shape is the simplified one; the
+# issue's reopened contract is:
+#   {ok, vm_name, vm_id, state, uptime_s,
+#    heartbeat: {enabled, primary_status, application_status},
+#    kvp: {available, items}, guest: {os_name, os_build, fqdn, ipv4, ipv6},
+#    phase, phase_basis, checked_at}
+# with the six-phase vocabulary off / suspended / no_guest_signal /
+# os_ready / os_unresponsive / heartbeat_disabled (plus the retained
+# `degraded` row as a documented superset) and classify_phase's richer
+# signature classify_phase(state, hb_enabled, hb_primary, kvp_available).
+#
+# Frozen canned-row convention for the ONE action process (extends the
+# module's documented shape with the two heartbeat-struct sources):
+#   {"state": <str>, "uptime_s": <int>, "heartbeat": <primary str>,
+#    "heartbeat_enabled": <bool>, "heartbeat_secondary": <str>,
+#    "kvp_items": [<raw GuestIntrinsicExchangeItems strings>]}
+# `heartbeat` carries the Heartbeat PrimaryStatusDescription and
+# `heartbeat_secondary` the SecondaryStatusDescription — the two sources the
+# richer heartbeat struct {enabled, primary_status, application_status} is
+# assembled from.
+# ---------------------------------------------------------------------------
+
+KVP_OSNAME_RICH = (
+    '<INSTANCE CLASSNAME="Msvm_KvpExchangeDataItem">'
+    '<PROPERTY NAME="Name" TYPE="string"><VALUE>OSName</VALUE></PROPERTY>'
+    '<PROPERTY NAME="Data" TYPE="string">'
+    '<VALUE>Windows 11 Enterprise</VALUE></PROPERTY>'
+    '</INSTANCE>'
+)
+KVP_BUILD_RICH = (
+    '<INSTANCE CLASSNAME="Msvm_KvpExchangeDataItem">'
+    '<PROPERTY NAME="Name" TYPE="string"><VALUE>OSBuildNumber</VALUE></PROPERTY>'
+    '<PROPERTY NAME="Data" TYPE="string"><VALUE>22631</VALUE></PROPERTY>'
+    '</INSTANCE>'
+)
+KVP_FQDN = (
+    '<INSTANCE CLASSNAME="Msvm_KvpExchangeDataItem">'
+    '<PROPERTY NAME="Name" TYPE="string">'
+    '<VALUE>FullyQualifiedDomainName</VALUE></PROPERTY>'
+    '<PROPERTY NAME="Data" TYPE="string">'
+    '<VALUE>lab-a-01.corp.example</VALUE></PROPERTY>'
+    '</INSTANCE>'
+)
+KVP_IPV4_RICH = (
+    '<INSTANCE CLASSNAME="Msvm_KvpExchangeDataItem">'
+    '<PROPERTY NAME="Name" TYPE="string">'
+    '<VALUE>NetworkAddressIPv4</VALUE></PROPERTY>'
+    '<PROPERTY NAME="Data" TYPE="string">'
+    '<VALUE>10.0.0.5;192.168.1.7</VALUE></PROPERTY>'
+    '</INSTANCE>'
+)
+KVP_IPV6 = (
+    '<INSTANCE CLASSNAME="Msvm_KvpExchangeDataItem">'
+    '<PROPERTY NAME="Name" TYPE="string">'
+    '<VALUE>NetworkAddressIPv6</VALUE></PROPERTY>'
+    '<PROPERTY NAME="Data" TYPE="string">'
+    '<VALUE>fe80::1;2001:db8::8</VALUE></PROPERTY>'
+    '</INSTANCE>'
+)
+RICH_STATUS_ACTION = json.dumps({
+    "state": "Running",
+    "uptime_s": 1234,
+    "heartbeat": "OK",
+    "heartbeat_enabled": True,
+    "heartbeat_secondary": "OK",
+    "kvp_items": [KVP_OSNAME_RICH, KVP_BUILD_RICH, KVP_FQDN,
+                  KVP_IPV4_RICH, KVP_IPV6],
+})
+SAVED_STATUS_ACTION = json.dumps({
+    "state": "Saved",
+    "uptime_s": 0,
+    "heartbeat": "",
+    "heartbeat_enabled": True,
+    "heartbeat_secondary": "",
+    "kvp_items": [],
+})
+DISABLED_STATUS_ACTION = json.dumps({
+    "state": "Running",
+    "uptime_s": 7,
+    "heartbeat": "OK",
+    "heartbeat_enabled": False,
+    "heartbeat_secondary": "",
+    "kvp_items": [KVP_OSNAME_RICH],
+})
+
+
+def test_deployment_status_rich_shape_no_credentials(monkeypatch):
+    """#32 AC4 (trace 55-108-31-32-33-collated): the RICHER result shape —
+    vm_id, TOP-LEVEL state/uptime_s, heartbeat as the {enabled,
+    primary_status, application_status} struct, guest.fqdn and guest.ipv6,
+    phase_basis naming the producing signals, and checked_at as UTC ISO —
+    while NEVER resolving guest (or victim) credentials."""
+    def _boom(name):
+        def _f(*args, **kwargs):
+            raise AssertionError(
+                f"deployment_status must never resolve credentials "
+                f"({name} called with {args!r} {kwargs!r})"
+            )
+        return _f
+
+    monkeypatch.setattr(credentials, "resolve_guest", _boom("resolve_guest"))
+    monkeypatch.setattr(credentials, "resolve_victim", _boom("resolve_victim"))
+    fake = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout=RICH_STATUS_ACTION, returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = readiness.deployment_status(UNRESTRICTED, "test-vm-1")
+
+    assert "vm_id" in out and out["vm_id"], (
+        "deployment_status rich shape missing vm_id (#32 AC4)"
+    )
+    assert out["vm_id"] == GUID
+    assert out["state"] == "Running", (
+        f"state must be TOP-LEVEL == 'Running'; got {out.get('state')!r}"
+    )
+    assert out["uptime_s"] == 1234, (
+        f"uptime_s must be TOP-LEVEL == 1234; got {out.get('uptime_s')!r}"
+    )
+    heartbeat = out["heartbeat"]
+    assert isinstance(heartbeat, dict), (
+        f"heartbeat must be the richer struct; got {heartbeat!r}"
+    )
+    assert {"enabled", "primary_status", "application_status"} <= set(heartbeat), (
+        f"heartbeat struct keys incomplete: {sorted(heartbeat)!r}"
+    )
+    assert heartbeat["primary_status"] == "OK"
+    assert heartbeat["enabled"] is True
+    assert heartbeat["application_status"] == "OK", (
+        "application_status must carry the Heartbeat "
+        f"SecondaryStatusDescription from the action rows; got "
+        f"{heartbeat.get('application_status')!r}"
+    )
+    guest = out["guest"]
+    assert guest["fqdn"] == "lab-a-01.corp.example", (
+        f"guest.fqdn must come from the FullyQualifiedDomainName KVP pair; "
+        f"got {guest.get('fqdn')!r}"
+    )
+    assert guest["ipv4"] == ["10.0.0.5", "192.168.1.7"], (
+        "NetworkAddressIPv4 must be split into individual addresses"
+    )
+    assert guest["ipv6"] == ["fe80::1", "2001:db8::8"], (
+        "NetworkAddressIPv6 must be split into individual addresses"
+    )
+    assert out["phase"] == "os_ready"
+    basis = out["phase_basis"]
+    for signal in ("state=", "heartbeat=", "kvp="):
+        assert signal in basis, (
+            f"phase_basis must name the producing signals; {signal!r} "
+            f"missing from {basis!r}"
+        )
+    import datetime as _dt
+
+    checked_at = _dt.datetime.fromisoformat(
+        str(out["checked_at"]).replace("Z", "+00:00"))
+    assert checked_at.utcoffset() == _dt.timedelta(0), (
+        "checked_at must parse as a UTC ISO-8601 timestamp"
+    )
+
+    # Suspended row: the basis names the state signal that produced it.
+    fake2 = FakePS([
+        _guid_res(),
+        pswindows.PSResult(stdout=SAVED_STATUS_ACTION, returncode=0),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake2)
+    out2 = readiness.deployment_status(UNRESTRICTED, "test-vm-1")
+    assert out2["phase"] == "suspended", (
+        f"Saved must classify as 'suspended'; got {out2.get('phase')!r}"
+    )
+    assert "state=Saved" in out2["phase_basis"], (
+        f"the suspended row's basis must name its state signal; "
+        f"got {out2.get('phase_basis')!r}"
+    )
+
+
+@pytest.mark.parametrize("state,hb_enabled,hb_primary,kvp_available,expected", [
+    ("Off", True, "OK", True, "off"),
+    ("Saved", True, "OK", True, "suspended"),
+    ("Paused", True, "OK", True, "suspended"),
+    ("Running", True, "No Contact", False, "no_guest_signal"),
+    ("Running", True, "OK", True, "os_ready"),
+    ("Running", True, "Lost Communication", True, "os_unresponsive"),
+    ("Running", True, "Error", True, "os_unresponsive"),
+    ("Running", False, "", False, "heartbeat_disabled"),
+    # a disabled/absent Heartbeat service beats even a primary "OK"
+    # reading (the host cannot vouch for the guest it never contacted)
+    ("Running", False, "OK", True, "heartbeat_disabled"),
+    # retained 7th row (documented superset over the six-phase vocabulary)
+    ("Running", True, "OK", False, "degraded"),
+])
+def test_phase_classification_v2(state, hb_enabled, hb_primary,
+                                 kvp_available, expected, monkeypatch):
+    """#32 AC5 (trace 55-108-31-32-33-collated): the six-phase vocabulary
+    under the RICHER signature
+    ``classify_phase(state, hb_enabled, hb_primary, kvp_available)`` —
+    off / suspended / no_guest_signal / os_ready / os_unresponsive /
+    heartbeat_disabled (including a disabled-service row whose primary
+    reading is "OK") — plus the retained degraded row; and
+    deployment_status must pass its classify call the enabled/primary
+    signals (spy asserts the exact call args for BOTH the enabled and the
+    disabled fixture), with the disabled case's phase_basis naming
+    heartbeat_enabled."""
+    assert readiness.classify_phase(
+        state, hb_enabled, hb_primary, kvp_available) == expected
+
+    def _drive_spy(action_stdout):
+        """One deployment_status drive with a fresh classify spy: returns
+        (classify call args, result dict)."""
+        real = readiness.classify_phase
+        seen: list = []
+
+        def _spy(cls_state, cls_enabled, cls_primary, cls_kvp):
+            seen.append((cls_state, cls_enabled, cls_primary, cls_kvp))
+            return real(cls_state, cls_enabled, cls_primary, cls_kvp)
+
+        monkeypatch.setattr(readiness, "classify_phase", _spy)
+        fake = FakePS([
+            _guid_res(),
+            pswindows.PSResult(stdout=action_stdout, returncode=0),
+        ])
+        monkeypatch.setattr(pswindows, "run_ps", fake)
+        return seen, readiness.deployment_status(UNRESTRICTED, "test-vm-1")
+
+    seen, _ = _drive_spy(RICH_STATUS_ACTION)
+    assert seen == [("Running", True, "OK", True)], (
+        "deployment_status must pass (state, hb_enabled, hb_primary, "
+        f"kvp_available) to classify_phase in that order for the enabled "
+        f"fixture; saw {seen!r}"
+    )
+
+    # Disabled-service fixture (primary reads "OK" but the service is
+    # disabled): the spy args must carry hb_enabled=False — not just the
+    # phase — and the basis must name heartbeat_enabled as its signal.
+    seen2, out2 = _drive_spy(DISABLED_STATUS_ACTION)
+    assert seen2 == [("Running", False, "OK", True)], (
+        "the disabled fixture's classify call must receive "
+        f"hb_enabled=False with the primary reading intact; saw {seen2!r}"
+    )
+    assert out2["phase"] == "heartbeat_disabled", (
+        f"the disabled fixture must classify heartbeat_disabled; got "
+        f"{out2.get('phase')!r}"
+    )
+    assert "heartbeat_enabled" in out2["phase_basis"], (
+        "the heartbeat_disabled basis must name heartbeat_enabled as the "
+        f"producing signal; got {out2.get('phase_basis')!r}"
+    )
+    # Gated view (PR-113 feedback round): a disabled Heartbeat service must
+    # invalidate KVP even when the primary reading is "OK" and one pair is
+    # present — guest identity and the kvp view read the heartbeat-GATED
+    # dict, so a gate that only checks hb_primary would surface stale pairs.
+    assert out2["guest"]["os_name"] == "", (
+        "the gated view must drop KVP pairs when the Heartbeat service is "
+        f"disabled even with a primary OK reading; got "
+        f"os_name={out2['guest']['os_name']!r}"
+    )
+    assert out2["kvp"]["items"] == {} and out2["kvp"]["available"] is False, (
+        "kvp must report the heartbeat-gated view (empty items, unavailable) "
+        f"for a disabled service; got {out2['kvp']!r}"
+    )

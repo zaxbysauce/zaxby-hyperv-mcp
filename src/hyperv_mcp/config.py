@@ -138,6 +138,17 @@ class DestructivePolicy:
 
 
 @dataclass
+class AgentIsolationPolicy:
+    """Issue #31 supplement (AC14): the optional cleanup-provider seam.
+
+    Only the literal "none" (the default) disables the seam; an unknown
+    configured name fails closed at resolve time (agent_isolation
+    module), never silently disabling the safety check."""
+
+    cleanup_provider: str = "none"
+
+
+@dataclass
 class HttpPolicy:
     host: str = "127.0.0.1"
     port: int = 8787
@@ -277,6 +288,8 @@ class Config:
     # to the pre-profile server. Appended last for the same positional-compat
     # reason as the fields above.
     credential_profiles: tuple[CredentialProfile, ...] = ()
+    # Issue #31 supplement: the optional per-agent cleanup-provider seam.
+    agent_isolation: AgentIsolationPolicy = field(default_factory=AgentIsolationPolicy)
 
     # -- loading ---------------------------------------------------------
 
@@ -547,6 +560,19 @@ class Config:
                 raise ConfigError(f"destructive.{key} must be a boolean")
             kwargs[key] = val
         object.__setattr__(self, "destructive", DestructivePolicy(**kwargs))
+
+    def _set_agent_isolation(self, value: Any) -> None:
+        if not isinstance(value, dict):
+            raise ConfigError("agent_isolation must be an object")
+        unknown = set(value) - set(AgentIsolationPolicy.__dataclass_fields__)
+        if unknown:
+            raise ConfigError(f"unknown agent_isolation key(s): {sorted(unknown)}")
+        provider = value.get("cleanup_provider", "none")
+        if not isinstance(provider, str) or not provider:
+            raise ConfigError(
+                "agent_isolation.cleanup_provider must be a non-empty string")
+        object.__setattr__(self, "agent_isolation", AgentIsolationPolicy(cleanup_provider=provider))
+
 
     def _set_http(self, value: Any) -> None:
         if not isinstance(value, dict):
@@ -858,4 +884,5 @@ Config._FIELD_MAP = {  # type: ignore[attr-defined]
     "leases": lambda c, v: c._set_leases(v),
     "operations": lambda c, v: c._set_operations(v),
     "credential_profiles": lambda c, v: c._set_credential_profiles(v),
+    "agent_isolation": lambda c, v: c._set_agent_isolation(v),
 }

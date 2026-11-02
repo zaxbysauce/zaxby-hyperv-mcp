@@ -23,7 +23,7 @@ import os
 import stat
 import time
 
-from . import guestexec, lifecycle, policy, pswindows, vmident, vmlocks
+from . import agent_isolation, guestexec, lifecycle, policy, pswindows, vmident, vmlocks
 from .config import Config
 from .policy import PolicyDenied
 
@@ -360,6 +360,13 @@ def vm_remove(
     policy.require_destructive(
         cfg, "vm_remove", confirm, f"remove VM '{vm_name or vm_id}'"
         + (" and its own disk files" if delete_disks else ""))
+    # Issue #31 supplement AC14: validate the configured cleanup provider
+    # BEFORE any host work (unknown names refuse here, fail-closed, with
+    # no PowerShell leg at all).
+    try:
+        agent_isolation.preflight_cleanup_provider(cfg)
+    except agent_isolation.CleanupRefusal as exc:
+        raise MediaError(f"vm_remove cleanup-provider preflight refused: {exc}") from exc
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     # operations imports media transitively (runner bodies); import lazily to
     # avoid the cycle — the cancel hook is a no-op outside detached ops.
@@ -376,6 +383,14 @@ def vm_remove(
             raise MediaError(
                 f"VM '{ref.name}' is in state {state or 'unknown'}: vm_remove "
                 "requires state Off (use hyperv_stop_vm first)")
+
+        # Issue #31 supplement AC14: consult the configured cleanup
+        # provider BEFORE any deletion work; PENDING/UNKNOWN/FAILED or a
+        # raising provider refuse fail-closed (VM untouched).
+        try:
+            agent_isolation.reconcile_before_remove(cfg, ref.id)
+        except agent_isolation.CleanupRefusal as exc:
+            raise MediaError(f"vm_remove refused: {exc}") from exc
 
         # One removal script: collect owned candidates + ancestors (the
         # ownership walk stops at the VM's own base disk; every ParentPath

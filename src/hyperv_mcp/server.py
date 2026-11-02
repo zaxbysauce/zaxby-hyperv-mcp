@@ -45,6 +45,7 @@ from mcp.shared.exceptions import UrlElicitationRequiredError
 from mcp.types import LATEST_PROTOCOL_VERSION, CallToolResult, TextContent
 from pydantic import AnyHttpUrl
 
+from . import __version__ as _pkg_version
 from . import (
     auditlog,
     console,
@@ -78,7 +79,11 @@ from .credentials import CredentialError
 
 __all__ = ["mcp", "main", "bootstrap", "configure_http_auth"]  # noqa: F822 (mcp: module __getattr__)
 
-VERSION = "0.4.0"
+# Issue #108: one source of truth. pyproject.toml is the release-time literal;
+# the package binds it as __version__, and every user-visible version string
+# (CLI banner, --version, --check-env, initialize serverInfo) derives from it
+# here. test_version_consistency.py pins the three sites together.
+VERSION = _pkg_version
 
 #: Issue #24: the detached-op runner admission bound, sized once per
 #: bootstrap (operations.runner_bound, defaulting to max_host_powershell).
@@ -2021,8 +2026,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         Differencing ancestors (the golden parent) and anything outside
         host_write_roots are NEVER deleted — every kept path is reported
         with a reason; the post-removal checkpoint merge is waited out
-        (bounded, timeout reported as retryable). Policy: vm_remove
-        category + confirm=true.
+        (bounded, timeout reported as retryable). When
+        agent_isolation.cleanup_provider names a registered provider, the
+        removal consults it BEFORE any deletion work and refuses
+        fail-closed on PENDING/UNKNOWN/FAILED or an unregistered name
+        (only the literal "none" — the default — skips the consult).
+        Policy: vm_remove category + confirm=true.
 
         Returns: {ok, status, vm_name} (deleted[]/kept[{path, reason}]
         additionally present with delete_disks=true) or the failure
@@ -2040,14 +2049,20 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     ) -> dict:
         """Credential-free deployment readiness from host-side signals
         (issue #32): VM state + the Heartbeat integration service + KVP
-        GuestIntrinsicExchangeItems (OSName, OSBuildNumber,
-        NetworkAddressIPv4) combined into one phase answer — off /
-        no_guest_signal / os_ready / degraded. Never resolves guest
-        credentials; os_ready never means PowerShell Direct credentials
-        work. Read-only: no category, no confirm.
+        GuestIntrinsicExchangeItems combined into one phase answer.
+        Never resolves guest credentials; os_ready never means PowerShell
+        Direct credentials work. Read-only: no category, no confirm.
 
-        Returns: {ok, phase, vm{state, uptime_s}, heartbeat,
-        guest{os_name, os_build, ipv4[]}, kvp{available, items}, vm_name}.
+        Phases: off / suspended / heartbeat_disabled / no_guest_signal /
+        os_ready / os_unresponsive / degraded (a Running+enabled+OK-
+        heartbeat+no-KVP row retained from the reviewed table).
+        guest.* and kvp.* always read the heartbeat-gated view so stale
+        pairs never surface as the guest's identity.
+
+        Returns: {ok, phase, phase_basis, vm_id, state, uptime_s,
+        heartbeat{enabled, primary_status, application_status},
+        guest{os_name, os_build, fqdn, ipv4[], ipv6[]},
+        kvp{available, items}, checked_at, vm_name}.
         """
         return _run_guest_tool(
             "hyperv_deployment_status", vm_name, "read",
@@ -2067,8 +2082,13 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         Requires SeBackupPrivilege (elevated). Policy: offline_harvest
         category (read-only, no confirm); no guest credentials.
 
-        Returns: {ok, dest_dir, files[{path, bytes, sha256}],
-        skipped[{path, reason}], vm_name}.
+        Returns: {ok, vm_id, vm_name, dest_dir,
+        files[{volume, source, dest, size, sha256, last_write_utc}],
+        missing[], skipped[{volume, reason}], truncated}.
+        source is the guest-relative log path (correlatable with the fixed
+        LOG_PATHS set and missing[]); files[].size and sha256 are
+        re-derived in Python from the copied bytes; truncated reports
+        engaged caps (per-file/total).
         """
         return _run_guest_tool(
             "hyperv_harvest_offline_logs", vm_name, "offline_harvest",
