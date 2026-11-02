@@ -235,6 +235,33 @@ def test_audit_stream_lines_carry_the_timestamp(monkeypatch, capsys):
     )
 
 
+def test_log_exception_prefixes_every_traceback_line(capsys):
+    """Implementation-review round 6: the crash-log emitter's traceback
+    prefix had NO shipped pin (mutating logemit's per-line prefix left the
+    suite green). Drive the emitter inside a real except block and require
+    EVERY emitted line - message AND traceback - to carry the prefix."""
+    from hyperv_mcp import logemit
+
+    try:
+        raise ValueError("deliberate probe failure")
+    except ValueError:
+        logemit.log_exception("tool probe raised an unexpected exception")
+    captured = capsys.readouterr()
+    lines = [
+        line
+        for line in (captured.out + captured.err).splitlines()
+        if line.strip()
+    ]
+    assert len(lines) >= 2, (
+        "the exception emission produced no traceback lines: " + repr(lines)
+    )
+    unprefixed = [line for line in lines if not TIMESTAMP_PREFIX.match(line)]
+    assert not unprefixed, (
+        "a traceback line reached the log without the ISO-8601 UTC prefix: "
+        f"{unprefixed!r}"
+    )
+
+
 def test_no_unprefixed_stderr_writers_in_the_package():
     """Package-wide guardrail (the general form of the #57 requirement).
 
@@ -275,12 +302,27 @@ def test_no_unprefixed_stderr_writers_in_the_package():
             continue
         skip_funcs = excluded_functions.get(module.name, set())
         tree = ast.parse(module.read_text(encoding="utf-8"))
-        for func in [
+        # Module-level emissions are scanned too (a module-level print() is
+        # not inside any FunctionDef - implementation-review round 6 nit).
+        scopes = [
             node
             for node in ast.walk(tree)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ]:
-            if func.name in skip_funcs:
+        ]
+        module_scope = ast.Module(
+            body=[
+                node
+                for node in tree.body
+                if not isinstance(
+                    node, (ast.FunctionDef, ast.AsyncFunctionDef)
+                )
+            ],
+            type_ignores=[],
+        )
+        scopes.append(module_scope)
+        for func in scopes:
+            fname = getattr(func, "name", "<module level>")
+            if fname in skip_funcs:
                 continue
             for node in ast.walk(func):
                 is_print = (
@@ -310,7 +352,7 @@ def test_no_unprefixed_stderr_writers_in_the_package():
                         )
                 if is_logger or stderr or not node.keywords:
                     offenders.append(
-                        f"{module.name}:{func.name}:{node.lineno}"
+                        f"{module.name}:{fname}:{node.lineno}"
                     )
     assert not offenders, (
         "these print() calls can reach the controller's redirected log "

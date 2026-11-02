@@ -134,8 +134,14 @@ def _transport_security_for(
     if host in ("127.0.0.1", "localhost", "::1"):
         return None
 
+    def _is_ipv6_literal(value: str) -> bool:
+        # A bare IPv6 literal has MORE than one colon; "name:port" has
+        # exactly one. Bracketing a name:port (as the previous rule did)
+        # produced "[lab.example.com:8787]", which matches nothing.
+        return value.count(":") > 1 and not value.startswith("[")
+
     def _host_forms(value: str) -> list[str]:
-        if ":" in value and not value.startswith("["):
+        if _is_ipv6_literal(value):
             # IPv6 literal: the matcher parses host:port by the LAST colon,
             # so a bare form would be misread; bracket it like [::1]:*.
             return [f"[{value}]", f"[{value}]:*"]
@@ -153,7 +159,7 @@ def _transport_security_for(
                 allowed_hosts.append(form)
     allowed_origins: list[str] = []
     for value in named:
-        url_host = f"[{value}]" if ":" in value and not value.startswith("[") else value
+        url_host = f"[{value}]" if _is_ipv6_literal(value) else value
         for scheme in ("http", "https"):
             for suffix in (":*", ""):
                 form = f"{scheme}://{url_host}{suffix}"

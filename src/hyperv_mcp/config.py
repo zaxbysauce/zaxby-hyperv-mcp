@@ -466,6 +466,12 @@ class Config:
                     f"{key} device-form roots are not supported "
                     f"(only \\\\*?\\<drive>:\\... is): {root!r}"
                 )
+            if not tail[2:3] in ("\\", "/"):
+                # A drive-relative device path (\\?\C:relative) is not
+                # absolute: the guest would resolve it against its CWD.
+                raise ConfigError(
+                    f"{key} device-form roots must be absolute: {root!r}"
+                )
         if normalized.startswith("\\\\"):
             # Issue #37: a UNC root must name the \\server\share PAIR.
             # splitdrive truthiness alone accepts share-less roots (\\server,
