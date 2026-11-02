@@ -174,25 +174,29 @@ def test_log_lines_never_carry_the_token_value(monkeypatch, capsys):
 
 
 def test_refusal_paths_never_carry_the_token_value(monkeypatch, capsys):
-    """Implementation-review round 1: the seam-level no-leak floor does
-    not prove the REAL refusal sites are safe. Drive the two serve-path
-    refusals that could echo a value (the per-agent token resolver and the
-    controller's own missing-token branch) and assert no token VALUE
-    reaches the output — the refusal may name the VARIABLE, never the value."""
-    sentinel = "sup3rs3cret-refusal-sentinel"
-    # (a) per-agent resolver: a missing agent variable refuses and names
-    # the agent id + variable name; the value must never appear.
-    monkeypatch.setenv("HYPERV_MCP_TOKEN_AGENT_A", sentinel)
+    """Implementation-review round 1+2: the seam-level no-leak floor does
+    not prove the REAL refusal sites are safe. Drive the serve-path
+    refusals that could echo a value and assert EVERY involved token
+    value is absent — the reviewer's falsifier (the refusal echoing
+    {value!r}) must be caught, so each value in the refusal's scope is
+    asserted absent, not just the first one."""
+    sentinel_a = "sup3rs3cret-refusal-sentinel-a"
+    sentinel_b = "sup3rs3cret-refusal-sentinel-b"
+    non_ascii = "not-ascii-\u00e9"
+    # (a) a RESOLVED agent emits nothing; its value must not appear.
+    monkeypatch.setenv("HYPERV_MCP_TOKEN_AGENT_A", sentinel_a)
     rc, pairs = http_entry._resolve_agent_tokens(
         {"agent-a": "HYPERV_MCP_TOKEN_AGENT_A"}, ""
     )
     assert rc == 0 and pairs, pairs
     captured = capsys.readouterr()
-    assert sentinel not in (captured.out + captured.err), (
+    assert sentinel_a not in (captured.out + captured.err), (
         "the agent-token resolver echoed the token value"
     )
-    # (b) a non-ASCII / collision refusal path
-    monkeypatch.setenv("HYPERV_MCP_TOKEN_AGENT_B", "not-ascii-\u00e9")
+    # (b) the non-ASCII refusal: the REFUSED value (non_ascii) AND the
+    # already-resolved sibling value (sentinel_a) must both be absent —
+    # asserting only the sibling's absence left the falsifier alive.
+    monkeypatch.setenv("HYPERV_MCP_TOKEN_AGENT_B", non_ascii)
     rc, _ = http_entry._resolve_agent_tokens(
         {
             "agent-a": "HYPERV_MCP_TOKEN_AGENT_A",
@@ -203,10 +207,31 @@ def test_refusal_paths_never_carry_the_token_value(monkeypatch, capsys):
     assert rc == 2, rc
     captured = capsys.readouterr()
     blob = captured.out + captured.err
-    assert sentinel not in blob, "the refusal echoed the token value"
+    assert non_ascii not in blob, (
+        "the refusal echoed the refused token value"
+    )
+    assert sentinel_a not in blob, (
+        "the refusal echoed another agent's token value"
+    )
     assert "agent-b" in blob, (
         f"the refusal must name the offending agent, not its value: {blob!r}"
     )
     assert "never printed" in blob, (
         f"the refusal must state that values are never printed: {blob!r}"
+    )
+    # (c) the MISSING-variable refusal names the variable, never a value.
+    monkeypatch.delenv("HYPERV_MCP_TOKEN_AGENT_B", raising=False)
+    rc, _ = http_entry._resolve_agent_tokens(
+        {
+            "agent-a": "HYPERV_MCP_TOKEN_AGENT_A",
+            "agent-b": "HYPERV_MCP_TOKEN_AGENT_B",
+        },
+        "",
+    )
+    assert rc == 2, rc
+    captured = capsys.readouterr()
+    blob = captured.out + captured.err
+    assert sentinel_a not in blob, "the missing-variable refusal echoed a value"
+    assert "HYPERV_MCP_TOKEN_AGENT_B" in blob, (
+        f"the missing-variable refusal must name the variable: {blob!r}"
     )

@@ -306,3 +306,46 @@ def test_allowed_hosts_config_is_parsed_and_reaches_the_allowlists():
     assert any(
         "lab.example.com" in origin for origin in (settings.allowed_origins or [])
     ), f"configured host missing from the origin allowlist: {settings.allowed_origins!r}"
+
+
+def test_configured_allowed_hosts_reach_the_running_transport(monkeypatch, tmp_path):
+    """Implementation-review round 2: the configured allow-list must travel
+    the WHOLE path (config file -> Config.load -> main -> mcp.run), not
+    only the seam. A mutant that drops the configured list on the way
+    (cfg.http.allowed_hosts[:0]) must fail here."""
+    import importlib
+
+    import hyperv_mcp.server as srv
+
+    importlib.reload(srv)
+    recorded: dict = {}
+
+    def record_run(*args, **kwargs):
+        recorded.update(kwargs)
+        return 0
+
+    real_get_mcp = http_entry.get_mcp
+
+    def wrap_get_mcp():
+        mcp = real_get_mcp()
+        mcp.run = record_run
+        return mcp
+
+    monkeypatch.setattr(http_entry, "get_mcp", wrap_get_mcp)
+    monkeypatch.setattr(http_entry, "configure_http_auth", lambda v: None)
+    config_file = tmp_path / "controller.json"
+    config_file.write_text(
+        '{"http": {"allowed_hosts": ["lab.example.com"]}}', encoding="utf-8"
+    )
+    monkeypatch.setenv("HYPERV_MCP_CONFIG", str(config_file))
+    rc = http_entry.main(["--host", "0.0.0.0", "--allow-anonymous"])
+    assert rc == 0, f"http_entry.main returned {rc}"
+    settings = recorded.get("transport_security")
+    assert settings is not None, "no transport_security reached mcp.run()"
+    assert _allowed_hosts_cover(settings.allowed_hosts, "lab.example.com"), (
+        "the CONFIGURED host never reached the running transport's allowlist: "
+        f"{settings.allowed_hosts!r}"
+    )
+    assert any(
+        "lab.example.com" in origin for origin in (settings.allowed_origins or [])
+    ), f"the configured host never reached the running origins: {settings.allowed_origins!r}"
