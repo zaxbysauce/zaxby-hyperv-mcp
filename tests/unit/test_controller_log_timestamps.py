@@ -342,15 +342,31 @@ def test_no_unprefixed_stderr_writers_in_the_package():
                     and isinstance(node.func.value, ast.Name)
                     and node.func.value.id == "logger"
                 )
-                if not (is_print or is_logger):
+                # A direct stream write (sys.stdout.write / sys.stderr.write)
+                # lands in the redirected log exactly like a print does
+                # (implementation-review round 7).
+                is_write = (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "write"
+                    and isinstance(node.func.value, ast.Attribute)
+                    and node.func.value.attr in ("stdout", "stderr")
+                    and isinstance(node.func.value.value, ast.Name)
+                    and node.func.value.value.id == "sys"
+                )
+                if not (is_print or is_logger or is_write):
                     continue
-                stderr = False
+                # The controller is spawned with stdout=log and
+                # stderr=STDOUT (stdio_proxy), so BOTH streams reach the
+                # same log file: an explicit file=sys.stdout is in scope
+                # too (implementation-review round 7).
+                to_stream = False
                 for kw in node.keywords:
                     if kw.arg == "file":
-                        stderr = isinstance(kw.value, ast.Attribute) and (
-                            kw.value.attr == "stderr"
+                        to_stream = isinstance(kw.value, ast.Attribute) and (
+                            kw.value.attr in ("stderr", "stdout")
                         )
-                if is_logger or stderr or not node.keywords:
+                if is_logger or is_write or to_stream or not node.keywords:
                     offenders.append(
                         f"{module.name}:{fname}:{node.lineno}"
                     )
@@ -380,14 +396,16 @@ def test_refusal_paths_never_carry_the_token_value(monkeypatch, capsys):
     assert sentinel_a not in (captured.out + captured.err), (
         "the agent-token resolver echoed the token value"
     )
-    # (b) the non-ASCII refusal: the REFUSED value (non_ascii) AND the
-    # already-resolved sibling value (sentinel_a) must both be absent —
-    # asserting only the sibling's absence left the falsifier alive.
-    monkeypatch.setenv("HYPERV_MCP_TOKEN_AGENT_B", non_ascii)
+    # (b) the non-ASCII refusal: the REFUSED value (non_ascii) AND EVERY
+    # already-resolved sibling value must be absent — asserting only the
+    # first sibling's absence left the falsifier alive.
+    monkeypatch.setenv("HYPERV_MCP_TOKEN_AGENT_B", sentinel_b)
+    monkeypatch.setenv("HYPERV_MCP_TOKEN_AGENT_C", non_ascii)
     rc, _ = http_entry._resolve_agent_tokens(
         {
             "agent-a": "HYPERV_MCP_TOKEN_AGENT_A",
             "agent-b": "HYPERV_MCP_TOKEN_AGENT_B",
+            "agent-c": "HYPERV_MCP_TOKEN_AGENT_C",
         },
         "",
     )
@@ -400,7 +418,10 @@ def test_refusal_paths_never_carry_the_token_value(monkeypatch, capsys):
     assert sentinel_a not in blob, (
         "the refusal echoed another agent's token value"
     )
-    assert "agent-b" in blob, (
+    assert sentinel_b not in blob, (
+        "the refusal echoed a second resolved agent's token value"
+    )
+    assert "agent-c" in blob, (
         f"the refusal must name the offending agent, not its value: {blob!r}"
     )
     assert "never printed" in blob, (

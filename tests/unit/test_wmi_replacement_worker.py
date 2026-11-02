@@ -30,8 +30,6 @@ No VM mutation or live COM dependency is involved.
 
 import threading
 
-import pytest
-
 from hyperv_mcp import console, pswindows, wmiconsole
 from hyperv_mcp.config import Config
 from hyperv_mcp.console import ConsoleError

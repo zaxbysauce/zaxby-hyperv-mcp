@@ -466,7 +466,7 @@ class Config:
                     f"{key} device-form roots are not supported "
                     f"(only \\\\*?\\<drive>:\\... is): {root!r}"
                 )
-            if not tail[2:3] in ("\\", "/"):
+            if tail[2:3] not in ("\\", "/"):
                 # A drive-relative device path (\\?\C:relative) is not
                 # absolute: the guest would resolve it against its CWD.
                 raise ConfigError(

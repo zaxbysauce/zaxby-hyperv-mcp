@@ -50,6 +50,8 @@ def test_shareless_unc_guest_roots_rejected():
         "\\\\?\\srv\\share",
         "\\\\.\\srv\\share",
         "\\\\.\\PhysicalDrive0",
+        "\\\\?\\C:relative",
+        "\\\\?\\C:",
     ):
         cfg = Config()
         cfg.guest_write_roots = [root]
@@ -91,7 +93,6 @@ def test_forward_slash_wellformed_unc_guest_roots_accepted():
 def test_shareless_unc_root_does_not_widen_the_guest_boundary():
     """The IMPACT of the share-less form: with it configured, the policy
     must not admit paths under OTHER shares of the same server."""
-    from hyperv_mcp.policy import check_guest_write
 
     cfg = Config()
     cfg.guest_write_roots = ["//srv//"]
