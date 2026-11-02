@@ -209,6 +209,32 @@ def test_main_output_is_fully_timestamped(monkeypatch, capsys):
     )
 
 
+def test_audit_stream_lines_carry_the_timestamp(monkeypatch, capsys):
+    """Implementation-review round 3 follow-up: the audit stream also
+    reaches the redirected per-user log (auditlog._emit writes to stderr
+    when no audit file is configured), so its lines carry the prefix too.
+    The end-to-end main() leg does NOT cover this: a controller that never
+    runs a tool emits no audit line at all — the mutant M14 (audit stream
+    unprefixed) survived until this leg existed."""
+    from hyperv_mcp import auditlog
+    from hyperv_mcp.config import Config
+
+    auditlog.init(Config())
+    auditlog.log_operation(tool="hyperv_test", category="lifecycle", ok=True)
+    captured = capsys.readouterr()
+    lines = [
+        line
+        for line in (captured.out + captured.err).splitlines()
+        if line.strip()
+    ]
+    assert lines, "the audit stream produced no observable line"
+    unprefixed = [line for line in lines if not TIMESTAMP_PREFIX.match(line)]
+    assert not unprefixed, (
+        "audit stream line reached the redirected log without the ISO-8601 "
+        f"UTC prefix: {unprefixed!r}"
+    )
+
+
 def test_refusal_paths_never_carry_the_token_value(monkeypatch, capsys):
     """Implementation-review round 1+2: the seam-level no-leak floor does
     not prove the REAL refusal sites are safe. Drive the serve-path
