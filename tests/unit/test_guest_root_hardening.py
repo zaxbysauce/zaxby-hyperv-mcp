@@ -77,7 +77,12 @@ def test_forward_slash_wellformed_unc_guest_roots_accepted():
     ):
         cfg = Config()
         cfg.guest_write_roots = [root]
-        cfg.validate()  # must not raise ConfigError
+        try:
+            cfg.validate()
+        except ConfigError as exc:
+            # A well-formed UNC root must load; the pre-fix validator rejected
+            # the forward-slash spellings (base-leg signature).
+            pytest.fail(f"a well-formed UNC root was rejected: {exc}")
 
 
 def test_shareless_unc_root_does_not_widen_the_guest_boundary():
