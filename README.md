@@ -246,10 +246,14 @@ the task-spawned controller reads it from the environment.
   and every translated WMI failure names the serving worker and the concrete
   operation (input-method failures name the method; input is still never
   replayed through PowerShell).
-- **Controller log lines carry timestamps (#57):** every serve-path line the
-  controller emits is prefixed `YYYY-MM-DDTHH:MM:SSZ` (ISO-8601 UTC), so
-  spawn/refusal history is readable from the log alone. The interactive
-  `--install-logon-task` prints keep their operator-shell format.
+- **Controller log lines carry timestamps (#57):** every line the controller
+  writes to its redirected per-user log is prefixed `YYYY-MM-DDTHH:MM:SSZ`
+  (ISO-8601 UTC), so spawn/refusal history is readable from the log alone.
+  That covers the startup banner and policy lines, the token refusals, the
+  audit stream and the endpoint notice — they all share one emitter
+  (`hyperv_mcp.logemit`). The interactive `--install-logon-task` prints keep
+  their operator-shell format (they are written to the operator's terminal,
+  not to the redirected log).
 - **Guest-root UNC validation hardened (#37):** share-less UNC roots
   (`\\server`, `\\server\`) and the `\\?\UNC\server\share`
   device form are rejected at config load; a configured root must name its
