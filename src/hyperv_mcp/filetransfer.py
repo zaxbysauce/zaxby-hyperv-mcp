@@ -336,7 +336,14 @@ def _cleanup_guest_staged(vm_id: str, staged_raw: str, cred: CredentialSet, cfg=
 
 def _makedirs_tracked(path: str) -> list[str]:
     """Create path (like makedirs) and return the directories this call
-    created, leaf first, for pruning if the transfer then fails."""
+    created, leaf first, for pruning if the transfer then fails.
+
+    Issue #37: os.makedirs does not roll back the components it already
+    created when it fails mid-chain, so a failure here would otherwise
+    leave empty husks outside every caller's cleanup boundary. On failure,
+    prune the recorded chain leaf-first (rmdir removes only EMPTY dirs,
+    so pre-existing or non-empty directories refuse safely) and re-raise.
+    """
     missing: list[str] = []
     probe = path
     while probe and not os.path.isdir(probe):
@@ -345,7 +352,15 @@ def _makedirs_tracked(path: str) -> list[str]:
         if parent == probe:
             break
         probe = parent
-    os.makedirs(path, exist_ok=True)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        for created in missing:
+            try:
+                os.rmdir(created)
+            except OSError:
+                pass
+        raise
     return missing
 
 

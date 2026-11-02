@@ -179,7 +179,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.7.0 today) instead of
+  package's version (0.8.0 today) instead of
   the SDK's.
 - **In-process embedders see the 2.x call shape.** `call_tool()` returns a
   `CallToolResult` (`.content`, `.structured_content`, `.is_error`) instead
@@ -224,8 +224,48 @@ per-user logon scheduled task (`hyperv-mcp-http`, RunLevel Limited — Hyper-V
 Administrators membership, no UAC — no execution time limit, IgnoreNew,
 restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
-(`setx HYPERV_MCP_HTTP_TOKEN <token>` — available from the next logon) and
+(`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.8.0 changes
+
+- **Non-loopback binds keep DNS-rebinding protection (#69):** on mcp 2.x the
+  SDK auto-enables Host/Origin validation only for loopback binds, so a
+  `--host 0.0.0.0` (or LAN IP) bind silently ran with the middleware
+  disabled. `hyperv-mcp-http` now arms explicit protection for every
+  non-loopback bind: allowed hosts/origins cover the bind address forms, and
+  a new `http.allowed_hosts` config list (names only, never secrets) covers
+  the LAN hostname/IP clients actually send. Loopback binds are unchanged.
+  A foreign Host header is rejected (421); an uncovered Origin is rejected
+  (403).
+- **WMI console survives worker turnover (#95):** a cached SWbem service
+  dies with the worker thread that created it (the observed
+  "Object is not connected to server" storm). The backend cache now records
+  each service's creator and reconnects on a live worker when the creator
+  has exited. `ConsoleWMI.creator`/`creator_thread` expose query provenance,
+  and every translated WMI failure names the serving worker and the concrete
+  operation (input-method failures name the method; input is still never
+  replayed through PowerShell).
+- **Controller log lines carry timestamps (#57):** every serve-path line the
+  controller emits is prefixed `YYYY-MM-DDTHH:MM:SSZ` (ISO-8601 UTC), so
+  spawn/refusal history is readable from the log alone. The interactive
+  `--install-logon-task` prints keep their operator-shell format.
+- **Guest-root UNC validation hardened (#37):** share-less UNC roots
+  (`\\server`, `\\server\`) and the `\\?\UNC\server\share`
+  device form are rejected at config load; a configured root must name its
+  share. A failed `guest_get` no longer leaves empty husk directories when
+  directory creation fails mid-chain (the created prefix is pruned
+  leaf-first before the error re-raises).
+- **Wheel ships the UIA helper — verified (#110):** a unit check builds the
+  wheel via the PEP 517 backend and asserts
+  `hyperv_mcp/guest/uia_helper.ps1` ships in the archive, and fails on a
+  build configuration that excludes it (a packaging regression can no
+  longer ship a broken wheel with CI green).
+- **README connect section documents the controller token (#56):** the
+  `.mcp.json` snippet and the `claude mcp add` one-liner now name
+  `HYPERV_MCP_HTTP_TOKEN`, and the `setx` guidance is paste-safe.
+- **Version bump:** 0.7.0 -> 0.8.0 (`pyproject.toml`, package `__version__`,
+  this section; `test_version_consistency.py` pins the sites).
 
 ## 0.7.0 changes
 
@@ -916,7 +956,7 @@ usual guest credentials:
 
 ```text
 $ hyperv-mcp --check-env
-hyperv-mcp 0.7.0
+hyperv-mcp 0.8.0
 hyperv.target remote host nuc01
 HYPERV_HOST_USERNAME                set
 HYPERV_HOST_PASSWORD                not set
@@ -1137,8 +1177,14 @@ way.
 ## Connecting to MCP clients
 
 ```powershell
+$env:HYPERV_MCP_HTTP_TOKEN = [convert]::ToBase64String((1..32 | ForEach-Object { Get-Random -Max 256 }))
 claude mcp add hyperv -- hyperv-mcp
 ```
+
+The stdio client inherits `HYPERV_MCP_HTTP_TOKEN` from this shell, so the
+merged auto-start fail-fast (which names that variable) is satisfied; the
+token value lives only in your environment, never in argv or the config
+file.
 
 `.mcp.json`:
 
@@ -1149,6 +1195,7 @@ claude mcp add hyperv -- hyperv-mcp
       "command": "hyperv-mcp",
       "env": {
         "HYPERV_MCP_CONFIG": "C:\\Lab\\hyperv-mcp.json",
+        "HYPERV_MCP_HTTP_TOKEN": "the token value you generated above",
         "HYPERV_GUEST_USERNAME": "Administrator",
         "HYPERV_GUEST_PASSWORD_FILE": "C:\\Lab\\secrets\\guest.pw"
       }

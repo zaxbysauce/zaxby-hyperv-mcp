@@ -232,13 +232,20 @@ def _com(operation: str, fn, *args: Any, **kwargs: Any) -> Any:
     """Run one raw COM call, translating every transport failure into
     WMIError (PRR-005): a pywintypes.com_error is neither WMIError nor
     BackendUnavailable and would otherwise bypass every structured-error
-    handler in console.py. Our own control-flow exceptions pass through."""
+    handler in console.py. Our own control-flow exceptions pass through.
+    The message carries the serving worker's identity (issue #95
+    supplement AC4: spawn/refusal history is attributable from the log
+    alone — worker turnover is exactly the failure mode this backend
+    guards against)."""
     try:
         return fn(*args, **kwargs)
     except (WMIError, BackendUnavailable, ValueError):
         raise
     except Exception as exc:
-        raise WMIError(pswindows.redact(f"WMI {operation} failed: {exc}")) from None
+        worker = threading.current_thread().name
+        raise WMIError(
+            pswindows.redact(f"WMI {operation} failed (worker {worker}): {exc}")
+        ) from None
 
 
 def _boot_epoch_from_cs(cs: Any) -> int | None:
@@ -283,12 +290,14 @@ def _path_of(obj: Any) -> str:
 def _exec_method(service: Any, obj_path: str, method: str, **params: Any) -> Any:
     """The ONLY method-invocation shape that works on this stack (probe
     fact): spawned in-parameters + ExecMethod_. In-parameters are set via
-    plain attribute assignment (works on both real SWbem and the fakes)."""
+    plain attribute assignment (works on both real SWbem and the fakes).
+    Operation tokens carry the method name (issue #95 supplement AC4: a
+    surfaced input-method failure must name the concrete operation)."""
     obj = _com(f"bind {obj_path}", lambda: service.Get(obj_path))
-    definition = _com("method lookup", lambda: obj.Methods_(method))
-    inp = _com("spawn in-parameters", lambda: definition.InParameters.SpawnInstance_())
+    definition = _com(f"method lookup {method}", lambda: obj.Methods_(method))
+    inp = _com(f"spawn in-parameters {method}", lambda: definition.InParameters.SpawnInstance_())
     for name, value in params.items():
-        _com("set parameter", lambda n=name, v=value: setattr(inp, n, v))
+        _com(f"set parameter {method}", lambda n=name, v=value: setattr(inp, n, v))
     return _com(f"ExecMethod_ {method}", lambda: obj.ExecMethod_(method, inp))
 
 
@@ -328,14 +337,25 @@ class _VMCache:
 class ConsoleWMI:
     """Backend bound to one WMI service (one host). Thread-safe: shared
     cache state is mutated under ``_lock`` and console input ops
-    additionally hold the per-VM vm_lock at the console layer."""
+    additionally hold the per-VM vm_lock at the console layer.
 
-    def __init__(self, service: Any) -> None:
+    ``creator`` records the thread whose COM apartment produced the cached
+    service (issue #95): pywin32 SWbem services die with their creating
+    worker, so the cache is only valid while that thread lives."""
+
+    def __init__(self, service: Any, creator: threading.Thread | None = None) -> None:
         self._service = service
         self._lock = threading.Lock()
         self._vms: dict[str, _VMCache] = {}
         self._names: dict[str, str] = {}
         self._vsms_path: str | None = None
+        self.creator = creator or threading.current_thread()
+
+    @property
+    def creator_thread(self) -> threading.Thread:
+        """The thread that created the cached service (query provenance;
+        supplement AC3)."""
+        return self.creator
 
     # -- internals ----------------------------------------------------------
 
@@ -908,12 +928,25 @@ def backend(cfg: Config) -> ConsoleWMI:
     """Cached ConsoleWMI per host-key; raises BackendUnavailable when the
     service cannot be obtained (memoized for
     _CONNECT_FAILURE_TTL_S so an unreachable endpoint costs one connect
-    per TTL, not one per call). Never imports pywin32 itself."""
+    per TTL, not one per call). Never imports pywin32 itself.
+
+    Issue #95: a cached service is only valid while its CREATING thread
+    lives (pywin32 SWbem services die with their creator worker — the
+    executed replacement-worker probe shows exactly the
+    1-pass/3-fail signature). A cache hit whose creator has exited is
+    dropped and the connection is re-established on the REQUESTING
+    thread, inside the same single-flight lock section; the negative
+    memo and its TTL are unchanged."""
     key = _host_key(cfg)
     with _backend_lock:
         be = _backends.get(key)
         if be is not None:
-            return be
+            creator = be.creator
+            if creator is not None and creator.is_alive():
+                return be
+            # Creator exited: the cached service is dead (disconnected
+            # SWbem). Drop it and reconnect below on the live requester.
+            _backends.pop(key, None)
         memo = _connect_failures.get(key)
         if memo is not None:
             failed_at, err = memo

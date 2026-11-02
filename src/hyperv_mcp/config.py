@@ -157,6 +157,13 @@ class HttpPolicy:
     # token (issue #10). Values are names, never token material; the token
     # values are resolved from the environment at startup only.
     agents: dict[str, str] = field(default_factory=dict)
+    # Issue #69: operator-vouched public hosts for non-loopback binds. With
+    # DNS-rebinding protection armed (the new non-loopback default), the
+    # transport middleware only admits Host/Origin headers matching the bind
+    # address forms; entries here cover the LAN hostname/IP clients actually
+    # send. Names, never secrets. Parsed in _set_http; no wildcard semantics
+    # beyond the middleware's own host:* port form.
+    allowed_hosts: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -447,7 +454,25 @@ class Config:
         drive, rest = ntpath.splitdrive(root)
         if not drive:
             raise ConfigError(f"{key} entries must be absolute Windows paths: {root!r}")
-        if drive.startswith("\\\\"):  # UNC: \\server\share
+        if drive.startswith("\\\\"):  # UNC or device-form UNC
+            # Issue #37: splitdrive truthiness alone accepts share-less UNC
+            # roots (\\server, \\server\ -> truthy drive), which widens the
+            # lexical guest boundary to EVERY share on that server. The
+            # \\server\share PAIR lives in the drive component itself (for a
+            # bare \\srv\share splitdrive returns the whole UNC as drive
+            # with empty rest), so parse the pair out of the drive and
+            # require both components. The \\?\UNC\... device form is
+            # rejected outright (well-formed but unsupported here; its
+            # drive component carries no separable pair on Python 3.11).
+            if drive.upper().startswith("\\\\?\\UNC"):
+                raise ConfigError(
+                    f"{key} device-form UNC roots are not supported: {root!r}"
+                )
+            components = drive[2:].replace("/", "\\").split("\\")
+            if len(components) < 2 or not components[0] or not components[1]:
+                raise ConfigError(
+                    f"{key} UNC roots must name a share (\\\\server\\share): {root!r}"
+                )
             return
         if rest[:1] not in ("\\", "/"):
             raise ConfigError(f"{key} entries must be absolute Windows paths: {root!r}")
@@ -577,7 +602,7 @@ class Config:
     def _set_http(self, value: Any) -> None:
         if not isinstance(value, dict):
             raise ConfigError("http must be an object")
-        unknown = set(value) - {"host", "port", "token_env", "agents"}
+        unknown = set(value) - {"host", "port", "token_env", "agents", "allowed_hosts"}
         if unknown:
             raise ConfigError(f"unknown http key(s): {sorted(unknown)}")
         http = HttpPolicy()
@@ -588,6 +613,14 @@ class Config:
                 http.port = val
             elif key == "agents":
                 http.agents = _set_agents(val)
+            elif key == "allowed_hosts":
+                if not isinstance(val, list) or not all(
+                    isinstance(item, str) and item.strip() for item in val
+                ):
+                    raise ConfigError(
+                        "http.allowed_hosts must be a list of non-empty strings"
+                    )
+                http.allowed_hosts = [item.strip() for item in val]
             elif isinstance(val, str) and val.strip():
                 # token_env is matched by exact (case-insensitive) name
                 # downstream; store it trimmed so padding cannot defeat the

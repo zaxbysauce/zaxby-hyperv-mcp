@@ -26,8 +26,11 @@ import os
 import secrets
 import shutil
 import sys
+from datetime import datetime, timezone
+from typing import Any
 
 from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.transport_security import TransportSecuritySettings
 
 from . import pswindows
 from .config import Config, ConfigError
@@ -95,6 +98,73 @@ class _MultiTokenVerifier(TokenVerifier):
         return AccessToken(token=token, client_id=matched, scopes=[])
 
 
+def controller_log(*parts: Any, file: Any = None) -> None:
+    """Emit one controller log line with an ISO-8601 UTC prefix (issue #57).
+
+    The controller's stdout/stderr is redirected by stdio_proxy into a
+    per-user log file; prefixing AT EMIT TIME makes spawn/refusal history
+    diagnosable from the log alone (ordering, rate, burst windows) instead
+    of reconstructed from filesystem mtimes. Every serve-path line routes
+    through this helper; the interactive --install-logon-task prints (the
+    operator's own shell, not the redirected log) deliberately do not.
+    Token values must never be passed here (AC floor: emission sites print
+    variable NAMES, never values). ``file`` resolves LATE (None -> the
+    current sys.stderr) so test capture and runtime redirection both see
+    the line — a ``file=sys.stderr`` default would bind the original
+    stream object at import time and bypass any later swap."""
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"{stamp} " + " ".join(str(part) for part in parts), file=file or sys.stderr)
+
+
+def _transport_security_for(
+    host: str, configured_hosts: Any = ()
+) -> TransportSecuritySettings | None:
+    """Transport-security settings for the bind host (issue #69).
+
+    mcp 2.x computes DNS-rebinding protection inside streamable_http_app
+    and auto-enables it ONLY for the three loopback literals; every other
+    bind receives None, which the middleware reads as protection DISABLED.
+    Loopback binds keep passing None (2.x auto-enable preserved). A
+    non-loopback bind arms explicit protection: allowed_hosts carries the
+    bind address (exact + :* forms; IPv6 bracketed per the SDK's [::1]:*
+    precedent) plus the operator-vouched http.allowed_hosts entries, and
+    allowed_origins mirrors the same set over http/https so configured
+    browser clients pass both validators."""
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return None
+
+    def _host_forms(value: str) -> list[str]:
+        if ":" in value and not value.startswith("["):
+            # IPv6 literal: the matcher parses host:port by the LAST colon,
+            # so a bare form would be misread; bracket it like [::1]:*.
+            return [f"[{value}]", f"[{value}]:*"]
+        return [value, f"{value}:*"]
+
+    named: list[str] = [host]
+    for entry in configured_hosts or ():
+        stripped = str(entry).strip()
+        if stripped and stripped not in named:
+            named.append(stripped)
+    allowed_hosts: list[str] = []
+    for value in named:
+        for form in _host_forms(value):
+            if form not in allowed_hosts:
+                allowed_hosts.append(form)
+    allowed_origins: list[str] = []
+    for value in named:
+        url_host = f"[{value}]" if ":" in value and not value.startswith("[") else value
+        for scheme in ("http", "https"):
+            for suffix in (":*", ""):
+                form = f"{scheme}://{url_host}{suffix}"
+                if form not in allowed_origins:
+                    allowed_origins.append(form)
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
+
+
 def _resolve_agent_tokens(
     agents: dict[str, str], legacy_token: str
 ) -> tuple[int, list[tuple[str, str]]]:
@@ -109,26 +179,25 @@ def _resolve_agent_tokens(
     must abort: a missing/blank agent token variable, a non-ASCII value, or
     a collision — two agents (or an agent and the legacy token) resolving to
     the same value would reintroduce the identity collapse this scheme
-    removes. Errors name agent ids, never token values.
-    """
+    removes. Errors name agent ids, never token values. Emissions go
+    through controller_log (issue #57: these refusals land in the
+    redirected log and must carry timestamps)."""
     pairs: list[tuple[str, str]] = []
     for agent_id in sorted(agents):
         value = os.environ.get(agents[agent_id], "").strip()
         if not value:
-            print(
+            controller_log(
                 f"ERROR: agent '{agent_id}' token environment variable "
                 f"{agents[agent_id]} is not set. Generate a token "
                 "(python -c \"import secrets; print(secrets.token_urlsafe(32))\") "
                 "and export it before starting.",
-                file=sys.stderr,
             )
             return 2, []
         if not value.isascii():
-            print(
+            controller_log(
                 f"ERROR: agent '{agent_id}' token must contain only ASCII "
                 "characters (an HTTP Authorization header could never carry "
                 "the configured value). Token values are never printed.",
-                file=sys.stderr,
             )
             return 2, []
         pairs.append((agent_id, value))
@@ -138,11 +207,10 @@ def _resolve_agent_tokens(
     owner: dict[str, str] = {}
     for agent_id, value in pairs:
         if value in owner:
-            print(
+            controller_log(
                 f"ERROR: token collision: '{owner[value]}' and '{agent_id}' "
                 "resolve to the same bearer token. Give each agent its own "
                 "token (token values are never printed).",
-                file=sys.stderr,
             )
             return 2, []
         owner[value] = agent_id
@@ -365,7 +433,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         cfg = load_controller_config()
     except ConfigError as exc:
-        print(f"CONFIG ERROR: {exc}", file=sys.stderr)
+        controller_log(f"CONFIG ERROR: {exc}")
         return 2
     if ns.install_logon_task or ns.uninstall_logon_task:
         return _handle_logon_task(
@@ -385,11 +453,10 @@ def main(argv: list[str] | None = None) -> int:
 
     verifier: TokenVerifier | None = None
     if ns.allow_anonymous:
-        print(
+        controller_log(
             "WARNING: --allow-anonymous is set. Every local process that can "
             "reach this endpoint may invoke ALL tools, including destructive "
             "ones. This is only acceptable on a disposable research host.",
-            file=sys.stderr,
         )
     elif cfg.http.agents:
         # Per-agent tokens take over the endpoint; the legacy shared token is
@@ -400,12 +467,11 @@ def main(argv: list[str] | None = None) -> int:
             return rc
         verifier = _MultiTokenVerifier(pairs)
     elif not token:
-        print(
+        controller_log(
             f"ERROR: {token_env} is not set. Generate a token "
             f"(python -c \"import secrets; print(secrets.token_urlsafe(32))\") "
             "and pass it via the environment, or pass --allow-anonymous "
             "explicitly if you accept an unauthenticated endpoint.",
-            file=sys.stderr,
         )
         return 2
     else:
@@ -418,26 +484,25 @@ def main(argv: list[str] | None = None) -> int:
     host = ns.host or cfg.http.host
     port = ns.port or cfg.http.port
     if not isinstance(port, int) or not (1 <= port <= 65535):
-        print(f"ERROR: --port must be an integer in 1..65535 (got {port!r})", file=sys.stderr)
+        controller_log(f"ERROR: --port must be an integer in 1..65535 (got {port!r})")
         return 2
 
-    print(f"hyperv-mcp {VERSION} (streamable-http)", file=sys.stderr)
-    print(f"elevated:            {_elevated()}", file=sys.stderr)
+    controller_log(f"hyperv-mcp {VERSION} (streamable-http)")
+    controller_log(f"elevated:            {_elevated()}")
     for name in (
         "HYPERV_GUEST_USERNAME", "HYPERV_GUEST_PASSWORD", "HYPERV_GUEST_PASSWORD_FILE",
         "HYPERV_GUEST_VICTIM_USERNAME", "HYPERV_GUEST_VICTIM_PASSWORD",
         "HYPERV_GUEST_VICTIM_PASSWORD_FILE",
     ):
-        print(f"{name:20}{'set' if os.environ.get(name) else 'NOT SET'}", file=sys.stderr)
+        controller_log(f"{name:20}{'set' if os.environ.get(name) else 'NOT SET'}")
     elevated = _elevated()
     if not elevated:
-        print(
+        controller_log(
             "NOTE: not elevated. Hyper-V cmdlets work without UAC when this "
             "process token carries the Hyper-V Administrators group; otherwise "
             "launch from an elevated shell.",
-            file=sys.stderr,
         )
-    print(f"endpoint:            http://{host}:{port}/mcp", file=sys.stderr)
+    controller_log(f"endpoint:            http://{host}:{port}/mcp")
     if isinstance(verifier, _MultiTokenVerifier):
         auth_desc = f"per-agent bearer tokens ({len(cfg.http.agents)} agent(s))"
         if len(verifier._pairs) > len(cfg.http.agents):
@@ -446,38 +511,46 @@ def main(argv: list[str] | None = None) -> int:
             auth_desc += " + legacy shared token (local-cli)"
     else:
         auth_desc = "bearer token" if verifier else "ANONYMOUS (--allow-anonymous)"
-    print(f"auth:                {auth_desc}", file=sys.stderr)
+    controller_log(f"auth:                {auth_desc}")
 
     if host not in ("127.0.0.1", "::1", "localhost"):
-        print(
+        controller_log(
             f"WARNING: binding to {host} exposes the endpoint beyond this "
             "machine. The bearer token(s) are the only identity on this "
             "endpoint (per agent when http.agents is configured; one shared "
             "principal otherwise) — prefer an SSH tunnel or a reverse proxy "
-            "with auth.",
-            file=sys.stderr,
+            "with auth. DNS-rebinding protection is ARMED for this bind: "
+            "clients must send a Host header matching the bind address or an "
+            "http.allowed_hosts entry (README, non-loopback section), or the "
+            "request is rejected.",
         )
 
     mcp = get_mcp()
     try:
         # mcp 2.x moved the transport bind off `settings` (the Settings
         # model no longer carries host/port) and onto run(): the kwargs
-        # flow to run_streamable_http_async(host=, port=).
-        mcp.run(transport="streamable-http", host=host, port=port)
+        # flow to run_streamable_http_async(host=, port=). transport_security
+        # arms DNS-rebinding protection for non-loopback binds (issue #69);
+        # loopback keeps None so 2.x auto-enable stays in charge.
+        mcp.run(
+            transport="streamable-http",
+            host=host,
+            port=port,
+            transport_security=_transport_security_for(host, cfg.http.allowed_hosts),
+        )
     except SystemExit as exc:
         # uvicorn converts a bind OSError into SystemExit(STARTUP_FAILURE)
         # before the OSError handler below can see it.
         if exc.code:
-            print(
+            controller_log(
                 "ERROR: streamable-http server failed to start "
                 f"(exit {exc.code}) — is the port already in use?",
-                file=sys.stderr,
             )
             return 1
         raise
     except OSError as exc:
         # e.g. port already bound — surface a clean operator error, not a traceback.
-        print(f"ERROR: streamable-http server failed: {exc}", file=sys.stderr)
+        controller_log(f"ERROR: streamable-http server failed: {exc}")
         return 1
     return 0
 
