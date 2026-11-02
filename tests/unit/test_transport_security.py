@@ -113,7 +113,7 @@ def _assert_run_call_is_wired(seam_name: str) -> None:
         )
 
     wired = [
-        node
+        kw.value
         for node in run_calls
         for kw in node.keywords
         if kw.arg == "transport_security" and _kw_value_is_seam_call(kw.value)
@@ -123,6 +123,29 @@ def _assert_run_call_is_wired(seam_name: str) -> None:
         f"(transport_security must be a {seam_name}(...) call, never None "
         "or an unrelated literal); the transport stays unprotected"
     )
+    # Plan-critic/implementation-review round 1: the seam must be called with
+    # the REAL bind host and the operator's configured hosts -- a call with a
+    # literal (e.g. "127.0.0.1") would leave a 0.0.0.0 bind unprotected while
+    # every seam-level assertion still passed.
+    for call in wired:
+        assert call.args, (
+            f"{seam_name} must be called with the bind host as its first "
+            "argument"
+        )
+        first = call.args[0]
+        assert isinstance(first, ast.Name) and first.id == "host", (
+            f"{seam_name}'s first argument must be the bind-host variable "
+            f"'host', not {ast.dump(first)}; a literal host would bind the "
+            "wrong protection to the real bind address"
+        )
+        assert any(
+            isinstance(sub, ast.Attribute)
+            and sub.attr == "allowed_hosts"
+            for sub in ast.walk(call)
+        ), (
+            f"{seam_name} must receive cfg.http.allowed_hosts so the "
+            "operator's public hosts reach the allow-lists"
+        )
 
 
 def test_nonloopback_bind_arms_dns_rebinding_protection():
@@ -223,3 +246,63 @@ def test_loopback_bind_keeps_protection():
     assert status == 421, (
         f"mcp 2.x auto-enable regressed on loopback (status {status})"
     )
+
+
+def test_main_wires_armed_settings_into_the_running_transport(monkeypatch):
+    """Implementation-review round 1: the seam-level assertions are not
+    enough -- the SETTINGS must reach the transport main actually starts.
+    Drives http_entry.main() with the recorder pattern (the repo's
+    tests/unit/test_c03_http_entry.py::_run_entry_with_recorder shape) and
+    inspects the transport_security keyword handed to mcp.run()."""
+    import importlib
+
+    import hyperv_mcp.server as srv
+
+    importlib.reload(srv)
+    recorded: dict = {}
+
+    def record_run(*args, **kwargs):
+        recorded.update(kwargs)
+        return 0
+
+    real_get_mcp = http_entry.get_mcp
+
+    def wrap_get_mcp():
+        mcp = real_get_mcp()
+        mcp.run = record_run
+        return mcp
+
+    monkeypatch.setattr(http_entry, "get_mcp", wrap_get_mcp)
+    monkeypatch.setattr(http_entry, "configure_http_auth", lambda v: None)
+    rc = http_entry.main(["--host", "0.0.0.0", "--allow-anonymous"])
+    assert rc == 0, f"http_entry.main returned {rc}"
+    assert "transport_security" in recorded, (
+        "http_entry.main did not pass transport_security to mcp.run(); a "
+        "non-loopback bind would run with the middleware disabled"
+    )
+    settings = recorded["transport_security"]
+    assert settings is not None, (
+        "http_entry.main passed transport_security=None for a 0.0.0.0 bind; "
+        "DNS-rebinding protection would be disabled"
+    )
+    assert settings.enable_dns_rebinding_protection is True
+    assert _allowed_hosts_cover(settings.allowed_hosts, "0.0.0.0"), (
+        f"the running transport's allowlist misses the bind host: "
+        f"{settings.allowed_hosts!r}"
+    )
+
+
+def test_allowed_hosts_config_is_parsed_and_reaches_the_allowlists():
+    """Implementation-review round 1: the operator-facing config key must
+    parse (unknown-key rejection must not swallow it) and must reach the
+    seam's allow-lists."""
+    from hyperv_mcp.config import Config
+
+    cfg = Config.from_dict({"http": {"allowed_hosts": ["lab.example.com"]}})
+    assert cfg.http.allowed_hosts == ["lab.example.com"], cfg.http.allowed_hosts
+    seam = _settings_seam()
+    settings = seam("0.0.0.0", cfg.http.allowed_hosts)
+    assert _allowed_hosts_cover(settings.allowed_hosts, "lab.example.com")
+    assert any(
+        "lab.example.com" in origin for origin in (settings.allowed_origins or [])
+    ), f"configured host missing from the origin allowlist: {settings.allowed_origins!r}"

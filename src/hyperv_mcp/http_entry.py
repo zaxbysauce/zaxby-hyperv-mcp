@@ -521,7 +521,8 @@ def main(argv: list[str] | None = None) -> int:
             "principal otherwise) — prefer an SSH tunnel or a reverse proxy "
             "with auth. DNS-rebinding protection is ARMED for this bind: "
             "clients must send a Host header matching the bind address or an "
-            "http.allowed_hosts entry (README, non-loopback section), or the "
+            "http.allowed_hosts entry (README, 'Non-loopback binds: "
+            "DNS-rebinding protection'), or the "
             "request is rejected.",
         )
 

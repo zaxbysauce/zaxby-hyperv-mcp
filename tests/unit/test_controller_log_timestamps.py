@@ -136,6 +136,22 @@ def test_log_lines_carry_iso8601_timestamps(capsys):
     assert TIMESTAMP_PREFIX.match(lines[0]), (
         f"controller log line carries no ISO-8601 UTC timestamp prefix: {lines[0]!r}"
     )
+    # Implementation-review round 1: the PREFIX SHAPE alone is not UTC --
+    # a local-time stamp suffixed "Z" matches the same regex. Parse the
+    # emitted stamp as UTC and compare it with the real UTC clock.
+    from datetime import datetime, timezone
+
+    stamp = lines[0].split(" ", 1)[0]
+    parsed = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
+    )
+    now = datetime.now(timezone.utc)
+    drift = abs((now - parsed).total_seconds())
+    assert drift <= 120, (
+        f"controller log timestamp {stamp!r} is not UTC (drift {drift:.0f}s "
+        f"from {now.isoformat()}); local time suffixed 'Z' matches the shape "
+        "but is the wrong clock"
+    )
 
 
 def test_log_lines_never_carry_the_token_value(monkeypatch, capsys):
@@ -154,4 +170,43 @@ def test_log_lines_never_carry_the_token_value(monkeypatch, capsys):
     blob = "".join(returned) + captured.out + captured.err
     assert "sup3rs3cret-sentinel-value" not in blob, (
         "controller log output leaked the token value"
+    )
+
+
+def test_refusal_paths_never_carry_the_token_value(monkeypatch, capsys):
+    """Implementation-review round 1: the seam-level no-leak floor does
+    not prove the REAL refusal sites are safe. Drive the two serve-path
+    refusals that could echo a value (the per-agent token resolver and the
+    controller's own missing-token branch) and assert no token VALUE
+    reaches the output — the refusal may name the VARIABLE, never the value."""
+    sentinel = "sup3rs3cret-refusal-sentinel"
+    # (a) per-agent resolver: a missing agent variable refuses and names
+    # the agent id + variable name; the value must never appear.
+    monkeypatch.setenv("HYPERV_MCP_TOKEN_AGENT_A", sentinel)
+    rc, pairs = http_entry._resolve_agent_tokens(
+        {"agent-a": "HYPERV_MCP_TOKEN_AGENT_A"}, ""
+    )
+    assert rc == 0 and pairs, pairs
+    captured = capsys.readouterr()
+    assert sentinel not in (captured.out + captured.err), (
+        "the agent-token resolver echoed the token value"
+    )
+    # (b) a non-ASCII / collision refusal path
+    monkeypatch.setenv("HYPERV_MCP_TOKEN_AGENT_B", "not-ascii-\u00e9")
+    rc, _ = http_entry._resolve_agent_tokens(
+        {
+            "agent-a": "HYPERV_MCP_TOKEN_AGENT_A",
+            "agent-b": "HYPERV_MCP_TOKEN_AGENT_B",
+        },
+        "",
+    )
+    assert rc == 2, rc
+    captured = capsys.readouterr()
+    blob = captured.out + captured.err
+    assert sentinel not in blob, "the refusal echoed the token value"
+    assert "agent-b" in blob, (
+        f"the refusal must name the offending agent, not its value: {blob!r}"
+    )
+    assert "never printed" in blob, (
+        f"the refusal must state that values are never printed: {blob!r}"
     )

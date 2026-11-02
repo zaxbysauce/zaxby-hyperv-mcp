@@ -741,7 +741,10 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
   //                                    // OMIT the section entirely for local mode
   //                                    // (the section requires a non-empty host)
   "http": { "host": "127.0.0.1", "port": 8787, "token_env": "HYPERV_MCP_HTTP_TOKEN",
-            "agents": { "agent-a": "HYPERV_MCP_TOKEN_AGENT_A" } }
+            "agents": { "agent-a": "HYPERV_MCP_TOKEN_AGENT_A" },
+            // allowed_hosts: public host names/IPs clients send for a
+            // non-loopback bind (DNS-rebinding protection, issue #69)
+            "allowed_hosts": ["lab.example.com"] }
 }
 ```
 
@@ -849,6 +852,38 @@ directories stripped, the 5.1 system module directory appended). Pointing
 not recommended: the pwsh7 child would lose its pwsh7 module directories on
 every spawn. The knob exists for exotic 5.1 layouts; leave it `null` for
 PowerShell 7 hosts.
+
+## Non-loopback binds: DNS-rebinding protection (0.8.0, issue #69)
+
+`hyperv-mcp-http` binds loopback by default. A non-loopback bind
+(`--host 0.0.0.0`, a LAN IP, or a DNS name) now arms DNS-rebinding
+protection explicitly: requests whose `Host` (or `Origin`) header does not
+match the bind address are rejected with 421 (host) / 403 (origin).
+
+The allow-lists cover the bind address itself (any port, and the bracketed
+IPv6 form). Clients that connect by a DIFFERENT name — the usual LAN case,
+where a browser or agent dials `http://192.168.1.20:8787` while the server
+binds `0.0.0.0` — must be allowed explicitly:
+
+```jsonc
+{
+  "http": {
+    "host": "0.0.0.0",
+    "port": 8787,
+    "token_env": "HYPERV_MCP_HTTP_TOKEN",
+    "allowed_hosts": ["192.168.1.20", "lab.example.com"]
+  }
+}
+```
+
+Each entry contributes its host and host:* forms to the allowed hosts and
+its `http://` / `https://` forms (any port) to the allowed origins. Names
+only — never put a secret in this list. Leave it empty for a bind that is
+only reachable as the bind address itself, or front the endpoint with a
+reverse proxy that rewrites `Host`/`Origin` to the bind address.
+
+Loopback binds are unchanged: mcp 2.x's own auto-enable still applies, and
+no allow-list is needed.
 
 ## Remote Hyper-V host
 
