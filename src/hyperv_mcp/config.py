@@ -452,6 +452,20 @@ class Config:
         host cannot see. Reject it loudly at load time instead.
         """
         normalized = root.replace("/", "\\")
+        if normalized.startswith("\\\\?\\") or normalized.startswith("\\\\.\\"):
+            # Device forms (\\?\..., \\.\...). Only a DRIVE device path
+            # (\\?\C:\...) is equivalent to a drive root; every other device
+            # form is not a guest root at all - accepted, it left the guest
+            # boundary resolving RELATIVE paths against the guest CWD
+            # (implementation-review round 5: "\\?\srv\share" was accepted and
+            # then admitted only "srv\share\x", which the in-guest
+            # GetFullPath resolved against the guest's working directory).
+            tail = normalized[4:]
+            if not (len(tail) >= 2 and tail[1] == ":" and tail[0].isalpha()):
+                raise ConfigError(
+                    f"{key} device-form roots are not supported "
+                    f"(only \\\\*?\\<drive>:\\... is): {root!r}"
+                )
         if normalized.startswith("\\\\"):
             # Issue #37: a UNC root must name the \\server\share PAIR.
             # splitdrive truthiness alone accepts share-less roots (\\server,

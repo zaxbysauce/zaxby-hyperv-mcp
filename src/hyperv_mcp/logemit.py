@@ -19,7 +19,7 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
-__all__ = ["log_line", "timestamp_prefix"]
+__all__ = ["log_line", "log_exception", "timestamp_prefix"]
 
 
 def timestamp_prefix() -> str:
@@ -40,3 +40,21 @@ def log_line(*parts: Any, file: Any = None) -> None:
         f"{timestamp_prefix()} " + " ".join(str(part) for part in parts),
         file=file or sys.stderr,
     )
+
+
+def log_exception(*parts: Any, file: Any = None) -> None:
+    """Emit one controller log line plus the current exception's traceback.
+
+    Every traceback line carries the SAME prefix: the controller log is read
+    line by line, and an unprefixed continuation line would break the
+    "every line is timestamped" property the log is built for (a logger
+    handler that prints a bare traceback does exactly that).
+    """
+    import traceback
+
+    stamp = timestamp_prefix()
+    stream = file or sys.stderr
+    print(f"{stamp} " + " ".join(str(part) for part in parts), file=stream)
+    for line in traceback.format_exc().splitlines():
+        if line.strip():
+            print(f"{stamp} {line}", file=stream)

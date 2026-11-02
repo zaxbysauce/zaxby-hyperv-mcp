@@ -283,11 +283,24 @@ def test_no_unprefixed_stderr_writers_in_the_package():
             if func.name in skip_funcs:
                 continue
             for node in ast.walk(func):
-                if not (
+                is_print = (
                     isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Name)
                     and node.func.id == "print"
-                ):
+                )
+                # A logger call reaches stderr through the root handler
+                # (the SDK installs one) just as a print does, and its
+                # handler prints the message - and any traceback - WITHOUT
+                # a timestamp (implementation-review round 5).
+                is_logger = (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr
+                    in ("exception", "error", "warning", "info", "critical")
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "logger"
+                )
+                if not (is_print or is_logger):
                     continue
                 stderr = False
                 for kw in node.keywords:
@@ -295,7 +308,7 @@ def test_no_unprefixed_stderr_writers_in_the_package():
                         stderr = isinstance(kw.value, ast.Attribute) and (
                             kw.value.attr == "stderr"
                         )
-                if stderr or not node.keywords:
+                if is_logger or stderr or not node.keywords:
                     offenders.append(
                         f"{module.name}:{func.name}:{node.lineno}"
                     )

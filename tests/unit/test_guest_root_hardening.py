@@ -47,6 +47,9 @@ def test_shareless_unc_guest_roots_rejected():
         "//server",
         "//server//",
         "//server/",
+        "\\\\?\\srv\\share",
+        "\\\\.\\srv\\share",
+        "\\\\.\\PhysicalDrive0",
     ):
         cfg = Config()
         cfg.guest_write_roots = [root]

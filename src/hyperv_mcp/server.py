@@ -4135,7 +4135,14 @@ def _harden_tools(mcp: MCPServer) -> None:
                     if cause is not None and not isinstance(cause, ValueError):
                         # A crash also never reaches the SDK's own crash logger
                         # once this guard returns an envelope, so log it here.
-                        logger.exception("tool %s raised an unexpected exception", name)
+                        # Issue #57: the root logger's stderr handler prints
+                        # the message AND the traceback unprefixed, so the
+                        # line reached the controller log without a
+                        # timestamp. The shared emitter keeps the traceback
+                        # and prefixes EVERY line of it.
+                        logemit.log_exception(
+                            f"tool {name} raised an unexpected exception"
+                        )
                     env = errors.envelope(cause if cause is not None else exc)
                     if ops_ctx is not None:
                         operations.fail_inline(ops_ctx, cause if cause is not None else exc)
