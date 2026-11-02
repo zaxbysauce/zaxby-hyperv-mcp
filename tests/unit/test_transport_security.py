@@ -292,6 +292,27 @@ def test_main_wires_armed_settings_into_the_running_transport(monkeypatch):
     )
 
 
+def test_configured_host_with_port_is_not_bracketed():
+    """Implementation-review round 6 (question) + the M20 mutant: a
+    configured entry that carries a PORT ('lab.example.com:8787') must
+    stay in its host:port form - bracketing it ('[lab.example.com:8787]')
+    makes it match nothing, because the matcher splits host and port."""
+    seam = _settings_seam()
+    settings = seam("0.0.0.0", ("lab.example.com:8787",))
+    assert settings is not None
+    assert "lab.example.com:8787" in settings.allowed_hosts, (
+        "a configured host:port entry must keep its own form: "
+        f"{settings.allowed_hosts!r}"
+    )
+    assert "[lab.example.com:8787]" not in settings.allowed_hosts, (
+        "a host:port entry was bracketed as an IPv6 literal: "
+        f"{settings.allowed_hosts!r}"
+    )
+    # A bare IPv6 literal IS bracketed (more than one colon).
+    v6 = seam("0.0.0.0", ("2001:db8::1",))
+    assert "[2001:db8::1]" in v6.allowed_hosts, v6.allowed_hosts
+
+
 def test_allowed_hosts_config_is_parsed_and_reaches_the_allowlists():
     """Implementation-review round 1: the operator-facing config key must
     parse (unknown-key rejection must not swallow it) and must reach the
