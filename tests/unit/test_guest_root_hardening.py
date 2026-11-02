@@ -55,10 +55,20 @@ def test_shareless_unc_guest_roots_rejected():
 
 
 def test_wellformed_unc_guest_roots_accepted():
-    # The well-formed pair in every separator form (Windows accepts both).
+    # The well-formed pair in the BACKSLASH spelling (unchanged behavior:
+    # green before and after the fix).
+    for root in ("\\\\srv\\share", "\\\\srv\\share\\sub"):
+        cfg = Config()
+        cfg.guest_write_roots = [root]
+        cfg.validate()  # must not raise ConfigError
+
+
+def test_forward_slash_wellformed_unc_guest_roots_accepted():
+    # The same well-formed pair in the FORWARD-slash and mixed spellings.
+    # Windows accepts both, and the pre-fix validator rejected them (its
+    # splitdrive parse only understood the backslash drive), so this leg is
+    # RED at base and GREEN after the normalization fix.
     for root in (
-        "\\\\srv\\share",
-        "\\\\srv\\share\\sub",
         "//srv/share",
         "//srv/share/sub",
         "\\\\srv//share",
