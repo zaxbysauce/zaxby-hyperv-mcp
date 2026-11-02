@@ -59,6 +59,7 @@ from . import (
     harvest,
     leases,
     lifecycle,
+    logemit,
     media,
     operations,
     policy,
@@ -357,55 +358,54 @@ def _startup_banner(cfg: Config) -> None:
     # The Hyper-V target line prints FIRST and unconditionally: unrestricted
     # mode early-returns below, and remote lab deployments are exactly the
     # unrestricted ones (issue #43) — the target must never be silenced.
+    # Issue #57: these lines land in the controller's redirected per-user log
+    # (stdio_proxy spawns the controller with stdout=log, stderr=STDOUT), so
+    # they carry the same ISO-8601 UTC prefix as every other controller log
+    # line — a per-file helper left the banner unprefixed.
     target = cfg.hyperv.host
     if target:
-        print(
+        logemit.log_line(
             f"[hyperv-mcp] Hyper-V target: remote host {target} "
             "(run `hyperv-mcp --check-env` to verify target reachability)",
-            file=sys.stderr,
         )
     else:
-        print("[hyperv-mcp] Hyper-V target: local host", file=sys.stderr)
-    print(f"[hyperv-mcp] policy: {cfg.policy_summary()}", file=sys.stderr)
+        logemit.log_line("[hyperv-mcp] Hyper-V target: local host")
+    logemit.log_line(f"[hyperv-mcp] policy: {cfg.policy_summary()}")
     # Issue #22: the durable state store is always on. Print where it lives so
     # an operator can find (and back up, or delete) it.
-    print(f"[hyperv-mcp] state store: {statestore.resolve_state_db_path(cfg)}",
-          file=sys.stderr)
+    logemit.log_line(
+        f"[hyperv-mcp] state store: {statestore.resolve_state_db_path(cfg)}"
+    )
     if cfg.unrestricted:
-        print(
+        logemit.log_line(
             "[hyperv-mcp] WARNING: UNRESTRICTED mode — every policy axis is "
             "fully open and destructive operations are category-enabled. "
             "Only appropriate on disposable lab hosts.",
-            file=sys.stderr,
         )
         return
     configured = cfg.configured_axes()
     if configured:
-        print(
+        logemit.log_line(
             f"[hyperv-mcp] INFO: configured axes (deny-by-default outside "
             f"each allowlist): {', '.join(configured)}",
-            file=sys.stderr,
         )
     else:
-        print(
+        logemit.log_line(
             "[hyperv-mcp] NOTE: every policy axis is currently DENIED. "
             "Set HYPERV_MCP_CONFIG or HYPERV_MCP_UNRESTRICTED=1 to allow work.",
-            file=sys.stderr,
         )
     # A "*" pattern or a drive-root entry means the axis is effectively
     # fully open even though it is "configured" — keep a WARNING for it.
     if "*" in cfg.allowed_vm_patterns:
-        print(
+        logemit.log_line(
             "[hyperv-mcp] WARNING: allowed_vm_patterns contains '*' — every "
             "VM on this host can be targeted.",
-            file=sys.stderr,
         )
     for axis in ("host_read_roots", "host_write_roots", "guest_read_roots", "guest_write_roots"):
         if any(r.rstrip("\\/").endswith(":") for r in getattr(cfg, axis)):
-            print(
+            logemit.log_line(
                 f"[hyperv-mcp] WARNING: {axis} contains a drive root — the "
                 "entire drive is within policy.",
-                file=sys.stderr,
             )
 
 

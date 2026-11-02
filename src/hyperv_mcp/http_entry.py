@@ -26,13 +26,12 @@ import os
 import secrets
 import shutil
 import sys
-from datetime import datetime, timezone
 from typing import Any
 
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.transport_security import TransportSecuritySettings
 
-from . import pswindows
+from . import logemit, pswindows
 from .config import Config, ConfigError
 from .server import VERSION, bootstrap, configure_http_auth, get_mcp
 
@@ -105,15 +104,17 @@ def controller_log(*parts: Any, file: Any = None) -> None:
     per-user log file; prefixing AT EMIT TIME makes spawn/refusal history
     diagnosable from the log alone (ordering, rate, burst windows) instead
     of reconstructed from filesystem mtimes. Every serve-path line routes
-    through this helper; the interactive --install-logon-task prints (the
+    through this helper — including the server bootstrap banner
+    (server._startup_banner) and the audit stream (auditlog._emit), which
+    share the emitter in `logemit` so no per-module helper can leave a
+    line unprefixed. The interactive --install-logon-task prints (the
     operator's own shell, not the redirected log) deliberately do not.
     Token values must never be passed here (AC floor: emission sites print
     variable NAMES, never values). ``file`` resolves LATE (None -> the
     current sys.stderr) so test capture and runtime redirection both see
     the line — a ``file=sys.stderr`` default would bind the original
     stream object at import time and bypass any later swap."""
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    print(f"{stamp} " + " ".join(str(part) for part in parts), file=file or sys.stderr)
+    logemit.log_line(*parts, file=file)
 
 
 def _transport_security_for(

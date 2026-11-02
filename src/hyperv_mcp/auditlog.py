@@ -20,7 +20,6 @@ the stderr line is forced on so the bypass stays visible.
 from __future__ import annotations
 
 import json
-import sys
 import threading
 import time
 import uuid
@@ -29,7 +28,7 @@ from typing import Literal
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 
-from . import credentials, vmlocks
+from . import credentials, logemit, vmlocks
 from . import timing as timing_mod
 from .config import Config
 
@@ -68,9 +67,11 @@ def _emit(line: str) -> None:
                 fh.write(line + "\n")
         if _config is not None and _config.unrestricted:
             # Unrestricted bypass stays visible even when a file sink is set.
-            print(f"[hyperv-mcp audit] {line}", file=sys.stderr)
+            # Issue #57: the audit stream reaches the controller's redirected
+            # per-user log, so it carries the same ISO-8601 UTC prefix.
+            logemit.log_line(f"[hyperv-mcp audit] {line}")
     else:
-        print(f"[hyperv-mcp audit] {line}", file=sys.stderr)
+        logemit.log_line(f"[hyperv-mcp audit] {line}")
 
 
 def log_operation(

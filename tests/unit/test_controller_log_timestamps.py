@@ -173,6 +173,42 @@ def test_log_lines_never_carry_the_token_value(monkeypatch, capsys):
     )
 
 
+def test_main_output_is_fully_timestamped(monkeypatch, capsys):
+    """Implementation-review round 3: the per-file AST walk could not see
+    the modules main() IMPORTS — the server bootstrap banner and the audit
+    stream reached the redirected per-user log UNPREFIXED while every
+    seam-level assertion passed. This leg captures what main() actually
+    writes and requires EVERY non-empty line to carry the prefix."""
+    import importlib
+
+    import hyperv_mcp.server as srv
+
+    importlib.reload(srv)
+    real_get_mcp = http_entry.get_mcp
+
+    def wrap_get_mcp():
+        mcp = real_get_mcp()
+        mcp.run = lambda *a, **k: 0
+        return mcp
+
+    monkeypatch.setattr(http_entry, "get_mcp", wrap_get_mcp)
+    monkeypatch.setattr(http_entry, "configure_http_auth", lambda v: None)
+    rc = http_entry.main(["--host", "127.0.0.1", "--allow-anonymous"])
+    assert rc == 0, f"http_entry.main returned {rc}"
+    captured = capsys.readouterr()
+    lines = [
+        line
+        for line in (captured.out + captured.err).splitlines()
+        if line.strip()
+    ]
+    assert lines, "main() produced no observable output to check"
+    unprefixed = [line for line in lines if not TIMESTAMP_PREFIX.match(line)]
+    assert not unprefixed, (
+        "controller output reached the redirected log without the ISO-8601 "
+        f"UTC prefix: {unprefixed!r}"
+    )
+
+
 def test_refusal_paths_never_carry_the_token_value(monkeypatch, capsys):
     """Implementation-review round 1+2: the seam-level no-leak floor does
     not prove the REAL refusal sites are safe. Drive the serve-path
