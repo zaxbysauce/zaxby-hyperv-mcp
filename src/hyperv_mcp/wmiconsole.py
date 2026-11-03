@@ -983,9 +983,14 @@ def backend(cfg: Config) -> ConsoleWMI:
     # The CONNECT runs OUTSIDE the process-global cache lock, under a
     # per-host connect lock: a slow credentialed DCOM connect for one host
     # must not stall backend acquisition for every other host
-    # (implementation-review). The per-host lock keeps the single-flight
-    # property: concurrent first callers for the SAME host wait here and
-    # then hit the cached backend instead of each opening a DCOM connect.
+    # (implementation-review). The per-host lock keeps ONE connect in
+    # flight per host: a caller that arrives while another is connecting
+    # waits here and then finds the backend in the cache. On the FAILURE
+    # path the negative memo is re-read under this lock, so a second
+    # caller shares the first caller's failure instead of opening its own
+    # connect (the failure path is the single-flighted one: on the healthy
+    # path each thread connects for ITSELF, because a service is never
+    # handed to a worker other than its creator).
     with _connect_lock(host_key):
         with _backend_lock:
             be = _backends.get(key)

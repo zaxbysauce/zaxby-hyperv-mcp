@@ -330,6 +330,34 @@ def test_uvicorn_access_records_keep_their_args_contract():
         )
 
 
+def test_a_failing_log_stream_does_not_break_the_caller():
+    """PRR-008: the controller's stderr IS the shared per-user log volume,
+    so a write failure (a full or closed log) must not turn a tool's
+    failure into an unstructured I/O error - the emitter swallows it.
+
+    The pin is the ABSENCE of an exception: reaching the line after the
+    emission IS the assertion (a swallowed failure is the contract)."""
+    from hyperv_mcp import logemit
+
+    class _BrokenStream:
+        """A log volume that refuses every write."""
+
+        def write(self, _text):
+            raise OSError("the log volume is closed")
+
+        def flush(self):
+            raise OSError("the log volume is closed")
+
+    broken = _BrokenStream()
+    logemit.log_line("a line that cannot be written", file=broken)
+    try:
+        raise ValueError("deliberate probe failure")
+    except ValueError:
+        logemit.log_exception("a summary that cannot be written", file=broken)
+    # No exception escaped: the emitter's contract is that a log failure
+    # never reaches the caller.
+
+
 def test_log_line_prefixes_every_physical_line(capsys):
     """PRR-003 (closeout-review finding 13): a payload with an embedded
     newline must not leak an unprefixed continuation line - the log is
