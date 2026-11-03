@@ -306,6 +306,53 @@ def test_worker_identity_distinguishes_same_named_workers(monkeypatch):
         assert "worker AnyIO worker thread#" in message, message
 
 
+def test_concurrent_callers_open_one_connect(monkeypatch):
+    """The per-host connect lock is SINGLE-FLIGHT: concurrent callers for
+    the SAME host must not each open a DCOM connect (the review's probe:
+    two callers against a failing host -> two connect calls).
+
+    The negative memo is re-read UNDER the connect lock, so the second
+    caller sees the first caller's failure instead of connecting again."""
+    import time as _time
+
+    cfg = Config()
+    _install_fake_service(monkeypatch)
+
+    calls: list = []
+
+    class FailingLocator:
+        def ConnectServer(self, *args):
+            calls.append(1)
+            # Hold the connect long enough for the second caller to
+            # arrive and queue on the per-host lock.
+            _time.sleep(0.3)
+            raise RuntimeError("DCOM endpoint is down")
+
+    monkeypatch.setattr(wmiconsole, "_locator", lambda: FailingLocator())
+
+    errors: list = []
+
+    def caller() -> None:
+        try:
+            wmiconsole.backend(cfg)
+        except Exception as exc:  # noqa: BLE001 - the failure is the subject
+            errors.append(type(exc).__name__)
+
+    threads = [threading.Thread(target=caller, name=f"wmi-single-{i}") for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+        assert not t.is_alive(), "CONNECT_CALLER_TIMED_OUT"
+
+    assert len(calls) == 1, (
+        f"concurrent callers opened {len(calls)} connects: the per-host "
+        "connect lock is not single-flight"
+    )
+    assert len(errors) == 2, errors
+    assert all(name == "BackendUnavailable" for name in errors), errors
+
+
 def test_replacement_worker_failure_does_not_replay_input(monkeypatch):
     cfg = Config(unrestricted=True)
     _install_fake_service(monkeypatch)
