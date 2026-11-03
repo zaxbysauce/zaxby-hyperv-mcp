@@ -135,7 +135,11 @@ def test_connect_section_states_the_plaintext_token_storage():
         "the connect section does not state that a persistent .mcp.json "
         "stores the token in plaintext"
     )
-    assert "never in argv or the config file" not in connect, (
+    # Match on whitespace-NORMALIZED text: the contradiction the fix
+    # removed was wrapped across lines ("never in argv or the config\nfile."),
+    # so a raw-text match would not have seen it.
+    flat = " ".join(connect.split())
+    assert "never in argv or the config file" not in flat, (
         "the connect section still claims the token never enters a config "
         "file, while its own .mcp.json example persists it there"
     )
