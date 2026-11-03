@@ -57,14 +57,17 @@ def _inline_tools() -> list:
     shape on a throwaway MCPServer instance."""
     global _INLINE_TOOLS
     if _INLINE_TOOLS is None:
+        import tempfile
+
         from mcp.server.mcpserver import MCPServer
 
         from hyperv_mcp import server
         from hyperv_mcp.config import Config
 
+        audit_tmp = Path(tempfile.mkdtemp(prefix="d04-inline-variant-"))
         cfg = Config(
             unrestricted=True,
-            audit_log_path=str(_REPO / ".zcode-work-audit-variant.jsonl"),
+            audit_log_path=str(audit_tmp / "audit-variant.jsonl"),
             allow_inline_credentials=True,
         )
         mcp = MCPServer("hyperv_mcp_inline_variant", version="0.0.0-test")

@@ -857,7 +857,9 @@ def test_default_mode_autostarts_controller_when_absent(tmp_path):
         # Patient bounded wait (issue #71): the controller outlives the
         # proxy, so give its listener up to one auto-start budget to answer
         # instead of a single 2 s connect probe that host load can starve.
-        deadline = time.monotonic() + 30.0
+        from hyperv_mcp.stdio_proxy import AUTOSTART_WAIT_S
+
+        deadline = time.monotonic() + AUTOSTART_WAIT_S
         listening = False
         while time.monotonic() < deadline:
             if _port_open(port):
