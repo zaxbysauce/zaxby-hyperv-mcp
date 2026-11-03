@@ -253,8 +253,8 @@ the task-spawned controller reads it from the environment.
   audit stream and the endpoint notice — they all share one emitter
   (`hyperv_mcp.logemit`), which also prefixes every line of a multi-line
   payload. The SDK's and uvicorn's own records land in the same file, so a
-  process-wide record filter stamps those too (uvicorn's access line carries
-  the stamp in its client-address field). The interactive
+  process-wide record factory stamps those too (uvicorn's access line
+  carries the stamp in its client-address field). The interactive
   `--install-logon-task` prints keep their operator-shell format (they are
   written to the operator's terminal, not to the redirected log).
 - **Guest-root UNC validation hardened (#37):** share-less UNC roots
@@ -884,10 +884,13 @@ binds `0.0.0.0` — must be allowed explicitly:
 ```
 
 Each entry contributes its host and host:* forms to the allowed hosts and
-its `http://` / `https://` forms (any port) to the allowed origins. Names
-only — never put a secret in this list. Entries are validated at load: a
-scheme, a path, a wildcard or a name with whitespace is rejected at
-startup rather than silently failing to match any request.
+its `http://` / `https://` forms (any port) to the allowed origins. An
+entry that already names a PORT (`lab.example.com:8787`) contributes only
+its exact form — the `host:port:*` sibling could never match a Host
+header. Names only — never put a secret in this list. Entries are
+validated at load: a scheme, a path, a wildcard, a name with whitespace,
+a malformed address or an out-of-range port is rejected at startup rather
+than silently failing to match any request.
 
 For a WILDCARD bind (`0.0.0.0`, `::`) the loopback forms
 (`127.0.0.1`, `localhost`, `[::1]`) are admitted automatically — this

@@ -32,7 +32,7 @@ __all__ = [
     "log_line",
     "log_exception",
     "timestamp_prefix",
-    "install_log_prefix_filter",
+    "install_log_prefix",
 ]
 
 
@@ -79,20 +79,28 @@ def log_exception(*parts: Any, file: Any = None) -> None:
 
     Every traceback line carries the SAME prefix: the controller log is
     read line by line, and an unprefixed continuation line would break
-    the "every line is timestamped" property the log is built for.
+    the "every line is timestamped" property the log is built for. The
+    summary line is split the same way log_line splits its payload, so a
+    multi-part summary cannot leak an unprefixed continuation either.
     """
     import traceback
 
     stamp = timestamp_prefix()
     stream = file or sys.stderr
-    _write(f"{stamp} " + " ".join(str(part) for part in parts), stream)
+    summary = " ".join(str(part) for part in parts)
+    for line in summary.splitlines() or [""]:
+        _write(f"{stamp} {line}" if line else f"{stamp}", stream)
     for line in traceback.format_exc().splitlines():
         if line.strip():
             _write(f"{stamp} {line}", stream)
 
 
 _PREFIXED_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z(\s|$)")
-_INSTALLED_FACTORY: Any = None
+# Marker set on the installed factory: the guard is "is the CURRENT
+# factory ours?", not "did we ever install one?" - a caller that
+# REPLACES the factory (a test restoring the previous one) must be able
+# to install again without a second stamp stacking on every record.
+_FACTORY_MARKER = "_hyperv_log_prefix_factory"
 
 
 def _prefix_record(record: logging.LogRecord) -> None:
@@ -112,10 +120,16 @@ def _prefix_record(record: logging.LogRecord) -> None:
       INTO the controller log, so the stamp goes into the client address
       instead and the tuple contract is preserved.
     """
+    rendered = True
     try:
         message = record.getMessage()
     except Exception:  # noqa: BLE001 - never break the log call
-        return
+        # The message cannot be rendered (a stray "%" with no args, a
+        # broken format tuple). The record must still be stamped: fall
+        # back to the raw message and CONSUME the args (they are what
+        # broke the rendering).
+        rendered = False
+        message = record.msg if isinstance(record.msg, str) else ""
     if not isinstance(message, str) or _PREFIXED_RE.match(message):
         return
     try:
@@ -136,9 +150,10 @@ def _prefix_record(record: logging.LogRecord) -> None:
             elif isinstance(client, str):
                 record.args = (f"{stamp} {client}",) + record.args[1:]
             return
-        if "\n" in message:
-            # A multi-line payload: embed the RENDERED text so that every
-            # physical line carries the prefix (the args are consumed).
+        if "\n" in message or not rendered:
+            # A multi-line payload (or an unrenderable one): embed the
+            # RENDERED text so that every physical line carries the prefix
+            # (the args are consumed).
             record.msg = "\n".join(
                 f"{stamp} {line}" if line else stamp for line in message.splitlines()
             )
@@ -151,7 +166,7 @@ def _prefix_record(record: logging.LogRecord) -> None:
         pass
 
 
-def install_log_prefix_filter() -> None:
+def install_log_prefix() -> None:
     """Prefix EVERY record the process logs with the ISO-8601 UTC stamp.
 
     The controller's redirected streams also carry the SDK's own records
@@ -165,9 +180,8 @@ def install_log_prefix_filter() -> None:
     configure_logging() replaces the root handlers at startup. The global
     RECORD FACTORY is the one hook that sees every record the process
     creates, whichever logger and handler it ends up in."""
-    global _INSTALLED_FACTORY
     base = logging.getLogRecordFactory()
-    if _INSTALLED_FACTORY is not None and base is _INSTALLED_FACTORY:
+    if getattr(base, _FACTORY_MARKER, False):
         # Already installed (the controller calls this once per start); a
         # second call must not STACK a second prefix on every record.
         return
@@ -177,5 +191,5 @@ def install_log_prefix_filter() -> None:
         _prefix_record(record)
         return record
 
+    setattr(factory, _FACTORY_MARKER, True)
     logging.setLogRecordFactory(factory)
-    _INSTALLED_FACTORY = factory

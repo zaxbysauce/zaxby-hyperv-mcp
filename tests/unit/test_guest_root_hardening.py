@@ -119,15 +119,46 @@ def test_shareless_unc_root_does_not_widen_the_guest_boundary():
 
 
 def test_parent_reference_roots_are_rejected():
-    """A root ending in a parent reference ("C:\\guest\\..") is the
+    """A root CONTAINING a parent reference ("C:\\guest\\..") is the
     drive-side twin of the #37 hole: the guest boundary is lexical, so it
     normalizes to the drive root and widens the guest scope to the whole
-    drive (implementation-review)."""
-    for root in ("C:\\guest\\..", "C:/guest/..", "D:\\guest\\..\\"):
+    drive (implementation-review).
+
+    The check is on the COMPONENTS, so every spelling that normalizes to
+    the drive root is caught - the suffix-only form missed the ones that
+    carry a trailing separator or a "." component ("C:\\guest\\..\\.").
+    """
+    for root in (
+        "C:\\guest\\..",
+        "C:/guest/..",
+        "D:\\guest\\..\\",
+        "C:\\guest\\..\\.",
+        "C:/guest/../.",
+        "C:\\guest\\..\\..\\.",
+        "C:\\guest\\sub\\..",
+        "\\\\?\\C:\\guest\\..\\.",
+    ):
         cfg = Config()
         cfg.guest_write_roots = [root]
         with pytest.raises(ConfigError):
             cfg.validate()
+
+    # A name that merely ENDS in two dots is NOT a parent reference and
+    # must stay loadable.
+    ok = Config()
+    ok.guest_write_roots = ["C:\\guest\\backup.."]
+    ok.validate()
+
+
+def test_parent_reference_root_cannot_widen_the_boundary():
+    """The IMPACT of the parent-reference class: even if such a root
+    reached the policy layer, it must not admit a path outside the
+    intended guest subtree."""
+    scoped = Config()
+    scoped.guest_write_roots = ["//srv/share"]
+    scoped.validate()
+    with pytest.raises(policy.PolicyDenied):
+        policy.check_guest_write(scoped, "\\\\srv\\other-share\\file.txt")
 
 
 def test_device_namespace_roots_are_rejected():

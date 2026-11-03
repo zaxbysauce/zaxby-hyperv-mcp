@@ -569,3 +569,63 @@ def test_get_destination_equal_to_host_root_denied(monkeypatch, rooted_cfg, tmp_
             str(tmp_path / "host-dst"), cred=CRED,
         )
     assert fake.scripts == []
+
+
+def test_makedirs_tracked_returns_created_dirs_leaf_first(tmp_path):
+    """The caller prunes the returned list FORWARD, so it must be leaf
+    first: with two or more created levels, removing the root first fails
+    (the child still exists) and the husks survive (closeout-review
+    finding 2 - a regression the fix wave introduced)."""
+    from hyperv_mcp.filetransfer import _makedirs_tracked
+
+    target = tmp_path / "level1" / "level2" / "level3"
+    created = _makedirs_tracked(str(target))
+    assert len(created) == 3, created
+    assert created == sorted(created, key=len, reverse=True), (
+        f"the created directories are not leaf first: {created}"
+    )
+    assert created[0].endswith("level3"), created
+    assert created[-1].endswith("level1"), created
+
+
+def test_cleanup_failed_get_prunes_every_created_level(tmp_path):
+    """The end-to-end consequence: a transfer that fails after creating
+    two levels must leave NEITHER of them behind."""
+    from hyperv_mcp.filetransfer import _cleanup_failed_get, _makedirs_tracked
+
+    staged = tmp_path / "staged.bin"
+    staged.write_bytes(b"x")
+    # The caller creates the DESTINATION's parent chain, so the chain is
+    # the two directory levels (the file itself is never a component).
+    target = tmp_path / "level1" / "level2"
+    created = _makedirs_tracked(str(target))
+    assert len(created) == 2, created
+    _cleanup_failed_get(str(staged), created)
+    assert not staged.exists(), "the staged file survived the cleanup"
+    assert not (tmp_path / "level1").exists(), (
+        "a created level survived the cleanup: " + str(created)
+    )
+
+
+def test_makedirs_tracked_composes_a_unc_chain(monkeypatch):
+    """A UNC path must be composed from the server+share DRIVE plus the
+    remaining components - building it from the whole path would recreate
+    the share inside itself ("\\\\srv\\share\\srv\\share\\newdir")
+    and never create the requested directory (closeout-review finding 3).
+    """
+    from hyperv_mcp import filetransfer
+
+    attempted: list = []
+
+    def fake_isdir(path):
+        return False
+
+    def fake_mkdir(path):
+        attempted.append(path)
+
+    monkeypatch.setattr(filetransfer.os.path, "isdir", fake_isdir)
+    monkeypatch.setattr(filetransfer.os, "mkdir", fake_mkdir)
+    filetransfer._makedirs_tracked("\\\\srv\\share\\newdir")
+    # Exactly ONE component is created, under the share - never the share
+    # rebuilt inside itself.
+    assert attempted == ["\\\\srv\\share\\newdir"], attempted

@@ -331,6 +331,28 @@ def test_configured_host_with_port_is_not_bracketed():
     assert "lab.example.com:*" in portless.allowed_hosts, portless.allowed_hosts
 
 
+def test_wildcard_bind_admits_the_loopback_forms():
+    """PRR-001 (closeout-review finding 13): a WILDCARD bind is reached
+    over loopback by this repo's own stdio proxy (the proxy maps a
+    wildcard to 127.0.0.1 so the bearer token never crosses a routable
+    interface). Without the loopback forms in the allow-list every call
+    through the proxy is refused with 421.
+
+    This leg is DISCRIMINATING: deleting the wildcard block leaves every
+    other check green, so the admission needs its own pin."""
+    seam = _settings_seam()
+    for bind in ("0.0.0.0", "::"):
+        settings = seam(bind, ())
+        assert settings is not None
+        for form in ("127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*"):
+            assert form in settings.allowed_hosts, (
+                f"a wildcard bind on {bind} does not admit {form}: "
+                f"{settings.allowed_hosts!r}"
+            )
+        assert "[::1]" in settings.allowed_hosts, settings.allowed_hosts
+        assert "[::1]:*" in settings.allowed_hosts, settings.allowed_hosts
+
+
 def test_allowed_hosts_config_is_parsed_and_reaches_the_allowlists():
     """Implementation-review round 1: the operator-facing config key must
     parse (unknown-key rejection must not swallow it) and must reach the
@@ -363,6 +385,11 @@ def test_malformed_allowed_hosts_entries_are_rejected_at_load():
         "",                         # empty
         "lab.example.com:",         # an empty port
         "lab.example.com:notaport",  # a non-numeric port
+        "lab.example.com:99999",    # a port above 65535
+        "999.999.999.999",          # not an IPv4 address
+        "10.0.0.5:0",               # a port below 1
+        "[::1]:99999",               # an out-of-range port on a literal
+        "[::1",                     # an unclosed bracket
     ):
         with pytest.raises(ConfigError):
             Config.from_dict({"http": {"allowed_hosts": [bad]}})
@@ -371,6 +398,8 @@ def test_malformed_allowed_hosts_entries_are_rejected_at_load():
     for good in (
         "lab.example.com",
         "lab.example.com:8787",
+        "lab.example.com.",          # the FQDN root form
+        "MY_PC",                      # a Windows NetBIOS name
         "10.0.0.5",
         "10.0.0.5:8787",
         "localhost",

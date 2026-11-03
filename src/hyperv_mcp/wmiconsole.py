@@ -960,7 +960,9 @@ def backend(cfg: Config) -> ConsoleWMI:
     executed replacement-worker probe shows exactly the
     1-pass/3-fail signature). A cache hit whose creator has exited is
     dropped and the connection is re-established on the REQUESTING
-    thread; the negative memo and its TTL are unchanged."""
+    thread; the negative memo keeps its TTL, is re-read under the
+    per-host connect lock (single-flight) and is cleared by a
+    successful connect."""
     key = _cache_key(cfg)
     host_key = _host_key(cfg)
     with _backend_lock:
@@ -991,6 +993,17 @@ def backend(cfg: Config) -> ConsoleWMI:
                 creator = be.creator
                 if creator is not None and creator.is_alive():
                     return be
+            # The memo is RE-READ under the connect lock: a caller that
+            # passed the outer check while another thread was failing the
+            # connect must see the failure instead of opening a second
+            # connect (the single-flight property the old all-under-one-
+            # lock shape had).
+            memo = _connect_failures.get(host_key)
+            if memo is not None:
+                failed_at, err = memo
+                if time.monotonic() - failed_at < _CONNECT_FAILURE_TTL_S:
+                    raise err
+                _connect_failures.pop(host_key, None)
         try:
             service = connect_service(cfg)
         except BackendUnavailable as exc:
@@ -1000,6 +1013,10 @@ def backend(cfg: Config) -> ConsoleWMI:
         be = ConsoleWMI(service)
         with _backend_lock:
             _backends[key] = be
+            # A successful connect clears the host's negative memo: the
+            # host is reachable, so a stale failure must not keep
+            # refusing the NEXT worker for the rest of the TTL.
+            _connect_failures.pop(host_key, None)
         return be
 
 

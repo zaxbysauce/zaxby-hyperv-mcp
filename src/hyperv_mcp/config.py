@@ -15,6 +15,7 @@ a control.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import ntpath
 import os
@@ -47,20 +48,64 @@ _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # optionally with a port. A scheme, a path, a wildcard or whitespace is a
 # typo that would silently produce allow-list forms matching no real Host
 # header (and so refuse every client) — reject it at load instead.
-_HOST_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
-_ALLOWED_HOST_RE = re.compile(
-    r"^(?:"
-    r"\[[0-9A-Fa-f:.]+\]"                 # bracketed IPv6 literal
-    r"|[0-9A-Fa-f:]*:[0-9A-Fa-f:.]+"      # bare IPv6 literal (contains a colon)
-    r"|(?:[0-9]{1,3}\.){3}[0-9]{1,3}"     # IPv4 literal
-    r"|" + _HOST_LABEL + r"(?:\." + _HOST_LABEL + r")*"  # hostname (dotted)
-    r")"
-    r"(?::[0-9]{1,5})?$"                  # optional port
+#
+# A hostname label may contain "_" (a Windows NetBIOS name is a legitimate
+# operator host) and the FQDN root form may carry a trailing dot.
+_HOST_LABEL = r"[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?"
+_ALLOWED_HOST_NAME_RE = re.compile(
+    r"^" + _HOST_LABEL + r"(?:\." + _HOST_LABEL + r")*\.?$"
 )
 
 
+def _split_host_port(value: str) -> tuple[str, int | None]:
+    """Split an allow-list entry into (host, port).
+
+    A bracketed IPv6 literal keeps its brackets stripped; a bare IPv6
+    literal (more than one colon) has no port of its own.
+    """
+    if value.startswith("["):
+        end = value.find("]")
+        if end == -1:
+            raise ConfigError(
+                f"http.allowed_hosts entries must close a bracketed address: {value!r}"
+            )
+        host = value[1:end]
+        rest = value[end + 1 :]
+        if not rest:
+            return host, None
+        if not rest.startswith(":"):
+            raise ConfigError(
+                "http.allowed_hosts entries must be a host name or address, "
+                f"optionally with a port: {value!r}"
+            )
+        port_text = rest[1:]
+        if not port_text.isdigit():
+            raise ConfigError(
+                f"http.allowed_hosts entries must name a numeric port: {value!r}"
+            )
+        return host, int(port_text)
+    if value.count(":") == 1:
+        host, _, port_text = value.rpartition(":")
+        if not port_text.isdigit():
+            raise ConfigError(
+                f"http.allowed_hosts entries must name a numeric port: {value!r}"
+            )
+        return host, int(port_text)
+    # No colon (a hostname or an IPv4 literal) or more than one (a bare
+    # IPv6 literal): the whole value is the host.
+    return value, None
+
+
 def _set_allowed_host(value: str) -> str:
-    """Validate one http.allowed_hosts entry (PRR-004)."""
+    """Validate one http.allowed_hosts entry (PRR-004).
+
+    The entry must be a real host the operator's clients dial: a host
+    name, an IPv4/IPv6 literal (bracketed or bare), each optionally with a
+    port in 1..65535. A scheme, a path, a wildcard, whitespace, an
+    unparsable address or an out-of-range port would produce allow-list
+    forms matching no real Host header (and so refuse every client) —
+    reject it at load instead.
+    """
     if value != value.strip() or " " in value:
         raise ConfigError(
             f"http.allowed_hosts entries must not contain whitespace: {value!r}"
@@ -70,11 +115,28 @@ def _set_allowed_host(value: str) -> str:
             "http.allowed_hosts entries must be host names or addresses "
             "(no scheme, path or wildcard): " + repr(value)
         )
-    if not _ALLOWED_HOST_RE.match(value):
+    host, port = _split_host_port(value)
+    if not host:
         raise ConfigError(
             "http.allowed_hosts entries must be a host name or address, "
-            "optionally with a port: " + repr(value)
+            f"optionally with a port: {value!r}"
         )
+    if port is not None and not (1 <= port <= 65535):
+        raise ConfigError(
+            f"http.allowed_hosts entries must name a port in 1..65535: {value!r}"
+        )
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        # Not an address: it must be a syntactically valid host name. A
+        # numeric dotted form that is NOT a valid address ("999.999.999.999")
+        # is a malformed address, not a host name.
+        looks_numeric = all(c.isdigit() or c == "." for c in host)
+        if looks_numeric or not _ALLOWED_HOST_NAME_RE.match(host):
+            raise ConfigError(
+                "http.allowed_hosts entries must be a host name or address, "
+                f"optionally with a port: {value!r}"
+            ) from None
     return value
 
 
@@ -514,16 +576,24 @@ class Config:
                 raise ConfigError(
                     f"{key} device-form roots must be absolute: {root!r}"
                 )
-        if normalized.rstrip("\\").endswith(".."):
-            # A root that ENDS in a parent reference ("C:\guest\..") is the
+        if any(part == ".." for part in normalized.split("\\")):
+            # A root that CONTAINS a parent reference ("C:\guest\..") is the
             # drive-side twin of the #37 hole: the guest boundary is LEXICAL
             # (policy normalizes the root with ntpath.normpath), so
             # "C:\guest\.." collapses to "C:\" and silently widens the
             # guest read/write scope to the WHOLE drive. Base accepted this
             # spelling too (pre-existing); it is rejected here because it is
             # the same defect class this change closes.
+            #
+            # The check is on the COMPONENTS, not on the string suffix: a
+            # suffix test misses the parent-reference spellings that carry a
+            # trailing separator or a "." component ("C:\guest\..\.",
+            # "C:\guest\..\..\."), and each of those normalizes to the drive
+            # root exactly like "C:\guest\..". A component test also stops
+            # over-blocking a legitimate name that merely ENDS in two dots
+            # ("C:\guest\backup.."), which is not a parent reference.
             raise ConfigError(
-                f"{key} entries must not end in a parent reference "
+                f"{key} entries must not contain a parent reference "
                 f"('..' widens the guest scope): {root!r}"
             )
         if normalized.startswith("\\\\"):

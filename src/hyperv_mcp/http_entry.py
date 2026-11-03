@@ -141,9 +141,12 @@ def _transport_security_for(
         return value.count(":") > 1 and not value.startswith("[")
 
     def _names_a_port(value: str) -> bool:
-        # A bracketed IPv6 literal ("[::1]") carries no port; a "name:port"
+        # A bracketed IPv6 literal ("[::1]") carries no port, but a
+        # bracketed literal WITH one ("[::1]:8787") does; a "name:port"
         # entry carries exactly one colon.
-        return not value.startswith("[") and value.count(":") == 1
+        if value.startswith("["):
+            return "]:" in value
+        return value.count(":") == 1
 
     def _host_forms(value: str) -> list[str]:
         if _is_ipv6_literal(value):
@@ -486,7 +489,7 @@ def main(argv: list[str] | None = None) -> int:
     # The SDK's own records (mcp calls configure_logging) and uvicorn's
     # access lines land in the SAME redirected file; prefix them too, so
     # every physical line in the log carries its timestamp.
-    logemit.install_log_prefix_filter()
+    logemit.install_log_prefix()
 
     try:
         cfg = load_controller_config()

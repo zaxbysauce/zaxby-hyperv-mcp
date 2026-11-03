@@ -251,7 +251,7 @@ def test_sdk_and_uvicorn_records_are_prefixed_too(capsys):
     logger.setLevel(logging.INFO)
     logger.propagate = False
     try:
-        logemit.install_log_prefix_filter()
+        logemit.install_log_prefix()
         logger.info("sdk record %s", name)
         captured = capsys.readouterr()
     finally:
@@ -268,19 +268,34 @@ def test_sdk_and_uvicorn_records_are_prefixed_too(capsys):
 
 
 def test_uvicorn_access_records_keep_their_args_contract():
-    """PRR-009 follow-up: uvicorn's access line is composed by uvicorn's
-    own AccessFormatter from a five-element args tuple. The stamp must
-    reach that line WITHOUT breaking the tuple (a broken tuple makes
-    uvicorn's formatter raise and print a logging error into the
-    controller log)."""
+    """PRR-009 follow-up (closeout-review finding 8): uvicorn's access
+    line is composed by uvicorn's own AccessFormatter from a five-element
+    args tuple. The stamp must reach that line WITHOUT breaking the tuple
+    (a broken tuple makes uvicorn's formatter raise and print a logging
+    error into the controller log).
+
+    The client address uvicorn really passes is a STRING ("host:port",
+    from uvicorn/protocols/utils.py get_client_addr) - so that is the
+    shape the leg drives; the tuple form is kept as a compatibility leg
+    because the stamp handles both.
+    """
     import logging
 
     from hyperv_mcp import logemit
 
     previous_factory = logging.getLogRecordFactory()
     try:
-        logemit.install_log_prefix_filter()
+        logemit.install_log_prefix()
         record = logging.getLogger("uvicorn.access").makeRecord(
+            "uvicorn.access",
+            logging.INFO,
+            __file__,
+            1,
+            '%s - "%s %s HTTP/%s" %d',
+            ("127.0.0.1:54321", "GET", "/mcp", "1.1", 200),
+            None,
+        )
+        tuple_record = logging.getLogger("uvicorn.access").makeRecord(
             "uvicorn.access",
             logging.INFO,
             __file__,
@@ -292,26 +307,88 @@ def test_uvicorn_access_records_keep_their_args_contract():
     finally:
         logging.setLogRecordFactory(previous_factory)
 
-    assert len(record.args) == 5, (
-        f"the access record's args tuple was reshaped: {record.args!r}"
-    )
-    client = record.args[0]
-    assert isinstance(client, str), client
-    assert TIMESTAMP_PREFIX.match(client), (
-        f"the access record carries no timestamp: {client!r}"
-    )
-    # The REAL uvicorn formatter must still be able to render the record.
-    from uvicorn.logging import AccessFormatter
+    for rec in (record, tuple_record):
+        assert len(rec.args) == 5, (
+            f"the access record's args tuple was reshaped: {rec.args!r}"
+        )
+        client = rec.args[0]
+        assert isinstance(client, str), client
+        assert TIMESTAMP_PREFIX.match(client), (
+            f"the access record carries no timestamp: {client!r}"
+        )
+        # The REAL uvicorn formatter must still be able to render it.
+        from uvicorn.logging import AccessFormatter
 
-    rendered = AccessFormatter(
-        fmt="%(client_addr)s - %(request_line)s %(status_code)s"
-    ).format(record)
-    assert TIMESTAMP_PREFIX.search(rendered), (
-        f"the rendered access line carries no timestamp: {rendered!r}"
+        rendered = AccessFormatter(
+            fmt="%(client_addr)s - %(request_line)s %(status_code)s"
+        ).format(rec)
+        assert TIMESTAMP_PREFIX.search(rendered), (
+            f"the rendered access line carries no timestamp: {rendered!r}"
+        )
+        assert "GET /mcp HTTP/1.1" in rendered, (
+            f"the access line lost its request text: {rendered!r}"
+        )
+
+
+def test_log_line_prefixes_every_physical_line(capsys):
+    """PRR-003 (closeout-review finding 13): a payload with an embedded
+    newline must not leak an unprefixed continuation line - the log is
+    read line by line, so EVERY physical line must carry the prefix."""
+    from hyperv_mcp import logemit
+
+    logemit.log_line("first line", "second\nthird line")
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.strip()]
+    assert len(lines) == 2, f"expected two physical lines, got {lines!r}"
+    unprefixed = [line for line in lines if not TIMESTAMP_PREFIX.match(line)]
+    assert not unprefixed, (
+        f"a continuation line reached the log without the prefix: {unprefixed!r}"
     )
-    assert "GET /mcp HTTP/1.1" in rendered, (
-        f"the access line lost its request text: {rendered!r}"
+
+
+def test_controller_streams_are_pinned_to_utf8(monkeypatch):
+    """PRR-018 (closeout-review finding 13): the controller's stdout and
+    stderr are redirected into a UTF-8 log file, but the child's streams
+    otherwise follow the Windows locale encoding - a non-ASCII line would
+    be written in the wrong encoding. The entry point must pin both
+    streams to UTF-8."""
+    import sys
+
+    import hyperv_mcp.http_entry as http_entry_mod
+
+    class _Stream:
+        """A text stream that records the reconfigure() call."""
+
+        def __init__(self) -> None:
+            self.calls: list = []
+            self.encoding = "cp1252"
+
+        def reconfigure(self, **kwargs) -> None:
+            self.calls.append(kwargs)
+            self.encoding = kwargs.get("encoding", self.encoding)
+
+        def write(self, _text: str) -> int:
+            return 0
+
+        def flush(self) -> None:
+            return None
+
+    out, err = _Stream(), _Stream()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    # main() must not need a real config for this leg: it fails early and
+    # returns, and the reconfiguration happens BEFORE the config load.
+    monkeypatch.setattr(
+        http_entry_mod, "load_controller_config", lambda: (_ for _ in ()).throw(RuntimeError("stop"))
     )
+    try:
+        http_entry_mod.main(["--host", "127.0.0.1"])
+    except Exception:
+        pass
+    for stream, name in ((out, "stdout"), (err, "stderr")):
+        assert stream.calls, f"{name} was never reconfigured"
+        assert stream.calls[0].get("encoding") == "utf-8", stream.calls
+        assert stream.encoding == "utf-8", stream.encoding
 
 
 def test_audit_stream_lines_carry_the_timestamp(monkeypatch, capsys):
@@ -367,6 +444,73 @@ def test_log_exception_prefixes_every_traceback_line(capsys):
     )
 
 
+def _is_logger_receiver(value) -> bool:
+    """Is this expression a logger?
+
+    Three shapes reach the redirected log unprefixed: a NAME that names
+    a logger ("logger", "_audit_log", "log"), an ATTRIBUTE chain on such
+    a name ("self.logger"), and a CALL to logging.getLogger(...)
+    ("logging.getLogger('x').warning(...)") - the last one is the shape
+    the round-1 finding named, and a name-only test could not see it.
+    """
+    if isinstance(value, ast.Name):
+        name = value.id
+        return (
+            name == "logger"
+            or name.lstrip("_").endswith("log")
+            or name.lstrip("_").endswith("logger")
+        )
+    if isinstance(value, ast.Attribute):
+        # "self.logger" - the attribute's own name is the logger name.
+        attr = value.attr
+        if (
+            attr == "logger"
+            or attr.lstrip("_").endswith("log")
+            or attr.lstrip("_").endswith("logger")
+        ):
+            return True
+        return _is_logger_receiver(value.value)
+    if isinstance(value, ast.Call):
+        # A LOGGER FACTORY call: logging.getLogger("mcp") or
+        # get_logger() - the expression IS the logger.
+        func = value.func
+        if isinstance(func, ast.Attribute) and func.attr in ("getLogger", "get_logger"):
+            return True
+        if isinstance(func, ast.Name) and func.id in ("getLogger", "get_logger"):
+            return True
+    return False
+
+
+def test_logger_guardrail_covers_every_logger_shape():
+    """PRR-013 (closeout-review finding 11): the package guardrail must
+    see EVERY shape a logger call can take. A receiver that is a CALL
+    ("logging.getLogger('x').warning(...)") is not an ast.Name, so a
+    name-only test could not see it - and the shape the finding named
+    would have slipped through the guardrail."""
+    import ast
+
+    cases = {
+        "logger.warning('x')": True,
+        "_audit_log.warning('x')": True,
+        "log.info('x')": True,
+        "self.logger.error('x')": True,
+        "logging.getLogger('mcp').warning('x')": True,
+        "get_logger().warning('x')": True,
+        "print('x')": False,
+        "sys.stderr.write('x')": False,
+        "some_object.helper('x')": False,
+    }
+    for source, expected in cases.items():
+        call = ast.parse(source).body[0].value
+        assert isinstance(call, ast.Call), source
+        if isinstance(call.func, ast.Attribute):
+            got = _is_logger_receiver(call.func.value)
+        else:
+            # print(...) and friends are not logger calls at all.
+            got = False
+        assert got is expected, source
+
+
 def test_no_unprefixed_stderr_writers_in_the_package():
     """Package-wide guardrail (the general form of the #57 requirement).
 
@@ -394,6 +538,7 @@ def test_no_unprefixed_stderr_writers_in_the_package():
 
     package = Path(http_entry.__file__).resolve().parent
     emitter = package / "logemit.py"
+
     # module -> fully excluded function names
     excluded_functions = {
         "http_entry.py": {"_handle_logon_task"},
@@ -444,12 +589,7 @@ def test_no_unprefixed_stderr_writers_in_the_package():
                     and isinstance(node.func, ast.Attribute)
                     and node.func.attr
                     in ("exception", "error", "warning", "info", "critical")
-                    and isinstance(node.func.value, ast.Name)
-                    and (
-                        node.func.value.id == "logger"
-                        or node.func.value.id.lstrip("_").endswith("log")
-                        or node.func.value.id.lstrip("_").endswith("logger")
-                    )
+                    and _is_logger_receiver(node.func.value)
                 )
                 # A direct stream write (sys.stdout.write / sys.stderr.write)
                 # lands in the redirected log exactly like a print does

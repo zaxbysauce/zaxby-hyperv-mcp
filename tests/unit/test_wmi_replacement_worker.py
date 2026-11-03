@@ -222,6 +222,90 @@ def test_fresh_and_replacement_workers_use_live_com_services(monkeypatch):
     assert served_by[2] is threading.current_thread()
 
 
+def test_concurrent_workers_never_share_a_backend_service(monkeypatch):
+    """PRR-005 (closeout-review finding 13): the backend cache must be
+    keyed per (host, thread), so a service is NEVER handed to a worker
+    other than its creator.
+
+    This leg is DISCRIMINATING for the cache key: the two workers are
+    ALIVE at the same time, so a host-only key would hand worker B the
+    backend worker A created (A is alive, so the creator-liveness check
+    passes and the stale service is served to the wrong worker - exactly
+    the #95 incident)."""
+    cfg = Config()
+    _install_fake_service(monkeypatch)
+
+    a_ready = threading.Event()
+    release_a = threading.Event()
+    backends: dict = {}
+
+    def worker_a() -> None:
+        backends["a"] = wmiconsole.backend(cfg)
+        a_ready.set()
+        release_a.wait(timeout=5)
+
+    def worker_b() -> None:
+        backends["b"] = wmiconsole.backend(cfg)
+
+    a = threading.Thread(target=worker_a, name="wmi-shared-A")
+    a.start()
+    try:
+        assert a_ready.wait(timeout=5), "WORKER_A_TIMED_OUT"
+        b = threading.Thread(target=worker_b, name="wmi-shared-B")
+        b.start()
+        b.join(timeout=5)
+        assert not b.is_alive(), "WORKER_B_TIMED_OUT"
+    finally:
+        release_a.set()
+        a.join(timeout=5)
+
+    assert "a" in backends and "b" in backends, backends
+    assert backends["a"] is not backends["b"], (
+        "two live workers were served by the SAME backend: the cache is not "
+        "keyed per thread, so a service crosses the worker boundary"
+    )
+    # Each service belongs to the thread that created it.
+    assert backends["a"]._service.owner is a, backends["a"]._service.owner
+    assert backends["b"]._service.owner is b, backends["b"]._service.owner
+
+
+def test_worker_identity_distinguishes_same_named_workers(monkeypatch):
+    """PRR-006 (closeout-review finding 13): under mcp 2.x EVERY
+    dispatched tool body runs on a worker whose thread NAME is the
+    constant "AnyIO worker thread", so the name alone cannot say which
+    worker served a call. The identity must therefore carry the thread
+    id, and two same-named workers must produce DIFFERENT identities."""
+    messages: list = []
+
+    def failing_worker() -> None:
+        def boom():
+            raise RuntimeError("backend exploded")
+
+        try:
+            wmiconsole._com("read EnabledState", boom)
+        except Exception as exc:  # noqa: BLE001 - the message is the subject
+            messages.append(str(exc))
+
+    threads = [
+        threading.Thread(target=failing_worker, name="AnyIO worker thread")
+        for _ in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+        assert not t.is_alive(), "WORKER_TIMED_OUT"
+
+    assert len(messages) == 2, messages
+    first, second = messages
+    assert first != second, (
+        "two workers with the SAME thread name produced the SAME identity: "
+        f"{first!r} == {second!r}"
+    )
+    for message in messages:
+        assert "worker AnyIO worker thread#" in message, message
+
+
 def test_replacement_worker_failure_does_not_replay_input(monkeypatch):
     cfg = Config(unrestricted=True)
     _install_fake_service(monkeypatch)

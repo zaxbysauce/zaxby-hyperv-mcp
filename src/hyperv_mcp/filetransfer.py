@@ -353,10 +353,23 @@ def _makedirs_tracked(path: str) -> list[str]:
     or populated directory refuses safely.
     """
     created: list[str] = []
-    parts = [part for part in path.replace("/", "\\").split("\\") if part]
+    drive, tail = ntpath.splitdrive(path)
+    # The components come from the TAIL, not from the whole path: for a
+    # UNC path splitdrive returns the server+share as the drive
+    # ("\\\\srv\\share"), so the full path's components would rebuild the
+    # share INSIDE itself ("\\\\srv\\share\\srv\\share\\newdir").
+    parts = [part for part in tail.replace("/", "\\").split("\\") if part]
     if not parts:
         return created
-    drive, tail = ntpath.splitdrive(path)
+
+    def _prune_ours() -> None:
+        """Remove the directories THIS call created (leaf first)."""
+        for ours in reversed(created):
+            try:
+                os.rmdir(ours)
+            except OSError:
+                pass
+
     current = drive + "\\" if drive else ""
     for part in parts:
         current = os.path.join(current, part) if current else part
@@ -366,17 +379,21 @@ def _makedirs_tracked(path: str) -> list[str]:
             os.mkdir(current)
         except FileExistsError:
             # A concurrent creator won the race: the directory is NOT ours.
+            # A FILE at this path is not a directory at all - the chain
+            # cannot be built, so fail loudly instead of walking past it.
+            if not os.path.isdir(current):
+                _prune_ours()
+                raise
             continue
         except (OSError, ValueError):
             # Creation failed: prune only what we created, then re-raise.
-            for ours in reversed(created):
-                try:
-                    os.rmdir(ours)
-                except OSError:
-                    pass
+            _prune_ours()
             raise
         created.append(current)
-    return created
+    # The caller prunes the returned list FORWARD, so it must be LEAF
+    # FIRST: with two or more created levels, removing the root first
+    # fails (the child still exists) and the husks would survive.
+    return list(reversed(created))
 
 
 def _cleanup_failed_get(staged_raw: str, created_dirs: list[str]) -> None:
