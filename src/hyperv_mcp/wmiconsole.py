@@ -985,12 +985,11 @@ def backend(cfg: Config) -> ConsoleWMI:
     # must not stall backend acquisition for every other host
     # (implementation-review). The per-host lock keeps ONE connect in
     # flight per host: a caller that arrives while another is connecting
-    # waits here and then finds the backend in the cache. On the FAILURE
-    # path the negative memo is re-read under this lock, so a second
-    # caller shares the first caller's failure instead of opening its own
-    # connect (the failure path is the single-flighted one: on the healthy
-    # path each thread connects for ITSELF, because a service is never
-    # handed to a worker other than its creator).
+    # WAITS here. On the healthy path it then connects for ITSELF (a
+    # service is never handed to a worker other than its creator, so the
+    # cache is keyed per thread); on the FAILURE path it finds the
+    # negative memo, which is re-read under this lock, and shares the
+    # first caller's failure instead of opening its own connect.
     with _connect_lock(host_key):
         with _backend_lock:
             be = _backends.get(key)

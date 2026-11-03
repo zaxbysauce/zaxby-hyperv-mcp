@@ -330,6 +330,38 @@ def test_uvicorn_access_records_keep_their_args_contract():
         )
 
 
+def test_main_installs_the_record_prefix(monkeypatch):
+    """PRR-009: the CONTROLLER ENTRY POINT must install the record
+    factory - the SDK's and uvicorn's own records reach the same
+    redirected log, and only the entry point can install the factory for
+    the whole process.
+
+    The leg resets the global record factory to a plain one first, so the
+    assertion is about what main() does - not about a factory a previous
+    test happened to install."""
+    import logging
+
+    import hyperv_mcp.http_entry as http_entry_mod
+    from hyperv_mcp import logemit
+
+    previous_factory = logging.getLogRecordFactory()
+    try:
+        # A plain factory: the marker must come from main() alone.
+        logging.setLogRecordFactory(previous_factory)
+        # main() installs the factory BEFORE it loads the config, so the
+        # early config failure still exercises the installation.
+        rc = http_entry_mod.main(["--host", "127.0.0.1"])
+        assert rc != 0, "main() unexpectedly succeeded without a config"
+        factory = logging.getLogRecordFactory()
+        assert getattr(factory, logemit._FACTORY_MARKER, False), (
+            "the controller entry point did not install the record prefix "
+            "factory: the SDK's and uvicorn's records would reach the log "
+            "unprefixed"
+        )
+    finally:
+        logging.setLogRecordFactory(previous_factory)
+
+
 def test_a_failing_log_stream_does_not_break_the_caller():
     """PRR-008: the controller's stderr IS the shared per-user log volume,
     so a write failure (a full or closed log) must not turn a tool's

@@ -606,6 +606,13 @@ class Config:
             # root exactly like "C:\guest\..". A component test also stops
             # over-blocking a legitimate name that merely ENDS in two dots
             # ("C:\guest\backup.."), which is not a parent reference.
+            #
+            # The rule is deliberately CONSERVATIVE: ANY parent reference is
+            # refused, including one that would normalize back inside the
+            # configured root ("C:\guest\sub\..\other"). Such a root does
+            # not widen the scope, but the lexical boundary compares the
+            # NORMALIZED forms, so the safest rule is to refuse the class
+            # rather than reason about which spelling escapes.
             raise ConfigError(
                 f"{key} entries must not contain a parent reference "
                 f"('..' widens the guest scope): {root!r}"

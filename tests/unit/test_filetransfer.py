@@ -644,9 +644,50 @@ def test_makedirs_tracked_fails_loudly_on_a_file_component(tmp_path):
         _makedirs_tracked(str(leaf_file))
     assert not (tmp_path / "leaf").is_dir()
 
-    # A file at a MIDDLE component, with a directory this call creates
-    # below it: the created prefix must be pruned.
+    # A file at a MIDDLE component: the chain cannot be built at all.
     middle_file = tmp_path / "middle"
     middle_file.write_bytes(b"x")
     with pytest.raises(OSError):
         _makedirs_tracked(str(middle_file / "leaf"))
+
+
+def test_a_concurrent_creator_s_component_is_never_pruned(tmp_path, monkeypatch):
+    """The OWNERSHIP rule, deterministically: a component another transfer
+    created (here: os.mkdir raises FileExistsError because the other
+    worker won the race) is NOT recorded as ours and is NOT removed when
+    our own create fails.
+
+    This is the deterministic pin for PRR-002. The racy probe
+    (`.zcode/pr-review/pr114-review-20261102/probe_prune_ownership.py`)
+    demonstrated the mechanism but could report a defect on CORRECT code
+    (its own thread created the component it then called 'the other
+    worker's'), so it is not cited as the pin."""
+    from hyperv_mcp import filetransfer
+
+    head = tmp_path / "head"
+    middle = head / "middle"
+    target = middle / "leaf<blocked>"   # the invalid final component
+
+    real_mkdir = filetransfer.os.mkdir
+
+    def fake_mkdir(path, *args, **kwargs):
+        if str(path).endswith("middle"):
+            # The OTHER worker wins the race: the directory exists, and our
+            # mkdir sees FileExistsError.
+            real_mkdir(path)
+            raise FileExistsError(path)
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(filetransfer.os, "mkdir", fake_mkdir)
+    with pytest.raises(OSError):
+        filetransfer._makedirs_tracked(str(target))
+
+    assert middle.exists(), (
+        "the concurrent creator's directory was pruned: the ownership rule "
+        "was broken"
+    )
+    # The parent we created survives too - and it MUST: the empty-only
+    # prune (os.rmdir) refuses a directory that still holds the other
+    # worker's component, which is exactly the point of the ownership
+    # rule (the pre-fix snapshot prune removed that component and then
+    # the parent as well).
