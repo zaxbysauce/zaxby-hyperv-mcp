@@ -37,6 +37,7 @@ Safety and integrity properties:
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import secrets
 from uuid import uuid4
@@ -336,17 +337,63 @@ def _cleanup_guest_staged(vm_id: str, staged_raw: str, cred: CredentialSet, cfg=
 
 def _makedirs_tracked(path: str) -> list[str]:
     """Create path (like makedirs) and return the directories this call
-    created, leaf first, for pruning if the transfer then fails."""
-    missing: list[str] = []
-    probe = path
-    while probe and not os.path.isdir(probe):
-        missing.append(probe)
-        parent = os.path.dirname(probe)
-        if parent == probe:
-            break
-        probe = parent
-    os.makedirs(path, exist_ok=True)
-    return missing
+    created, leaf first, for pruning if the transfer then fails.
+
+    Issue #37: os.makedirs does not roll back the components it already
+    created when it fails mid-chain, so a failure here would otherwise
+    leave empty husks outside every caller's cleanup boundary.
+
+    The chain is built ONE COMPONENT AT A TIME with os.mkdir and only the
+    components THIS CALL actually created are recorded: a pre-create probe
+    snapshot would also contain a directory a CONCURRENT transfer created
+    in between, and pruning that would delete the sibling's directory
+    (implementation-review: the ownership bug was confirmed by an executed
+    probe). A component that already exists is never recorded and never
+    removed. os.rmdir removes only EMPTY directories, so a pre-existing
+    or populated directory refuses safely.
+    """
+    created: list[str] = []
+    drive, tail = ntpath.splitdrive(path)
+    # The components come from the TAIL, not from the whole path: for a
+    # UNC path splitdrive returns the server+share as the drive
+    # ("\\\\srv\\share"), so the full path's components would rebuild the
+    # share INSIDE itself ("\\\\srv\\share\\srv\\share\\newdir").
+    parts = [part for part in tail.replace("/", "\\").split("\\") if part]
+    if not parts:
+        return created
+
+    def _prune_ours() -> None:
+        """Remove the directories THIS call created (leaf first)."""
+        for ours in reversed(created):
+            try:
+                os.rmdir(ours)
+            except OSError:
+                pass
+
+    current = drive + "\\" if drive else ""
+    for part in parts:
+        current = os.path.join(current, part) if current else part
+        if os.path.isdir(current):
+            continue
+        try:
+            os.mkdir(current)
+        except FileExistsError:
+            # A concurrent creator won the race: the directory is NOT ours.
+            # A FILE at this path is not a directory at all - the chain
+            # cannot be built, so fail loudly instead of walking past it.
+            if not os.path.isdir(current):
+                _prune_ours()
+                raise
+            continue
+        except (OSError, ValueError):
+            # Creation failed: prune only what we created, then re-raise.
+            _prune_ours()
+            raise
+        created.append(current)
+    # The caller prunes the returned list FORWARD, so it must be LEAF
+    # FIRST: with two or more created levels, removing the root first
+    # fails (the child still exists) and the husks would survive.
+    return list(reversed(created))
 
 
 def _cleanup_failed_get(staged_raw: str, created_dirs: list[str]) -> None:

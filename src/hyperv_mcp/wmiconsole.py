@@ -232,13 +232,27 @@ def _com(operation: str, fn, *args: Any, **kwargs: Any) -> Any:
     """Run one raw COM call, translating every transport failure into
     WMIError (PRR-005): a pywintypes.com_error is neither WMIError nor
     BackendUnavailable and would otherwise bypass every structured-error
-    handler in console.py. Our own control-flow exceptions pass through."""
+    handler in console.py. Our own control-flow exceptions pass through.
+    The message carries the serving worker's identity (issue #95
+    supplement AC4: spawn/refusal history is attributable from the log
+    alone — worker turnover is exactly the failure mode this backend
+    guards against)."""
     try:
         return fn(*args, **kwargs)
     except (WMIError, BackendUnavailable, ValueError):
         raise
     except Exception as exc:
-        raise WMIError(pswindows.redact(f"WMI {operation} failed: {exc}")) from None
+        # The worker identity must be DISTINGUISHABLE: under mcp 2.x every
+        # dispatched tool body runs on an anyio worker whose thread NAME is
+        # the constant "AnyIO worker thread", so the name alone cannot say
+        # which worker (or which creator's session) served the call. The
+        # thread ident is stable per worker and shows the turnover the fix
+        # is about (implementation-review).
+        worker = threading.current_thread()
+        identity = f"{worker.name}#{threading.get_ident()}"
+        raise WMIError(
+            pswindows.redact(f"WMI {operation} failed (worker {identity}): {exc}")
+        ) from None
 
 
 def _boot_epoch_from_cs(cs: Any) -> int | None:
@@ -283,12 +297,14 @@ def _path_of(obj: Any) -> str:
 def _exec_method(service: Any, obj_path: str, method: str, **params: Any) -> Any:
     """The ONLY method-invocation shape that works on this stack (probe
     fact): spawned in-parameters + ExecMethod_. In-parameters are set via
-    plain attribute assignment (works on both real SWbem and the fakes)."""
+    plain attribute assignment (works on both real SWbem and the fakes).
+    Operation tokens carry the method name (issue #95 supplement AC4: a
+    surfaced input-method failure must name the concrete operation)."""
     obj = _com(f"bind {obj_path}", lambda: service.Get(obj_path))
-    definition = _com("method lookup", lambda: obj.Methods_(method))
-    inp = _com("spawn in-parameters", lambda: definition.InParameters.SpawnInstance_())
+    definition = _com(f"method lookup {method}", lambda: obj.Methods_(method))
+    inp = _com(f"spawn in-parameters {method}", lambda: definition.InParameters.SpawnInstance_())
     for name, value in params.items():
-        _com("set parameter", lambda n=name, v=value: setattr(inp, n, v))
+        _com(f"set parameter {method}", lambda n=name, v=value: setattr(inp, n, v))
     return _com(f"ExecMethod_ {method}", lambda: obj.ExecMethod_(method, inp))
 
 
@@ -328,14 +344,25 @@ class _VMCache:
 class ConsoleWMI:
     """Backend bound to one WMI service (one host). Thread-safe: shared
     cache state is mutated under ``_lock`` and console input ops
-    additionally hold the per-VM vm_lock at the console layer."""
+    additionally hold the per-VM vm_lock at the console layer.
 
-    def __init__(self, service: Any) -> None:
+    ``creator`` records the thread whose COM apartment produced the cached
+    service (issue #95): pywin32 SWbem services die with their creating
+    worker, so the cache is only valid while that thread lives."""
+
+    def __init__(self, service: Any, creator: threading.Thread | None = None) -> None:
         self._service = service
         self._lock = threading.Lock()
         self._vms: dict[str, _VMCache] = {}
         self._names: dict[str, str] = {}
         self._vsms_path: str | None = None
+        self.creator = creator or threading.current_thread()
+
+    @property
+    def creator_thread(self) -> threading.Thread:
+        """The thread that created the cached service (query provenance;
+        supplement AC3)."""
+        return self.creator
 
     # -- internals ----------------------------------------------------------
 
@@ -890,8 +917,12 @@ def _checked_caller_name(vm_name: str) -> str:
 # backend cache
 # ---------------------------------------------------------------------------
 
-_backends: dict[str, ConsoleWMI] = {}
+_backends: dict[tuple[str, int], ConsoleWMI] = {}
 _backend_lock = threading.Lock()
+# Per-host connect locks: the CONNECT itself must not run under the
+# process-global cache lock, or a slow DCOM connect for one host stalls
+# backend acquisition for every other host (implementation-review).
+_connect_locks: dict[str, threading.Lock] = {}
 # Negative memo: a failed connect is re-attempted at most once per TTL, so
 # a downed DCOM endpoint costs one connect timeout per TTL instead of one
 # per console call (PRR-012). Cleared by shutdown() and on success.
@@ -904,33 +935,103 @@ def _host_key(cfg: Config) -> str:
     return pswindows.hyperv_host(cfg) or "local"
 
 
+def _cache_key(cfg: Config) -> tuple[str, int]:
+    """The cache key of a backend: (host, creating thread).
+
+    A pywin32 SWbem service dies with the thread that created it, so a
+    service must never be handed to a DIFFERENT thread: another worker
+    would then use a service whose creator has exited (the exact #95
+    symptom), and no liveness check on the acquiring side can close that
+    window. Keying the cache per thread keeps every service with its own
+    creator; a worker thread's service stays valid for that worker's
+    lifetime, and a thread whose service died reconnects on its next call.
+    """
+    return (_host_key(cfg), threading.get_ident())
+
+
 def backend(cfg: Config) -> ConsoleWMI:
-    """Cached ConsoleWMI per host-key; raises BackendUnavailable when the
-    service cannot be obtained (memoized for
+    """Cached ConsoleWMI per (host, thread); raises BackendUnavailable when
+    the service cannot be obtained (memoized for
     _CONNECT_FAILURE_TTL_S so an unreachable endpoint costs one connect
-    per TTL, not one per call). Never imports pywin32 itself."""
-    key = _host_key(cfg)
+    per TTL, not one per call). Never imports pywin32 itself.
+
+    Issue #95: a cached service is only valid while its CREATING thread
+    lives (pywin32 SWbem services die with their creator worker — the
+    executed replacement-worker probe shows exactly the
+    1-pass/3-fail signature). A cache hit whose creator has exited is
+    dropped and the connection is re-established on the REQUESTING
+    thread; the negative memo keeps its TTL, is re-read under the
+    per-host connect lock (single-flight) and is cleared by a
+    successful connect."""
+    key = _cache_key(cfg)
+    host_key = _host_key(cfg)
     with _backend_lock:
         be = _backends.get(key)
         if be is not None:
-            return be
-        memo = _connect_failures.get(key)
+            creator = be.creator
+            if creator is not None and creator.is_alive():
+                return be
+            # Creator exited: the cached service is dead (disconnected
+            # SWbem). Drop it and reconnect below on the live requester.
+            _backends.pop(key, None)
+        memo = _connect_failures.get(host_key)
         if memo is not None:
             failed_at, err = memo
             if time.monotonic() - failed_at < _CONNECT_FAILURE_TTL_S:
                 raise err
-            _connect_failures.pop(key, None)
-        # Single-flight: the connect runs UNDER the lock, so concurrent
-        # first callers wait here and then hit the cached backend (or the
-        # shared failure memo) instead of each opening a DCOM connect.
+            _connect_failures.pop(host_key, None)
+    # The CONNECT runs OUTSIDE the process-global cache lock, under a
+    # per-host connect lock: a slow credentialed DCOM connect for one host
+    # must not stall backend acquisition for every other host
+    # (implementation-review). The per-host lock keeps ONE connect in
+    # flight per host: a caller that arrives while another is connecting
+    # WAITS here. On the healthy path it then connects for ITSELF (a
+    # service is never handed to a worker other than its creator, so the
+    # cache is keyed per thread); on the FAILURE path it finds the
+    # negative memo, which is re-read under this lock, and shares the
+    # first caller's failure instead of opening its own connect.
+    with _connect_lock(host_key):
+        with _backend_lock:
+            be = _backends.get(key)
+            if be is not None:
+                creator = be.creator
+                if creator is not None and creator.is_alive():
+                    return be
+            # The memo is RE-READ under the connect lock: a caller that
+            # passed the outer check while another thread was failing the
+            # connect must see the failure instead of opening a second
+            # connect (the single-flight property the old all-under-one-
+            # lock shape had).
+            memo = _connect_failures.get(host_key)
+            if memo is not None:
+                failed_at, err = memo
+                if time.monotonic() - failed_at < _CONNECT_FAILURE_TTL_S:
+                    raise err
+                _connect_failures.pop(host_key, None)
         try:
             service = connect_service(cfg)
         except BackendUnavailable as exc:
-            _connect_failures[key] = (time.monotonic(), exc)
+            with _backend_lock:
+                _connect_failures[host_key] = (time.monotonic(), exc)
             raise
         be = ConsoleWMI(service)
-        _backends[key] = be
+        with _backend_lock:
+            _backends[key] = be
+            # A successful connect clears the host's negative memo: the
+            # host is reachable, so a stale failure must not keep
+            # refusing the NEXT worker for the rest of the TTL.
+            _connect_failures.pop(host_key, None)
         return be
+
+
+def _connect_lock(host_key: str) -> threading.Lock:
+    """The per-host connect lock (see backend())."""
+    with _backend_lock:
+        lock = _connect_locks.get(host_key)
+        if lock is None:
+            lock = threading.Lock()
+            _connect_locks[host_key] = lock
+        return lock
 
 
 def shutdown() -> None:
@@ -944,6 +1045,7 @@ def shutdown() -> None:
         backends = list(_backends.values())
         _backends.clear()
         _connect_failures.clear()
+        _connect_locks.clear()
     for be in backends:
         with be._lock:  # noqa: SLF001 - same-module teardown
             be._vms.clear()

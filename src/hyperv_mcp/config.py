@@ -15,6 +15,7 @@ a control.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import ntpath
 import os
@@ -42,6 +43,115 @@ _RESERVED_AGENT_IDS = {"local-cli"}
 # Config values must BE environment variable NAMES: a token pasted here would
 # otherwise be echoed to stderr by the missing-variable startup error.
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# An http.allowed_hosts entry is a HOST the operator's clients dial: a
+# hostname, an IPv4 literal, an IPv6 literal (optionally bracketed), each
+# optionally with a port. A scheme, a path, a wildcard or whitespace is a
+# typo that would silently produce allow-list forms matching no real Host
+# header (and so refuse every client) — reject it at load instead.
+#
+# A hostname label may contain "_" (a Windows NetBIOS name is a legitimate
+# operator host) and the FQDN root form may carry a trailing dot.
+_HOST_LABEL = r"[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?"
+_ALLOWED_HOST_NAME_RE = re.compile(
+    r"^" + _HOST_LABEL + r"(?:\." + _HOST_LABEL + r")*\.?$"
+)
+
+
+def _split_host_port(value: str) -> tuple[str, int | None]:
+    """Split an allow-list entry into (host, port).
+
+    A bracketed IPv6 literal keeps its brackets stripped; a bare IPv6
+    literal (more than one colon) has no port of its own. A BRACKETED
+    entry must name an IPv6 literal - the bracket form exists for the
+    IPv6 spelling, so "[foo]" is not a host name in brackets but a
+    malformed address.
+    """
+    if value.startswith("["):
+        end = value.find("]")
+        if end == -1:
+            raise ConfigError(
+                f"http.allowed_hosts entries must close a bracketed address: {value!r}"
+            )
+        host = value[1:end]
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            raise ConfigError(
+                "http.allowed_hosts entries in brackets must name an IPv6 "
+                f"literal: {value!r}"
+            ) from None
+        rest = value[end + 1 :]
+        if not rest:
+            return host, None
+        if not rest.startswith(":"):
+            raise ConfigError(
+                "http.allowed_hosts entries must be a host name or address, "
+                f"optionally with a port: {value!r}"
+            )
+        port_text = rest[1:]
+        if not port_text.isdigit():
+            raise ConfigError(
+                f"http.allowed_hosts entries must name a numeric port: {value!r}"
+            )
+        return host, int(port_text)
+    if value.count(":") == 1:
+        host, _, port_text = value.rpartition(":")
+        if not port_text.isdigit():
+            raise ConfigError(
+                f"http.allowed_hosts entries must name a numeric port: {value!r}"
+            )
+        return host, int(port_text)
+    # No colon (a hostname or an IPv4 literal) or more than one (a bare
+    # IPv6 literal): the whole value is the host.
+    return value, None
+
+
+def _set_allowed_host(value: str) -> str:
+    """Validate one http.allowed_hosts entry (PRR-004).
+
+    The entry must be a real host the operator's clients dial: a host
+    name, an IPv4/IPv6 literal (bracketed or bare), each optionally with a
+    port in 1..65535. A scheme, a path, a wildcard, whitespace, an
+    unparsable address or an out-of-range port would produce allow-list
+    forms matching no real Host header (and so refuse every client) —
+    reject it at load instead.
+    """
+    if value != value.strip() or " " in value:
+        raise ConfigError(
+            f"http.allowed_hosts entries must not contain whitespace: {value!r}"
+        )
+    if "*" in value or "/" in value or "://" in value:
+        raise ConfigError(
+            "http.allowed_hosts entries must be host names or addresses "
+            "(no scheme, path or wildcard): " + repr(value)
+        )
+    host, port = _split_host_port(value)
+    if not host:
+        raise ConfigError(
+            "http.allowed_hosts entries must be a host name or address, "
+            f"optionally with a port: {value!r}"
+        )
+    if port is not None and not (1 <= port <= 65535):
+        raise ConfigError(
+            f"http.allowed_hosts entries must name a port in 1..65535: {value!r}"
+        )
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        # Not an address: it must be a syntactically valid host name. A
+        # DOTTED numeric form that is NOT a valid address
+        # ("999.999.999.999") is a malformed address, not a host name; a
+        # single numeric label ("12345") is a legitimate host name and
+        # stays loadable.
+        looks_like_address = "." in host and all(
+            c.isdigit() or c == "." for c in host
+        )
+        if looks_like_address or not _ALLOWED_HOST_NAME_RE.match(host):
+            raise ConfigError(
+                "http.allowed_hosts entries must be a host name or address, "
+                f"optionally with a port: {value!r}"
+            ) from None
+    return value
 
 
 def _set_agents(value: Any) -> dict[str, str]:
@@ -157,6 +267,13 @@ class HttpPolicy:
     # token (issue #10). Values are names, never token material; the token
     # values are resolved from the environment at startup only.
     agents: dict[str, str] = field(default_factory=dict)
+    # Issue #69: operator-vouched public hosts for non-loopback binds. With
+    # DNS-rebinding protection armed (the new non-loopback default), the
+    # transport middleware only admits Host/Origin headers matching the bind
+    # address forms; entries here cover the LAN hostname/IP clients actually
+    # send. Names, never secrets. Parsed in _set_http; no wildcard semantics
+    # beyond the middleware's own host:* port form.
+    allowed_hosts: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -444,11 +561,95 @@ class Config:
         ("\\g-write", "C:sub") would anchor the boundary to a guest cwd the
         host cannot see. Reject it loudly at load time instead.
         """
-        drive, rest = ntpath.splitdrive(root)
+        normalized = root.replace("/", "\\")
+        if normalized.startswith("\\\\.\\"):
+            # The \\.\ device namespace is NOT canonicalized by the
+            # enforcement layer (policy strips only \\?\) - a root spelled
+            # this way loads and then denies every path under it (the
+            # implementation-review round-5 finding). Reject it.
+            raise ConfigError(
+                f"{key} device-namespace roots are not supported: {root!r}"
+            )
+        if normalized.startswith("\\\\?\\"):
+            # Device forms (\\?\...). Only a DRIVE device path
+            # (\\?\C:\...) is equivalent to a drive root; every other device
+            # form is not a guest root at all - accepted, it left the guest
+            # boundary resolving RELATIVE paths against the guest CWD
+            # (implementation-review round 5: "\\?\srv\share" was accepted and
+            # then admitted only "srv\share\x", which the in-guest
+            # GetFullPath resolved against the guest's working directory).
+            tail = normalized[4:]
+            if not (len(tail) >= 2 and tail[1] == ":" and tail[0].isalpha()):
+                raise ConfigError(
+                    f"{key} device-form roots are not supported "
+                    f"(only \\\\?\\<drive>:\\... is): {root!r}"
+                )
+            if tail[2:3] not in ("\\", "/"):
+                # A drive-relative device path (\\?\C:relative) is not
+                # absolute: the guest would resolve it against its CWD.
+                raise ConfigError(
+                    f"{key} device-form roots must be absolute: {root!r}"
+                )
+        if any(part == ".." for part in normalized.split("\\")):
+            # A root that CONTAINS a parent reference ("C:\guest\..") is the
+            # drive-side twin of the #37 hole: the guest boundary is LEXICAL
+            # (policy normalizes the root with ntpath.normpath), so
+            # "C:\guest\.." collapses to "C:\" and silently widens the
+            # guest read/write scope to the WHOLE drive. Base accepted this
+            # spelling too (pre-existing); it is rejected here because it is
+            # the same defect class this change closes.
+            #
+            # The check is on the COMPONENTS, not on the string suffix: a
+            # suffix test misses the parent-reference spellings that carry a
+            # trailing separator or a "." component ("C:\guest\..\.",
+            # "C:\guest\..\..\."), and each of those normalizes to the drive
+            # root exactly like "C:\guest\..". A component test also stops
+            # over-blocking a legitimate name that merely ENDS in two dots
+            # ("C:\guest\backup.."), which is not a parent reference.
+            #
+            # The rule is deliberately CONSERVATIVE: ANY parent reference is
+            # refused, including one that would normalize back inside the
+            # configured root ("C:\guest\sub\..\other"). Such a root does
+            # not widen the scope, but the lexical boundary compares the
+            # NORMALIZED forms, so the safest rule is to refuse the class
+            # rather than reason about which spelling escapes.
+            raise ConfigError(
+                f"{key} entries must not contain a parent reference "
+                f"('..' widens the guest scope): {root!r}"
+            )
+        if normalized.startswith("\\\\"):
+            # Issue #37: a UNC root must name the \\server\share PAIR.
+            # splitdrive truthiness alone accepts share-less roots (\\server,
+            # \\server\ -> truthy drive), which widens the lexical guest
+            # boundary to EVERY share on that server.
+            #
+            # The pair is parsed from the NORMALIZED root rather than from
+            # splitdrive's drive: (a) the separators are normalized FIRST,
+            # because Windows accepts both and the forward-slash spelling of
+            # a share-less root ("//srv//") otherwise skipped this branch
+            # entirely and widened the boundary (implementation-review
+            # round 4); (b) splitdrive stops at a DOUBLE separator
+            # ("\\srv\\share" -> drive "\\srv\", rest "\share"), so a
+            # well-formed mixed spelling was wrongly rejected.
+            #
+            # Empty segments are dropped (Windows collapses them), so the
+            # share is the SECOND non-empty segment; a root with fewer than
+            # two is share-less and is rejected.
+            if normalized.upper().startswith("\\\\?\\UNC"):
+                raise ConfigError(
+                    f"{key} device-form UNC roots are not supported: {root!r}"
+                )
+            components = [
+                part for part in normalized[2:].split("\\") if part
+            ]
+            if len(components) < 2:
+                raise ConfigError(
+                    f"{key} UNC roots must name a share (\\\\server\\share): {root!r}"
+                )
+            return
+        drive, rest = ntpath.splitdrive(normalized)
         if not drive:
             raise ConfigError(f"{key} entries must be absolute Windows paths: {root!r}")
-        if drive.startswith("\\\\"):  # UNC: \\server\share
-            return
         if rest[:1] not in ("\\", "/"):
             raise ConfigError(f"{key} entries must be absolute Windows paths: {root!r}")
 
@@ -577,7 +778,7 @@ class Config:
     def _set_http(self, value: Any) -> None:
         if not isinstance(value, dict):
             raise ConfigError("http must be an object")
-        unknown = set(value) - {"host", "port", "token_env", "agents"}
+        unknown = set(value) - {"host", "port", "token_env", "agents", "allowed_hosts"}
         if unknown:
             raise ConfigError(f"unknown http key(s): {sorted(unknown)}")
         http = HttpPolicy()
@@ -588,6 +789,16 @@ class Config:
                 http.port = val
             elif key == "agents":
                 http.agents = _set_agents(val)
+            elif key == "allowed_hosts":
+                if not isinstance(val, list) or not all(
+                    isinstance(item, str) and item.strip() for item in val
+                ):
+                    raise ConfigError(
+                        "http.allowed_hosts must be a list of non-empty strings"
+                    )
+                http.allowed_hosts = [
+                    _set_allowed_host(item.strip()) for item in val
+                ]
             elif isinstance(val, str) and val.strip():
                 # token_env is matched by exact (case-insensitive) name
                 # downstream; store it trimmed so padding cannot defeat the

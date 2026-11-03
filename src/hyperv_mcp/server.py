@@ -28,7 +28,6 @@ import argparse
 import dataclasses
 import importlib.metadata
 import json
-import logging
 import os
 import re
 import subprocess
@@ -59,6 +58,7 @@ from . import (
     harvest,
     leases,
     lifecycle,
+    logemit,
     media,
     operations,
     policy,
@@ -198,8 +198,6 @@ _bootstrapped = False
 _compat_warning_shown = False
 CFG: Config | None = None
 
-logger = logging.getLogger(__name__)
-
 
 def configure_http_auth(token_verifier) -> None:
     """Install a bearer-token verifier BEFORE bootstrap().
@@ -224,12 +222,11 @@ def __getattr__(name: str):
     if name == "mcp":
         instance = get_mcp()
         if not _compat_warning_shown:
-            print(
+            logemit.log_line(
                 "[hyperv-mcp] WARNING: compat import of `server.mcp` yields an "
                 "MCPServer instance WITHOUT bearer-token auth; serving it over "
                 "streamable-http exposes an unauthenticated endpoint. Prefer "
-                "the `hyperv-mcp-http` entry point.",
-                file=sys.stderr,
+                "the `hyperv-mcp-http` entry point."
             )
             globals()["_compat_warning_shown"] = True
         return instance
@@ -357,55 +354,54 @@ def _startup_banner(cfg: Config) -> None:
     # The Hyper-V target line prints FIRST and unconditionally: unrestricted
     # mode early-returns below, and remote lab deployments are exactly the
     # unrestricted ones (issue #43) — the target must never be silenced.
+    # Issue #57: these lines land in the controller's redirected per-user log
+    # (stdio_proxy spawns the controller with stdout=log, stderr=STDOUT), so
+    # they carry the same ISO-8601 UTC prefix as every other controller log
+    # line — a per-file helper left the banner unprefixed.
     target = cfg.hyperv.host
     if target:
-        print(
+        logemit.log_line(
             f"[hyperv-mcp] Hyper-V target: remote host {target} "
             "(run `hyperv-mcp --check-env` to verify target reachability)",
-            file=sys.stderr,
         )
     else:
-        print("[hyperv-mcp] Hyper-V target: local host", file=sys.stderr)
-    print(f"[hyperv-mcp] policy: {cfg.policy_summary()}", file=sys.stderr)
+        logemit.log_line("[hyperv-mcp] Hyper-V target: local host")
+    logemit.log_line(f"[hyperv-mcp] policy: {cfg.policy_summary()}")
     # Issue #22: the durable state store is always on. Print where it lives so
     # an operator can find (and back up, or delete) it.
-    print(f"[hyperv-mcp] state store: {statestore.resolve_state_db_path(cfg)}",
-          file=sys.stderr)
+    logemit.log_line(
+        f"[hyperv-mcp] state store: {statestore.resolve_state_db_path(cfg)}"
+    )
     if cfg.unrestricted:
-        print(
+        logemit.log_line(
             "[hyperv-mcp] WARNING: UNRESTRICTED mode — every policy axis is "
             "fully open and destructive operations are category-enabled. "
             "Only appropriate on disposable lab hosts.",
-            file=sys.stderr,
         )
         return
     configured = cfg.configured_axes()
     if configured:
-        print(
+        logemit.log_line(
             f"[hyperv-mcp] INFO: configured axes (deny-by-default outside "
             f"each allowlist): {', '.join(configured)}",
-            file=sys.stderr,
         )
     else:
-        print(
+        logemit.log_line(
             "[hyperv-mcp] NOTE: every policy axis is currently DENIED. "
             "Set HYPERV_MCP_CONFIG or HYPERV_MCP_UNRESTRICTED=1 to allow work.",
-            file=sys.stderr,
         )
     # A "*" pattern or a drive-root entry means the axis is effectively
     # fully open even though it is "configured" — keep a WARNING for it.
     if "*" in cfg.allowed_vm_patterns:
-        print(
+        logemit.log_line(
             "[hyperv-mcp] WARNING: allowed_vm_patterns contains '*' — every "
             "VM on this host can be targeted.",
-            file=sys.stderr,
         )
     for axis in ("host_read_roots", "host_write_roots", "guest_read_roots", "guest_write_roots"):
         if any(r.rstrip("\\/").endswith(":") for r in getattr(cfg, axis)):
-            print(
+            logemit.log_line(
                 f"[hyperv-mcp] WARNING: {axis} contains a drive root — the "
                 "entire drive is within policy.",
-                file=sys.stderr,
             )
 
 
@@ -3976,11 +3972,10 @@ def _harden_tools(mcp: MCPServer) -> None:
     if not tools:
         # PRR-015: a silent no-op would revert unknown-argument handling to
         # pydantic's extra="ignore" fail-open. Make the SDK coupling loud.
-        print(
+        logemit.log_line(
             "[hyperv-mcp] WARNING: _harden_tools found no registered tools; "
             "unknown-argument rejection and additionalProperties stamping "
-            "were NOT installed (mcp SDK shape changed?)",
-            file=sys.stderr,
+            "were NOT installed (mcp SDK shape changed?)"
         )
         return
     for tool in tools:
@@ -4049,10 +4044,9 @@ def _harden_tools(mcp: MCPServer) -> None:
             except Exception as audit_exc:  # noqa: BLE001 - best-effort: a
                 # broken audit sink must not turn a rejection into a raw
                 # exception with no envelope (issue #9 review PRR-014).
-                print(
+                logemit.log_line(
                     f"[hyperv-mcp] WARNING: audit write failed for a "
-                    f"rejected call on {name}: {audit_exc}",
-                    file=sys.stderr,
+                    f"rejected call on {name}: {audit_exc}"
                 )
             return errors.failure_result(env)
 
@@ -4138,7 +4132,14 @@ def _harden_tools(mcp: MCPServer) -> None:
                     if cause is not None and not isinstance(cause, ValueError):
                         # A crash also never reaches the SDK's own crash logger
                         # once this guard returns an envelope, so log it here.
-                        logger.exception("tool %s raised an unexpected exception", name)
+                        # Issue #57: the root logger's stderr handler prints
+                        # the message AND the traceback unprefixed, so the
+                        # line reached the controller log without a
+                        # timestamp. The shared emitter keeps the traceback
+                        # and prefixes EVERY line of it.
+                        logemit.log_exception(
+                            f"tool {name} raised an unexpected exception"
+                        )
                     env = errors.envelope(cause if cause is not None else exc)
                     if ops_ctx is not None:
                         operations.fail_inline(ops_ctx, cause if cause is not None else exc)

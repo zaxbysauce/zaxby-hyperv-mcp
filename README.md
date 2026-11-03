@@ -179,7 +179,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.7.0 today) instead of
+  package's version (0.8.0 today) instead of
   the SDK's.
 - **In-process embedders see the 2.x call shape.** `call_tool()` returns a
   `CallToolResult` (`.content`, `.structured_content`, `.is_error`) instead
@@ -224,8 +224,55 @@ per-user logon scheduled task (`hyperv-mcp-http`, RunLevel Limited — Hyper-V
 Administrators membership, no UAC — no execution time limit, IgnoreNew,
 restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
-(`setx HYPERV_MCP_HTTP_TOKEN <token>` — available from the next logon) and
+(`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.8.0 changes
+
+- **Non-loopback binds keep DNS-rebinding protection (#69):** on mcp 2.x the
+  SDK auto-enables Host/Origin validation only for loopback binds, so a
+  `--host 0.0.0.0` (or LAN IP) bind silently ran with the middleware
+  disabled. `hyperv-mcp-http` now arms explicit protection for every
+  non-loopback bind: allowed hosts/origins cover the bind address forms, and
+  a new `http.allowed_hosts` config list (names only, never secrets) covers
+  the LAN hostname/IP clients actually send. Loopback binds are unchanged.
+  A foreign Host header is rejected (421); an uncovered Origin is rejected
+  (403).
+- **WMI console survives worker turnover (#95):** a cached SWbem service
+  dies with the worker thread that created it (the observed
+  "Object is not connected to server" storm). The backend cache now records
+  each service's creator and reconnects on a live worker when the creator
+  has exited. `ConsoleWMI.creator`/`creator_thread` expose query provenance,
+  and every translated WMI failure names the serving worker and the concrete
+  operation (input-method failures name the method; input is still never
+  replayed through PowerShell).
+- **Controller log lines carry timestamps (#57):** every line the controller
+  writes to its redirected per-user log is prefixed `YYYY-MM-DDTHH:MM:SSZ`
+  (ISO-8601 UTC), so spawn/refusal history is readable from the log alone.
+  That covers the startup banner and policy lines, the token refusals, the
+  audit stream and the endpoint notice — they all share one emitter
+  (`hyperv_mcp.logemit`), which also prefixes every line of a multi-line
+  payload. The SDK's and uvicorn's own records land in the same file, so a
+  process-wide record factory stamps those too (uvicorn's access line
+  carries the stamp in its client-address field). The interactive
+  `--install-logon-task` prints keep their operator-shell format (they are
+  written to the operator's terminal, not to the redirected log).
+- **Guest-root UNC validation hardened (#37):** share-less UNC roots
+  (`\\server`, `\\server\`) and the `\\?\UNC\server\share`
+  device form are rejected at config load; a configured root must name its
+  share. A failed `guest_get` no longer leaves empty husk directories when
+  directory creation fails mid-chain (the created prefix is pruned
+  leaf-first before the error re-raises).
+- **Wheel ships the UIA helper — verified (#110):** a unit check builds the
+  wheel via the PEP 517 backend and asserts
+  `hyperv_mcp/guest/uia_helper.ps1` ships in the archive, and fails on a
+  build configuration that excludes it (a packaging regression can no
+  longer ship a broken wheel with CI green).
+- **README connect section documents the controller token (#56):** the
+  `.mcp.json` snippet and the `claude mcp add` one-liner now name
+  `HYPERV_MCP_HTTP_TOKEN`, and the `setx` guidance is paste-safe.
+- **Version bump:** 0.7.0 -> 0.8.0 (`pyproject.toml`, package `__version__`,
+  this section; `test_version_consistency.py` pins the sites).
 
 ## 0.7.0 changes
 
@@ -701,7 +748,10 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
   //                                    // OMIT the section entirely for local mode
   //                                    // (the section requires a non-empty host)
   "http": { "host": "127.0.0.1", "port": 8787, "token_env": "HYPERV_MCP_HTTP_TOKEN",
-            "agents": { "agent-a": "HYPERV_MCP_TOKEN_AGENT_A" } }
+            "agents": { "agent-a": "HYPERV_MCP_TOKEN_AGENT_A" },
+            // allowed_hosts: public host names/IPs clients send for a
+            // non-loopback bind (DNS-rebinding protection, issue #69)
+            "allowed_hosts": ["lab.example.com"] }
 }
 ```
 
@@ -810,6 +860,52 @@ not recommended: the pwsh7 child would lose its pwsh7 module directories on
 every spawn. The knob exists for exotic 5.1 layouts; leave it `null` for
 PowerShell 7 hosts.
 
+## Non-loopback binds: DNS-rebinding protection (0.8.0, issue #69)
+
+`hyperv-mcp-http` binds loopback by default. A non-loopback bind
+(`--host 0.0.0.0`, a LAN IP, or a DNS name) now arms DNS-rebinding
+protection explicitly: requests whose `Host` (or `Origin`) header does not
+match the bind address are rejected with 421 (host) / 403 (origin).
+
+The allow-lists cover the bind address itself (any port, and the bracketed
+IPv6 form). Clients that connect by a DIFFERENT name — the usual LAN case,
+where a browser or agent dials `http://192.168.1.20:8787` while the server
+binds `0.0.0.0` — must be allowed explicitly:
+
+```jsonc
+{
+  "http": {
+    "host": "0.0.0.0",
+    "port": 8787,
+    "token_env": "HYPERV_MCP_HTTP_TOKEN",
+    "allowed_hosts": ["192.168.1.20", "lab.example.com"]
+  }
+}
+```
+
+Each entry contributes its host and host:* forms to the allowed hosts and
+its `http://` / `https://` forms (any port) to the allowed origins. An
+entry that already names a PORT (`lab.example.com:8787`) contributes only
+its exact form — the `host:port:*` sibling could never match a Host
+header. Names only — never put a secret in this list. Entries are
+validated at load: a scheme, a path, a wildcard, a name with whitespace,
+a malformed address or an out-of-range port is rejected at startup rather
+than silently failing to match any request.
+
+For a WILDCARD bind (`0.0.0.0`, `::`) the loopback forms
+(`127.0.0.1`, `localhost`, `[::1]`) are admitted automatically — this
+repo's own stdio proxy dials the controller over loopback on a wildcard
+bind (so the bearer token never crosses a routable interface), and a
+client dialing the machine's LAN address still needs its own entry.
+Do NOT leave the list empty on a wildcard bind: the bind address itself
+is not a name any client dials, so every LAN client would be refused
+with 421. Either list the addresses your clients dial, or front the
+endpoint with a reverse proxy that rewrites `Host`/`Origin` to the bind
+address.
+
+Loopback binds are unchanged: mcp 2.x's own auto-enable still applies, and
+no allow-list is needed.
+
 ## Remote Hyper-V host
 
 Set `hyperv.host` to manage Hyper-V on another machine — the layout where
@@ -916,7 +1012,7 @@ usual guest credentials:
 
 ```text
 $ hyperv-mcp --check-env
-hyperv-mcp 0.7.0
+hyperv-mcp 0.8.0
 hyperv.target remote host nuc01
 HYPERV_HOST_USERNAME                set
 HYPERV_HOST_PASSWORD                not set
@@ -1137,10 +1233,19 @@ way.
 ## Connecting to MCP clients
 
 ```powershell
+$env:HYPERV_MCP_HTTP_TOKEN = [convert]::ToBase64String((1..32 | ForEach-Object { Get-Random -Max 256 }))
 claude mcp add hyperv -- hyperv-mcp
 ```
 
-`.mcp.json`:
+The stdio client inherits `HYPERV_MCP_HTTP_TOKEN` from this shell, so the
+merged auto-start fail-fast (which names that variable) is satisfied; the
+token value stays in your environment and out of argv.
+
+`.mcp.json` (a persistent client configuration — the token is stored there
+IN PLAINTEXT, so keep the file out of version control, and replace the
+placeholder below with your generated secret: the controller accepts ANY
+non-empty value as the bearer token, so an unreplaced placeholder would
+become a published credential):
 
 ```json
 {
@@ -1149,6 +1254,7 @@ claude mcp add hyperv -- hyperv-mcp
       "command": "hyperv-mcp",
       "env": {
         "HYPERV_MCP_CONFIG": "C:\\Lab\\hyperv-mcp.json",
+        "HYPERV_MCP_HTTP_TOKEN": "REPLACE_WITH_YOUR_GENERATED_TOKEN",
         "HYPERV_GUEST_USERNAME": "Administrator",
         "HYPERV_GUEST_PASSWORD_FILE": "C:\\Lab\\secrets\\guest.pw"
       }

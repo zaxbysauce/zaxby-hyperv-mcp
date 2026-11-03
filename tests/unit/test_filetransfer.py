@@ -569,3 +569,129 @@ def test_get_destination_equal_to_host_root_denied(monkeypatch, rooted_cfg, tmp_
             str(tmp_path / "host-dst"), cred=CRED,
         )
     assert fake.scripts == []
+
+
+def test_makedirs_tracked_returns_created_dirs_leaf_first(tmp_path):
+    """The caller prunes the returned list FORWARD, so it must be leaf
+    first: with two or more created levels, removing the root first fails
+    (the child still exists) and the husks survive (closeout-review
+    finding 2 - a regression the fix wave introduced)."""
+    from hyperv_mcp.filetransfer import _makedirs_tracked
+
+    target = tmp_path / "level1" / "level2" / "level3"
+    created = _makedirs_tracked(str(target))
+    assert len(created) == 3, created
+    assert created == sorted(created, key=len, reverse=True), (
+        f"the created directories are not leaf first: {created}"
+    )
+    assert created[0].endswith("level3"), created
+    assert created[-1].endswith("level1"), created
+
+
+def test_cleanup_failed_get_prunes_every_created_level(tmp_path):
+    """The end-to-end consequence: a transfer that fails after creating
+    two levels must leave NEITHER of them behind."""
+    from hyperv_mcp.filetransfer import _cleanup_failed_get, _makedirs_tracked
+
+    staged = tmp_path / "staged.bin"
+    staged.write_bytes(b"x")
+    # The caller creates the DESTINATION's parent chain, so the chain is
+    # the two directory levels (the file itself is never a component).
+    target = tmp_path / "level1" / "level2"
+    created = _makedirs_tracked(str(target))
+    assert len(created) == 2, created
+    _cleanup_failed_get(str(staged), created)
+    assert not staged.exists(), "the staged file survived the cleanup"
+    assert not (tmp_path / "level1").exists(), (
+        "a created level survived the cleanup: " + str(created)
+    )
+
+
+def test_makedirs_tracked_composes_a_unc_chain(monkeypatch):
+    """A UNC path must be composed from the server+share DRIVE plus the
+    remaining components - building it from the whole path would recreate
+    the share inside itself ("\\\\srv\\share\\srv\\share\\newdir")
+    and never create the requested directory (closeout-review finding 3).
+    """
+    from hyperv_mcp import filetransfer
+
+    attempted: list = []
+
+    def fake_isdir(path):
+        return False
+
+    def fake_mkdir(path):
+        attempted.append(path)
+
+    monkeypatch.setattr(filetransfer.os.path, "isdir", fake_isdir)
+    monkeypatch.setattr(filetransfer.os, "mkdir", fake_mkdir)
+    filetransfer._makedirs_tracked("\\\\srv\\share\\newdir")
+    # Exactly ONE component is created, under the share - never the share
+    # rebuilt inside itself.
+    assert attempted == ["\\\\srv\\share\\newdir"], attempted
+
+
+def test_makedirs_tracked_fails_loudly_on_a_file_component(tmp_path):
+    """A FILE at a chain component is not a directory: the chain cannot be
+    built, so the call must fail instead of walking past it (and the
+    prefix this call created must be pruned)."""
+    from hyperv_mcp.filetransfer import _makedirs_tracked
+
+    # A file at the FINAL component.
+    leaf_file = tmp_path / "leaf"
+    leaf_file.write_bytes(b"x")
+    with pytest.raises(OSError):
+        _makedirs_tracked(str(leaf_file))
+    assert not (tmp_path / "leaf").is_dir()
+
+    # A file at a MIDDLE component: the chain cannot be built at all.
+    middle_file = tmp_path / "middle"
+    middle_file.write_bytes(b"x")
+    with pytest.raises(OSError):
+        _makedirs_tracked(str(middle_file / "leaf"))
+
+
+def test_a_concurrent_creator_s_component_is_never_pruned(tmp_path, monkeypatch):
+    """The OWNERSHIP rule, deterministically: a component another transfer
+    created (here: os.mkdir raises FileExistsError because the other
+    worker won the race) is NOT recorded as ours and is NOT removed when
+    our own create fails.
+
+    This is the deterministic pin for PRR-002. The racy probe
+    (`.zcode/pr-review/pr114-review-20261102/probe_prune_ownership.py`)
+    demonstrated the mechanism but could report a defect on CORRECT code
+    (its own thread created the component it then called 'the other
+    worker's'), so it is not cited as the pin."""
+    from hyperv_mcp import filetransfer
+
+    head = tmp_path / "head"
+    middle = head / "middle"
+    target = middle / "leaf<blocked>"   # the invalid final component
+
+    real_mkdir = filetransfer.os.mkdir
+
+    def fake_mkdir(path, *args, **kwargs):
+        if str(path).endswith("middle"):
+            # The OTHER worker wins the race: the directory exists, and our
+            # mkdir sees FileExistsError.
+            real_mkdir(path)
+            raise FileExistsError(path)
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(filetransfer.os, "mkdir", fake_mkdir)
+    with pytest.raises(OSError):
+        filetransfer._makedirs_tracked(str(target))
+
+    assert middle.exists(), (
+        "the concurrent creator's directory was pruned: the ownership rule "
+        "was broken"
+    )
+    # The parent we created survives too - and it MUST: the empty-only
+    # prune (os.rmdir) refuses a directory that still holds the other
+    # worker's component, which is exactly the point of the ownership
+    # rule (the pre-fix snapshot prune removed that component and then
+    # the parent as well).
+    assert head.exists(), (
+        "the parent we created was removed even though it still holds the "
+        "other worker's component"
+    )
