@@ -117,3 +117,25 @@ def test_setx_guidance_is_paste_safe():
     assert found, (
         "README carries no 'setx HYPERV_MCP_HTTP_TOKEN' guidance line"
     )
+
+
+def test_connect_section_states_the_plaintext_token_storage():
+    """PRR-014: the connect section must SAY that a persistent .mcp.json
+    stores the token in plaintext, and must not carry the contradictory
+    "never in a config file" claim next to an example that does exactly
+    that. The example must carry the replace-me placeholder, because the
+    controller accepts ANY non-empty value as the bearer token."""
+    text = _readme_text()
+    connect = text.split("## Connecting")[1] if "## Connecting" in text else text
+    assert "REPLACE_WITH_YOUR_GENERATED_TOKEN" in connect, (
+        "the connect section's .mcp.json example does not carry the "
+        "replace-me placeholder"
+    )
+    assert "plaintext" in connect.lower(), (
+        "the connect section does not state that a persistent .mcp.json "
+        "stores the token in plaintext"
+    )
+    assert "never in argv or the config file" not in connect, (
+        "the connect section still claims the token never enters a config "
+        "file, while its own .mcp.json example persists it there"
+    )

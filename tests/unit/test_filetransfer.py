@@ -691,3 +691,7 @@ def test_a_concurrent_creator_s_component_is_never_pruned(tmp_path, monkeypatch)
     # worker's component, which is exactly the point of the ownership
     # rule (the pre-fix snapshot prune removed that component and then
     # the parent as well).
+    assert head.exists(), (
+        "the parent we created was removed even though it still holds the "
+        "other worker's component"
+    )
