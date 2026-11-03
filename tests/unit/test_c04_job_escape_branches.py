@@ -107,7 +107,8 @@ def test_spawner_prints_only_verified_markers():
 def test_wrapper_self_verifies_child_and_refuses_in_job():
     """The WMI wrapper verifies ITS OWN child's escape (no racy external PID
     check): an in-job child is killed and the wrapper refuses with a
-    nonzero exit, so wrapper failure reads as spawn failure (plan-critic
+    nonzero exit, so an unverifiable wrapper surfaces as the port-wait
+    refusal (plan-critic
     B2). Structural pin: the embedded ctypes helper cannot be stubbed from
     outside the self-contained script, so the branch is pinned here and
     exercised for real by the frozen C8 acceptance check on affected
