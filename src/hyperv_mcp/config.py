@@ -61,7 +61,10 @@ def _split_host_port(value: str) -> tuple[str, int | None]:
     """Split an allow-list entry into (host, port).
 
     A bracketed IPv6 literal keeps its brackets stripped; a bare IPv6
-    literal (more than one colon) has no port of its own.
+    literal (more than one colon) has no port of its own. A BRACKETED
+    entry must name an IPv6 literal - the bracket form exists for the
+    IPv6 spelling, so "[foo]" is not a host name in brackets but a
+    malformed address.
     """
     if value.startswith("["):
         end = value.find("]")
@@ -70,6 +73,13 @@ def _split_host_port(value: str) -> tuple[str, int | None]:
                 f"http.allowed_hosts entries must close a bracketed address: {value!r}"
             )
         host = value[1:end]
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            raise ConfigError(
+                "http.allowed_hosts entries in brackets must name an IPv6 "
+                f"literal: {value!r}"
+            ) from None
         rest = value[end + 1 :]
         if not rest:
             return host, None
@@ -129,10 +139,14 @@ def _set_allowed_host(value: str) -> str:
         ipaddress.ip_address(host)
     except ValueError:
         # Not an address: it must be a syntactically valid host name. A
-        # numeric dotted form that is NOT a valid address ("999.999.999.999")
-        # is a malformed address, not a host name.
-        looks_numeric = all(c.isdigit() or c == "." for c in host)
-        if looks_numeric or not _ALLOWED_HOST_NAME_RE.match(host):
+        # DOTTED numeric form that is NOT a valid address
+        # ("999.999.999.999") is a malformed address, not a host name; a
+        # single numeric label ("12345") is a legitimate host name and
+        # stays loadable.
+        looks_like_address = "." in host and all(
+            c.isdigit() or c == "." for c in host
+        )
+        if looks_like_address or not _ALLOWED_HOST_NAME_RE.match(host):
             raise ConfigError(
                 "http.allowed_hosts entries must be a host name or address, "
                 f"optionally with a port: {value!r}"

@@ -346,6 +346,41 @@ def test_log_line_prefixes_every_physical_line(capsys):
     )
 
 
+def test_unrenderable_records_are_still_stamped(capsys):
+    """A record whose message cannot be rendered (a stray "%" with no
+    args) must still be stamped - and must not raise into the caller."""
+    import logging
+    import sys
+
+    from hyperv_mcp import logemit
+
+    previous_factory = logging.getLogRecordFactory()
+    logger = logging.getLogger("mcp.unrenderable")
+    saved = (logger.level, list(logger.handlers), logger.propagate)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.INFO)
+    logger.handlers = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        logemit.install_log_prefix()
+        logger.info("100%% done")          # a stray percent, no args
+        logger.info("%s and %s", "one")     # too few args
+        captured = capsys.readouterr()
+    finally:
+        logger.handlers = saved[1]
+        logger.setLevel(saved[0])
+        logger.propagate = saved[2]
+        logging.setLogRecordFactory(previous_factory)
+    lines = [line for line in captured.err.splitlines() if line.strip()]
+    assert len(lines) == 2, f"expected two logged records, got {lines!r}"
+    unprefixed = [line for line in lines if not TIMESTAMP_PREFIX.match(line)]
+    assert not unprefixed, (
+        "an unrenderable record reached the log without the prefix: "
+        f"{unprefixed!r}"
+    )
+
+
 def test_controller_streams_are_pinned_to_utf8(monkeypatch):
     """PRR-018 (closeout-review finding 13): the controller's stdout and
     stderr are redirected into a UTF-8 log file, but the child's streams
@@ -427,14 +462,14 @@ def test_log_exception_prefixes_every_traceback_line(capsys):
     try:
         raise ValueError("deliberate probe failure")
     except ValueError:
-        logemit.log_exception("tool probe raised an unexpected exception")
+        logemit.log_exception("tool probe raised an unexpected exception\nsecond line")
     captured = capsys.readouterr()
     lines = [
         line
         for line in (captured.out + captured.err).splitlines()
         if line.strip()
     ]
-    assert len(lines) >= 2, (
+    assert len(lines) >= 3, (
         "the exception emission produced no traceback lines: " + repr(lines)
     )
     unprefixed = [line for line in lines if not TIMESTAMP_PREFIX.match(line)]
@@ -511,41 +546,15 @@ def test_logger_guardrail_covers_every_logger_shape():
         assert got is expected, source
 
 
-def test_no_unprefixed_stderr_writers_in_the_package():
-    """Package-wide guardrail (the general form of the #57 requirement).
+def _scan_unprefixed_writers(package, emitter, excluded_modules, excluded_functions):
+    """Scan a package directory for writers that can reach the controller's
+    redirected log UNPREFIXED.
 
-    Every print() that can reach the CONTROLLER's redirected per-user log
-    must go through the shared timestamped emitter. The controller process
-    is the `hyperv-mcp-http` entry point (http_entry.main) plus everything
-    it calls (server.bootstrap -> _startup_banner, the audit sink, the
-    PowerShell slot pool).
-
-    Documented exclusions (each writes to a DIFFERENT stream):
-      - http_entry._handle_logon_task: the interactive install path, whose
-        output goes to the operator's terminal;
-      - server.main: the STDIO server CLI, whose stderr is the MCP
-        CLIENT's stderr;
-      - stdio_proxy: the client-side proxy, whose stderr is the operator's
-        terminal;
-      - consolebench: a development benchmark tool.
-
-    A NEW module (or a new function in an in-scope module) that prints to
-    stderr would fail here - the round-3 gap (server banner / audit
-    stream) was exactly that shape, and a per-module check could not see
-    it."""
-    import ast
-    from pathlib import Path
-
-    package = Path(http_entry.__file__).resolve().parent
-    emitter = package / "logemit.py"
-
-    # module -> fully excluded function names
-    excluded_functions = {
-        "http_entry.py": {"_handle_logon_task"},
-        "server.py": {"main"},
-    }
-    # modules whose stderr never reaches the controller log
-    excluded_modules = {"stdio_proxy.py", "consolebench.py"}
+    Split out of the guardrail test so a SYNTHETIC package can be fed to
+    it: the shapes the scan must recognise (a logger-factory call, an
+    attribute receiver) do not occur in the shipped package, so the scan's
+    own branches would otherwise never be exercised.
+    """
     offenders = []
     for module in sorted(package.glob("*.py")):
         if module == emitter or module.name in excluded_modules:
@@ -633,10 +642,93 @@ def test_no_unprefixed_stderr_writers_in_the_package():
                     offenders.append(
                         f"{module.name}:{fname}:{node.lineno}"
                     )
+    return offenders
+
+
+def test_no_unprefixed_stderr_writers_in_the_package():
+    """Package-wide guardrail (the general form of the #57 requirement).
+
+    Every print() that can reach the CONTROLLER's redirected per-user log
+    must go through the shared timestamped emitter. The controller process
+    is the `hyperv-mcp-http` entry point (http_entry.main) plus everything
+    it calls (server.bootstrap -> _startup_banner, the audit sink, the
+    PowerShell slot pool).
+
+    Documented exclusions (each writes to a DIFFERENT stream):
+      - http_entry._handle_logon_task: the interactive install path, whose
+        output goes to the operator's terminal;
+      - server.main: the STDIO server CLI, whose stderr is the MCP
+        CLIENT's stderr;
+      - stdio_proxy: the client-side proxy, whose stderr is the operator's
+        terminal;
+      - consolebench: a development benchmark tool.
+
+    A NEW module (or a new function in an in-scope module) that prints to
+    stderr would fail here - the round-3 gap (server banner / audit
+    stream) was exactly that shape, and a per-module check could not see
+    it."""
+    from pathlib import Path
+
+    package = Path(http_entry.__file__).resolve().parent
+    emitter = package / "logemit.py"
+    # module -> fully excluded function names
+    excluded_functions = {
+        "http_entry.py": {"_handle_logon_task"},
+        "server.py": {"main"},
+    }
+    # modules whose stderr never reaches the controller log
+    excluded_modules = {"stdio_proxy.py", "consolebench.py"}
+    offenders = _scan_unprefixed_writers(
+        package, emitter, excluded_modules, excluded_functions
+    )
     assert not offenders, (
         "these print() calls can reach the controller's redirected log "
         f"unprefixed: {offenders}"
     )
+
+
+def test_the_guardrail_reports_every_writer_shape(tmp_path):
+    """The scan must REPORT the shapes it claims to know: a print, a
+    logger by name, a logger reached through a factory call
+    ("logging.getLogger('mcp').warning(...)") and a logger reached
+    through an attribute ("self.logger.error(...)").
+
+    The shipped package contains none of the latter two, so without a
+    synthetic package the scan's own branches would never run (and a
+    revert of the receiver handling would stay green).
+    """
+    from pathlib import Path
+
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "logemit.py").write_text("# the emitter itself\n", encoding="utf-8")
+    (package / "offender.py").write_text(
+        "import logging\n"
+        "\n"
+        "def a():\n"
+        "    print('x')\n"
+        "\n"
+        "def b():\n"
+        "    logger.warning('x')\n"
+        "\n"
+        "def c():\n"
+        "    logging.getLogger('mcp').warning('x')\n"
+        "\n"
+        "def d():\n"
+        "    self.logger.error('x')\n",
+        encoding="utf-8",
+    )
+    offenders = _scan_unprefixed_writers(
+        Path(package), Path(package) / "logemit.py", set(), {}
+    )
+    # EVERY shape must be reported - not merely "some offender": the
+    # synthetic module holds four writers, and a scan that only sees the
+    # first one would still report an offender.
+    for shape in ("a", "b", "c", "d"):
+        assert any(
+            o.startswith(f"offender.py:{shape}:") for o in offenders
+        ), f"the scan did not report the {shape}() writer: {offenders}"
+    assert len(offenders) == 4, offenders
 
 
 def test_refusal_paths_never_carry_the_token_value(monkeypatch, capsys):

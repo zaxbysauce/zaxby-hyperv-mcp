@@ -353,6 +353,35 @@ def test_concurrent_callers_open_one_connect(monkeypatch):
     assert all(name == "BackendUnavailable" for name in errors), errors
 
 
+def test_a_successful_connect_clears_the_negative_memo(monkeypatch):
+    """The negative memo must not outlive a SUCCESSFUL connect: a stale
+    failure would keep refusing the next worker for the rest of the TTL
+    even though the host is reachable (the reviewer's blocker: the memo
+    was never cleared on success)."""
+    import time as _time
+
+    cfg = Config()
+    _install_fake_service(monkeypatch)
+    host_key = wmiconsole._host_key(cfg)
+
+    def connect_and_record_a_concurrent_failure(cfg):
+        # A concurrent caller recorded a FRESH failure for this host
+        # while this connect was in flight.
+        wmiconsole._connect_failures[host_key] = (
+            _time.monotonic(),
+            wmiconsole.BackendUnavailable("concurrent failure"),
+        )
+        return Service()
+
+    monkeypatch.setattr(wmiconsole, "connect_service", connect_and_record_a_concurrent_failure)
+    be = wmiconsole.backend(cfg)
+    assert be is not None, "the connect did not produce a backend"
+    assert host_key not in wmiconsole._connect_failures, (
+        "a successful connect left the negative memo in place: "
+        f"{wmiconsole._connect_failures!r}"
+    )
+
+
 def test_replacement_worker_failure_does_not_replay_input(monkeypatch):
     cfg = Config(unrestricted=True)
     _install_fake_service(monkeypatch)

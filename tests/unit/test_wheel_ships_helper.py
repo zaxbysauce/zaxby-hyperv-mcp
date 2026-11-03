@@ -19,8 +19,9 @@ Token -> AC map:
 The builds run inside tmp_path over a COPY of pyproject.toml + src/ (+ the
 files the build references), so the repository tree is never written to
 and the discriminating leg's mutated pyproject never leaks anywhere.
-Skips when hatchling is not importable (CI installs the dev dependencies,
-which carry hatchling as the build backend once the issue lands).
+FAILS when hatchling is not importable: the packaging gate must never
+VANISH (hatchling is a declared dev dependency, so its absence is an
+environment fault, not a reason to skip the gate silently).
 """
 
 import os

@@ -629,3 +629,24 @@ def test_makedirs_tracked_composes_a_unc_chain(monkeypatch):
     # Exactly ONE component is created, under the share - never the share
     # rebuilt inside itself.
     assert attempted == ["\\\\srv\\share\\newdir"], attempted
+
+
+def test_makedirs_tracked_fails_loudly_on_a_file_component(tmp_path):
+    """A FILE at a chain component is not a directory: the chain cannot be
+    built, so the call must fail instead of walking past it (and the
+    prefix this call created must be pruned)."""
+    from hyperv_mcp.filetransfer import _makedirs_tracked
+
+    # A file at the FINAL component.
+    leaf_file = tmp_path / "leaf"
+    leaf_file.write_bytes(b"x")
+    with pytest.raises(OSError):
+        _makedirs_tracked(str(leaf_file))
+    assert not (tmp_path / "leaf").is_dir()
+
+    # A file at a MIDDLE component, with a directory this call creates
+    # below it: the created prefix must be pruned.
+    middle_file = tmp_path / "middle"
+    middle_file.write_bytes(b"x")
+    with pytest.raises(OSError):
+        _makedirs_tracked(str(middle_file / "leaf"))

@@ -329,6 +329,19 @@ def test_configured_host_with_port_is_not_bracketed():
     # form the matcher needs for a client that dials any port).
     portless = seam("0.0.0.0", ("lab.example.com",))
     assert "lab.example.com:*" in portless.allowed_hosts, portless.allowed_hosts
+    # A BRACKETED IPv6 literal WITH a port is matched exactly too: the
+    # ":*" sibling's base would be read as everything before the LAST
+    # colon, so it could never match.
+    bracketed = seam("0.0.0.0", ("[::1]:8787",))
+    assert "[::1]:8787" in bracketed.allowed_hosts, bracketed.allowed_hosts
+    assert "[::1]:8787:*" not in bracketed.allowed_hosts, (
+        "a bracketed IPv6 entry with a port got a dead ':*' sibling: "
+        f"{bracketed.allowed_hosts!r}"
+    )
+    assert not any(
+        origin.endswith("[::1]:8787:*")
+        for origin in (bracketed.allowed_origins or [])
+    ), f"a bracketed IPv6 entry got a dead origin ':*' sibling: {bracketed.allowed_origins!r}"
 
 
 def test_wildcard_bind_admits_the_loopback_forms():
@@ -390,6 +403,10 @@ def test_malformed_allowed_hosts_entries_are_rejected_at_load():
         "10.0.0.5:0",               # a port below 1
         "[::1]:99999",               # an out-of-range port on a literal
         "[::1",                     # an unclosed bracket
+        "[foo]",                    # brackets must name an IPv6 literal
+        "[lab.example.com]",        # a host name in brackets
+        "[lab.example.com]:8787",   # a host name in brackets, with a port
+        "[10.0.0.5]",               # brackets are the IPv6 spelling only
     ):
         with pytest.raises(ConfigError):
             Config.from_dict({"http": {"allowed_hosts": [bad]}})
@@ -400,6 +417,7 @@ def test_malformed_allowed_hosts_entries_are_rejected_at_load():
         "lab.example.com:8787",
         "lab.example.com.",          # the FQDN root form
         "MY_PC",                      # a Windows NetBIOS name
+        "12345",                      # a single numeric label is a host name
         "10.0.0.5",
         "10.0.0.5:8787",
         "localhost",
