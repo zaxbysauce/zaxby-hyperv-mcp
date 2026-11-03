@@ -28,7 +28,6 @@ import argparse
 import dataclasses
 import importlib.metadata
 import json
-import logging
 import os
 import re
 import subprocess
@@ -198,8 +197,6 @@ _http_token_verifier = None
 _bootstrapped = False
 _compat_warning_shown = False
 CFG: Config | None = None
-
-logger = logging.getLogger(__name__)
 
 
 def configure_http_auth(token_verifier) -> None:

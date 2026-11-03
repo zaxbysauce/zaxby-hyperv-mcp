@@ -140,14 +140,39 @@ def _transport_security_for(
         # produced "[lab.example.com:8787]", which matches nothing.
         return value.count(":") > 1 and not value.startswith("[")
 
+    def _names_a_port(value: str) -> bool:
+        # A bracketed IPv6 literal ("[::1]") carries no port; a "name:port"
+        # entry carries exactly one colon.
+        return not value.startswith("[") and value.count(":") == 1
+
     def _host_forms(value: str) -> list[str]:
         if _is_ipv6_literal(value):
             # IPv6 literal: the matcher parses host:port by the LAST colon,
             # so a bare form would be misread; bracket it like [::1]:*.
             return [f"[{value}]", f"[{value}]:*"]
+        if _names_a_port(value):
+            # The entry ALREADY names a port ("lab.example.com:8787"). The
+            # SDK matches such an entry EXACTLY, and a ":*" sibling would
+            # be dead weight: its base is read as everything before the
+            # last colon, so "lab.example.com:8787:*" would require a
+            # colon AFTER the port and can never match a Host header.
+            return [value]
         return [value, f"{value}:*"]
 
     named: list[str] = [host]
+    if host in ("0.0.0.0", "0", "::", "::0"):
+        # A WILDCARD bind is reached over loopback by this repo's own
+        # stdio proxy (stdio_proxy maps a wildcard to 127.0.0.1 so the
+        # bearer token never crosses a routable interface), and the SDK
+        # matches the Host header literally. Without the loopback forms
+        # the allow-list admits only the bind literal, so every call
+        # through the proxy is refused with 421. Loopback is reachable
+        # only from this machine - which already holds the token - and a
+        # DNS-rebinding page sends its own Host, never 127.0.0.1, so
+        # admitting these forms does not weaken the rebinding defense.
+        for loopback in ("127.0.0.1", "localhost", "[::1]"):
+            if loopback not in named:
+                named.append(loopback)
     for entry in configured_hosts or ():
         stripped = str(entry).strip()
         if stripped and stripped not in named:
@@ -161,7 +186,11 @@ def _transport_security_for(
     for value in named:
         url_host = f"[{value}]" if _is_ipv6_literal(value) else value
         for scheme in ("http", "https"):
-            for suffix in (":*", ""):
+            # Same rule as the host forms: an entry that already names a
+            # port gets the EXACT origin only (an "origin:port:*" form
+            # could never match an Origin header).
+            suffixes = ("",) if _names_a_port(value) else (":*", "")
+            for suffix in suffixes:
                 form = f"{scheme}://{url_host}{suffix}"
                 if form not in allowed_origins:
                     allowed_origins.append(form)
@@ -436,6 +465,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     ns = parser.parse_args(argv)
+
+    # The controller's stdout/stderr are redirected into the per-user log
+    # file, which is opened UTF-8, but the child's streams otherwise use the
+    # WINDOWS LOCALE encoding (cp1252) - a non-ASCII line would be written
+    # in the wrong encoding and read back as mojibake (or fail a strict
+    # UTF-8 read). Pin both streams to UTF-8 with replacement (the log is a
+    # diagnostic surface, never a byte-exact transport).
+    for _stream in (sys.stdout, sys.stderr):
+        # reconfigure is a TextIOWrapper attribute (not on the TextIO
+        # protocol), so it is looked up dynamically: a redirected stream
+        # may be a plain file object without it.
+        _reconfigure = getattr(_stream, "reconfigure", None)
+        if _reconfigure is None:
+            continue
+        try:
+            _reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+    # The SDK's own records (mcp calls configure_logging) and uvicorn's
+    # access lines land in the SAME redirected file; prefix them too, so
+    # every physical line in the log carries its timestamp.
+    logemit.install_log_prefix_filter()
 
     try:
         cfg = load_controller_config()

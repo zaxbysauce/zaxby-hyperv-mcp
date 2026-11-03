@@ -251,9 +251,12 @@ the task-spawned controller reads it from the environment.
   (ISO-8601 UTC), so spawn/refusal history is readable from the log alone.
   That covers the startup banner and policy lines, the token refusals, the
   audit stream and the endpoint notice — they all share one emitter
-  (`hyperv_mcp.logemit`). The interactive `--install-logon-task` prints keep
-  their operator-shell format (they are written to the operator's terminal,
-  not to the redirected log).
+  (`hyperv_mcp.logemit`), which also prefixes every line of a multi-line
+  payload. The SDK's and uvicorn's own records land in the same file, so a
+  process-wide record filter stamps those too (uvicorn's access line carries
+  the stamp in its client-address field). The interactive
+  `--install-logon-task` prints keep their operator-shell format (they are
+  written to the operator's terminal, not to the redirected log).
 - **Guest-root UNC validation hardened (#37):** share-less UNC roots
   (`\\server`, `\\server\`) and the `\\?\UNC\server\share`
   device form are rejected at config load; a configured root must name its
@@ -882,9 +885,20 @@ binds `0.0.0.0` — must be allowed explicitly:
 
 Each entry contributes its host and host:* forms to the allowed hosts and
 its `http://` / `https://` forms (any port) to the allowed origins. Names
-only — never put a secret in this list. Leave it empty for a bind that is
-only reachable as the bind address itself, or front the endpoint with a
-reverse proxy that rewrites `Host`/`Origin` to the bind address.
+only — never put a secret in this list. Entries are validated at load: a
+scheme, a path, a wildcard or a name with whitespace is rejected at
+startup rather than silently failing to match any request.
+
+For a WILDCARD bind (`0.0.0.0`, `::`) the loopback forms
+(`127.0.0.1`, `localhost`, `[::1]`) are admitted automatically — this
+repo's own stdio proxy dials the controller over loopback on a wildcard
+bind (so the bearer token never crosses a routable interface), and a
+client dialing the machine's LAN address still needs its own entry.
+Do NOT leave the list empty on a wildcard bind: the bind address itself
+is not a name any client dials, so every LAN client would be refused
+with 421. Either list the addresses your clients dial, or front the
+endpoint with a reverse proxy that rewrites `Host`/`Origin` to the bind
+address.
 
 Loopback binds are unchanged: mcp 2.x's own auto-enable still applies, and
 no allow-list is needed.
@@ -1222,10 +1236,13 @@ claude mcp add hyperv -- hyperv-mcp
 
 The stdio client inherits `HYPERV_MCP_HTTP_TOKEN` from this shell, so the
 merged auto-start fail-fast (which names that variable) is satisfied; the
-token value lives only in your environment, never in argv or the config
-file.
+token value stays in your environment and out of argv.
 
-`.mcp.json`:
+`.mcp.json` (a persistent client configuration — the token is stored there
+IN PLAINTEXT, so keep the file out of version control, and replace the
+placeholder below with your generated secret: the controller accepts ANY
+non-empty value as the bearer token, so an unreplaced placeholder would
+become a published credential):
 
 ```json
 {
@@ -1234,7 +1251,7 @@ file.
       "command": "hyperv-mcp",
       "env": {
         "HYPERV_MCP_CONFIG": "C:\\Lab\\hyperv-mcp.json",
-        "HYPERV_MCP_HTTP_TOKEN": "the token value you generated above",
+        "HYPERV_MCP_HTTP_TOKEN": "REPLACE_WITH_YOUR_GENERATED_TOKEN",
         "HYPERV_GUEST_USERNAME": "Administrator",
         "HYPERV_GUEST_PASSWORD_FILE": "C:\\Lab\\secrets\\guest.pw"
       }

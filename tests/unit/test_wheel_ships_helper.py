@@ -75,8 +75,14 @@ def build_wheel_into(dest: Path) -> Path:
     """
     try:
         from hatchling.build import build_wheel
-    except ImportError:
-        pytest.skip("hatchling not available")
+    except ImportError as exc:  # pragma: no cover - dependency missing
+        # The packaging gate must not VANISH: hatchling is a declared dev
+        # dependency, so its absence is an environment fault, not a reason
+        # to skip the gate silently (implementation-review).
+        pytest.fail(
+            "hatchling is required for the wheel gate (install the dev "
+            f"extras): {exc}"
+        )
     src_tree = dest / "project"
     src_tree.mkdir(parents=True)
     _copy_project(src_tree)
@@ -105,8 +111,11 @@ def test_wheel_ships_the_uia_helper(tmp_path):
 def test_helper_check_discriminates_a_wheel_missing_the_entry(tmp_path):
     try:
         from hatchling.build import build_wheel
-    except ImportError:
-        pytest.skip("hatchling not available")
+    except ImportError as exc:  # pragma: no cover - dependency missing
+        pytest.fail(
+            "hatchling is required for the wheel gate (install the dev "
+            f"extras): {exc}"
+        )
     project = tmp_path / "project"
     project.mkdir()
     _copy_project(project)

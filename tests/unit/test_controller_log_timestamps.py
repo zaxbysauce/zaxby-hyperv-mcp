@@ -130,11 +130,20 @@ def test_log_lines_carry_iso8601_timestamps(capsys):
     _assert_serve_path_routes_through_seam(seam_name)
     returned = seam("controller refused to start: no token is set")
     captured = capsys.readouterr()
-    text = returned if isinstance(returned, str) else (captured.out + captured.err)
-    lines = [line for line in text.splitlines() if line.strip()]
+    # BOTH output sources are validated: a seam that returns a string AND
+    # prints must not let the printed (possibly unprefixed) line escape
+    # the check (implementation-review).
+    chunks = [captured.out, captured.err]
+    if isinstance(returned, str):
+        chunks.append(returned)
+    lines = [
+        line for chunk in chunks for line in chunk.splitlines() if line.strip()
+    ]
     assert lines, "emission seam produced no observable line"
-    assert TIMESTAMP_PREFIX.match(lines[0]), (
-        f"controller log line carries no ISO-8601 UTC timestamp prefix: {lines[0]!r}"
+    unprefixed = [line for line in lines if not TIMESTAMP_PREFIX.match(line)]
+    assert not unprefixed, (
+        "controller log lines carry no ISO-8601 UTC timestamp prefix: "
+        f"{unprefixed!r}"
     )
     # Implementation-review round 1: the PREFIX SHAPE alone is not UTC --
     # a local-time stamp suffixed "Z" matches the same regex. Parse the
@@ -206,6 +215,102 @@ def test_main_output_is_fully_timestamped(monkeypatch, capsys):
     assert not unprefixed, (
         "controller output reached the redirected log without the ISO-8601 "
         f"UTC prefix: {unprefixed!r}"
+    )
+
+
+def test_sdk_and_uvicorn_records_are_prefixed_too(capsys):
+    """PRR-009: the SDK's own records ("mcp.*") and uvicorn's records land
+    in the SAME redirected per-user log, so they must carry the prefix as
+    well.
+
+    A filter attached to a LOGGER does not see the records of its
+    CHILDREN, and a filter attached to a HANDLER is lost when the SDK's
+    configure_logging() replaces the root handlers - so this leg pins the
+    hook that actually covers every record (the global record factory).
+
+    The uvicorn ACCESS record is the delicate one: uvicorn composes that
+    line from a FIVE-element args tuple (its own AccessFormatter), so the
+    stamp must not reshape that tuple - doing so would make uvicorn raise
+    "not enough values to unpack" and print a logging error INTO the
+    controller log.
+    """
+    import logging
+    import sys
+
+    from hyperv_mcp import logemit
+
+    # The record factory is process-global: install it, observe, and put
+    # the previous one back so this leg cannot leak into later tests.
+    previous_factory = logging.getLogRecordFactory()
+    name = "mcp.server.lowlevel.server"
+    logger = logging.getLogger(name)
+    saved = (logger.level, list(logger.handlers), logger.propagate)
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(logging.INFO)
+    logger.handlers = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        logemit.install_log_prefix_filter()
+        logger.info("sdk record %s", name)
+        captured = capsys.readouterr()
+    finally:
+        logger.handlers = saved[1]
+        logger.setLevel(saved[0])
+        logger.propagate = saved[2]
+        logging.setLogRecordFactory(previous_factory)
+    lines = [line for line in captured.err.splitlines() if line.strip()]
+    assert len(lines) == 1, f"expected one logged record, got {lines!r}"
+    assert TIMESTAMP_PREFIX.match(lines[0]), (
+        "a third-party log record reached the redirected log without the "
+        f"ISO-8601 UTC prefix: {lines[0]!r}"
+    )
+
+
+def test_uvicorn_access_records_keep_their_args_contract():
+    """PRR-009 follow-up: uvicorn's access line is composed by uvicorn's
+    own AccessFormatter from a five-element args tuple. The stamp must
+    reach that line WITHOUT breaking the tuple (a broken tuple makes
+    uvicorn's formatter raise and print a logging error into the
+    controller log)."""
+    import logging
+
+    from hyperv_mcp import logemit
+
+    previous_factory = logging.getLogRecordFactory()
+    try:
+        logemit.install_log_prefix_filter()
+        record = logging.getLogger("uvicorn.access").makeRecord(
+            "uvicorn.access",
+            logging.INFO,
+            __file__,
+            1,
+            '%s - "%s %s HTTP/%s" %d',
+            (("127.0.0.1", 54321), "GET", "/mcp", "1.1", 200),
+            None,
+        )
+    finally:
+        logging.setLogRecordFactory(previous_factory)
+
+    assert len(record.args) == 5, (
+        f"the access record's args tuple was reshaped: {record.args!r}"
+    )
+    client = record.args[0]
+    assert isinstance(client, str), client
+    assert TIMESTAMP_PREFIX.match(client), (
+        f"the access record carries no timestamp: {client!r}"
+    )
+    # The REAL uvicorn formatter must still be able to render the record.
+    from uvicorn.logging import AccessFormatter
+
+    rendered = AccessFormatter(
+        fmt="%(client_addr)s - %(request_line)s %(status_code)s"
+    ).format(record)
+    assert TIMESTAMP_PREFIX.search(rendered), (
+        f"the rendered access line carries no timestamp: {rendered!r}"
+    )
+    assert "GET /mcp HTTP/1.1" in rendered, (
+        f"the access line lost its request text: {rendered!r}"
     )
 
 
@@ -340,7 +445,11 @@ def test_no_unprefixed_stderr_writers_in_the_package():
                     and node.func.attr
                     in ("exception", "error", "warning", "info", "critical")
                     and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id == "logger"
+                    and (
+                        node.func.value.id == "logger"
+                        or node.func.value.id.lstrip("_").endswith("log")
+                        or node.func.value.id.lstrip("_").endswith("logger")
+                    )
                 )
                 # A direct stream write (sys.stdout.write / sys.stderr.write)
                 # lands in the redirected log exactly like a print does
@@ -366,7 +475,21 @@ def test_no_unprefixed_stderr_writers_in_the_package():
                         to_stream = isinstance(kw.value, ast.Attribute) and (
                             kw.value.attr in ("stderr", "stdout")
                         )
-                if is_logger or is_write or to_stream or not node.keywords:
+                # A print with ANY keyword other than file= (flush=,
+                # sep=, end=) still writes to stdout - which IS the
+                # redirected log - so it counts as an unprefixed writer
+                # (implementation-review). A logger named anything other
+                # than "logger" (_log, audit) counts too.
+                other_kwargs = [
+                    kw for kw in node.keywords if kw.arg != "file"
+                ]
+                if (
+                    is_logger
+                    or is_write
+                    or to_stream
+                    or not node.keywords
+                    or other_kwargs
+                ):
                     offenders.append(
                         f"{module.name}:{fname}:{node.lineno}"
                     )

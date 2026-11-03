@@ -32,6 +32,7 @@ so both checks fail by naming the missing seam. The real-app legs use
 starlette's TestClient only — no real sockets, fully deterministic.
 """
 
+import pytest
 from mcp.server.transport_security import TransportSecuritySettings
 
 from hyperv_mcp import http_entry
@@ -311,6 +312,23 @@ def test_configured_host_with_port_is_not_bracketed():
     # A bare IPv6 literal IS bracketed (more than one colon).
     v6 = seam("0.0.0.0", ("2001:db8::1",))
     assert "[2001:db8::1]" in v6.allowed_hosts, v6.allowed_hosts
+    # Copilot comment 4449030835: an entry that ALREADY names a port must
+    # not get a ":*" sibling - the matcher reads a ":*" base as everything
+    # before the LAST colon, so "lab.example.com:8787:*" could never match
+    # a Host header (it demands a colon after the port). The exact
+    # host:port entry is the form that works.
+    assert "lab.example.com:8787:*" not in settings.allowed_hosts, (
+        "a host:port entry got a dead ':*' sibling form: "
+        f"{settings.allowed_hosts!r}"
+    )
+    assert not any(
+        origin.endswith("lab.example.com:8787:*")
+        for origin in (settings.allowed_origins or [])
+    ), f"a host:port entry got a dead origin ':*' sibling: {settings.allowed_origins!r}"
+    # A PORTLESS entry still gets its wildcard-port sibling (that is the
+    # form the matcher needs for a client that dials any port).
+    portless = seam("0.0.0.0", ("lab.example.com",))
+    assert "lab.example.com:*" in portless.allowed_hosts, portless.allowed_hosts
 
 
 def test_allowed_hosts_config_is_parsed_and_reaches_the_allowlists():
@@ -327,6 +345,46 @@ def test_allowed_hosts_config_is_parsed_and_reaches_the_allowlists():
     assert any(
         "lab.example.com" in origin for origin in (settings.allowed_origins or [])
     ), f"configured host missing from the origin allowlist: {settings.allowed_origins!r}"
+
+
+def test_malformed_allowed_hosts_entries_are_rejected_at_load():
+    """PRR-004: an allow-list entry that can never match a real Host header
+    (a scheme, a path, a wildcard, whitespace, a bare label with no host)
+    must fail at CONFIG load, not silently produce allow-list forms that
+    refuse every client at request time."""
+    from hyperv_mcp.config import Config, ConfigError
+
+    for bad in (
+        "http://lab.example.com",   # a scheme
+        "https://lab.example.com",
+        "lab.example.com/path",     # a path
+        "*.example.com",            # a wildcard
+        "lab example.com",          # inner whitespace
+        "",                         # empty
+        "lab.example.com:",         # an empty port
+        "lab.example.com:notaport",  # a non-numeric port
+    ):
+        with pytest.raises(ConfigError):
+            Config.from_dict({"http": {"allowed_hosts": [bad]}})
+
+    # The well-formed spellings still load (hardening must not over-block).
+    for good in (
+        "lab.example.com",
+        "lab.example.com:8787",
+        "10.0.0.5",
+        "10.0.0.5:8787",
+        "localhost",
+        "[::1]",
+        "[::1]:8787",
+        "2001:db8::1",
+    ):
+        cfg = Config.from_dict({"http": {"allowed_hosts": [good]}})
+        assert cfg.http.allowed_hosts == [good], cfg.http.allowed_hosts
+
+    # Padding around an entry is trimmed (the pre-existing contract), so a
+    # padded-but-well-formed entry still produces a usable allow-list form.
+    padded = Config.from_dict({"http": {"allowed_hosts": ["  lab.example.com  "]}})
+    assert padded.http.allowed_hosts == ["lab.example.com"], padded.http.allowed_hosts
 
 
 def test_configured_allowed_hosts_reach_the_running_transport(monkeypatch, tmp_path):

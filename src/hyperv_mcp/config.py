@@ -42,6 +42,40 @@ _RESERVED_AGENT_IDS = {"local-cli"}
 # Config values must BE environment variable NAMES: a token pasted here would
 # otherwise be echoed to stderr by the missing-variable startup error.
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# An http.allowed_hosts entry is a HOST the operator's clients dial: a
+# hostname, an IPv4 literal, an IPv6 literal (optionally bracketed), each
+# optionally with a port. A scheme, a path, a wildcard or whitespace is a
+# typo that would silently produce allow-list forms matching no real Host
+# header (and so refuse every client) — reject it at load instead.
+_HOST_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+_ALLOWED_HOST_RE = re.compile(
+    r"^(?:"
+    r"\[[0-9A-Fa-f:.]+\]"                 # bracketed IPv6 literal
+    r"|[0-9A-Fa-f:]*:[0-9A-Fa-f:.]+"      # bare IPv6 literal (contains a colon)
+    r"|(?:[0-9]{1,3}\.){3}[0-9]{1,3}"     # IPv4 literal
+    r"|" + _HOST_LABEL + r"(?:\." + _HOST_LABEL + r")*"  # hostname (dotted)
+    r")"
+    r"(?::[0-9]{1,5})?$"                  # optional port
+)
+
+
+def _set_allowed_host(value: str) -> str:
+    """Validate one http.allowed_hosts entry (PRR-004)."""
+    if value != value.strip() or " " in value:
+        raise ConfigError(
+            f"http.allowed_hosts entries must not contain whitespace: {value!r}"
+        )
+    if "*" in value or "/" in value or "://" in value:
+        raise ConfigError(
+            "http.allowed_hosts entries must be host names or addresses "
+            "(no scheme, path or wildcard): " + repr(value)
+        )
+    if not _ALLOWED_HOST_RE.match(value):
+        raise ConfigError(
+            "http.allowed_hosts entries must be a host name or address, "
+            "optionally with a port: " + repr(value)
+        )
+    return value
 
 
 def _set_agents(value: Any) -> dict[str, str]:
@@ -452,8 +486,16 @@ class Config:
         host cannot see. Reject it loudly at load time instead.
         """
         normalized = root.replace("/", "\\")
-        if normalized.startswith("\\\\?\\") or normalized.startswith("\\\\.\\"):
-            # Device forms (\\?\..., \\.\...). Only a DRIVE device path
+        if normalized.startswith("\\\\.\\"):
+            # The \\.\ device namespace is NOT canonicalized by the
+            # enforcement layer (policy strips only \\?\) - a root spelled
+            # this way loads and then denies every path under it (the
+            # implementation-review round-5 finding). Reject it.
+            raise ConfigError(
+                f"{key} device-namespace roots are not supported: {root!r}"
+            )
+        if normalized.startswith("\\\\?\\"):
+            # Device forms (\\?\...). Only a DRIVE device path
             # (\\?\C:\...) is equivalent to a drive root; every other device
             # form is not a guest root at all - accepted, it left the guest
             # boundary resolving RELATIVE paths against the guest CWD
@@ -464,7 +506,7 @@ class Config:
             if not (len(tail) >= 2 and tail[1] == ":" and tail[0].isalpha()):
                 raise ConfigError(
                     f"{key} device-form roots are not supported "
-                    f"(only \\\\*?\\<drive>:\\... is): {root!r}"
+                    f"(only \\\\?\\<drive>:\\... is): {root!r}"
                 )
             if tail[2:3] not in ("\\", "/"):
                 # A drive-relative device path (\\?\C:relative) is not
@@ -472,6 +514,18 @@ class Config:
                 raise ConfigError(
                     f"{key} device-form roots must be absolute: {root!r}"
                 )
+        if normalized.rstrip("\\").endswith(".."):
+            # A root that ENDS in a parent reference ("C:\guest\..") is the
+            # drive-side twin of the #37 hole: the guest boundary is LEXICAL
+            # (policy normalizes the root with ntpath.normpath), so
+            # "C:\guest\.." collapses to "C:\" and silently widens the
+            # guest read/write scope to the WHOLE drive. Base accepted this
+            # spelling too (pre-existing); it is rejected here because it is
+            # the same defect class this change closes.
+            raise ConfigError(
+                f"{key} entries must not end in a parent reference "
+                f"('..' widens the guest scope): {root!r}"
+            )
         if normalized.startswith("\\\\"):
             # Issue #37: a UNC root must name the \\server\share PAIR.
             # splitdrive truthiness alone accepts share-less roots (\\server,
@@ -651,7 +705,9 @@ class Config:
                     raise ConfigError(
                         "http.allowed_hosts must be a list of non-empty strings"
                     )
-                http.allowed_hosts = [item.strip() for item in val]
+                http.allowed_hosts = [
+                    _set_allowed_host(item.strip()) for item in val
+                ]
             elif isinstance(val, str) and val.strip():
                 # token_env is matched by exact (case-insensitive) name
                 # downstream; store it trimmed so padding cannot defeat the

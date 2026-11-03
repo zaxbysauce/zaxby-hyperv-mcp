@@ -39,7 +39,11 @@ def test_replacement_worker_can_query(monkeypatch):
     def query():
         try:
             be = wmiconsole.backend(cfg)
-            results.append(be._query_one("SELECT * FROM Msvm_ComputerSystem"))
+            row = be._query_one("SELECT * FROM Msvm_ComputerSystem")
+            # A REAL row, not a None (an empty query) that a count-only
+            # assertion would accept (implementation-review).
+            assert row is not None, "console query returned no row"
+            results.append(row)
         except Exception as exc:
             errors.append(f"{type(exc).__name__}: {exc}")
 

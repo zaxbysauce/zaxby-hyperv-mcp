@@ -167,7 +167,13 @@ def test_fresh_and_replacement_workers_use_live_com_services(monkeypatch):
     def query(worker_name: str) -> None:
         try:
             be = wmiconsole.backend(cfg)
-            results.append(be._query_one("SELECT * FROM Msvm_ComputerSystem"))
+            row = be._query_one("SELECT * FROM Msvm_ComputerSystem")
+            # The result must be a REAL row: recording a None (an empty
+            # query) would satisfy a count-only assertion while proving
+            # nothing (implementation-review: the check could pass without
+            # a VM row ever coming back).
+            assert row is not None, "console query returned no row"
+            results.append(row)
             served_by.append(_required_creator(be, worker_name))
         except Exception as exc:
             errors.append(f"{type(exc).__name__}: {exc}")

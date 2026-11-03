@@ -103,13 +103,17 @@ def test_connect_oneliner_documents_controller_token():
 
 
 def test_setx_guidance_is_paste_safe():
+    # EVERY matching line is checked, not just the first: a second setx
+    # example with an angle-bracket placeholder must not slip past
+    # (implementation-review).
+    found = False
     for line in _readme_text().splitlines():
         if "setx HYPERV_MCP_HTTP_TOKEN" in line:
+            found = True
             assert "<" not in line and ">" not in line, (
                 f"setx guidance is not paste-safe (angle-bracket "
                 f"placeholder): {line!r}"
             )
-            return
-    raise AssertionError(
+    assert found, (
         "README carries no 'setx HYPERV_MCP_HTTP_TOKEN' guidance line"
     )

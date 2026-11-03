@@ -37,6 +37,7 @@ Safety and integrity properties:
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 import secrets
 from uuid import uuid4
@@ -340,28 +341,42 @@ def _makedirs_tracked(path: str) -> list[str]:
 
     Issue #37: os.makedirs does not roll back the components it already
     created when it fails mid-chain, so a failure here would otherwise
-    leave empty husks outside every caller's cleanup boundary. On failure,
-    prune the recorded chain leaf-first (rmdir removes only EMPTY dirs,
-    so pre-existing or non-empty directories refuse safely) and re-raise.
+    leave empty husks outside every caller's cleanup boundary.
+
+    The chain is built ONE COMPONENT AT A TIME with os.mkdir and only the
+    components THIS CALL actually created are recorded: a pre-create probe
+    snapshot would also contain a directory a CONCURRENT transfer created
+    in between, and pruning that would delete the sibling's directory
+    (implementation-review: the ownership bug was confirmed by an executed
+    probe). A component that already exists is never recorded and never
+    removed. os.rmdir removes only EMPTY directories, so a pre-existing
+    or populated directory refuses safely.
     """
-    missing: list[str] = []
-    probe = path
-    while probe and not os.path.isdir(probe):
-        missing.append(probe)
-        parent = os.path.dirname(probe)
-        if parent == probe:
-            break
-        probe = parent
-    try:
-        os.makedirs(path, exist_ok=True)
-    except OSError:
-        for created in missing:
-            try:
-                os.rmdir(created)
-            except OSError:
-                pass
-        raise
-    return missing
+    created: list[str] = []
+    parts = [part for part in path.replace("/", "\\").split("\\") if part]
+    if not parts:
+        return created
+    drive, tail = ntpath.splitdrive(path)
+    current = drive + "\\" if drive else ""
+    for part in parts:
+        current = os.path.join(current, part) if current else part
+        if os.path.isdir(current):
+            continue
+        try:
+            os.mkdir(current)
+        except FileExistsError:
+            # A concurrent creator won the race: the directory is NOT ours.
+            continue
+        except (OSError, ValueError):
+            # Creation failed: prune only what we created, then re-raise.
+            for ours in reversed(created):
+                try:
+                    os.rmdir(ours)
+                except OSError:
+                    pass
+            raise
+        created.append(current)
+    return created
 
 
 def _cleanup_failed_get(staged_raw: str, created_dirs: list[str]) -> None:

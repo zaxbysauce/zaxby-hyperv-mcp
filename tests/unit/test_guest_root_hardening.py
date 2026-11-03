@@ -31,7 +31,9 @@ directory survives.
 
 import pytest
 
+from hyperv_mcp import policy
 from hyperv_mcp.config import Config, ConfigError
+from hyperv_mcp.policy import PolicyDenied
 
 
 def test_shareless_unc_guest_roots_rejected():
@@ -91,15 +93,68 @@ def test_forward_slash_wellformed_unc_guest_roots_accepted():
 
 
 def test_shareless_unc_root_does_not_widen_the_guest_boundary():
-    """The IMPACT of the share-less form: with it configured, the policy
-    must not admit paths under OTHER shares of the same server."""
+    """The IMPACT of the share-less form, and what actually prevents it.
+
+    The guest boundary is LEXICAL (policy compares the normalized root as a
+    prefix), so a share-less root ("//srv//") WOULD widen the scope to
+    every share of that server if it were configured at all - which is
+    exactly why the CONFIG layer must refuse it. This pins both halves:
+    the refusal (the load-bearing guard) and the boundary behaviour of a
+    well-formed root (a configured share does NOT admit another share's
+    paths)."""
 
     cfg = Config()
     cfg.guest_write_roots = ["//srv//"]
     with pytest.raises(ConfigError):
         cfg.validate()
-    # (If a future policy ever accepts such a root, the boundary check
-    # below must fail - the pair requirement is what prevents it.)
+
+    # A well-formed root is scoped to ITS share.
+    scoped = Config()
+    scoped.guest_write_roots = ["//srv/share"]
+    scoped.validate()
+    with pytest.raises(PolicyDenied):
+        policy.check_guest_write(scoped, "\\\\srv\\other-share\\file.txt")
+    with pytest.raises(PolicyDenied):
+        policy.check_guest_read(scoped, "\\\\srv\\other-share\\file.txt")
+
+
+def test_parent_reference_roots_are_rejected():
+    """A root ending in a parent reference ("C:\\guest\\..") is the
+    drive-side twin of the #37 hole: the guest boundary is lexical, so it
+    normalizes to the drive root and widens the guest scope to the whole
+    drive (implementation-review)."""
+    for root in ("C:\\guest\\..", "C:/guest/..", "D:\\guest\\..\\"):
+        cfg = Config()
+        cfg.guest_write_roots = [root]
+        with pytest.raises(ConfigError):
+            cfg.validate()
+
+
+def test_device_namespace_roots_are_rejected():
+    """The \\\\.\\ device namespace is not canonicalized by the enforcement
+    layer (policy strips only \\\\?\\), so a root spelled that way loads
+    and then denies everything (implementation-review)."""
+    for root in ("\\\\.\\C:\\guest", "\\\\.\\PhysicalDrive0"):
+        cfg = Config()
+        cfg.guest_write_roots = [root]
+        with pytest.raises(ConfigError):
+            cfg.validate()
+
+
+def test_device_root_error_message_names_the_real_prefix():
+    """Copilot comment 4449030892: the guidance in the device-root error
+    must show the Windows extended-path prefix ("\\\\?\\\\"), not a
+    malformed "\\\\*?\\\\" - a wrong prefix in the message sends the
+    operator looking for a spelling that does not exist."""
+    cfg = Config()
+    cfg.guest_write_roots = ["\\\\?\\UNC\\srv\\share"]
+    with pytest.raises(ConfigError) as excinfo:
+        cfg.validate()
+    message = str(excinfo.value)
+    assert "\\\\?\\" in message, f"the message does not name the prefix: {message!r}"
+    assert "\\\\*?\\" not in message, (
+        f"the message shows a malformed prefix: {message!r}"
+    )
 
 
 def test_makedirs_tracked_failure_prunes_husks(tmp_path):
