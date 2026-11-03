@@ -1001,8 +1001,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         ) -> dict:
             """Configure KDNET (network kernel debugging) in a guest via
             PowerShell Direct + bcdedit. Returns kernel_attach_string for
-            kd-mcp. Credentials from env/credential-file, or inline
-            username/password (inline requires allow_inline_credentials=true).
+            kd-mcp. Credentials come from the environment/credential file or
+            the inline username/password Args entries (inline requires
+            allow_inline_credentials=true).
 
             Args:
                 vm_name:  Name of the VM

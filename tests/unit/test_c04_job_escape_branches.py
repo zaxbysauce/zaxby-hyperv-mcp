@@ -40,7 +40,7 @@ def _generated_spawner() -> str:
     source = inspect.getsource(stdio_proxy.ensure_controller)
     start = source.find("spawner = ")
     end = source.find("\n    try:", start)
-    namespace: dict = {}
+    namespace: dict = {"_JOB_GUARD_SRC": stdio_proxy._JOB_GUARD_SRC}
     exec(source[start:end], namespace)  # noqa: S102 - trusted module source
     return namespace["spawner"]
 
@@ -64,7 +64,14 @@ def test_spawner_plain_branch_when_jobless():
     assert "if not _in_any_job():" in source, "the jobless fast path moved"
     plain_block = source.split("if not _in_any_job():", 1)[1].split("else:", 1)[0]
     assert "print('plain')" in plain_block
-    assert "0x01000000" not in plain_block and "_CREATE_BREAKAWAY" not in plain_block, (
+    # The generated script interpolates DECIMAL literals: plain =
+    # DETACHED_PROCESS|NEW_PROCESS_GROUP|NO_WINDOW = 134218248; adding the
+    # breakaway bit (0x01000000 = 16777216) yields 150995464. Pin both so a
+    # breakaway bit added to the plain spawn fails this test.
+    assert "creationflags=134218248" in plain_block, (
+        "the plain-spawn literal moved; update this pin alongside it"
+    )
+    assert "150995464" not in plain_block and "0x01000000" not in plain_block, (
         "the plain (jobless) spawn must not carry the breakaway flag"
     )
 

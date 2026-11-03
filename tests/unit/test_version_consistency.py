@@ -1,13 +1,14 @@
 """Version-consistency regression checks (issue #108; trace
 55-108-31-32-33-collated, arm's-length acceptance-check authoring, tier L).
 
-At base the version lives in three independent literals with no pin between
-them — ``src/hyperv_mcp/server.py`` ``VERSION = "0.4.0"`` (the source of the
-CLI banner/``--version``/``--check-env`` strings AND of the MCP initialize
-``serverInfo.version`` via ``MCPServer(..., version=VERSION)``),
-``src/hyperv_mcp/__init__.py`` ``__version__ = "0.9.0"``, and
-``pyproject.toml`` ``version = "0.9.0"`` — so every release bump desyncs the
-user-visible strings from the installed package. These checks are
+``src/hyperv_mcp/server.py`` derives ``VERSION`` from the package
+metadata (issue #108), so the CLI banner/``--version``/``--check-env``
+strings AND the MCP initialize ``serverInfo.version`` come from
+``importlib.metadata``; the remaining independent literals are
+``src/hyperv_mcp/__init__.py`` ``__version__`` and ``pyproject.toml``
+``version`` — a release bump that misses either desyncs the user-visible
+strings from the installed package (the trace's original base carried three
+unpinned literals, ``VERSION = "0.4.0"`` among them). These checks are
 import-level and deterministic (no CLI subprocess, no network): they pin
 every user-visible version source to the installed distribution metadata
 ``importlib.metadata.version("hyperv-mcp")``.

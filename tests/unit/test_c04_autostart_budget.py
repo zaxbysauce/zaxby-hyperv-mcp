@@ -20,10 +20,11 @@ path-like token (or the phrase "controller log path").
 
 test_refusal_precedes_the_wait_deadline is a keep-green structural guard
 (green at base by design): the tokenless-spawn refusal CONTRACT is already
-frozen by tests/unit/test_b03_stdio_proxy.py (the issue #13 trace's C5
-row), so this file does not duplicate it -- it only pins the source order
-(fail-fast refusal before the port-wait deadline) so the budget/message
-work cannot silently reorder it.
+runtime-tested in tests/unit/test_b03_feedback_fixes.py (fail-fast tests
+for the agents/shared-token/whitespace/custom-env variants), so this file
+does not duplicate it -- it only pins the source order (fail-fast refusal
+before the port-wait deadline) so the budget/message work cannot silently
+reorder it.
 
 Deterministic: constant comparison plus pure string/inspect work; no
 controller is spawned, no socket touched, no wall clock read.
@@ -113,11 +114,21 @@ def test_every_budget_expiry_site_routes_through_the_message():
     expiry."""
     source = inspect.getsource(stdio_proxy.ensure_controller)
     calls = len(re.findall(r"_autostart_timeout_message\(", source))
-    assert calls >= 3, (
-        "issue #71: ensure_controller has three budget-expiry exits (port "
-        "wait, spawner TimeoutExpired, spawner failure) and all must route "
-        f"through _autostart_timeout_message; found {calls} call sites: "
-        "the TimeoutExpired branch may still carry the bare diagnostic"
+    assert calls == 3, (
+        "issue #71: ensure_controller's three budget-expiry exits (the "
+        "POSIX port-wait expiry, the spawner subprocess.TimeoutExpired "
+        "branch, and the Windows port-wait expiry) must all route through "
+        f"_autostart_timeout_message; found {calls} call sites (expected "
+        "exactly 3 — the spawner's own marker-failure exit keeps its "
+        "distinct diagnostic and is not a budget expiry)"
+    )
+    observed_wait_uses = len(re.findall(
+        r"time\.monotonic\(\) - wait_started, log_path",
+        source,
+    ))
+    assert observed_wait_uses >= 2, (
+        "issue #71: both port-wait expiry sites must report the OBSERVED "
+        f"wait (time.monotonic() - wait_started); found {observed_wait_uses}"
     )
     expired_branch = re.search(
         r"except subprocess\.TimeoutExpired.*?raise ProxyRefused",

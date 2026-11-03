@@ -36,7 +36,7 @@ refusal: the proxy simply presents no Authorization header and the
 controller's 401 becomes the standard error reply. Auto-start additionally
 requires every configured agent variable to be present in the environment
 (the spawned controller validates them all at startup), so a partial set
-fails fast with a named-variable refusal instead of a 15 s port timeout.
+fails fast with a named-variable refusal instead of a 30 s port timeout.
 """
 
 from __future__ import annotations
@@ -70,8 +70,8 @@ PROXY_ERROR_CODE = -32000
 # on the POST path.
 UPSTREAM_CONNECT_TIMEOUT_S = 5.0
 UPSTREAM_WRITE_TIMEOUT_S = 30.0
-# One budget for the WHOLE auto-start (spawn + listen wait): the 15 s in the
-# README and the operator message is a wall-clock deadline, not per-phase.
+# One budget for the WHOLE auto-start (spawn + listen wait): the 30 s in
+# the README and the operator message is a wall-clock deadline, not per-phase.
 # Auto-start budget. Measured basis (issue #71): a spawned streamable-HTTP
 # controller accepts connections in ~1.1 s idle and 2.2-3.9 s under CPU load
 # (dev box, 3/3 runs each); the WMI fallback leg adds a PowerShell/CIM hop on
@@ -95,20 +95,13 @@ _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CREATE_NO_WINDOW = 0x08000000
 _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
-# Fixed source for the WMI-branch logging wrapper: Win32_Process.Create
-# cannot redirect stdio, so the WMI-created process is a tiny python that
-# re-spawns the controller with stdout/stderr bound to the per-user log file.
-# argv contract: python -c <this> <controller_python> <host> <port> <log_path>
-# (sys.argv[1..4] from -c's perspective: ['-c', python, host, port, log]).
-_WMI_LOG_WRAPPER = "\n".join([
-    "import os, subprocess, sys",
+_JOB_GUARD_SRC = "\n".join([
     "import ctypes",
     "",
-    "# The wrapper is WMI-created (outside the client's job); it verifies its",
-    "# OWN child escaped any job before exiting cleanly (plan-critic B2: the",
-    "# short-lived wrapper is verified from inside, not by racing its PID",
-    "# from the spawner). A failed check kills the child and exits nonzero,",
-    "# so an unverifiable wrapper surfaces as the port-wait refusal.",
+    "# Verified job escape (issue #71 / plan-critic B2): a spawn only",
+    "# counts when the controller is verifiably OUTSIDE every job. Shared",
+    "# source: BOTH the spawner and the WMI wrapper embed this block so",
+    "# future edits cannot drift between them.",
     "def _in_any_job(process_handle=None):",
     "    k32 = ctypes.windll.kernel32",
     "    k32.IsProcessInJob.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]",
@@ -120,6 +113,22 @@ _WMI_LOG_WRAPPER = "\n".join([
     "    if not k32.IsProcessInJob(ctypes.c_void_p(int(process_handle)), None, ctypes.byref(result)):",
     "        return True  # API failure: fail closed (assume in-job)",
     "    return bool(result.value)",
+])
+
+# Fixed source for the WMI-branch logging wrapper: Win32_Process.Create
+# cannot redirect stdio, so the WMI-created process is a tiny python that
+# re-spawns the controller with stdout/stderr bound to the per-user log file.
+# argv contract: python -c <this> <controller_python> <host> <port> <log_path>
+# (sys.argv[1..4] from -c's perspective: ['-c', python, host, port, log]).
+_WMI_LOG_WRAPPER = "\n".join([
+    "import os, subprocess, sys",
+    _JOB_GUARD_SRC,
+    "",
+    "# The wrapper is WMI-created (outside the client's job); it verifies its",
+    "# OWN child escaped any job before exiting cleanly (plan-critic B2: the",
+    "# short-lived wrapper is verified from inside, not by racing its PID",
+    "# from the spawner). A failed check kills the child and exits nonzero,",
+    "# so an unverifiable wrapper surfaces as the port-wait refusal.",
     "",
     "log = open(sys.argv[4], 'a', encoding='utf-8', errors='replace')",
     "child = subprocess.Popen([sys.argv[1], '-m', 'hyperv_mcp.http_entry', '--host', sys.argv[2], '--port', sys.argv[3]],",
@@ -362,23 +371,13 @@ def ensure_controller(cfg) -> None:
             time.sleep(0.25)
         raise ProxyRefused(_autostart_timeout_message(
             host, port, time.monotonic() - wait_started, log_path))
+    # The observed wait covers the WHOLE budget window (spawn + port wait):
+    # start the clock before the spawner runs, so a slow WMI spawn is never
+    # excluded from what the expiry message reports (cubic round, P2).
+    wait_started = time.monotonic()
     spawner = "\n".join([
         "import base64, os, subprocess, sys",
-        "import ctypes",
-        "",
-        "# Verified job escape (issue #71 / plan-critic B2): a spawn only",
-        "# counts when the controller is verifiably OUTSIDE every job.",
-        "def _in_any_job(process_handle=None):",
-        "    k32 = ctypes.windll.kernel32",
-        "    k32.IsProcessInJob.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]",
-        "    k32.IsProcessInJob.restype = ctypes.c_int",
-        "    if process_handle is None:",
-        "        k32.GetCurrentProcess.restype = ctypes.c_void_p",
-        "        process_handle = k32.GetCurrentProcess()",
-        "    result = ctypes.c_int(0)",
-        "    if not k32.IsProcessInJob(ctypes.c_void_p(int(process_handle)), None, ctypes.byref(result)):",
-        "        return True  # API failure: fail closed (assume in-job)",
-        "    return bool(result.value)",
+        _JOB_GUARD_SRC,
         "",
         "host, port, log_path = sys.argv[1], sys.argv[2], sys.argv[3]",
         "wrapper = sys.argv[4]",
@@ -455,8 +454,13 @@ def ensure_controller(cfg) -> None:
         )
     except subprocess.TimeoutExpired:
         # Observed wait == the whole budget: the spawner never returned.
-        refusal = _autostart_timeout_message(
-            cfg.http.host, str(cfg.http.port), AUTOSTART_WAIT_S, log_path
+        # Name the hang (WMI/CIM leg?) — a bare "controller did not accept
+        # connections" would mislead, since no controller may exist yet.
+        refusal = (
+            "the controller spawner did not finish (WMI/CIM hung?): "
+            + _autostart_timeout_message(
+                cfg.http.host, str(cfg.http.port), AUTOSTART_WAIT_S, log_path
+            )
         )
         raise ProxyRefused(refusal) from None
     except OSError as exc:
@@ -470,7 +474,6 @@ def ensure_controller(cfg) -> None:
             "could not auto-start the controller outside this client's job "
             f"object: {detail}"
         )
-    wait_started = time.monotonic()
     while time.monotonic() < deadline:
         if port_listening(cfg.http.host, cfg.http.port):
             return

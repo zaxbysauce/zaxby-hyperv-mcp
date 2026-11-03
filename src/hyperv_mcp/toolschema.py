@@ -28,7 +28,8 @@ from collections.abc import Iterable
 
 #: Headers that end an Args: block (case-insensitive) when they appear at
 #: the block's parameter indent.
-_STOP_HEADERS = {"returns", "failure", "policy", "notes", "raises", "examples"}
+_STOP_HEADERS = {"returns", "failure", "policy", "notes", "raises",
+                 "examples", "example", "yields"}
 
 _ARGS_HEADER = re.compile(r"^\s*Args:\s*$")
 _PARAM_LINE = re.compile(r"^\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s?(.*)$")

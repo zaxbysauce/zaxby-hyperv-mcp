@@ -1,6 +1,6 @@
 """Acceptance checks for issue #16, part 2 — the SDK-generation port pins.
 
-AC7 (pyproject declares mcp>=2.3,<3 and version 0.8.0), AC8 (bootstrapping
+AC7 (pyproject declares mcp>=2.3,<3 and version 0.9.0), AC8 (bootstrapping
 builds an mcp.server.mcpserver.MCPServer), AC9 (call_tool returns a
 CallToolResult). Sibling c03 files: test_c03_tool_concurrency.py (AC1-AC5),
 test_c03_http_entry.py (AC6, AC13), test_c03_tool_surface.py (AC10-AC12).

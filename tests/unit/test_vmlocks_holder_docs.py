@@ -61,11 +61,15 @@ def test_module_docstring_documents_queued_writer():
         "measurement to the since/held_ms fields it describes"
     )
 
-    # Fact 2: the record refreshes only while the queue is empty (any of
-    # the accepted variants).
-    assert any(variant in low for variant in _REFRESH_VARIANTS), (
-        "issue #60: the docstring does not state the refresh rule for the "
-        "pending-writer record; accepted phrasings: "
+    # Fact 2: the refresh rule must live in the SAME queued-writer
+    # paragraph(s) fact 1 pins, not anywhere in the module docstring.
+    assert any(
+        variant in p.lower()
+        for p in queue_paragraphs
+        for variant in _REFRESH_VARIANTS
+    ), (
+        "issue #60: the queued-writer paragraph does not state the refresh "
+        "rule for the pending-writer record; accepted phrasings: "
         + " / ".join(_REFRESH_VARIANTS)
     )
 
