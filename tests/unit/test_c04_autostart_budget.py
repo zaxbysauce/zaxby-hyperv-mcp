@@ -103,12 +103,14 @@ def test_timeout_message_names_log_path_and_wait():
 
 def test_every_budget_expiry_site_routes_through_the_message():
     """AC1 (coverage, plan-critic round 1 blocker B1): every budget-expiry
-    exit in ensure_controller -- the port-wait expiry, the spawner
-    subprocess.TimeoutExpired branch, and the spawner failure exit -- must
-    route through _autostart_timeout_message with the observed wait and the
-    controller log path, so none of them can retain the old bare-timeout
-    diagnostic. Source-order pin (the branches are not drivable without a
-    hung spawner)."""
+    exit in ensure_controller -- the POSIX port-wait expiry, the spawner
+    subprocess.TimeoutExpired branch, and the Windows port-wait expiry --
+    must route through _autostart_timeout_message with the observed wait
+    and the controller log path, so none of them can retain the old
+    bare-timeout diagnostic. Source-order pin (the branches are not
+    drivable without a hung spawner). The spawner's own failure exit (a
+    bad marker) keeps its distinct diagnostic; it is not a budget
+    expiry."""
     source = inspect.getsource(stdio_proxy.ensure_controller)
     calls = len(re.findall(r"_autostart_timeout_message\(", source))
     assert calls >= 3, (

@@ -4123,7 +4123,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
 
         Args:
-            lease_id: Optional lease citation - the lease gate runs before the body"""
+            lease_id: REQUIRED - the id of the lease being renewed"""
         with _audit("hyperv_lease_renew", "", "lease", lease_ref=str(lease_id)[:16]):
             _owned_lease_or_invalid(lease_id)
             renewed = leases.renew(_cfg(), lease_id, auditlog.current_agent_id())
@@ -4134,7 +4134,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         """Release a lease you hold, so other agents can use the VM again.
 
 Args:
-    lease_id: Optional lease citation - the lease gate runs before the body"""
+    lease_id: REQUIRED - the id of the lease being released"""
         with _audit("hyperv_lease_release", "", "lease", lease_ref=str(lease_id)[:16]):
             _owned_lease_or_invalid(lease_id)
             leases.release(_cfg(), lease_id, auditlog.current_agent_id())

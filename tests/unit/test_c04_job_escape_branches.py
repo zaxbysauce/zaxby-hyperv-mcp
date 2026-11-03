@@ -1,26 +1,29 @@
-"""Deterministic branch tests for the auto-start spawner's verified job
-escape (issue #71 / plan F5b, plan-critic B2).
+"""Structural source pins for the auto-start spawner's verified job escape
+(issue #71 / plan F5b, plan-critic B2).
 
-The spawner is a generated standalone script (stdio_proxy builds it as a
-string so the child carries no hyperv_mcp import dependency). These tests
-EXEC that generated source in a controlled namespace with stubbed
-subprocess/ctypes surfaces, so every branch is exercised deterministically:
+The spawner and the WMI wrapper are generated standalone scripts (stdio_proxy
+builds them as strings so the spawned child carries no hyperv_mcp import
+dependency), and each script defines its OWN ctypes `IsProcessInJob` helper —
+fail-closed by design — so the branches cannot be stubbed from outside a test
+process (a fake handle makes the real fail-closed query read in-job). The
+branch BEHAVIOR is therefore certified by the frozen C8 acceptance check
+(live RED at base on affected hosts, GREEN after the fix; mutant M7 re-creates
+the base defect and dies), while THIS file pins the branch STRUCTURE of the
+generated sources themselves, derived from the production emitter:
 
-- plain spawn: the spawner itself is in no job -> spawn without breakaway,
-  print 'plain'.
-- honored breakaway: in-job spawner, child escapes -> print 'breakaway',
-  child untouched.
-- silently-ignored breakaway: in-job spawner, child stays a job member ->
-  child killed AND reaped before the WMI fallback (the dying controller
-  must not keep the port).
-- breakaway refused (OSError) -> WMI fallback.
-- WMI failure (PowerShell output lacks the marker) -> SystemExit, nonzero.
-- wrapper self-verification: the WMI wrapper kills its child and exits
-  nonzero when the child is still in a job.
+- both generated scripts compile on every platform CI runs on;
+- the jobless spawner takes the plain path without the breakaway flag;
+- the breakaway claim is gated on the child's ACTUAL job membership;
+- a silently-ignored breakaway kills AND reaps the in-job child before the
+  WMI fallback;
+- the parent accepts only verified-escape markers (plain/breakaway/wmi);
+- the wrapper verifies its OWN child and refuses (kill + SystemExit) when
+  the child stays in a job;
+- both embedded job queries fail closed (a failed query reads in-job).
 
 RED/GREEN lifecycle: written alongside the F5b fix; these run against the
-generated script's ACTUAL source (inspect.getsource), so a spawner rewrite
-that drops a branch fails here.
+generated scripts' ACTUAL source (extracted from ensure_controller's source),
+so a spawner rewrite that drops a branch fails here.
 """
 
 from __future__ import annotations
@@ -28,96 +31,6 @@ from __future__ import annotations
 import inspect
 
 from hyperv_mcp import stdio_proxy
-
-
-def _generated_spawner() -> str:
-    """The generated spawner script, exactly as a real auto-start would run
-    it (extracted from ensure_controller's source so the tests cannot drift
-    from the production string)."""
-    source = inspect.getsource(stdio_proxy.ensure_controller)
-    start = source.find("spawner = ")
-    end = source.find("\n    try:", start)
-    namespace: dict = {}
-    exec(source[start:end], namespace)  # noqa: S102 - trusted module source
-    return namespace["spawner"]
-
-
-def _generated_wrapper() -> str:
-    return stdio_proxy._WMI_LOG_WRAPPER
-
-
-class _FakePopen:
-    """Minimal Popen double: records construction, exposes a handle int."""
-
-    instances: list[_FakePopen] = []
-
-    def __init__(self, argv, stdin=None, stdout=None, stderr=None, env=None,
-                 creationflags=0):
-        self.argv = argv
-        self.creationflags = creationflags
-        self.killed = False
-        self.waited = False
-        self.handle = id(self)  # the spawner queries this
-        _FakePopen.instances.append(self)
-
-    def kill(self):
-        self.killed = True
-
-    def wait(self, timeout=None):
-        self.waited = True
-        return 0
-
-
-class _FakeRun:
-    def __init__(self, stdout="", stderr="", returncode=0):
-        self.stdout = stdout
-        self.stderr = stderr
-        self.returncode = returncode
-
-
-def _generated_spawner() -> str:
-    """The generated spawner script, exactly as a real auto-start would run
-    it (extracted from ensure_controller's source so the tests cannot drift
-    from the production string)."""
-    source = inspect.getsource(stdio_proxy.ensure_controller)
-    start = source.find("spawner = ")
-    end = source.find("\n    try:", start)
-    namespace: dict = {}
-    exec(source[start:end], namespace)  # noqa: S102 - trusted module source
-    return namespace["spawner"]
-
-
-def _generated_wrapper() -> str:
-    return stdio_proxy._WMI_LOG_WRAPPER
-
-
-class _FakePopen:
-    """Minimal Popen double: records construction, exposes a handle int."""
-
-    instances: list[_FakePopen] = []
-
-    def __init__(self, argv, stdin=None, stdout=None, stderr=None, env=None,
-                 creationflags=0):
-        self.argv = argv
-        self.creationflags = creationflags
-        self.killed = False
-        self.waited = False
-        self.handle = id(self)  # the spawner queries this
-        _FakePopen.instances.append(self)
-
-    def kill(self):
-        self.killed = True
-
-    def wait(self, timeout=None):
-        self.waited = True
-        return 0
-
-
-class _FakeRun:
-    def __init__(self, stdout="", stderr="", returncode=0):
-        self.stdout = stdout
-        self.stderr = stderr
-        self.returncode = returncode
 
 
 def _generated_spawner() -> str:
