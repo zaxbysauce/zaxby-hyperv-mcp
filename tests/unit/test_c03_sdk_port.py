@@ -44,7 +44,9 @@ def _is_resolution_leg(script: str) -> bool:
 
 def test_ac7_pyproject_declares_mcp2_and_version():
     """AC7: pyproject.toml declares exactly one mcp requirement
-    `mcp>=2.3,<3` and version `0.8.0`."""
+    `mcp>=2.3,<3` and version `0.9.0` (the release literal re-pins through
+    the issue-16 trace's AMEND path at every version bump; issue #67 owns
+    the versioning-policy decision)."""
     try:
         import tomllib
     except ImportError:  # Python 3.10
@@ -59,8 +61,8 @@ def test_ac7_pyproject_declares_mcp2_and_version():
 
     mcp_reqs = [d for d in deps if req_name(d) == "mcp"]
     assert mcp_reqs == ["mcp>=2.3,<3"], f"AC7: pyproject mcp requirement(s) {mcp_reqs!r} != ['mcp>=2.3,<3']"
-    assert data["project"]["version"] == "0.8.0", (
-        f"AC7: pyproject version {data['project']['version']!r} != '0.8.0'"
+    assert data["project"]["version"] == "0.9.0", (
+        f"AC7: pyproject version {data['project']['version']!r} != '0.9.0'"
     )
 
 

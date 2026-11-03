@@ -20,7 +20,17 @@ evidence capture — run concurrently with each other; write-scope legs
 (VM power, checkpoints, media, firmware, repair apply) exclude
 everything; a waiting writer is preferred over newly arriving readers so
 polling readers can never starve `stop_vm`/`checkpoint_restore` out
-indefinitely. A conflicting acquire
+indefinitely.
+
+Queued-writer holder semantics: a waiting writer's holder record is stamped
+at queue entry, so its `since`/`held_ms` measure QUEUE time — how long the
+request has waited, not how long anything has been held. The record
+refreshes only when no writer is queued (the next queue entrant re-stamps
+it) and is cleared when the last queued writer leaves. When a busy failure
+reports that pending writer, `held_ms` is recomputed live at raise time
+(like every reported holder), and the honest no-holder case — contention
+drained between the waiter's wakeup and its expiry — carries
+no `holder` key at all rather than a fabricated record. A conflicting acquire
 waits up to a bounded window (`wait_s`, defaulting to
 `Config.vm_lock_wait_s`, 0 = fail fast) and then raises `VMBusy` carrying
 holder metadata (tool, mode, since, held_ms) so an agent can tell a 2 s
@@ -202,7 +212,9 @@ class _RWLock:
         self._waiting_writers = 0
         # Oldest queued writer's record, so a reader that times out while
         # ONLY a queued writer blocks it can name that writer instead of
-        # fabricating a record about itself (feedback PRR-008).
+        # fabricating a record about itself (feedback PRR-008). The record
+        # is stamped at queue entry, so its since/held_ms measure queue time
+        # (time waited), never held time.
         self._pending_writer: dict | None = None
 
     def _current_holder(self) -> dict | None:
@@ -261,6 +273,11 @@ class _RWLock:
             if mode == "write":
                 self._waiting_writers += 1
                 if self._pending_writer is None:
+                    # Stamped at QUEUE ENTRY: this record's since/held_ms
+                    # measure QUEUE TIME (how long the oldest waiter has
+                    # waited), never held time — nothing is held yet. It
+                    # refreshes only when no writer is queued (the next
+                    # entrant after a full drain re-stamps it).
                     self._pending_writer = _holder_dict(mode, time.time())
                 try:
                     while self._writer is not None or self._readers:
@@ -275,6 +292,9 @@ class _RWLock:
                 finally:
                     self._waiting_writers -= 1
                     if self._waiting_writers == 0:
+                        # Last queued writer left: the queue-time record is
+                        # stale the moment the queue empties, so drop it
+                        # (it refreshes only via a fresh queue entrant).
                         self._pending_writer = None
                     # A timeout (or error) here must wake readers queued
                     # behind this writer; on success the new writer blocks

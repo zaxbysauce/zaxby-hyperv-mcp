@@ -72,7 +72,13 @@ UPSTREAM_CONNECT_TIMEOUT_S = 5.0
 UPSTREAM_WRITE_TIMEOUT_S = 30.0
 # One budget for the WHOLE auto-start (spawn + listen wait): the 15 s in the
 # README and the operator message is a wall-clock deadline, not per-phase.
-AUTOSTART_WAIT_S = 15.0
+# Auto-start budget. Measured basis (issue #71): a spawned streamable-HTTP
+# controller accepts connections in ~1.1 s idle and 2.2-3.9 s under CPU load
+# (dev box, 3/3 runs each); the WMI fallback leg adds a PowerShell/CIM hop on
+# top. 30 s is ~8x the loaded worst case; the previous 15 s had under 4x and
+# expired on loaded hosts. Every budget-expiry exit names the OBSERVED wait
+# and the controller log path (_autostart_timeout_message).
+AUTOSTART_WAIT_S = 30.0
 LISTEN_PROBE_TIMEOUT_S = 0.5
 # The controller log resets when it outgrows this (bounded retention; a
 # detached controller's stderr is unbounded by nature).
@@ -96,11 +102,33 @@ _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 # (sys.argv[1..4] from -c's perspective: ['-c', python, host, port, log]).
 _WMI_LOG_WRAPPER = "\n".join([
     "import os, subprocess, sys",
+    "import ctypes",
+    "",
+    "# The wrapper is WMI-created (outside the client's job); it verifies its",
+    "# OWN child escaped any job before exiting cleanly (plan-critic B2: the",
+    "# short-lived wrapper is verified from inside, not by racing its PID",
+    "# from the spawner). A failed check kills the child and exits nonzero,",
+    "# so the spawner reads wrapper failure as spawn failure.",
+    "def _in_any_job(process_handle=None):",
+    "    k32 = ctypes.windll.kernel32",
+    "    k32.IsProcessInJob.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]",
+    "    k32.IsProcessInJob.restype = ctypes.c_int",
+    "    if process_handle is None:",
+    "        k32.GetCurrentProcess.restype = ctypes.c_void_p",
+    "        process_handle = k32.GetCurrentProcess()",
+    "    result = ctypes.c_int(0)",
+    "    if not k32.IsProcessInJob(ctypes.c_void_p(int(process_handle)), None, ctypes.byref(result)):",
+    "        return True  # API failure: fail closed (assume in-job)",
+    "    return bool(result.value)",
+    "",
     "log = open(sys.argv[4], 'a', encoding='utf-8', errors='replace')",
-    "subprocess.Popen([sys.argv[1], '-m', 'hyperv_mcp.http_entry', '--host', sys.argv[2], '--port', sys.argv[3]],",
+    "child = subprocess.Popen([sys.argv[1], '-m', 'hyperv_mcp.http_entry', '--host', sys.argv[2], '--port', sys.argv[3]],",
     "                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,",
     "                 env=dict(os.environ),",
     "                 creationflags=0x00000008 | 0x00000200 | 0x08000000)",
+    "if _in_any_job(child._handle):",
+    "    child.kill()",
+    "    raise SystemExit('controller did not escape the job; wrapper refused')",
 ])
 
 
@@ -327,49 +355,90 @@ def ensure_controller(cfg) -> None:
             log.close()
         except OSError:
             pass
+        wait_started = time.monotonic()
         while time.monotonic() < deadline:
             if port_listening(host, int(port)):
                 return
             time.sleep(0.25)
-        raise ProxyRefused(_autostart_timeout_message(host, port))
+        raise ProxyRefused(_autostart_timeout_message(
+            host, port, time.monotonic() - wait_started, log_path))
     spawner = "\n".join([
         "import base64, os, subprocess, sys",
+        "import ctypes",
+        "",
+        "# Verified job escape (issue #71 / plan-critic B2): a spawn only",
+        "# counts when the controller is verifiably OUTSIDE every job.",
+        "def _in_any_job(process_handle=None):",
+        "    k32 = ctypes.windll.kernel32",
+        "    k32.IsProcessInJob.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]",
+        "    k32.IsProcessInJob.restype = ctypes.c_int",
+        "    if process_handle is None:",
+        "        k32.GetCurrentProcess.restype = ctypes.c_void_p",
+        "        process_handle = k32.GetCurrentProcess()",
+        "    result = ctypes.c_int(0)",
+        "    if not k32.IsProcessInJob(ctypes.c_void_p(int(process_handle)), None, ctypes.byref(result)):",
+        "        return True  # API failure: fail closed (assume in-job)",
+        "    return bool(result.value)",
+        "",
         "host, port, log_path = sys.argv[1], sys.argv[2], sys.argv[3]",
         "wrapper = sys.argv[4]",
         "argv = [sys.executable, '-m', 'hyperv_mcp.http_entry', '--host', host, '--port', port]",
         "log = open(log_path, 'a', encoding='utf-8', errors='replace')",
-        "try:",
-        f"    flags = {_DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW | _CREATE_BREAKAWAY_FROM_JOB}",
+        "if not _in_any_job():",
+        "    # The spawner itself is in no job, so plain children escape by",
+        "    # construction; the breakaway flag is a no-op there.",
         "    subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log,",
         "                     stderr=subprocess.STDOUT, env=dict(os.environ),",
-        "                     creationflags=flags)",
-        "    print('breakaway')",
-        "except OSError:",
-        "    # The job forbids breakaway (mcp's stdio job uses default flags).",
-        "    # Create a WMI-launched LOGGING WRAPPER via Win32_Process.Create:",
-        "    # the WMI service is outside this job, so the wrapper — and the",
-        "    # controller it re-spawns with stdout/stderr bound to the log —",
-        "    # never become job members. The environment (token variables",
-        "    # included) rides in the CIM startup block; the command line is",
-        "    # only python -c <wrapper source> python host port log (the",
-        "    # wrapper source itself contains no secrets).",
-        "    wmi_argv = [sys.executable, '-c', wrapper, sys.executable, host, port, log_path]",
-        "    cmdline = subprocess.list2cmdline(wmi_argv)",
-        "    ps = '\\n'.join([",
-        "        \"$ErrorActionPreference = 'Stop'\",",
-        "        \"$cmd = '\" + cmdline.replace(\"'\", \"''\") + \"'\",",
-        "        \"$envs = [string[]](Get-ChildItem env: | ForEach-Object { '{0}={1}' -f $_.Name, $_.Value })\",",
-        "        \"$startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [UInt16]0; EnvironmentVariables = $envs }\",",
-        "        \"$out = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd; ProcessStartupInformation = $startup }\",",
-        "        \"if ($out.ReturnValue -ne 0) { throw ('WMI Create failed: ' + $out.ReturnValue) }\",",
-        "        \"Write-Output 'wmi'\",",
-        "    ])",
-        "    encoded = base64.b64encode(ps.encode('utf-16-le')).decode('ascii')",
-        "    run = subprocess.run(['powershell', '-NoProfile', '-EncodedCommand', encoded],",
-        "                         capture_output=True, text=True)",
-        "    if not (run.stdout or '').strip().endswith('wmi'):",
-        "        raise SystemExit('WMI spawn failed: ' + (run.stderr or run.stdout or '')[-300:])",
-        "    print('wmi')",
+        "                     creationflags=134218248)",
+        "    print('plain')",
+        "else:",
+        "    try:",
+        "        flags = 150995464",
+        "        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log,",
+        "                         stderr=subprocess.STDOUT, env=dict(os.environ),",
+        "                         creationflags=flags)",
+        "    except OSError:",
+        "        child = None",
+        "    if child is not None and not _in_any_job(child._handle):",
+        "        print('breakaway')",
+        "    else:",
+        "        if child is not None:",
+        "            # The breakaway was SILENTLY IGNORED on this Windows build:",
+        "            # the child stayed a job member and would die with the",
+        "            # client. Kill it and reap before the WMI fallback so the",
+        "            # dying controller cannot still own the port.",
+        "            child.kill()",
+        "            try:",
+        "                child.wait(timeout=5)",
+        "            except Exception:",
+        "                pass  # the child is already being killed; nothing to reap",
+        "        # Breakaway unavailable or unverified: create a WMI-launched",
+        "        # LOGGING WRAPPER via Win32_Process.Create. The WMI service is",
+        "        # outside this job, so the wrapper - and the controller it",
+        "        # re-spawns with stdout/stderr bound to the log - never become",
+        "        # job members; the wrapper VERIFIES its own child's escape",
+        "        # before exiting cleanly (wrapper failure reads as spawn",
+        "        # failure). The environment (token variables included) rides",
+        "        # in the CIM startup block; the command line is only",
+        "        # python -c <wrapper source> python host port log (the wrapper",
+        "        # source itself contains no secrets).",
+        "        wmi_argv = [sys.executable, '-c', wrapper, sys.executable, host, port, log_path]",
+        "        cmdline = subprocess.list2cmdline(wmi_argv)",
+        "        ps = \'\\n\'.join([",
+        "            \"$ErrorActionPreference = 'Stop'\",",
+        "            \"$cmd = '\" + cmdline.replace(\"'\", \"''\") + \"'\",",
+        "            \"$envs = [string[]](Get-ChildItem env: | ForEach-Object { '{0}={1}' -f $_.Name, $_.Value })\",",
+        "            \"$startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [UInt16]0; EnvironmentVariables = $envs }\",",
+        "            \"$out = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd; ProcessStartupInformation = $startup }\",",
+        "            \"if ($out.ReturnValue -ne 0) { throw ('WMI Create failed: ' + $out.ReturnValue) }\",",
+        "            \"Write-Output 'wmi'\",",
+        "        ])",
+        "        encoded = base64.b64encode(ps.encode('utf-16-le')).decode('ascii')",
+        "        run = subprocess.run(['powershell', '-NoProfile', '-EncodedCommand', encoded],",
+        "                             capture_output=True, text=True)",
+        "        if not (run.stdout or '').strip().endswith('wmi'):",
+        "            raise SystemExit('WMI spawn failed: ' + (run.stderr or run.stdout or '')[-300:])",
+        "        print('wmi')",
     ])
     try:
         result = subprocess.run(  # noqa: S603 - fixed argv, no shell, no secrets in argv
@@ -385,14 +454,15 @@ def ensure_controller(cfg) -> None:
             check=False,
         )
     except subprocess.TimeoutExpired:
-        raise ProxyRefused(
-            f"the controller spawner did not finish within {AUTOSTART_WAIT_S:.0f}s "
-            f"(WMI/CIM hung?); check the controller log for this port"
-        ) from None
+        # Observed wait == the whole budget: the spawner never returned.
+        refusal = _autostart_timeout_message(
+            cfg.http.host, str(cfg.http.port), AUTOSTART_WAIT_S, log_path
+        )
+        raise ProxyRefused(refusal) from None
     except OSError as exc:
         raise ProxyRefused(f"could not launch the controller spawner: {exc}") from None
     marker = ((result.stdout or "").strip().splitlines() or [""])[-1].strip()
-    if marker not in ("wmi", "breakaway"):
+    if marker not in ("wmi", "breakaway", "plain"):
         # The spawner could not sever job inheritance; say so loudly instead
         # of shipping a controller that dies with this client.
         detail = (result.stderr or result.stdout or "no output").strip()[-400:]
@@ -400,19 +470,29 @@ def ensure_controller(cfg) -> None:
             "could not auto-start the controller outside this client's job "
             f"object: {detail}"
         )
+    wait_started = time.monotonic()
     while time.monotonic() < deadline:
         if port_listening(cfg.http.host, cfg.http.port):
             return
         time.sleep(0.25)
-    raise ProxyRefused(_autostart_timeout_message(cfg.http.host, str(cfg.http.port)))
+    raise ProxyRefused(_autostart_timeout_message(
+        cfg.http.host, str(cfg.http.port), time.monotonic() - wait_started, log_path))
 
 
-def _autostart_timeout_message(host: str, port: str) -> str:
+def _autostart_timeout_message(
+    host: str, port: str, waited_s: float | None = None, log_path: str | None = None
+) -> str:
+    """The budget-expiry diagnostic. Names the OBSERVED wait (distinct from
+    the budget), the budget itself, and the EXACT controller log path, so an
+    operator can tell a slow start from a stuck spawn and go straight to the
+    log (issue #71: every budget-expiry exit routes through here)."""
+    observed = AUTOSTART_WAIT_S if waited_s is None else max(0.0, float(waited_s))
+    log = log_path or "(controller log unavailable)"
     return (
         f"the auto-started controller did not accept connections on "
-        f"{host}:{port} within {AUTOSTART_WAIT_S:.0f}s; check the "
-        f"controller log for this port and start hyperv-mcp-http manually "
-        f"if needed"
+        f"{host}:{port} within {observed:.0f}s (budget "
+        f"{AUTOSTART_WAIT_S:.0f}s); controller log: {log}. Start "
+        f"hyperv-mcp-http manually if needed."
     )
 
 

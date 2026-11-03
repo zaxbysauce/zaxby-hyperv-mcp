@@ -179,7 +179,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.8.0 today) instead of
+  package's version (0.9.0 today) instead of
   the SDK's.
 - **In-process embedders see the 2.x call shape.** `call_tool()` returns a
   `CallToolResult` (`.content`, `.structured_content`, `.is_error`) instead
@@ -226,6 +226,43 @@ restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.9.0 changes
+
+- **The auto-started controller verifiably escapes the client's job (#71):**
+  on current Windows builds the spawner's `CREATE_BREAKAWAY_FROM_JOB` is
+  silently ignored, so the controller stayed inside the MCP client's
+  kill-on-close job object and died with every client disconnect (the
+  long-standing "flaky" b03 autostart test, and silent controller respawns in
+  daily use). The spawn path now queries `IsProcessInJob` (fail-closed) and
+  only claims success when the controller verifiably runs OUTSIDE any job:
+  plain spawn when jobless, verified breakaway, else the WMI wrapper (which
+  verifies its own child and refuses on failure). The auto-start budget is
+  30 s (measured spawn-to-listening: ~1.1 s idle, 2.2-3.9 s loaded) and the
+  budget-expiry diagnostic names the observed wait and the exact controller
+  log path.
+- **Every tool parameter is described in the schema (#86):** mcp 2.x builds
+  each inputSchema from the function signature alone, so the Google-style
+  `Args:` docstring sections never reached the wire (434 properties across
+  78 tools published without any description). The docstring is now the
+  single source of truth: registration stamps every undescribed property
+  with its `Args:` text, and a suite-wide pin fails on any parameter whose
+  docstring never documents it (both credential variants are covered).
+- **Whole-tree pytest runs the unit suite (#115):** the integration
+  conftest's collection hook scoped its skip/timeout markers to the whole
+  session, so `pytest tests` reported every item skipped with exit 0 and a
+  broken tree looked green. The markers now apply only to items under
+  `tests/integration`; unit items always execute.
+- **Failure-envelope docstrings name the busy holder (#60):** the
+  `(+ holder on busy)` note now covers every lock-capable tool that
+  advertises the failure envelope (the UIA family and
+  `hyperv_vm_secureboot_set` had drifted). The lock-free
+  `hyperv_vm_get_video` states explicitly that it takes no VM lock and never
+  emits holder metadata, and `vmlocks.py` documents the queued-writer holder
+  semantics (queue-time `since`/`held_ms`, refresh-only-when-queued, live
+  recompute, honest no-holder case).
+- **Version bump:** 0.8.0 -> 0.9.0 (`pyproject.toml`, package `__version__`,
+  this section; `test_version_consistency.py` pins the sites).
 
 ## 0.8.0 changes
 

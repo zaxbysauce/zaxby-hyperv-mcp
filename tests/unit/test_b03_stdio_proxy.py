@@ -828,6 +828,10 @@ def test_default_mode_autostarts_controller_when_absent(tmp_path):
     (inheriting the child's config and token environment), complete the
     hyperv_relay_status call, and leave the configured port listening."""
     port = _free_port()
+    # Deterministic pre-state (issue #71): reap any controller already
+    # holding this port before spawning, so a stale process from an earlier
+    # test can never influence the outcome.
+    _terminate_controllers_on_port(port)
     config_path = tmp_path / "autostart-cfg.json"
     config_path.write_text(
         json.dumps(
@@ -850,7 +854,17 @@ def test_default_mode_autostarts_controller_when_absent(tmp_path):
         "serve hyperv_relay_status"
     )
     try:
-        assert _port_open(port), (
+        # Patient bounded wait (issue #71): the controller outlives the
+        # proxy, so give its listener up to one auto-start budget to answer
+        # instead of a single 2 s connect probe that host load can starve.
+        deadline = time.monotonic() + 30.0
+        listening = False
+        while time.monotonic() < deadline:
+            if _port_open(port):
+                listening = True
+                break
+            time.sleep(0.25)
+        assert listening, (
             f"the configured port {port} must still be listening after the "
             "auto-started controller serves the call (the controller must "
             "outlive the proxy)"

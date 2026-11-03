@@ -16,6 +16,7 @@ the environment; placeholder values are never baked into this repo.
 """
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -70,9 +71,20 @@ INTEGRATION_TIMEOUT_S = 900
 
 
 def pytest_collection_modifyitems(config, items):
-    """Skip the whole real-Hyper-V suite unless explicitly enabled, and give
-    surviving tests a timeout that accommodates real checkpoint merges."""
+    """Skip the real-Hyper-V suite unless explicitly enabled, and give
+    surviving tests a timeout that accommodates real checkpoint merges.
+
+    pytest hands this hook the SESSION-WIDE collection, so the markers must
+    be scoped by item path (issue #115): without the filter, a whole-tree
+    run (pytest tests) stamped the integration skip/timeout onto every UNIT
+    item too, and the whole suite reported as skipped with exit 0. Only
+    items living under this conftest's directory are touched; unit items
+    keep the repo's own timeout and run normally."""
+    integration_root = Path(__file__).resolve().parent
     for item in items:
+        item_path = Path(str(getattr(item, "path", None) or item.fspath)).resolve()
+        if not item_path.is_relative_to(integration_root):
+            continue
         item.add_marker(pytest.mark.timeout(INTEGRATION_TIMEOUT_S))
         if not READY:
             item.add_marker(pytest.mark.skip(reason=SKIP_REASON))

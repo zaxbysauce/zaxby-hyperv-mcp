@@ -70,6 +70,7 @@ from . import (
     statestore,
     stdio_proxy,
     timing,
+    toolschema,
     uia,
     vmident,
     vmlocks,
@@ -781,6 +782,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
+            detach: Detach: report the accepted operation and finish in background
+            idempotency_key: Optional caller-managed key for idempotent retries
         Returns: {status, vm_name, state}
 
         Failure: {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).        """
@@ -806,6 +815,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                      "turnoff" — hard power-off
             confirm: Must be true (destructive.require_confirm)
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
+            detach: Detach: report the accepted operation and finish in background
+            idempotency_key: Optional caller-managed key for idempotent retries
 
         Returns: {status, vm_name, method, state}
 
@@ -829,6 +842,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_name: Name of the VM
             confirm: Must be true (destructive.require_confirm)
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
+            detach: Detach: report the accepted operation and finish in background
+            idempotency_key: Optional caller-managed key for idempotent retries
 
         Returns: {status, vm_name, state}
 
@@ -869,6 +886,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                              fallback — writes guest memory to the host checkpoint store:
                              it can persist secrets held in guest memory (for example an
                              autologon password).
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
+            detach: Detach: report the accepted operation and finish in background
+            idempotency_key: Optional caller-managed key for idempotent retries
 
         Returns: {status, vm_name, checkpoint_name} (+ checkpoint_type: the type you
         requested, and vm_checkpoint_type: the VM's pre-call CheckpointType setting, when a
@@ -887,6 +908,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
         Returns: [{name, type, created, parent_name}]
         """
         # list on success, {"ok": False, ...} envelope on failure (the one
@@ -917,6 +942,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             checkpoint_name: Name of the checkpoint to restore
             confirm:         Must be true (destructive.require_confirm)
             vm_id:           Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
+            detach: Detach: report the accepted operation and finish in background
+            idempotency_key: Optional caller-managed key for idempotent retries
 
         Returns: {status, vm_name, checkpoint_name, state, note}
 
@@ -943,6 +972,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             include_subtree: Also remove all child checkpoints
             confirm:         Must be true (destructive.require_confirm)
             vm_id:           Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
+            detach: Detach: report the accepted operation and finish in background
+            idempotency_key: Optional caller-managed key for idempotent retries
 
         Returns: {status, vm_name, checkpoint_name}
 
@@ -979,6 +1012,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 reboot:   Reboot the guest after configuring
                 confirm:  Must be true (destructive.require_confirm)
                 vm_id:    Optional VM GUID; exactly one of vm_name/vm_id must be given
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
 
             Returns: {status, vm_name, host_ip, port, key,
                       kernel_attach_string, bcdedit_output, rebooting}
@@ -1010,6 +1047,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 com_port:  1 or 2 (default 1)
                 confirm:   Must be true (destructive.require_confirm)
                 vm_id:     Optional VM GUID; exactly one of vm_name/vm_id must be given
+                reboot: Reboot the guest after configuring
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
 
             Returns: {status, vm_name, com_port, pipe_path,
                       kernel_attach_string, bcdedit_output, rebooting}
@@ -1044,6 +1086,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 reboot:   Reboot the guest after configuring
                 confirm:  Must be true (destructive.require_confirm)
                 vm_id:    Optional VM GUID; exactly one of vm_name/vm_id must be given
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
 
             Returns: {status, vm_name, host_ip, port, key,
                       kernel_attach_string, bcdedit_output, rebooting}
@@ -1074,6 +1118,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 com_port:  1 or 2 (default 1)
                 confirm:   Must be true (destructive.require_confirm)
                 vm_id:     Optional VM GUID; exactly one of vm_name/vm_id must be given
+                reboot: Reboot the guest after configuring
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
 
             Returns: {status, vm_name, com_port, pipe_path,
                       kernel_attach_string, bcdedit_output, rebooting}
@@ -1108,6 +1155,16 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+                script: PowerShell script text to run in the guest
+                timeout_ms: Per-call timeout in milliseconds
+                elevated: Run elevated in the guest (destructive.elevated_exec + confirm)
+                confirm: Must be true (the tool's destructive category + require_confirm)
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
+                detach: Detach: report the accepted operation and finish in background
+                idempotency_key: Optional caller-managed key for idempotent retries
 
             Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
             or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
@@ -1136,6 +1193,18 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+                command: The executable or shell command to run in the guest
+                args: Argument list passed to the command
+                cwd: Working directory for the guest command
+                timeout_ms: Per-call timeout in milliseconds
+                elevated: Run elevated in the guest (destructive.elevated_exec + confirm)
+                confirm: Must be true (the tool's destructive category + require_confirm)
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
+                detach: Detach: report the accepted operation and finish in background
+                idempotency_key: Optional caller-managed key for idempotent retries
 
             Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
             or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
@@ -1163,6 +1232,16 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+                local_path: Path on the host (policy-checked against host roots)
+                remote_path: Path in the guest filesystem
+                confirm: Must be true (the tool's destructive category + require_confirm)
+                verify: Verify the transferred bytes with SHA-256 after the copy
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
+                detach: Detach: report the accepted operation and finish in background
+                idempotency_key: Optional caller-managed key for idempotent retries
 
             Returns: {ok, bytes_copied, sha256_local?, sha256_remote?}
             or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
@@ -1189,6 +1268,15 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+                remote_path: Path in the guest filesystem
+                local_path: Path on the host (policy-checked against host roots)
+                verify: Verify the transferred bytes with SHA-256 after the copy
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
+                detach: Detach: report the accepted operation and finish in background
+                idempotency_key: Optional caller-managed key for idempotent retries
 
             Returns: {ok, bytes_copied, sha256_local?, sha256_remote?}
             or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
@@ -1212,6 +1300,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+                remote_path: Path in the guest filesystem
+                max_bytes: Read cap in bytes (bounded stream read)
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
 
             Returns: {ok, content_b64, bytes_read, truncated}
             or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
@@ -1233,6 +1325,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+                remote_path: Path in the guest filesystem
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
 
             Returns: {ok, entries: [{name, is_dir, size_bytes, modified}]}
             or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
@@ -1260,6 +1355,18 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+            Args:
+                vm_name: Name of the VM (must match allowed_vm_patterns)
+                script: PowerShell script text to run in the guest
+                timeout_ms: Per-call timeout in milliseconds
+                elevated: Run elevated in the guest (destructive.elevated_exec + confirm)
+                confirm: Must be true (the tool's destructive category + require_confirm)
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
+                detach: Detach: report the accepted operation and finish in background
+                idempotency_key: Optional caller-managed key for idempotent retries
             Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
             or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
@@ -1286,6 +1393,20 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+            Args:
+                vm_name: Name of the VM (must match allowed_vm_patterns)
+                command: The executable or shell command to run in the guest
+                args: Argument list passed to the command
+                cwd: Working directory for the guest command
+                timeout_ms: Per-call timeout in milliseconds
+                elevated: Run elevated in the guest (destructive.elevated_exec + confirm)
+                confirm: Must be true (the tool's destructive category + require_confirm)
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
+                detach: Detach: report the accepted operation and finish in background
+                idempotency_key: Optional caller-managed key for idempotent retries
             Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
             or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
@@ -1309,6 +1430,18 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+            Args:
+                vm_name: Name of the VM (must match allowed_vm_patterns)
+                local_path: Path on the host (policy-checked against host roots)
+                remote_path: Path in the guest filesystem
+                confirm: Must be true (the tool's destructive category + require_confirm)
+                verify: Verify the transferred bytes with SHA-256 after the copy
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
+                detach: Detach: report the accepted operation and finish in background
+                idempotency_key: Optional caller-managed key for idempotent retries
             Returns: {ok, bytes_copied, sha256_local?, sha256_remote?}
             or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
@@ -1331,6 +1464,17 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+            Args:
+                vm_name: Name of the VM (must match allowed_vm_patterns)
+                remote_path: Path in the guest filesystem
+                local_path: Path on the host (policy-checked against host roots)
+                verify: Verify the transferred bytes with SHA-256 after the copy
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
+                detach: Detach: report the accepted operation and finish in background
+                idempotency_key: Optional caller-managed key for idempotent retries
             Returns: {ok, bytes_copied, sha256_local?, sha256_remote?}
             or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
@@ -1350,6 +1494,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+            Args:
+                vm_name: Name of the VM (must match allowed_vm_patterns)
+                remote_path: Path in the guest filesystem
+                max_bytes: Read cap in bytes (bounded stream read)
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
             Returns: {ok, content_b64, bytes_read, truncated}
             or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
@@ -1365,6 +1515,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+            Args:
+                vm_name: Name of the VM (must match allowed_vm_patterns)
+                remote_path: Path in the guest filesystem
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
             Returns: {ok, entries: [{name, is_dir, size_bytes, modified}]}
             or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
             """
@@ -1388,6 +1543,16 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            command: The executable or shell command to run in the guest
+            args: Argument list passed to the command
+            cwd: Working directory for the guest command
+            timeout_ms: Per-call timeout in milliseconds
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
         Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
         or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
         """
@@ -1408,6 +1573,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            script: PowerShell script text to run in the guest
+            timeout_ms: Per-call timeout in milliseconds
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
         Returns: {ok, exit_code, stdout, stderr, timed_out, truncated}
         or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
         """
@@ -1528,6 +1701,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
         Returns: {ok, enabled_state, head_horizontal, head_vertical,
                   keyboard_present, keyboard_enabled, mouse_present,
                   mouse_enabled, boot_epoch, guest_channel, guest_channel_note,
@@ -1551,6 +1728,13 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            text: Text to type into the guest console
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
         Returns: {ok, chunks, chars} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
         """
         return _run_console_tool(
@@ -1564,14 +1748,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         vm_id: str = "",
         lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
-        """Press a named key (scan-code make/break pair) with optional
+        r"""Press a named key (scan-code make/break pair) with optional
         modifiers (ctrl/alt/shift incl. right- variants, win/leftwin/
         rightwin — held while key is tapped). Supported keys: enter, escape
         (esc), tab, backspace, space, capslock, up/down/left/right, delete,
         home, end, pageup, pagedown, insert, f1-f12, a-z, 0-9, punctuation
         (minus, equals, leftbracket, rightbracket, semicolon, apostrophe,
         grave, backslash, comma, period, slash — single-character aliases
-        - = [ ] \\ ; ' ` , . / map to the same bytes), numpad (num0-num9,
+        - = [ ] \ ; ' ` , . / map to the same bytes), numpad (num0-num9,
         numdecimal, nummultiply, numsubtract, numadd, numlock, numdivide,
         numenter), and the GUI/Application keys win (alias leftwin),
         rightwin, menu (alias apps) — modifier-named keys are also valid
@@ -1582,6 +1766,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            key: A key name to press
+            modifiers: Modifier key names held while the key is tapped
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
         Returns: {ok, scancodes_sent, chunks} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
         """
         return _run_console_tool(
@@ -1598,6 +1790,13 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         modifier breaks last (e.g. ["ctrl", "alt", "delete"], ["win", "r"]).
         Modifiers: ctrl/alt/shift (incl. right- variants) and win/leftwin/
         rightwin; every other accepted key name is a tapped key.
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            keys: Key combination as an ordered name list (modifiers make/break)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
         Policy: console_input.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
@@ -1616,6 +1815,13 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     ) -> dict:
         """Send raw PS/2 scan codes (0..255 ints, make/break pairs included)
         via Msvm_Keyboard.TypeScancodes; chunked at 64 codes with pacing.
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            scancodes: PS/2 scan-code sequence (make/break pairs included)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
         Policy: console_input.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
@@ -1643,6 +1849,16 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            x: Click X in the coordinate space of the observed frame (optional)
+            y: Click Y in the coordinate space of the observed frame (optional)
+            frame_width: Frame width the coordinates were observed at (scales them)
+            frame_height: Frame height the coordinates were observed at (scales them)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
         Returns: {ok, operation, vm_name, head_x, head_y} or the failure
         envelope {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
         """
@@ -1671,6 +1887,17 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         screenshot between steps — never assume focus from a prior frame —
         and follow the click with hyperv_console_wait_frame_stable instead of
         a fixed sleep so the UI transition is allowed to finish.
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            x: Click X in the coordinate space of the observed frame (optional)
+            y: Click Y in the coordinate space of the observed frame (optional)
+            frame_width: Frame width the coordinates were observed at (scales them)
+            frame_height: Frame height the coordinates were observed at (scales them)
+            button: Button number (1=left, 2=right)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
         Policy: console_input.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
@@ -1693,6 +1920,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            button: Button number (1=left, 2=right)
+            is_down: True presses the button, False releases it
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
         Returns: {ok, operation} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
         """
         return _run_console_tool(
@@ -1706,6 +1941,13 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Scroll the console wheel by delta (positive = down).
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            delta: Wheel delta (positive = down)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
         Policy: console_input.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
@@ -1735,6 +1977,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_id:          Optional VM GUID; exactly one of vm_name/vm_id must be given
             baseline_hash:  frame_hash from a previous capture ("" compares
                             against nothing — first poll's frame is baseline)
+            width: Requested snapshot width in pixels (160..4096)
+            height: Requested snapshot height in pixels (160..4096)
+            timeout_s: Overall deadline in seconds
+            interval_s: Poll interval in seconds
         """
         try:
             with _audit("hyperv_console_wait_frame_change", vm_name, "read") as op:
@@ -1786,6 +2032,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             timeout_s:      Overall deadline (>= 1); the host-side child bound is timeout_s + 15
             baseline_hash:  frame_hash from before the input ("" settles on the
                             current screen — first poll starts the quiet window)
+            interval_ms: Poll interval in milliseconds
+            width: Requested snapshot width in pixels (160..4096)
+            height: Requested snapshot height in pixels (160..4096)
         """
         try:
             with _audit("hyperv_console_wait_frame_stable", vm_name, "read") as op:
@@ -1822,7 +2071,15 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         captured_at), elapsed_ms, dimensions.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
-        """
+
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            count: Number of console frames to capture
+            interval_s: Poll interval in seconds
+            width: Requested snapshot width in pixels (160..4096)
+            height: Requested snapshot height in pixels (160..4096)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given"""
         try:
             with _audit("hyperv_console_capture_sequence", vm_name, "read") as op:
                 out = console.capture_sequence(
@@ -1900,6 +2157,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                                no-replay contract
             width:             Capture geometry shared by preconditions and wait steps
             height:            Capture geometry shared by preconditions and wait steps
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
         """
         return _run_console_tool(
             "hyperv_console_sequence", vm_name, "console_input",
@@ -1926,6 +2185,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            states: States to wait for (Off/Running/Saved/Paused/Starting/Stopping/Resuming/Pausing)
+            timeout_s: Overall deadline in seconds
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            detach: Detach: report the accepted operation and finish in background
+            idempotency_key: Optional caller-managed key for idempotent retries
         Returns: {ok, final_state, guest_channel[, heartbeat]} — {ok: false,
         error_class: "transport"} carrying the last observed state if the
         deadline expires first. Non-Running finals run no heartbeat query.
@@ -1974,6 +2241,20 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     ) -> dict:
         """Create a disposable VM with a fresh VHDX (New-VHD + New-VM). The
         new name must match allowed_vm_patterns so it stays policy-scoped.
+
+        Args:
+            name: New VM name (must match allowed_vm_patterns)
+            vhd_path: Path for the new VHDX (policy-checked against host_write_roots)
+            memory_mb: Startup memory in MB
+            cpu_count: Virtual processor count
+            generation: VM generation (1 or 2)
+            vhd_size_gb: VHDX size in GB
+            switch_name: Virtual switch name to connect the adapter to
+            confirm: Must be true (the tool's destructive category + require_confirm)
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
+            detach: Detach: report the accepted operation and finish in background
+            idempotency_key: Optional caller-managed key for idempotent retries
         Policy: vm_provision category + confirm=true.
 
         Returns: {ok, id, name, state, generation} or the failure envelope
@@ -1998,6 +2279,18 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         golden image (New-VHD -Differencing + New-VM; issue #31). A writable
         parent is locked read-only first, a parent attached to any VM is
         refused, and a failed New-VM cleans up the staged child.
+
+        Args:
+            name: New VM name (must match allowed_vm_patterns)
+            parent_vhd_path: Read-only golden parent VHDX path (host_read_roots)
+            vhd_path: Path for the new VHDX (policy-checked against host_write_roots)
+            memory_mb: Startup memory in MB
+            cpu_count: Virtual processor count
+            generation: VM generation (1 or 2)
+            switch_name: Virtual switch name to connect the adapter to
+            confirm: Must be true (the tool's destructive category + require_confirm)
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
         Policy: vm_provision category + confirm=true.
 
         Returns: {ok, id, name, state, generation, vhd_path,
@@ -2027,6 +2320,16 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         removal consults it BEFORE any deletion work and refuses
         fail-closed on PENDING/UNKNOWN/FAILED or an unregistered name
         (only the literal "none" — the default — skips the consult).
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            delete_disks: Also delete this VM's own disk files (never the parent)
+            confirm: Must be true (the tool's destructive category + require_confirm)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
+            detach: Detach: report the accepted operation and finish in background
+            idempotency_key: Optional caller-managed key for idempotent retries
         Policy: vm_remove category + confirm=true.
 
         Returns: {ok, status, vm_name} (deleted[]/kept[{path, reason}]
@@ -2055,6 +2358,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         guest.* and kvp.* always read the heartbeat-gated view so stale
         pairs never surface as the guest's identity.
 
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
         Returns: {ok, phase, phase_basis, vm_id, state, uptime_s,
         heartbeat{enabled, primary_status, application_status},
         guest{os_name, os_build, fqdn, ipv4[], ipv6[]},
@@ -2078,6 +2385,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         Requires SeBackupPrivilege (elevated). Policy: offline_harvest
         category (read-only, no confirm); no guest credentials.
 
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            dest_dir: Directory on the host to copy the harvested logs into
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
         Returns: {ok, vm_id, vm_name, dest_dir,
         files[{volume, source, dest, size, sha256, last_write_utc}],
         missing[], skipped[{volume, reason}], truncated}.
@@ -2104,6 +2416,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         Args:
             vm_name: Name of the VM
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            path: Path of the VHDX to attach
+            size_gb: Size in GB for the new VHDX
+            controller_type: Disk controller type (default SCSI)
+            confirm: Must be true (the tool's destructive category + require_confirm)
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
 
         Returns: {ok, vhd_path, disk_count} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
         disk_count is null if the post-add read failed (the disk is attached
@@ -2123,6 +2441,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
         Returns: {ok, disks: [...]}
         """
         return _run_guest_tool(
@@ -2143,6 +2465,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         Args:
             vm_name: Name of the VM
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            iso_path: Path of the ISO to attach (host_read policy)
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
 
         Returns: {ok, iso_path, attached} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
         attached is null if the post-attach read failed (the ISO is attached
@@ -2159,6 +2484,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Detach all virtual DVD drives; returns the removed ISO paths.
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
         Policy: media category (reversible, no confirm).
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
@@ -2176,6 +2507,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
         Returns: {ok, media: [...]}
         """
         return _run_guest_tool(
@@ -2190,6 +2525,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
         Returns: {ok, secure_boot, secure_boot_template, boot_order, tpm_enabled}
         """
         return _run_guest_tool(
@@ -2210,6 +2549,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         Args:
             vm_name: Name of the VM
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            boot_type: First boot device type: Drive | Network | File
+            confirm: Must be true (the tool's destructive category + require_confirm)
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
 
         Returns: {ok, first_boot} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
         """
@@ -2232,6 +2575,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             enabled: REQUIRED — true to enable, false to disable (omission is
                      a schema error; it never silently defaults to disable)
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            confirm: Must be true (the tool's destructive category + require_confirm)
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
 
         Returns: {ok, tpm_enabled, vm_name} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
         """
@@ -2256,10 +2602,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             enabled: REQUIRED — true to enable, false to disable (omission is
                      a schema error; it never silently defaults to disable)
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            template: Secure Boot template (e.g. MicrosoftWindows)
+            confirm: Must be true (the tool's destructive category + require_confirm)
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
 
         Returns: {ok, secure_boot, secure_boot_template, vm_name} or the
         failure envelope {ok: false, error, error_class, retryable,
-        retry_after_ms}.
+        retry_after_ms} (+ holder on busy).
         """
         return _run_guest_tool(
             "hyperv_vm_secureboot_set", vm_name, "vm_provision",
@@ -2277,6 +2627,13 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+        Read-only tool: takes no VM lock, so a busy envelope and its
+        holder metadata can never appear here.
+
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
         Returns: {ok, resolution_type, horizontal, vertical,
                   observed_horizontal, observed_vertical, vm_name} or the
         failure envelope {ok: false, error, error_class, retryable,
@@ -2327,6 +2684,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             restart: stop/start the VM now so the mode applies immediately
             confirm: required for the stop/start when restart=true
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
 
         Returns: {ok, resolution_type, horizontal, vertical,
                   observed_horizontal, observed_vertical,
@@ -2353,6 +2712,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         Args:
             vm_name: Name of the VM
             vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            switch_name: Virtual switch name to connect the adapter to
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
 
         Returns: {ok, switch_name} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
         """
@@ -2446,12 +2808,15 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 adapter: "" (default) or "electron" — an Electron adapter
                     request is refused adapter_unapproved unless the helper
                     registration carries the adapter:electron capability
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
                 username/password: inline guest credentials (this variant)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
 
             Returns: {ok, elements, truncated, tree, session, helper?} or
-            {ok: false, error, error_class, retryable, retry_after_ms}
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_ui_tool(
                 "hyperv_ui_inspect", vm_name, "read", uia.inspect,
@@ -2480,13 +2845,16 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 adapter: "" (default) or "electron" — refused
                     adapter_unapproved unless the registration carries the
                     adapter:electron capability
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
                 username/password: inline guest credentials (this variant)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
 
             Returns: {ok, elements[], session, helper?} (an empty list is a
             no-match, never the desktop root) or
-            {ok: false, error, error_class, retryable, retry_after_ms}
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_ui_tool(
                 "hyperv_ui_find", vm_name, "read", uia.find,
@@ -2518,12 +2886,15 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 lease_id: optional lease citation (issue #23) — the lease
                     gate runs before the body
                 fencing_token: the lease's fencing token, with lease_id
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
                 username/password: inline guest credentials (this variant)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
 
             Returns: {ok, invoked, pattern, session, helper?} or
-            {ok: false, error, error_class, retryable, retry_after_ms}
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_ui_tool(
                 "hyperv_ui_invoke", vm_name, "console_input", uia.invoke,
@@ -2553,12 +2924,15 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 lease_id: optional lease citation (issue #23) — the lease
                     gate runs before the body
                 fencing_token: the lease's fencing token, with lease_id
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
                 username/password: inline guest credentials (this variant)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
 
             Returns: {ok, length_set, pattern, session, helper?} or
-            {ok: false, error, error_class, retryable, retry_after_ms}
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_ui_tool(
                 "hyperv_ui_set_value", vm_name, "console_input", uia.set_value,
@@ -2584,12 +2958,15 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 selector: UIA selector waited for (accepted keys as find)
                 gone: true waits for DISAPPEARANCE instead of appearance
                 timeout_s: wait budget in seconds (1..120, default 30)
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
                 username/password: inline guest credentials (this variant)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
 
             Returns: {ok, elements[] | gone, session, helper?} or
-            {ok: false, error, error_class, retryable, retry_after_ms}
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_ui_tool(
                 "hyperv_ui_wait_for", vm_name, "read", uia.wait_for,
@@ -2615,12 +2992,15 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 lease_id: optional lease citation (issue #23) — the lease
                     gate runs before the body
                 fencing_token: the lease's fencing token, with lease_id
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
                 username/password: inline guest credentials (this variant)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
 
             Returns: {ok, focused, raised, session, helper?} or
-            {ok: false, error, error_class, retryable, retry_after_ms}
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_ui_tool(
                 "hyperv_ui_focus", vm_name, "console_input", uia.focus,
@@ -2639,13 +3019,16 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             Args:
                 vm_name: Name of the VM
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
                 username/password: inline guest credentials (this variant)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
 
             Returns: {ok, active_session_id, interactive_user, locked,
             foreground_window, session, helper} or
-            {ok: false, error, error_class, retryable, retry_after_ms}
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_ui_tool(
                 "hyperv_ui_session_state", vm_name, "read", uia.session_state,
@@ -2683,6 +3066,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 lease_id: optional lease citation (issue #23) — the lease
                     gate runs before the body
                 fencing_token: the lease's fencing token, with lease_id
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
                 username/password: inline guest credentials (this variant)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
@@ -2692,7 +3078,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             helper_dir} — or, with teardown=true, {ok, torn_down,
             task_unregistered, helper_directories_removed,
             lsa_secret_deleted, autologon_restored} — or
-            {ok: false, error, error_class, retryable, retry_after_ms}
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_ui_tool(
                 "hyperv_ui_helper_provision", vm_name, "destructive",
@@ -2785,7 +3171,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Policy: see the summary; denials return policy envelopes.
 
             Returns: {ok, elements, truncated, tree, session, helper?} or
-            {ok: false, error, error_class, retryable, retry_after_ms}
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_ui_tool(
                 "hyperv_ui_inspect", vm_name, "read", uia.inspect,
@@ -2819,7 +3205,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             Returns: {ok, elements[], session, helper?} (an empty list is a
             no-match, never the desktop root) or
-            {ok: false, error, error_class, retryable, retry_after_ms}
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_ui_tool(
                 "hyperv_ui_find", vm_name, "read", uia.find,
@@ -2855,7 +3241,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Policy: see the summary; denials return policy envelopes.
 
             Returns: {ok, invoked, pattern, session, helper?} or
-            {ok: false, error, error_class, retryable, retry_after_ms}
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_ui_tool(
                 "hyperv_ui_invoke", vm_name, "console_input", uia.invoke,
@@ -2889,7 +3275,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Policy: see the summary; denials return policy envelopes.
 
             Returns: {ok, length_set, pattern, session, helper?} or
-            {ok: false, error, error_class, retryable, retry_after_ms}
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_ui_tool(
                 "hyperv_ui_set_value", vm_name, "console_input", uia.set_value,
@@ -2919,7 +3305,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Policy: see the summary; denials return policy envelopes.
 
             Returns: {ok, elements[] | gone, session, helper?} or
-            {ok: false, error, error_class, retryable, retry_after_ms}
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_ui_tool(
                 "hyperv_ui_wait_for", vm_name, "read", uia.wait_for,
@@ -2949,7 +3335,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Policy: see the summary; denials return policy envelopes.
 
             Returns: {ok, focused, raised, session, helper?} or
-            {ok: false, error, error_class, retryable, retry_after_ms}
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_ui_tool(
                 "hyperv_ui_focus", vm_name, "console_input", uia.focus,
@@ -2973,7 +3359,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             Returns: {ok, active_session_id, interactive_user, locked,
             foreground_window, session, helper} or
-            {ok: false, error, error_class, retryable, retry_after_ms}
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_ui_tool(
                 "hyperv_ui_session_state", vm_name, "read", uia.session_state,
@@ -3019,7 +3405,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             helper_dir} — or, with teardown=true, {ok, torn_down,
             task_unregistered, helper_directories_removed,
             lsa_secret_deleted, autologon_restored} — or
-            {ok: false, error, error_class, retryable, retry_after_ms}
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             return _run_ui_tool(
                 "hyperv_ui_helper_provision", vm_name, "destructive",
@@ -3047,6 +3433,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+                timeout_ms: Per-call timeout in milliseconds
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
 
             Returns: {ok, vm_name, vm, ps_direct, guest, findings, checked_at}.
             """
@@ -3075,6 +3464,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+                apply: Propose only by default; pass true with confirm to apply repairs
+                confirm: Must be true (the tool's destructive category + require_confirm)
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
 
             Returns: {ok, vm_name, applied, plan, changes,
             verification_findings[, backup_path]}.
@@ -3111,6 +3506,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+                command: The executable or shell command to run in the guest
+                args: Argument list passed to the command
+                cwd: Working directory for the guest command
+                timeout_ms: Per-call timeout in milliseconds
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
 
             Returns: {ok, job_id, vm_name, pid, start_time_ticks, job_dir, out_path, err_path, exit_path, started_at}.
             """
@@ -3137,6 +3540,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+                services: Guest service names to verify Running after restart
+                processes: Guest process names to verify present after restart
+                timeout_s: Overall deadline in seconds
+                interval_s: Poll interval in seconds
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                detach: Detach: report the accepted operation and finish in background
+                idempotency_key: Optional caller-managed key for idempotent retries
 
             Returns: {ok, vm_name, ps_direct, services, processes, failures, checked_at}.
             """
@@ -3163,6 +3574,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+                guest_port: Guest-local port to relay to (loopback)
+                host_port: Host-side loopback listener port
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
 
             Returns: {ok, relay_id, url, host_port, ...}. The url is a
             capability URL embedding the relay's per-relay secret (the only
@@ -3254,6 +3671,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+            Args:
+                vm_name: Name of the VM (must match allowed_vm_patterns)
+                timeout_ms: Per-call timeout in milliseconds
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
             Returns: {ok, vm_name, vm, ps_direct, guest, findings, checked_at}.
             """
             return _run_guest_tool(
@@ -3280,6 +3702,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+            Args:
+                vm_name: Name of the VM (must match allowed_vm_patterns)
+                apply: Propose only by default; pass true with confirm to apply repairs
+                confirm: Must be true (the tool's destructive category + require_confirm)
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
             Returns: {ok, vm_name, applied, plan, changes, verification_findings[, backup_path]}.
             """
             return _run_guest_tool(
@@ -3312,6 +3742,16 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+            Args:
+                vm_name: Name of the VM (must match allowed_vm_patterns)
+                command: The executable or shell command to run in the guest
+                args: Argument list passed to the command
+                cwd: Working directory for the guest command
+                timeout_ms: Per-call timeout in milliseconds
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
             Returns: {ok, job_id, vm_name, pid, start_time_ticks, job_dir, out_path, err_path, exit_path, started_at}.
             """
             return _run_guest_tool(
@@ -3336,6 +3776,16 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+            Args:
+                vm_name: Name of the VM (must match allowed_vm_patterns)
+                services: Guest service names to verify Running after restart
+                processes: Guest process names to verify present after restart
+                timeout_s: Overall deadline in seconds
+                interval_s: Poll interval in seconds
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+                detach: Detach: report the accepted operation and finish in background
+                idempotency_key: Optional caller-managed key for idempotent retries
             Returns: {ok, vm_name, ps_direct, services, processes, failures, checked_at}.
             """
             return _run_guest_tool(
@@ -3360,6 +3810,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
+
+            Args:
+                vm_name: Name of the VM (must match allowed_vm_patterns)
+                guest_port: Guest-local port to relay to (loopback)
+                host_port: Host-side loopback listener port
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
             Returns: {ok, relay_id, url, host_port, ...}. The url is a
             capability URL embedding the relay's per-relay secret (the only
             place the secret is returned); requests without it get 401.
@@ -3445,6 +3903,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         Addresses the host-side job registry (credentials
         were stored at start time).
 
+
+        Args:
+            job_id: Job id returned by job_start
         Returns: {ok, job_id, pid, status[, exit_code, process_name]}.
         """
         return _run_guest_tool(
@@ -3464,6 +3925,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         the last tail_bytes per stream. Encoding is BOM-sniffed from the
         stream head (PS 5.1 redirection may write UTF-16LE) and reported.
 
+
+        Args:
+            job_id: Job id returned by job_start
+            tail_bytes: Read the last N bytes of each stream
         Returns: {ok, job_id, pid, tail_bytes, stdout, stderr, *_truncated, *_encoding, *_size}.
         """
         return _run_guest_tool(
@@ -3494,6 +3959,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         start time is an unknown, not a mismatch — nothing is killed and
         pid_reused stays false).
 
+
+        Args:
+            job_id: Job id returned by job_start
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
         Returns: {ok, job_id, pid, stopped, alive_pids, job_dir_removed, pid_reused}.
         """
         return _run_guest_tool(
@@ -3509,6 +3979,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_relay_status(relay_id: str = "") -> dict:
         """List relays (or one) with liveness, request counters and latency.
 
+
+        Args:
+            relay_id: Relay id returned by relay_start
         Returns: {ok, relays: [{relay_id, url, counters, stopped, latency,
         ...}]}. `latency` is always present and reports the guest leg's
         duration for every COMPLETED request as {cap, samples, p50_ms,
@@ -3533,6 +4006,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         """Stop a relay: close the loopback listener and release the stored
         credentials.
 
+
+        Args:
+            relay_id: Relay id returned by relay_start
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
         Returns: {ok, relay_id, host_port, stopped}.
         """
         return _run_guest_tool(
@@ -3561,7 +4039,13 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         and is renewed by hyperv_lease_renew. For a VM that does not exist yet
         (hyperv_vm_create workflow) the lease keys on the raw NAME and does not
         follow a rename. Release it with hyperv_lease_release when done.
-        """
+
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            scopes: Lease scopes to acquire (e.g. lifecycle, guest_exec, transfer)
+            ttl_s: Lease time-to-live in seconds"""
         wanted = list(scopes or [])
         if not vm_name and not vm_id:
             raise ValueError("vm_name or vm_id is required")
@@ -3636,7 +4120,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         Call this periodically from a long workflow (a heartbeat) so the lease
         does not expire mid-flight and another agent takes the VM over. A
         lease whose TTL lapsed reports "lease_expired" and must be re-acquired.
-        """
+
+
+        Args:
+            lease_id: Optional lease citation - the lease gate runs before the body"""
         with _audit("hyperv_lease_renew", "", "lease", lease_ref=str(lease_id)[:16]):
             _owned_lease_or_invalid(lease_id)
             renewed = leases.renew(_cfg(), lease_id, auditlog.current_agent_id())
@@ -3644,7 +4131,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
     @mcp.tool()
     def hyperv_lease_release(lease_id: str) -> dict:
-        """Release a lease you hold, so other agents can use the VM again."""
+        """Release a lease you hold, so other agents can use the VM again.
+
+Args:
+    lease_id: Optional lease citation - the lease gate runs before the body"""
         with _audit("hyperv_lease_release", "", "lease", lease_ref=str(lease_id)[:16]):
             _owned_lease_or_invalid(lease_id)
             leases.release(_cfg(), lease_id, auditlog.current_agent_id())
@@ -3654,7 +4144,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_lease_list(vm_name: str = "", vm_id: str = "") -> dict:
         """List the leases on a VM (or on every VM when neither argument is
         given). Holder, scopes and expiry are public; lease_id and
-        fencing_token appear ONLY for leases the calling agent holds."""
+        fencing_token appear ONLY for leases the calling agent holds.
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given"""
         with _audit("hyperv_lease_list", vm_name, "lease"):
             cfg = _cfg()
             agent = auditlog.current_agent_id()
@@ -3693,7 +4187,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         error_class "interrupted" and notes the VM-side outcome is unknown.
         Operation ids are scoped to the calling agent: another agent's (or an
         unknown) id answers exactly the same refusal.
-        """
+
+
+        Args:
+            op_id: Operation handle id returned by the starting tool"""
         with _audit("hyperv_op_status", "", "operations"):
             return operations.op_status(_cfg(), op_id, auditlog.current_agent_id() or "")
 
@@ -3705,7 +4202,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         most 64 KiB of the stored (redacted) result text; re-reading from an
         earlier cursor returns identical bytes, including after a server
         restart. Refuses while the op is still working.
-        """
+
+
+        Args:
+            op_id: Operation handle id returned by the starting tool
+            cursor: Continuation cursor from a previous paged result"""
         with _audit("hyperv_op_result", "", "operations"):
             return operations.op_result(
                 _cfg(), op_id, auditlog.current_agent_id() or "", cursor
@@ -3719,7 +4220,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         request at its next leg boundary; cancelling a terminal op is a no-op
         that reports its terminal status. Scoped to the calling agent like
         every op tool.
-        """
+
+
+        Args:
+            op_id: Operation handle id returned by the starting tool"""
         with _audit("hyperv_op_cancel", "", "operations"):
             return operations.op_cancel(_cfg(), op_id, auditlog.current_agent_id() or "")
 
@@ -3729,7 +4233,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         Returns {ok, ops: [{op_id, status, tool, ...}]}. Only the caller's
         own ops are listed; pass include_terminal=true to see finished ones.
-        """
+
+
+        Args:
+            include_terminal: Also list finished operations"""
         with _audit("hyperv_op_list", "", "operations"):
             return operations.op_list(
                 _cfg(), auditlog.current_agent_id() or "", include_terminal
@@ -3744,13 +4251,31 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         resume where you left off — across restarts too. A cursor older than
         the retention window answers {cursor_expired: true, oldest_cursor}.
         Events are scoped to the calling agent.
-        """
+
+
+        Args:
+            after: Resume cursor from a previous read
+            limit: Maximum events to return"""
         with _audit("hyperv_events", "", "operations"):
             return operations.events_read(
                 _cfg(), auditlog.current_agent_id() or "", after, limit
             )
 
     _harden_tools(mcp)
+    # Issue #86: the docstring is the source of truth for parameter
+    # descriptions. mcp 2.x builds each inputSchema from the signature alone,
+    # so after registration every still-undescribed property is stamped with
+    # the tool docstring's Args: text (never overwriting an existing
+    # description). Runs here so BOTH registration variants are enriched by
+    # construction; the suite-wide pin (C3) fails on any parameter missing
+    # from its Args: block, so authoring gaps surface in CI.
+    described = toolschema.apply_docstring_descriptions(
+        list(getattr(getattr(mcp, "_tool_manager", None), "_tools", {}).values())
+    )
+    logemit.log_line(
+        f"[hyperv-mcp] schema descriptions: {described} parameter(s) "
+        "described from docstrings"
+    )
 
 
 # Issue #23: the mutating tools that accept (and require, where
