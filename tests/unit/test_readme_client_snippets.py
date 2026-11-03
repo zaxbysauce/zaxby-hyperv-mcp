@@ -125,8 +125,7 @@ def test_connect_section_states_the_plaintext_token_storage():
     "never in a config file" claim next to an example that does exactly
     that. The example must carry the replace-me placeholder, because the
     controller accepts ANY non-empty value as the bearer token."""
-    text = _readme_text()
-    connect = text.split("## Connecting")[1] if "## Connecting" in text else text
+    connect = _connect_section()
     assert "REPLACE_WITH_YOUR_GENERATED_TOKEN" in connect, (
         "the connect section's .mcp.json example does not carry the "
         "replace-me placeholder"

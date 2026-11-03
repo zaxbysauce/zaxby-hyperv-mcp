@@ -346,8 +346,9 @@ def test_main_installs_the_record_prefix(monkeypatch):
 
     previous_factory = logging.getLogRecordFactory()
     try:
-        # A plain factory: the marker must come from main() alone.
-        logging.setLogRecordFactory(previous_factory)
+        # A PLAIN factory (the stdlib default), so the marker can only come
+        # from main() itself - not from an earlier test that already ran it.
+        logging.setLogRecordFactory(logging.LogRecord)
         # main() installs the factory BEFORE it loads the config, so the
         # early config failure still exercises the installation.
         rc = http_entry_mod.main(["--host", "127.0.0.1"])
