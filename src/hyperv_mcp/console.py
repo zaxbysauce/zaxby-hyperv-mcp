@@ -3393,7 +3393,9 @@ def _reject_oversized_sequence_plan(cfg, script: str, plan: list[dict]) -> None:
     codes step whose compact base64 seed alone busts the budget (measured:
     20000 codes -> 26668-char seed, 78333-char command line). Such plans used
     to fall through and die at spawn with WinError 206; they are refused HERE
-    instead — before the console lock, before any spawn, zero side effects.
+    instead — before the console lock and before the SEQUENCE command spawns.
+    (A by-id plan may already have spent one resolver spawn in the prelude;
+    the oversized sequence command line itself is never composed into a spawn.)
 
     The measure is the EXACT spawned command line: the script is composed
     through the real pswindows.compose_remote (pure string work — identity in
