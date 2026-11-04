@@ -126,6 +126,27 @@ def test_display_info_reports_the_ps2_mouse(monkeypatch, unrestricted_cfg):
         "AC14: the display-info script must emit mouse_ps2_present from the "
         "queried PS/2 device ([bool]$m), not a hard-coded constant"
     )
+    # ORDERING PIN (PRR-102, the executed reorder mutant): synthetic query
+    # BEFORE the $mouse capture BEFORE the PS/2 query — asserted by index so
+    # moving the capture after the PS/2 lookup (mouse_present would read the
+    # PS/2 device) fails here even though every emission pin above holds.
+    script = stub.scripts[-1]
+    i_synth = script.index("-ClassName Msvm_SyntheticMouse")
+    i_capture = script.index("$mouse = $m | Select-Object -First 1")
+    i_ps2 = script.index("-ClassName Msvm_Ps2Mouse")
+    assert i_synth < i_capture < i_ps2, (
+        "AC14: the queries are mis-ordered — the synthetic lookup must run "
+        "before the $mouse capture, and the capture before the PS/2 lookup "
+        f"(synthetic@{i_synth}, capture@{i_capture}, ps2@{i_ps2})"
+    )
+    # SCOPING PIN (CUB-display-115): the PS/2 query line itself carries the
+    # SystemName='$vmTarget' filter, so a host-wide Msvm_Ps2Mouse lookup
+    # fails here.
+    ps2_line = next(ln for ln in script.splitlines() if "Msvm_Ps2Mouse" in ln)
+    assert "SystemName='$vmTarget'" in ps2_line, (
+        "AC14: the Msvm_Ps2Mouse query must be scoped to the target VM "
+        f"(SystemName='$vmTarget'), not host-wide: {ps2_line!r}"
+    )
 
 
 def test_display_info_synthetic_case_unchanged(monkeypatch, unrestricted_cfg):

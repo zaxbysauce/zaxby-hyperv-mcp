@@ -198,6 +198,14 @@ class SpawnCounter:
             # emitter statement and the $n loop bound from the captured text
             # and serves one RC=/CHUNK= line per parsed chunk. A script whose
             # emitters were suppressed (C23) is served no progress lines.
+            # CUB-spawns-201 disclosure: this serving branch is a TEXTUAL-
+            # STRUCTURAL check — the served lines are DERIVED from the
+            # captured emitter text and the $n literal, so the AC5
+            # len(served_progress) == n_bound leg is tautological against
+            # this stub (it genuinely pins only the result's chunks against
+            # the $n literal). The EXECUTED arithmetic oracle — every chunk
+            # of the loop really reaching TypeScancodes — lives in AC19's
+            # real-PowerShell harness below.
             has_emitter, n = _chunk_progress_from_script(s)
             if not has_emitter or n < 1:
                 return pswindows.PSResult(stdout="", returncode=0)

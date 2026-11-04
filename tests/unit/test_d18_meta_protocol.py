@@ -104,10 +104,19 @@ def test_spawn_ms_entries_share_one_basis(monkeypatch, unrestricted_cfg):
         encoding="utf-8")
     paragraphs = [p for p in readme.split("\n\n") if "spawn_ms" in p]
     assert paragraphs, "AC19: README no longer documents spawn_ms at all"
-    two_basis = [
-        p for p in paragraphs
-        if "slot" in p.lower() and ("resolve" in p.lower() or "duration_ms" in p.lower())
-    ]
+    # PRR-106 + CUB-meta-109: BOTH bases must appear in the SAME paragraph
+    # AND in the documented direction — the wall-clock (resolve-leg) wording
+    # precedes the duration_ms (op-leg) wording; the executed inversion
+    # mutant (duration_ms before wall-clock) must fail here, as must a
+    # paragraph naming only one basis.
+    def _two_basis(p: str) -> bool:
+        low = p.lower()
+        return (
+            "wall-clock" in low and "duration_ms" in low and "slot" in low
+            and low.index("wall-clock") < low.index("duration_ms")
+        )
+
+    two_basis = [p for p in paragraphs if _two_basis(p)]
     assert two_basis, (
         "AC19: no spawn_ms paragraph states the two bases — the resolve-leg "
         "entry is wall-clock including policy/compose/slot-wait and op-leg "

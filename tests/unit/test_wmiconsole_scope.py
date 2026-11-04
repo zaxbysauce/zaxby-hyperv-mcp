@@ -18,6 +18,7 @@ test_wmiconsole.py by import (that file must never be modified)."""
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
 
 import pytest
 from test_wmiconsole import (  # noqa: F401  (same-directory import, --import-mode=prepend)
@@ -111,7 +112,9 @@ def test_failed_mouse_probe_surfaces_not_laundered(monkeypatch, unrestricted_cfg
     _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
     stub = _ps(monkeypatch)
 
-    with pytest.raises(ConsoleError):
+    # CUB-scope-114: match the probe's own failure text so the ConsoleError
+    # is proven to come from the mouse channel, not some other error path.
+    with pytest.raises(ConsoleError, match="rpc unavailable"):
         console.get_display_info(unrestricted_cfg, "vm1")
     assert stub.scripts == [], "a failed probe must not fall back to PowerShell"
 
@@ -140,3 +143,79 @@ def test_display_info_absent_devices_stay_present_false(monkeypatch, unrestricte
     assert out["keyboard_present"] is False
     assert out["mouse_present"] is False
     assert stub.scripts == []
+
+
+def test_display_info_reports_ps2_mouse_on_wmi_transport(monkeypatch, unrestricted_cfg):
+    """PRR-101 fix pin: a VM with NO synthetic mouse but a PS/2 mouse reports
+    mouse_ps2_present=True on the WMI transport too. Pre-fix the field was a
+    constant False here (wmiconsole.display_info never probed Msvm_Ps2Mouse)
+    while the PowerShell transport measured it — the diagnostic disagreed
+    across transports. mouse_present stays the synthetic-only answer the
+    input ops act on (issue #83 Design b); the probe must be the scoped
+    SystemName query, mirroring _mouse_path."""
+
+    class Ps2OnlyService(FakeWMIService):
+        """No synthetic mouse (its query serves nothing), one PS/2 mouse;
+        every query is recorded so the scoping assertion below sees the
+        probe the transport actually issued."""
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.queries: list[str] = []
+
+        def ExecQuery(self, wql: str) -> list:
+            self.queries.append(wql)
+            text = " ".join(wql.split())
+            if "Msvm_Ps2Mouse" in text:
+                return [SimpleNamespace(Name=GUID + "-ps2")]
+            if "Msvm_SyntheticMouse" in text:
+                return []
+            return super().ExecQuery(wql)
+
+    svc = Ps2OnlyService(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    stub = _ps(monkeypatch)
+
+    out = console.get_display_info(unrestricted_cfg, "vm1")
+    assert out["ok"] is True
+    assert out["mouse_present"] is False, (
+        "PRR-101: mouse_present is the synthetic-only answer and must stay "
+        "false on a PS/2-only VM"
+    )
+    assert out["mouse_ps2_present"] is True, (
+        "PRR-101: the WMI transport must probe Msvm_Ps2Mouse — a PS/2-only "
+        "VM cannot read as 'no mouse at all' on the default in-process path"
+    )
+    ps2_queries = [
+        q for q in svc.queries
+        if "msvm_ps2mouse" in q.lower()
+        and re.search(r"systemname\s*=\s*'" + re.escape(GUID) + r"'", q, re.I)
+    ]
+    assert ps2_queries, (
+        "PRR-101: the PS/2 probe must be a SystemName-scoped Msvm_Ps2Mouse "
+        f"query (queries seen: {svc.queries!r})"
+    )
+    assert stub.scripts == []
+
+
+def test_failed_ps2_probe_surfaces_not_laundered(monkeypatch, unrestricted_cfg):
+    """PRR-101 failure leg, mirroring the AC8 launder shape: the synthetic
+    mouse discovery SUCCEEDS via super() and ONLY the Msvm_Ps2Mouse query
+    raises — so the ConsoleError can only come from the PS/2 probe (a probe
+    failure laundered to absent would report mouse_ps2_present=False
+    instead of raising)."""
+
+    class FailedPs2ProbeService(FakeWMIService):
+        def ExecQuery(self, wql: str) -> list:
+            text = " ".join(wql.split()).upper()
+            if "MSVM_PS2MOUSE" in text:
+                raise OSError("rpc unavailable")  # probe failure, NOT empty
+            return super().ExecQuery(wql)
+
+    svc = FailedPs2ProbeService(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    stub = _ps(monkeypatch)
+
+    with pytest.raises(ConsoleError, match="rpc unavailable"):
+        console.get_display_info(unrestricted_cfg, "vm1")
+    assert stub.scripts == [], "a failed PS/2 probe must not fall back to PowerShell"

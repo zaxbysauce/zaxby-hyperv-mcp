@@ -475,7 +475,8 @@ class ConsoleWMI:
         client-side SystemName re-filter, which objects that do not
         expose the attribute would defeat). Absence (zero rows) returns
         None with absent_ok / raises WMIError otherwise; a TRANSPORT
-        failure (WMIError/OSError from ExecQuery) propagates — never
+        failure propagates as WMIError (CUB-478: _com() folds the
+        underlying OSError/com_error, so nothing else escapes) — never
         laundered to absent."""
         if entry.mouse_path is not None:
             return entry.mouse_path
@@ -490,6 +491,22 @@ class ConsoleWMI:
         with self._lock:
             entry.mouse_path = _path_of(rows[0])
         return entry.mouse_path
+
+    def _ps2_mouse_present(self, guid: str) -> bool:
+        """Per-call PS/2 mouse presence probe (issue #83 Design b,
+        PRR-101): the same SystemName-scoped key filter _mouse_path uses,
+        against Msvm_Ps2Mouse — the WMI transport's mirror of the folded
+        script's _MOUSE_PS2 query, so display_info's mouse_ps2_present
+        agrees across transports. Empty rows -> not present; a TRANSPORT
+        failure propagates as WMIError (same absent_ok semantics as
+        _mouse_path's probe — never laundered to absent). Uncached on
+        purpose: display_info is the only consumer, a per-call probe
+        needs no cache entry to invalidate."""
+        rows = _rows(_com("ExecQuery ps2 mouse", lambda: self._service.ExecQuery(
+            "SELECT * FROM Msvm_Ps2Mouse WHERE SystemName = "
+            + _wql_quote(guid.lower())
+        )))
+        return bool(rows)
 
     def _head_object(self, guid: str, entry: _VMCache) -> Any | None:
         """Head object via cached path (re-read per call so resolution
@@ -708,6 +725,12 @@ class ConsoleWMI:
             # (bind/transport) raises — never laundered to absent (PRR-013).
             mouse_path = self._mouse_path(guid, entry, absent_ok=True)
             mouse_obj = _com("bind mouse", lambda: self._service.Get(mouse_path)) if mouse_path else None
+            # PRR-101: the PS/2 probe is the WMI mirror of the folded
+            # script's _MOUSE_PS2 query (issue #83 Design b) — mouse_present
+            # above stays the synthetic-only answer the input ops act on;
+            # this key reports the fallback device's presence. Empty rows ->
+            # False; a failed probe raises WMIError (never laundered).
+            ps2_present = self._ps2_mouse_present(guid)
             method_ms = (time.monotonic() - t0) * 1000.0
 
             def _res(obj: Any) -> tuple[int | None, int | None]:
@@ -730,6 +753,7 @@ class ConsoleWMI:
                 "keyboard_enabled": getattr(kb_obj, "EnabledState", None) if kb_obj else None,
                 "mouse_present": mouse_obj is not None,
                 "mouse_enabled": getattr(mouse_obj, "EnabledState", None) if mouse_obj else None,
+                "mouse_ps2_present": ps2_present,
                 "boot_epoch": _boot_epoch_from_cs(cs),
             }
             return info, {

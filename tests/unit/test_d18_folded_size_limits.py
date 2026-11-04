@@ -267,9 +267,10 @@ def test_command_line_stays_under_the_limit_for_schema_allowed_shapes(
     # 91125-character command line), nor a single codes step whose compact
     # base64 seed alone busts the budget (20000 codes -> a 78333-character
     # command line). Both must be refused BEFORE any spawn: a structured
-    # ConsoleError naming the 32767-char command-line budget, with the
-    # captured transport proving ZERO spawn attempts (fail-closed, not
-    # launched into WinError 206).
+    # ConsoleError naming the 32766-char command-line budget (PRR-103: the
+    # ceiling is 32766 SPAWNABLE characters — CreateProcess's 32767 includes
+    # the terminating null), with the captured transport proving ZERO spawn
+    # attempts (fail-closed, not launched into WinError 206).
     for label, steps in [
         ("type_text", [{"action": "type_text", "text": "a" * 512} for _ in range(50)]),
         ("codes", [{"action": "type_scancodes", "scancodes": [123] * 20000}]),
@@ -282,7 +283,7 @@ def test_command_line_stays_under_the_limit_for_schema_allowed_shapes(
             f"the over-limit {label} plan spawned {len(runner.calls)} PowerShell "
             "process(es) before the rejection — the refusal must be pre-spawn"
         )
-        assert "32767" in message and "command" in message, (
+        assert "32766" in message and "command" in message, (
             f"the {label} rejection must name the command-line budget: {message!r}"
         )
         shapes.append((f"run_sequence {label} plan rejected pre-spawn", []))

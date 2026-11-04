@@ -98,6 +98,23 @@ def _ok(stdout):
     return pswindows.PSResult(stdout=stdout, returncode=0)
 
 
+def _assert_era_queue_drained(stub: _ResponseQueue) -> None:
+    """CUB-d01-92: the dual-queue stub lets unused responses of the OTHER
+    era sit unconsumed, which softened the single-protocol stub's strict
+    call-count discipline. After each tool body, the queue for the era
+    that actually ran must be fully drained — leftover responses there
+    mean the call count regressed (fewer op legs than the check queued),
+    while an extra call on an empty queue already fails loudly in the
+    stub itself."""
+    era_folded = any(_is_folded_op_script(s) for s in stub.scripts)
+    leftover = stub.folded if era_folded else stub.legacy
+    era = "folded" if era_folded else "legacy"
+    assert not leftover, (
+        f"{len(leftover)} unconsumed {era}-era response(s) after the tool "
+        "call — the run_ps call count for the running era regressed"
+    )
+
+
 def _guid_leg():
     return _ok(GUID)
 
@@ -227,14 +244,15 @@ def test_screenshot_tool_encodes_png_once(monkeypatch, encode_counter, tool_serv
     """AC3: RED at base with `assert 2 == 1` (console._decode_rgb565 encodes, then
     the tool encodes again), GREEN after the fix. One PNG encode per returned image."""
     payload = _thumbnail(320, 240)
-    monkeypatch.setattr(pswindows, "run_ps", _ResponseQueue(
+    stub = _ResponseQueue(
         legacy=[
             _guid_leg(),          # by-name resolve (pre-fold leg 1)
             _head_leg(),          # head resolution (pre-fold leg 2)
             _capture_leg(payload)  # capture (pre-fold leg 3)
         ],
         folded=[_folded_screenshot(payload, 320, 240)],
-    ))
+    )
+    monkeypatch.setattr(pswindows, "run_ps", stub)
     encode_counter["encodes"] = 0
 
     result = asyncio.run(tool_server.call_tool(
@@ -246,6 +264,7 @@ def test_screenshot_tool_encodes_png_once(monkeypatch, encode_counter, tool_serv
     assert encode_counter["encodes"] == 1, (
         f"AC3: {encode_counter['encodes']} PNG encodes for one returned image"
     )
+    _assert_era_queue_drained(stub)  # CUB-d01-92: era queue drained fully
 
 
 # ---------------------------------------------------------------------------
@@ -258,13 +277,14 @@ def test_wait_frame_change_tool_encodes_png_once(monkeypatch, encode_counter, to
     width, height = 320, 240
     payload = b"\x00\x00\x00\x00" + b"\x00\x00" * (width * height)
     frame_line = "STOP=changed POLLS=2 HASH=" + "a" * 64 + "\nFRAME=" + base64.b64encode(payload).decode()
-    monkeypatch.setattr(pswindows, "run_ps", _ResponseQueue(
+    stub = _ResponseQueue(
         legacy=[
             _guid_leg(),   # by-name resolve (pre-fold)
             _ok(frame_line)  # the poll loop itself (identical shape pre-fold)
         ],
         folded=[_ok(frame_line)],
-    ))
+    )
+    monkeypatch.setattr(pswindows, "run_ps", stub)
     encode_counter["encodes"] = 0
 
     result = asyncio.run(tool_server.call_tool(
@@ -281,6 +301,7 @@ def test_wait_frame_change_tool_encodes_png_once(monkeypatch, encode_counter, to
     assert encode_counter["encodes"] == 1, (
         f"AC4: {encode_counter['encodes']} PNG encodes for one returned image"
     )
+    _assert_era_queue_drained(stub)  # CUB-d01-92: era queue drained fully
 
 
 # ---------------------------------------------------------------------------
@@ -293,10 +314,11 @@ def test_capture_sequence_tool_encodes_each_returned_png_once(monkeypatch, encod
     encode per returned image (a 3-frame sequence returns the first and last)."""
     width, height = 320, 240
     payload = _thumbnail(width, height)
-    monkeypatch.setattr(pswindows, "run_ps", _ResponseQueue(
+    stub = _ResponseQueue(
         legacy=[_guid_leg()] + [_capture_leg(payload) for _ in range(3)],
         folded=[_capture_leg(payload) for _ in range(3)],
-    ))
+    )
+    monkeypatch.setattr(pswindows, "run_ps", stub)
     encode_counter["encodes"] = 0
 
     result = asyncio.run(tool_server.call_tool(
@@ -309,6 +331,7 @@ def test_capture_sequence_tool_encodes_each_returned_png_once(monkeypatch, encod
     assert (encode_counter["encodes"], len(image_blocks)) == (2, 2), (
         f"AC5: ({encode_counter['encodes']}, {len(image_blocks)}) — one encode per image"
     )
+    _assert_era_queue_drained(stub)  # CUB-d01-92: era queue drained fully
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +348,7 @@ def test_capture_evidence_tool_encodes_png_once(monkeypatch, encode_counter, too
     capture leg differs: pre-fold the head resolution and the capture are two
     more legacy responses, folded it is ONE folded capture."""
     payload = _thumbnail(320, 240)
-    monkeypatch.setattr(pswindows, "run_ps", _ResponseQueue(
+    stub = _ResponseQueue(
         legacy=[
             _guid_leg(),          # evidence's own by-name resolve
             _ok("test-vm-1"),     # console's by-id resolve (policy on the real name)
@@ -333,7 +356,8 @@ def test_capture_evidence_tool_encodes_png_once(monkeypatch, encode_counter, too
             _capture_leg(payload)  # capture (pre-fold)
         ],
         folded=[_folded_screenshot(payload, 320, 240)],
-    ))
+    )
+    monkeypatch.setattr(pswindows, "run_ps", stub)
     encode_counter["encodes"] = 0
 
     result = asyncio.run(tool_server.call_tool(
@@ -345,3 +369,4 @@ def test_capture_evidence_tool_encodes_png_once(monkeypatch, encode_counter, too
     assert encode_counter["encodes"] == 1, (
         f"AC6: {encode_counter['encodes']} PNG encodes for one returned image"
     )
+    _assert_era_queue_drained(stub)  # CUB-d01-92: era queue drained fully

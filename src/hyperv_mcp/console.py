@@ -422,11 +422,14 @@ _SCANCODES_PER_SCRIPT = 1600
 #: sequence steps, triggers the compact in-script codes encoding.
 _SCRIPT_CHAR_BUDGET = 9000
 
-#: the CreateProcess command-line ceiling itself (issue #81 measurement): a
-#: composed argv longer than this fails to spawn at all (WinError 206), so a
-#: plan that cannot be brought under it is refused pre-spawn rather than
-#: launched into the cliff.
-_CMDLINE_CHAR_LIMIT = 32767
+#: the CreateProcess command-line ceiling itself (issue #81 measurement).
+#: PRR-103: CreateProcess's 32767 ceiling INCLUDES the terminating null, so
+#: an exactly-32767-character line cannot spawn (executed probe: 32766
+#: spawns, 32767 -> WinError 206) — the budget is the largest SPAWNABLE
+#: line. A composed argv longer than this fails to spawn at all, so a plan
+#: that cannot be brought under it is refused pre-spawn rather than launched
+#: into the cliff.
+_CMDLINE_CHAR_LIMIT = 32766
 
 # Per-process identity emission (issues #82/#83): every folded script that
 # drives console input or polling reports the GUID its own resolver bound, so
@@ -2192,6 +2195,7 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
         "    if ($i -lt $n - 1) { Start-Sleep -Milliseconds 50 }\n"
     )
     with _input_lock(ref):
+        delivered_chunks = 0
         for gi, group in enumerate(groups):
             if gi:
                 # pacing between composed commands mirrors the in-script
@@ -2221,8 +2225,19 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
                 payload_lines=len(group),
                 timing=timing,
             )
-            _check_input_rc(result, "console type_text", vm_name)
-            _validate_vmid_hint(result, vm_name or ref.name)
+            # PRR-105: a failing leg names delivered-so-far (every full chunk
+            # is 512 chars) so a caller's retry resumes instead of duplicating
+            # guest input; the underlying error text is appended.
+            try:
+                _check_input_rc(result, "console type_text", vm_name)
+                _validate_vmid_hint(result, vm_name or ref.name)
+            except ConsoleError as exc:
+                raise ConsoleError(
+                    f"leg {gi + 1}/{len(groups)} failed; about "
+                    f"{delivered_chunks * 512} characters delivered by earlier "
+                    f"legs: {exc}"
+                ) from None
+            delivered_chunks += len(group)
     return {
         "ok": True, "chunks": len(chunks), "chars": len(text), "vm_name": ref.name,
         "timings": _ps_timings(timing),
@@ -2310,16 +2325,21 @@ def _send_scancodes_locked(
     if be is not None:
         sent = 0
         phase_dicts: list[dict] = []
-        try:
-            with _input_lock(ref):
-                for i, chunk in enumerate(chunks):
+        with _input_lock(ref):
+            for i, chunk in enumerate(chunks):
+                try:
                     _r, t = be.type_scancodes(ref.id, chunk)
-                    phase_dicts.append(t)
-                    sent += len(chunk)
-                    if i < len(chunks) - 1:
-                        time.sleep(0.02)  # pacing: let the Hyper-V input buffer drain
-        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
-            raise ConsoleError(str(exc)) from None
+                except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
+                    # PRR-105: name delivered-so-far so a retry resumes
+                    # instead of duplicating guest input.
+                    raise ConsoleError(
+                        f"leg {i + 1}/{len(chunks)} failed; {sent} of "
+                        f"{len(codes)} codes delivered by the earlier legs: {exc}"
+                    ) from None
+                phase_dicts.append(t)
+                sent += len(chunk)
+                if i < len(chunks) - 1:
+                    time.sleep(0.02)  # pacing: let the Hyper-V input buffer drain
         return {
             "ok": True, "scancodes_sent": sent, "chunks": len(chunks),
             "vm_name": ref.name, "timings": _wmi_timings(connect_ms, *phase_dicts),
@@ -2336,15 +2356,25 @@ def _send_scancodes_locked(
         # in order under this one input lock. `chunks` below stays the TOTAL
         # 64-window count and scancodes_sent the total delivered.
         sent = 0
-        for si, sl in enumerate(
+        slices = [
             codes[i:i + _SCANCODES_PER_SCRIPT]
             for i in range(0, len(codes), _SCANCODES_PER_SCRIPT)
-        ):
+        ]
+        for si, sl in enumerate(slices):
             if si:
                 time.sleep(0.02)  # pacing: let the Hyper-V input buffer drain
             result = _run(cfg, _scancodes_script(prelude, sl), timeout_s=90, timing=timing)
-            _check_input_rc(result, "console scancodes", ref.name)
-            _validate_vmid_hint(result, ref.name)
+            # PRR-105: a failing leg names delivered-so-far so a caller's
+            # retry resumes instead of duplicating guest input; the underlying
+            # error text is appended.
+            try:
+                _check_input_rc(result, "console scancodes", ref.name)
+                _validate_vmid_hint(result, ref.name)
+            except ConsoleError as exc:
+                raise ConsoleError(
+                    f"leg {si + 1}/{len(slices)} failed; {sent} of "
+                    f"{len(codes)} codes delivered by the earlier legs: {exc}"
+                ) from None
             sent += len(sl)
     out = {"ok": True, "scancodes_sent": sent, "chunks": len(chunks), "vm_name": ref.name}
     if timing is not None:
