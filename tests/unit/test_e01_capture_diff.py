@@ -72,6 +72,7 @@ def _flipped(payload: bytes, *indexes: int) -> bytes:
 
 def _count_events(a: bytes, b: bytes) -> int:
     events = [0]
+    prev = sys.gettrace()
 
     def _tracer(frame, event, arg):
         if event == "line":
@@ -82,7 +83,7 @@ def _count_events(a: bytes, b: bytes) -> int:
     try:
         console_mod._changed_pixel_bytes(a, b)
     finally:
-        sys.settrace(None)
+        sys.settrace(prev)
     return events[0]
 
 
