@@ -244,7 +244,8 @@ the task-spawned controller reads it from the environment.
   single-process emissions the one-process pins freeze.
 - **`run_sequence` refuses over-budget plans fail-closed (#81):** a plan
   whose composed command line cannot fit the spawn budget even after the
-  codes-step compaction is rejected BEFORE any spawn with a structured
+  codes-step compaction is refused before the sequence command spawns (a
+  by-id plan may already have spent one resolver spawn) with a structured
   `ConsoleError` naming the composed command-line length and the 32766-char
   budget — reduce steps or per-step payload.
 - **New result fields `mouse_ps2_present` and `used_fallback` (#83):**
@@ -1991,7 +1992,8 @@ automatically per call:
   PS/2 equivalent).
 
 Oversized input delivery (issue #81): Windows caps the spawned command line
-at 32767 characters and a folded script costs roughly 8/3 command-line
+at 32766 spawnable characters (CreateProcess's 32767 ceiling includes the
+terminating null) and a folded script costs roughly 8/3 command-line
 characters per script character after `-EncodedCommand` base64, so input that
 would overflow ONE command is split into sequential commands rather than
 failing — scancode arrays beyond ~1600 codes split across consecutive folded

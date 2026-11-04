@@ -69,6 +69,27 @@ def test_d01_file_has_no_lint_violations_under_isolated_ruff():
     )
 
 
+def _fallback_per_file_ignore_keys(text: str) -> set[str]:
+    """Python 3.10 fallback scanner (tomllib is 3.11+): scan the section body
+    between the [tool.ruff.lint.per-file-ignores] header and the next header
+    for quoted key paths. CUB-lint-80 completion (review round 2, R3): TOML
+    allows single- AND double-quoted keys, so a key line starting with EITHER
+    quote char is collected (strip the starter quote, take up to the matching
+    close) with backslashes normalized to slashes — a single-quoted glob must
+    not silently escape the fnmatch sweep below."""
+    keys: set[str] = set()
+    in_section = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == "[tool.ruff.lint.per-file-ignores]"
+            continue
+        if in_section and stripped[:1] in ('"', "'"):
+            quote = stripped[:1]
+            keys.add(stripped.split(quote)[1].replace("\\", "/"))
+    return keys
+
+
 def _per_file_ignore_keys() -> set[str]:
     """Every key of [tool.ruff.lint.per-file-ignores], posix-normalized."""
     text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
@@ -78,19 +99,7 @@ def _per_file_ignore_keys() -> set[str]:
         data = tomllib.loads(text)
         section = data.get("tool", {}).get("ruff", {}).get("lint", {})
         return {k.replace("\\", "/") for k in section.get("per-file-ignores", {})}
-    # Python 3.10 fallback (tomllib is 3.11+): scan the section body between
-    # the [tool.ruff.lint.per-file-ignores] header and the next header for
-    # quoted key paths.
-    keys: set[str] = set()
-    in_section = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            in_section = stripped == "[tool.ruff.lint.per-file-ignores]"
-            continue
-        if in_section and stripped.startswith('"'):
-            keys.add(stripped.split('"')[1].replace("\\", "/"))
-    return keys
+    return _fallback_per_file_ignore_keys(text)
 
 
 def test_pyproject_has_no_per_file_ignore_entry_for_d01():
@@ -106,4 +115,46 @@ def test_pyproject_has_no_per_file_ignore_entry_for_d01():
         "AC1: pyproject.toml carries a per-file-ignores entry matching the "
         f"frozen d01 file (exact or glob form; matching keys: {matching}, "
         f"all keys: {sorted(keys)})"
+    )
+
+
+def test_fallback_parse_collects_single_quoted_keys():
+    """CUB-lint-80 completion (review round 2, R3) scratch-proof: the 3.10
+    fallback collects a SINGLE-quoted key line, so a single-quoted glob that
+    re-silences the d01 file cannot escape the fnmatch sweep in AC1b (the
+    3.11+ tomllib path parses both quote styles natively). Proof driven by
+    feeding a fallback-parse fixture through the collector helper directly —
+    no pyproject.toml mutation. Recorded proof output (run at fix time):
+    sorted(keys) == ['tests/unit/d01_double.py', 'tests/unit/d10_single.py']."""
+    fixture = "\n".join([
+        "[build-system]",
+        'requires = ["setuptools"]',
+        "",
+        "[tool.ruff.lint.per-file-ignores]",
+        '"tests/unit/d01_double.py" = ["I001"]',  # double-quoted key
+        "'tests\\unit\\d10_single.py' = ['F401']",  # single-quoted key
+        "[tool.ruff.lint]",
+        "select = []",
+        "",
+    ])
+    keys = _fallback_per_file_ignore_keys(fixture)
+    assert sorted(keys) == [
+        "tests/unit/d01_double.py",
+        "tests/unit/d10_single.py",
+    ], (
+        "the fallback parser dropped a quote style or a separator "
+        f"normalization; collected: {sorted(keys)!r}"
+    )
+    # And the collected single-quoted glob form is what AC1b fnmatches: a
+    # single-quoted glob key DOES catch the d01 path (pre-fix this key never
+    # reached the sweep, so the exemption passed silently).
+    from fnmatch import fnmatch
+
+    wide = _fallback_per_file_ignore_keys(
+        "[tool.ruff.lint.per-file-ignores]\n"
+        "'tests/unit/*.py' = ['I001']\n"
+    )
+    assert any(fnmatch(D01_REL, k) for k in wide), (
+        "a single-quoted glob matching the d01 file was not collected into "
+        "the fnmatch sweep"
     )

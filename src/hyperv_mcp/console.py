@@ -400,9 +400,11 @@ _HEAD_LOOKUP = (
 # ---------------------------------------------------------------------------
 # command-line size budgets (issue #81)
 #
-# CreateProcess caps the spawned command line at 32767 characters and a folded
-# script costs ~386 fixed argv characters (the powershell.exe path, the three
-# flags and "-EncodedCommand ") plus 8/3 argv characters per script character
+# CreateProcess caps the SPAWNABLE command line at _CMDLINE_CHAR_LIMIT (32766)
+# characters — the raw 32767 buffer includes the terminating null (PRR-103,
+# below) — and a folded script costs ~386 fixed argv characters (the
+# powershell.exe path, the three flags and "-EncodedCommand ") plus 8/3 argv
+# characters per script character
 # (UTF-16LE bytes, base64-encoded at 4/3) — measured with real subprocess.Popen
 # (trace 75-76-78-81-83-84-collated, 02-reproduction.md). Two growth terms rode
 # that cliff: the scancode seed (~4 script chars per code, cliff at ~2465 codes
@@ -2144,17 +2146,26 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
         assert ref is not None
         chunks = [text[i:i + 512] for i in range(0, len(text), 512)]
         calls = 0
+        chars = 0
         phase_dicts: list[dict] = []
-        try:
-            with _input_lock(ref):
-                for i, chunk in enumerate(chunks):
+        with _input_lock(ref):
+            for i, chunk in enumerate(chunks):
+                try:
                     _r, t = be.type_text(ref.id, chunk)
-                    phase_dicts.append(t)
-                    calls += 1
-                    if i < len(chunks) - 1:
-                        time.sleep(0.05)
-        except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
-            raise ConsoleError(str(exc)) from None
+                except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
+                    # PRR-105 (review round 2, R1): a failing chunk names
+                    # delivered-so-far (every earlier chunk is a full 512-char
+                    # chunk) so a caller's retry resumes instead of duplicating
+                    # guest input — same shape as the scancodes sibling below.
+                    raise ConsoleError(
+                        f"leg {i + 1}/{len(chunks)} failed; {chars} of "
+                        f"{len(text)} characters delivered by the earlier legs: {exc}"
+                    ) from None
+                phase_dicts.append(t)
+                calls += 1
+                chars += len(chunk)
+                if i < len(chunks) - 1:
+                    time.sleep(0.05)
         return {
             "ok": True, "chunks": calls, "chars": len(text), "vm_name": ref.name,
             "timings": _wmi_timings(connect_ms, *phase_dicts),
@@ -2170,7 +2181,8 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
     # block cannot read local stdin; local mode keeps the inline read.
     # Issue #81: each remote payload line costs ~165 argv characters of composed
     # command line (the $__pN read, the param() entry, the -ArgumentList entry
-    # and the $payloads entry) and CreateProcess caps the line at 32767 — 163
+    # and the $payloads entry) and the spawnable line is capped at
+    # _CMDLINE_CHAR_LIMIT (32766) — 163
     # chunks already overflow. Oversized text therefore composes MULTIPLE
     # sequential commands, each carrying a contiguous chunk range (all delivered
     # in order under one input lock); the reported chunk count stays the TOTAL.
@@ -2348,8 +2360,8 @@ def _send_scancodes_locked(
     with _input_lock(ref):
         # Issue #81: the seed line grows ~4 script chars per code (~10.7 argv
         # chars after base64), so one folded process cannot carry an unbounded
-        # array — the composed command line hits the 32767-character
-        # CreateProcess limit near ~2465 codes. Ordinary inputs (<=
+        # array — the composed command line passes the 32766-character spawn
+        # budget (_CMDLINE_CHAR_LIMIT) near ~2465 codes. Ordinary inputs (<=
         # _SCANCODES_PER_SCRIPT codes) stay the EXACT single folded script the
         # D-02 chunk-expression pins; oversized arrays split into consecutive
         # processes, each carrying a contiguous slice as its own seed, delivered
@@ -3417,7 +3429,8 @@ def _reject_oversized_sequence_plan(cfg, script: str, plan: list[dict]) -> None:
     """Fail-closed sequence size gate (issue #81 fix round, implementation
     review finding): the compaction loop in _sequence_script can only shrink
     CODES steps, so a schema-allowed plan can still compose past the
-    32767-character CreateProcess command-line budget through terms
+    _CMDLINE_CHAR_LIMIT (32766-character) CreateProcess command-line budget
+    through terms
     compaction cannot touch — 50 unrolled step blocks (measured: 50x512-char
     text steps compose a 34028-char script, a 91125-char command line) or ONE
     codes step whose compact base64 seed alone busts the budget (measured:
