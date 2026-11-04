@@ -397,6 +397,38 @@ _HEAD_LOOKUP = (
     "| Select-Object -First 1\n"
 )
 
+# ---------------------------------------------------------------------------
+# command-line size budgets (issue #81)
+#
+# CreateProcess caps the spawned command line at 32767 characters and a folded
+# script costs ~386 fixed argv characters (the powershell.exe path, the three
+# flags and "-EncodedCommand ") plus 8/3 argv characters per script character
+# (UTF-16LE bytes, base64-encoded at 4/3) — measured with real subprocess.Popen
+# (trace 75-76-78-81-83-84-collated, 02-reproduction.md). Two growth terms rode
+# that cliff: the scancode seed (~4 script chars per code, cliff at ~2465 codes
+# for the vm1abc prelude) and the unrolled sequence-step codes array. The
+# budgets below keep every composed line WELL under the limit, not at its edge,
+# so a longer VM-name prelude cannot tip a leg over.
+# ---------------------------------------------------------------------------
+
+#: scancode codes carried by ONE folded type_scancodes process; ordinary inputs
+#: (<= this many codes) keep the exact single-process seed D-02 AC19 pins, and
+#: oversized arrays split into consecutive processes each carrying a contiguous
+#: slice as its own seed (all delivered in order, one input lock spanning them).
+_SCANCODES_PER_SCRIPT = 1600
+
+#: script-character budget for ONE composed command; a script longer than this
+#: is over-engineered against the 32767 cliff (~24k argv at this size) and, for
+#: sequence steps, triggers the compact in-script codes encoding.
+_SCRIPT_CHAR_BUDGET = 9000
+
+# Per-process identity emission (issues #82/#83): every folded script that
+# drives console input or polling reports the GUID its own resolver bound, so
+# the host can validate the by-name identity it acted on and feed the hint map.
+# $vmTarget IS the validated GUID on both addressing paths — the exact seam
+# shape _folded_capture_script established.
+_VMID_EMIT_LINE = "Write-Output ('VMID=' + $vmTarget)"
+
 # In-script replication of _scale_to_head (issue #18): the head resolution is
 # only known inside the script, so the frame->head scaling runs there. Python
 # round() and [math]::Round both round half to even, and the grouping below is
@@ -438,6 +470,7 @@ def _folded_mouse_positional_script(
         "if (-not $m) { throw 'no synthetic mouse device associated with the VM; "
         "absolute positioning is unavailable (the PS/2 fallback supports button, "
         "scroll and click-at-current-position only)' }",
+        _VMID_EMIT_LINE,
         _HEAD_LOOKUP,
         # The guard rejects a head that reports no resolution as well as a head
         # that is absent: wmiconsole.head_resolution, _scale_to_head and
@@ -522,8 +555,17 @@ def _folded_screenshot_script(prelude: str, width: int, height: int) -> str:
         "        }\n",
         "        if ($r.ReturnValue -ne 0) { throw ('GetVirtualSystemThumbnailImage failed "
         "with ReturnValue=' + $r.ReturnValue) }\n",
-        "        $used = $key\n",
         "        $payload = $r.ImageData\n",
+        # A ReturnValue-0 capture with a WRONG-LENGTH payload is corrupt, not
+        # a success: without this in-script guard the chain would commit the
+        # size (issue #81) and surface as a host-side length error instead of
+        # advancing to the next chain size. Same shape as the poll scripts'
+        # guard (the length invariant: 4-byte prefix + W*H*2 RGB565).
+        "        $pxLen = 0; if ($payload -ne $null) { $pxLen = $payload.Length }\n",
+        "        $pxWant = 4 + ($s[0] * $s[1] * 2)\n",
+        "        if ($pxLen -ne $pxWant) { throw ('thumbnail payload length mismatch: "
+        "got ' + $pxLen + ' bytes, expected ' + $pxWant) }\n",
+        "        $used = $key\n",
         "        break\n",
         "    } catch {\n",
         "        $lastError = $_.Exception.Message\n",
@@ -590,6 +632,7 @@ def _folded_wait_frame_script(
         _VM_LOOKUP,
         "$svc = Get-CimInstance -Namespace '" + _WMI_NS + "' "
         "-ClassName Msvm_VirtualSystemManagementService\n",
+        _VMID_EMIT_LINE + "\n",
         "$deadline = (Get-Date).AddSeconds(" + str(int(timeout_s)) + ")\n",
         "$polls = 0\n",
         "$baseline = '" + baseline_hash + "'\n",
@@ -651,6 +694,7 @@ def _folded_wait_stable_script(
         _VM_LOOKUP,
         "$svc = Get-CimInstance -Namespace '" + _WMI_NS + "' "
         "-ClassName Msvm_VirtualSystemManagementService\n",
+        _VMID_EMIT_LINE + "\n",
         "$deadline = (Get-Date).AddSeconds(" + str(int(timeout_s)) + ")\n",
         "$polls = 0\n",
         "$baseline = '" + baseline_hash + "'\n",
@@ -712,8 +756,11 @@ def _folded_wait_stable_script(
 # folded-protocol stdout parsing
 # ---------------------------------------------------------------------------
 
-def _meta_lines(result: pswindows.PSResult) -> tuple[dict[str, str], str]:
-    """(tagged metadata, payload line) from a folded script's stdout.
+def _meta_lines(
+    result: pswindows.PSResult,
+) -> tuple[dict[str, str], str, dict[str, list[str]]]:
+    """(tagged metadata, payload line, per-key ordered values) from a folded
+    script's stdout.
 
     The folded scripts emit KEY=value metadata lines (VMID=, HEAD=, SIZES=,
     USED=, HEADX=, HEADY=, RC=) and, where the op returns a payload, the
@@ -721,8 +768,15 @@ def _meta_lines(result: pswindows.PSResult) -> tuple[dict[str, str], str]:
     shape, so an op whose whole stdout is metadata (the mouse ops) keeps all of
     it; a response with no payload line at all is a structured error for the
     ops that need one, exactly as a malformed capture JSON is.
+
+    The dict folds REPEATED keys last-wins (the pre-existing contract every
+    single-value consumer relies on); the third element preserves every value
+    in emission order per key (issue #83), so a 3-chunk keyboard response's
+    ``RC=`` progression stays distinguishable from a loss — consumers that
+    need the ordered view read ``all_values["RC"]`` instead of ``meta["RC"]``.
     """
     meta: dict[str, str] = {}
+    all_values: dict[str, list[str]] = {}
     payload = ""
     for line in result.stdout.splitlines():
         line = line.strip()
@@ -730,10 +784,12 @@ def _meta_lines(result: pswindows.PSResult) -> tuple[dict[str, str], str]:
             continue
         key, sep, value = line.partition("=")
         if sep and re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
-            meta[key] = value.strip()
+            stripped = value.strip()
+            meta[key] = stripped
+            all_values.setdefault(key, []).append(stripped)
         else:
             payload = line
-    return meta, payload
+    return meta, payload, all_values
 
 
 def _parse_guid(meta: dict[str, str], vm_name: str) -> str:
@@ -746,6 +802,42 @@ def _parse_guid(meta: dict[str, str], vm_name: str) -> str:
         return guestexec.validate_vm_guid(guid).lower()
     except ValueError as exc:
         raise ConsoleError(f"VM '{vm_name}' resolved to an invalid Id: {exc}") from None
+
+
+def _validate_vmid_hint(result: pswindows.PSResult, vm_name: str) -> None:
+    """Conditional host-side validation of a folded script's `VMID=` line
+    (issues #82/#83): when the metadata carries the key, re-validate the
+    resolved GUID through the same shape gate a host-resolved GUID passes and
+    record the name->GUID hint; when the key is absent (an older-protocol
+    response), skip silently — the op's own success path is unaffected. A
+    present-but-garbage GUID raises ConsoleError here, BEFORE the caller can
+    mistake the response for a verified success."""
+    meta, _payload, _all_values = _meta_lines(result)
+    if "VMID" in meta:
+        guid = _parse_guid(meta, vm_name)
+        note_name_guid_hint(vm_name, guid)
+
+
+def _reject_non_int(value: object, name: str) -> None:
+    """Bool-rejecting integer guard for caller-interpolated mouse inputs
+    (issue #83): `type(v) is not int` rejects bools (True must never pass as
+    1 — the `True in (1, 2)` membership hole) and non-integers (a string
+    coordinate would otherwise ride the script as `$x = foo`). Mirrors the
+    scancode guard's shape: a ValueError naming the reason, raised BEFORE any
+    spawn."""
+    if type(value) is not int:
+        raise ValueError(
+            f"{name} must be an integer (bools rejected); got {value!r}")
+
+
+def _reject_non_int_button(button: object) -> None:
+    """The button-flavored guard (issue #83): same bool-rejecting shape, worded
+    for the five membership sites so the message names both the valid values
+    and the bool rejection."""
+    if type(button) is not int:
+        raise ValueError(
+            f"button must be 1 (left) or 2 (right), an integer (bools rejected); "
+            f"got {button!r}")
 
 
 def _parse_head(meta: dict[str, str]) -> tuple[int, int] | None:
@@ -813,7 +905,16 @@ def _check_input_rc(
 
 class _PsTiming:
     """Per-op PowerShell timing accumulator: one float per run_ps call the
-    operation made (the vmident.resolve leg included)."""
+    operation made (the vmident.resolve leg included).
+
+    spawn_ms mixes two bases BY CONTRACT (issue #83, documented in README's
+    console-transport section): the RESOLVE-leg entry is host-side wall-clock
+    around vmident.resolve — including its policy check, the remote
+    composition and the PowerShell slot wait — while every op-leg entry is the
+    child's duration_ms, measured after the slot wait (the bounded wait is its
+    own budget and must not consume the caller's script timeout). Both bases
+    are numeric milliseconds and the entries stay in call order, so the count
+    parity with the underlying run_ps calls is exact on every path."""
 
     __slots__ = ("spawn_ms",)
 
@@ -1637,7 +1738,7 @@ def _capture_raw_with_meta(
     script = _folded_capture_script(prelude, width, height)
     result = _run(cfg, script, timeout_s=90, timing=timing)
     _check_rc(result, ctx)
-    meta, payload_line = _meta_lines(result)
+    meta, payload_line, _all_values = _meta_lines(result)
     try:
         data = json.loads(payload_line)
         payload = base64.b64decode(data["imageDataB64"], validate=True)
@@ -1806,11 +1907,12 @@ def screenshot(
     script = _folded_screenshot_script(prelude, width, height)
     result = _run(cfg, script, timeout_s=90 * 4, timing=timing)
     _check_rc(result, "console screenshot")
-    meta_lines, payload_line = _meta_lines(result)
+    meta_lines, payload_line, _all_values = _meta_lines(result)
     guid = _parse_guid(meta_lines, vm_name or ref.name)
     note_name_guid_hint(vm_name or ref.name, guid)
     head = _parse_head(meta_lines)
-    used = _parse_size(meta_lines, "USED") or (width, height)
+    used_parsed = _parse_size(meta_lines, "USED")
+    used = used_parsed or (width, height)
     try:
         data = json.loads(payload_line)
         raw = base64.b64decode(data["imageDataB64"], validate=True)
@@ -1830,6 +1932,11 @@ def screenshot(
         "vm_name": ref.name,
         "vm_id": guid,
         "fallback_used": fallback_used,
+        # Issue #83: the USED= line is the only in-band report of which chain
+        # size actually produced the payload; when it is absent or malformed
+        # the dimensions below are an ASSUMPTION (the requested size), and
+        # that degradation must be a result signal, not a silent rename.
+        "used_fallback": used_parsed is None,
         "head_resolution": {"horizontal": head[0], "vertical": head[1]} if head else None,
         "scale_note": (
             "mouse tools accept frame_width/frame_height to scale image coords "
@@ -1892,6 +1999,14 @@ def _screenshot_wmi(
             "vm_name": ref.name,
             "vm_id": ref.id,
             "fallback_used": fallback_used,
+            # Issue #83 key-set parity with the PowerShell leg (PRR-004: both
+            # transports emit the same default metadata keys). There
+            # `used_fallback` flags an absent/malformed USED= line making the
+            # reported dimensions an assumption; this leg's chain loop sets
+            # actual_w/actual_h from the capture that succeeded, so the
+            # dimensions are always observed, never assumed — False is the
+            # truthful constant.
+            "used_fallback": False,
             "head_resolution": {"horizontal": head[0], "vertical": head[1]} if head else None,
             "scale_note": (
                 "mouse tools accept frame_width/frame_height to scale image coords "
@@ -1925,6 +2040,9 @@ def get_display_info(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
             info, t = be.display_info(ref.id)
         except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
             raise ConsoleError(str(exc)) from None
+        # Same normalization as the folded path: every response shape carries
+        # mouse_ps2_present, absent meaning false.
+        info.setdefault("mouse_ps2_present", False)
         return {
             "ok": True,
             **info,
@@ -1946,6 +2064,13 @@ def get_display_info(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
         _KEYBOARD_LOOKUP_SOFT,
         _MOUSE_SYNTHETIC,
         "$mouse = $m | Select-Object -First 1\n",
+        # Issue #83 (Design b, additive): the input ops fall back to the PS/2
+        # mouse for button/scroll/click-at-current-position, so a VM whose
+        # only mouse is PS/2 must not read as "nothing can act on the
+        # console". The synthetic query above keeps feeding mouse_present;
+        # this SystemName-scoped PS/2 query feeds the NEW key only — $m is
+        # reused after $mouse captured the synthetic answer.
+        _MOUSE_PS2,
         "$bootMs = $vm.OnTimeInMilliseconds\n",
         "$bootEpoch = [int]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - "
         "[int64]($bootMs / 1000))\n",
@@ -1959,11 +2084,12 @@ def get_display_info(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
         "    keyboard_enabled = if ($kb) { $kb.EnabledState } else { $null }\n",
         "    mouse_present = [bool]$mouse\n",
         "    mouse_enabled = if ($mouse) { $mouse.EnabledState } else { $null }\n",
+        "    mouse_ps2_present = [bool]$m\n",
         "} | ConvertTo-Json -Compress\n",
     ])
     result = _run(cfg, script, timeout_s=60, timing=timing)
     _check_rc(result, "console display info")
-    meta_lines, payload_line = _meta_lines(result)
+    meta_lines, payload_line, _all_values = _meta_lines(result)
     guid = _parse_guid(meta_lines, vm_name or ref.name)
     note_name_guid_hint(vm_name or ref.name, guid)
     try:
@@ -1971,6 +2097,11 @@ def get_display_info(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
     except json.JSONDecodeError as exc:
         raise ConsoleError(f"display info parse failed: {exc}") from None
     data["vm_id"] = guid
+    # Host-side normalization: every response shape carries the field (a
+    # folded response from an older script, or the WMI-shape stubs tests use,
+    # has no mouse_ps2_present key — absence means "no PS/2 mouse reported",
+    # never "unknown").
+    data["mouse_ps2_present"] = bool(data.get("mouse_ps2_present", False))
     # The host-side boot boundary (issue #28): optional in the parse — folded
     # responses without the EPOCH= line keep the legacy result shape.
     if meta_lines.get("EPOCH"):
@@ -2028,16 +2159,22 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
     # Remote mode: the composer's preamble read the lines and forwarded them as
     # scriptblock parameters ($__p0.., collected into $payloads) because a remote
     # block cannot read local stdin; local mode keeps the inline read.
-    if pswindows.hyperv_host(cfg):
+    # Issue #81: each remote payload line costs ~165 argv characters of composed
+    # command line (the $__pN read, the param() entry, the -ArgumentList entry
+    # and the $payloads entry) and CreateProcess caps the line at 32767 — 163
+    # chunks already overflow. Oversized text therefore composes MULTIPLE
+    # sequential commands, each carrying a contiguous chunk range (all delivered
+    # in order under one input lock); the reported chunk count stays the TOTAL.
+    remote = pswindows.hyperv_host(cfg) is not None
+    if remote:
+        groups = [
+            chunks[i:i + pswindows.REMOTE_PAYLOAD_LINES_CAP]
+            for i in range(0, len(chunks), pswindows.REMOTE_PAYLOAD_LINES_CAP)
+        ]
         read_expr = "$payloads[$i]"
-        payload_init = (
-            "$payloads = @("
-            + ", ".join(f"$__p{i}" for i in range(len(chunks)))
-            + ")\n"
-        )
     else:
+        groups = [chunks]
         read_expr = "[Console]::In.ReadLine()"
-        payload_init = ""
     call = (
         "$text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("
         + read_expr + "))\n"
@@ -2048,26 +2185,38 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
         "    Write-Output ('RC=' + $r.ReturnValue + ' CHUNK=' + ($i+1) + '/' + $n)\n"
         "    if ($i -lt $n - 1) { Start-Sleep -Milliseconds 50 }\n"
     )
-    script = "\n".join([
-        prelude,
-        _VM_LOOKUP,
-        _KEYBOARD_LOOKUP,
-        payload_init,
-        "$n = " + str(len(chunks)),
-        "for ($i = 0; $i -lt $n; $i++) {",
-        call,
-        "}",
-    ])
     with _input_lock(ref):
-        result = _run(
-            cfg,
-            script,
-            timeout_s=90,
-            stdin_b64="\n".join(pswindows.utf8_b64(chunk) for chunk in chunks),
-            payload_lines=len(chunks),
-            timing=timing,
-        )
-    _check_input_rc(result, "console type_text", vm_name)
+        for gi, group in enumerate(groups):
+            if gi:
+                # pacing between composed commands mirrors the in-script
+                # inter-chunk sleep (let the Hyper-V input buffer drain)
+                time.sleep(0.05)
+            payload_init = (
+                "$payloads = @("
+                + ", ".join(f"$__p{i}" for i in range(len(group)))
+                + ")\n"
+            ) if remote else ""
+            script = "\n".join([
+                prelude,
+                _VM_LOOKUP,
+                _KEYBOARD_LOOKUP,
+                _VMID_EMIT_LINE,
+                payload_init,
+                "$n = " + str(len(group)),
+                "for ($i = 0; $i -lt $n; $i++) {",
+                call,
+                "}",
+            ])
+            result = _run(
+                cfg,
+                script,
+                timeout_s=90,
+                stdin_b64="\n".join(pswindows.utf8_b64(chunk) for chunk in group),
+                payload_lines=len(group),
+                timing=timing,
+            )
+            _check_input_rc(result, "console type_text", vm_name)
+            _validate_vmid_hint(result, vm_name or ref.name)
     return {
         "ok": True, "chunks": len(chunks), "chars": len(text), "vm_name": ref.name,
         "timings": _ps_timings(timing),
@@ -2170,11 +2319,42 @@ def _send_scancodes_locked(
             "vm_name": ref.name, "timings": _wmi_timings(connect_ms, *phase_dicts),
         }
     assert prelude is not None, "the PowerShell path requires the $vmTarget prelude"
-    # Scancodes ride IN the script as ONE flat code array and the loop slices
-    # its 64-code window per chunk (a nested array-of-arrays is not safe here:
-    # PS 5.1 flattens @(@(a,b)) for a single chunk, which would send one byte).
-    # Unlike typed text they carry no stdin read, which keeps the pinned
-    # ReadLine census at exactly one emission inside type_text.
+    with _input_lock(ref):
+        # Issue #81: the seed line grows ~4 script chars per code (~10.7 argv
+        # chars after base64), so one folded process cannot carry an unbounded
+        # array — the composed command line hits the 32767-character
+        # CreateProcess limit near ~2465 codes. Ordinary inputs (<=
+        # _SCANCODES_PER_SCRIPT codes) stay the EXACT single folded script the
+        # D-02 chunk-expression pins; oversized arrays split into consecutive
+        # processes, each carrying a contiguous slice as its own seed, delivered
+        # in order under this one input lock. `chunks` below stays the TOTAL
+        # 64-window count and scancodes_sent the total delivered.
+        sent = 0
+        for si, sl in enumerate(
+            codes[i:i + _SCANCODES_PER_SCRIPT]
+            for i in range(0, len(codes), _SCANCODES_PER_SCRIPT)
+        ):
+            if si:
+                time.sleep(0.02)  # pacing: let the Hyper-V input buffer drain
+            result = _run(cfg, _scancodes_script(prelude, sl), timeout_s=90, timing=timing)
+            _check_input_rc(result, "console scancodes", ref.name)
+            _validate_vmid_hint(result, ref.name)
+            sent += len(sl)
+    out = {"ok": True, "scancodes_sent": sent, "chunks": len(chunks), "vm_name": ref.name}
+    if timing is not None:
+        out["timings"] = _ps_timings(timing)
+    return out
+
+
+def _scancodes_script(prelude: str, codes: list[int]) -> str:
+    """One folded type_scancodes process over a slice of the code array.
+    Scancodes ride IN the script as ONE flat code array and the loop slices
+    its 64-code window per chunk (a nested array-of-arrays is not safe here:
+    PS 5.1 flattens @(@(a,b)) for a single chunk, which would send one byte).
+    Unlike typed text they carry no stdin read, which keeps the pinned
+    ReadLine census at exactly one emission inside type_text. `$n` is the
+    64-window count for THIS script's slice."""
+    chunks = [codes[i:i + 64] for i in range(0, len(codes), 64)]
     call = "\n".join([
         "$lo = $i * 64",
         "    $hi = [math]::Min($lo + 63, $chunks.Count - 1)",
@@ -2185,24 +2365,17 @@ def _send_scancodes_locked(
         "    Write-Output ('RC=' + $r.ReturnValue + ' CHUNK=' + ($i+1) + '/' + $n)",
         "    if ($i -lt $n - 1) { Start-Sleep -Milliseconds 20 }",
     ]) + "\n"
-    script = "\n".join([
+    return "\n".join([
         prelude,
         _VM_LOOKUP,
         _KEYBOARD_LOOKUP,
+        _VMID_EMIT_LINE,
         "$chunks = @(" + ",".join(str(c) for c in codes) + ")",
         "$n = " + str(len(chunks)),
         "for ($i = 0; $i -lt $n; $i++) {",
         call,
         "}",
     ])
-    with _input_lock(ref):
-        result = _run(cfg, script, timeout_s=90, timing=timing)
-    _check_input_rc(result, "console scancodes", ref.name)
-    sent = sum(len(chunk) for chunk in chunks)
-    out = {"ok": True, "scancodes_sent": sent, "chunks": len(chunks), "vm_name": ref.name}
-    if timing is not None:
-        out["timings"] = _ps_timings(timing)
-    return out
 
 
 def mouse_move(
@@ -2214,6 +2387,13 @@ def mouse_move(
     # policy/spawn so the invalid call costs nothing.
     if x is None or y is None:
         raise ValueError("x and y are required")
+    # Issue #83: bool-rejecting type guards ahead of the positivity check (a
+    # string dim would die there with a TypeError; a bool dim would PASS it —
+    # True <= 0 is False — and interpolate into the script).
+    _reject_non_int(x, "x")
+    _reject_non_int(y, "y")
+    _reject_non_int(frame_width, "frame_width")
+    _reject_non_int(frame_height, "frame_height")
     if (frame_width or frame_height) and (frame_width <= 0 or frame_height <= 0):
         raise ValueError("frame_width/frame_height must be positive when given")
     policy.require_category(cfg, "console_input", f"move mouse on '{vm_name}' console")
@@ -2239,7 +2419,10 @@ def mouse_move(
     with _input_lock(ref):
         result = _run(cfg, script, timeout_s=90, timing=timing)
     _check_input_rc(result, "console mouse move", vm_name)
-    meta_lines, _payload = _meta_lines(result)
+    meta_lines, _payload, _all_values = _meta_lines(result)
+    if "VMID" in meta_lines:
+        guid = _parse_guid(meta_lines, vm_name or ref.name)
+        note_name_guid_hint(vm_name or ref.name, guid)
     hx = _require_int(meta_lines, "HEADX", "mouse move")
     hy = _require_int(meta_lines, "HEADY", "mouse move")
     return {
@@ -2253,11 +2436,21 @@ def click(
     cfg: Config, vm_name: str = "", x: int | None = None, y: int | None = None,
     frame_width: int = 0, frame_height: int = 0, button: int = 1, vm_id: str = "",
 ) -> dict:
+    # Issue #83 guards before anything spawns: a bool button passes the
+    # membership check (True in (1, 2)) and interpolates as ButtonIndex =
+    # True; string coords/dims interpolate or die at the positivity check
+    # with the wrong exception type.
+    _reject_non_int_button(button)
+    if (x is None) != (y is None):
+        raise ValueError("x and y must be given together")
+    if x is not None and y is not None:
+        _reject_non_int(x, "x")
+        _reject_non_int(y, "y")
+    _reject_non_int(frame_width, "frame_width")
+    _reject_non_int(frame_height, "frame_height")
     policy.require_category(cfg, "console_input", f"click on '{vm_name}' console")
     if button not in (1, 2):
         raise ValueError("button must be 1 (left) or 2 (right)")
-    if (x is None) != (y is None):
-        raise ValueError("x and y must be given together")
     if (frame_width or frame_height) and (frame_width <= 0 or frame_height <= 0):
         raise ValueError("frame_width/frame_height must be positive when given")
     be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
@@ -2288,7 +2481,10 @@ def click(
         with _input_lock(ref):
             result = _run(cfg, script, timeout_s=90, timing=timing)
         _check_input_rc(result, "console mouse click", vm_name)
-        meta_lines, _payload = _meta_lines(result)
+        meta_lines, _payload, _all_values = _meta_lines(result)
+        if "VMID" in meta_lines:
+            guid = _parse_guid(meta_lines, vm_name or ref.name)
+            note_name_guid_hint(vm_name or ref.name, guid)
         hx = _require_int(meta_lines, "HEADX", "click")
         hy = _require_int(meta_lines, "HEADY", "click")
         return {
@@ -2311,6 +2507,7 @@ def mouse_button(
     cfg: Config, vm_name: str = "", button: int = 1, is_down: bool = False, vm_id: str = "",
 ) -> dict:
     policy.require_category(cfg, "console_input", f"button {'down' if is_down else 'up'} on '{vm_name}' console")
+    _reject_non_int_button(button)
     if button not in (1, 2):
         raise ValueError("button must be 1 (left) or 2 (right)")
     be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
@@ -2384,11 +2581,13 @@ def _mouse_op(
         _MOUSE_PS2,
         "    if (-not $m) { throw 'no mouse device associated with the VM' }\n",
         "}\n",
+        _VMID_EMIT_LINE,
         call,
     ])
     with _input_lock(ref):
         result = _run(cfg, script, timeout_s=90, timing=timing)
     _check_input_rc(result, f"console mouse {detail}", ref.name)
+    _validate_vmid_hint(result, ref.name)
     out = {"ok": True, "operation": detail, "vm_name": ref.name}
     if extra:
         out.update(extra)
@@ -2432,6 +2631,7 @@ def wait_frame_change(
     result = _run(cfg, script, timeout_s=int(timeout_s) + 15, timing=timing)
     elapsed_ms = int((time.monotonic() - started) * 1000)
     _check_rc(result, "console wait_frame_change")
+    _validate_vmid_hint(result, vm_name or ref.name)
 
     stop_reason, polls, last_hash, frame_b64 = "deadline", 0, "", ""
     for line in result.stdout.splitlines():
@@ -2573,6 +2773,7 @@ def wait_frame_stable(
     result = _run(cfg, script, timeout_s=int(timeout_s) + 15, timing=timing)
     elapsed_ms = int((time.monotonic() - started) * 1000)
     _check_rc(result, "console wait_frame_stable")
+    _validate_vmid_hint(result, vm_name or ref.name)
 
     stop_reason, polls, last_hash, stable_ms_reported, frame_b64 = "deadline", 0, "", None, ""
     for line in result.stdout.splitlines():
@@ -2902,6 +3103,13 @@ def _validate_sequence_steps(
                 x, y = step.get("x"), step.get("y")
                 if x is None or y is None:
                     raise ValueError("x and y are required")
+                # Issue #83: type guards BEFORE the int() coercions below (a
+                # string or bool coordinate must be a step-indexed ValueError,
+                # never an interpolated script literal or a coerced 1/0).
+                _reject_non_int(x, "x")
+                _reject_non_int(y, "y")
+                _reject_non_int(step.get("frame_width", 0), "frame_width")
+                _reject_non_int(step.get("frame_height", 0), "frame_height")
                 fw = int(step.get("frame_width") or 0)
                 fh = int(step.get("frame_height") or 0)
                 if (fw or fh) and (fw <= 0 or fh <= 0):
@@ -2913,14 +3121,20 @@ def _validate_sequence_steps(
                 if x is None or y is None:
                     if x is not None or y is not None:
                         raise ValueError("x and y must be given together")
+                    _reject_non_int_button(step.get("button", 1))
                     button = step.get("button", 1)
                     if button not in (1, 2):
                         raise ValueError("button must be 1 (left) or 2 (right)")
                     plan.append({"action": "mouse_click_here", "button": button})
                 else:
+                    _reject_non_int_button(step.get("button", 1))
                     button = step.get("button", 1)
                     if button not in (1, 2):
                         raise ValueError("button must be 1 (left) or 2 (right)")
+                    _reject_non_int(x, "x")
+                    _reject_non_int(y, "y")
+                    _reject_non_int(step.get("frame_width", 0), "frame_width")
+                    _reject_non_int(step.get("frame_height", 0), "frame_height")
                     fw = int(step.get("frame_width") or 0)
                     fh = int(step.get("frame_height") or 0)
                     if (fw or fh) and (fw <= 0 or fh <= 0):
@@ -2929,6 +3143,7 @@ def _validate_sequence_steps(
                     plan.append({"action": "mouse_positional", "x": int(x), "y": int(y),
                                  "fw": fw, "fh": fh, "click": True, "button": button})
             elif action == "mouse_button":
+                _reject_non_int_button(step.get("button", 1))
                 button = step.get("button", 1)
                 if button not in (1, 2):
                     raise ValueError("button must be 1 (left) or 2 (right)")
@@ -2980,19 +3195,40 @@ def _validate_sequence_steps(
 
 def _sequence_step_block(
     index: int, step: dict, read_expr: str, seq_width: int, seq_height: int,
+    compact_codes: bool = False,
 ) -> list[str]:
     """One unrolled step block: guarded by $seqFailed (stop-on-failure; later
     steps report SKIPPED, never silently dropped), body in try/catch, result
-    on one STEP= stdout line (ERR rides base64 so CLIXML cannot mangle it)."""
+    on one STEP= stdout line (ERR rides base64 so CLIXML cannot mangle it).
+
+    compact_codes (issue #81): a codes step whose literal array would push the
+    ONE composed sequence command over the argv budget encodes the same bytes
+    as a base64 seed decoded in-script — every other semantic of the step
+    (guarding, try/catch, STEP= reporting, delivery order and content) is
+    identical, and the delivered bytes are exactly the literal's."""
     body: list[str]
     if step["action"] == "codes":
-        body = [
-            "        $r = Invoke-CimMethod -InputObject $kb -MethodName TypeScancodes "
-            "-ErrorAction Stop -Arguments @{ ScanCodes = [byte[]]@("
-            + ",".join(str(c) for c in step["codes"]) + ") }",
-            "        if ($r.ReturnValue -ne 0) { throw ('TypeScancodes failed with "
-            "ReturnValue=' + $r.ReturnValue) }",
-        ]
+        if compact_codes:
+            # Codes are validated 0..255, so the array IS a byte string: the
+            # base64 seed is ~1.34 chars per code against the literal's ~4,
+            # which is what pulls an oversized step back under the budget.
+            seed_b64 = base64.b64encode(bytes(step["codes"])).decode("ascii")
+            body = [
+                "        $__scB64 = '" + seed_b64 + "'",
+                "        $__sc = [byte[]][Convert]::FromBase64String($__scB64)",
+                "        $r = Invoke-CimMethod -InputObject $kb -MethodName TypeScancodes "
+                "-ErrorAction Stop -Arguments @{ ScanCodes = $__sc }",
+                "        if ($r.ReturnValue -ne 0) { throw ('TypeScancodes failed with "
+                "ReturnValue=' + $r.ReturnValue) }",
+            ]
+        else:
+            body = [
+                "        $r = Invoke-CimMethod -InputObject $kb -MethodName TypeScancodes "
+                "-ErrorAction Stop -Arguments @{ ScanCodes = [byte[]]@("
+                + ",".join(str(c) for c in step["codes"]) + ") }",
+                "        if ($r.ReturnValue -ne 0) { throw ('TypeScancodes failed with "
+                "ReturnValue=' + $r.ReturnValue) }",
+            ]
     elif step["action"] == "text":
         body = [
             "        $text = [System.Text.Encoding]::UTF8.GetString("
@@ -3130,87 +3366,107 @@ def _sequence_script(
 ) -> str:
     """The one folded sequence process (frozen protocol): prelude(+identity
     guard) -> lookups -> boot epoch -> VMID=/EPOCH= emission -> preconditions
-    (exit before any input on mismatch) -> the unrolled step blocks."""
-    uses_kb = any(s["action"] in ("codes", "text") for s in plan)
-    uses_mouse = any(s["action"].startswith("mouse") or s["action"] == "button"
-                     or s["action"] == "scroll" for s in plan)
-    uses_positional = any(s["action"] == "mouse_positional" for s in plan)
-    uses_frames = bool(expect_frame_hash) or any(
-        s["action"] == "wait_stable" for s in plan)
-    text_steps = [s for s in plan if s["action"] == "text"]
-    parts = [prelude, _VM_LOOKUP]
-    if uses_kb:
-        parts.append(_KEYBOARD_LOOKUP)
-    if uses_mouse:
-        parts += [
-            _MOUSE_SYNTHETIC,
-            "if (-not $m) {",
-            _MOUSE_PS2,
-            "    if (-not $m) { throw 'no mouse device associated with the VM' }",
-            "}",
-        ]
-    if uses_positional:
-        parts.append(_HEAD_LOOKUP)
-    if uses_frames:
-        parts.append(
-            "$svc = Get-CimInstance -Namespace '" + _WMI_NS + "' "
-            "-ClassName Msvm_VirtualSystemManagementService")
-    # Boot epoch (issue #28): host WMI, credential-free — OnTimeInMilliseconds
-    # relative to the host clock, so it is meaningful in firmware/WinPE.
-    parts += [
-        "$bootMs = $vm.OnTimeInMilliseconds",
-        "$bootEpoch = [int]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - "
-        "[int64]($bootMs / 1000))",
-        "Write-Output ('VMID=' + $vmTarget)",
-        "Write-Output ('EPOCH=' + $bootEpoch)",
-    ]
-    if expect_frame_hash:
-        parts += [
-            "        $r = Invoke-CimMethod -InputObject $svc -MethodName "
-            "GetVirtualSystemThumbnailImage -ErrorAction Stop -Arguments @{",
-            "            TargetSystem = $vm",
-            "            WidthPixels  = " + str(width),
-            "            HeightPixels = " + str(height),
-            "        }",
-            "        if ($r.ReturnValue -ne 0) { throw ('GetVirtualSystemThumbnailImage "
-            "failed with ReturnValue=' + $r.ReturnValue) }",
-            "        $pxLen = 0; if ($r.ImageData -ne $null) { $pxLen = $r.ImageData.Length }",
-            "        $pxWant = 4 + (" + str(width) + " * " + str(height) + " * 2)",
-            "        if ($pxLen -ne $pxWant) { throw ('thumbnail payload length mismatch: "
-            "got ' + $pxLen + ' bytes, expected ' + $pxWant) }",
-            "        $sha0 = New-Object Security.Cryptography.SHA256Managed",
-            "        $hash0 = ([System.BitConverter]::ToString("
-            "$sha0.ComputeHash($r.ImageData, 4, $r.ImageData.Length - 4)) "
-            "-replace '-','').ToLowerInvariant()",
-            "        if ($hash0 -ne " + pswindows.ps_quote(expect_frame_hash) + ") {",
-            "            [Console]::Error.WriteLine('console sequence precondition "
-            "mismatch: frame_hash expected " + expect_frame_hash + " actual ' + $hash0)",
-            "            exit 1",
-            "        }",
-        ]
-    if expect_boot_epoch is not None:
-        parts += [
-            "        if ([math]::Abs($bootEpoch - " + str(int(expect_boot_epoch)) + ") -gt 5) {",
-            "            [Console]::Error.WriteLine('console sequence precondition "
-            "mismatch: boot_epoch expected " + str(int(expect_boot_epoch)) +
-            " actual ' + $bootEpoch)",
-            "            exit 1",
-            "        }",
-        ]
-    # Text rides stdin, one base64 line per text step (the type_text rule).
-    read_expr = "$payloads[$ti]" if remote else "[Console]::In.ReadLine()"
-    if text_steps:
-        if remote:
+    (exit before any input on mismatch) -> the unrolled step blocks.
+
+    Issue #81: the whole plan rides ONE command line, so a codes step's
+    literal array (~4 script chars per code) can push the composed script past
+    the CreateProcess budget. Oversized plans compact their largest literal
+    arrays into the in-script base64 seed (see _sequence_step_block) until the
+    script fits _SCRIPT_CHAR_BUDGET — the one-process/one-deadline/
+    stop-on-failure contract and the delivered bytes are unchanged, and
+    ordinary steps keep the literal array."""
+
+    def build(compact: set[int]) -> str:
+        uses_kb = any(s["action"] in ("codes", "text") for s in plan)
+        uses_mouse = any(s["action"].startswith("mouse") or s["action"] == "button"
+                         or s["action"] == "scroll" for s in plan)
+        uses_positional = any(s["action"] == "mouse_positional" for s in plan)
+        uses_frames = bool(expect_frame_hash) or any(
+            s["action"] == "wait_stable" for s in plan)
+        text_steps = [s for s in plan if s["action"] == "text"]
+        parts = [prelude, _VM_LOOKUP]
+        if uses_kb:
+            parts.append(_KEYBOARD_LOOKUP)
+        if uses_mouse:
+            parts += [
+                _MOUSE_SYNTHETIC,
+                "if (-not $m) {",
+                _MOUSE_PS2,
+                "    if (-not $m) { throw 'no mouse device associated with the VM' }",
+                "}",
+            ]
+        if uses_positional:
+            parts.append(_HEAD_LOOKUP)
+        if uses_frames:
             parts.append(
-                "$payloads = @("
-                + ", ".join(f"$__p{i}" for i in range(len(text_steps))) + ")")
-        parts.append("$ti = 0")
-    parts.append("$seqFailed = $false")
-    for i, step in enumerate(plan):
-        parts += _sequence_step_block(i, step, read_expr, width, height)
-        if step["action"] == "text":
-            parts.append("    $ti++")
-    return "\n".join(parts)
+                "$svc = Get-CimInstance -Namespace '" + _WMI_NS + "' "
+                "-ClassName Msvm_VirtualSystemManagementService")
+        # Boot epoch (issue #28): host WMI, credential-free — OnTimeInMilliseconds
+        # relative to the host clock, so it is meaningful in firmware/WinPE.
+        parts += [
+            "$bootMs = $vm.OnTimeInMilliseconds",
+            "$bootEpoch = [int]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - "
+            "[int64]($bootMs / 1000))",
+            "Write-Output ('VMID=' + $vmTarget)",
+            "Write-Output ('EPOCH=' + $bootEpoch)",
+        ]
+        if expect_frame_hash:
+            parts += [
+                "        $r = Invoke-CimMethod -InputObject $svc -MethodName "
+                "GetVirtualSystemThumbnailImage -ErrorAction Stop -Arguments @{",
+                "            TargetSystem = $vm",
+                "            WidthPixels  = " + str(width),
+                "            HeightPixels = " + str(height),
+                "        }",
+                "        if ($r.ReturnValue -ne 0) { throw ('GetVirtualSystemThumbnailImage "
+                "failed with ReturnValue=' + $r.ReturnValue) }",
+                "        $pxLen = 0; if ($r.ImageData -ne $null) { $pxLen = $r.ImageData.Length }",
+                "        $pxWant = 4 + (" + str(width) + " * " + str(height) + " * 2)",
+                "        if ($pxLen -ne $pxWant) { throw ('thumbnail payload length mismatch: "
+                "got ' + $pxLen + ' bytes, expected ' + $pxWant) }",
+                "        $sha0 = New-Object Security.Cryptography.SHA256Managed",
+                "        $hash0 = ([System.BitConverter]::ToString("
+                "$sha0.ComputeHash($r.ImageData, 4, $r.ImageData.Length - 4)) "
+                "-replace '-','').ToLowerInvariant()",
+                "        if ($hash0 -ne " + pswindows.ps_quote(expect_frame_hash) + ") {",
+                "            [Console]::Error.WriteLine('console sequence precondition "
+                "mismatch: frame_hash expected " + expect_frame_hash + " actual ' + $hash0)",
+                "            exit 1",
+                "        }",
+            ]
+        if expect_boot_epoch is not None:
+            parts += [
+                "        if ([math]::Abs($bootEpoch - " + str(int(expect_boot_epoch)) + ") -gt 5) {",
+                "            [Console]::Error.WriteLine('console sequence precondition "
+                "mismatch: boot_epoch expected " + str(int(expect_boot_epoch)) +
+                " actual ' + $bootEpoch)",
+                "            exit 1",
+                "        }",
+            ]
+        # Text rides stdin, one base64 line per text step (the type_text rule).
+        read_expr = "$payloads[$ti]" if remote else "[Console]::In.ReadLine()"
+        if text_steps:
+            if remote:
+                parts.append(
+                    "$payloads = @("
+                    + ", ".join(f"$__p{i}" for i in range(len(text_steps))) + ")")
+            parts.append("$ti = 0")
+        parts.append("$seqFailed = $false")
+        for i, step in enumerate(plan):
+            parts += _sequence_step_block(
+                i, step, read_expr, width, height, compact_codes=i in compact)
+            if step["action"] == "text":
+                parts.append("    $ti++")
+        return "\n".join(parts)
+
+    codes_steps = [i for i, s in enumerate(plan) if s["action"] == "codes"]
+    compact: set[int] = set()
+    script = build(compact)
+    while len(script) > _SCRIPT_CHAR_BUDGET and len(compact) < len(codes_steps):
+        remaining = [i for i in codes_steps if i not in compact]
+        compact.add(max(remaining, key=lambda i: len(plan[i]["codes"])))
+        script = build(compact)
+    return script
 
 
 def _parse_sequence_steps(stdout: str) -> list[dict]:
@@ -3505,7 +3761,7 @@ def run_sequence(
                 env["boot_epoch"] = with_suppress
             return env
         _check_input_rc(result, "console sequence", vm_name)
-    meta, _payload = _meta_lines(result)
+    meta, _payload, _all_values = _meta_lines(result)
     if "VMID" in meta:
         guid = _parse_guid(meta, vm_name or ref.name)
         note_name_guid_hint(vm_name or ref.name, guid)

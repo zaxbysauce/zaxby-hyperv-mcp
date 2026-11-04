@@ -129,7 +129,14 @@ READLINE_BUDGETS = {
     # issue #28: the sequence script chooses the local-mode read expression
     # (one [Console]::In.ReadLine() per text step, read via the read_expr
     # parameter inside _sequence_step_block — the literal lives here only).
-    ("console.py", "_sequence_script"): 1,
+    # issue #81: the CreateProcess-budget compaction loop wrapped the
+    # _sequence_script body in its nested build(compact) closure (the body is
+    # rebuilt once per compaction iteration until the script fits
+    # _SCRIPT_CHAR_BUDGET), so the census now attributes the read_expr literal
+    # to build — still ONE emission: the same local-mode read expression,
+    # threaded into every text step via the read_expr parameter, with no step
+    # block emitting a ReadLine of its own.
+    ("console.py", "build"): 1,
     # issue #21: the pooled worker's OWN stdin channel. The first read takes the
     # credential line the pool writes before any request; the second reads one
     # request frame per call. Neither is a remote-hop preamble, which is what
