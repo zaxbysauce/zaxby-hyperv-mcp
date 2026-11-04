@@ -20,7 +20,20 @@ evidence capture — run concurrently with each other; write-scope legs
 (VM power, checkpoints, media, firmware, repair apply) exclude
 everything; a waiting writer is preferred over newly arriving readers so
 polling readers can never starve `stop_vm`/`checkpoint_restore` out
-indefinitely. A conflicting acquire
+indefinitely.
+
+Queued-writer holder semantics: every queued writer carries its OWN holder
+record, stamped at its queue entry, so its `since`/`held_ms` measure
+queue time — how long that request has waited, not how long anything has
+been held. The reported record is the CURRENT queue head's, and it refreshes to
+the next writer as each queued writer reaches the front (its entry is
+dropped at admission, on timeout, and on cancellation), so a timed-out
+reader names a currently queued writer, never a departed one; the record
+pool is cleared when no writer is queued. When a busy failure reports that
+pending writer, `held_ms` is recomputed live at raise time (like every
+reported holder), and the honest no-holder case — contention drained
+between the waiter's wakeup and its expiry — carries no `holder` key
+at all rather than a fabricated record. A conflicting acquire
 waits up to a bounded window (`wait_s`, defaulting to
 `Config.vm_lock_wait_s`, 0 = fail fast) and then raises `VMBusy` carrying
 holder metadata (tool, mode, since, held_ms) so an agent can tell a 2 s
@@ -200,10 +213,15 @@ class _RWLock:
         self._readers: dict[int, dict] = {}  # tid -> holder dict
         self._writer: tuple[int, dict] | None = None  # (tid, holder dict)
         self._waiting_writers = 0
-        # Oldest queued writer's record, so a reader that times out while
-        # ONLY a queued writer blocks it can name that writer instead of
-        # fabricating a record about itself (feedback PRR-008).
-        self._pending_writer: dict | None = None
+        # (tid, record) FIFO of CURRENTLY queued writers; [0] is the holder
+        # record reported to a timed-out reader (feedback PRR-008), so a
+        # reader blocked only by queued writers names a real writer instead
+        # of fabricating a record about itself. Each entry is stamped at ITS
+        # OWN queue entry, so its since/held_ms measure queue time (time
+        # waited), never held time; the head is promoted as each queued
+        # writer reaches the front and its entry is dropped at admission,
+        # so a timed-out reader never names a departed writer.
+        self._pending_writer_records: list[tuple[int, dict]] = []
 
     def _current_holder(self) -> dict | None:
         """The holder record to report on failure: the writer, else the
@@ -213,8 +231,8 @@ class _RWLock:
             return _live_holder(self._writer[1])
         if self._readers:
             return _live_holder(min(self._readers.values(), key=lambda h: h["since"]))
-        if self._pending_writer is not None:
-            return _live_holder(self._pending_writer)
+        if self._pending_writer_records:
+            return _live_holder(self._pending_writer_records[0][1])
         return None
 
     def acquire(self, key: object, mode: str, wait_s: float | None, tid: int) -> int:
@@ -260,8 +278,12 @@ class _RWLock:
                 return 0
             if mode == "write":
                 self._waiting_writers += 1
-                if self._pending_writer is None:
-                    self._pending_writer = _holder_dict(mode, time.time())
+                # Stamped at THIS waiter's QUEUE ENTRY: its since/held_ms
+                # measure QUEUE TIME (how long this waiter has waited),
+                # never held time — nothing is held yet.
+                self._pending_writer_records.append(
+                    (tid, _holder_dict(mode, time.time()))
+                )
                 try:
                     while self._writer is not None or self._readers:
                         if not self._wait_tick(deadline):
@@ -274,8 +296,17 @@ class _RWLock:
                     self._writer = (tid, _holder_dict(mode, time.time()))
                 finally:
                     self._waiting_writers -= 1
+                    # THIS waiter is leaving the queue (admitted, timed out,
+                    # or cancelled): its own entry must go in every case, so
+                    # the reported head is always a currently queued writer.
+                    self._pending_writer_records = [
+                        entry for entry in self._pending_writer_records
+                        if entry[0] != tid
+                    ]
                     if self._waiting_writers == 0:
-                        self._pending_writer = None
+                        # Last queued writer left: no pending record may
+                        # survive the empty queue.
+                        self._pending_writer_records = []
                     # A timeout (or error) here must wake readers queued
                     # behind this writer; on success the new writer blocks
                     # them anyway, so an extra notify is harmless.
