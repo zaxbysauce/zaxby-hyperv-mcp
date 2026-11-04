@@ -468,31 +468,28 @@ class ConsoleWMI:
     def _mouse_path(
         self, guid: str, entry: _VMCache, absent_ok: bool = False
     ) -> str | None:
-        """Cached synthetic-mouse path via enumerate + owner-association
-        (the namespace serves several mice per host; reverse ASSOCIATORS
-        from the CS is not the production discovery shape). Absence
-        (no mouse owns this VM) returns None with absent_ok / raises
-        WMIError otherwise; a TRANSPORT failure inside the walk raises
-        WMIError either way — callers can distinguish the two."""
+        """Cached synthetic-mouse path via ONE SystemName-scoped query —
+        the same key-filter discovery console.py's _MOUSE_SYNTHETIC uses
+        (FND-16 scoping parity; the namespace serves several mice per
+        host, so the WQL filter itself binds the row to THIS VM — no
+        client-side SystemName re-filter, which objects that do not
+        expose the attribute would defeat). Absence (zero rows) returns
+        None with absent_ok / raises WMIError otherwise; a TRANSPORT
+        failure (WMIError/OSError from ExecQuery) propagates — never
+        laundered to absent."""
         if entry.mouse_path is not None:
             return entry.mouse_path
-        for mouse in _rows(_com("ExecQuery mice", lambda: self._service.ExecQuery(
-                "SELECT * FROM Msvm_SyntheticMouse"))):
-            try:
-                owners = _rows(_com("ExecQuery mouse owner", lambda m=mouse: self._service.ExecQuery(
-                    "ASSOCIATORS OF {" + _path_of(m)
-                    + "} WHERE ResultClass = Msvm_ComputerSystem"
-                )))
-            except WMIError:
-                continue  # one unqueryable mouse must not fail the walk
-            for owner in owners:
-                if str(getattr(owner, "Name", "")).lower() == guid.lower():
-                    with self._lock:
-                        entry.mouse_path = _path_of(mouse)
-                    return entry.mouse_path
-        if absent_ok:
-            return None
-        raise WMIError("no synthetic mouse device associated with the VM")
+        rows = _rows(_com("ExecQuery mouse", lambda: self._service.ExecQuery(
+            "SELECT * FROM Msvm_SyntheticMouse WHERE SystemName = "
+            + _wql_quote(guid.lower())
+        )))
+        if not rows:
+            if absent_ok:
+                return None
+            raise WMIError("no synthetic mouse device associated with the VM")
+        with self._lock:
+            entry.mouse_path = _path_of(rows[0])
+        return entry.mouse_path
 
     def _head_object(self, guid: str, entry: _VMCache) -> Any | None:
         """Head object via cached path (re-read per call so resolution
@@ -705,11 +702,10 @@ class ConsoleWMI:
                 "ASSOCIATORS OF {" + entry.cs_path + "} WHERE ResultClass = Msvm_Keyboard"
             )))
             kb_obj = kb_rows[0] if kb_rows else None
-            # The CS->mouse reverse association is unreliable on the live
-            # namespace; the working discovery is enumerate + owner match
-            # (the same walk every mouse op uses). Absent -> present False;
-            # a FAILED probe (bind/transport) raises — never laundered to
-            # absent (PRR-013).
+            # Mouse discovery is the SystemName-scoped query every mouse op
+            # uses (see _mouse_path; FND-16 scoping parity with console.py).
+            # Absent (zero rows) -> present False; a FAILED probe
+            # (bind/transport) raises — never laundered to absent (PRR-013).
             mouse_path = self._mouse_path(guid, entry, absent_ok=True)
             mouse_obj = _com("bind mouse", lambda: self._service.Get(mouse_path)) if mouse_path else None
             method_ms = (time.monotonic() - t0) * 1000.0
