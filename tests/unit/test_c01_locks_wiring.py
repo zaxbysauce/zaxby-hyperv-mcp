@@ -262,7 +262,7 @@ def test_reader_expiry_names_queued_writer(PRR008=None):
     }
     with lock._cv:
         lock._waiting_writers = 1
-        lock._pending_writer = writer_rec
+        lock._pending_writer_records = [(threading.get_ident(), writer_rec)]
     with pytest.raises(VMBusy) as raised:
         lock.acquire("queued-writer-vm", "read", 0.1, threading.get_ident())
     holder = raised.value.holder
@@ -279,7 +279,7 @@ def test_reader_expiry_without_holder_is_honest(PRR008b=None):
     lock = vmlocks._RWLock()
     with lock._cv:
         lock._waiting_writers = 1  # predicate true, nobody recorded
-        lock._pending_writer = None
+        lock._pending_writer_records = []
     with pytest.raises(VMBusy) as raised:
         lock.acquire("drained-vm", "read", 0.1, threading.get_ident())
     assert raised.value.holder is None
