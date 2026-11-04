@@ -18,6 +18,17 @@ RED at base for the issue's reason: the field must be reported on the
 synthetic-only response too (base carries no ``mouse_ps2_present`` key at
 all) and the display-info script must query Msvm_Ps2Mouse (base queries
 Msvm_SyntheticMouse only — 02-reproduction.md Attempt 5).
+
+Amended under the sanctioned CHECK_WRONG procedure (the C13/R2-A overfit
+precedent, issue #84): every response assertion in this file checks only the
+stub-served JSON, which the host passes through verbatim — so an emitter
+that keeps the device queries but hard-codes the emitted field (the
+reviewer's probe B2 pinned a constant ``mouse_ps2_present``) passed both
+checks. The amendment adds EMISSION PIN legs to AC14 asserting the
+generated script's literal emission expressions — delivery invariants are
+asserted from emitted script text, per the trace's own standard: the PS/2
+presence must be emitted from the queried device, not a constant, and the
+synthetic presence likewise. Existing legs and assertions are unchanged.
 """
 
 from __future__ import annotations
@@ -71,6 +82,14 @@ def test_display_info_reports_the_ps2_mouse(monkeypatch, unrestricted_cfg):
         "AC14: mouse_ps2_present must always be reported — a synthetic-only "
         "response answers false, never an absent key"
     )
+    # EMISSION PIN (overfit amendment): mouse_present passes through the
+    # served JSON untouched, so nothing above would notice an emitter that
+    # hard-codes it. The synthetic presence must be EMITTED from the queried
+    # device — pin the literal emission expression from the generated script.
+    assert "mouse_present = [bool]$mouse\n" in stub_syn.scripts[-1], (
+        "AC14: the display-info script must emit mouse_present from the "
+        "queried synthetic device ([bool]$mouse), not a hard-coded constant"
+    )
 
     # -- leg 2: PS/2-only VM (the post-fix script reports both device classes)
     body_ps2_only = {
@@ -96,6 +115,16 @@ def test_display_info_reports_the_ps2_mouse(monkeypatch, unrestricted_cfg):
     assert "Msvm_Ps2Mouse" in stub.scripts[-1], (
         "AC14: the display-info script never queries Msvm_Ps2Mouse, so it "
         "cannot report the device class the input ops fall back to"
+    )
+    # EMISSION PIN (overfit amendment, the reviewer's probe B2): the class
+    # membership check above still passes when the query's answer is ignored
+    # and the field is hard-coded. The PS/2 presence must be EMITTED from the
+    # queried device — pin the literal emission expression (the $m reassigned
+    # by the Msvm_Ps2Mouse lookup, after $mouse captured the synthetic answer)
+    # so a constant emission fails even with a correctly-shaped stub response.
+    assert "mouse_ps2_present = [bool]$m\n" in stub.scripts[-1], (
+        "AC14: the display-info script must emit mouse_ps2_present from the "
+        "queried PS/2 device ([bool]$m), not a hard-coded constant"
     )
 
 

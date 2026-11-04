@@ -422,6 +422,12 @@ _SCANCODES_PER_SCRIPT = 1600
 #: sequence steps, triggers the compact in-script codes encoding.
 _SCRIPT_CHAR_BUDGET = 9000
 
+#: the CreateProcess command-line ceiling itself (issue #81 measurement): a
+#: composed argv longer than this fails to spawn at all (WinError 206), so a
+#: plan that cannot be brought under it is refused pre-spawn rather than
+#: launched into the cliff.
+_CMDLINE_CHAR_LIMIT = 32767
+
 # Per-process identity emission (issues #82/#83): every folded script that
 # drives console input or polling reports the GUID its own resolver bound, so
 # the host can validate the by-name identity it acted on and feed the hint map.
@@ -3360,9 +3366,65 @@ def _sequence_step_block(
     return lines
 
 
+def _spawned_cmdline_chars(script: str) -> int:
+    """The exact command-line length pswindows.run_ps spawns for this script:
+    argv is [_ps_path, "-NonInteractive", "-NoProfile", "-EncodedCommand",
+    encode_command(_PS_PIN + script)] joined by single spaces — the same
+    composition the D-18 pack measures. Priced with the transport's own PIN
+    and encoder so the measure cannot drift from what actually spawns.
+    Measurement only: nothing is spawned, and an uninitialised transport
+    (no _ps_path) answers 0 because run_ps then refuses before composing any
+    command line at all."""
+    if pswindows._ps_path is None:
+        return 0
+    return len(
+        pswindows._ps_path + " -NonInteractive -NoProfile -EncodedCommand "
+        + pswindows.encode_command(pswindows._PS_PIN + script)
+    )
+
+
+def _reject_oversized_sequence_plan(cfg, script: str, plan: list[dict]) -> None:
+    """Fail-closed sequence size gate (issue #81 fix round, implementation
+    review finding): the compaction loop in _sequence_script can only shrink
+    CODES steps, so a schema-allowed plan can still compose past the
+    32767-character CreateProcess command-line budget through terms
+    compaction cannot touch — 50 unrolled step blocks (measured: 50x512-char
+    text steps compose a 34028-char script, a 91125-char command line) or ONE
+    codes step whose compact base64 seed alone busts the budget (measured:
+    20000 codes -> 26668-char seed, 78333-char command line). Such plans used
+    to fall through and die at spawn with WinError 206; they are refused HERE
+    instead — before the console lock, before any spawn, zero side effects.
+
+    The measure is the EXACT spawned command line: the script is composed
+    through the real pswindows.compose_remote (pure string work — identity in
+    local mode, the true WS-Man wrapper with every text payload line priced
+    in remote mode) and then priced as run_ps prices argv. A single compact
+    step that cannot fit is the degenerate case — the plan carrying it
+    measures over budget here too — so one gate closes both shapes. Plans
+    that fit pass untouched: the gate only rejects, it never rewrites
+    (ordinary plans stay byte-identical)."""
+    text_steps = [s for s in plan if s["action"] == "text"]
+    composed, _stdin = pswindows.compose_remote(
+        cfg, script,
+        payload_lines=len(text_steps),
+        stdin_b64="\n".join(pswindows.utf8_b64(s["text"]) for s in text_steps)
+        or None,
+    )
+    cmdline = _spawned_cmdline_chars(composed)
+    if cmdline > _CMDLINE_CHAR_LIMIT:
+        n_steps = len(plan)
+        raise ConsoleError(
+            f"sequence plan composes a {len(script)}-char PowerShell script "
+            f"(a {cmdline}-character spawned command line), over the "
+            f"{_CMDLINE_CHAR_LIMIT}-char command-line budget "
+            f"({n_steps} step{'s' if n_steps != 1 else ''}); "
+            "reduce steps or per-step payload")
+
+
 def _sequence_script(
-    prelude: str, plan: list[dict], expect_frame_hash: str, expect_boot_epoch: int | None,
-    timeout_s: int, width: int, height: int, remote: bool,
+    cfg, prelude: str, plan: list[dict], expect_frame_hash: str,
+    expect_boot_epoch: int | None, timeout_s: int, width: int, height: int,
+    remote: bool,
 ) -> str:
     """The one folded sequence process (frozen protocol): prelude(+identity
     guard) -> lookups -> boot epoch -> VMID=/EPOCH= emission -> preconditions
@@ -3374,7 +3436,10 @@ def _sequence_script(
     arrays into the in-script base64 seed (see _sequence_step_block) until the
     script fits _SCRIPT_CHAR_BUDGET — the one-process/one-deadline/
     stop-on-failure contract and the delivered bytes are unchanged, and
-    ordinary steps keep the literal array."""
+    ordinary steps keep the literal array. When even full compaction cannot
+    bring the plan under the real command-line budget (the compaction loop
+    only shrinks codes steps), _reject_oversized_sequence_plan refuses the
+    plan BEFORE any spawn — never launch an over-limit command line."""
 
     def build(compact: set[int]) -> str:
         uses_kb = any(s["action"] in ("codes", "text") for s in plan)
@@ -3466,6 +3531,10 @@ def _sequence_script(
         remaining = [i for i in codes_steps if i not in compact]
         compact.add(max(remaining, key=lambda i: len(plan[i]["codes"])))
         script = build(compact)
+    # Backstop for everything the loop could not shrink (no codes steps, or a
+    # single compact step that still busts the budget): the plan either fits
+    # the real CreateProcess command line or is refused before any spawn.
+    _reject_oversized_sequence_plan(cfg, script, plan)
     return script
 
 
@@ -3711,7 +3780,7 @@ def run_sequence(
     started = time.monotonic()
     remote = pswindows.hyperv_host(cfg) is not None
     script = _sequence_script(
-        prelude, plan, expect_frame_hash, expect_boot_epoch, timeout_s,
+        cfg, prelude, plan, expect_frame_hash, expect_boot_epoch, timeout_s,
         width, height, remote)
     text_payloads = [pswindows.utf8_b64(s["text"]) for s in plan if s["action"] == "text"]
     with _input_lock(ref):

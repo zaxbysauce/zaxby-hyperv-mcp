@@ -13,6 +13,12 @@ Measured constants (02-reproduction.md, real subprocess.Popen at base):
     chunk: the $__pN stdin read + the param() entry + the -ArgumentList
     entry + the $payloads entry).
   * run_sequence step cliff: 2400 codes/step -> cmdline 32609.
+  * fix-round rejection shapes (implementation review of the collated fix):
+    a 50-step type_text plan (50 x 512-char steps) composes a 34028-char
+    script -> a 91125-character command line, and a single 20000-code
+    scancode step stays over even compacted (26668-char base64 seed ->
+    29231-char script -> 78333-character command line) — both must be
+    refused BEFORE any spawn, never launched into WinError 206.
 
 Frozen-docstring wording note: the discriminating checks below are RED at
 the pre-fix tree (single oversized composed command) and GREEN after the
@@ -197,7 +203,15 @@ def test_command_line_stays_under_the_limit_for_schema_allowed_shapes(
     codes, and one short ordinary call. EVERY composed command line must
     stay <= 32767 and the delivery invariants must hold (all codes / all
     text / all step codes / the short call's two codes). RED at base (the
-    5000-code and 2500-code-step shapes overflow), GREEN after the fix."""
+    5000-code and 2500-code-step shapes overflow), GREEN after the fix.
+
+    Fix-round amendment (same procedure as the R2-A one above): the
+    implementation review of the collated fix found run_sequence could still
+    compose an over-limit script for schema-allowed plans the codes-step
+    compaction loop cannot shrink — a 50-step type_text plan and a single
+    20000-code step — so those two shapes are now pinned as PRE-SPAWN
+    rejections (structured ConsoleError naming the budget, ZERO PowerShell
+    spawn attempts) instead of launches into WinError 206."""
     shapes: list[tuple[str, list[str]]] = []
 
     # (1) 5000 scancodes — past the cliff, must split and deliver everything.
@@ -246,6 +260,32 @@ def test_command_line_stays_under_the_limit_for_schema_allowed_shapes(
     if not out["ok"] or out["scancodes_sent"] != 2:
         problems.append("the short call did not report both codes sent")
     shapes.append(("short type_scancodes call", problems))
+
+    # (5) fix-round legs closing the implementation-review finding: the
+    # codes-step compaction loop cannot shrink a plan whose size rides the
+    # UNROLLED BLOCKS (50 type_text steps -> a 34028-char script -> a
+    # 91125-character command line), nor a single codes step whose compact
+    # base64 seed alone busts the budget (20000 codes -> a 78333-character
+    # command line). Both must be refused BEFORE any spawn: a structured
+    # ConsoleError naming the 32767-char command-line budget, with the
+    # captured transport proving ZERO spawn attempts (fail-closed, not
+    # launched into WinError 206).
+    for label, steps in [
+        ("type_text", [{"action": "type_text", "text": "a" * 512} for _ in range(50)]),
+        ("codes", [{"action": "type_scancodes", "scancodes": [123] * 20000}]),
+    ]:
+        runner = _install(monkeypatch, _CapturingRunner())
+        with pytest.raises(console.ConsoleError) as excinfo:
+            console.run_sequence(unrestricted_cfg, "vm1", steps=steps)
+        message = str(excinfo.value)
+        assert runner.calls == [], (
+            f"the over-limit {label} plan spawned {len(runner.calls)} PowerShell "
+            "process(es) before the rejection — the refusal must be pre-spawn"
+        )
+        assert "32767" in message and "command" in message, (
+            f"the {label} rejection must name the command-line budget: {message!r}"
+        )
+        shapes.append((f"run_sequence {label} plan rejected pre-spawn", []))
 
     failures = {label: probs for label, probs in shapes if probs}
     assert failures == {}, (
