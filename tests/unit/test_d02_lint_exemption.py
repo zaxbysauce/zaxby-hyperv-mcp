@@ -27,12 +27,19 @@ D01_REL = "tests/unit/test_d01_screenshot_decode.py"
 
 
 def _ruff_exe() -> Path:
+    # The repo .venv is the first choice, but CI installs dev extras into the
+    # runner environment (no repo .venv), where ruff resolves from PATH.
+    import shutil
+
     for candidate in (ROOT / ".venv" / "Scripts" / "ruff.exe", ROOT / ".venv" / "bin" / "ruff"):
         if candidate.exists():
             return candidate
+    found = shutil.which("ruff")
+    if found:
+        return Path(found)
     raise AssertionError(
-        "AC1: no ruff executable found under .venv (dev extras missing?); the "
-        "config-independent lint check cannot run"
+        "AC1: no ruff executable found (repo .venv or PATH; dev extras missing?); "
+        "the config-independent lint check cannot run"
     )
 
 
