@@ -1,15 +1,26 @@
 """Frozen acceptance checks for issue #18 (Workstream D PR 2, D-02).
 
 Every console call must start exactly ONE PowerShell process on the PowerShell
-transport: the VM resolution, the display-head lookup, the device lookup and
-the operation itself run inside one script; chunked keyboard input keeps every
-chunk and its pacing inside that one process with chunks riding stdin as base64
-lines; the screenshot fallback chain loops the de-duplicated size list in the
-script and never attempts a size twice; the mouse lookup is scoped to the VM
-with a SystemName WQL filter with no per-device association scan; and the parse
-lane captures the full WMI template of every console op.
+transport, with ONE sanctioned exception: ``capture_sequence`` carries no
+payload between frames, so each frame is its own self-contained folded process
+(``count`` processes by name, ``count + 1`` by id — the per-frame carve-out
+README.md and the console module docstring document). Inside the one process:
+the VM resolution, the display-head lookup, the device lookup and the operation
+itself run inside one script; chunked keyboard input keeps every chunk and its
+pacing inside that one process with chunks riding stdin as base64 lines; the
+screenshot fallback chain loops the de-duplicated size list in the script and
+never attempts a size twice; the mouse lookup is scoped to the VM with a
+SystemName WQL filter with no per-device association scan; and the parse lane
+captures the full WMI template of every console op. The folded-protocol
+emission pins live in the companion file tests/unit/test_console_folded_protocol.py
+(18 test functions, 29 collected items).
 
 RED at base 4c1ecd4d6d3b44abbeb52ed62e5ec7edc538f69c, GREEN after the fix.
+Amended for issue #84 under the trace-18 sanction (C5/C7/C12 plus this
+docstring's carve-out): the C5/C7 stubs DERIVE their served reports by PARSING
+the captured generated-script text, so the C22/C23 emitter mutations change
+what is served and the assertions bite; C12's recorder drives a reachable
+resolver seam and asserts observed values instead of passing vacuously.
 
 The SpawnCounter stub below replaces pswindows.run_ps. It serves the per-leg
 protocol the base implementation speaks (a bare GUID for the by-name resolver,
@@ -52,16 +63,65 @@ def _int_literal(value: str) -> int | None:
     return int(value) if value.isdigit() else None
 
 
-def _fmt(sizes: list[tuple[int, int]]) -> str:
-    return ",".join(f"{w}x{h}" for w, h in sizes)
+def _screenshot_chain_report(script: str) -> list[str]:
+    """Replay the captured screenshot script's own chain bookkeeping and
+    return the size list its emitted SIZES=/ATTEMPTED= lines would report
+    (issue #84, R2-C: the served report is DERIVED from the captured script
+    text, never from host-side knowledge of the chain).
+
+    Parsed from the emitted text: the $sizes seed, the head-append block (the
+    stub's served head is HEAD, so $hh/$vv replay as HEAD), every hardcoded
+    $sizes += append, the $seen guard's live condition and the $seen[$key]
+    record statement. A script whose guard is disabled — issue #84's C22
+    mutant gives the condition an `-and $false` — replays with the duplicate
+    intact, so the served report shows it and the AC7 assertion fails."""
+    seed = re.search(r"\$sizes = @\(\s*,\((\d+),(\d+)\)\s*\)", script)
+    assert seed, "AC7 stub: the captured screenshot script seeds no $sizes chain"
+    chain: list[tuple[int, int]] = [(int(seed.group(1)), int(seed.group(2)))]
+    if re.search(r"if \(-not \$dup\)\s*\{\s*\$sizes \+= ,\(\$hh,\$vv\)\s*\}", script):
+        # The in-script duplicate check gates the head append; the replay
+        # applies the same gate against the head this stub serves.
+        if HEAD not in chain:
+            chain.append(HEAD)
+    for w, h in re.findall(r"\$sizes \+= ,\((\d+),(\d+)\)", script):
+        chain.append((int(w), int(h)))
+    guard = re.search(
+        r"if \(\$seen\.ContainsKey\(\$key\)(?P<cond>[^)]*)\)\s*\{ continue \}", script
+    )
+    guard_live = bool(guard) and "-and $false" not in guard.group("cond")
+    record_live = re.search(r"\$seen\[\$key\] = \$true", script) is not None
+    attempted: list[str] = []
+    seen: set[str] = set()
+    for w, h in chain:
+        key = f"{w}x{h}"
+        if guard_live and record_live and key in seen:
+            continue
+        seen.add(key)
+        attempted.append(key)
+    return attempted
 
 
-def _dedup(sizes: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    seen: list[tuple[int, int]] = []
-    for size in sizes:
-        if size not in seen:
-            seen.append(size)
-    return seen
+def _chunk_progress_from_script(script: str) -> tuple[bool, int]:
+    """(emitter present, chunk count) parsed from a captured keyboard
+    script's own text: the per-chunk progress emitter statement and the loop
+    bound $n literal (issue #84, R2-C). The stub serves one RC=/CHUNK= line
+    per parsed chunk ONLY when the emitter statement is present, so
+    suppressing the emitters (the C23 mutant) serves no progress lines and
+    the AC5 count comparison fails."""
+    has_emitter = re.search(r"Write-Output[^;\n]*' CHUNK='", script) is not None
+    bound = re.search(r"^\$n = (\d+)$", script, re.M)
+    return has_emitter, (int(bound.group(1)) if bound else 0)
+
+
+def _served_chunk_progress(result: pswindows.PSResult | None) -> list[str]:
+    """The RC=/CHUNK= progress lines a served keyboard response carried —
+    the per-chunk report the captured script's own emitter statements
+    produce inside its loop."""
+    if result is None:
+        return []
+    return [
+        ln for ln in result.stdout.splitlines() if re.fullmatch(r"RC=\d+ CHUNK=\d+/\d+", ln)
+    ]
 
 
 class SpawnCounter:
@@ -134,32 +194,40 @@ class SpawnCounter:
                 stdout=json.dumps({"horizontal": HEAD[0], "vertical": HEAD[1]}), returncode=0
             )
         if "TypeText" in s or "TypeScancodes" in s:
-            n = _stdin_lines(stdin_b64)
-            lines = ["RC=0 CHUNK=" + str(i + 1) + "/" + str(max(n, 1)) for i in range(max(n, 1))]
+            # The per-chunk report is the SCRIPT'S OWN: the stub parses the
+            # emitter statement and the $n loop bound from the captured text
+            # and serves one RC=/CHUNK= line per parsed chunk. A script whose
+            # emitters were suppressed (C23) is served no progress lines.
+            has_emitter, n = _chunk_progress_from_script(s)
+            if not has_emitter or n < 1:
+                return pswindows.PSResult(stdout="", returncode=0)
+            lines = ["RC=0 CHUNK=" + str(i + 1) + "/" + str(n) for i in range(n)]
             return pswindows.PSResult(stdout="\n".join(lines), returncode=0)
         return pswindows.PSResult(stdout="", returncode=0)
 
     def _serve_folded_screenshot(self, script: str) -> pswindows.PSResult:
-        """The folded screenshot loop: de-duplicated chain requested -> head ->
-        640x480 -> 320x240, one payload for the first success or ATTEMPTED for
-        the all-fail case."""
-        w, h = _size_from_script(script)
-        chain = _dedup([(w, h), HEAD, (640, 480), (320, 240)])
+        """The folded screenshot loop's own report: the stub replays the
+        captured script's chain bookkeeping (_screenshot_chain_report) and
+        serves what the emitted SIZES=/ATTEMPTED= lines report — requested ->
+        head native -> 640x480 -> 320x240, de-duplicated by the script's own
+        $seen guard — plus one payload for the first success (capture_ok) or
+        the ATTEMPTED line for the all-fail case."""
+        attempted = _screenshot_chain_report(script)
         if self.capture_ok:
-            uw, uh = chain[0]
+            uw, uh = (int(part) for part in attempted[0].split("x"))
             return pswindows.PSResult(
                 stdout="VMID="
                 + GUID
                 + "\nHEAD=1024x768\nSIZES="
-                + _fmt(chain)
+                + ",".join(attempted)
                 + "\nUSED="
-                + _fmt([chain[0]])
+                + attempted[0]
                 + "\n"
                 + _payload_json(uw, uh),
                 returncode=0,
             )
         return pswindows.PSResult(
-            stdout="VMID=" + GUID + "\nATTEMPTED=" + _fmt(chain),
+            stdout="VMID=" + GUID + "\nATTEMPTED=" + ",".join(attempted),
             stderr="capture boom",
             returncode=1,
         )
@@ -223,25 +291,6 @@ def _position_from_script(script: str) -> tuple[int, int] | None:
         max(0, min(hx, HEAD[0] - 1)),
         max(0, min(hy, HEAD[1] - 1)),
     )
-
-
-def _stdin_lines(stdin_b64: str | None) -> int:
-    if not stdin_b64:
-        return 0
-    return len([ln for ln in stdin_b64.split("\n") if ln.strip()])
-
-
-def _sizes_from_scripts(scripts: list[str]) -> list[str]:
-    """Per-leg capture scripts carry literal WidthPixels/HeightPixels; the folded
-    loop drives them from variables, so this is empty for a folded script."""
-    sizes = []
-    for script in scripts:
-        if "GetVirtualSystemThumbnailImage" not in script:
-            continue
-        w, h = _size_from_script(script)
-        if w and h:
-            sizes.append(f"{w}x{h}")
-    return sizes
 
 
 def _attempted_from_response(result: pswindows.PSResult | None) -> list[str]:
@@ -309,7 +358,9 @@ def test_keyboard_ops_spawn_one_process_each(monkeypatch, unrestricted_cfg):
 def test_chunked_input_spawns_one_process(monkeypatch, unrestricted_cfg):
     """AC5: type_text (1200 chars, 3 chunks) and type_scancodes (192 codes, 3
     chunks) together start exactly 2 processes; chunking and pacing stay inside
-    the one process and the text rides stdin as base64 lines."""
+    the one process and the text rides stdin as base64 lines. The chunk counts
+    are read from the script's own emitted per-chunk RC=/CHUNK= report (the
+    issue #84 amendment — not from the host-side Python chunk lists)."""
     text = "a" * 512 + "b" * 512 + "c" * 176
     stub_text = _install(monkeypatch, SpawnCounter())
     out_text = console.type_text(unrestricted_cfg, "vm1", text)
@@ -319,6 +370,28 @@ def test_chunked_input_spawns_one_process(monkeypatch, unrestricted_cfg):
     assert total == 2, f"AC5: chunked input started {total} PowerShell processes"
     assert out_text["chunks"] == 3 and out_text["chars"] == 1200
     assert out_codes["chunks"] == 3 and out_codes["scancodes_sent"] == 192
+    # Issue #84 amendment (R2-C): the chunk counts must be derived from the
+    # script's OWN per-chunk report — the stub parses each captured script's
+    # emitter statement and $n loop bound and serves one RC=/CHUNK= line per
+    # chunk — and compared against the result dict, not against the host-side
+    # Python chunk lists. The C23 mutant (emitter statements suppressed in the
+    # keyboard script builders) serves no per-chunk lines and fails here.
+    for label, stub_op, out_op in (
+        ("type_text", stub_text, out_text),
+        ("type_scancodes", stub_codes, out_codes),
+    ):
+        n_bound = _chunk_progress_from_script(stub_op.scripts[-1])[1]
+        served_progress = _served_chunk_progress(stub_op.served[-1])
+        assert len(served_progress) == out_op["chunks"] == n_bound == 3, (
+            f"AC5: emitted-chunk count mismatch for {label}: the script's own "
+            f"per-chunk report served {len(served_progress)} RC=/CHUNK= lines "
+            f"against the script's $n bound {n_bound} while the result reports "
+            f"chunks={out_op['chunks']}"
+        )
+        assert served_progress[-1] == f"RC=0 CHUNK={out_op['chunks']}/{out_op['chunks']}", (
+            f"AC5: {label} per-chunk report does not count up to the emitted "
+            f"total: {served_progress}"
+        )
     lines = [ln for ln in (stub_text.kwargs[-1]["stdin_b64"] or "").split("\n") if ln.strip()]
     assert len(lines) == 3, "AC5: one folded type_text process must carry 3 stdin lines"
     assert base64.b64decode(lines[0]).decode() == "a" * 512
@@ -342,21 +415,33 @@ def test_screenshot_spawns_one_process(monkeypatch, unrestricted_cfg):
 
 def test_screenshot_fallback_chain_spawns_one_process_and_never_retries_a_size(monkeypatch, unrestricted_cfg):
     """AC7: a 640x480 request whose every capture fails starts exactly 1 process,
-    never attempts a size twice, and still raises ConsoleError."""
+    never attempts a size twice, and still raises ConsoleError. The dedup half
+    reads the SCRIPT'S OWN emitted chain report (the issue #84 amendment,
+    R2-C): the stub replays the captured script's chain bookkeeping — seed,
+    head append, hardcoded appends and the $seen guard's live condition, all
+    parsed from the emitted text — over a genuinely multi-element chain
+    (head native + 640x480 + 320x240), so disabling the in-script $seen guard
+    (the C22 mutant) shows the duplicate in the served ATTEMPTED= line and
+    fails here instead of passing on a host-side tautology."""
     stub = _install(monkeypatch, SpawnCounter(capture_ok=False))
     with pytest.raises(console.ConsoleError):
         console.screenshot(unrestricted_cfg, "vm1", 640, 480)
-    sizes = _sizes_from_scripts(stub.scripts) or _attempted_from_response(stub.served[-1])
-    no_duplicate_sizes = len(sizes) == len(set(sizes))
-    assert (stub.count, no_duplicate_sizes) == (1, True), (
-        f"AC7: screenshot fallback chain started {stub.count} processes and attempted {sizes}"
-    )
-    # Structural pin: the chain is built and de-duplicated INSIDE the script, so
-    # a folded script that loops sizes but retries one cannot pass on the stub's
-    # synthesized ATTEMPTED line alone.
+    assert stub.count == 1, f"AC7: screenshot fallback chain started {stub.count} PowerShell processes"
+    # Structural pin: the chain is built and de-duplicated INSIDE the script.
     script = stub.scripts[-1]
     assert "$sizes" in script, "AC7: the folded screenshot does not build its size chain in-script"
     assert "$seen" in script, "AC7: the folded screenshot has no in-script de-duplication guard"
+    # The script's own emitted report: the served ATTEMPTED= line is what the
+    # replayed in-script bookkeeping would print, over a multi-element chain.
+    sizes = _attempted_from_response(stub.served[-1])
+    assert sizes, "AC7: the folded screenshot emitted no ATTEMPTED= chain report"
+    assert {"640x480", "1024x768", "320x240"} <= set(sizes), (
+        f"AC7: the emitted chain report is not the multi-element fallback chain: {sizes}"
+    )
+    assert len(sizes) == len(set(sizes)), (
+        f"AC7: the emitted chain report shows a duplicate size — the in-script "
+        f"$seen guard did not de-duplicate the chain: {sizes}"
+    )
 
 
 def test_positional_mouse_script_guards_missing_head(monkeypatch, unrestricted_cfg):
@@ -460,19 +545,82 @@ def test_display_info_mouse_lookup_filters_by_system_name(monkeypatch, unrestric
 # ---------------------------------------------------------------------------
 
 
+# The folded by-name resolver block (guestexec.psdirect_vm_target): its CIM
+# query is the only forward-slash namespace occurrence in a folded script (the
+# op-side _VM_LOOKUP uses the quoted backslash form with a -Filter), so this
+# exact line pins the RESOLVER SEAM rather than any op template.
+_RESOLVER_QUERY = "Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ComputerSystem"
+
+
 class _Recorder:
-    """The parse lane's stub (tests/unit/test_script_parse.py): every non-leg
-    script gets empty stdout, so an op that needs its intermediate values before
-    generating its WMI script never generates one."""
+    """The parse lane's stub (tests/unit/test_script_parse.py), amended for
+    issue #84: the resolver seam is the folded resolver BLOCK itself — every
+    by-name op script embeds the PR #4 prelude, whose forward-slash
+    Get-CimInstance line (_RESOLVER_QUERY) marks it — so the seam is
+    REACHABLE and each matched script is served a response the op can PROCEED
+    with (VMID=GUID plus the metadata that op's host-side parser needs). The
+    base recorder keyed on scripts ENDING with $vmTarget (the per-leg shape),
+    which no folded script does — the seam was unreachable and C12 passed
+    vacuously. Every call records whether it matched the seam, so the C12
+    check (and the C24 probe) can require observed values to flow from the
+    resolver-matched response rather than from any unrelated leg."""
 
     def __init__(self):
         self.scripts: list[str] = []
+        self.calls: list[dict] = []
+
+    def resolver_hit(self, script: str) -> bool:
+        """The seam predicate: the script embeds the by-name resolver block."""
+        return _RESOLVER_QUERY in script
 
     def __call__(self, script: str, timeout_s: float | None = None, stdin_b64: str | None = None):
         self.scripts.append(script)
         s = script.strip()
-        if "Msvm_ComputerSystem" in s and s.endswith("$vmTarget"):
-            return pswindows.PSResult(stdout=GUID, returncode=0)
+        matched = self.resolver_hit(script)
+        result = self._serve(s, matched)
+        self.calls.append(
+            {"script": script, "resolver_matched": matched, "served_guid": GUID in result.stdout}
+        )
+        return result
+
+    def _serve(self, s: str, matched: bool) -> pswindows.PSResult:
+        if not matched:
+            # Not the by-name lane: serve nothing, like the parse lane's empty
+            # leg — an op that never reaches the seam never proceeds.
+            return pswindows.PSResult(stdout="", returncode=0)
+        if "EnabledState" in s:
+            body = json.dumps(
+                {
+                    "enabled_state": 2,
+                    "head_horizontal": HEAD[0],
+                    "head_vertical": HEAD[1],
+                    "keyboard_present": True,
+                    "keyboard_enabled": 2,
+                    "mouse_present": True,
+                    "mouse_enabled": 2,
+                }
+            )
+            return pswindows.PSResult(
+                stdout="VMID=" + GUID + "\nEPOCH=1700000000\n" + body, returncode=0
+            )
+        if "$baseline" in s:
+            return pswindows.PSResult(stdout="STOP=deadline POLLS=1 HASH=" + "ab" * 32, returncode=0)
+        if "GetVirtualSystemThumbnailImage" in s and "$sizes" in s:
+            return pswindows.PSResult(
+                stdout="VMID="
+                + GUID
+                + "\nHEAD=1024x768\nSIZES=1024x768\nUSED=1024x768\n"
+                + _payload_json(HEAD[0], HEAD[1]),
+                returncode=0,
+            )
+        if "SetAbsolutePosition" in s:
+            lines = ["RC=0"] if "ClickButton" in s else []
+            lines += ["HEADX=100", "HEADY=50"]
+            return pswindows.PSResult(stdout="\n".join(lines), returncode=0)
+        if "ClickButton" in s or "SetButtonState" in s or "SetScrollPosition" in s:
+            return pswindows.PSResult(stdout="RC=0", returncode=0)
+        if "TypeText" in s or "TypeScancodes" in s:
+            return pswindows.PSResult(stdout="RC=0", returncode=0)
         return pswindows.PSResult(stdout="", returncode=0)
 
 
@@ -498,20 +646,49 @@ _OP_MARKERS = (
 
 def test_parse_lane_recorder_captures_wmi_template_for_every_console_op(monkeypatch, unrestricted_cfg):
     """AC12: driving every console op against the parse lane's Recorder hands it a
-    script carrying that op's own root\\virtualization\\v2 WMI template."""
+    script carrying that op's own root\\virtualization\\v2 WMI template — and,
+    since the issue #84 amendment, the recorder's resolver seam is REACHABLE
+    (every folded by-name script embeds the resolver block) and every op
+    PROCEEDS with the identity served from the resolver-matched response, so
+    the check asserts OBSERVED values instead of passing vacuously on ops that
+    errored behind a swallowed exception."""
     rec = _Recorder()
     monkeypatch.setattr(pswindows, "run_ps", rec)
-    missing = []
+    missing: list[str] = []
+    errored: list[str] = []
+    unresolved: list[str] = []
+    observed = {}
     for name, op, marker in _OP_MARKERS:
-        before = len(rec.scripts)
+        before_scripts = len(rec.scripts)
+        before_calls = len(rec.calls)
         try:
-            op(unrestricted_cfg)
-        except Exception:  # noqa: BLE001 - the lane swallows op failures by design
-            pass
-        produced = [s for s in rec.scripts[before:] if marker in s and WMI_NS_BACKSLASH in s]
+            result = op(unrestricted_cfg)
+        except Exception as exc:  # noqa: BLE001 - recorded and asserted below
+            errored.append(f"{name}: {exc!r}")
+            continue
+        produced = [s for s in rec.scripts[before_scripts:] if marker in s and WMI_NS_BACKSLASH in s]
         if not produced:
             missing.append(name)
+            continue
+        if not any(c["resolver_matched"] for c in rec.calls[before_calls:]):
+            unresolved.append(name)
+            continue
+        observed[name] = result
     assert missing == [], f"AC12: ops that never generated their WMI template: {missing}"
+    assert errored == [], (
+        f"AC12: ops that errored while driving the resolver seam (exceptions "
+        f"are no longer swallowed silently): {errored}"
+    )
+    assert unresolved == [], f"AC12: ops whose script never reached the resolver seam: {unresolved}"
+    # Observed values: the identity the resolver-matched response served is
+    # the identity the ops report — the resolver GUID flowed through the op,
+    # and the ops proceeded (their results carry the served values).
+    assert observed["get_display_info"]["vm_id"] == GUID
+    _shot_frame, shot_meta = observed["screenshot"]
+    assert shot_meta["vm_id"] == GUID
+    assert observed["mouse_move"]["head_x"] == 100 and observed["mouse_move"]["head_y"] == 50
+    assert observed["click with coordinates"]["head_x"] == 100
+    assert observed["wait_frame_change"]["stop_reason"] == "deadline"
 
 
 # ---------------------------------------------------------------------------
