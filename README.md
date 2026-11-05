@@ -227,6 +227,22 @@ definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
 
+## 0.11.0 changes
+
+- Frozen-check amendments (issues #63/#66): the Workstream C/D acceptance checks now
+  discriminate tree-kill (event-synchronized unwind seam), the real promptness bound
+  (`elapsed < 1.0`), slot-return capacity, same-VM poll overlap and seeded status, and a
+  recorded-child precondition on the cancel path.
+- Frozen-checkpoint drift re-baseline (issue #119): every drifted manifest pair
+  re-baselined with original replay bases preserved; trace-74's suite-count expects moved
+  to stable predicates.
+- New: `docs/rebaseline-runbook.md` (the CHECK_WRONG re-baseline procedure),
+  `docs/issue-trace-drift-inventory.md` (live drift state), and
+  `scripts/gen_trace_drift_inventory.py` (`--check` gate with fail-closed marker,
+  clean-checkout, and snapshot-refusal guards).
+- Version bump: 0.10.0 -> 0.11.0 (`pyproject.toml`, package `__version__`,
+  `test_c03_sdk_port.py`'s expected literal; `test_version_consistency.py` pins the sites).
+
 ## 0.10.0 changes
 
 - **Oversized console input delivers everything (#81):** Windows caps the

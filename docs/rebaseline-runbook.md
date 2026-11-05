@@ -8,14 +8,22 @@ This runbook is the sanctioned repair procedure.
 ## When to run it
 
 Run the drift inventory (one command, below) whenever a PR touches a file that appears in a
-checkpoint manifest — i.e. before merging any PR whose diff intersects
-`src/`, `tests/unit/test_*.py`, or `README.md` paths pinned by a closed trace. The `--check` gate compares the docs copy against a live regeneration and exits
+checkpoint manifest — e.g. before merging any PR whose diff intersects `src/`,
+`tests/unit/test_*.py`, `tests/integration/*.py`, frozen `repro/check-*.sh` scripts,
+`README.md`, or the docs/scripts this wave pinned. The authoritative membership test is
+the manifest itself: grep `.agents/issue-traces/*/repro/checkpoint.manifest` for the path. The `--check` gate compares the docs copy against a live regeneration and exits
 1 on drift between the two; it does not by itself assert that every trace is
 clean — read the inventory's CHANGED tallies (or run the verifier per trace)
-for that. Verifier exit codes are `0` (clean) and `1` (drift found); no legacy
-manifest format remains in the tree (a repo-wide sweep finds only exit 0/1).
+for that. Verifier exit codes are `0` (clean) and `1` (drift found); exit `2` means a
+missing or malformed trace/manifest (invalid local checkpoint setup — not a
+clean-or-drift result), and the generator's `--check` treats it as a gate failure. No
+legacy manifest format remains in the tree (a repo-wide sweep finds only exit 0/1).
 
 ## One-command local verification
+
+Prerequisite: the git-ignored local trace store must exist (`.agents/issue-traces/` with
+checkpoint manifests). From a clean checkout the gate fails closed with exit 2 — restore
+or re-sync the local traces first; it cannot run there.
 
 ```
 python scripts/gen_trace_drift_inventory.py --check

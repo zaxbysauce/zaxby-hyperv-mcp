@@ -248,6 +248,7 @@ def test_ac4_cancelled_call_kills_child_promptly(tmp_path, monkeypatch, fresh_se
     )
     mcp = mod.get_mcp()
     outcome: dict = {}
+    startup_seen = {"observed": False}
     try:
 
         async def main():
@@ -261,13 +262,18 @@ def test_ac4_cancelled_call_kills_child_promptly(tmp_path, monkeypatch, fresh_se
                         try:
                             lines = events.read_text(encoding="utf-8").splitlines()
                         except OSError:
-                            return False
+                            # Transient reader/writer contention (AV, indexer):
+                            # retry within the gate budget instead of firing the
+                            # cancel without proof the child started.
+                            time.sleep(0.05)
+                            continue
                         for line in lines:
                             try:
                                 rec = json.loads(line)
                             except json.JSONDecodeError:
                                 continue
                             if rec.get("event") == "start":
+                                startup_seen["observed"] = True
                                 return True
                     time.sleep(0.05)
                 return False
@@ -311,10 +317,15 @@ def test_ac4_cancelled_call_kills_child_promptly(tmp_path, monkeypatch, fresh_se
         # file lives in this test's own tmp_path and only this call's shim
         # writes to it, so the recorded pids are this leg's children by
         # construction (isolation assumption; a foreign writer would need
-        # out-of-band access to the per-test tmpdir).
+        # out-of-band access to the per-test tmpdir). A gate expiry (the
+        # startup wait timing out with no event) lands here too — the message
+        # names it so a loaded runner is not misread as a broken shim.
         assert pids, (
-            "AC4: no recorded child for the cancelled leg; the recorder shim "
-            "never proved a child existed, so the kill assertion would be vacuous"
+            "AC4: no recorded child for the cancelled leg (startup gate "
+            f"observed={'event' if startup_seen['observed'] else 'timeout'}); "
+            "shim never proved a child existed, so the kill assertion would be "
+            "vacuous — a timeout on a loaded runner means slow startup, not a "
+            "broken mechanism"
         )
         cancelled = bool(outcome.get("cancelled_caught"))
         elapsed = float(outcome.get("elapsed", -1.0))

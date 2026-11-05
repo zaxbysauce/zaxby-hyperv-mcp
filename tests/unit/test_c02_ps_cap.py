@@ -133,7 +133,8 @@ def _peak_concurrency(intervals: list[tuple[float, float]]) -> int:
 
 
 def _first_event_pid(events_dir: Path, timeout_s: float) -> int | None:
-    """Pid of the first recording child to publish a COMPLETE event, or None.
+    """Pid of the first recording child to publish a complete (parseable) JSON
+    record, or None.
 
     A child killed mid-json.dump can leave a truncated file; skip it instead
     of raising (issue-63 PRR-019).
@@ -144,8 +145,8 @@ def _first_event_pid(events_dir: Path, timeout_s: float) -> int | None:
         for path in published:
             try:
                 return int(json.loads(path.read_text(encoding="utf-8"))["pid"])
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                continue  # truncated write from a child killed mid-dump; try the next file
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError):
+                continue  # truncated write or a transient read race; try the next file
         time.sleep(0.05)
     return None
 
@@ -269,7 +270,7 @@ def test_child_killed_when_run_ps_unwinds_by_exception(tmp_path, monkeypatch):
                             try:
                                 int(json.loads(path.read_text(encoding="utf-8"))["pid"])
                                 break
-                            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                            except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError):
                                 continue
                         else:
                             time.sleep(0.05)
@@ -398,6 +399,11 @@ def test_cancelled_worker_thread_kills_child_promptly(tmp_path, monkeypatch):
     assert _alive(direct_child_pid[0]) is False, (
         f"child pid {direct_child_pid[0]} from the cancelled leg is still alive"
     )
+    # The leaf observation is CONDITIONAL by design (issue-63 PRR-019): a hard
+    # assert here would reintroduce the kill-before-publish startup race. On a
+    # slow runner the leaf may not have published within the 1 s window and this
+    # secondary tree-kill check is skipped; AC2's unconditional leaf precondition
+    # (:324) remains the primary tree-kill discriminator for the suite.
     pid = _first_event_pid(events_dir, timeout_s=1.0)
     if pid is not None:
         deadline = time.monotonic() + 1.0

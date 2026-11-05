@@ -22,8 +22,10 @@ FOUND survives the repair itself.
 from __future__ import annotations
 
 import argparse
+import datetime
 import difflib
 import subprocess
+import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -46,7 +48,16 @@ def _verify(slug: str) -> tuple[int, str]:
 
 def _collect() -> list[dict]:
     rows = []
-    for manifest in sorted(TRACES.glob("*/repro/checkpoint.manifest")):
+    manifests = sorted(TRACES.glob("*/repro/checkpoint.manifest"))
+    if not manifests:
+        print(
+            "FAIL: no local checkpoint manifests under .agents/issue-traces/ "
+            "(git-ignored state; the gate cannot run from a clean checkout) — "
+            "run on the maintainer host that holds the local traces",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    for manifest in manifests:
         slug = manifest.parent.parent.name
         code, out = _verify(slug)
         lines = out.splitlines()
@@ -93,6 +104,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", action="store_true",
                         help="capture current state as the durable artifact (run once, pre-repair)")
+    parser.add_argument("--force", action="store_true",
+                        help="allow --snapshot to replace an existing Discovery snapshot")
     parser.add_argument("--check", action="store_true",
                         help="compare regeneration against the docs copy; exit 1 on drift")
     args = parser.parse_args()
@@ -100,6 +113,13 @@ def main() -> int:
     dynamic = _dynamic(_collect())
 
     if args.snapshot:
+        if DOCS.exists() and _static_of(DOCS.read_text(encoding="utf-8")) and not args.force:
+            print("FAIL: docs copy already carries a Discovery snapshot; --snapshot would "
+                  "replace the recorded audit trail. Use --force only to intentionally "
+                  "re-record it.", file=sys.stderr)
+            return 1
+        base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO,
+                              capture_output=True, text=True, encoding="utf-8").stdout.strip()
         parts = [
             "# Issue-trace checkpoint inventory",
             "",
@@ -107,7 +127,7 @@ def main() -> int:
         ]
         drifted = [row for row in _collect() if row["changed_lines"]]
         if drifted:
-            parts.append(f"{DISCOVERY_HEADING} (recorded 2026-11-05, base 8bc60cb7196ae128231c25a15881cded26b0afda)")
+            parts.append(f"{DISCOVERY_HEADING} (recorded {datetime.date.today().isoformat()}, base {base})")
             parts.append("")
             parts.append("Verbatim verify-checkpoint output per drifted trace at the recorded state.")
             parts.append("")
@@ -143,8 +163,16 @@ def main() -> int:
     # regenerate in place
     if DOCS.exists():
         existing = DOCS.read_text(encoding="utf-8")
+        s_idx = existing.find(BEGIN)
+        e_idx = existing.find(END)
         static = _static_of(existing)
-        head = existing[:existing.find(BEGIN)].rstrip("\n")
+        if s_idx == -1 or e_idx == -1 or (not static and any(
+                row["changed_lines"] for row in _collect())):
+            print("FAIL: docs copy is malformed (missing regenerated-state markers or "
+                  "Discovery snapshot); refusing to write — fix it with --snapshot "
+                  "--force or restore from git history", file=sys.stderr)
+            return 1
+        head = existing[:s_idx].rstrip("\n")
         body = head + "\n\n" + dynamic.rstrip("\n") + "\n"
         if static:
             body += "\n" + static
@@ -157,5 +185,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(main())
