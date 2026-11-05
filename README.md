@@ -230,8 +230,9 @@ the task-spawned controller reads it from the environment.
 ## 0.11.0 changes
 
 - Frozen-check amendments (issues #63/#66): the Workstream C/D acceptance checks now
-  discriminate tree-kill (event-synchronized unwind seam), the real promptness bound
-  (`elapsed < 1.0`), slot-return capacity, same-VM poll overlap and seeded status, and a
+  discriminate tree-kill (event-synchronized unwind seam), the run_ps worker-thread
+  promptness bound (`elapsed < 1.0`, tightening the tool-call layer's 1.5 s cancel
+  bound), slot-return capacity, same-VM poll overlap and seeded status, and a
   recorded-child precondition on the cancel path.
 - Frozen-checkpoint drift re-baseline (issue #119): every drifted manifest pair
   re-baselined with original replay bases preserved; trace-74's suite-count expects moved

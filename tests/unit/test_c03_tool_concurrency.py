@@ -324,8 +324,8 @@ def test_ac4_cancelled_call_kills_child_promptly(tmp_path, monkeypatch, fresh_se
             "AC4: no recorded child for the cancelled leg (startup gate "
             f"observed={'event' if startup_seen['observed'] else 'timeout'}); "
             "shim never proved a child existed, so the kill assertion would be "
-            "vacuous — a timeout on a loaded runner means slow startup, not a "
-            "broken mechanism"
+            "vacuous — a gate timeout is consistent with EITHER a loaded/slow "
+            "runner OR a broken shim; check both before concluding which"
         )
         cancelled = bool(outcome.get("cancelled_caught"))
         elapsed = float(outcome.get("elapsed", -1.0))
