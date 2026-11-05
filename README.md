@@ -179,7 +179,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.9.0 today) instead of
+  package's version (0.10.0 today) instead of
   the SDK's.
 - **In-process embedders see the 2.x call shape.** `call_tool()` returns a
   `CallToolResult` (`.content`, `.structured_content`, `.is_error`) instead
@@ -226,6 +226,51 @@ restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.10.0 changes
+
+- **Oversized console input delivers everything (#81):** Windows caps the
+  spawned command line at 32766 spawnable characters (CreateProcess's 32767
+  ceiling includes the terminating null), so input that would overflow ONE
+  command is split into sequential commands rather than launched into
+  WinError 206 — scancode arrays beyond ~1600 codes split across consecutive
+  folded `type_scancodes` processes (each carrying a contiguous slice as its
+  own in-script seed, all delivered in order under one console input lock;
+  the result's `chunks` stays the TOTAL 64-code window count), remote
+  `type_text` beyond 100 stdin chunks composes multiple sequential
+  `Invoke-Command` hops (each carrying a contiguous chunk range), and an
+  oversized `run_sequence` codes step encodes its array as an in-script
+  base64 seed decoded in the script. Ordinary-size inputs keep the exact
+  single-process emissions the one-process pins freeze.
+- **`hyperv_console_sequence` refuses over-budget plans fail-closed (#81):** a plan
+  whose composed command line cannot fit the spawn budget even after the
+  codes-step compaction is refused before the sequence command spawns (a
+  by-id plan may already have spent one resolver spawn) with a structured
+  `ConsoleError` naming the composed command-line length and the 32766-char
+  budget — reduce steps or per-step payload.
+- **New result fields `mouse_ps2_present` and `used_fallback` (#83):**
+  `hyperv_console_get_display_info` additionally reports the PS/2 mouse
+  (the non-positional input ops — button, scroll, click-at-current-position
+  — fall back to it, so a PS/2-only VM no longer reads as "nothing can act
+  on the console"; `mouse_present` stays the synthetic-only answer), and a
+  folded screenshot response without a usable `USED=` line surfaces
+  `used_fallback: true` instead of silently assuming the requested size.
+- **The WMI transport probes the PS/2 mouse too (#83):** the in-process WMI
+  `display_info` resolves `Msvm_Ps2Mouse` through a `SystemName`-scoped
+  query mirroring the mouse-path lookup, so `mouse_ps2_present` agrees
+  across transports instead of reading constant false on the default
+  in-process path.
+- **Console input guards (#83):** mouse coordinates, frame dimensions and
+  button values are bool-rejecting integer guards (a bool must never pass as
+  1) validated before any spawn, and non-ASCII `type_text` is rejected with
+  a pointer to `hyperv_console_type_scancodes`.
+- **Folded ops emit a validated identity (#82/#83):** every folded console
+  op emits `VMID=` from the script's own resolved identity and the host
+  re-validates it through the same shape gate a host-resolved GUID passes,
+  so a VM deleted and recreated under the same name fails closed BEFORE any
+  guest input and the name->GUID mapping self-heals.
+- **Version bump:** 0.9.0 -> 0.10.0 (`pyproject.toml`, package `__version__`,
+  this section; `test_version_consistency.py` pins the sites).
 
 ## 0.9.0 changes
 
@@ -1839,8 +1884,8 @@ selectors fail with `ambiguous_selector` and up to 20 candidates.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_console_screenshot` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `format?` (png\|jpeg/jpg\|webp), `quality?` (1..100), `scale?` (0,1], `crop?` ([left,top,right,bottom]), `if_changed_from?` (frame_hash) | MCP ImageContent + metadata text (`vm_id`, `frame_hash`, `head_resolution`, `scale_note`, `fallback_used`, `capture_method`, `captured_at`, `timings`, `width`, `height`, `vm_name`, `prefix_hex`, plus `format`/`quality`/`scale`/`crop`/`saved_format` only when those options were supplied) — metadata alone when `if_changed_from` matches |
-| `hyperv_console_get_display_info` | `vm_name` or `vm_id` | `{ok, enabled_state, head_horizontal, head_vertical, keyboard_present, keyboard_enabled, mouse_present, mouse_enabled, boot_epoch, guest_channel, guest_channel_note, vm_id}` — NOTE: `guest_channel` is per-tool vocabulary; this tool still reports the constant `ps_direct_unverified` (Workstream D owns its rework), while `hyperv_wait_vm_state` derives `os_heartbeat_ok`/`no_guest_signal` from the Heartbeat service and `hyperv_deployment_status` reports the richer seven-phase `phase` vocabulary (`off`/`suspended`/`heartbeat_disabled`/`no_guest_signal`/`os_ready`/`os_unresponsive`/`degraded`) instead |
+| `hyperv_console_screenshot` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `format?` (png\|jpeg/jpg\|webp), `quality?` (1..100), `scale?` (0,1], `crop?` ([left,top,right,bottom]), `if_changed_from?` (frame_hash) | MCP ImageContent + metadata text (`vm_id`, `frame_hash`, `head_resolution`, `scale_note`, `fallback_used`, `used_fallback`, `capture_method`, `captured_at`, `timings`, `width`, `height`, `vm_name`, `prefix_hex`, plus `format`/`quality`/`scale`/`crop`/`saved_format` only when those options were supplied) — metadata alone when `if_changed_from` matches. `used_fallback` (issue #83, PowerShell transport) is true exactly when the response's `USED=` line was absent or malformed, i.e. the reported dimensions are the REQUESTED size by assumption rather than the chain's own report; false when `USED=` was present and parseable (`fallback_used` remains the separate human-readable note about which chain size actually captured) |
+| `hyperv_console_get_display_info` | `vm_name` or `vm_id` | `{ok, enabled_state, head_horizontal, head_vertical, keyboard_present, keyboard_enabled, mouse_present, mouse_enabled, mouse_ps2_present, boot_epoch, guest_channel, guest_channel_note, vm_id}` — `mouse_present` reports the SYNTHETIC mouse only (absolute positioning); `mouse_ps2_present` (issue #83) additionally reports the PS/2 mouse the non-positional input ops (button, scroll, click-at-current-position) fall back to, so a PS/2-only VM no longer reads as "nothing can act on the console" — the field is always present, false meaning no PS/2 mouse was reported, and it is measured per transport: the in-process WMI transport probes it via a `SystemName`-scoped `Msvm_Ps2Mouse` query, the PowerShell transport via the folded script's own PS/2 query. NOTE: `guest_channel` is per-tool vocabulary; this tool still reports the constant `ps_direct_unverified` (Workstream D owns its rework), while `hyperv_wait_vm_state` derives `os_heartbeat_ok`/`no_guest_signal` from the Heartbeat service and `hyperv_deployment_status` reports the richer seven-phase `phase` vocabulary (`off`/`suspended`/`heartbeat_disabled`/`no_guest_signal`/`os_ready`/`os_unresponsive`/`degraded`) instead |
 | `hyperv_console_type_text` | `vm_name` or `vm_id`, `text` (ASCII) | `{ok, chunks, chars}` |
 | `hyperv_console_press_key` | `vm_name` or `vm_id`, `key`, `modifiers[]` (ctrl/alt/shift incl. right- variants, win/leftwin/rightwin — held while key taps) — keys: enter, escape (esc), tab, backspace, space, capslock, up/down/left/right, delete, home, end, pageup, pagedown, insert, f1-f12, a-z, 0-9, punctuation (minus/equals/leftbracket/rightbracket/semicolon/apostrophe/grave/backslash/comma/period/slash, single-char aliases `-` `=` `[` `]` `\` `;` `'` `` ` `` `,` `.` `/`), numpad (num0-num9, numdecimal, nummultiply, numsubtract, numadd, numlock, numdivide, numenter), win (alias leftwin), rightwin, menu (alias apps); modifier-named keys are also valid bare presses | `{ok, scancodes_sent, chunks}` |
 | `hyperv_console_key_combo` | `vm_name` or `vm_id`, `keys[]` — modifiers ctrl/alt/shift (incl. right- variants) and win/leftwin/rightwin; every other key name taps in order, e.g. `["win","r"]` | `{ok, scancodes_sent, chunks}` |
@@ -1912,7 +1957,11 @@ mapping self-heals from the guard's own report). A by-name console input
 with NO learned mapping yet stays keyed on the caller-supplied name until a
 feeding operation supplies one; that residual window is disclosed here
 rather than fixed with an extra resolve spawn, which would break the
-one-PowerShell-process-per-call contract.
+one-PowerShell-process-per-call contract (ordinary inputs compose exactly
+one process; oversized inputs split into sequential processes and
+over-budget `hyperv_console_sequence` plans are refused before the sequence
+command spawns (a by-id plan may already have spent one resolver spawn) —
+see the oversized-input delivery paragraph below).
 
 #### Console transport: in-process WMI or PowerShell (issue #45)
 
@@ -1943,6 +1992,23 @@ automatically per call:
   (positional ops report the structured error: absolute positioning has no
   PS/2 equivalent).
 
+Oversized input delivery (issue #81): Windows caps the spawned command line
+at 32766 spawnable characters (CreateProcess's 32767 ceiling includes the
+terminating null) and a folded script costs roughly 8/3 command-line
+characters per script character after `-EncodedCommand` base64, so input that
+would overflow ONE command is split into sequential commands rather than
+failing — scancode arrays beyond ~1600 codes split across consecutive folded
+`type_scancodes` processes (each carrying a contiguous slice as its own
+in-script seed, all delivered in order under one console input lock; the
+result's `chunks` stays the TOTAL 64-code window count), remote `type_text`
+beyond 100 stdin chunks composes multiple sequential `Invoke-Command` hops
+(each carrying a contiguous chunk range), and an oversized `run_sequence`
+codes step encodes its array as an in-script base64 seed decoded in the
+script — ordinary-size inputs keep the exact single-process emissions the
+one-process pins freeze. The screenshot chain additionally refuses a
+`ReturnValue=0` capture whose payload has the wrong length IN-SCRIPT, so a
+corrupt payload advances the chain to the next size instead of committing.
+
 Fallback happens only at connect/selection time: a WMI **method** failure
 (non-zero `ReturnValue`, bad payload, raw COM failure) — or a backend
 unavailability raised mid-operation — is a structured error and is never
@@ -1950,14 +2016,30 @@ retried through PowerShell, so console input can never double-send. Every
 SUCCESSFUL result carries a per-call `timings` breakdown (failure
 envelopes carry the standard error shape without timings):
 `{"transport": "powershell", "spawn_ms": [402.6]}` (one float per
-`powershell.exe` spawn — since issue #18 each call is ONE process whose script
-resolves the VM, looks up the devices/head and runs the operation; a call
+`powershell.exe` spawn — since issue #18 each ORDINARY call is ONE process
+whose script resolves the VM, looks up the devices/head and runs the
+operation; oversized inputs instead split into sequential processes (see
+the oversized-input delivery paragraph above) and `hyperv_console_sequence`
+refuses an over-budget plan before the sequence command spawns (a by-id plan
+may already have spent one resolver spawn); a call
 addressed by `vm_id` keeps a separate resolution leg first, because policy must
 run on the GUID's resolved name before any guest mutation. `capture_sequence`
 is the exception: it carries no payload between frames, so each frame is its
 own folded process — `count` floats by name, `count + 1` by `vm_id`) or
 `{"transport": "wmi", "connect_ms": 0.0, "rebind_ms": 0.8,
-"method_ms": 31.2}`. On the WMI path `connect_ms` is the measured
+"method_ms": 31.2}`.
+
+`spawn_ms` entries are recorded on two bases (issue #83, documented contract —
+the field is NOT re-plumbed to one basis): the resolve-leg entry is host-side
+wall-clock around `vmident.resolve` — it INCLUDES the policy check, the remote
+composition and the PowerShell slot wait — while every op-leg entry is the
+child's `duration_ms`, measured AFTER the slot wait (the bounded
+`host_powershell_wait_s` slot wait is its own budget and must not consume the
+caller's script timeout, which is also why `run_ps` starts the leg clock after
+slot acquisition). Both bases are numeric milliseconds in call order, so the
+entry count is exactly the spawn count on every path.
+
+On the WMI path `connect_ms` is the measured
 backend lookup (near-zero on a warm cache — one real DCOM connect per host
 per process, shared by concurrent callers),
 `rebind_ms` the cached-identity re-bind and state check, and `method_ms`

@@ -1185,6 +1185,20 @@ def _write_frame(stdin, frame: str, timeout_s: float = 30.0) -> None:
 #: payload to the host heap at once.
 _MAX_FRAME_BYTES = 8 * 1024 * 1024
 
+#: Issue #81: the maximum number of stdin payload lines ONE composed remote
+#: command may carry. Every payload line costs ~165 argv characters on the
+#: composed ``Invoke-Command`` command line (the ``$__pN`` stdin read, the
+#: ``param()`` entry, the ``-ArgumentList`` entry and the script's own
+#: ``$payloads`` entry) and the spawnable command line is capped at 32766
+#: characters — console._CMDLINE_CHAR_LIMIT, the SPAWNABLE ceiling under
+#: CreateProcess (CUB2-6: the raw 32767-character buffer includes the
+#: terminating null, so an exactly-32767 line cannot spawn) — 163 lines
+#: already compose past the cliff (measured 32793). 100 lines
+#: compose to ~22.4k characters, comfortably under; callers with more lines
+#: (console.type_text) split them across sequential composed commands, each
+#: carrying a contiguous line range delivered in order.
+REMOTE_PAYLOAD_LINES_CAP = 100
+
 
 def _decode_worker_response(line: bytes, duration_ms: int) -> PooledResult:
     """Turn one base64 JSON response frame into a PooledResult.

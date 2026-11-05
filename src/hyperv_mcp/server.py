@@ -2143,6 +2143,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         UNKNOWN record and deadline enforcement are PowerShell-transport
         behaviors; the WMI transport carries no per-call timeout. One audit
         record replaces N single-step calls.
+        A plan whose composed command line cannot fit under the Windows
+        spawn limit is refused fail-closed before the sequence command
+        spawns — a by-id plan may already have spent one resolver spawn
+        (ConsoleError naming the composed command-line length and the
+        32766-char budget; reduce steps or per-step payload).
         Policy: console_input category; no confirm parameter.
 
         Args:

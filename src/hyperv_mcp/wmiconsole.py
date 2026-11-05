@@ -468,31 +468,54 @@ class ConsoleWMI:
     def _mouse_path(
         self, guid: str, entry: _VMCache, absent_ok: bool = False
     ) -> str | None:
-        """Cached synthetic-mouse path via enumerate + owner-association
-        (the namespace serves several mice per host; reverse ASSOCIATORS
-        from the CS is not the production discovery shape). Absence
-        (no mouse owns this VM) returns None with absent_ok / raises
-        WMIError otherwise; a TRANSPORT failure inside the walk raises
-        WMIError either way — callers can distinguish the two."""
+        """Cached synthetic-mouse path via ONE SystemName-scoped query —
+        the same key-filter discovery console.py's _MOUSE_SYNTHETIC uses
+        (FND-16 scoping parity; the namespace serves several mice per
+        host, so the WQL filter itself binds the row to THIS VM — no
+        client-side SystemName re-filter, which objects that do not
+        expose the attribute would defeat). Absence (zero rows) returns
+        None with absent_ok / raises WMIError otherwise; a TRANSPORT
+        failure propagates as WMIError (CUB-478: _com() folds the
+        underlying OSError/com_error, so nothing else escapes) — never
+        laundered to absent."""
         if entry.mouse_path is not None:
             return entry.mouse_path
-        for mouse in _rows(_com("ExecQuery mice", lambda: self._service.ExecQuery(
-                "SELECT * FROM Msvm_SyntheticMouse"))):
-            try:
-                owners = _rows(_com("ExecQuery mouse owner", lambda m=mouse: self._service.ExecQuery(
-                    "ASSOCIATORS OF {" + _path_of(m)
-                    + "} WHERE ResultClass = Msvm_ComputerSystem"
-                )))
-            except WMIError:
-                continue  # one unqueryable mouse must not fail the walk
-            for owner in owners:
-                if str(getattr(owner, "Name", "")).lower() == guid.lower():
-                    with self._lock:
-                        entry.mouse_path = _path_of(mouse)
-                    return entry.mouse_path
-        if absent_ok:
-            return None
-        raise WMIError("no synthetic mouse device associated with the VM")
+        rows = _rows(_com("ExecQuery mouse", lambda: self._service.ExecQuery(
+            "SELECT * FROM Msvm_SyntheticMouse WHERE SystemName = "
+            + _wql_quote(guid.lower())
+        )))
+        if not rows:
+            if absent_ok:
+                return None
+            raise WMIError("no synthetic mouse device associated with the VM")
+        with self._lock:
+            entry.mouse_path = _path_of(rows[0])
+        return entry.mouse_path
+
+    def _ps2_mouse_present(self, guid: str) -> bool:
+        """Per-call PS/2 mouse presence probe (issue #83 Design b,
+        PRR-101): the same SystemName-scoped key filter _mouse_path uses,
+        against Msvm_Ps2Mouse — the WMI transport's mirror of the folded
+        script's _MOUSE_PS2 query, so display_info's mouse_ps2_present
+        agrees across transports. Empty rows -> not present; a TRANSPORT
+        failure — the query OR the row enumeration — propagates as
+        WMIError, never laundered to an answer (CUB2-1: the probe does
+        NOT go through _rows, whose except-Exception arm converts a
+        failed live enumeration into a truthy [result] row that
+        bool(rows) would read as PRESENT; _mouse_path's laundering-free
+        semantics — every COM-touching step under _com — now hold here
+        too). Uncached on purpose: display_info is the only consumer, a
+        per-call probe needs no cache entry to invalidate."""
+        # CUB2-1: laundering-free probe — the row enumeration runs INSIDE
+        # _com so a mid-enumeration COM failure (the live SWbemObjectSet
+        # case: the result set is enumerated lazily, so the failure lands
+        # at iteration time) folds into WMIError instead of reaching
+        # bool(rows) as a truthy [result] row.
+        rows = _com("ExecQuery ps2 mouse", lambda: list(self._service.ExecQuery(
+            "SELECT * FROM Msvm_Ps2Mouse WHERE SystemName = "
+            + _wql_quote(guid.lower())
+        )))
+        return bool(rows)
 
     def _head_object(self, guid: str, entry: _VMCache) -> Any | None:
         """Head object via cached path (re-read per call so resolution
@@ -705,13 +728,18 @@ class ConsoleWMI:
                 "ASSOCIATORS OF {" + entry.cs_path + "} WHERE ResultClass = Msvm_Keyboard"
             )))
             kb_obj = kb_rows[0] if kb_rows else None
-            # The CS->mouse reverse association is unreliable on the live
-            # namespace; the working discovery is enumerate + owner match
-            # (the same walk every mouse op uses). Absent -> present False;
-            # a FAILED probe (bind/transport) raises — never laundered to
-            # absent (PRR-013).
+            # Mouse discovery is the SystemName-scoped query every mouse op
+            # uses (see _mouse_path; FND-16 scoping parity with console.py).
+            # Absent (zero rows) -> present False; a FAILED probe
+            # (bind/transport) raises — never laundered to absent (PRR-013).
             mouse_path = self._mouse_path(guid, entry, absent_ok=True)
             mouse_obj = _com("bind mouse", lambda: self._service.Get(mouse_path)) if mouse_path else None
+            # PRR-101: the PS/2 probe is the WMI mirror of the folded
+            # script's _MOUSE_PS2 query (issue #83 Design b) — mouse_present
+            # above stays the synthetic-only answer the input ops act on;
+            # this key reports the fallback device's presence. Empty rows ->
+            # False; a failed probe raises WMIError (never laundered).
+            ps2_present = self._ps2_mouse_present(guid)
             method_ms = (time.monotonic() - t0) * 1000.0
 
             def _res(obj: Any) -> tuple[int | None, int | None]:
@@ -734,6 +762,7 @@ class ConsoleWMI:
                 "keyboard_enabled": getattr(kb_obj, "EnabledState", None) if kb_obj else None,
                 "mouse_present": mouse_obj is not None,
                 "mouse_enabled": getattr(mouse_obj, "EnabledState", None) if mouse_obj else None,
+                "mouse_ps2_present": ps2_present,
                 "boot_epoch": _boot_epoch_from_cs(cs),
             }
             return info, {
