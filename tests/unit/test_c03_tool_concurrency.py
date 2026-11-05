@@ -248,14 +248,44 @@ def test_ac4_cancelled_call_kills_child_promptly(tmp_path, monkeypatch, fresh_se
     )
     mcp = mod.get_mcp()
     outcome: dict = {}
+    startup_seen = {"observed": False}
     try:
 
         async def main():
             started = time.monotonic()
+            cancel_time: list[float] = []
+
+            def wait_for_startup() -> bool:
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if events.exists():
+                        try:
+                            lines = events.read_text(encoding="utf-8").splitlines()
+                        except OSError:
+                            # Transient reader/writer contention (AV, indexer):
+                            # retry within the gate budget instead of firing the
+                            # cancel without proof the child started.
+                            time.sleep(0.05)
+                            continue
+                        for line in lines:
+                            try:
+                                rec = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if rec.get("event") == "start":
+                                startup_seen["observed"] = True
+                                return True
+                    time.sleep(0.05)
+                return False
+
             with anyio.CancelScope() as scope:
 
                 async def canceller():
-                    await anyio.sleep(0.5)
+                    # Gate cancellation on observed startup so a slow-but-valid
+                    # recorder is not killed before it proves its existence
+                    # (issue-66 PRR-010 follow-through).
+                    await anyio.to_thread.run_sync(wait_for_startup)
+                    cancel_time.append(time.monotonic())
                     scope.cancel()
 
                 tg_cancel = asyncio.ensure_future(canceller())
@@ -263,7 +293,11 @@ def test_ac4_cancelled_call_kills_child_promptly(tmp_path, monkeypatch, fresh_se
                     await mcp.call_tool("hyperv_get_vm_info", {"vm_name": "c03-vm-a"})
                 finally:
                     tg_cancel.cancel()
-            outcome["elapsed"] = time.monotonic() - started
+            outcome["elapsed"] = (
+                time.monotonic() - cancel_time[0]
+                if cancel_time
+                else time.monotonic() - started
+            )
             outcome["cancelled_caught"] = scope.cancelled_caught
 
         asyncio.run(main())
@@ -277,6 +311,22 @@ def test_ac4_cancelled_call_kills_child_promptly(tmp_path, monkeypatch, fresh_se
                     continue
                 if rec.get("event") == "start":
                     pids.append(rec["pid"])
+        # A recorded child is a stated precondition (issue-66 PRR-010): the
+        # child-death assertion must run against a pid that provably existed,
+        # not pass vacuously because the recorder never started. The events
+        # file lives in this test's own tmp_path and only this call's shim
+        # writes to it, so the recorded pids are this leg's children by
+        # construction (isolation assumption; a foreign writer would need
+        # out-of-band access to the per-test tmpdir). A gate expiry (the
+        # startup wait timing out with no event) lands here too — the message
+        # names it so a loaded runner is not misread as a broken shim.
+        assert pids, (
+            "AC4: no recorded child for the cancelled leg (startup gate "
+            f"observed={'event' if startup_seen['observed'] else 'timeout'}); "
+            "shim never proved a child existed, so the kill assertion would be "
+            "vacuous — a gate timeout is consistent with EITHER a loaded/slow "
+            "runner OR a broken shim; check both before concluding which"
+        )
         cancelled = bool(outcome.get("cancelled_caught"))
         elapsed = float(outcome.get("elapsed", -1.0))
         assert (cancelled, elapsed < 1.5) == (True, True), (
@@ -314,9 +364,19 @@ def test_ac5_same_vm_job_status_polls_without_busy(fresh_server, monkeypatch):
     try:
         status_json = '{"status": "running", "process_name": "fake.exe"}'
 
+        peak_state = {"live": 0, "peak": 0}
+        peak_lock = threading.Lock()
+
         def fake_run_ps(script, **kwargs):
-            time.sleep(0.6)
-            return PSResult(stdout=status_json, returncode=0)
+            with peak_lock:
+                peak_state["live"] += 1
+                peak_state["peak"] = max(peak_state["peak"], peak_state["live"])
+            try:
+                time.sleep(0.6)
+                return PSResult(stdout=status_json, returncode=0)
+            finally:
+                with peak_lock:
+                    peak_state["live"] -= 1
 
         monkeypatch.setattr(pswindows, "run_ps", fake_run_ps)
         mcp = mod.get_mcp()
@@ -334,5 +394,18 @@ def test_ac5_same_vm_job_status_polls_without_busy(fresh_server, monkeypatch):
         assert "busy" not in repr(results).lower(), (
             f"AC5: a busy envelope surfaced for same-VM polls: {repr(results)[:300]}"
         )
+        # Discriminators added by the issue-66 amendment (PRR-009): the two
+        # same-VM polls must actually OVERLAP on the per-VM read lock (a
+        # read->write regression serializes them), and each poll must carry
+        # the seeded status (an early-return envelope would drop it).
+        assert peak_state["peak"] == 2, (
+            f"AC5: peak concurrent run_ps legs was {peak_state['peak']}, expected 2 "
+            "(same-VM status polls must overlap on the per-VM read lock)"
+        )
+        for index, result in enumerate(results):
+            assert "running" in repr(result).lower(), (
+                f"AC5: poll {index} result carries no seeded status: "
+                f"{repr(result)[:200]}"
+            )
     finally:
         guestjobs.clear_registry_for_tests()

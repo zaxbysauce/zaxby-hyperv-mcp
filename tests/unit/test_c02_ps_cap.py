@@ -133,14 +133,38 @@ def _peak_concurrency(intervals: list[tuple[float, float]]) -> int:
 
 
 def _first_event_pid(events_dir: Path, timeout_s: float) -> int | None:
-    """Pid of the first recording child to publish an event, or None."""
+    """Pid of the first recording child to publish a complete (parseable) JSON
+    record, or None.
+
+    A child killed mid-json.dump can leave a truncated file; skip it instead
+    of raising (issue-63 PRR-019).
+    """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         published = sorted((events_dir / "events").glob("*.json"))
-        if published:
-            return int(json.loads(published[0].read_text(encoding="utf-8"))["pid"])
+        for path in published:
+            try:
+                return int(json.loads(path.read_text(encoding="utf-8"))["pid"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError):
+                continue  # truncated write or a transient read race; try the next file
         time.sleep(0.05)
     return None
+
+
+def _isolate_slots(kwargs: dict, tmp_path: Path) -> dict:
+    """Add ps_slot_dir to Config(...) kwargs when the field exists.
+
+    The issue-15 replay base predates the ps_slot_dir config field, where a
+    direct kwarg would TypeError; probe the dataclass fields so the same test
+    code replays on both generations (issue-63 PRR-006).
+    """
+    import dataclasses
+
+    if "ps_slot_dir" in {f.name for f in dataclasses.fields(Config)}:
+        slot_dir = tmp_path / "slots"
+        slot_dir.mkdir(exist_ok=True)
+        kwargs["ps_slot_dir"] = str(slot_dir)
+    return kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +182,7 @@ def test_host_powershell_children_are_capped(tmp_path, monkeypatch):
     shim = _write_recorder_shim(tmp_path)
     monkeypatch.setenv("RECORDER_FILE", str(events_dir))
     monkeypatch.setenv("SLEEP_S", "0.8")
-    pswindows.init(Config(host_powershell_path=str(shim)))
+    pswindows.init(Config(**_isolate_slots({"host_powershell_path": str(shim)}, tmp_path)))
 
     results: list = [None] * 12
     failures: list = []
@@ -213,15 +237,19 @@ def test_child_killed_when_run_ps_unwinds_by_exception(tmp_path, monkeypatch):
     shim = _write_recorder_shim(tmp_path)
     monkeypatch.setenv("RECORDER_FILE", str(events_dir))
     monkeypatch.setenv("SLEEP_S", "5")
-    pswindows.init(Config(host_powershell_path=str(shim)))
+    pswindows.init(Config(**_isolate_slots({"host_powershell_path": str(shim)}, tmp_path)))
 
     direct_child_pid: list[int] = []
 
     if os.name == "nt":
         # Windows branch (CI is windows-only; this is the load-bearing one):
-        # wrap only Popen.communicate so the FIRST call raises a
-        # non-TimeoutExpired exception while the REAL child - already
-        # spawned, job-assigned and resumed by run_ps - keeps running.
+        # wrap only Popen.communicate so the FIRST call waits — bounded — for
+        # the recording leaf to publish a COMPLETE event, then raises a
+        # non-TimeoutExpired exception while the REAL child keeps running.
+        # The event-synchronized wait makes the check observe the child TREE
+        # (leaf + direct child), not only the direct child, and works on both
+        # transport generations because the wait lives inside the first
+        # wrapped call on both (issue-63 PRR-005).
         real_popen = subprocess.Popen
 
         class _UnwindingPopen:
@@ -235,12 +263,31 @@ def test_child_killed_when_run_ps_unwinds_by_exception(tmp_path, monkeypatch):
 
             def communicate(self, input=None, timeout=None):
                 if not self._raised:
+                    events = Path(os.environ["RECORDER_FILE"]) / "events"
+                    deadline = time.monotonic() + 5.0
+                    while time.monotonic() < deadline:
+                        for path in sorted(events.glob("*.json")):
+                            try:
+                                int(json.loads(path.read_text(encoding="utf-8"))["pid"])
+                                break
+                            except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError):
+                                continue
+                        else:
+                            time.sleep(0.05)
+                            continue
+                        break
                     self._raised = True
                     raise RuntimeError("probe: non-timeout unwind during communicate")
                 return self._proc.communicate(input=input, timeout=timeout)
 
             def kill(self):
                 return self._proc.kill()
+
+            def __enter__(self):
+                return self._proc.__enter__()
+
+            def __exit__(self, *exc_info):
+                return self._proc.__exit__(*exc_info)
 
             def __getattr__(self, name):
                 return getattr(self._proc, name)
@@ -275,6 +322,10 @@ def test_child_killed_when_run_ps_unwinds_by_exception(tmp_path, monkeypatch):
     # Watch every known pid: the Windows wrapper captured the direct (shim)
     # child, the recording leaf publishes its own pid once running.
     leaf_pid = _first_event_pid(events_dir, timeout_s=2.0)
+    assert leaf_pid is not None, (
+        "the recording leaf never published before the unwind; the seam must "
+        "fire only after the leaf proves its existence"
+    )
     watched = [pid for pid in (direct_child_pid[:1] + [leaf_pid]) if pid]
     assert watched, "no child pid could be observed to check the abnormal-exit kill"
 
@@ -306,7 +357,17 @@ def test_cancelled_worker_thread_kills_child_promptly(tmp_path, monkeypatch):
     shim = _write_recorder_shim(tmp_path)
     monkeypatch.setenv("RECORDER_FILE", str(events_dir))
     monkeypatch.setenv("SLEEP_S", "5")
-    pswindows.init(Config(host_powershell_path=str(shim)))
+    pswindows.init(Config(**_isolate_slots({"host_powershell_path": str(shim)}, tmp_path)))
+
+    direct_child_pid: list[int] = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        direct_child_pid.append(proc.pid)
+        return proc
+
+    monkeypatch.setattr(pswindows.subprocess, "Popen", recording_popen)
 
     def leg():
         return pswindows.run_ps("Write-Output 'cancel-probe'", timeout_s=60)
@@ -323,15 +384,34 @@ def test_cancelled_worker_thread_kills_child_promptly(tmp_path, monkeypatch):
         f"the cancelled worker thread kept the leg alive for {elapsed:.2f}s; "
         "cancellation must kill the child and free the thread promptly"
     )
-
-    pid = _first_event_pid(events_dir, timeout_s=1.0)
-    assert pid is not None, "no child was ever started for the cancelled leg"
-    deadline = time.monotonic() + 1.0
-    while time.monotonic() < deadline and _alive(pid):
-        time.sleep(0.05)
-    assert _alive(pid) is False, (
-        f"child pid {pid} from the cancelled leg is still alive"
+    assert elapsed < 1.0, (
+        f"the cancelled worker thread settled in {elapsed:.2f}s; the real "
+        "worst case (cancel fires at 0.5 s, kill lands on the next poll "
+        "slice) must stay under 1.0 s (issue-63 PRR-032)"
     )
+
+    # The direct child's death is the primary observation (recorded from the
+    # wrapper, immune to the startup race); the event-file pid is secondary.
+    assert direct_child_pid, "no child was ever started for the cancelled leg"
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and _alive(direct_child_pid[0]):
+        time.sleep(0.05)
+    assert _alive(direct_child_pid[0]) is False, (
+        f"child pid {direct_child_pid[0]} from the cancelled leg is still alive"
+    )
+    # The leaf observation is CONDITIONAL by design (issue-63 PRR-019): a hard
+    # assert here would reintroduce the kill-before-publish startup race. On a
+    # slow runner the leaf may not have published within the 1 s window and this
+    # secondary tree-kill check is skipped; AC2's unconditional leaf precondition
+    # (:324) remains the primary tree-kill discriminator for the suite.
+    pid = _first_event_pid(events_dir, timeout_s=1.0)
+    if pid is not None:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and _alive(pid):
+            time.sleep(0.05)
+        assert _alive(pid) is False, (
+            f"child pid {pid} from the cancelled leg is still alive"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -360,8 +440,15 @@ def test_cap_wait_is_bounded_and_reports_busy(tmp_path, monkeypatch):
     )
     pswindows.init(cfg)
 
+    holder_outcome: dict = {}
+
     def slot_holding_leg():
-        pswindows.run_ps("Write-Output 'busy-holder'", timeout_s=30)
+        try:
+            holder_outcome["result"] = pswindows.run_ps(
+                "Write-Output 'busy-holder'", timeout_s=30
+            )
+        except BaseException as exc:  # recorded, never swallowed
+            holder_outcome["error"] = exc
 
     first = threading.Thread(target=slot_holding_leg)
     first.start()
@@ -390,6 +477,16 @@ def test_cap_wait_is_bounded_and_reports_busy(tmp_path, monkeypatch):
         )
     finally:
         first.join(timeout=30)
+    assert holder_outcome.get("result") is not None and holder_outcome["result"].ok(), (
+        f"the slot-holding leg did not complete cleanly: {holder_outcome!r} "
+        "(issue-63 PRR-032)"
+    )
+    monkeypatch.setenv("SLEEP_S", "0.2")
+    after = pswindows.run_ps("Write-Output 'post-release'", timeout_s=30)
+    assert after.ok(), (
+        f"capacity did not return after the holder released: {after.stderr!r} "
+        "(issue-63 PRR-032)"
+    )
 
 
 # ---------------------------------------------------------------------------
