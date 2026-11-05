@@ -2342,8 +2342,11 @@ def _send_scancodes_locked(
                 try:
                     _r, t = be.type_scancodes(ref.id, chunk)
                 except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
-                    # PRR-105: name delivered-so-far so a retry resumes
-                    # instead of duplicating guest input.
+                    # PRR-105/CUB2-2: on leg failure the error names how many
+                    # complete legs delivered; within-leg progress is not
+                    # recovered, so a retry re-types the failed leg's
+                    # remaining input — keep payloads under one leg where
+                    # duplication matters.
                     raise ConsoleError(
                         f"leg {i + 1}/{len(chunks)} failed; {sent} of "
                         f"{len(codes)} codes delivered by the earlier legs: {exc}"
@@ -2368,23 +2371,31 @@ def _send_scancodes_locked(
         # in order under this one input lock. `chunks` below stays the TOTAL
         # 64-window count and scancodes_sent the total delivered.
         sent = 0
-        slices = [
+        # CUB2-4: iterate the legs lazily — the leg count is derived once
+        # (ceil of len(codes)/_SCANCODES_PER_SCRIPT, exactly what the eager
+        # list's len() was) and each slice is built inline by the generator,
+        # so no full `slices` list is materialized on top of `chunks`;
+        # delivered behavior and the leg-failure messages are unchanged.
+        leg_count = (len(codes) + _SCANCODES_PER_SCRIPT - 1) // _SCANCODES_PER_SCRIPT
+        legs = (
             codes[i:i + _SCANCODES_PER_SCRIPT]
             for i in range(0, len(codes), _SCANCODES_PER_SCRIPT)
-        ]
-        for si, sl in enumerate(slices):
+        )
+        for si, sl in enumerate(legs):
             if si:
                 time.sleep(0.02)  # pacing: let the Hyper-V input buffer drain
             result = _run(cfg, _scancodes_script(prelude, sl), timeout_s=90, timing=timing)
-            # PRR-105: a failing leg names delivered-so-far so a caller's
-            # retry resumes instead of duplicating guest input; the underlying
-            # error text is appended.
+            # PRR-105/CUB2-2: on leg failure the error names how many
+            # complete legs delivered; within-leg progress is not recovered,
+            # so a retry re-types the failed leg's remaining input — keep
+            # payloads under one leg where duplication matters. The
+            # underlying error text is appended.
             try:
                 _check_input_rc(result, "console scancodes", ref.name)
                 _validate_vmid_hint(result, ref.name)
             except ConsoleError as exc:
                 raise ConsoleError(
-                    f"leg {si + 1}/{len(slices)} failed; {sent} of "
+                    f"leg {si + 1}/{leg_count} failed; {sent} of "
                     f"{len(codes)} codes delivered by the earlier legs: {exc}"
                 ) from None
             sent += len(sl)

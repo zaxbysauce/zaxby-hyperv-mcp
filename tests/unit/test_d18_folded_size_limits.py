@@ -37,7 +37,13 @@ import pytest
 from hyperv_mcp import console, credentials, pswindows
 from hyperv_mcp.config import Config
 
-CMDLINE_LIMIT = 32767
+# CUB2-3: the sweep bound is the PRR-103 PRODUCT ceiling — the largest
+# SPAWNABLE command line is 32766 characters (console._CMDLINE_CHAR_LIMIT;
+# the OS's raw 32767 buffer includes the terminating null, cited once in the
+# module docstring above). The product gate now refuses a composed 32767-char
+# line pre-spawn, so a sweep shape composing exactly 32767 is
+# refused-not-delivered and must read as OVER this bound, not at it.
+CMDLINE_LIMIT = 32766
 
 
 @pytest.fixture(autouse=True)

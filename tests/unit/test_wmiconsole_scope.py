@@ -219,3 +219,42 @@ def test_failed_ps2_probe_surfaces_not_laundered(monkeypatch, unrestricted_cfg):
     with pytest.raises(ConsoleError, match="rpc unavailable"):
         console.get_display_info(unrestricted_cfg, "vm1")
     assert stub.scripts == [], "a failed PS/2 probe must not fall back to PowerShell"
+
+
+class _BrokenEnumeration:
+    """Stand-in for a live SWbemObjectSet whose enumeration fails mid-call
+    (CUB2-1: a REAL result set is enumerated lazily, so a COM/RPC failure
+    lands at iteration time, not at query time). Iterable-shaped — so the
+    laundering _rows helper reaches its list(result) arm — but iterating
+    raises like a live com_error would."""
+
+    def __iter__(self):
+        raise OSError("rpc unavailable during enumeration")
+
+
+def test_failed_ps2_enumeration_never_answers_present(monkeypatch, unrestricted_cfg):
+    """CUB2-1 fail-open pin, mirroring the PRR-101 launder shapes above: the
+    Msvm_Ps2Mouse ExecQuery SUCCEEDS and only the returned row set FAILS to
+    enumerate. _rows' except-Exception arm converted that failure into a
+    truthy [result] row, so bool(rows) answered mouse_ps2_present=True — a
+    failed probe reporting the mouse PRESENT. The probe must instead surface
+    the failure as a ConsoleError; the mouse_ps2_present path may never
+    answer True on a failed probe (the PS/2-present and PS/2-absent legs
+    elsewhere in this file pin the genuine answers)."""
+
+    class BrokenEnumerationPs2Service(FakeWMIService):
+        def ExecQuery(self, wql: str) -> list:
+            text = " ".join(wql.split()).upper()
+            if "MSVM_PS2MOUSE" in text:
+                return _BrokenEnumeration()  # query ok, enumeration fails
+            return super().ExecQuery(wql)
+
+    svc = BrokenEnumerationPs2Service(head=(320, 240))
+    _install_wmi(monkeypatch, unrestricted_cfg, lambda cfg: svc)
+    stub = _ps(monkeypatch)
+
+    with pytest.raises(
+        ConsoleError, match="rpc unavailable during enumeration"
+    ):
+        console.get_display_info(unrestricted_cfg, "vm1")
+    assert stub.scripts == [], "a failed PS/2 probe must not fall back to PowerShell"

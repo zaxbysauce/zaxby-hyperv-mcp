@@ -498,11 +498,20 @@ class ConsoleWMI:
         against Msvm_Ps2Mouse — the WMI transport's mirror of the folded
         script's _MOUSE_PS2 query, so display_info's mouse_ps2_present
         agrees across transports. Empty rows -> not present; a TRANSPORT
-        failure propagates as WMIError (same absent_ok semantics as
-        _mouse_path's probe — never laundered to absent). Uncached on
-        purpose: display_info is the only consumer, a per-call probe
-        needs no cache entry to invalidate."""
-        rows = _rows(_com("ExecQuery ps2 mouse", lambda: self._service.ExecQuery(
+        failure — the query OR the row enumeration — propagates as
+        WMIError, never laundered to an answer (CUB2-1: the probe does
+        NOT go through _rows, whose except-Exception arm converts a
+        failed live enumeration into a truthy [result] row that
+        bool(rows) would read as PRESENT; _mouse_path's laundering-free
+        semantics — every COM-touching step under _com — now hold here
+        too). Uncached on purpose: display_info is the only consumer, a
+        per-call probe needs no cache entry to invalidate."""
+        # CUB2-1: laundering-free probe — the row enumeration runs INSIDE
+        # _com so a mid-enumeration COM failure (the live SWbemObjectSet
+        # case: the result set is enumerated lazily, so the failure lands
+        # at iteration time) folds into WMIError instead of reaching
+        # bool(rows) as a truthy [result] row.
+        rows = _com("ExecQuery ps2 mouse", lambda: list(self._service.ExecQuery(
             "SELECT * FROM Msvm_Ps2Mouse WHERE SystemName = "
             + _wql_quote(guid.lower())
         )))

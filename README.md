@@ -242,7 +242,7 @@ the task-spawned controller reads it from the environment.
   oversized `run_sequence` codes step encodes its array as an in-script
   base64 seed decoded in the script. Ordinary-size inputs keep the exact
   single-process emissions the one-process pins freeze.
-- **`run_sequence` refuses over-budget plans fail-closed (#81):** a plan
+- **`hyperv_console_sequence` refuses over-budget plans fail-closed (#81):** a plan
   whose composed command line cannot fit the spawn budget even after the
   codes-step compaction is refused before the sequence command spawns (a
   by-id plan may already have spent one resolver spawn) with a structured
@@ -1959,8 +1959,9 @@ feeding operation supplies one; that residual window is disclosed here
 rather than fixed with an extra resolve spawn, which would break the
 one-PowerShell-process-per-call contract (ordinary inputs compose exactly
 one process; oversized inputs split into sequential processes and
-over-budget `run_sequence` plans are refused before any spawn — see the
-oversized-input delivery paragraph below).
+over-budget `hyperv_console_sequence` plans are refused before the sequence
+command spawns (a by-id plan may already have spent one resolver spawn) —
+see the oversized-input delivery paragraph below).
 
 #### Console transport: in-process WMI or PowerShell (issue #45)
 
@@ -2018,8 +2019,9 @@ envelopes carry the standard error shape without timings):
 `powershell.exe` spawn — since issue #18 each ORDINARY call is ONE process
 whose script resolves the VM, looks up the devices/head and runs the
 operation; oversized inputs instead split into sequential processes (see
-the oversized-input delivery paragraph above) and `run_sequence` refuses an
-over-budget plan before any spawn; a call
+the oversized-input delivery paragraph above) and `hyperv_console_sequence`
+refuses an over-budget plan before the sequence command spawns (a by-id plan
+may already have spent one resolver spawn); a call
 addressed by `vm_id` keeps a separate resolution leg first, because policy must
 run on the GUID's resolved name before any guest mutation. `capture_sequence`
 is the exception: it carries no payload between frames, so each frame is its

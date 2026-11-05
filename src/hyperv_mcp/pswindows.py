@@ -1189,8 +1189,11 @@ _MAX_FRAME_BYTES = 8 * 1024 * 1024
 #: command may carry. Every payload line costs ~165 argv characters on the
 #: composed ``Invoke-Command`` command line (the ``$__pN`` stdin read, the
 #: ``param()`` entry, the ``-ArgumentList`` entry and the script's own
-#: ``$payloads`` entry) and CreateProcess caps the line at 32767 characters —
-#: 163 lines already compose past the cliff (measured 32793). 100 lines
+#: ``$payloads`` entry) and the spawnable command line is capped at 32766
+#: characters — console._CMDLINE_CHAR_LIMIT, the SPAWNABLE ceiling under
+#: CreateProcess (CUB2-6: the raw 32767-character buffer includes the
+#: terminating null, so an exactly-32767 line cannot spawn) — 163 lines
+#: already compose past the cliff (measured 32793). 100 lines
 #: compose to ~22.4k characters, comfortably under; callers with more lines
 #: (console.type_text) split them across sequential composed commands, each
 #: carrying a contiguous line range delivered in order.
