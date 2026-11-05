@@ -307,7 +307,11 @@ def test_ac4_cancelled_call_kills_child_promptly(tmp_path, monkeypatch, fresh_se
                     pids.append(rec["pid"])
         # A recorded child is a stated precondition (issue-66 PRR-010): the
         # child-death assertion must run against a pid that provably existed,
-        # not pass vacuously because the recorder never started.
+        # not pass vacuously because the recorder never started. The events
+        # file lives in this test's own tmp_path and only this call's shim
+        # writes to it, so the recorded pids are this leg's children by
+        # construction (isolation assumption; a foreign writer would need
+        # out-of-band access to the per-test tmpdir).
         assert pids, (
             "AC4: no recorded child for the cancelled leg; the recorder shim "
             "never proved a child existed, so the kill assertion would be vacuous"

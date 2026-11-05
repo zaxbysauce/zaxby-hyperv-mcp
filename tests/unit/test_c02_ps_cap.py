@@ -141,11 +141,11 @@ def _first_event_pid(events_dir: Path, timeout_s: float) -> int | None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         published = sorted((events_dir / "events").glob("*.json"))
-        if published:
+        for path in published:
             try:
-                return int(json.loads(published[0].read_text(encoding="utf-8"))["pid"])
+                return int(json.loads(path.read_text(encoding="utf-8"))["pid"])
             except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                pass  # truncated write from a child killed mid-dump
+                continue  # truncated write from a child killed mid-dump; try the next file
         time.sleep(0.05)
     return None
 
@@ -281,6 +281,12 @@ def test_child_killed_when_run_ps_unwinds_by_exception(tmp_path, monkeypatch):
 
             def kill(self):
                 return self._proc.kill()
+
+            def __enter__(self):
+                return self._proc.__enter__()
+
+            def __exit__(self, *exc_info):
+                return self._proc.__exit__(*exc_info)
 
             def __getattr__(self, name):
                 return getattr(self._proc, name)
