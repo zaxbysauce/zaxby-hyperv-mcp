@@ -497,11 +497,23 @@ def main(argv: list[str] | None = None) -> int:
         controller_log(f"CONFIG ERROR: {exc}")
         return 2
     if ns.install_logon_task or ns.uninstall_logon_task:
+        # Issue #70 PRR-044: the logon-task branch installs the task with an
+        # explicit port, so an explicitly supplied port is validated HERE,
+        # before the install - `--install-logon-task --port 0` (the
+        # conventional ephemeral request) is refused with a clear error
+        # instead of silently dropping the zero into a config-default
+        # fallback. The serve branch keeps its own validation below.
+        if ns.port is not None and (
+                not isinstance(ns.port, int) or not (1 <= ns.port <= 65535)):
+            controller_log(
+                f"ERROR: --port must be an integer in 1..65535 (got {ns.port!r})"
+            )
+            return 2
         return _handle_logon_task(
             cfg,
             install=ns.install_logon_task,
             host=ns.host or "",
-            port=str(ns.port) if ns.port else "",
+            port=str(ns.port) if ns.port is not None else "",
             allow_anonymous=ns.allow_anonymous,
         )
     token_env = cfg.http.token_env
@@ -543,7 +555,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = bootstrap(config=cfg)
 
     host = ns.host or cfg.http.host
-    port = ns.port or cfg.http.port
+    port = ns.port if ns.port is not None else cfg.http.port
     if not isinstance(port, int) or not (1 <= port <= 65535):
         controller_log(f"ERROR: --port must be an integer in 1..65535 (got {port!r})")
         return 2

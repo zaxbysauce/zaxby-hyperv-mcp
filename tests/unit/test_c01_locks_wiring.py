@@ -33,7 +33,7 @@ def test_config_default_and_validation():
         Config(vm_lock_wait_s=-1).validate()
 
 
-def test_vm_lock_wait_s_load_path(PRR013d=None):
+def test_vm_lock_wait_s_load_path():
     """The JSON/_FIELD_MAP load path registers the key and rejects a
     non-integer (feedback PRR-013: constructor-only coverage let a dropped
     _FIELD_MAP entry pass silently)."""
@@ -69,7 +69,7 @@ def test_server_bootstrap_wires_wait_default(monkeypatch):
     assert vmlocks._DEFAULT_WAIT_S == 7.0
 
 
-def test_vm_lock_rejects_bad_args(PRR014=None):
+def test_vm_lock_rejects_bad_args():
     """vm_lock validates mode AND wait_s up front (feedback PRR-014: a
     non-numeric wait_s used to reach max() inside the acquire and surface
     as TypeError/transport after the pin was taken)."""
@@ -107,7 +107,7 @@ def test_envelope_carries_holder():
     assert "holder" not in errors.envelope(RuntimeError("x"))
 
 
-def test_enrich_failure_preserves_holder(PRR013c=None):
+def test_enrich_failure_preserves_holder():
     """enrich_failure keeps (and re-redacts) a module-supplied holder and
     ignores a non-dict one (feedback PRR-013: this branch was untested)."""
     env = errors.enrich_failure({
@@ -133,7 +133,7 @@ def test_tuple_key_normalizes_and_is_distinct():
                 pass
 
 
-def test_tuple_key_casefolds_per_element(PRR013f=None):
+def test_tuple_key_casefolds_per_element():
     """Tuple keys case-fold each element (feedback PRR-013: a mutant
     dropping .casefold() from the tuple branch previously survived)."""
     with vm_lock(("Case-GUID", "Console")):
@@ -142,7 +142,7 @@ def test_tuple_key_casefolds_per_element(PRR013f=None):
                 pass
 
 
-def test_plain_name_cannot_alias_tuple_key(PRR009=None):
+def test_plain_name_cannot_alias_tuple_key():
     """String and tuple keys are disjoint namespaces (feedback PRR-009):
     a client VM name shaped like a dual key cannot collide with one."""
     with vm_lock("alias-guid|console"):  # hostile/colliding client name
@@ -150,7 +150,7 @@ def test_plain_name_cannot_alias_tuple_key(PRR009=None):
             pass
 
 
-def test_console_input_takes_dual_keys(monkeypatch, PRR013a=None):
+def test_console_input_takes_dual_keys(monkeypatch):
     """console._input_lock takes READ on the VM key + WRITE (default) on
     the (vm, "console") key (feedback PRR-013: deleting the tuple lock
     from _input_lock used to leave the whole suite green)."""
@@ -173,7 +173,7 @@ def test_console_input_takes_dual_keys(monkeypatch, PRR013a=None):
     ]
 
 
-def test_holder_held_ms_grows(PRR001=None):
+def test_holder_held_ms_grows():
     """Feedback PRR-001: held_ms must reflect the LIVE hold at failure
     time (issue #14 Verification: "a growing held_ms"), and the message
     must carry that live value — a birth-time snapshot (~0) fails this."""
@@ -210,7 +210,7 @@ def test_holder_held_ms_grows(PRR001=None):
         t.join(timeout=5)
 
 
-def test_read_holder_reports_longest_reader(PRR013b=None):
+def test_read_holder_reports_longest_reader():
     """A write conflict against MULTIPLE readers reports the earliest
     reader (longest-held) — feedback PRR-013: the single-reader version
     could not distinguish min(since) from max/next."""
@@ -250,7 +250,7 @@ def test_read_holder_reports_longest_reader(PRR013b=None):
         t2.join(timeout=5)
 
 
-def test_reader_expiry_names_queued_writer(PRR008=None):
+def test_reader_expiry_names_queued_writer():
     """Feedback PRR-008: a reader timing out while ONLY a queued writer
     blocks it must name that writer — not fabricate a record blaming the
     requester. (State constructed directly to hit the transient window
@@ -272,7 +272,7 @@ def test_reader_expiry_names_queued_writer(PRR008=None):
     assert holder["held_ms"] >= 2000  # queued-writer wait reported live
 
 
-def test_reader_expiry_without_holder_is_honest(PRR008b=None):
+def test_reader_expiry_without_holder_is_honest():
     """If contention drained before expiry, there is no holder: the
     envelope must omit `holder` and the message must not name a tool
     instead of blaming the requester."""
@@ -287,7 +287,7 @@ def test_reader_expiry_without_holder_is_honest(PRR008b=None):
     assert "holder" not in errors.envelope(raised.value)
 
 
-def test_context_manager_exit_on_another_thread_releases(PRR015=None):
+def test_context_manager_exit_on_another_thread_releases():
     """Feedback PRR-015: the CM must release the OWNING thread's records
     even when finalized elsewhere (ExitStack / GC finalization), instead
     of wedging a phantom holder for the process lifetime."""
@@ -307,7 +307,7 @@ def test_context_manager_exit_on_another_thread_releases(PRR015=None):
         pass
 
 
-def test_eviction_never_removes_pinned_or_held(monkeypatch, PRR011=None):
+def test_eviction_never_removes_pinned_or_held(monkeypatch):
     """Registry cap with a GENUINELY pinned (fetched, not yet acquired)
     key (feedback PRR-011: the previous version never created one, so the
     pin machinery — the plan's BLOCKER-1 fix — had zero coverage)."""
@@ -367,3 +367,150 @@ def test_eviction_never_removes_pinned_or_held(monkeypatch, PRR011=None):
         monkeypatch.setattr(vmlocks, "_MAX_LOCKS", _MAX_LOCKS)
     # Pins never leak once the acquires resolve.
     assert _pins.get("evict-pinned", 0) == 0
+
+# ---------------------------------------------------------------------------
+# W1.2 / W1.3 — issue #59 (wave 59-64-68-70-hardening): pins for PR #58
+# review fixes that had no asserting test at base. These test nodes are
+# absent at base (pytest exit 4 RED signature) and GREEN after the fix.
+# The defaulted-parameter guardrail pattern for this file is
+# PRR0[0-9]+[a-z]*=None (two-digit ids were invisible to the old pattern).
+
+
+def test_job_stop_vmbusy_propagates_as_busy(monkeypatch):
+    """A VMBusy raised by job_stop's guest stop leg propagates (the tool
+    wrapper envelopes it as error_class=busy with holder) instead of being
+    rewritten into a transport result (feedback PRR-002)."""
+    from hyperv_mcp import guestjobs
+    from hyperv_mcp.config import Config as _Cfg
+
+    cfg = _Cfg()
+    entry = {
+        "job_id": "j-busy", "vm_id": "00000000-0000-0000-0000-000000000001",
+        "vm_name": "vm", "pid": 4321, "stopped": False,
+        "row_state": "running", "owner": None, "in_flight": False,
+        "job_dir": "C:/tmp/j-busy", "start_time_ticks": 1,
+    }
+    with guestjobs._jobs_lock:
+        guestjobs._jobs["j-busy"] = entry
+
+    def _raise_busy(*_a, **_k):
+        raise vmlocks.VMBusy(
+            "write lock held", holder={"tool": "other", "mode": "write"},
+            waited_ms=7,
+        )
+
+    monkeypatch.setattr(guestjobs, "run_guest_inner", _raise_busy)
+    monkeypatch.setattr(
+        guestjobs, "_entry_credential",
+        lambda cfg, entry: SimpleNamespace(username="u", password="p"),
+    )
+    with pytest.raises(vmlocks.VMBusy) as excinfo:
+        guestjobs.job_stop(cfg, "j-busy")
+    assert getattr(excinfo.value, "holder", None) == {
+        "tool": "other", "mode": "write",
+    }
+    # and the envelope machinery classifies it busy (holder rides the error)
+    cls = errors.classify(vmlocks.VMBusy("held", holder={"tool": "x"}))
+    assert cls == "busy"
+
+
+def test_swallowed_lock_failure_keeps_busy_class(monkeypatch):
+    """Swallowed lock failures keep error_class=busy: the evidence UIA walk
+    records it in the ui_tree field and a repair apply records it in the
+    change dict (feedback PRR-004 classification)."""
+    from types import SimpleNamespace as _NS
+
+    from hyperv_mcp import evidence
+    from hyperv_mcp import repair as repair_module
+    from hyperv_mcp.config import Config as _Cfg
+    from hyperv_mcp.credentials import CredentialSet
+
+    def _raise_busy(*_a, **_k):
+        raise vmlocks.VMBusy("read lock held", holder={"tool": "writer"})
+
+    # evidence leg: the ps_direct walk swallow site (evidence.py PRR-004).
+    cfg = _Cfg()
+    monkeypatch.setattr(evidence.vmident, "resolve",
+                        lambda *a, **k: _NS(id="g-1", name="vm"))
+    monkeypatch.setattr(evidence.console, "screenshot",
+                        lambda *a, **k: (object(), {"ok": True}))
+    monkeypatch.setattr(evidence, "_uia_via_helper", lambda *a, **k: None)
+    monkeypatch.setattr(evidence, "run_guest_inner", _raise_busy)
+    result = evidence.capture_evidence(
+        cfg, "vm", ui_tree=True, cred=CredentialSet("Administrator", "pw"))
+    ui_tree = result["meta"]["ui_tree"]
+    assert ui_tree["ok"] is False and ui_tree["error_class"] == "busy"
+
+    # repair leg: the apply-loop swallow site (repair.py PRR-004).
+    cfg.destructive.guest_repair = True  # require_destructive gate
+    monkeypatch.setattr(repair_module.vmident, "resolve",
+                        lambda *a, **k: _NS(id="g-1", name="vm"))
+    monkeypatch.setattr(repair_module, "_plan_items", lambda report: [{
+        "action": "start_sshd", "target": "sshd", "before": "stopped",
+        "apply_script": "Start-Service sshd", "verify_finding": "f-sshd",
+    }])
+    monkeypatch.setattr(repair_module.diagnostics, "diagnose_report",
+                        lambda *a, **k: {"findings": []})
+    monkeypatch.setattr(repair_module, "run_guest_inner", _raise_busy)
+    out = repair_module.repair_guest_access(
+        cfg, "vm", apply=True, confirm=True,
+        cred=CredentialSet("Administrator", "pw"))
+    change = out["changes"][0]
+    assert change["applied"] is False
+    assert change["error_class"] == "busy"
+
+
+def test_job_stop_busy_envelope_through_the_tool_wrapper(monkeypatch):
+    """issue #59 AC2 wrapper leg: a VMBusy raised by job_stop's guest leg
+    reaches the MCP envelope as error_class=busy with the holder dict
+    intact (the direct re-raise is pinned separately; this drives the
+    registered tool the way an MCP client does)."""
+    import asyncio as _aio
+    import importlib as _il
+    import json as _json
+
+    from hyperv_mcp import guestjobs as _gj
+
+    mod = _il.reload(server)
+    mod.bootstrap({"HYPERV_MCP_UNRESTRICTED": "1"})
+
+    entry = {
+        "job_id": "j-wrap", "vm_id": "00000000-0000-0000-0000-000000000003",
+        "vm_name": "vm", "pid": 4321, "stopped": False,
+        "row_state": "running", "owner": None, "in_flight": False,
+        "job_dir": "C:/tmp/j-wrap", "start_time_ticks": 1,
+    }
+    with _gj._jobs_lock:
+        _gj._jobs["j-wrap"] = entry
+    try:
+
+        def _raise_busy(*_a, **_k):
+            raise vmlocks.VMBusy(
+                "write lock held", holder={"tool": "other", "mode": "write"},
+                waited_ms=7,
+            )
+
+        monkeypatch.setattr(_gj, "run_guest_inner", _raise_busy)
+        monkeypatch.setattr(
+            _gj, "_entry_credential",
+            lambda cfg, entry: SimpleNamespace(username="u", password="p"),
+        )
+        result = _aio.run(mod.get_mcp().call_tool(
+            "hyperv_guest_job_stop", {"job_id": "j-wrap"}))
+        assert getattr(result, "is_error", False), (
+            f"the busy envelope must be an error result; got {result!r}"
+        )
+        text = result.content[0].text
+        payload = _json.loads(text)
+        assert payload.get("error_class") == "busy", (
+            f"envelope must carry error_class=busy; got {payload!r}"
+        )
+        holder = (payload.get("error") or {}).get("holder") if isinstance(
+            payload.get("error"), dict) else payload.get("holder")
+        assert holder == {"tool": "other", "mode": "write"}, (
+            f"envelope must carry the holder dict intact; got {payload!r}"
+        )
+    finally:
+        with _gj._jobs_lock:
+            _gj._jobs.pop("j-wrap", None)
+        _il.reload(server)

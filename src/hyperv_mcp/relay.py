@@ -1066,7 +1066,13 @@ def relay_status(cfg: Config, relay_id: str = "", *, owner: str | None = None) -
     # round 1). The local view is read under the lock, then the store, then the
     # lock again only to consult the local view — mirroring guestjobs._lookup.
     with _relays_lock:
-        local = dict(_relays)
+        # Issue #70 PRR-046: snapshot the VALUES too (dict(_relays) copied
+        # only the mapping; the entry dicts stayed live, so a concurrent
+        # stop mutating stopped/cred mid row-build could tear a row).
+        # Shallow per-entry copies keep the context/thread references the
+        # row-builder snapshots under counter_lock; the documented
+        # store-lock/registry-lock ordering is unchanged.
+        local = {k: dict(v) for k, v in _relays.items()}
     if relay_id:
         entry = local.get(relay_id)
         if entry is None:

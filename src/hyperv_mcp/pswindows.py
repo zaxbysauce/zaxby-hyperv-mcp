@@ -30,6 +30,7 @@ import time
 from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Protocol, TypeVar
 
 import anyio
@@ -436,6 +437,9 @@ _POLL_SLICE_S = 0.2  # communicate() polling slice; also the cancellation window
 _DRAIN_TIMEOUT_S = 2.0  # bound on the post-kill partial-output drain
 _SLOT_RETRY_S = 0.05
 _SLOT_ACLS_DONE: set[str] = set()  # directories already hardened (best effort)
+# Issue #64 pool state: the once-per-process marker publication flag and the
+# once-per-process divergence-warning keys. Tests swap this atomically.
+_PS_POOL_STATE = SimpleNamespace(warned=set(), marker_written=False)
 
 
 def _ps_slot_dir() -> Path:
@@ -475,6 +479,108 @@ def _ps_slot_dir() -> Path:
         # _SLOT_ACLS_DONE keeps it once-per-directory per process.
         _harden_slot_dir_acl(directory)
     return directory
+
+
+def _default_ps_slot_dir() -> Path:
+    """The platform-default slot directory (what _ps_slot_dir resolves when
+    no ps_slot_dir is configured) — the host-visible default the dir
+    divergence warning compares against (issue #64)."""
+    import tempfile
+
+    if os.name == "nt" and os.environ.get("ProgramData"):
+        return Path(os.environ["ProgramData"]) / "hyperv-mcp" / "ps-slots"
+    return Path(tempfile.gettempdir()) / "hyperv-mcp-ps-slots"
+
+
+# Issue #64: per-process pool state for the identity marker and the
+# once-per-process divergence warnings. A SimpleNamespace so tests can swap
+# it atomically; never mutated cross-thread except under _PS_POOL_LOCK.
+_PS_POOL_LOCK = threading.Lock()
+
+
+def _publish_pool_marker(directory: Path, cap: int) -> None:
+    """Publish pool.meta (the pool's cap record) atomically.
+
+    Cross-process arbitration: the publication lock (same byte-lock
+    mechanism as the slot files) serializes publishers; under the lock the
+    existing marker is re-checked and a VALID one defers (first valid
+    publisher wins; a divergent later config warns via the normal divergence
+    path instead of rewriting). The payload rides a PID-unique temp file so
+    a concurrent reader never observes partial JSON; os.replace publishes
+    it atomically."""
+    meta = directory / "pool.meta"
+    tmp = directory / f"pool.meta.tmp.{os.getpid()}.{threading.get_ident()}"
+    lock_fd = None
+    try:
+        lock_fd = _try_lock_slot(directory / "pool.meta.lock")
+        if lock_fd is not None:
+            # Arbitration held: defer to a valid existing marker.
+            try:
+                payload = json.loads(meta.read_text(encoding="utf-8"))
+                if isinstance(payload, dict) and isinstance(payload.get("cap"), int):
+                    return  # a valid marker already exists; never rewrite
+            except (OSError, ValueError):
+                if meta.exists():
+                    # A corrupt legacy marker (partial write from a
+                    # non-atomic creator) is repaired loudly, never silently.
+                    logemit.log_line(
+                        f"pswindows: {meta.name} unreadable or corrupt in "
+                        f"slot directory {directory.name}; republishing the "
+                        f"local cap"
+                    )
+        payload = json.dumps({"cap": int(cap)})
+        tmp.write_text(payload, encoding="utf-8")
+        # A concurrent reader holding meta open makes the replace transiently
+        # fail on Windows (Access denied); retry briefly, then re-raise.
+        for attempt in range(5):
+            try:
+                os.replace(tmp, meta)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.01 * (attempt + 1))
+    finally:
+        if lock_fd is not None:
+            _release_ps_slot(lock_fd)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _read_pool_cap(directory: Path, local_cap: int) -> int:
+    """The effective pool cap: a valid recorded pool.meta cap wins (a
+    cap-64 process cannot exceed a recorded cap-8 pool); an absent or
+    corrupt marker logs a loud warning naming the file and republishes the
+    local cap (a partial-write legacy is repaired on first read), never
+    silently authorizing the local cap without the warning."""
+    meta = directory / "pool.meta"
+    try:
+        raw = meta.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+        recorded = payload.get("cap")
+        if isinstance(recorded, int) and 1 <= recorded <= 64:
+            return recorded
+        raise ValueError(f"invalid recorded cap {recorded!r}")
+    except FileNotFoundError:
+        return local_cap  # first use: publish below
+    except (OSError, ValueError):
+        logemit.log_line(
+            f"pswindows: {meta.name} unreadable or corrupt in slot directory "
+            f"{directory.name}; republishing the local cap {local_cap}"
+        )
+        _publish_pool_marker(directory, local_cap)  # repair the legacy
+        return local_cap
+
+
+def _warn_once(key: tuple, message: str) -> None:
+    """One warning per process per divergence key (issue #64)."""
+    with _PS_POOL_LOCK:
+        if key in _PS_POOL_STATE.warned:
+            return
+        _PS_POOL_STATE.warned.add(key)
+    logemit.log_line(message)
 
 
 def _harden_slot_dir_acl(directory: Path) -> None:
@@ -566,20 +672,53 @@ def _acquire_ps_slot() -> int:
 
     The wait itself observes anyio cancellation each retry tick, so a
     cancelled caller never sits out the full bound and never gets told to
-    retry a call it cancelled.
+    retry a call it cancelled. Issue #64: the slot directory records the
+    pool's cap (pool.meta, atomically published under a publication lock);
+    the effective cap is the recorded one when a valid marker exists, so a
+    cap-64 process cannot exceed a recorded cap-8 pool; cap and directory
+    divergence are warned once per process. The inter-attempt wait backs off
+    exponentially from 5 ms to a 200 ms ceiling, with every sleep capped to
+    the remaining deadline so a short budget never overshoots by a full
+    ceiling.
     """
     if _config is None:
         raise PowerShellTransportError("pswindows.init() was not called")
-    cap = _config.max_host_powershell
+    local_cap = int(_config.max_host_powershell)
     wait_s = float(_config.host_powershell_wait_s)
     directory = _ps_slot_dir()
+    # Issue #64: pool identity + divergence warnings (once per process).
+    if not _PS_POOL_STATE.marker_written:
+        with _PS_POOL_LOCK:
+            if not _PS_POOL_STATE.marker_written:
+                _publish_pool_marker(directory, local_cap)
+                _PS_POOL_STATE.marker_written = True
+    recorded = _read_pool_cap(directory, local_cap)
+    if recorded != local_cap:
+        _warn_once(
+            ("cap", directory, local_cap),
+            f"pswindows: configured max_host_powershell {local_cap} differs "
+            f"from the recorded pool cap {recorded} in slot directory "
+            f"{directory.name}; the recorded cap bounds this process",
+        )
+    if _config.ps_slot_dir:
+        default_dir = _default_ps_slot_dir()
+        if directory != default_dir:
+            _warn_once(
+                ("dir", directory),
+                f"pswindows: configured ps_slot_dir {directory} differs from "
+                f"the platform default {default_dir}; the two pools do not "
+                "share slot files",
+            )
+    cap = recorded  # the effective cap: sweep/index/busy text use ONE value
     names = [directory / f"slot-{i:02d}.lock" for i in range(cap)]
     started = time.monotonic()
     deadline = started + wait_s
     start_index = (threading.get_ident() + int(started * 1000)) % cap
+    backoff_s = 0.005
     while True:
         for offset in range(cap):
-            if wait_s and time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if wait_s and remaining <= 0:
                 break  # check the deadline inside the sweep: never overshoot
             fd = _try_lock_slot(names[(start_index + offset) % cap])
             if fd is not None:
@@ -591,7 +730,9 @@ def _acquire_ps_slot() -> int:
                 f"already running; waited {waited:.3g}s"
             )
         _check_ps_cancellation()
-        time.sleep(_SLOT_RETRY_S)
+        # Exponential backoff, capped to the remaining deadline (issue #64).
+        time.sleep(min(backoff_s, max(deadline - time.monotonic(), 0.001)))
+        backoff_s = min(backoff_s * 2, 0.2)
 
 
 def _release_ps_slot(fd: int) -> None:

@@ -830,7 +830,7 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
   "host_powershell_path": null,        // default: Windows PowerShell 5.1
   "verify_sha256": false,              // default integrity check for transfers
   "ps_timeout_s": 120,                 // default host PowerShell timeout
-  "vm_lock_wait_s": 30,                // per-VM lock bounded wait, 0..600 s (0 = fail fast)
+  "vm_lock_wait_s": 30,                // per-VM lock bounded wait, 0..600 s (0 = fail fast; also bounds the documented PS-free admission delay, issue #68)
   "max_host_powershell": 8,            // host-wide concurrent powershell.exe cap, 1..64 (issue #15)
   "host_powershell_wait_s": 60,        // oversubscribed-leg bounded wait, 0..600 s, int or float
                                        // (0 = fail immediately with a busy error)
@@ -1257,7 +1257,14 @@ repair apply exclude everything. A conflicting call waits up to
 error whose payload carries `holder` — `{tool, mode, since, held_ms}` — so
 the caller can see what holds the VM and for how long. Waiting writers are
 admitted before newly arriving readers, so polling reads cannot starve a
-checkpoint restore. Console input runs under a read lock on the VM key
+checkpoint restore. Documented admission bound (issue #68): the tool-limiter
+resize (2x `max_host_powershell`) reserves no class for PS-free tools, so
+lock-queued calls occupying every limiter token delay PS-free admission up to the `vm_lock_wait_s` bound
+(measured worst case: 1 lock holder + 15 lock-queued calls); the agent-fairness
+reserve is the planned issue-#68-supplement admission layer. The limiter
+bound is restored on server-lifespan exit, so co-tenant `to_thread` users
+keep their own token count; in-process embedders driving `call_tool` never
+enter the lifespan and keep anyio's 40-token default. Console input runs under a read lock on the VM key
 (guest work proceeds during typing) plus a write lock on a second per-VM
 key, so two agents cannot interleave keystrokes. Both keys derive from the
 resolved GUID on every transport since issue #77: operations whose stdout
@@ -1282,10 +1289,18 @@ cap for the whole host. A pooled worker holds its slot for its whole LIFETIME
 rather than for the duration of a call, which is why the pool reserves two
 slots of headroom (`max_host_powershell - 2`) and installs no pool at all
 below a host cap of 3: see the session-reuse section below. The cap is only as wide as the slot directory:
-servers configured with different `ps_slot_dir` values run separate pools,
-and a server started with a smaller `max_host_powershell` sees only its own
-first N slots (the effective host-wide bound is then the largest configured
-cap) — keep one slot directory and one cap per host. The wait does not
+servers configured with different `ps_slot_dir` values run separate pools
+(each divergence is warned once per process, naming both directories), and
+the slot directory records the pool's cap in a `pool.meta` marker (published
+atomically under a publication lock; a corrupt marker is repaired loudly on
+first read). A process whose configured `max_host_powershell` differs from
+the recorded cap is warned once, naming both values, and honors the
+RECORDED cap — a cap-64 process cannot exceed a recorded cap-8 pool (issue
+#64) — so keep one slot directory and one cap per host. The inter-attempt
+wait backs off exponentially from 5 ms to a 200 ms ceiling (each sleep
+capped to the remaining deadline), so a saturated wait performs far fewer
+lock attempts than the previous fixed 50 ms cadence; cancellation is still
+observed on every retry tick. The wait does not
 consume the leg's own timeout: a caller that queues gets its full
 `timeout_s` budget once it holds a slot. A caller that cannot get a slot
 within `host_powershell_wait_s` (default 60 s) gets a retryable `busy`
