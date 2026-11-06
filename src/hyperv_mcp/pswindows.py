@@ -535,7 +535,9 @@ def _publish_pool_marker(directory: Path, cap: int) -> bool:
         try:
             payload = json.loads(meta.read_text(encoding="utf-8"))
             recorded = payload.get("cap") if isinstance(payload, dict) else None
-            if isinstance(recorded, int) and 1 <= recorded <= 64:
+            # A JSON boolean is NOT a cap (isinstance(True, int) is True in
+            # Python - round-3 review question 2): exclude bools explicitly.
+            if isinstance(recorded, int) and not isinstance(recorded, bool)                     and 1 <= recorded <= 64:
                 return True  # a valid marker already exists; never rewrite
             corrupt_existing = meta.exists()  # valid JSON, unusable marker
         except (OSError, ValueError):
@@ -583,11 +585,11 @@ def _read_pool_cap(directory: Path, local_cap: int) -> int:
         raw = meta.read_text(encoding="utf-8")
         payload = json.loads(raw)
         recorded = payload.get("cap") if isinstance(payload, dict) else None
-        if isinstance(recorded, int) and 1 <= recorded <= 64:
+        if isinstance(recorded, int) and not isinstance(recorded, bool)                 and 1 <= recorded <= 64:
             return recorded
         # Valid JSON but not a usable marker (null, list, out-of-range cap):
         # the repair contract is the same loud warn + republish.
-        raise ValueError(f"invalid recorded cap {recorded!r}")
+        raise ValueError(f"invalid recorded cap {recorded!r}")  # bool excluded
     except FileNotFoundError:
         if first_publication_done:
             # The marker existed once (this process published it) and is
@@ -599,6 +601,16 @@ def _read_pool_cap(directory: Path, local_cap: int) -> int:
                 f"the local cap {local_cap}"
             )
             _publish_pool_marker(directory, local_cap)
+            # Same contract as the corrupt-repair branch: the repair may
+            # have deferred to another process's valid marker - re-read
+            # once (round-3 review question 1).
+            try:
+                payload = json.loads(meta.read_text(encoding="utf-8"))
+                recorded = payload.get("cap") if isinstance(payload, dict) else None
+                if isinstance(recorded, int) and not isinstance(recorded, bool)                         and 1 <= recorded <= 64:
+                    return recorded
+            except (OSError, ValueError):
+                pass
         return local_cap  # genuine first use: publish below
     except (OSError, ValueError, AttributeError):
         logemit.log_line(

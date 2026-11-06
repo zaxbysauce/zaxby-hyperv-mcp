@@ -511,9 +511,11 @@ def test_defer_to_valid_marker_is_pinned(pool_env):
 
 
 def test_corrupt_shapes_repaired_on_the_fresh_process_path(pool_env):
-    """Round-2 review F3 falsifier: the NORMAL fresh-process path
-    (marker_written False, publisher runs first) must warn + repair corrupt
-    valid-JSON shapes - not silently overwrite them."""
+    """Round-2 review F3 falsifier: corrupt valid-JSON shapes must be
+    warned + repaired, never silently overwritten. The first shape drives
+    the NORMAL fresh-process path (marker_written False, publisher runs
+    first); subsequent shapes exercise the reader repair path (marker
+    already published this process) - both paths carry the same contract."""
     import json as _json
 
     for shape in ("null", "[]", '{"cap": 100}'):

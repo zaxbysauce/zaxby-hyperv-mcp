@@ -88,20 +88,27 @@ def test_guest_reads_share_vm_and_writer_waits(it, monkeypatch):
     _real_vm_lock = filetransfer.vmlocks.vm_lock
 
     class _RecordingLock:
-        def __init__(self, real_cm):
+        def __init__(self, real_cm, read_mode):
             self._real = real_cm
+            self._read = read_mode
 
         def __enter__(self):
             return self._real.__enter__()
 
         def __exit__(self, *exc):
             # STILL INSIDE the lock-wrapped section: the real unlock has not
-            # run yet - this is the instant AC4 wants.
-            release_instants.append(time.monotonic())
+            # run yet - this is the instant AC4 wants. Only READ-mode
+            # releases are recorded: the writer's checkpoint_create shares
+            # this vmlocks module (round-3 review: filetransfer.vmlocks IS
+            # lifecycle.vmlocks) and its write-lock release must not enter
+            # the reader-release set.
+            if self._read:
+                release_instants.append(time.monotonic())
             return self._real.__exit__(*exc)
 
     def _recording_vm_lock(key, mode="write", **kw):
-        return _RecordingLock(_real_vm_lock(key, mode=mode, **kw))
+        return _RecordingLock(_real_vm_lock(key, mode=mode, **kw),
+                              read_mode=(mode == "read"))
 
     monkeypatch.setattr(filetransfer.vmlocks, "vm_lock", _recording_vm_lock)
 
