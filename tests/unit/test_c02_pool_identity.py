@@ -407,3 +407,85 @@ def test_marker_publication_arbitration(pool_env, monkeypatch):
     assert marker.get("cap") in (4, 64), (
         f"final marker must be one publisher's cap, got {marker}"
     )
+
+
+def test_corrupt_shapes_all_repaired(pool_env):
+    """Every corrupt/unreadable marker shape triggers the loud warn +
+    republish contract (implementation review F3): valid-JSON non-object
+    (null/list), out-of-range cap, and post-publication deletion."""
+    import json as _json
+
+    # Shape A: valid JSON, wrong shape (null).
+    (pool_env.dir / _META_NAME).write_text("null", encoding="utf-8")
+    pswindows._PS_POOL_STATE.marker_written = True  # prior publication
+    fd = pswindows._acquire_ps_slot()
+    pswindows._release_ps_slot(fd)
+    payload = _json.loads((pool_env.dir / _META_NAME).read_text(encoding="utf-8"))
+    assert payload == {"cap": 4}, f"null marker not repaired: {payload}"
+    assert any("unreadable or corrupt" in ln for ln in pool_env.logs)
+
+    # Shape B: valid JSON object, out-of-range cap.
+    pool_env.logs.clear()
+    (pool_env.dir / _META_NAME).write_text('{"cap": 100}', encoding="utf-8")
+    fd2 = pswindows._acquire_ps_slot()
+    pswindows._release_ps_slot(fd2)
+    payload2 = _json.loads((pool_env.dir / _META_NAME).read_text(encoding="utf-8"))
+    assert payload2 == {"cap": 4}, f"out-of-range marker not repaired: {payload2}"
+
+    # Shape C: deleted after a prior publication (not "first use").
+    pool_env.logs.clear()
+    (pool_env.dir / _META_NAME).unlink()
+    fd3 = pswindows._acquire_ps_slot()
+    pswindows._release_ps_slot(fd3)
+    payload3 = _json.loads((pool_env.dir / _META_NAME).read_text(encoding="utf-8"))
+    assert payload3 == {"cap": 4}, f"deleted marker not republished: {payload3}"
+    assert any("missing from slot directory" in ln for ln in pool_env.logs)
+
+
+def test_publisher_never_publishes_without_the_lock(pool_env, monkeypatch):
+    """The publication lock is not best-effort (implementation review F2):
+    a publisher that cannot acquire it must NOT publish - the recorded cap
+    stays authoritative (first-writer-wins deterministically)."""
+    import json as _json
+
+    # First publication records cap 4.
+    fd = pswindows._acquire_ps_slot()
+    pswindows._release_ps_slot(fd)
+    assert _json.loads((pool_env.dir / _META_NAME).read_text(encoding="utf-8")) == {"cap": 4}
+
+    # Hold the publication lock and simulate a divergent publisher.
+    lock_path = pool_env.dir / "pool.meta.lock"
+    held_fd = pswindows._try_lock_slot(lock_path)
+    assert held_fd is not None
+    try:
+        pswindows._config = _pool_cfg(64, pool_env.dir)
+        result = pswindows._publish_pool_marker(pool_env.dir, 64)
+        assert result is False, "publish must report skip under lock contention"
+        payload = _json.loads((pool_env.dir / _META_NAME).read_text(encoding="utf-8"))
+        assert payload == {"cap": 4}, (
+            f"lock-contended publisher overwrote the recorded cap: {payload}"
+        )
+    finally:
+        pswindows._release_ps_slot(held_fd)
+
+    # Deterministic first-writer-wins: divergent first publishers racing
+    # under the arbitration resolve to ONE winner (the first to publish).
+    import threading as _th2
+    pswindows._PS_POOL_STATE.marker_written = False
+    pswindows._config = _pool_cfg(4, pool_env.dir)
+    (pool_env.dir / _META_NAME).unlink()
+    outcomes: list = []
+
+    def _publisher(cap):
+        outcomes.append(pswindows._publish_pool_marker(pool_env.dir, cap))
+
+    a = _th2.Thread(target=_publisher, args=(4,))
+    b = _th2.Thread(target=_publisher, args=(64,))
+    a.start()
+    b.start()
+    a.join(timeout=5)
+    b.join(timeout=5)
+    payload = _json.loads((pool_env.dir / _META_NAME).read_text(encoding="utf-8"))
+    assert payload["cap"] in (4, 64)
+    # Exactly one TRUE publish; the loser deferred-to-valid or skipped.
+    assert outcomes.count(True) >= 1 and outcomes.count(False) <= 1

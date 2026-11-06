@@ -179,7 +179,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.11.0 today) instead of
+  package's version (0.12.0 today) instead of
   the SDK's.
 - **In-process embedders see the 2.x call shape.** `call_tool()` returns a
   `CallToolResult` (`.content`, `.structured_content`, `.is_error`) instead
@@ -227,7 +227,7 @@ definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
 
-## 0.11.0 changes
+## 0.12.0 changes
 
 - Frozen-check amendments (issues #63/#66): the Workstream C/D acceptance checks now
   discriminate tree-kill (event-synchronized unwind seam), the run_ps worker-thread
@@ -241,7 +241,7 @@ the task-spawned controller reads it from the environment.
   `docs/issue-trace-drift-inventory.md` (live drift state), and
   `scripts/gen_trace_drift_inventory.py` (`--check` gate with fail-closed marker,
   clean-checkout, and snapshot-refusal guards).
-- Version bump: 0.10.0 -> 0.11.0 (`pyproject.toml`, package `__version__`,
+- Version bump: 0.10.0 -> 0.12.0 (`pyproject.toml`, package `__version__`,
   `test_c03_sdk_port.py`'s expected literal; `test_version_consistency.py` pins the sites).
 
 ## 0.10.0 changes

@@ -723,9 +723,6 @@ async def _run_proxy(
         return 0
 
 
-_EMITTED = [False]  # retained name for any external reference; unused by the
-# emission path below (issue #70 replaced the flag with claim-based ownership).
-
 # Issue #70 emission ownership: emitters currently inside _fail_outstanding.
 # Single event loop; claimed ids are removed from the shared set
 # synchronously, so every id is claimed exactly once.

@@ -498,7 +498,7 @@ def _default_ps_slot_dir() -> Path:
 _PS_POOL_LOCK = threading.Lock()
 
 
-def _publish_pool_marker(directory: Path, cap: int) -> None:
+def _publish_pool_marker(directory: Path, cap: int) -> bool:
     """Publish pool.meta (the pool's cap record) atomically.
 
     Cross-process arbitration: the publication lock (same byte-lock
@@ -510,24 +510,41 @@ def _publish_pool_marker(directory: Path, cap: int) -> None:
     it atomically."""
     meta = directory / "pool.meta"
     tmp = directory / f"pool.meta.tmp.{os.getpid()}.{threading.get_ident()}"
-    lock_fd = None
-    try:
+    # Issue #64 (implementation review F2): the arbitration lock is NOT
+    # best-effort - a publisher that cannot acquire it must NOT publish
+    # (a divergent loser overwriting a valid recorded cap defeats
+    # record-once/first-writer-wins). Retry briefly, then give up WITHOUT
+    # publishing; the caller leaves marker_written False so a later
+    # acquire retries, and _read_pool_cap keeps honoring the recorded cap.
+    for _attempt in range(5):
         lock_fd = _try_lock_slot(directory / "pool.meta.lock")
         if lock_fd is not None:
-            # Arbitration held: defer to a valid existing marker.
-            try:
-                payload = json.loads(meta.read_text(encoding="utf-8"))
-                if isinstance(payload, dict) and isinstance(payload.get("cap"), int):
-                    return  # a valid marker already exists; never rewrite
-            except (OSError, ValueError):
-                if meta.exists():
-                    # A corrupt legacy marker (partial write from a
-                    # non-atomic creator) is repaired loudly, never silently.
-                    logemit.log_line(
-                        f"pswindows: {meta.name} unreadable or corrupt in "
-                        f"slot directory {directory.name}; republishing the "
-                        f"local cap"
-                    )
+            break
+        time.sleep(0.01 * (_attempt + 1))
+    if lock_fd is None:
+        logemit.log_line(
+            f"pswindows: {meta.name} publication lock contended in slot "
+            f"directory {directory.name}; skipping this publication (the "
+            "recorded cap, if any, stays authoritative)"
+        )
+        return False
+    try:
+        # Arbitration held: defer to a VALID existing marker (dict shape
+        # AND 1..64 range - an out-of-range int is corrupt, not valid).
+        try:
+            payload = json.loads(meta.read_text(encoding="utf-8"))
+            recorded = payload.get("cap") if isinstance(payload, dict) else None
+            if isinstance(recorded, int) and 1 <= recorded <= 64:
+                return True  # a valid marker already exists; never rewrite
+        except (OSError, ValueError):
+            if meta.exists():
+                # A corrupt legacy marker (partial write from a non-atomic
+                # creator) is repaired loudly, never silently.
+                logemit.log_line(
+                    f"pswindows: {meta.name} unreadable or corrupt in "
+                    f"slot directory {directory.name}; republishing the "
+                    f"local cap"
+                )
         payload = json.dumps({"cap": int(cap)})
         tmp.write_text(payload, encoding="utf-8")
         # A concurrent reader holding meta open makes the replace transiently
@@ -540,6 +557,7 @@ def _publish_pool_marker(directory: Path, cap: int) -> None:
                 if attempt == 4:
                     raise
                 time.sleep(0.01 * (attempt + 1))
+        return True
     finally:
         if lock_fd is not None:
             _release_ps_slot(lock_fd)
@@ -556,16 +574,29 @@ def _read_pool_cap(directory: Path, local_cap: int) -> int:
     local cap (a partial-write legacy is repaired on first read), never
     silently authorizing the local cap without the warning."""
     meta = directory / "pool.meta"
+    first_publication_done = _PS_POOL_STATE.marker_written
     try:
         raw = meta.read_text(encoding="utf-8")
         payload = json.loads(raw)
-        recorded = payload.get("cap")
+        recorded = payload.get("cap") if isinstance(payload, dict) else None
         if isinstance(recorded, int) and 1 <= recorded <= 64:
             return recorded
+        # Valid JSON but not a usable marker (null, list, out-of-range cap):
+        # the repair contract is the same loud warn + republish.
         raise ValueError(f"invalid recorded cap {recorded!r}")
     except FileNotFoundError:
-        return local_cap  # first use: publish below
-    except (OSError, ValueError):
+        if first_publication_done:
+            # The marker existed once (this process published it) and is
+            # now gone: that is out-of-band deletion, not "first use" -
+            # repair loudly per the docstring contract.
+            logemit.log_line(
+                f"pswindows: {meta.name} missing from slot directory "
+                f"{directory.name} after a prior publication; republishing "
+                f"the local cap {local_cap}"
+            )
+            _publish_pool_marker(directory, local_cap)
+        return local_cap  # genuine first use: publish below
+    except (OSError, ValueError, AttributeError):
         logemit.log_line(
             f"pswindows: {meta.name} unreadable or corrupt in slot directory "
             f"{directory.name}; republishing the local cap {local_cap}"
@@ -690,8 +721,9 @@ def _acquire_ps_slot() -> int:
     if not _PS_POOL_STATE.marker_written:
         with _PS_POOL_LOCK:
             if not _PS_POOL_STATE.marker_written:
-                _publish_pool_marker(directory, local_cap)
-                _PS_POOL_STATE.marker_written = True
+                published = _publish_pool_marker(directory, local_cap)
+                if published:
+                    _PS_POOL_STATE.marker_written = True
     recorded = _read_pool_cap(directory, local_cap)
     if recorded != local_cap:
         _warn_once(
