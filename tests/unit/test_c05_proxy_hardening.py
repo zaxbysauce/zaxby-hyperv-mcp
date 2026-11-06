@@ -29,7 +29,13 @@ pre-fix tree for the named reasons.
 """
 
 import asyncio
+import sys
 from types import SimpleNamespace
+
+if sys.version_info >= (3, 11):
+    _BaseExceptionGroup = BaseExceptionGroup  # noqa: F821 (3.11 builtin)
+else:
+    from exceptiongroup import BaseExceptionGroup as _BaseExceptionGroup
 
 import anyio
 import pytest
@@ -151,7 +157,7 @@ def test_concurrent_failures_answer_every_id_exactly_once(monkeypatch):
     # The exit sentinel may arrive raw or wrapped in the task group's
     # exception group — accept both shapes, but it must be present.
     group = excinfo.value
-    if isinstance(group, BaseExceptionGroup):  # noqa: F821 (py311 builtin)
+    if isinstance(group, _BaseExceptionGroup):  # noqa: F821 (py311 builtin)
         codes = [getattr(item, "code", None) for item in group.exceptions]
     else:
         codes = [getattr(group, "code", None)]
@@ -214,7 +220,7 @@ def test_upstream_closed_carries_text(monkeypatch, capsys):
     group = asyncio.run(main())
 
     def _leaves(exc):
-        if isinstance(exc, BaseExceptionGroup):  # noqa: F821 (py311 builtin)
+        if isinstance(exc, _BaseExceptionGroup):  # noqa: F821 (py311 builtin)
             out = []
             for item in exc.exceptions:
                 out.extend(_leaves(item))
@@ -384,7 +390,7 @@ def test_blocked_send_blocks_peer_exit(monkeypatch):
     group = excinfo.value
 
     def _leaves(exc):
-        if isinstance(exc, BaseExceptionGroup):  # noqa: F821 (py311 builtin)
+        if isinstance(exc, _BaseExceptionGroup):  # noqa: F821 (py311 builtin)
             out = []
             for item in exc.exceptions:
                 out.extend(_leaves(item))
