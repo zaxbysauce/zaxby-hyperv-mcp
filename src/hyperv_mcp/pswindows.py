@@ -531,20 +531,24 @@ def _publish_pool_marker(directory: Path, cap: int) -> bool:
     try:
         # Arbitration held: defer to a VALID existing marker (dict shape
         # AND 1..64 range - an out-of-range int is corrupt, not valid).
+        corrupt_existing = False
         try:
             payload = json.loads(meta.read_text(encoding="utf-8"))
             recorded = payload.get("cap") if isinstance(payload, dict) else None
             if isinstance(recorded, int) and 1 <= recorded <= 64:
                 return True  # a valid marker already exists; never rewrite
+            corrupt_existing = meta.exists()  # valid JSON, unusable marker
         except (OSError, ValueError):
-            if meta.exists():
-                # A corrupt legacy marker (partial write from a non-atomic
-                # creator) is repaired loudly, never silently.
-                logemit.log_line(
-                    f"pswindows: {meta.name} unreadable or corrupt in "
-                    f"slot directory {directory.name}; republishing the "
-                    f"local cap"
-                )
+            corrupt_existing = meta.exists()
+        if corrupt_existing:
+            # A corrupt legacy marker (partial write, wrong JSON shape, or
+            # out-of-range cap) is repaired loudly, never silently (impl-
+            # review round-2: the fresh-process publisher path must warn).
+            logemit.log_line(
+                f"pswindows: {meta.name} unreadable or corrupt in "
+                f"slot directory {directory.name}; republishing the "
+                f"local cap"
+            )
         payload = json.dumps({"cap": int(cap)})
         tmp.write_text(payload, encoding="utf-8")
         # A concurrent reader holding meta open makes the replace transiently
@@ -602,6 +606,16 @@ def _read_pool_cap(directory: Path, local_cap: int) -> int:
             f"{directory.name}; republishing the local cap {local_cap}"
         )
         _publish_pool_marker(directory, local_cap)  # repair the legacy
+        # The repair may have DEFERRED to another process's valid marker
+        # (arbitration): re-read once so this acquire honors the recorded
+        # cap instead of assuming the local one (impl-review round-2 Q3).
+        try:
+            payload = json.loads(meta.read_text(encoding="utf-8"))
+            recorded = payload.get("cap") if isinstance(payload, dict) else None
+            if isinstance(recorded, int) and 1 <= recorded <= 64:
+                return recorded
+        except (OSError, ValueError):
+            pass
         return local_cap
 
 

@@ -241,7 +241,7 @@ the task-spawned controller reads it from the environment.
   `docs/issue-trace-drift-inventory.md` (live drift state), and
   `scripts/gen_trace_drift_inventory.py` (`--check` gate with fail-closed marker,
   clean-checkout, and snapshot-refusal guards).
-- Version bump: 0.10.0 -> 0.12.0 (`pyproject.toml`, package `__version__`,
+- Version bump: 0.11.0 -> 0.12.0 (`pyproject.toml`, package `__version__`,
   `test_c03_sdk_port.py`'s expected literal; `test_version_consistency.py` pins the sites).
 
 ## 0.10.0 changes

@@ -489,3 +489,48 @@ def test_publisher_never_publishes_without_the_lock(pool_env, monkeypatch):
     assert payload["cap"] in (4, 64)
     # Exactly one TRUE publish; the loser deferred-to-valid or skipped.
     assert outcomes.count(True) >= 1 and outcomes.count(False) <= 1
+
+
+def test_defer_to_valid_marker_is_pinned(pool_env):
+    """Direct no-rewrite pin (round-2 review P1 falsifier): a valid recorded
+    marker + free lock -> _publish_pool_marker defers (True) and the marker
+    is byte-identical afterwards. The P1 mutant (defer disabled) overwrites
+    and fails this test."""
+    import json as _json
+
+    fd = pswindows._acquire_ps_slot()
+    pswindows._release_ps_slot(fd)
+    before = (pool_env.dir / _META_NAME).read_bytes()
+    assert _json.loads(before) == {"cap": 4}
+    result = pswindows._publish_pool_marker(pool_env.dir, 64)
+    assert result is True, "defer to a valid marker must report True"
+    after = (pool_env.dir / _META_NAME).read_bytes()
+    assert after == before, (
+        f"a valid recorded marker was rewritten: {before!r} -> {after!r}"
+    )
+
+
+def test_corrupt_shapes_repaired_on_the_fresh_process_path(pool_env):
+    """Round-2 review F3 falsifier: the NORMAL fresh-process path
+    (marker_written False, publisher runs first) must warn + repair corrupt
+    valid-JSON shapes - not silently overwrite them."""
+    import json as _json
+
+    for shape in ("null", "[]", '{"cap": 100}'):
+        pool_env.logs.clear()
+        (pool_env.dir / _META_NAME).write_text(shape, encoding="utf-8")
+        fd = pswindows._acquire_ps_slot()
+        pswindows._release_ps_slot(fd)
+        payload = _json.loads((pool_env.dir / _META_NAME).read_text(encoding="utf-8"))
+        assert payload == {"cap": 4}, (
+            f"shape {shape}: fresh-process path did not repair to the local "
+            f"cap: {payload}"
+        )
+        assert any(
+            "unreadable or corrupt" in ln for ln in pool_env.logs
+        ), f"shape {shape}: the loud warning is missing: {pool_env.logs}"
+        # Subsequent acquisitions see a valid marker again.
+        fd2 = pswindows._acquire_ps_slot()
+        pswindows._release_ps_slot(fd2)
+        assert _json.loads(
+            (pool_env.dir / _META_NAME).read_text(encoding="utf-8")) == {"cap": 4}

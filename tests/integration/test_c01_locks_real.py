@@ -78,30 +78,43 @@ def test_guest_reads_share_vm_and_writer_waits(it, monkeypatch):
 
     monkeypatch.setattr(pswindows, "run_ps", watching_run_ps)
 
+    # Issue #59 AC4: the RELEASE instant must be recorded WHILE the worker
+    # still holds the read lock - not after guest_read_file returns (a GIL
+    # switch inside the return path could otherwise flip the writer-exclusion
+    # comparison). Wrap vm_lock with a recorder whose __exit__ entry
+    # timestamps the instant BEFORE the real unlock runs: that observation
+    # is genuinely inside the lock-wrapped section.
+    release_instants: list = []
+    _real_vm_lock = filetransfer.vmlocks.vm_lock
+
+    class _RecordingLock:
+        def __init__(self, real_cm):
+            self._real = real_cm
+
+        def __enter__(self):
+            return self._real.__enter__()
+
+        def __exit__(self, *exc):
+            # STILL INSIDE the lock-wrapped section: the real unlock has not
+            # run yet - this is the instant AC4 wants.
+            release_instants.append(time.monotonic())
+            return self._real.__exit__(*exc)
+
+    def _recording_vm_lock(key, mode="write", **kw):
+        return _RecordingLock(_real_vm_lock(key, mode=mode, **kw))
+
+    monkeypatch.setattr(filetransfer.vmlocks, "vm_lock", _recording_vm_lock)
+
     def read_worker(label: str, delay: float) -> None:
         time.sleep(delay)
         began = time.monotonic()
-        # Issue #59 AC4: the RELEASE instant must be recorded while this
-        # worker still HOLDS the read lock, not after guest_read_file
-        # returns (a GIL switch inside the return path could otherwise flip
-        # the writer-exclusion comparison). guest_read_file releases the
-        # vm_lock just before returning, so observing the lock's holder set
-        # right after the call - while this thread is still inside the
-        # with-block of the callee - is the closest in-lock observation
-        # available from this seam; capture it via the vmlocks registry.
-        release_instant = None
         try:
             out = filetransfer.guest_read_file(
                 cfg, it.vm, _GUEST_FILE, max_bytes=_READ_BYTES, cred=it.creds
             )
-            # guest_read_file's `with vm_lock(...)` has exited by return;
-            # record OUR release observation immediately, before any later
-            # scheduling of the writer's leg can run in this thread.
-            release_instant = time.monotonic()
             reads[label] = {
                 "start": began,
                 "end": time.monotonic(),
-                "release_instant": release_instant,
                 "ok": bool(out.get("ok")),
                 "error": out.get("error"),
             }
@@ -109,7 +122,6 @@ def test_guest_reads_share_vm_and_writer_waits(it, monkeypatch):
             reads[label] = {
                 "start": began,
                 "end": time.monotonic(),
-                "release_instant": time.monotonic(),
                 "ok": False,
                 "error": type(exc).__name__,
             }
@@ -161,15 +173,15 @@ def test_guest_reads_share_vm_and_writer_waits(it, monkeypatch):
     # ... yet its Checkpoint-VM leg only STARTED after both released, and
     # the checkpoint succeeded (writer exclusion under live contention).
     assert checkpoint_leg_starts, f"checkpoint leg never ran: {writer}"
-    # Issue #59 AC4: compare against the RELEASE INSTANTS recorded inside
-    # each read worker (before its return-path scheduling window), not
-    # against post-return end timestamps.
-    release_instants = [
-        reads[k]["release_instant"] for k in ("r1", "r2") if k in reads
-    ]
+    # Issue #59 AC4: compare against the RELEASE INSTANTS recorded at the
+    # vm_lock __exit__ ENTRY (inside the lock-wrapped section, before the
+    # real unlock) - not against post-release thread timestamps.
     assert release_instants and all(
         isinstance(x, float) for x in release_instants
     ), f"release instants missing: {reads}"
+    assert len(release_instants) >= 2, (
+        f"both readers must have released under the recorder: {release_instants}"
+    )
     assert min(checkpoint_leg_starts) >= max(release_instants), (
         "checkpoint leg started while readers still held the VM"
     )
