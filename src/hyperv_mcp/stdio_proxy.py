@@ -606,6 +606,12 @@ def _describe_failure(exc: BaseException | None) -> str:
         return "session ended"
     leaves = _iter_group_exceptions(exc)
     if len(leaves) == 1 and leaves[0] is exc:
+        cause = exc.__cause__
+        if cause is not None:
+            # PR #121 review PRR-018: a wrapper raised `from <cause>` should
+            # name the observed cause, not just the wrapper label.
+            return (f"{type(exc).__name__}: {exc} "
+                    f"({type(cause).__name__}: {cause})")
         return f"{type(exc).__name__}: {exc}"
     return "; ".join(f"{type(leaf).__name__}: {leaf}" for leaf in leaves[:3])
 
@@ -705,8 +711,11 @@ async def _run_proxy(
                         raise _UpstreamClosed("controller closed the session stream")
             except BaseExceptionGroupType as eg:
                 await _fail_outstanding(client_write, outstanding, eg, token_env_name, url)
-            except _UpstreamClosed:
-                await _fail_outstanding(client_write, outstanding, None, token_env_name, url)
+            except _UpstreamClosed as closed:
+                # Issue #70 PRR-043: pass the caught exception so the
+                # diagnostic names the OBSERVED cause (the literal
+                # "session ended" stays reserved for a cause-less path).
+                await _fail_outstanding(client_write, outstanding, closed, token_env_name, url)
             finally:
                 upstream.clear()  # no sends on a stream the unwound context closed
                 tg.cancel_scope.cancel()
@@ -720,7 +729,11 @@ async def _run_proxy(
         return 0
 
 
-_EMITTED = [False]  # single event loop: check-and-set at entry is atomic
+# Issue #70 emission ownership: emitters currently inside _fail_outstanding.
+# Single event loop; claimed ids are removed from the shared set
+# synchronously, so every id is claimed exactly once.
+_ACTIVE_EMITTERS: set = set()
+_NOTE_EMITTED = [False]  # once-only stderr diagnostic (PRR-014a)
 
 
 async def _fail_outstanding(
@@ -733,34 +746,68 @@ async def _fail_outstanding(
     """Answer every outstanding request id with the JSON-RPC error contract
     and explain on stderr. Never echoes token material. Always hard-exits
     (the stdio server cannot unwind while the client keeps stdin open), so
-    this function never returns. Idempotent: if read_client and the host
-    task both fail within the same scheduling window, only the first caller
-    emits (the set is single-threaded and cleared before exit)."""
-    if _EMITTED[0]:
-        os._exit(EXIT_TRANSPORT_FAILURE)
-    _EMITTED[0] = True
-    status = _http_status_of(exc)
-    if status in (401, 403):
-        print(
-            f"hyperv-mcp proxy: the controller rejected the bearer token "
-            f"(HTTP {status}); check the {token_env_name} environment "
-            "variable, then retry.",
-            file=sys.stderr,
-        )
-        note = "controller rejected the proxy's bearer token"
+    this function never returns.
+
+    Emission ownership (issue #70): each caller CLAIMS the ids it will
+    answer - synchronously, before the first await - by removing them from
+    the shared outstanding set (disjoint claims, so every id is answered
+    exactly once across concurrent callers), and registers itself in
+    _ACTIVE_EMITTERS. After its emission attempt it UNREGISTERS in a
+    finally, then waits for remaining peers to unregister (unbounded: a
+    peer blocked inside send blocks this exit instead of cutting it off -
+    the same pre-existing property that a blocked send hangs the failing
+    pump). Only then does it flush stdout/stderr and hard-exit; the last
+    finisher's tail wins, every completer runs the same tail, and no
+    caller flushes or exits while a peer still owns unsent claimed
+    replies."""
+    emitter = object()
+    # PR #121 review PRR-014a: base had a once-only stderr note (_EMITTED);
+    # the ownership redesign kept id answers exactly-once via claims but
+    # dropped the note guard, so concurrent failures printed the diagnostic
+    # twice. Dedupe the NOTE only (id answers stay claim-driven).
+    if not _NOTE_EMITTED[0]:
+        _NOTE_EMITTED[0] = True
+        _emit_note = True
     else:
-        print(
-            f"hyperv-mcp proxy: cannot reach the controller at {url}: "
-            f"{_describe_failure(exc)}",
-            file=sys.stderr,
-        )
-        note = "proxy transport failure"
-    for request_id in list(outstanding):
-        try:
-            await client_write.send(_error_reply(request_id, note))
-        except Exception:  # noqa: BLE001 - client may already be gone
-            break
-    outstanding.clear()
+        _emit_note = False
+    claimed = set(outstanding)
+    outstanding.difference_update(claimed)  # synchronous claim, no awaits
+    _ACTIVE_EMITTERS.add(emitter)
+    try:
+        status = _http_status_of(exc)
+        if status in (401, 403):
+            if _emit_note:
+                print(
+                    f"hyperv-mcp proxy: the controller rejected the bearer token "
+                    f"(HTTP {status}); check the {token_env_name} environment "
+                    "variable, then retry.",
+                    file=sys.stderr,
+                )
+            note = "controller rejected the proxy's bearer token"
+        else:
+            if _emit_note:
+                print(
+                    f"hyperv-mcp proxy: cannot reach the controller at {url}: "
+                    f"{_describe_failure(exc)}",
+                    file=sys.stderr,
+                )
+            note = "proxy transport failure"
+        # PR #121 review PRR-003: JSON-RPC RequestId is int|str and the
+        # SDK's own subscriptions API mints string ids alongside int ids,
+        # so claimed can mix types; a bare sorted() would raise TypeError
+        # BEFORE any -32000 reply. Total-order sort: all ints first, then
+        # all strs, each type-sorted internally.
+        for request_id in sorted(claimed, key=lambda i: (isinstance(i, str), i)):
+            try:
+                await client_write.send(_error_reply(request_id, note))
+            except Exception:  # noqa: BLE001 - client may already be gone
+                break
+    finally:
+        # Unregister BEFORE the peer wait (round-3 challenge 1: a
+        # wait-then-unregister ordering deadlocks two emitters).
+        _ACTIVE_EMITTERS.discard(emitter)
+    while len(_ACTIVE_EMITTERS) > 0:
+        await anyio.sleep(0.02)
     # The stdio server cannot unwind while the client keeps stdin open (its
     # reader blocks on the pipe), so a failed proxy flushes and hard-exits:
     # the client already holds the error reply and there is nothing to clean

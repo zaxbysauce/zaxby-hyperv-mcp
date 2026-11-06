@@ -255,17 +255,22 @@ def _make_tool_limiter_lifespan(cap: int):
     waits on another thread — and PS-free tools keep admission instead of
     inheriting anyio's global default. The sizing covers the slot queue and
     the VM-lock queue's single holder; it does not reserve a class for
-    PS-free tools, so a fully lock-queued pool can still delay them (tracked
-    as a follow-up). Entered once per server run on both transports (stdio
-    and streamable-http); in-process embedders driving `call_tool` directly
-    never enter it and keep anyio's 40-token default. The bound is not
-    restored on exit — within one event loop the shrunken value persists for
-    co-tenant to_thread users.
+    PS-free tools, so a fully lock-queued pool can still delay them
+    (documented bound, issue #68): 1 lock holder + 15 lock-queued calls can
+    occupy every token for up to vm_lock_wait_s (30 s default), delaying
+    PS-free admission up to that bound; the fairness reserve is the
+    #68-supplement admission layer, not this bound. Entered once per server
+    run on both transports (stdio and streamable-http); in-process
+    embedders driving `call_tool` directly never enter it and keep anyio's
+    40-token default. On exit the lifespan RESTORES the captured prior
+    token count (issue #68) so a co-tenant to_thread user in the same
+    event loop keeps its own bound.
     """
 
     @asynccontextmanager
     async def _tool_limiter_lifespan(_server: MCPServer):
         limiter = anyio.to_thread.current_default_thread_limiter()
+        prior_tokens = limiter.total_tokens  # captured BEFORE the resize (issue #68)
         limiter.total_tokens = 2 * cap
         # The SDK's default lifespan yields {}; replacing it with a bare
         # yield would make request_context.lifespan_context None for any
@@ -273,6 +278,11 @@ def _make_tool_limiter_lifespan(cap: int):
         try:
             yield {}
         finally:
+            # Issue #68: restore the captured prior token count so a
+            # co-tenant to_thread user in the same event loop is not left
+            # with the shrunken bound after the server exits (the CAPTURED
+            # value, never a hardcoded constant).
+            limiter.total_tokens = prior_tokens
             # Every pooled PowerShell Direct worker is a live host
             # powershell.exe holding a decrypted credential. Closing them here
             # is what returns the host process count to zero on server exit

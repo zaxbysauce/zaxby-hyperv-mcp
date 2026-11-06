@@ -571,7 +571,18 @@ def wait_guest_recovery(
     cred: CredentialSet | None = None,
     vm_id: str = "",
 ) -> dict:
-    """Wait for PowerShell Direct, then verify services/processes (AC11)."""
+    """Wait for PowerShell Direct, then verify services/processes (AC11).
+
+    Bounded-wait shape (issue #70 PRR-042, documented bound): the polling
+    legs sleep IN-GUEST (`Start-Sleep -Seconds $interval` in the recovery
+    script), so a single recovery wait can take up to timeout_s on the
+    guest side regardless of this process; the Python side observes host
+    cancellation at the run_ps poll slice (0.2 s), not per in-guest
+    interval_s tick - a cancelled caller settles within one poll slice of
+    the current PS leg rather than waiting out interval_s. Non-PS stretches
+    of other tool bodies (image encode, guest file transfer) are not
+    cancellable by construction; each tool's own docstring bounds its
+    legs."""
     if cred is None:
         raise ValueError("guest credentials are required")
     if timeout_s < 1 or interval_s < 1:

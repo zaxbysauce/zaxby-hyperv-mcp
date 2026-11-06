@@ -68,6 +68,11 @@ carries Hyper-V rights. Two supported fixes:
    # client config: {"command": "...", "url": "http://127.0.0.1:8787/mcp"}
    ```
 
+   (`--port` accepts an integer in 1..65535 and is validated at the serve
+   and logon-task-install paths; the conventional ephemeral request
+   `--port 0` is refused with exit code 2 rather than silently binding the
+   configured port.)
+
    The bearer token is REQUIRED unless you pass `--allow-anonymous` explicitly
    (an unauthenticated localhost endpoint lets any local process invoke every
    tool, including destructive ones — disposable labs only). Loopback bind is
@@ -179,7 +184,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.11.0 today) instead of
+  package's version (0.12.0 today) instead of
   the SDK's.
 - **In-process embedders see the 2.x call shape.** `call_tool()` returns a
   `CallToolResult` (`.content`, `.structured_content`, `.is_error`) instead
@@ -226,6 +231,32 @@ restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.12.0 changes
+
+- **Issue #59 (lock-scope pins)**: a new AST guardrail freezes the
+  issue-#14 VM-lock scope table; job_stop's VMBusy re-raise is pinned end
+  to end (module + MCP envelope), the evidence/repair swallow paths pin
+  `error_class=busy`, and the wiring tests' defaulted finding-tag
+  parameters were removed.
+- **Issue #64 (slot-pool identity + polite waiting)**: the slot directory
+  records the pool cap in `pool.meta` (atomically published under a
+  publication lock; corrupt markers are warned and republished); cap and
+  directory divergence warn once per process; the effective host-wide cap
+  is the RECORDED one; the acquire loop backs off exponentially from 5 ms
+  to a 200 ms ceiling with every sleep capped to the remaining deadline.
+- **Issue #68 (limiter restore + documented bound)**: the server lifespan
+  restores the captured prior thread-limiter token count on exit; the
+  PS-free admission bound under VM-lock saturation is documented in the
+  concurrency section and measured by a real-lock saturation test.
+- **Issue #70 (five runtime fixes)**: the stdio proxy's failure path now
+  claims outstanding request ids synchronously and answers every id
+  exactly once even when two failures race (emission ownership); the
+  upstream-closed diagnostic names the observed cause; `--port 0` is
+  refused with a clear error (valid range 1..65535); registry lookups
+  return snapshots; the guest-recovery wait documents its in-guest
+  interval bound and its poll-slice cancellation window.
+- Version bump: 0.11.0 -> 0.12.0
 
 ## 0.11.0 changes
 
@@ -830,7 +861,7 @@ Configuration file (JSON), selected with `HYPERV_MCP_CONFIG`:
   "host_powershell_path": null,        // default: Windows PowerShell 5.1
   "verify_sha256": false,              // default integrity check for transfers
   "ps_timeout_s": 120,                 // default host PowerShell timeout
-  "vm_lock_wait_s": 30,                // per-VM lock bounded wait, 0..600 s (0 = fail fast)
+  "vm_lock_wait_s": 30,                // per-VM lock bounded wait, 0..600 s (0 = fail fast; also bounds the documented PS-free admission delay, issue #68)
   "max_host_powershell": 8,            // host-wide concurrent powershell.exe cap, 1..64 (issue #15)
   "host_powershell_wait_s": 60,        // oversubscribed-leg bounded wait, 0..600 s, int or float
                                        // (0 = fail immediately with a busy error)
@@ -1171,7 +1202,7 @@ error — fix that before calling tools (see Troubleshooting).
 |---|---|---|
 | `hyperv.target_probe UNREACHABLE: The client cannot connect to the destination specified` | WinRM not listening on the host, or the agent box does not trust it (workgroup) | `Enable-PSRemoting -SkipNetworkProfileCheck` on the host; `Set-Item WSMan:\localhost\Client\TrustedHosts -Value '<host>' -Concatenate` on the agent box; retest with `Test-WSMan -ComputerName <host>` |
 | `hyperv.target_probe POOL_BUSY: host PowerShell pool saturated: ...` | The host-wide PowerShell slot pool is full (`max_host_powershell` children already running) and the bounded wait expired. With session reuse on (the default), an **idle** pooled worker holds its slot for its whole lifetime — up to 300 s with no call in flight — so the pool can be saturated with no tool leg running at all | Retry (the envelope is `busy`, retryable); reduce concurrency or raise `max_host_powershell` (1..64) if the host has headroom; when the slots are held by idle pooled workers, set `psdirect_session_reuse: false` or lower `max_host_powershell` |
-| Legs fail as `error_class: "transport"` with `cannot open PowerShell slot file slot-NN.lock` | The slot directory's ACLs do not include the running account (e.g. a second non-admin account against the hardened default directory) | Set `ps_slot_dir` to a directory both accounts can use, or grant the account access to `%ProgramData%\hyperv-mcp\ps-slots`; `--check-env` prints the effective `max_host_powershell`, `host_powershell_wait_s` and `ps_slot_dir` |
+| Legs fail as `error_class: "transport"` with `cannot open PowerShell slot file pool.meta.lock` (the pool-cap marker's publication lock is opened before the slot files; a `slot-NN.lock` name in this message indicates the same ACL problem) | The slot directory's ACLs do not include the running account (e.g. a second non-admin account against the hardened default directory) | Set `ps_slot_dir` to a directory both accounts can use, or grant the account access to `%ProgramData%\hyperv-mcp\ps-slots`; `--check-env` prints the effective `max_host_powershell`, `host_powershell_wait_s` and `ps_slot_dir` |
 | `Access is denied` (or 0x80070005) on every remote tool | Wrong `HYPERV_HOST_*` credentials, or the account lacks remote VM rights | Check the credential env vars are in the **server's** environment (restart the MCP client after editing `.mcp.json`); put the account in the host's `Hyper-V Administrators` group |
 | Tools worked locally; after adding `hyperv.host` every call fails | Server process started before the env/config landed | Config is read at server start; env per call but from the server's process — restart the MCP client and re-check the banner line |
 | `CONFIG ERROR: hyperv.host must be a hostname or IP literal` | Metacharacters in the configured host | Use the bare hostname/IP; quoting is applied by the server |
@@ -1257,7 +1288,14 @@ repair apply exclude everything. A conflicting call waits up to
 error whose payload carries `holder` — `{tool, mode, since, held_ms}` — so
 the caller can see what holds the VM and for how long. Waiting writers are
 admitted before newly arriving readers, so polling reads cannot starve a
-checkpoint restore. Console input runs under a read lock on the VM key
+checkpoint restore. Documented admission bound (issue #68): the tool-limiter
+resize (2x `max_host_powershell`) reserves no class for PS-free tools, so
+lock-queued calls occupying every limiter token delay PS-free admission up to the `vm_lock_wait_s` bound
+(measured worst case: 1 lock holder + 15 lock-queued calls); the agent-fairness
+reserve is the planned issue-#68-supplement admission layer. The limiter
+bound is restored on server-lifespan exit, so co-tenant `to_thread` users
+keep their own token count; in-process embedders driving `call_tool` never
+enter the lifespan and keep anyio's 40-token default. Console input runs under a read lock on the VM key
 (guest work proceeds during typing) plus a write lock on a second per-VM
 key, so two agents cannot interleave keystrokes. Both keys derive from the
 resolved GUID on every transport since issue #77: operations whose stdout
@@ -1281,11 +1319,24 @@ the number of simultaneous `powershell.exe` children stays at or below the
 cap for the whole host. A pooled worker holds its slot for its whole LIFETIME
 rather than for the duration of a call, which is why the pool reserves two
 slots of headroom (`max_host_powershell - 2`) and installs no pool at all
-below a host cap of 3: see the session-reuse section below. The cap is only as wide as the slot directory:
-servers configured with different `ps_slot_dir` values run separate pools,
-and a server started with a smaller `max_host_powershell` sees only its own
-first N slots (the effective host-wide bound is then the largest configured
-cap) — keep one slot directory and one cap per host. The wait does not
+below a host cap of 3: see the session-reuse section below. When the
+recorded `pool.meta` cap differs from this process's configured cap, the
+headroom arithmetic no longer lines up (the pool still sizes from the
+CONFIGURED cap while the slot sweep honors the RECORDED one) - the
+documented mitigation is to keep one slot directory and one cap per host,
+which the divergence warning also names. The cap is only as wide as the slot directory:
+servers configured with different `ps_slot_dir` values run separate pools
+(each divergence is warned once per process, naming both directories), and
+the slot directory records the pool's cap in a `pool.meta` marker (published
+atomically under a publication lock; a corrupt marker is repaired loudly on
+first read). A process whose configured `max_host_powershell` differs from
+the recorded cap is warned once, naming both values, and honors the
+RECORDED cap — a cap-64 process cannot exceed a recorded cap-8 pool (issue
+#64) — so keep one slot directory and one cap per host. The inter-attempt
+wait backs off exponentially from 5 ms to a 200 ms ceiling (each sleep
+capped to the remaining deadline), so a saturated wait performs far fewer
+lock attempts than the previous fixed 50 ms cadence; cancellation is still
+observed on every retry tick. The wait does not
 consume the leg's own timeout: a caller that queues gets its full
 `timeout_s` budget once it holds a slot. A caller that cannot get a slot
 within `host_powershell_wait_s` (default 60 s) gets a retryable `busy`
