@@ -536,3 +536,54 @@ def test_corrupt_shapes_repaired_on_the_fresh_process_path(pool_env):
         pswindows._release_ps_slot(fd2)
         assert _json.loads(
             (pool_env.dir / _META_NAME).read_text(encoding="utf-8")) == {"cap": 4}
+
+
+def test_bool_cap_rejected_on_every_path(pool_env, monkeypatch):
+    """Round-4 review falsifier: a JSON boolean is NOT a cap on ANY path -
+    publisher defer, reader range checks, and both repair re-reads. With
+    {"cap": true} on disk and the publication lock held, _read_pool_cap
+    must return the LOCAL cap (never True) and the marker stays corrupt
+    until a repair can run."""
+    import json as _json
+
+    (pool_env.dir / _META_NAME).write_text('{"cap": true}', encoding="utf-8")
+    # Hold the publication lock: the publisher must skip (repair blocked),
+    # so the reader cannot see a freshly-written valid marker.
+    lock_fd = pswindows._try_lock_slot(pool_env.dir / "pool.meta.lock")
+    assert lock_fd is not None
+    try:
+        cap = pswindows._read_pool_cap(pool_env.dir, 4)
+        assert isinstance(cap, int) and not isinstance(cap, bool) and cap == 4, (
+            f"a JSON boolean leaked through a repair re-read as the cap: {cap!r}"
+        )
+    finally:
+        pswindows._release_ps_slot(lock_fd)
+    # Once the lock frees, the next acquire repairs the corrupt marker.
+    fd = pswindows._acquire_ps_slot()
+    pswindows._release_ps_slot(fd)
+    payload = _json.loads((pool_env.dir / _META_NAME).read_text(encoding="utf-8"))
+    assert payload == {"cap": 4}, f"corrupt bool marker never repaired: {payload}"
+
+
+def test_missing_branch_repair_honors_foreign_cap(pool_env, monkeypatch):
+    """Round-3 Q1 pin: the missing-after-publication repair defers to a
+    foreign valid marker and the re-read honors ITS cap, not the local
+    one."""
+    import json as _json
+
+    # Publish once (marker_written True), then delete the marker.
+    fd = pswindows._acquire_ps_slot()
+    pswindows._release_ps_slot(fd)
+    (pool_env.dir / _META_NAME).unlink()
+
+    # A foreign publisher's valid marker lands during the repair window.
+    def _foreign_publish(directory, cap):
+        (pool_env.dir / _META_NAME).write_text('{"cap": 8}', encoding="utf-8")
+        return True  # the real publish would then defer to this valid marker
+
+    monkeypatch.setattr(pswindows, "_publish_pool_marker", _foreign_publish)
+    cap = pswindows._read_pool_cap(pool_env.dir, 4)
+    assert cap == 8, (
+        f"the deferred foreign cap was not honored by the re-read: {cap!r}"
+    )
+    assert _json.loads((pool_env.dir / _META_NAME).read_text(encoding="utf-8")) == {"cap": 8}

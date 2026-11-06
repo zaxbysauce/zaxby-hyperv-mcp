@@ -537,7 +537,8 @@ def _publish_pool_marker(directory: Path, cap: int) -> bool:
             recorded = payload.get("cap") if isinstance(payload, dict) else None
             # A JSON boolean is NOT a cap (isinstance(True, int) is True in
             # Python - round-3 review question 2): exclude bools explicitly.
-            if isinstance(recorded, int) and not isinstance(recorded, bool)                     and 1 <= recorded <= 64:
+            if (isinstance(recorded, int) and not isinstance(recorded, bool)
+                    and 1 <= recorded <= 64):
                 return True  # a valid marker already exists; never rewrite
             corrupt_existing = meta.exists()  # valid JSON, unusable marker
         except (OSError, ValueError):
@@ -585,7 +586,8 @@ def _read_pool_cap(directory: Path, local_cap: int) -> int:
         raw = meta.read_text(encoding="utf-8")
         payload = json.loads(raw)
         recorded = payload.get("cap") if isinstance(payload, dict) else None
-        if isinstance(recorded, int) and not isinstance(recorded, bool)                 and 1 <= recorded <= 64:
+        if (isinstance(recorded, int) and not isinstance(recorded, bool)
+                    and 1 <= recorded <= 64):
             return recorded
         # Valid JSON but not a usable marker (null, list, out-of-range cap):
         # the repair contract is the same loud warn + republish.
@@ -607,7 +609,8 @@ def _read_pool_cap(directory: Path, local_cap: int) -> int:
             try:
                 payload = json.loads(meta.read_text(encoding="utf-8"))
                 recorded = payload.get("cap") if isinstance(payload, dict) else None
-                if isinstance(recorded, int) and not isinstance(recorded, bool)                         and 1 <= recorded <= 64:
+                if (isinstance(recorded, int) and not isinstance(recorded, bool)
+                    and 1 <= recorded <= 64):
                     return recorded
             except (OSError, ValueError):
                 pass
@@ -624,7 +627,8 @@ def _read_pool_cap(directory: Path, local_cap: int) -> int:
         try:
             payload = json.loads(meta.read_text(encoding="utf-8"))
             recorded = payload.get("cap") if isinstance(payload, dict) else None
-            if isinstance(recorded, int) and 1 <= recorded <= 64:
+            if (isinstance(recorded, int) and not isinstance(recorded, bool)
+                    and 1 <= recorded <= 64):
                 return recorded
         except (OSError, ValueError):
             pass
