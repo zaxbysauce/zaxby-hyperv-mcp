@@ -361,13 +361,23 @@ def test_blocked_send_blocks_peer_exit(monkeypatch):
             tg.start_soon(_caller_a)
             tg.start_soon(_caller_b)
             # caller A claims (synchronous) then parks in send; caller B
-            # runs, claims nothing left, and must NOT exit while A parks
-            await anyio.sleep(0.1)
+            # runs, claims nothing left, and must NOT exit while A parks.
+            # The snapshot window must OUTLAST the settle tail (anyio.sleep
+            # 0.2 s): a mutant that bounds or deletes the peer wait lets B
+            # flush+exit at ~0.2-0.26 s, so sampling at 0.4 s catches it
+            # (final-critic blocker 1; the old 0.1 s snapshot preceded the
+            # tail and could not discriminate).
+            await anyio.sleep(0.4)
             assert not exit_marks, (
-                "a peer must not hard-exit while another emitter owns "
-                "claimed-but-unsent replies"
+                "a peer must not hard-exit (or even run its exit tail) "
+                "while another emitter still owns claimed-but-unsent replies"
             )
             unblock.set()
+            # NOTE (final-critic fix round): a per-emitter tail COUNTER is
+            # structurally impossible here - the first os._exit sentinel
+            # (production first-exit-wins) cancels the task group before the
+            # peer's tail runs, so only the TIMING assertion above
+            # discriminates the bounded/deleted-peer-wait mutants.
 
     with pytest.raises(BaseException) as excinfo:
         asyncio.run(asyncio.wait_for(main(), timeout=10))

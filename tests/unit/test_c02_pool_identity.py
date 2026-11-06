@@ -587,3 +587,51 @@ def test_missing_branch_repair_honors_foreign_cap(pool_env, monkeypatch):
         f"the deferred foreign cap was not honored by the re-read: {cap!r}"
     )
     assert _json.loads((pool_env.dir / _META_NAME).read_text(encoding="utf-8")) == {"cap": 8}
+
+
+def test_both_divergences_warn_in_one_acquire(pool_env):
+    """Final-critic blocker 2: when recorded cap AND slot dir diverge in the
+    SAME acquire, BOTH warnings fire (cap naming both values, dir naming
+    both directories). The shared-key mutant (dir key collapsed to the cap
+    key) suppresses the dir warning and fails this test."""
+    import re as _re
+
+    # A foreign pool recorded cap 4 in the caller-named slot directory (the
+    # marker is pre-seeded; marker_written True as if this process had read
+    # it). The local config is cap 64 in that same named dir: ONE acquire
+    # carries BOTH divergences (recorded-vs-local cap, named-vs-default dir).
+    (pool_env.dir / _META_NAME).write_text('{"cap": 4}', encoding="utf-8")
+    pswindows._PS_POOL_STATE.marker_written = True
+    pool_env.logs.clear()
+    pswindows._config = _pool_cfg(64, pool_env.dir)
+    fd2 = pswindows._acquire_ps_slot()
+    pswindows._release_ps_slot(fd2)
+    cap_warns = [ln for ln in pool_env.logs
+                 if _re.search(r"\b64\b", ln) and _re.search(r"\b4\b", ln)
+                 and "cap" in ln.lower()]
+    dir_warns = [ln for ln in pool_env.logs
+                 if str(pool_env.dir) in ln
+                 and str(pswindows._default_ps_slot_dir()) in ln]
+    assert cap_warns, f"cap divergence warning missing: {pool_env.logs}"
+    assert dir_warns, (
+        f"dir divergence warning suppressed when both diverge in one "
+        f"acquire (shared-key mutant): {pool_env.logs}"
+    )
+    # The effective bound still honors the recorded cap-4 pool.
+    attempted: list[str] = []
+    real_try_lock = pswindows._try_lock_slot
+
+    def _recording(path):
+        attempted.append(path.name)
+        return real_try_lock(path)
+
+    pswindows._try_lock_slot = _recording
+    try:
+        fd3 = pswindows._acquire_ps_slot()
+        pswindows._release_ps_slot(fd3)
+    finally:
+        pswindows._try_lock_slot = real_try_lock
+    assert all(name.startswith("slot-0") and int(name[5]) < 4 for name in attempted
+               if name.startswith("slot-")), (
+        f"cap-64 process swept outside the recorded cap-4 pool: {attempted}"
+    )
