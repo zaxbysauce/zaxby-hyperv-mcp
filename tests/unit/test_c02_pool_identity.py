@@ -635,3 +635,46 @@ def test_both_divergences_warn_in_one_acquire(pool_env):
                if name.startswith("slot-")), (
         f"cap-64 process swept outside the recorded cap-4 pool: {attempted}"
     )
+
+
+def test_recursion_error_repaired(pool_env):
+    """PRR-009 regression: deep-nested hostile JSON in pool.meta raises
+    RecursionError (a RuntimeError, not ValueError) from json.loads - the
+    repair contract must still run, and the corrupt marker must be
+    republished to the local cap."""
+    import json as _json
+
+    deep = '{"cap": ' + "[" * 1200 + "]" * 1200 + "}"
+    (pool_env.dir / _META_NAME).write_text(deep, encoding="utf-8")
+    pswindows._PS_POOL_STATE.marker_written = True  # prior publication
+    fd = pswindows._acquire_ps_slot()
+    pswindows._release_ps_slot(fd)
+    payload = _json.loads((pool_env.dir / _META_NAME).read_text(encoding="utf-8"))
+    assert payload == {"cap": 4}, (
+        f"RecursionError marker not repaired to the local cap: {payload}"
+    )
+    assert any("unreadable or corrupt" in ln for ln in pool_env.logs)
+
+
+def test_unrepairable_marker_degrades_to_local_cap(pool_env, monkeypatch):
+    """PRR-006 regression: a repair that cannot publish (persistent replace
+    contention) DEGRADES to the local cap per the documented contract -
+    the acquire succeeds, the failure is logged (redacted), and the raw
+    OSError never escapes to run_ps callers (at base-revision-equivalent
+    behavior the leg worked with the local cap)."""
+    (pool_env.dir / _META_NAME).write_text("not json", encoding="utf-8")
+
+    def _failing_publish(directory, cap):
+        raise PermissionError(
+            f"[WinError 5] Access is denied: {directory}" + chr(92) + "pool.meta")
+
+    monkeypatch.setattr(pswindows, "_publish_pool_marker", _failing_publish)
+    fd = pswindows._acquire_ps_slot()  # must NOT raise raw OSError
+    pswindows._release_ps_slot(fd)
+    logs = " ".join(pool_env.logs)
+    assert "repair publication failed" in logs or "publication failed" in logs, (
+        f"the publish failure must be logged: {pool_env.logs}"
+    )
+    assert str(pool_env.dir) in logs or pool_env.dir.name in logs, (
+        "the log names the slot directory (operator debugging)"
+    )

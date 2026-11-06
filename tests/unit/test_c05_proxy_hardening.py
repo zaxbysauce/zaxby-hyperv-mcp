@@ -66,8 +66,11 @@ class _RecorderWrite:
 
 @pytest.fixture(autouse=True)
 def _no_real_exit(monkeypatch):
-    """os._exit must never run in tests; record and raise a sentinel."""
+    """os._exit must never run in tests; record and raise a sentinel.
+    Also resets the PRR-014a once-only note guard (module state persists
+    across tests in one process)."""
     _EXIT_CALLS.clear()
+    stdio_proxy._NOTE_EMITTED[0] = False
     monkeypatch.setattr(stdio_proxy.os, "_exit",
                         lambda code=1: (_EXIT_CALLS.append(code),
                                         (_ for _ in ()).throw(_ExitSentinel(code))))
@@ -409,4 +412,25 @@ def test_blocked_send_blocks_peer_exit(monkeypatch):
     all_ids = sorted(_ids_of(first.payloads + second.payloads))
     assert all_ids == [20, 21, 22], (
         f"every outstanding id must be answered exactly once; got {all_ids!r}"
+    )
+
+
+def test_mixed_type_ids_all_answered():
+    """PRR-003 regression (critic-confirmed HIGH): a claimed set mixing int
+    and str JSON-RPC ids (the SDK's subscriptions API mints string ids
+    alongside int ids) must answer EVERY id with its -32000 reply and run
+    the exit tail - a bare sorted() raised TypeError before any reply."""
+    mixed = {1, "a", 2}
+    writes = _RecorderWrite()
+
+    async def _call():
+        await stdio_proxy._fail_outstanding(
+            writes, mixed, RuntimeError("mixed ids"), "TOK", "http://u")
+
+    with pytest.raises(_ExitSentinel) as excinfo:
+        asyncio.run(_call())
+    assert excinfo.value.code == stdio_proxy.EXIT_TRANSPORT_FAILURE
+    got = sorted(_ids_of(writes.payloads), key=lambda i: (isinstance(i, str), str(i)))
+    assert got == [1, 2, "a"], (
+        f"every mixed-type id must receive its -32000 reply; got {got!r}"
     )

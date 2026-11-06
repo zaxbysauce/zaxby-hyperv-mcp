@@ -606,6 +606,12 @@ def _describe_failure(exc: BaseException | None) -> str:
         return "session ended"
     leaves = _iter_group_exceptions(exc)
     if len(leaves) == 1 and leaves[0] is exc:
+        cause = exc.__cause__
+        if cause is not None:
+            # PR #121 review PRR-018: a wrapper raised `from <cause>` should
+            # name the observed cause, not just the wrapper label.
+            return (f"{type(exc).__name__}: {exc} "
+                    f"({type(cause).__name__}: {cause})")
         return f"{type(exc).__name__}: {exc}"
     return "; ".join(f"{type(leaf).__name__}: {leaf}" for leaf in leaves[:3])
 
@@ -727,6 +733,7 @@ async def _run_proxy(
 # Single event loop; claimed ids are removed from the shared set
 # synchronously, so every id is claimed exactly once.
 _ACTIVE_EMITTERS: set = set()
+_NOTE_EMITTED = [False]  # once-only stderr diagnostic (PRR-014a)
 
 
 async def _fail_outstanding(
@@ -754,27 +761,43 @@ async def _fail_outstanding(
     caller flushes or exits while a peer still owns unsent claimed
     replies."""
     emitter = object()
+    # PR #121 review PRR-014a: base had a once-only stderr note (_EMITTED);
+    # the ownership redesign kept id answers exactly-once via claims but
+    # dropped the note guard, so concurrent failures printed the diagnostic
+    # twice. Dedupe the NOTE only (id answers stay claim-driven).
+    if not _NOTE_EMITTED[0]:
+        _NOTE_EMITTED[0] = True
+        _emit_note = True
+    else:
+        _emit_note = False
     claimed = set(outstanding)
     outstanding.difference_update(claimed)  # synchronous claim, no awaits
     _ACTIVE_EMITTERS.add(emitter)
     try:
         status = _http_status_of(exc)
         if status in (401, 403):
-            print(
-                f"hyperv-mcp proxy: the controller rejected the bearer token "
-                f"(HTTP {status}); check the {token_env_name} environment "
-                "variable, then retry.",
-                file=sys.stderr,
-            )
+            if _emit_note:
+                print(
+                    f"hyperv-mcp proxy: the controller rejected the bearer token "
+                    f"(HTTP {status}); check the {token_env_name} environment "
+                    "variable, then retry.",
+                    file=sys.stderr,
+                )
             note = "controller rejected the proxy's bearer token"
         else:
-            print(
-                f"hyperv-mcp proxy: cannot reach the controller at {url}: "
-                f"{_describe_failure(exc)}",
-                file=sys.stderr,
-            )
+            if _emit_note:
+                print(
+                    f"hyperv-mcp proxy: cannot reach the controller at {url}: "
+                    f"{_describe_failure(exc)}",
+                    file=sys.stderr,
+                )
             note = "proxy transport failure"
-        for request_id in sorted(claimed):
+        # PR #121 review PRR-003: JSON-RPC RequestId is int|str and the
+        # SDK's own subscriptions API mints string ids alongside int ids,
+        # so claimed can mix types; a bare sorted() would raise TypeError
+        # BEFORE any -32000 reply. Total-order sort: all ints first, then
+        # all strs, each type-sorted internally.
+        for request_id in sorted(claimed, key=lambda i: (isinstance(i, str), i)):
             try:
                 await client_write.send(_error_reply(request_id, note))
             except Exception:  # noqa: BLE001 - client may already be gone

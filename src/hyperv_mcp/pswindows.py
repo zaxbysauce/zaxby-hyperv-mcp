@@ -541,7 +541,9 @@ def _publish_pool_marker(directory: Path, cap: int) -> bool:
                     and 1 <= recorded <= 64):
                 return True  # a valid marker already exists; never rewrite
             corrupt_existing = meta.exists()  # valid JSON, unusable marker
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
+            # RecursionError (PRR-009): deep-nested hostile JSON is a
+            # RuntimeError from json.loads - corruption, repairable.
             corrupt_existing = meta.exists()
         if corrupt_existing:
             # A corrupt legacy marker (partial write, wrong JSON shape, or
@@ -574,6 +576,24 @@ def _publish_pool_marker(directory: Path, cap: int) -> bool:
             pass
 
 
+def _repair_pool_marker_guarded(directory: Path, local_cap: int) -> None:
+    """PR #121 review PRR-006: a repair that cannot publish (slot dir
+    deleted/read-only/full, persistent replace contention) DEGRADES to the
+    local cap per the documented contract - the loud corruption warning
+    already fired at the call site, so the publish failure is logged
+    (redacted, directory NAME only) and the acquire proceeds with the
+    local cap. Never a raw OSError whose str() would put the slot-dir
+    path into client-visible envelopes; never a hard leg failure."""
+    try:
+        _publish_pool_marker(directory, local_cap)
+    except OSError as exc:
+        logemit.log_line(
+            f"pswindows: pool.meta repair publication failed in slot "
+            f"directory {directory.name}: {redact(str(exc))}; continuing "
+            f"with the local cap {local_cap}"
+        )
+
+
 def _read_pool_cap(directory: Path, local_cap: int) -> int:
     """The effective pool cap: a valid recorded pool.meta cap wins (a
     cap-64 process cannot exceed a recorded cap-8 pool); an absent or
@@ -592,6 +612,16 @@ def _read_pool_cap(directory: Path, local_cap: int) -> int:
         # Valid JSON but not a usable marker (null, list, out-of-range cap):
         # the repair contract is the same loud warn + republish.
         raise ValueError(f"invalid recorded cap {recorded!r}")  # bool excluded
+    except RecursionError:
+        # PR #121 review PRR-009: deep-nested hostile JSON raises
+        # RecursionError (a RuntimeError, not ValueError) from json.loads;
+        # treat it as corruption so the repair contract still runs.
+        logemit.log_line(
+            f"pswindows: {meta.name} unreadable or corrupt in slot directory "
+            f"{directory.name}; republishing the local cap {local_cap}"
+        )
+        _repair_pool_marker_guarded(directory, local_cap)
+        return local_cap
     except FileNotFoundError:
         if first_publication_done:
             # The marker existed once (this process published it) and is
@@ -602,7 +632,7 @@ def _read_pool_cap(directory: Path, local_cap: int) -> int:
                 f"{directory.name} after a prior publication; republishing "
                 f"the local cap {local_cap}"
             )
-            _publish_pool_marker(directory, local_cap)
+            _repair_pool_marker_guarded(directory, local_cap)
             # Same contract as the corrupt-repair branch: the repair may
             # have deferred to another process's valid marker - re-read
             # once (round-3 review question 1).
@@ -620,7 +650,7 @@ def _read_pool_cap(directory: Path, local_cap: int) -> int:
             f"pswindows: {meta.name} unreadable or corrupt in slot directory "
             f"{directory.name}; republishing the local cap {local_cap}"
         )
-        _publish_pool_marker(directory, local_cap)  # repair the legacy
+        _repair_pool_marker_guarded(directory, local_cap)
         # The repair may have DEFERRED to another process's valid marker
         # (arbitration): re-read once so this acquire honors the recorded
         # cap instead of assuming the local one (impl-review round-2 Q3).
@@ -751,7 +781,18 @@ def _acquire_ps_slot() -> int:
     if not _PS_POOL_STATE.marker_written:
         with _PS_POOL_LOCK:
             if not _PS_POOL_STATE.marker_written:
-                published = _publish_pool_marker(directory, local_cap)
+                try:
+                    published = _publish_pool_marker(directory, local_cap)
+                except OSError as exc:
+                    # PRR-006: a failed first publication degrades to the
+                    # local cap (base behavior) with a typed, redacted log
+                    # line; the slot sweep below still bounds the process.
+                    logemit.log_line(
+                        f"pswindows: pool.meta publication failed in slot "
+                        f"directory {directory.name}: {redact(str(exc))}; "
+                        f"continuing with the local cap {local_cap}"
+                    )
+                    published = False
                 if published:
                     _PS_POOL_STATE.marker_written = True
     recorded = _read_pool_cap(directory, local_cap)

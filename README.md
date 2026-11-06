@@ -68,6 +68,11 @@ carries Hyper-V rights. Two supported fixes:
    # client config: {"command": "...", "url": "http://127.0.0.1:8787/mcp"}
    ```
 
+   (`--port` accepts an integer in 1..65535 and is validated at the serve
+   and logon-task-install paths; the conventional ephemeral request
+   `--port 0` is refused with exit code 2 rather than silently binding the
+   configured port.)
+
    The bearer token is REQUIRED unless you pass `--allow-anonymous` explicitly
    (an unauthenticated localhost endpoint lets any local process invoke every
    tool, including destructive ones — disposable labs only). Loopback bind is
@@ -229,6 +234,32 @@ the task-spawned controller reads it from the environment.
 
 ## 0.12.0 changes
 
+- **Issue #59 (lock-scope pins)**: a new AST guardrail freezes the
+  issue-#14 VM-lock scope table; job_stop's VMBusy re-raise is pinned end
+  to end (module + MCP envelope), the evidence/repair swallow paths pin
+  `error_class=busy`, and the wiring tests' defaulted finding-tag
+  parameters were removed.
+- **Issue #64 (slot-pool identity + polite waiting)**: the slot directory
+  records the pool cap in `pool.meta` (atomically published under a
+  publication lock; corrupt markers are warned and republished); cap and
+  directory divergence warn once per process; the effective host-wide cap
+  is the RECORDED one; the acquire loop backs off exponentially from 5 ms
+  to a 200 ms ceiling with every sleep capped to the remaining deadline.
+- **Issue #68 (limiter restore + documented bound)**: the server lifespan
+  restores the captured prior thread-limiter token count on exit; the
+  PS-free admission bound under VM-lock saturation is documented in the
+  concurrency section and measured by a real-lock saturation test.
+- **Issue #70 (five runtime fixes)**: the stdio proxy's failure path now
+  claims outstanding request ids synchronously and answers every id
+  exactly once even when two failures race (emission ownership); the
+  upstream-closed diagnostic names the observed cause; `--port 0` is
+  refused with a clear error (valid range 1..65535); registry lookups
+  return snapshots; the guest-recovery wait documents its in-guest
+  interval bound and its poll-slice cancellation window.
+- Version bump: 0.11.0 -> 0.12.0
+
+## 0.11.0 changes
+
 - Frozen-check amendments (issues #63/#66): the Workstream C/D acceptance checks now
   discriminate tree-kill (event-synchronized unwind seam), the run_ps worker-thread
   promptness bound (`elapsed < 1.0`, tightening the tool-call layer's 1.5 s cancel
@@ -241,7 +272,7 @@ the task-spawned controller reads it from the environment.
   `docs/issue-trace-drift-inventory.md` (live drift state), and
   `scripts/gen_trace_drift_inventory.py` (`--check` gate with fail-closed marker,
   clean-checkout, and snapshot-refusal guards).
-- Version bump: 0.11.0 -> 0.12.0 (`pyproject.toml`, package `__version__`,
+- Version bump: 0.10.0 -> 0.11.0 (`pyproject.toml`, package `__version__`,
   `test_c03_sdk_port.py`'s expected literal; `test_version_consistency.py` pins the sites).
 
 ## 0.10.0 changes
@@ -1171,7 +1202,7 @@ error — fix that before calling tools (see Troubleshooting).
 |---|---|---|
 | `hyperv.target_probe UNREACHABLE: The client cannot connect to the destination specified` | WinRM not listening on the host, or the agent box does not trust it (workgroup) | `Enable-PSRemoting -SkipNetworkProfileCheck` on the host; `Set-Item WSMan:\localhost\Client\TrustedHosts -Value '<host>' -Concatenate` on the agent box; retest with `Test-WSMan -ComputerName <host>` |
 | `hyperv.target_probe POOL_BUSY: host PowerShell pool saturated: ...` | The host-wide PowerShell slot pool is full (`max_host_powershell` children already running) and the bounded wait expired. With session reuse on (the default), an **idle** pooled worker holds its slot for its whole lifetime — up to 300 s with no call in flight — so the pool can be saturated with no tool leg running at all | Retry (the envelope is `busy`, retryable); reduce concurrency or raise `max_host_powershell` (1..64) if the host has headroom; when the slots are held by idle pooled workers, set `psdirect_session_reuse: false` or lower `max_host_powershell` |
-| Legs fail as `error_class: "transport"` with `cannot open PowerShell slot file slot-NN.lock` | The slot directory's ACLs do not include the running account (e.g. a second non-admin account against the hardened default directory) | Set `ps_slot_dir` to a directory both accounts can use, or grant the account access to `%ProgramData%\hyperv-mcp\ps-slots`; `--check-env` prints the effective `max_host_powershell`, `host_powershell_wait_s` and `ps_slot_dir` |
+| Legs fail as `error_class: "transport"` with `cannot open PowerShell slot file pool.meta.lock` (the pool-cap marker's publication lock is opened before the slot files; a `slot-NN.lock` name in this message indicates the same ACL problem) | The slot directory's ACLs do not include the running account (e.g. a second non-admin account against the hardened default directory) | Set `ps_slot_dir` to a directory both accounts can use, or grant the account access to `%ProgramData%\hyperv-mcp\ps-slots`; `--check-env` prints the effective `max_host_powershell`, `host_powershell_wait_s` and `ps_slot_dir` |
 | `Access is denied` (or 0x80070005) on every remote tool | Wrong `HYPERV_HOST_*` credentials, or the account lacks remote VM rights | Check the credential env vars are in the **server's** environment (restart the MCP client after editing `.mcp.json`); put the account in the host's `Hyper-V Administrators` group |
 | Tools worked locally; after adding `hyperv.host` every call fails | Server process started before the env/config landed | Config is read at server start; env per call but from the server's process — restart the MCP client and re-check the banner line |
 | `CONFIG ERROR: hyperv.host must be a hostname or IP literal` | Metacharacters in the configured host | Use the bare hostname/IP; quoting is applied by the server |
@@ -1288,7 +1319,12 @@ the number of simultaneous `powershell.exe` children stays at or below the
 cap for the whole host. A pooled worker holds its slot for its whole LIFETIME
 rather than for the duration of a call, which is why the pool reserves two
 slots of headroom (`max_host_powershell - 2`) and installs no pool at all
-below a host cap of 3: see the session-reuse section below. The cap is only as wide as the slot directory:
+below a host cap of 3: see the session-reuse section below. When the
+recorded `pool.meta` cap differs from this process's configured cap, the
+headroom arithmetic no longer lines up (the pool still sizes from the
+CONFIGURED cap while the slot sweep honors the RECORDED one) - the
+documented mitigation is to keep one slot directory and one cap per host,
+which the divergence warning also names. The cap is only as wide as the slot directory:
 servers configured with different `ps_slot_dir` values run separate pools
 (each divergence is warned once per process, naming both directories), and
 the slot directory records the pool's cap in a `pool.meta` marker (published
