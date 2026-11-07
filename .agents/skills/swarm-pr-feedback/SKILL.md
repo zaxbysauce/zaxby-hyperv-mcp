@@ -1,6 +1,5 @@
 ---
 name: swarm-pr-feedback
-audience: swarm-plugin
 description: >
   Ingest and resolve known pull request feedback with skeptical source verification.
   Use when addressing pasted PR feedback, GitHub review comments or threads,
@@ -12,7 +11,9 @@ description: >
   (structural pre-checks) and Stage B (reviewer + test_engineer) gates and the
   reviewer + critic closeout gate are MANDATORY for any change made as part of
   this process.
-swarm-contract-digest: 143d9443a82d
+metadata:
+  audience: swarm-plugin
+  swarm-contract-digest: "203da214c99a"
 ---
 
 # Swarm PR Feedback
@@ -156,36 +157,11 @@ Controller-tool absence is NOT a blocker; Profiles B and C are first-class
 execution paths. BLOCKED is reserved for bypassing an active controller and
 for verification or coverage gaps that stay unclosable after bounded retries.
 
-## Pre-flight: Check Out the PR Branch Locally
+Detailed reference material moved to `.opencode/skills/swarm-pr-feedback/references/preflight-checkout.md` (issue #2907 progressive-disclosure budget).
 
-Before verifying any claim or making any fix, ensure the PR branch is the working
-tree:
-
-- If `head_ref` is a remote branch that is not checked out locally, fetch it
-  (`git fetch origin <head_ref>`).
-- **Check for parallel work first.** Before checkout, use the repository or
-  runtime's parallel-work check. When the bundled
-  `parallel-work-check` skill exists, it is one conditional implementation to
-  detect concurrent pushes from other agents (for example the repo's
-  auto-review bot following up, a maintainer pushing fixes, or parallel swarm
-  work). If remote has new commits: read `git log local..remote`, evaluate whether the parallel work
-  supersedes your planned fixes, and prefer the parallel work if it's more
-  comprehensive (more tests, better edge coverage, clearer error handling).
-  Abort your rebase, take the remote state, then add minor improvements on top.
 - Verify the working tree is clean first (`git status --porcelain`). If any
   tracked or untracked changes exist, call `prepare_pr_workflow_checkout`
-  before binding (Profile A). Omit `paths` to auto-discover and atomically
   preserve every dirty path, including untracked files; pass explicit `paths`
-  only for an exact bounded tracked-file set. It creates an auditable stash
-  receipt containing the original branch/HEAD and a structured
-  `operation: "restore"` recovery instruction. Do not issue `git stash`
-  through shell.
-  Without the controller, surface dirty state to the user or abort the checkout
-  — do not blind-stash.
-- Treat `recovery-required` and `indeterminate` controller results as terminal
-  for the current attempt: report the typed `required_action`, abort/clear any
-  already-active gate, and stop. Only `stashable` permits one preparation call;
-  retry only when the controller explicitly returns `retryable: true`.
 - **Check out the head branch locally before dispatching feedback lanes.** Feedback verification reads the working-tree
   filesystem (`Read`/`Glob`/`Grep`), and fixes must land on the PR branch — without a
   checkout you would verify and patch the base branch's code instead. Record the
@@ -193,8 +169,6 @@ tree:
  - Pass the exact `merge_base...head_ref` commit range in every read-only verification or
    explorer/advisory-lane delegation so lane agents can inspect specific revisions
    with `git show` when needed.
-- If no PR reference was provided (a pasted-feedback session on the current branch),
-   confirm the current branch is the intended PR branch before editing.
 - A detached checkout at the authoritative full PR head is a valid pre-bind
   intake state. On the first Profile-A bind, the controller attaches it only
   when Git reports exactly one safe candidate: an existing local branch at
@@ -203,15 +177,6 @@ tree:
   candidates, multiple candidates, a linked-worktree-owned local branch, or an
   existing mismatched upstream fails closed without publishing the bind. Retry
   is idempotent if switching succeeded but state persistence failed.
-- The existing constrained tracked-branch and safe `gh pr checkout` pre-bind
-  forms remain supported on every profile after proving the exact SHA and a
-  unique intended remote ref. Never use force, submodule-recursive, or detached
-  `gh pr checkout` variants.
-- Immediately after the first bind and before feedback verification dispatch,
-  prove that `git rev-parse HEAD` equals the authoritative full `pr_head_sha`,
-  `git status --porcelain` is empty, and the current branch tracks the intended
-  PR head remote/branch. A detached exact-head checkout is intake-only; the
-  bind must attach it before feedback dispatch or publication.
 
 When a verification lane result includes `output_ref`, treat `output` as a
 preview and call `retrieve_lane_output` before using it to classify, resolve,
@@ -232,15 +197,13 @@ including pre-existing changes from other branches or prior work.
 **The check:** Run `git status --porcelain` first. If output is non-empty, identify
 which files are PR-related vs pre-existing uncommitted changes.
 
-**The rule:** Stage files explicitly by path when the working tree contains files
-unrelated to the PR. For example:
+**The rule:** Never stage with `git add -A`, `git add .`, or any glob form —
+stage exact paths with the `--` separator, each already inside the
+PR changed set (the gate refuses every other form):
 
 ```bash
-git add src/foo.ts tests/foo.test.ts
+git add -- src/foo.ts tests/foo.test.ts
 ```
-
-Never use `git add -A` when the working tree has pre-existing changes from other
-branches or prior work sessions.
 
 ## Batch Collection (mandatory before any fix)
 
@@ -298,111 +261,12 @@ Build a complete feedback ledger before editing. Include every available source:
 
 If a source is unavailable, retry with alternative access paths. If unavailable after retry, the source is a coverage gap that must be reported to the user — do not silently "record that limitation" and proceed as if the source doesn't matter.
 
-### Async advisory verification lanes
+Detailed reference material moved to `.opencode/skills/swarm-pr-feedback/references/intake-surfaces.md` (issue #2907 progressive-disclosure budget).
 
-After the complete feedback ledger exists and before editing, run independent
-read-only verification lanes. Under Profile A, use
-`dispatch_lanes_async` with `mode: "swarm-pr-feedback:verification"`, the
-complete immutable `feedback_inventory` ID list, the exact current
-`pr_head_sha`, and each lane's exact
-`feedback_item_ids` ownership list for independent read-only verification lanes:
-comment classification, CI/log root-cause inspection, test impact mapping,
-release/docs claim checks, and stale-branch/conflict analysis. Partition the
-ledger so each `FB-###` item is owned by exactly one verification lane and the
-union of lanes covers the entire ledger — no feedback item may be left
-unassigned to a lane; state each lane's owned IDs both structurally and in its
-prompt. The runtime rejects missing, duplicate, overlapping, or unknown item
-ownership and blocks mutation until the verification batch settles. Scale
-the lane count to the ledger size: a 1–3 item round may use a single combined
-lane, while a large multi-round intake may warrant one lane per category above.
 Cap each `dispatch_lanes_async` batch at 8 lanes (`MAX_LANES`); if the ledger
 needs more than 8 verification lanes, dispatch in sequential batches and settle
 each batch's COVERAGE GATE before the next — do not over-spawn lanes for a
-trivial round. Record each returned `batch_id`, then continue only ledger-safe
-architect work: normalize feedback IDs, gather deterministic PR metadata, prepare
-reproduction commands, and plan likely fix groups. Do not edit, close items, or
-mark feedback resolved from running lanes.
-
-Every verification lane must end with one parseable row for each owned item:
-
-```text
-[FEEDBACK-VERIFIED] | FB-### | CONFIRMED/PARTIAL/DISPROVED/PRE_EXISTING/NEEDS_MORE_EVIDENCE/NEEDS_USER_DECISION | evidence
-```
-
-Non-empty prose without this marker contract is not a settled verification
-artifact and cannot unlock mutation.
-
-Before the Verification step can mark any item `CONFIRMED`, `PARTIAL`,
-`DISPROVED`, `PRE_EXISTING`, `NEEDS_MORE_EVIDENCE`, or `NEEDS_USER_DECISION`,
-every open verification batch must be fully settled. Poll with
-`collect_lane_results` (wait omitted or `false`) to process settled lanes
-incrementally — clustering confirmed items and pre-reading files for settled
-findings while ledger-safe work remains — then issue a final
-`collect_lane_results` with `wait: true` per batch once independent work is
-exhausted, to confirm every lane is settled.
-Missing, stale, cancelled, or failed lanes are coverage gaps that must be closed
-before marking any item CONFIRMED/PARTIAL/DISPROVED/PRE_EXISTING. Apply the
-COVERAGE GATE:
-retry failed lanes (max 2) as another
-`swarm-pr-feedback:verification` async batch with the same immutable inventory,
-exact `pr_head_sha`, agent type, prompt, scope, and isolation, or stop and
-surface the lane failure to the user as BLOCKED. Under Profile A, blocking and
-direct-Task fallbacks are rejected because they cannot satisfy the durable
-ownership and head-provenance gate.
-Do not proceed with "blocking verification and record that async advisory lanes
-were unavailable" — record-and-continue is not coverage closure.
-
-Under Profile B, partition the same immutable inventory across fresh read-only
-verification subagents — every `FB-###` item owned by exactly one lane and the
-union of lanes covering the entire ledger — with each prompt stating its owned
-IDs and the exact `pr_head_sha`, and each lane returning one
-`[FEEDBACK-VERIFIED]` row per owned item. Under Profile C, verify the ledger
-in sequential category passes with the same one-row-per-item contract. On
-every profile, no item may be classified until its verification lane or pass
-has settled, and unclosable verification gaps are surfaced as BLOCKED.
-
-### CI matrix cascade check (do this before fixing)
-
-When the PR's `unit` job is a matrix across multiple OSes and downstream jobs
-(`integration`, `smoke`) have `needs: unit`, an OS leg failure blocks the
-entire pipeline. Before triaging, check:
-
-1. Are `integration` or `smoke` jobs in `skipped` or `cancelled` state rather
-   than `failed`? That signals a unit matrix cascade — the unit job failed
-   on one OS leg, blocking the downstream jobs from running on the current
-   HEAD.
-2. If a unit OS leg is the blocker, classify the failure:
-   - **Code issue** — the test itself fails. Reproduce locally; if the
-     test passes locally, the runner is the problem.
-   - **Runner performance** — the test step exceeds the configured timeout.
-     Run all files in the step locally with per-file timing; if cumulative
-     local runtime is <10 min and the runner can't complete in 60+ min, the
-     issue is runner performance. Bump the CI timeout as a stopgap and file
-     a follow-up issue for parallelization. Do not loop bumping the timeout
-     past 90 min without filing the follow-up.
-3. Surface cascade failures to the user explicitly. The downstream jobs'
-   results don't exist; the code's coverage of the current HEAD cannot be
-   confirmed by CI alone.
-
-### PR body claim verification
-
-The `.swarm/evidence/` paths below apply only when the reviewed repository uses
-this plugin's council evidence contract. For any other repository, locate the
-authoritative CI attestation, code-host review record, or repository-declared
-evidence store; the universal rule is that an approval claim needs a real,
-retrievable provenance artifact.
-
-PR body text like "PHASE 2 council APPROVED (5/5, round 2)" or "Final council
-APPROVED" must be backed by an evidence file under `.swarm/evidence/` — phase
-councils write `.swarm/evidence/{phaseNumber}/phase-council.json`; the final
-council writes the flat `.swarm/evidence/final-council.json`. Bot-generated PR
-bodies commonly auto-fill these claims without real review. Before accepting
-such a claim as part of triage:
-
-1. Check whether the corresponding evidence file exists with `verdict:APPROVED`.
-2. If the claim is unsupported, mark the closure ledger item as
-   `NEEDS_MORE_EVIDENCE` rather than `CONFIRMED`. Do not silently drop the
-   claim — it indicates the PR body was generated without a real review.
+trivial round.
 
 ## Feedback Ledger
 
@@ -428,7 +292,7 @@ Rules:
   items.
 - Use explicit IDs for non-review feedback when useful, for example
   `CONFLICT-001` for merge/base drift and `CI-001` for check failures, so PR
-  bodies can show exactly how operational blockers were closed.
+  bodies can show exactly how operational blockers were closed. See `references/operational-gotchas.md` (## Contract addendum (2026-10-12)) for the body-claim-audit, probe-hygiene, and stable-obligation/coverage-diff ledger rules.
 
 ### Mandatory: integrate all PR comments with feedback or findings before branch validation (Stage A)
 
@@ -467,7 +331,7 @@ Rules:
     each must be explicitly justified in the closure ledger.
 - **The closure ledger at the end of the run must account for every `FB-###`
   item** with a final status (fixed / disproved / pre-existing / needs user
-  decision / needs more evidence).
+  decision / needs more evidence); each PRE_EXISTING, NEEDS_MORE_EVIDENCE, or NEEDS_USER_DECISION item also gets one disposition (ABSORB / FILE / RECORD / ASK) per `references/followup-dispositions.md`; DISPROVED items need none.
 - **Comments from the latest bot round take precedence over earlier rounds**
   for the same finding; the earlier-round `FB-###` item is updated with the
   new evidence rather than a new item being created.
@@ -537,7 +401,7 @@ or compatibility policy, mark the item `NEEDS_USER_DECISION` and ask.
 - Do not implement speculative cleanup while feedback remains unclosed.
 - Never ship unwired code. Any new command, tool, skill, config, docs surface, or
   generated artifact must be fully registered and validated.
-- Never defer work or declare it out of scope without explicit user instruction.
+- Never defer work or declare it out of scope without explicit user instruction; route every unfixed item through `references/followup-dispositions.md` (RECORD is a visible closure, never a silent drop).
 - Keep invalid or disproved findings in the closure ledger with the evidence.
 - For CI failures, verify the failing job belongs to the current PR head before
   treating it as current evidence.
@@ -607,14 +471,14 @@ Every gate lane emits exactly one fully populated row per feedback ID:
 [CLOSEOUT-CRITIC] | FB-001 | APPROVE|NEEDS_REVISION|BLOCKED | evidence
 ```
 
-Only exact positive verdict fields pass. A sentence containing “not APPROVE,” a
+Only exact positive verdict fields pass — `APPROVE` (or its accepted spelling
+`APPROVED` on the three review/critic markers) for review/critic rows, exact
+`PASS` for test rows; anything else fails. A sentence containing “not APPROVE,” a
 header without item rows, duplicate rows, missing IDs, degraded/truncated
 artifacts, wrong roles, stale content digests, parallel or out-of-order phases,
 and reused pre-edit approvals all fail closed. Any content change after Stage A
-invalidates Stage A and every later gate; restart at step 1. See
-"Re-recording Stage A on an unchanged revision" below for the one retention
-exception, which applies only when the revision digest itself did not change.
-Publication tools
+invalidates Stage A and every later gate; restart at step 1. For an in-scope edit whose moved digest triggers the incomplete-ownership block, re-dispatch `swarm-pr-feedback:verification` on the edited tree (new batch_id, same lane ids) to re-settle coverage; further coder writes need a fresh scope (new task_id), then re-run Stage A and the ordered gates. See
+"Re-recording Stage A on an unchanged revision" below for the one retention exception, which applies only when the revision digest itself did not change. Publication tools
 and `git commit`/`git push` remain blocked until all four ordered lane phases
 settle on the Stage-A digest. After they settle, only one standalone `git commit`
 command may create the reviewed commit; push and remote publication remain
@@ -752,26 +616,7 @@ digest change, still wipes every recorded gate batch and un-arms publication
 exactly as before — a controller cannot narrow what it declares in order to
 dodge re-verification.
 
-### Why gate evidence is not item-scoped
-
-Stage A, Stage B, and closeout evidence invalidate as whole gate batches, not
-per feedback item, and that is a deliberate design decision, not unfinished
-work:
-
-- **No trustworthy item-to-file mapping exists to key invalidation on.** The
-  file scope a caller declares for a feedback item is caller-asserted and
-  only path-sanitized — it is never intersected with the actual changed-file
-  set, and it carries no persisted binding back to feedback item IDs. Keying
-  invalidation on that declaration would let a controller dodge
-  re-verification by under-declaring scope, turning a fail-closed guarantee
-  into a fail-open one (AGENTS.md invariant 9) — the same failure class that
-  already ruled out keying digest invalidation on `git diff --raw` blob OIDs.
-- **The four gate phases are holistic by contract.** Each recorded batch must
-  own every inventory item exactly once and in declared order. Retaining
-  evidence for a subset of items per gate would re-partition that
-  independent-review contract itself, and would need its own
-  collusion/independence analysis before it could be trusted — it is not a
-  drop-in extension of the revision-level retention above.
+Detailed reference material moved to `.opencode/skills/swarm-pr-feedback/references/gate-evidence-scope.md` (issue #2907 progressive-disclosure budget).
 
 ### Stage B — reviewer + test_engineer (mandatory after Stage A passes)
 
@@ -836,8 +681,10 @@ pre-checks and must not be folded into Stage A.
 ## Publishing And Communication
 
 After every ordered local gate passes on one unchanged content digest, create
-the reviewed commit with one standalone `git commit` command. Under Profile A,
-then call
+the reviewed commit with one standalone `git commit` command. A message with
+shell metacharacters (e.g. a `Co-Authored-By: X <...>` trailer) goes through
+`prepare_pr_feedback_commit_message` + `git commit -F <returned path>` (the
+file lives outside the repository). Under Profile A, then call
 `complete_pr_workflow` once with `mode: "PR_FEEDBACK"` and the immutable intake
 `pr_head_sha`. A `ready-to-publish` result arms publication but deliberately
 keeps the durable gate active and binds that post-commit HEAD to the current
@@ -877,9 +724,9 @@ After fixes, update the PR body or comment with a closure ledger:
 ```text
 FB-001 | fixed | commit/test evidence
 FB-002 | disproved | code evidence
-FB-003 | pre-existing | base-branch evidence
-FB-004 | needs user decision | decision required
-FB-005 | needs more evidence | .swarm/evidence/{phase}/phase-council.json missing
+FB-003 | pre-existing | base-branch evidence | ABSORB #NNNN
+FB-004 | needs user decision | decision required | ASK
+FB-005 | needs more evidence | .swarm/evidence/{phase}/phase-council.json missing | ASK
 CONFLICT-001 | fixed | remote mergeability is MERGEABLE/CLEAN
 CI-001 | fixed | current-head check/run evidence
 ```
@@ -948,21 +795,3 @@ gates must run again. A published generation is never cleared by abort; use
 reports `checkout_restore_required`, call `prepare_pr_workflow_checkout` with
 `operation: "restore"` before returning. On Profiles B/C there is no durable
 gate to abort: report the blocker to the user and stop.
-
-## Contract addendum (2026-10-12)
-
-- **Body-claim audit.** Before the reviewer gate, grep the LIVE published
-  artifact (PR body, issue body) against every ledger row whose fix-ref is
-  that artifact: the fixed phrasing present, the contradicting phrasing
-  absent. A row marked FIXED for a file never edited is an unbacked claim —
-  record CLOSED only after the grep matches.
-- **Probe hygiene.** Mutation/revert probes must leave the tree as found:
-  restore with `git checkout -- <file>` after every probe and verify
-  `git status --porcelain` clean before the first commit of the round. An
-  uncommitted mutant left in a tracked source file can ride explicit-path
-  staging into the fix commit — or `git add -A` into the release.
-- **Stable obligation identity.** Never substitute the obligation between
-  ledger and proof: if the ledger defined mutant M4 as X, closing it with a
-  different mutant Y is a new row, not a closure. Coverage-diff the ledger
-  against EVERY source finding table by ID, both directions, before
-  implementing.
