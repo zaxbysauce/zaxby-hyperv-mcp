@@ -88,3 +88,23 @@ Minimal recipe: `git stash` the fix hunk (or apply the inverse patch) in the thr
 ## When the path does not apply
 
 Some issues (pure documentation fixes, non-executable product decisions already resolved by classification) have no meaningful acceptance check at all. Use NON-EXECUTABLE rows with named substitute evidence rather than forcing an artificial executable check, and let the plan critic confirm the justification is real rather than a shortcut around the loop.
+
+## Contract addendum (2026-10-12)
+
+- **Named-mutation discipline.** Every DISCRIMINATING check must name, in its
+  08-test-results block, one concrete mutation that kills it and the test that
+  fails under it — "the suite passes" is not evidence a check bites. A check
+  whose named mutant survives the shipped suite is a coverage gap, not a pass.
+  Probe hygiene is part of the contract: restore with `git checkout -- <file>`
+  after every probe and verify `git status --porcelain` clean before any
+  commit — a stray uncommitted mutant can ride explicit-path staging into the
+  fix commit.
+- **Frozen-docstring wording.** Check authors must phrase frozen-file
+  docstrings to stay true at both ends: "RED at base, GREEN after the fix",
+  never "must FAIL at the current tree" — the file ships and the claim becomes
+  false, and correcting it costs a checkpoint AMEND plus a re-anchored receipt.
+- **Replay script at freeze.** Write `repro/replay-all.sh` beside the manifest:
+  one explicit `repro-check.sh run` per check with `--base --class --id
+  --expect --copy --deps` spelled out (every file the base leg needs listed in
+  `--copy`). Replays then run one command instead of re-assembling flags — an
+  omitted `--copy` silently rewrites certified RED base logs as ERROR.

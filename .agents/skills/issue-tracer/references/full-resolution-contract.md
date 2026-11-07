@@ -6,8 +6,9 @@ Closure - any statement or artifact presenting the issue as fixed, done, resolve
 
 ## Mechanical gates
 
-- **Clause 2 (no deferred work).** Run and record:
-  `git diff origin/<default-branch>...HEAD | grep -nE '^\+.*(TODO|FIXME|XXX|HACK|NotImplemented|raise NotImplementedError|unimplemented!|todo!)'`
+- **Clause 2 (no deferred work).** Run and record the scanner itself from the repo root:
+  `bash .opencode/skills/issue-tracer/scripts/scan-deferred.sh origin/<default-branch>`
+  (its pattern is single-sourced there — the bare-word marker group is word-bounded on both sides so identifier-shaped letter-runs stay clean, zmem #309 — which also keeps this document's own diff free of literal marker tokens).
   Every hit is eliminated, or dispositioned FALSE_POSITIVE (quoting the hit) only when it is non-production content - fixtures, docs quoting, test data. Hits in production code are always eliminate-or-waiver. A genuinely separable concern discovered en route is filed as a tracked issue with the user's quoted acknowledgment; a code comment or summary sentence is never an acceptable parking spot.
 - **Clause 3 (no unwired code).** For each added or renamed function, method, class, constant, config key, route, or flag - regardless of visibility - record the call-site grep or execution trace proving invocation outside its own definition and tests. Tests demonstrate the path; they never constitute it (test code itself is exempt - tests are their own runtime). Dead branches and unreachable flags are removed, not shipped.
   `.opencode/skills/issue-tracer/scripts/scan-deferred.sh` (run from the repo root) is the standing reachability scan referenced at Phase 4 and the No-Gap Closure Checklist.
@@ -67,3 +68,15 @@ Before declaring the issue ready:
 - [ ] Publication (commit/push/PR) followed the repo's canonical publish protocol.
 - [ ] Merge itself was not performed by this skill; an explicit, quoted, SHA-bound user approval is recorded (`10b-merge-approval.md`).
 - [ ] PR-ready summary is complete.
+
+## Contract addendum (2026-10-12)
+
+- **Closure reconciliation.** Closure is a reconciliation against the final
+  PUBLISHED artifacts: every requirement and every source finding keeps a
+  stable identity through to the closure ledger; each disposition names what
+  was actually discharged (a mutant identity, a file, a published sentence)
+  and is grep-verified against the artifact it claims; any partial closure
+  carries explicit deferment authority (a filed follow-up issue or a quoted
+  user decision). A ledger that keeps the FIXED label while the obligation
+  changed shape is a false closure even when the code is correct, and a
+  mutation identity must never be substituted between obligation and proof.

@@ -1,12 +1,13 @@
 ---
 name: commit-pr
-audience: swarm-plugin
 description: >
   Apply when committing, pushing, opening or updating a pull request, or closing
   out CI. A portable, project-agnostic commit and PR workflow: verify before you
   push, write conventional commits and a clear PR body, and never commit
   generated or secret files.
-effort: medium
+metadata:
+  audience: swarm-plugin
+  effort: medium
 ---
 
 # Commit & PR Protocol (portable)
