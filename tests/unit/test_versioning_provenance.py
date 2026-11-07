@@ -148,9 +148,14 @@ def test_readme_carries_current_release_section():
         f"README today-markers {markers} must be exactly [{ver!r}]; any "
         "stale '(<old> today)' means a bump missed the marker rotation"
     )
-    assert "docs/versioning-policy.md" in text, (
-        "README.md must link docs/versioning-policy.md so the consumer-side "
-        "provenance contract is discoverable from the entry document"
+    import re as _re
+    assert _re.search(
+        r"\[docs/versioning-policy\.md\]\(docs/versioning-policy\.md\)", text
+    ), (
+        "README.md must contain a real markdown link to "
+        "docs/versioning-policy.md so the consumer-side provenance contract "
+        "is discoverable from the entry document (a bare backticked path "
+        "does not navigate)"
     )
     section = text.split(f"## {ver} changes", 1)[1].split("\n## ", 1)[0]
     assert len([ln for ln in section.splitlines() if ln.strip()]) >= 3, (

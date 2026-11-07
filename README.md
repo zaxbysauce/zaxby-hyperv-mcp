@@ -187,7 +187,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
   package's version (0.13.0 today) instead of
   the SDK's (the release contract, the complete bump-site
   enumeration, and how to read `version`/`git_revision` live in
-  `docs/versioning-policy.md`).
+  [docs/versioning-policy.md](docs/versioning-policy.md)).
 - **In-process embedders see the 2.x call shape.** `call_tool()` returns a
   `CallToolResult` (`.content`, `.structured_content`, `.is_error`) instead
   of the 1.x `(content_list, structured)` tuple, and `list_tools()` exposes

@@ -11,8 +11,9 @@ links here from its breaking-changes section.
 
 Every PR that changes shipped behavior bumps the version, and the bump is
 part of the PR (never a separate "release-only" commit after merge). Below
-1.0.0, breaking changes take a minor bump (0.x.y -> 0.x+1.0), fixes/features
-take a patch bump. This is the mandated contract: downstream consumers learn
+1.0.0, every release takes a minor bump (0.x.y -> 0.x+1.0) regardless of
+breaking vs feature/fix scope, so the minor digit is the primary
+update-now signal consumers learn from. This is the mandated contract: downstream consumers learn
 to update from the version number alone. After a release lands, downstream
 users must update **and restart** any long-running shared controller — a
 running server keeps its import-time literals.
@@ -32,9 +33,11 @@ A version move MUST update exactly these sites, all in the same PR:
 3. `tests/unit/test_c03_sdk_port.py` — the frozen AC7 assertion pinning the
    `pyproject.toml` version. This file is a frozen acceptance check of the
    `issue-16-tool-concurrency` trace: change it ONLY through the AMEND
-   procedure (`repro-check.sh checkpoint --reason CHECK_WRONG|
-   AC_CHANGED_BY_USER` on the issue-16 manifest, argv/expect copied
-   VERBATIM from the effective rows, then `repro-check.sh anchor` and
+   procedure (`repro-check.sh checkpoint --slug issue-16-tool-concurrency
+   --id <check-id> --reason CHECK_WRONG|AC_CHANGED_BY_USER --argv <verbatim>
+   --expect <verbatim> --base <original-replay-base> -- <frozen-path>` —
+   see docs/rebaseline-runbook.md for the complete invocation; argv/expect
+   copied VERBATIM from the effective rows, then `repro-check.sh anchor` and
    re-publication of the receipt as a superseding comment on issue #16;
    `verify-checkpoint` must report every pair OK).
 4. `README.md` — add a `## X.Y.Z changes` section at the top of the release
@@ -61,7 +64,9 @@ marker uniqueness, and the server_info payload version by
   consumer can map a version to its change set without reading source.
 - `hyperv_server_info` (MCP tool) is the machine-readable provenance
   surface: `version` (the frozen build's package version), `git_revision`,
-  `config_sha256`, `mcp_sdk_version`, `protocol_version`, `feature_flags`.
+  `config_path`, `config_sha256`, `mcp_sdk_version`, `protocol_version`,
+  `feature_flags`, `powershell` (host PowerShell provenance), and
+  `hyperv_target` (local/remote targeting).
 
 ### Historical case: the two 0.4.0 builds
 
@@ -107,8 +112,10 @@ legitimately differ from the build's frozen version — update and restart).
 are byte-copies of `ZaxbyHub/opencode-swarm/.opencode/skills/` pinned by
 `.agents/skills/vendored-skills.manifest` (sha256 per file at
 `canonical_commit`). `tests/unit/test_vendored_skill_manifest.py` fails CI
-on ANY local drift — including same-`version:`-string drift — in both
-directions (missing/extra files included). Checkout EOL of the manifest and
+on any CONTENT drift (CRLF-normalized sha256) — including
+same-`version:`-string drift — in both directions (missing/extra files
+included; EOL-only divergence is invisible by design and covered by the
+`.gitattributes` eol pinning). Checkout EOL of the manifest and
 `*.sh` files is pinned LF via `.gitattributes` so the anchor blob comparison
 (`git hash-object --no-filters`) is stable on every platform.
 
@@ -119,12 +126,20 @@ When the canonical side advances (e.g. ZaxbyHub/opencode-swarm#3576 lands):
 1. Freshness check first: `git -C <opencode-swarm> fetch` and compare its
    canonical main HEAD to the manifest's `canonical_commit` — drift is
    visible at release time, not only when someone wonders.
-2. Re-enumerate the canonical FILE LIST via `git ls-tree -r` at the new
-   pin (never merely re-hash the existing rows — added/removed canonical
-   files must move the set).
+2. Re-enumerate the canonical FILE LIST via
+   `git ls-tree -r <commit> -- .opencode/skills/issue-tracer
+   .opencode/skills/swarm-pr-review .opencode/skills/swarm-pr-feedback
+   .opencode/skills/commit-pr` at the new pin (never merely re-hash the
+   existing rows — added/removed canonical files must move the set).
 3. Re-generate every manifest row from the new pinned commit
-   (`git -C <opencode-swarm> show <commit>:<path> | sha256sum`), update the
-   `canonical_commit:` header line and the `refresh:` date.
+   (pipe the canonical blob through the same CRLF→LF normalization the
+   manifest header declares: `git -C <opencode-swarm> show
+   <commit>:<path> | sed 's/
+$//' | sha256sum`), map each canonical
+   `.opencode/skills/<x>` path to its vendored `.agents/skills/<x>` row
+   path, update the `canonical_commit:` header line, and bump the
+   `refresh:` line to carry the re-pin date together with the
+   `vendored-repin` procedure pointer.
 4. Resync the vendored files to the canonical blobs byte-for-byte.
 5. Run the trace's vendored-canonical compare (manifest↔canonical fidelity
    AND tree↔manifest) before opening the PR.

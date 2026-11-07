@@ -2,7 +2,7 @@
 # canonical_repo: ZaxbyHub/opencode-swarm
 # canonical_commit: d71e5aea9ca45d2b0b7c68c068886a3d4992af48
 # hash algorithm: sha256 over file bytes with CRLF normalized to LF
-# refresh: re-pin ritual documented in docs/versioning-policy.md#vendored-repin
+# refresh: 2026-11-07 (re-pin ritual: docs/versioning-policy.md#vendored-repin)
 476a6840819f47a21601d558f3d0a7a047f0ad1609b0b4dab3bfc6fc23c5c16f  .agents/skills/commit-pr/SKILL.md
 0d8d13b757b227ef7855557c096759e160bb9c4c8592275ad40d7d9c0ef3cc17  .agents/skills/issue-tracer/SKILL.md
 b18b51f80c3fd3ec192b51d35b3666cf9e73bd47adb303ff6788f326051302a6  .agents/skills/issue-tracer/assets/pr-template.md
