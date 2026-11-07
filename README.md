@@ -184,8 +184,10 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.12.0 today) instead of
-  the SDK's.
+  package's version (0.13.0 today) instead of
+  the SDK's (the release contract, the complete bump-site
+  enumeration, and how to read `version`/`git_revision` live in
+  [docs/versioning-policy.md](docs/versioning-policy.md)).
 - **In-process embedders see the 2.x call shape.** `call_tool()` returns a
   `CallToolResult` (`.content`, `.structured_content`, `.is_error`) instead
   of the 1.x `(content_list, structured)` tuple, and `list_tools()` exposes
@@ -231,6 +233,32 @@ restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.13.0 changes
+
+- **Issue #118 (vendored skill bytes pinned)**: the four vendored
+  agent skills under `.agents/skills/` resynced byte-for-byte to
+  `ZaxbyHub/opencode-swarm@d71e5aea` (11 drifted files restored, 11
+  reference docs that were missing are now present); a checked-in
+  `.agents/skills/vendored-skills.manifest` (per-file sha256 plus the
+  pinned canonical commit) and `tests/unit/test_vendored_skill_manifest.py`
+  now fail CI on ANY vendored drift — including same-`version:`-string
+  drift, which version-line comparison is structurally blind to.
+  `.gitattributes` gained `*.sh text eol=lf` and `*.manifest text eol=lf`,
+  killing the CRLF materialization class at checkout.
+- **Issue #67 (versioning policy + consumer build identity)**:
+  `docs/versioning-policy.md` documents the release contract — a version
+  bump on every behavior-changing PR, the complete bump-site
+  enumeration (`pyproject.toml`, `__version__`, the frozen AC7 pin via
+  the issue-16 AMEND procedure, and the README changelog section plus
+  today-marker), `hyperv_server_info` as the machine-readable
+  provenance surface, the call-time (not build-identity) semantics of
+  `git_revision`, the historical two-0.4.0 disambiguation via
+  `mcp_sdk_version`, and optional tag-at-merge provenance.
+  `tests/unit/test_versioning_provenance.py` pins the whole contract so
+  a consumer can distinguish installed builds without reading source.
+  The shared-controller section above links the new policy doc.
+- Version bump: 0.12.0 -> 0.13.0
 
 ## 0.12.0 changes
 

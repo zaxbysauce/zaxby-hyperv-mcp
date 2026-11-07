@@ -1,0 +1,44 @@
+# vendored-skills.manifest — byte-oracle for .agents/skills (issue #118)
+# canonical_repo: ZaxbyHub/opencode-swarm
+# canonical_commit: d71e5aea9ca45d2b0b7c68c068886a3d4992af48
+# hash algorithm: sha256 over file bytes with CRLF normalized to LF
+# refresh: 2026-11-07 (re-pin ritual: docs/versioning-policy.md#vendored-repin)
+476a6840819f47a21601d558f3d0a7a047f0ad1609b0b4dab3bfc6fc23c5c16f  .agents/skills/commit-pr/SKILL.md
+0d8d13b757b227ef7855557c096759e160bb9c4c8592275ad40d7d9c0ef3cc17  .agents/skills/issue-tracer/SKILL.md
+b18b51f80c3fd3ec192b51d35b3666cf9e73bd47adb303ff6788f326051302a6  .agents/skills/issue-tracer/assets/pr-template.md
+89f1fbd41dee42edaa5ec852a88dd366e1276b5c3870adda54b1e9c99be94590  .agents/skills/issue-tracer/references/acceptance-checks.md
+5da4abe86caedf40f94253e9bbe7cd1ce4efc2b4e83d1b8dfffe5a3a58a19f9f  .agents/skills/issue-tracer/references/critic-gate.md
+9d62ec2e0acd53da4ae5be4f719ab811c02e363f0c423e65ee48d43d3ed13484  .agents/skills/issue-tracer/references/evidence-artifacts.md
+101de903165e1790c6e24ffce6bbbae73dd88ac05db40921c5fe5c78d7753ec4  .agents/skills/issue-tracer/references/full-resolution-contract.md
+27eb0f53b0d9057a414243a5092504e10d7c1d8f9f3d7976c5adeaefe31f7eed  .agents/skills/issue-tracer/references/install.md
+52da2bf3b98ace6ded5d02371fb851b208b1788c2aba8e9e4071bcb08459e0b1  .agents/skills/issue-tracer/references/localization-playbook.md
+b39e33a3195863d983df8047fbed021f607f9f327a1bc1358b27bd9426943c8b  .agents/skills/issue-tracer/references/method-provenance.md
+4bd71e963f9f606eb436f014f3ab4b34e679fddcdb37118d3acab3db7288f808  .agents/skills/issue-tracer/references/phase-0-setup.md
+3f4351decf6668a327e23d5a33bc8e561e99712d5cf09a1bc88324da82a4dd1e  .agents/skills/issue-tracer/references/phase-1-intake.md
+f4da91130f15b67dd4127fc63d01177931b9f0ff0db98b8219f39c6bca2ec773  .agents/skills/issue-tracer/references/untrusted-content.md
+dea2e10ff3b56103628f4c6353205606d33ee740852c7077ec46601dcb4302d4  .agents/skills/issue-tracer/scripts/repro-check.sh
+f62afe0b92eb038265b7126ea28073424016e93bb6a31fa0a9b4659758a520aa  .agents/skills/issue-tracer/scripts/scan-deferred.sh
+f433bf7218dfc9434fcddda147bdc31f06959d4d858d09bd2118bae56d0d904e  .agents/skills/issue-tracer/scripts/trace-check.sh
+284331302d8475f1539978fc7b953b0cf90f05369308337f3b95da14a6dbaf15  .agents/skills/issue-tracer/scripts/trace-init.sh
+3c7f7351fda5fbeda826a6066b6bd69800cf0cd7d3cf3f01692730802b708061  .agents/skills/swarm-pr-feedback/SKILL.md
+bdde7095f6ca9f8e1f58794afa36f8765ee79980a6f525b122168227f2e5f7fa  .agents/skills/swarm-pr-feedback/references/bot-claim-verification.md
+8c70de10704efadfb3c0beb498f449543f9dd2011437fedf0426cdf2c37067f2  .agents/skills/swarm-pr-feedback/references/followup-dispositions.md
+1e771fb1a35547071c597ddb5c1cdb2d56aaac8be4c9d765f956c65db8fce05c  .agents/skills/swarm-pr-feedback/references/gate-evidence-scope.md
+27c0b233d36ffcd1908ac2075c9b26e2d3ddd5c33964c57a7bc6fef69e44c15f  .agents/skills/swarm-pr-feedback/references/intake-surfaces.md
+bf38763cdb6c9aea1e3cddde5762ca6e966e49f9334d6f3d8cfa7ef217c49ae5  .agents/skills/swarm-pr-feedback/references/operational-gotchas.md
+3a4ee3290e4a98c7cd9e371233346ef82f14a2f15e25b3b27e6717470fd90f97  .agents/skills/swarm-pr-feedback/references/preflight-checkout.md
+6e840465cf3f8c73b8ee28bb42005fd90e190cc389daf3da337a2dd47bf86827  .agents/skills/swarm-pr-review/SKILL.md
+fb84cc43e30007e62e12a15a27bc21823e46bd5ebf7f8f111002f7b29d32fdca  .agents/skills/swarm-pr-review/references/council-mode.md
+fdce4db96abc6e42d813c54eb5125ff7837c39ca6f9d98834c395a8683f541dc  .agents/skills/swarm-pr-review/references/counterbalancing.md
+e2e4f461154b211aaba89fd378380af23d5be50d843da6ac4252845f62fd0fca  .agents/skills/swarm-pr-review/references/explorer-output-format.md
+024bdf8b58c56c216144f55177dacfc936a370f1cbfe8d5e96be45c94ddf2d30  .agents/skills/swarm-pr-review/references/findings-persistence-contract.md
+fa732619396a2eb832f67dd54727256af4d9f87badd2e734170cfd217c2b4a15  .agents/skills/swarm-pr-review/references/findings-persistence-detail.md
+f69380ba89d2281a53e5dafe4b1cb5c7635156334e78a531ebc4653def147c05  .agents/skills/swarm-pr-review/references/lane-output-recoverability.md
+8e339d21bc2527d0b28ac7f0e52f9e66fa962cd0cea8a61df60b09d17e65b8e1  .agents/skills/swarm-pr-review/references/parallel-work-example.md
+b7c433a21be3750180fae1916285f2181a9903a6b89ed8b7a56b5413cf35e3be  .agents/skills/swarm-pr-review/references/parser-candidate-extraction.md
+9b744f74a241157d4ce6a0b661281dd66c6682a43331020561d3fd598ee51f45  .agents/skills/swarm-pr-review/references/parser-dry-run.md
+108361a7d7d3f95520eda814303aa4a679f8508580d66c90cb40b1d3aafeb9e9  .agents/skills/swarm-pr-review/references/phase0a-intake.md
+b3e7e3956d96a6102f71181f5c6e093fa1935a71b468c04fdb5df58ce26035b0  .agents/skills/swarm-pr-review/references/prompt-templates.md
+a257e0fcc5a1d75d38cef366a9f05eb97dfa3ce40de43412e30665dabaa408f9  .agents/skills/swarm-pr-review/references/scope-detection.md
+6aed89570783b533ce9513a46f10531426479d82dae2929702a0474d87641b4d  .agents/skills/swarm-pr-review/references/verdict-settlement-contract.md
+b736033e7c06ed4046b99fa154a2c6ae9133889ff86a909b7628d5d4eb8582cf  .agents/skills/swarm-pr-review/references/writeback-phases.md

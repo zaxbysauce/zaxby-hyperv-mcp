@@ -1,11 +1,11 @@
 ---
 name: issue-tracer
-audience: swarm-plugin
 description: Evidence-first investigation, validation, and full resolution of issues and bugs. Use when asked to investigate, trace, root-cause, reproduce, plan, fix, resolve, close, or prepare a PR for an issue, bug report, defect, regression, failing test, crash, or confusing runtime behavior. Drives issue validation, acceptance-check-driven reproduction and fix planning, independent critic and implementation review, recurrence-class eradication, and an invariant-aware, PR-ready closure with a recorded human merge gate under a mandatory full-resolution contract that forbids partial fixes, deferred work, and unwired code.
 license: MIT
 metadata:
   version: 3.0.0
   source: .opencode/skills/issue-tracer/SKILL.md
+  audience: swarm-plugin
 ---
 
 # Issue Tracer
@@ -194,32 +194,3 @@ See `references/install.md` for per-runner discovery, user-level shadowing, and 
 - `references/install.md` - per-runner discovery, user-level installs, version reconciliation
 - `references/method-provenance.md` - the research grounding for these methods
 - `assets/pr-template.md` - PR-ready closure text
-
-## Contract addendum (2026-10-12)
-
-- **Named-mutation discipline.** Every DISCRIMINATING check must name, in its
-  08-test-results block, one concrete mutation that kills it and the test that
-  fails under it — "the suite passes" is not evidence a check bites. A check
-  whose named mutant survives the shipped suite is a coverage gap, not a pass.
-  Probe hygiene is part of the contract: restore with `git checkout -- <file>`
-  after every probe and verify `git status --porcelain` clean before any
-  commit; a stray uncommitted mutant can ride explicit-path staging into the
-  fix commit (or `git add -A` into the release).
-- **Frozen-docstring wording.** Check authors must phrase frozen-file
-  docstrings to stay true at both ends: "RED at base, GREEN after the fix",
-  never "must FAIL at the current tree" — the file ships and the claim becomes
-  false, and correcting it costs a checkpoint AMEND plus a re-anchored receipt.
-- **Replay script at freeze.** Write `repro/replay-all.sh` beside the manifest:
-  one explicit `repro-check.sh run` per check with `--base --class --id
-  --expect --copy --deps` spelled out (every file the base leg needs listed in
-  `--copy`). Replays then run one command instead of re-assembling flags — an
-  omitted `--copy` silently rewrites certified RED base logs as ERROR.
-- **Closure reconciliation.** Closure is a reconciliation against the final
-  PUBLISHED artifacts: every requirement and every source finding keeps a
-  stable identity through to the closure ledger; each disposition names what
-  was actually discharged (a mutant identity, a file, a published sentence)
-  and is grep-verified against the artifact it claims; any partial closure
-  carries explicit deferment authority (a filed follow-up issue or a quoted
-  user decision). A ledger that keeps the FIXED label while the obligation
-  changed shape is a false closure even when the code is correct. Mutation
-  identities must never be substituted between obligation and proof.

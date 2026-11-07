@@ -234,8 +234,11 @@ Context pack summary:
 Candidates (Chunk A — src/utils/):
 - C-001 | HIGH | null-safety | src/utils/cache.ts:142 | Uncached getter may return undefined on cold start
 
-For each candidate, return:
-[REVIEWED] | item_id | classification | evidence_type | severity | introduced_by_pr | file:line | rationale | probe | reviewer_notes | risk_impact | risk_tags
+For each assigned candidate, return one structured reviewer verdict row in the
+exact format the controller-appended PR-workflow contract card specifies (the
+card carries the full 12-field grammar, the enums, and the escaping rules).
+Do not paste a row template into the dispatch prompt: the controller injects
+the authoritative contract and rejects a prompt that carries one (issue #3310).
 
 You must check caller context, reachability, schema/middleware/framework mitigations, state-machine constraints, test coverage, PR-introducedness, and severity.
 
