@@ -645,6 +645,10 @@ def _execute_body(
     with _ADMIT_STOPS_LOCK:
         _ADMIT_STOPS[op_id] = stop
     try:
+        # The outer finally (below) pops the registry entry on EVERY exit
+        # path from here, including the cancelled pre-check raising before
+        # the park — an entry stranded there would be memory-only but would
+        # also let a later cancel signal a dead event (review r3).
         _raise_if_cancelled_locked(cfg, op_id, store)
         try:
             ticket = admission.admit_sync(
@@ -664,9 +668,6 @@ def _execute_body(
             _safe_transition(store, op_id, statestore.OP_CANCELLED, agent, cfg,
                              "op.cancelled")
             return
-        finally:
-            with _ADMIT_STOPS_LOCK:
-                _ADMIT_STOPS.pop(op_id, None)
         try:
             result = tool_fn(**body_args)
         finally:
@@ -705,6 +706,14 @@ def _execute_body(
             error_class=str(env.get("error_class") or "transport"),
             result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
         )
+    finally:
+        # EVERY exit path from _execute_body pops the park-window registry
+        # entry: the cancelled pre-check raising before the park, the
+        # AdmissionBusy/Stopped arms, the body, and the terminal
+        # transitions (review r3 — no stranded entries, no dead-event
+        # signals).
+        with _ADMIT_STOPS_LOCK:
+            _ADMIT_STOPS.pop(op_id, None)
 
 
 def _admission_refusal(
