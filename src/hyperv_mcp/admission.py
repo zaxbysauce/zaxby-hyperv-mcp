@@ -62,6 +62,7 @@ tool names only, counts in the snapshot.
 from __future__ import annotations
 
 import contextvars
+import math
 import threading
 import time
 from collections import deque
@@ -479,19 +480,29 @@ def admit_sync(
     """The synchronous twin of admit() (the detached runner's flavor):
     the same core, tick-bounded, observing `stop_event` every tick — a
     set event aborts the wait as AdmissionStopped with every stage
-    reclaimed."""
+    reclaimed. The stop check runs INSIDE the state lock and BEFORE the
+    granted check (PR #123 review PRR-002): a cancel that lands in the
+    grant-to-return window can never hand out a ticket whose body would
+    start with the shared heartbeat stop already set — the grant is
+    reclaimed through the retire path instead."""
     waiter, bound = _enter(tool_name, agent_id, wait_s, actor_key)
     started = time.monotonic()
     deadline = started + bound
     try:
         while True:
             with _LOCK:
+                # Stop BEFORE granted (PRR-002): both observations happen
+                # under the same mutex a cancel-side grant+signal sequence
+                # holds, so the waiter cannot observe the grant without
+                # also observing the stop. Raising here falls into the
+                # except arm below, whose _retire reclaims the just-granted
+                # permit (the ticket was granted but never used).
+                if stop_event is not None and stop_event.is_set():
+                    raise AdmissionStopped
                 if waiter.granted:
                     return _issue(waiter, started)
                 if time.monotonic() >= deadline:
                     raise AdmissionBusy(_retry_after_ms(bound))
-            if stop_event is not None and stop_event.is_set():
-                raise AdmissionStopped
             time.sleep(_TICK_S)
     except BaseException:
         with _LOCK:
@@ -538,18 +549,37 @@ def configure(
     the bootstrap-valid default at every cap including 1. A SUPPLIED value
     is validated 0 <= light_reserve < total_tokens (a reserve at or above
     the budget leaves zero general capacity) and REJECTED with ValueError
-    — never clamped. Validation happens before any state moves, so a
-    refused configure leaves the running budget untouched.
+    — never clamped. wait_s / light_wait_s must be finite (NaN/inf are
+    rejected with the same ValueError shape — a NaN slips a bare `< 0`
+    check and would park forever). Validation happens before any state
+    moves, so a refused configure leaves the running budget untouched.
+    A configure while tickets are outstanding (in flight or parked in
+    either queue) is likewise refused: re-sizing would zero the counters
+    under live callers and drop parked waiters, and later releases would
+    drive the counters negative (PR #123 review PRR-003).
     """
     global _TOTAL_TOKENS, _LIGHT_RESERVE, _WAIT_S, _LIGHT_WAIT_S, _CONFIGURED
     if isinstance(total_tokens, bool) or not isinstance(total_tokens, int):
         raise ValueError("admission total_tokens must be an integer >= 1")
     if total_tokens < 1:
         raise ValueError("admission total_tokens must be an integer >= 1")
-    if not _is_number(wait_s) or wait_s < 0:
-        raise ValueError("admission wait_s must be a number >= 0")
-    if light_wait_s is not None and (not _is_number(light_wait_s) or light_wait_s < 0):
-        raise ValueError("admission light_wait_s must be a number >= 0 or None")
+    # isfinite is guarded to REAL FLOATS only: _is_number admits plain ints,
+    # and math.isfinite on a huge int raises OverflowError *before* the
+    # comparison could, escaping the ValueError -> ConfigError translation at
+    # bootstrap (the exact escape class the light_reserve check below
+    # avoids with its plain int comparison). Ints are finitely comparable.
+    if (
+        not _is_number(wait_s)
+        or (isinstance(wait_s, float) and not math.isfinite(wait_s))
+        or wait_s < 0
+    ):
+        raise ValueError("admission wait_s must be a finite number >= 0")
+    if light_wait_s is not None and (
+        not _is_number(light_wait_s)
+        or (isinstance(light_wait_s, float) and not math.isfinite(light_wait_s))
+        or light_wait_s < 0
+    ):
+        raise ValueError("admission light_wait_s must be a finite number >= 0 or None")
     if light_reserve is None:
         resolved = min(2, total_tokens - 1)
     else:
@@ -557,6 +587,14 @@ def configure(
             raise ValueError(
                 "admission light_reserve must be an integer or None (omitted)"
             )
+        # Plain integer comparison only (PR #123 review round 2, R1): the
+        # type check above already excludes NaN/inf (a bool or non-int is
+        # refused), and math.isfinite on a huge int raises OverflowError
+        # BEFORE the range check — escaping bootstrap's ValueError ->
+        # ConfigError translation and breaking the CONFIG ERROR contract
+        # with a raw traceback. isfinite stays on the FLOAT waits only
+        # (guarded by isinstance(float); huge ints refuse via the
+        # comparisons and the float() conversion guard below).
         if not 0 <= light_reserve < total_tokens:
             raise ValueError(
                 f"admission light_reserve {light_reserve} must satisfy "
@@ -565,11 +603,36 @@ def configure(
             )
         resolved = light_reserve
     with _LOCK:
+        if _IN_FLIGHT_GENERAL or _IN_FLIGHT_LIGHT or _LANE or _ACTORS:
+            # PR #123 review PRR-003: configure() zeroes the counters via
+            # _reset_core() — with a live ticket that would strand the
+            # holder's release into negative counters and oversell the
+            # new headroom. Bootstrap configures exactly once before any
+            # admit; only a second programmatic configure can land here.
+            raise ValueError(
+                "admission reconfigure refused: outstanding admission "
+                "tickets; release them before reconfiguring"
+            )
         _reset_core()
         _TOTAL_TOKENS = total_tokens
         _LIGHT_RESERVE = resolved
-        _WAIT_S = float(wait_s)
-        _LIGHT_WAIT_S = None if light_wait_s is None else float(light_wait_s)
+        try:
+            _WAIT_S = float(wait_s)
+        except OverflowError:
+            # A huge-int wait passes the comparisons above (ints are
+            # finitely comparable) but cannot become a float; normalize to
+            # the same ValueError shape bootstrap translates to ConfigError.
+            raise ValueError(
+                "admission wait_s must be a finite number >= 0"
+            ) from None
+        try:
+            _LIGHT_WAIT_S = (
+                None if light_wait_s is None else float(light_wait_s)
+            )
+        except OverflowError:
+            raise ValueError(
+                "admission light_wait_s must be a finite number >= 0 or None"
+            ) from None
         _CONFIGURED = True
 
 

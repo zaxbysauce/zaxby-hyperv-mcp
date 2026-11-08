@@ -14,16 +14,18 @@ bands (CI-runner scheduler jitter inflates each sleep ~5-10 ms and even the
 steady-state ceiling to ~210 ms, which tripped every absolute band the
 probe originally used):
 
-  P1  the sleep sequence ROUGHLY DOUBLES (each sleep 1.5x-3x the prior),
-      the first sleep stays < 15 ms, and at least one recorded sleep sits
-      >= 150 ms (3x the fixed 50 ms cadence — the ceiling evidence);
+  P1  the sleep sequence ROUGHLY DOUBLES (each ramp sleep 1.2x-3.2x the
+      prior, the ramp->ceiling transition step only >= 1.05x), the first
+      sleep stays < 35 ms, and the first ceiling sleep sits >= 185 ms
+      (max_ms >= 150 — 3x the fixed 50 ms cadence — stays the floor
+      evidence);
   P2  the sweep count in the 3.0 s window sits in the backoff band
       (10-24; the fixed 50 ms cadence would perform ~61 — no fixed-cadence
       or sub-ceiling mutant can land in this band);
   P3  the amendment's arithmetic recomputed from the MEASURED ceiling keeps
       the attempt-reduction ratio >= 3 (observed: 200.3 ms ceiling on a dev
       box -> 3005 vs 12000 = 3.99x; 210 ms on a loaded CI runner -> ~2862
-      vs 12000 = ~3.47x — both >= 3);
+      vs 12000 = ~4.19x — both >= 3);
   P4  the busy contract survives inside the same probe run: the waiter
       raises PowerShellBusy naming 'saturated', and its permit accounting
       closes cleanly — the failed waiter stranded no slot lock (a fresh
@@ -167,12 +169,14 @@ def test_backoff_attempt_schedule_matches_ceiling_model(pool_env, monkeypatch):
     print("SLEEPS-MS:", [round(s * 1000, 1) for s in measured_sleeps])
 
     # P1 — jitter-robust schedule shape (ratio bounds, no absolute bands):
-    # the sleep sequence must roughly double (each sleep 1.5x-3x the prior),
-    # the first sleep must stay tiny (< 15 ms), and at least one recorded
-    # sleep must sit at >= 150 ms (3x the fixed 50 ms cadence — the ceiling
-    # evidence). CI-runner scheduler jitter (~5-10 ms per sleep, observed)
-    # cannot fake a doubling sequence, and a fixed-cadence mutant's flat
-    # ~50 ms sequence fails the ratio bounds at its second sleep.
+    # the ramp must roughly double (each sleep 1.2x-3.2x the prior, the
+    # ramp->ceiling transition step only >= 1.05x), the first sleep must
+    # stay < 35 ms, and the first ceiling sleep must sit >= 185 ms (the
+    # max_ms >= 150 floor — 3x the fixed 50 ms cadence — stays as the
+    # ceiling evidence). CI-runner scheduler jitter (~5-10 ms per sleep,
+    # observed) cannot fake a doubling sequence, and a fixed-cadence
+    # mutant's flat ~50 ms sequence fails the ratio bounds at its second
+    # sleep.
     assert len(measured_sleeps) >= 7, (
         f"backoff sequence too short to show ramp+ceiling: {measured_sleeps}")
     first_ms = measured_sleeps[0] * 1000
@@ -232,7 +236,7 @@ def test_backoff_attempt_schedule_matches_ceiling_model(pool_env, monkeypatch):
     # ceiling >= 150 ms is >= 3x the fixed cadence, so the 600 s attempt
     # reduction is >= ~3x regardless of scheduler jitter (observed ceilings:
     # 200.3 ms on dev boxes -> 3005 vs 12000 = 3.99x; ~210 ms on a loaded CI
-    # runner -> ~2862 vs 12000 = ~3.47x — both >= 3).
+    # runner -> ~2862 vs 12000 = ~4.19x — both >= 3).
     ceiling_ms = max_ms
     ramp_ms = sum(measured_sleeps[:6]) * 1000
     window_ms = 600_000.0

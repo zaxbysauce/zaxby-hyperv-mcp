@@ -346,13 +346,19 @@ def bootstrap(
     # thread bound. light_reserve=None is the OMITTED default (resolved to
     # min(2, total - 1), bootstrap-valid at every cap including 1); a
     # supplied invalid value raises here — startup fails loudly, never
-    # clamped.
-    admission.configure(
-        total_tokens=2 * cfg.max_host_powershell,
-        light_reserve=cfg.admission.light_reserve,
-        wait_s=cfg.admission.wait_s,
-        light_wait_s=cfg.admission.light_wait_s,
-    )
+    # clamped. The ValueError is translated to ConfigError (PR #123 review
+    # PRR-005) so main's CONFIG ERROR contract (print + exit 2, never a
+    # raw traceback) covers admission misconfiguration too — the loader's
+    # own validation cannot see the derived budget arithmetic.
+    try:
+        admission.configure(
+            total_tokens=2 * cfg.max_host_powershell,
+            light_reserve=cfg.admission.light_reserve,
+            wait_s=cfg.admission.wait_s,
+            light_wait_s=cfg.admission.light_wait_s,
+        )
+    except ValueError as exc:
+        raise ConfigError(f"admission: {exc}") from None
     _mcp = MCPServer(
         "hyperv_mcp",
         instructions=_INSTRUCTIONS,
@@ -4494,6 +4500,15 @@ def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]
         return errors.envelope(exc), None
 
 
+#: The no-explicit-class sentinel for the guard's rejection writer (PR #123
+#: review PRR-007, F6): when a rejection carries no admission class of its
+#: own, the auditlog kwarg is OMITTED entirely (auditlog's own _UNSET
+#: semantics) so admission_class and admission_wait_ms resolve TOGETHER from
+#: the admission ContextVar — a tool-error rejection inside an admitted call
+#: keeps both fields instead of a null class beside a measured wait.
+_ADMISSION_CLASS_UNSET = object()
+
+
 def _harden_tools(mcp: MCPServer) -> None:
     """Stamp additionalProperties:false and reject bad calls at Tool.run.
 
@@ -4546,7 +4561,7 @@ def _harden_tools(mcp: MCPServer) -> None:
             arguments: dict,
             env: dict,
             *,
-            admission_class: str = "",
+            admission_class: object = _ADMISSION_CLASS_UNSET,
             retry_after_ms: float | None = None,
         ) -> CallToolResult:
             args = arguments or {}
@@ -4592,6 +4607,17 @@ def _harden_tools(mcp: MCPServer) -> None:
                 if not finished:
                     timing.finish(timing_token)
 
+            # F6 (PR #123 review PRR-007): class and wait resolve as a PAIR.
+            # The busy path passes its explicit class + retry hint (no admit
+            # was in flight, so the ContextVar handoff would serialize
+            # nulls there); every other path OMITS the kwarg entirely so
+            # auditlog fills class AND wait together from the admission
+            # ContextVar — inside an admitted call (a tool-error rejection)
+            # both stay populated, and pre-body (no admit in flight) both
+            # serialize null, never a null class beside a measured wait.
+            admission_kwargs: dict[str, Any] = {}
+            if admission_class is not _ADMISSION_CLASS_UNSET:
+                admission_kwargs["admission_class"] = admission_class or None
             try:
                 auditlog.log_operation(
                     tool=name,
@@ -4602,12 +4628,8 @@ def _harden_tools(mcp: MCPServer) -> None:
                     job_id=job_id,
                     relay_id=relay_id,
                     timing=timing_snapshot,
-                    # Issue #68 supplement: a pre-body admission refusal
-                    # records its class and the exception's retry hint
-                    # explicitly (no admit was in flight, so the ContextVar
-                    # handoff would serialize nulls here).
-                    admission_class=admission_class or None,
                     retry_after_ms=retry_after_ms,
+                    **admission_kwargs,
                 )
             except Exception as audit_exc:  # noqa: BLE001 - best-effort: a
                 # broken audit sink must not turn a rejection into a raw
@@ -4706,9 +4728,14 @@ def _harden_tools(mcp: MCPServer) -> None:
                     # The bounded park refused: an ordinary busy rejection
                     # (retryable, the exception's own retry hint) — a keyed
                     # sync row that already exists closes here, never left
-                    # working.
+                    # working. AFTER the terminal write the row's idem_key
+                    # is freed (PR #123 review PRR-001, F1): the busy
+                    # refusal is retryable, so a same-key retry mints a
+                    # FRESH row and executes instead of replaying this
+                    # refusal for the idempotency TTL.
                     if ops_ctx is not None:
                         operations.fail_inline(ops_ctx, busy)
+                        operations.release_busy_idem(ops_ctx)
                     busy_env = errors.envelope(busy)
                     return _audited_rejection(
                         name, arguments, busy_env,

@@ -335,8 +335,9 @@ class AdmissionSettings:
     value is validated against the token budget at startup
     (0 <= light_reserve < 2 x max_host_powershell) and rejected, never
     clamped. `light_reserve: 0` is the explicit disable, accepting that a
-    fully lock-queued budget can then delay light/status admission up to
-    `vm_lock_wait_s`."""
+    LIGHT caller then parks at most `light_wait_s` (default 10 s) behind a
+    fully lock-queued budget before it receives a retryable busy
+    envelope."""
 
     light_reserve: int | None = None
     wait_s: float = 30.0

@@ -1259,6 +1259,27 @@ class Store:
                 self._rollback()
                 raise
 
+    def op_release_idem(self, op_id: str) -> None:
+        """Clear one op row's idem_key WITHOUT touching anything else (the
+        admission-busy refusal path, PR #123 review PRR-001): a busy refusal
+        is RETRYABLE, so after its terminal FAILED write the row frees the
+        (agent, tool, idem_key) UNIQUE slot — the partial index ops_idem
+        ignores empty keys, so a same-key retry mints a FRESH row and
+        executes instead of replaying the refusal for the idempotency TTL.
+        The row itself (status, stored envelope) stays for its handle poll;
+        every other terminal path (completion, body failure, cancellation)
+        keeps its key and its replay semantics."""
+        with self._lock:
+            self._begin()
+            try:
+                self._connect().execute(
+                    "UPDATE ops SET idem_key = '' WHERE op_id = ?", (op_id,)
+                )
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+
     def ops_prune(self, older_than: float) -> int:
         """Retention: delete TERMINAL op rows (with their result payloads)
         whose created_at is older than the cutoff. Working rows are never

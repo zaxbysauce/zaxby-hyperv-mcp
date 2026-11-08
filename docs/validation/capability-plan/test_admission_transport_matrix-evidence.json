@@ -15,16 +15,16 @@
   ],
   "metrics_required_when_run": [
     "p50/p95 tool latency",
-    "queue wait",
+    "queue wait (bare queue_wait_ms aggregate + per-tool queue_wait_ms.<tool> lists)",
     "throughput",
-    "cancellation rate",
+    "busy-refusal rate",
     "per-VM fairness"
   ],
   "p50_ms": "unknown (not executed)",
   "p95_ms": "unknown (not executed)",
   "queue_wait_ms": "unknown (not executed)",
-  "throughput_calls_per_s": "unknown (not executed)",
-  "cancellation_rate": "unknown (not executed)",
+  "throughput_per_s": "unknown (not executed)",
+  "busy_refusal_rate": "unknown (not executed)",
   "per_vm_fairness": "unknown (not executed)",
   "note": "This file is the NAMED placeholder the issue's approval row reserves for the live transport leg. It is not a pass, a claim, or a partial result: the live leg has NOT been run and no performance claim is made. The harness itself ships unit-proven semantics via tests/unit/test_admission_fairness.py and tests/unit/test_admission_dispatch.py; the named env var gates the HOST_ONLY leg so it can never present as a live pass by default."
 }

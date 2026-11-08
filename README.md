@@ -263,15 +263,16 @@ the task-spawned controller reads it from the environment.
   ceiling, each sleep capped to the remaining deadline) is now bound by
   an executed probe (`tests/unit/test_c02_backoff_probe.py`): the
   measured schedule matches the ceiling model, a 3 s window performs
-  20 (±1) sweeps, and the amendment's 600 s figures extrapolate from the
-  measurement — ~3005 attempts vs the fixed-50 ms counterfactual's
-  12000, a ~3.99x attempt reduction.
+  10-24 sweeps (the jitter-tolerant band; a fixed 50 ms cadence would
+  sweep ~61 times), and the shipped assertions pin a >= 3x attempt
+  reduction from the measured ceiling (the dev-box measurement is ~4x).
 - **Issue #68 supplement AC6 (transport matrix harness + evidence)**:
-  `tests/benchmark/test_admission_transport_matrix.py` ships as the
-  HOST_ONLY harness (shared-VM vs independent-VM topology, p50/p95,
-  queue wait, throughput, cancellation rate, per-VM fairness over the
-  configured MCP transport), env-gated so it never presents as a live
-  pass by default, with the named evidence placeholder
+  the transport-matrix harness (available from the repository at
+  `tests/benchmark/test_admission_transport_matrix.py`, the HOST_ONLY
+  harness — shared-VM vs independent-VM topology, p50/p95, queue wait,
+  throughput, busy-refusal rate, per-VM fairness over the configured MCP
+  transport), env-gated so it never presents as a live pass by default,
+  with the named evidence placeholder — the repo doc artifact
   `docs/validation/capability-plan/test_admission_transport_matrix-evidence.json`
   (executed: false — the plan-critic-approved substitution).
 - Version bump: 0.13.0 -> 0.14.0
@@ -1363,7 +1364,9 @@ resize (2x `max_host_powershell`) reserves no class for PS-free tools, so
 lock-queued calls occupying every limiter token delay PS-free admission up to the `vm_lock_wait_s` bound
 (measured worst case: 1 lock holder + 15 lock-queued calls); the classed
 admission layer below is the issue-#68-supplement fairness reserve that
-closes it. The limiter
+closes it for the LIGHT class only — the reserved lane the admission
+section below calls the closed half of this bound (GENERAL admission
+keeps the documented bounded wait). The limiter
 bound is restored on server-lifespan exit, so co-tenant `to_thread` users
 keep their own token count; in-process embedders driving `call_tool` never
 enter the lifespan and keep anyio's 40-token default. Console input runs under a read lock on the VM key

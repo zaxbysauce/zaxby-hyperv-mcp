@@ -468,6 +468,22 @@ def fail_inline(op_ctx: dict[str, Any], exc: BaseException) -> None:
         pass
 
 
+def release_busy_idem(op_ctx: dict[str, Any]) -> None:
+    """The guard-side twin of the runner's post-busy idem release (PR #123
+    review PRR-001, F1): call AFTER fail_inline stored the busy envelope on
+    a keyed sync row — the refusal is RETRYABLE, so the row's idem_key is
+    cleared (statestore.op_release_idem; the partial UNIQUE index ignores
+    empty keys) and a same-key retry mints a FRESH row and executes instead
+    of replaying the refusal for the idempotency TTL. The caller keeps the
+    busy envelope fail_inline just wrote. Best-effort like fail_inline: a
+    store failure degrades to the replayable refusal this closes, never
+    into a raw exception on the response path."""
+    try:
+        store_for(op_ctx["cfg"]).op_release_idem(op_ctx["op_id"])
+    except Exception:
+        pass
+
+
 def _result_text(result: Any) -> str:
     """The serialized body of one tool result (CallToolResult or dict)."""
     content = getattr(result, "content", None)
@@ -497,11 +513,21 @@ _ADMIT_STOPS_LOCK = threading.Lock()
 
 
 def _signal_admit_stop(op_id: str) -> None:
-    """Fire a parked runner's admission stop event (never raises)."""
+    """Fire a parked runner's admission stop event (never raises).
+
+    The set() runs INSIDE the registry lock (PR #123 review PRR-002):
+    releasing the lock between the lookup and the set let the runner's
+    park-window pop (same lock) interleave, so the signal landed on the
+    shared heartbeat-teardown event AFTER the body had started — a live
+    runner's beat chain killed by a park-window cancel (the D12 defect
+    class). Signal-and-pop now serialize on the lock: either the cancel
+    fires while the entry is still registered (the park wakes into
+    AdmissionStopped) or the pop wins and the cancel finds no event (the
+    body-time cooperative path takes over)."""
     with _ADMIT_STOPS_LOCK:
         event = _ADMIT_STOPS.get(op_id)
-    if event is not None:
-        event.set()
+        if event is not None:
+            event.set()
 
 
 def _start_runner(
@@ -650,6 +676,7 @@ def _execute_body(
         # the park — an entry stranded there would be memory-only but would
         # also let a later cancel signal a dead event (review r3).
         _raise_if_cancelled_locked(cfg, op_id, store)
+        was_stopped = False
         try:
             ticket = admission.admit_sync(
                 tool_name,
@@ -669,17 +696,37 @@ def _execute_body(
                              "op.cancelled")
             return
         finally:
-            # The PARK-WINDOW pop (review round 5): the registry entry must
-            # be gone BEFORE the body starts. The registered event IS the
-            # runner's shared heartbeat-teardown `stop` — an entry left live
-            # through the body turns a body-time hyperv_op_cancel into a
-            # beat-chain kill of a LIVE runner: the heartbeats stop, read-time
+            # The PARK-WINDOW pop (review round 5) + the ATOMIC stop
+            # re-read (review round 2, R2): the registry entry must be gone
+            # BEFORE the body starts, and the pop and the stop re-read run
+            # under ONE _ADMIT_STOPS_LOCK hold — the same lock
+            # _signal_admit_stop holds for its lookup+set. That closes the
+            # grant-to-pop window: a park-window cancel either wins the
+            # lock while the entry is still registered (its set() lands,
+            # the re-read observes it, and the granted-but-unused ticket is
+            # released below — the body NEVER starts with the shared
+            # heartbeat-teardown stop already set) or loses the race to
+            # the pop (the signal finds no entry, and body-time
+            # cancellation stays with the cooperative leg-boundary hook).
+            # The registered event IS the runner's shared
+            # heartbeat-teardown `stop` — an entry left live through the
+            # body turns a body-time hyperv_op_cancel into a beat-chain
+            # kill of a LIVE runner: the heartbeats stop, read-time
             # staleness misclassifies the row failed/interrupted while the
             # body still runs, and the body's own cancelled transition is
-            # dropped by the stale flip. Body-time cancellation stays with
-            # the cooperative leg-boundary hook (raise_if_cancelled).
+            # dropped by the stale flip.
             with _ADMIT_STOPS_LOCK:
                 _ADMIT_STOPS.pop(op_id, None)
+                was_stopped = stop.is_set()
+        if was_stopped:
+            # A cancel signalled inside the grant-to-pop window: the ticket
+            # was granted but never used — release it (the retire path
+            # reclaims the permit) and close the op with the AdmissionStopped
+            # terminal, exactly as a stop observed mid-park would.
+            admission.release_sync(ticket)
+            _safe_transition(store, op_id, statestore.OP_CANCELLED, agent, cfg,
+                             "op.cancelled")
+            return
         try:
             result = tool_fn(**body_args)
         finally:
@@ -744,7 +791,11 @@ def _admission_refusal(
     auditable rejection row records tool, agent, error_class, the
     exception's retry hint, and the admission class — the same fields the
     guard's _audited_rejection writes, which is not reachable from this
-    thread. Best-effort on the audit sink: a broken sink must not raise
+    thread. The busy-vs-cancel tick race below is intended: a cancel
+    signal racing the park deadline may lose — the deadline outcome is
+    authoritative, and a same-key resubmit executes fresh (the idem
+    release below frees the key either way).
+    Best-effort on the audit sink: a broken sink must not raise
     into the runner's epilogue."""
     env = errors.envelope(busy)
     text = json.dumps(env, separators=(",", ":"), default=str)
@@ -753,6 +804,19 @@ def _admission_refusal(
         error_class="busy",
         result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
     )
+    # AFTER the terminal busy write: free the row's idem_key (PR #123
+    # review PRR-001, F1). The busy refusal is RETRYABLE — this caller's
+    # submitted handle keeps polling the stored busy envelope above, but
+    # the (agent, tool, idem_key) UNIQUE slot must not hold the key for
+    # the idempotency TTL: a same-key resubmit mints a FRESH row and
+    # executes instead of replaying the refusal. The cancel path (the
+    # AdmissionStopped arm) deliberately does NOT do this: a cancelled op
+    # is terminal and its retry answers from the row (D9's pin).
+    try:
+        store.op_release_idem(op_id)
+    except Exception:
+        pass  # best-effort: a store failure degrades to the replayable
+        # refusal this closes, never into a runner-crash
     try:
         auditlog.log_operation(
             tool=tool_name,

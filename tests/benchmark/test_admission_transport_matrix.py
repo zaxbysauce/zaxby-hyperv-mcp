@@ -4,8 +4,10 @@ HOST_ONLY, UNEXECUTED by default: this is the named harness the issue's
 approval row reserves for the live transport leg (the plan-critic round-1
 finding-8 substitution; the companion evidence placeholder is
 docs/validation/capability-plan/test_admission_transport_matrix-evidence.json).
-It never presents as a live pass: without the env gates below it SKIPS at
-collection, exactly like the issue-#29 AC18 HOST_ONLY precedent.
+It never presents as a live pass: without the env gates below the test
+SKIPS at its first line (the gate check runs INSIDE the test, not at
+collection — a default run reports the skip, never a pass), the
+issue-#29 AC18 HOST_ONLY precedent.
 
 What the harness measures once an operator points it at a configured,
 disposable lab over the CONFIGURED MCP TRANSPORT (the streamable-http
@@ -19,10 +21,12 @@ endpoint the deployment actually runs):
     tools/call dispatch to the result;
   - queue wait — the server-reported admission park wait per call
     (audit ``admission_wait_ms``, read from the audit sink the operator
-    names);
+    names; each summary row carries the per-tool ``queue_wait_ms.<tool>``
+    lists PLUS the bare ``queue_wait_ms`` aggregate — the max across
+    tools — so the value pastes straight into the evidence file's field);
   - throughput — completed calls per second at the configured
     concurrency;
-  - cancellation rate — the share of calls answered with a retryable
+  - busy-refusal rate — the share of calls answered with a retryable
     ``busy`` envelope;
   - per-VM fairness — per-VM completion counts and mean client latency
     under saturation (a starved VM shows ~0 completions while another
@@ -84,6 +88,11 @@ LIGHT_TOOL = "hyperv_list_vms"
 
 
 def _gate() -> None:
+    """The HOST_ONLY gate (the issue-#29 AC18 env-gated-skip precedent) —
+    validates EVERY matrix env before the run can start: the two topology
+    legs share one test, so a malformed independent-VM list discovered
+    only at its leg would arrive AFTER the shared-VM leg had already
+    driven raw input for the full duration (PR #123 review PRR-017)."""
     if not os.environ.get(GATE_ENV, "").strip():
         pytest.skip(
             f"HOST_ONLY: set {GATE_ENV}=1 against a configured, disposable, "
@@ -94,6 +103,19 @@ def _gate() -> None:
         pytest.skip(
             f"HOST_ONLY: {GATE_ENV} is set but {URL_ENV} does not name the "
             "configured MCP transport endpoint"
+        )
+    if not os.environ.get(SHARED_VM_ENV, "").strip():
+        pytest.skip(
+            f"HOST_ONLY: {GATE_ENV} is set but {SHARED_VM_ENV} does not name "
+            "the one disposable VM the shared-vm topology fans raw input onto"
+        )
+    vms_raw = os.environ.get(VMS_ENV, "")
+    vms = [name.strip() for name in vms_raw.split(",")]
+    if not vms_raw.strip() or any(not name for name in vms):
+        pytest.skip(
+            f"HOST_ONLY: {GATE_ENV} is set but {VMS_ENV} is not a non-empty "
+            f"comma-separated list of disposable VM names with no blank "
+            f"entry (got {vms_raw!r})"
         )
 
 
@@ -113,7 +135,7 @@ class CallRecord:
 class MatrixRun:
     """The collector for one matrix leg: every axis the evidence file's
     required-when-run fields name (p50/p95, queue wait, throughput,
-    cancellation rate, per-VM fairness)."""
+    busy-refusal rate, per-VM fairness)."""
 
     topology: str
     concurrency: int
@@ -138,8 +160,10 @@ class MatrixRun:
     def throughput_per_s(self) -> float:
         return len(self.records) / self.duration_s if self.duration_s else 0.0
 
-    def cancellation_rate(self) -> float:
-        """The share of calls the bounded admit refused retryable-busy."""
+    def busy_refusal_rate(self) -> float:
+        """The share of calls the bounded admit refused retryable-busy
+        (named for what it counts — the driver never cancels anything;
+        PR #123 review PRR-014)."""
         if not self.records:
             return float("nan")
         refused = sum(1 for r in self.records if r.error_class == "busy")
@@ -172,7 +196,7 @@ class MatrixRun:
             "p50_ms": self.p50_ms(),
             "p95_ms": self.p95_ms(),
             "throughput_per_s": self.throughput_per_s(),
-            "cancellation_rate": self.cancellation_rate(),
+            "busy_refusal_rate": self.busy_refusal_rate(),
             "per_vm_fairness": self.per_vm_fairness(),
         }
 
@@ -236,7 +260,7 @@ def _shared_vms() -> tuple[str, ...]:
     )
 
 
-def _independent_vms(concurrency: int) -> tuple[str, ...]:
+def _independent_vms() -> tuple[str, ...]:
     names = tuple(
         name.strip()
         for name in os.environ.get(VMS_ENV, "").split(",")
@@ -297,10 +321,12 @@ async def _drive(session, run: MatrixRun, vms: tuple[str, ...]) -> None:
 def test_admission_transport_matrix_host_only():
     """The matrix driver (issue #68 supplement AC6): shared-VM vs
     independent-VM topology at the configured concurrency, collecting
-    p50/p95 latency, throughput, cancellation rate, and per-VM fairness
+    p50/p95 latency, throughput, busy-refusal rate, and per-VM fairness
     over the configured MCP transport, plus the server-side queue-wait
-    axis from the audit sink. SKIPS unless the named lab env gates are
-    set — this harness's numbers are never produced by a default run."""
+    axis from the audit sink (per-tool lists + the bare max aggregate, so
+    a run's rows paste straight into the evidence file's fields). SKIPS
+    unless the named lab env gates are set — this harness's numbers are
+    never produced by a default run."""
     _gate()
     url = os.environ[URL_ENV].strip()
     concurrency = int(os.environ.get("HYPERV_MCP_MATRIX_CONCURRENCY", "4"))
@@ -315,7 +341,7 @@ def test_admission_transport_matrix_host_only():
                     vms = (
                         _shared_vms()
                         if topology == "shared-vm"
-                        else _independent_vms(concurrency)
+                        else _independent_vms()
                     )
                     run = MatrixRun(
                         topology=topology,
@@ -325,10 +351,20 @@ def test_admission_transport_matrix_host_only():
                     await _drive(session, run, vms)
                     row = run.summary()
                     if audit_path != Path(""):
-                        for tool in (RAW_INPUT_TOOL, LIGHT_TOOL):
-                            waits = audit_queue_waits_ms(audit_path, tool)
+                        per_tool_waits = {
+                            tool: audit_queue_waits_ms(audit_path, tool)
+                            for tool in (RAW_INPUT_TOOL, LIGHT_TOOL)
+                        }
+                        for tool, waits in per_tool_waits.items():
                             if waits:
                                 row[f"queue_wait_ms.{tool}"] = waits
+                        # The BARE aggregate (PR #123 review PRR-013): the
+                        # worst observed park wait across tools, so the
+                        # evidence file's queue_wait_ms field pastes
+                        # straight from this row.
+                        flat = [w for waits in per_tool_waits.values() for w in waits]
+                        if flat:
+                            row["queue_wait_ms"] = max(flat)
                     emit_row(row)
 
     asyncio.run(_matrix())

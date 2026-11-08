@@ -40,6 +40,37 @@ cannot see:
   D11 (review round 1, MINOR 4/5) casefolded canonical actor keys for
       mixed-case spellings, and fair_queue_depth counting stage-1 parks.
 
+PR #123 review round (swarm-pr-feedback), added here:
+
+  D13 (PRR-001/F1) a keyed call refused busy by the admission park —
+      BOTH arms (the guard's keyed-sync row and the detached runner's
+      row) — frees its idem_key after the terminal busy write: the old
+      handle still polls the stored busy envelope, and a SAME-KEY retry
+      mints a FRESH row and EXECUTES the body (the cancel arm keeps its
+      terminal replay; D9 above pins that);
+  D14 (PRR-002/F2) a stop that lands in the grant-to-return window of
+      admit_sync never yields a ticket — the stop check precedes the
+      granted check under the state lock;
+  D15 (PRR-003/F3) configure() with outstanding tickets is refused
+      (ValueError), and succeeds once they are released;
+  D16 (PRR-004/F4) configure() rejects NaN/inf wait bounds;
+  D17 (PRR-005/F5) an admission misconfiguration surfaces as CONFIG
+      ERROR + exit 2 from --check-env (ConfigError, never a raw
+      ValueError traceback);
+  D18 (PRR-007/F6) a tool-error rejection row inside an admitted call
+      carries admission_class AND admission_wait_ms TOGETHER from the
+      ContextVar; a busy rejection row keeps its explicit class +
+      retry_after_ms.
+
+PR #123 review round 2 (reviewer findings 2 and 3), added here:
+
+  D19 (R2) a cancel signal landing between admit_sync's RETURN and the
+      park-window pop closes the op CANCELLED with the granted ticket
+      released — the body never starts with the shared stop set;
+  D20 (R1) a ~400-digit int light_reserve surfaces as CONFIG ERROR +
+      exit 2 (the plain-integer range refusal), never a raw
+      OverflowError from math.isfinite on a huge int.
+
 Hermetic: no PowerShell spawn (content-dispatched run_ps fakes), no host,
 no network; every wait is a bounded poll. Whole-file runtime is well under
 60 s.
@@ -70,6 +101,7 @@ from mcp_types import Request, RequestParams, Result
 
 import hyperv_mcp.server as server_module
 from hyperv_mcp import admission, console, operations, pswindows
+from hyperv_mcp.config import ConfigError
 
 GUID = "d4d1d1d1-0000-4000-8000-0000000000aa"
 TASKS_ID = "io.modelcontextprotocol/tasks"
@@ -1001,7 +1033,10 @@ def test_cap1_bootstrap_omitted_default_valid_and_explicit_invalid_rejected(
     )
     assert mod.CFG.admission.light_reserve is None
 
-    with pytest.raises(ValueError) as refused:
+    # PR #123 review PRR-005 (F5): the admission ValueError is translated
+    # to ConfigError at bootstrap, so the CLI's CONFIG ERROR contract
+    # covers admission misconfiguration (D17 below pins the exit code).
+    with pytest.raises(ConfigError) as refused:
         fresh_server({
             "unrestricted": True,
             "max_host_powershell": 1,
@@ -1177,3 +1212,562 @@ def test_sequential_calls_no_admission_class_bleed(tmp_path, fresh_server, monke
     )
     assert rejection[-1]["admission_wait_ms"] is None
     assert rejection[-1]["retry_after_ms"] is None
+
+
+# ---------------------------------------------------------------------------
+# D13 (PR #123 review PRR-001, F1) - a keyed busy refusal frees the idem
+# key in BOTH arms; the same-key retry EXECUTES on a fresh row
+# ---------------------------------------------------------------------------
+
+
+def test_keyed_busy_refusal_frees_idem_key_sync_retry_executes(
+    tmp_path, fresh_server, monkeypatch
+):
+    """Guard arm: a keyed sync call refused busy by the admission park
+    closes its row with the busy envelope AND frees the idem key, so the
+    SAME-KEY retry mints a FRESH op row and EXECUTES the body - never
+    replays the refusal for the idempotency TTL. RED at the pre-fix head:
+    the retry replayed the stored busy envelope (op_find_idem still found
+    the keyed failed row) and the body never ran."""
+    audit = tmp_path / "audit.jsonl"
+    mod = fresh_server({
+        "allowed_vm_patterns": ["test-*"],
+        "unrestricted": True,
+        # total 2, reserve 1 -> general capacity 1, held by the harness.
+        "max_host_powershell": 1,
+        "admission": {"wait_s": 0.05},
+        "audit_log_path": str(audit),
+    })
+    mcp = mod.get_mcp()
+    fake = GatedFakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+
+    held = admission.admit_sync("hyperv_start_vm", "holder", wait_s=0.5)
+    assert admission.snapshot()["in_flight_general"] == 1
+    idem = "busy-retry-sync-1"
+
+    async def _keyed():
+        token = _as_agent("agent-a")
+        try:
+            return await mcp.call_tool("hyperv_checkpoint_restore", {
+                **RESTORE_ARGS, "idempotency_key": idem,
+            })
+        finally:
+            auth_context_var.reset(token)
+
+    refused = _payload(asyncio.run(_keyed()), "the busy refusal")
+    assert refused.get("ok") is False and refused.get("error_class") == "busy", (
+        f"the saturated keyed call must be refused busy: {refused}"
+    )
+
+    store = operations.store_for(mod.CFG)
+    # The row closed FAILED and its key was FREED: read it by agent (the
+    # idem consult must no longer see it — pre-fix it found the keyed
+    # failed row here and every same-key retry replayed the refusal for
+    # the idempotency TTL).
+    rows = [
+        r for r in store.op_rows_by_agent("agent-a", include_terminal=True)
+        if r.tool == "hyperv_checkpoint_restore"
+    ]
+    assert rows and rows[-1].status == "failed", (
+        f"the refused keyed call must have closed its op row: {rows!r}"
+    )
+    first_op_id = rows[-1].op_id
+    assert rows[-1].idem_key == "", (
+        f"the busy refusal must free the row's idem key: {rows[-1]!r}"
+    )
+    assert store.op_find_idem("agent-a", "hyperv_checkpoint_restore", idem) is None
+
+    # The capacity is freed; the SAME-KEY retry must EXECUTE on a fresh row.
+    admission.release_sync(held)
+    retry = _payload(asyncio.run(_keyed()), "the same-key retry")
+    assert "replayed" not in retry and retry.get("status") == "restored", (
+        f"the same-key retry must execute the body, not replay the busy "
+        f"refusal: {retry}"
+    )
+    assert fake.restore_calls == 1, (
+        f"the retry must have run the restore body exactly once: "
+        f"{fake.restore_calls}"
+    )
+    fresh_row = store.op_find_idem("agent-a", "hyperv_checkpoint_restore", idem)
+    assert fresh_row is not None and fresh_row.op_id != first_op_id, (
+        "the retry must mint a FRESH row under the freed key"
+    )
+    assert fresh_row.status == "completed", (
+        f"the fresh row must have executed to completion: {fresh_row.status!r}"
+    )
+    # The refused row keeps its busy envelope for its own op_id - but its
+    # idem key is freed (the op_release_idem primitive).
+    old = store.op_get(first_op_id)
+    assert old is not None and old.status == "failed" and old.idem_key == "", (
+        f"the busy-refused row must keep its envelope with a FREED key: "
+        f"{old!r}"
+    )
+    snap = admission.snapshot()
+    assert snap["in_flight_general"] == 0 and snap["fair_queue_depth"] == 0
+
+
+def test_detached_keyed_busy_refusal_handle_polls_and_resubmit_executes(
+    tmp_path, fresh_server, monkeypatch
+):
+    """Runner arm: a detached KEYED call whose runner is refused busy by
+    the admission park closes the row with the busy envelope, frees the
+    idem key, and (a) the submitted handle still polls that stored busy
+    envelope, while (b) a same-key resubmit mints a FRESH row and EXECUTES
+    the body. RED at the pre-fix head: the resubmit replayed the refusal
+    (the keyed failed row still owned the idem slot)."""
+    mod = fresh_server({
+        "allowed_vm_patterns": ["test-*"],
+        "unrestricted": True,
+        # total 2, reserve 1 -> general capacity 1, held by the harness.
+        "max_host_powershell": 1,
+        "admission": {"wait_s": 0.05},
+    })
+    mcp = mod.get_mcp()
+    fake = GatedFakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+
+    held = admission.admit_sync("hyperv_start_vm", "holder", wait_s=0.5)
+    idem = "busy-retry-detached-1"
+
+    async def _detach():
+        token = _as_agent("agent-a")
+        try:
+            return await mcp.call_tool("hyperv_checkpoint_restore", {
+                **RESTORE_ARGS, "detach": True, "idempotency_key": idem,
+            })
+        finally:
+            auth_context_var.reset(token)
+
+    handle = _payload(asyncio.run(_detach()), "the detach handle")
+    first_op_id = handle["op_id"]
+    assert first_op_id, f"the detach answer must carry an op_id: {handle}"
+
+    _wait_until(
+        lambda: operations.op_status(mod.CFG, first_op_id, "agent-a").get("status")
+        == "failed",
+        timeout_s=10.0, what="the parked runner to be refused busy",
+    )
+    operations.drain_for_tests(timeout_s=5.0)
+
+    # (a) the submitted HANDLE still polls the stored busy envelope.
+    result = operations.op_result(mod.CFG, first_op_id, "agent-a", "")
+    stored = json.loads(result["chunk"])
+    assert stored.get("error_class") == "busy", (
+        f"the old handle must still poll the stored busy envelope: {stored}"
+    )
+    old = operations.store_for(mod.CFG).op_get(first_op_id)
+    assert old is not None and old.idem_key == "", (
+        f"the runner's busy refusal must have freed the idem key: {old!r}"
+    )
+
+    # (b) with the capacity freed, the same-key resubmit EXECUTES fresh.
+    admission.release_sync(held)
+    second = _payload(asyncio.run(_detach()), "the same-key resubmit")
+    second_op_id = second.get("op_id")
+    assert second_op_id and second_op_id != first_op_id, (
+        f"the resubmit must mint a FRESH row, not replay the refused one: "
+        f"{second}"
+    )
+    _wait_until(
+        lambda: operations.op_status(mod.CFG, second_op_id, "agent-a").get("status")
+        == "completed",
+        timeout_s=10.0, what="the resubmitted detached op to complete",
+    )
+    operations.drain_for_tests(timeout_s=5.0)
+    assert fake.restore_calls == 1, (
+        f"the resubmit must have run the body exactly once: "
+        f"{fake.restore_calls}"
+    )
+    snap = admission.snapshot()
+    assert snap["in_flight_general"] == 0 and snap["fair_queue_depth"] == 0
+
+
+# ---------------------------------------------------------------------------
+# D14 (PR #123 review PRR-002, F2) - a stop in the grant-to-return window
+# never yields a ticket
+# ---------------------------------------------------------------------------
+
+
+def test_admit_sync_grant_window_stop_never_returns_ticket(monkeypatch):
+    """A cancel that lands in the grant-to-return window of admit_sync can
+    never hand out a ticket whose body would start with the shared stop
+    already set. The choreography makes the window atomic: _grant_pass is
+    patched so the release that grants the parked waiter ALSO sets the
+    stop INSIDE the same state lock - the waiter cannot observe the grant
+    without also observing the stop. RED at the pre-fix head (granted
+    checked before the stop event, outside any lock ordering): the waiter
+    returned a granted ticket with the stop set."""
+    admission.reset()
+    admission.configure(
+        total_tokens=2, light_reserve=1, wait_s=0.5, light_wait_s=0.5
+    )
+    # Widen the park tick (the reviewer's probe trick): the waiter is
+    # observably between iterations, never mid-spin.
+    monkeypatch.setattr(admission, "_TICK_S", 0.05)
+    held = admission.admit_sync("hyperv_start_vm", "holder", wait_s=0.5)
+    assert admission.snapshot()["in_flight_general"] == 1  # capacity 1
+
+    stop = threading.Event()
+    outcome: dict = {}
+    real_grant = admission._grant_pass
+
+    def _waiter():
+        try:
+            outcome["ticket"] = admission.admit_sync(
+                "hyperv_start_vm", "w", wait_s=30.0, stop_event=stop)
+        except BaseException as exc:  # noqa: BLE001 - recorded, asserted below
+            outcome["error"] = exc
+
+    waiter = threading.Thread(target=_waiter, daemon=True)
+    waiter.start()
+    _wait_until(
+        lambda: admission.snapshot()["fair_queue_depth"] >= 1,
+        timeout_s=2.0, what="the sync waiter to park",
+    )
+
+    def _grant_then_signal():
+        # Runs under _LOCK inside release_sync: the real pass grants the
+        # parked waiter, and the cancel's set() lands BEFORE the lock
+        # releases - the waiter's stop/granted observations serialize
+        # against the whole sequence.
+        real_grant()
+        stop.set()
+
+    monkeypatch.setattr(admission, "_grant_pass", _grant_then_signal)
+    admission.release_sync(held)
+    waiter.join(timeout=5.0)
+    assert not waiter.is_alive(), "the grant-window waiter must terminate"
+    assert "ticket" not in outcome, (
+        f"admit_sync must NOT return a granted ticket when the stop landed "
+        f"in the grant-to-return window: {outcome!r}"
+    )
+    assert isinstance(outcome.get("error"), admission.AdmissionStopped), (
+        f"the woken waiter must close as AdmissionStopped; got {outcome!r}"
+    )
+    snap = admission.snapshot()
+    assert snap["in_flight_general"] == 0 and snap["in_flight_light"] == 0, (
+        f"the granted-but-unused ticket must have been reclaimed: {snap}"
+    )
+    assert snap["fair_queue_depth"] == 0 and snap["actor_queue_depth"] == 0
+
+
+# ---------------------------------------------------------------------------
+# D15 (PR #123 review PRR-003, F3) - configure() with outstanding tickets
+# ---------------------------------------------------------------------------
+
+
+def test_configure_refused_while_tickets_outstanding():
+    """A second configure with a ticket outstanding is refused with the
+    configure ValueError (naming the outstanding tickets) and leaves the
+    running budget untouched; once every ticket is released the same
+    configure succeeds. RED at the pre-fix head: the configure zeroed the
+    counters under the held ticket and the later release drove
+    in_flight_general negative."""
+    admission.reset()
+    admission.configure(
+        total_tokens=4, light_reserve=2, wait_s=0.5, light_wait_s=0.5
+    )
+    held = admission.admit_sync("hyperv_start_vm", "holder", wait_s=0.5)
+    assert admission.snapshot()["in_flight_general"] == 1
+
+    with pytest.raises(ValueError) as refused:
+        admission.configure(
+            total_tokens=2, light_reserve=1, wait_s=1.0, light_wait_s=1.0
+        )
+    assert "outstanding admission tickets" in str(refused.value), (
+        f"the refusal must name the outstanding tickets: {refused.value}"
+    )
+    snap = admission.snapshot()
+    assert snap["total_tokens"] == 4 and snap["in_flight_general"] == 1, (
+        f"the refused configure must leave the running budget untouched: {snap}"
+    )
+
+    admission.release_sync(held)
+    admission.configure(
+        total_tokens=2, light_reserve=1, wait_s=1.0, light_wait_s=1.0
+    )
+    snap = admission.snapshot()
+    assert snap["total_tokens"] == 2 and snap["in_flight_general"] == 0
+    assert snap["fair_queue_depth"] == 0 and snap["actor_queue_depth"] == 0
+
+
+# ---------------------------------------------------------------------------
+# D16 (PR #123 review PRR-004, F4) - NaN/inf wait bounds are refused
+# ---------------------------------------------------------------------------
+
+
+def test_configure_rejects_nan_and_inf_wait_bounds():
+    """NaN and inf wait bounds are refused with the configure ValueError
+    shape (a NaN slips a bare `< 0` comparison - `nan < 0` is False - and
+    the park deadline would never fire). RED at the pre-fix head: both NaN
+    and inf were accepted silently."""
+    admission.reset()
+    for bad in (float("nan"), float("inf"), -float("inf")):
+        with pytest.raises(ValueError) as wait_refused:
+            admission.configure(total_tokens=4, light_reserve=2, wait_s=bad)
+        assert "wait_s" in str(wait_refused.value), (
+            f"the refusal must name wait_s: {wait_refused.value}"
+        )
+        with pytest.raises(ValueError) as light_refused:
+            admission.configure(
+                total_tokens=4, light_reserve=2, wait_s=1.0, light_wait_s=bad
+            )
+        assert "light_wait_s" in str(light_refused.value), (
+            f"the refusal must name light_wait_s: {light_refused.value}"
+        )
+    # Huge-int waits must ALSO refuse with the ValueError shape: they
+    # pass the comparisons (ints are finitely comparable) but cannot become
+    # a float, and math.isfinite on them raises OverflowError *before* any
+    # comparison could - the same escape class the light_reserve check
+    # avoids with its plain int comparison (final-critic round on the
+    # feedback fixes).
+    for bad_int in (10**400,):
+        with pytest.raises(ValueError) as wait_int_refused:
+            admission.configure(total_tokens=4, light_reserve=2, wait_s=bad_int)
+        assert "wait_s" in str(wait_int_refused.value)
+        with pytest.raises(ValueError) as light_int_refused:
+            admission.configure(
+                total_tokens=4, light_reserve=2, wait_s=1.0, light_wait_s=bad_int
+            )
+        assert "light_wait_s" in str(light_int_refused.value)
+    # A finite configure still succeeds after the refusals.
+    admission.configure(
+        total_tokens=4, light_reserve=2, wait_s=1.0, light_wait_s=1.0
+    )
+    assert admission.snapshot()["total_tokens"] == 4
+
+
+# ---------------------------------------------------------------------------
+# D17 (PR #123 review PRR-005, F5) - an admission misconfiguration is a
+# CONFIG ERROR (print + exit 2), never a raw traceback
+# ---------------------------------------------------------------------------
+
+
+def test_check_env_admission_misconfig_prints_config_error_exits_2(
+    tmp_path, monkeypatch, capsys
+):
+    """--check-env with light_reserve >= budget must print CONFIG ERROR
+    and exit 2 through main's documented contract: bootstrap translates
+    admission.configure's ValueError into ConfigError instead of letting
+    a raw traceback escape. RED at the pre-fix head: the ValueError
+    escaped main's `except ConfigError` and --check-env died with a
+    traceback."""
+    cfg_path = tmp_path / "admission-misconfig.json"
+    cfg_path.write_text(json.dumps({
+        "unrestricted": True,
+        "max_host_powershell": 1,  # total_tokens = 2
+        "admission": {"light_reserve": 2},  # >= budget: refused
+    }), encoding="utf-8")
+    monkeypatch.setenv("HYPERV_MCP_CONFIG", str(cfg_path))
+    importlib.reload(server_module)
+    try:
+        rc = server_module.main(["--check-env"])
+    finally:
+        importlib.reload(server_module)
+    assert rc == 2, f"an admission misconfiguration must exit 2, got {rc}"
+    captured = capsys.readouterr()
+    assert "CONFIG ERROR" in captured.err, (
+        f"the failure must print the CONFIG ERROR line: {captured.err!r}"
+    )
+    assert "admission" in captured.err and "light_reserve" in captured.err, (
+        f"the CONFIG ERROR line must name the admission refusal: "
+        f"{captured.err!r}"
+    )
+    assert "Traceback" not in captured.out and "Traceback" not in captured.err, (
+        "a misconfigured admission must never surface a raw traceback"
+    )
+
+
+# ---------------------------------------------------------------------------
+# D18 (PR #123 review PRR-007, F6) - rejection rows carry the class/wait
+# pair together
+# ---------------------------------------------------------------------------
+
+
+def test_tool_error_rejection_row_carries_class_and_wait_together(
+    tmp_path, fresh_server, monkeypatch
+):
+    """A tool-error rejection written INSIDE an admitted call (a declared
+    argument with the wrong type: Tool.run's pydantic ValidationError
+    fires after the guard admitted the call, before the body) must carry
+    admission_class AND admission_wait_ms TOGETHER from the admission
+    ContextVar - the exact population the wait is recorded for. RED at the
+    pre-fix head: the rejection writer passed admission_class=None
+    explicitly, suppressing the class while the wait still resolved (a
+    null-class-with-wait row). The busy rejection keeps its explicit
+    class + retry_after_ms."""
+    audit = tmp_path / "audit.jsonl"
+    fresh_server({
+        "unrestricted": True,
+        # total 2, reserve 1 -> general capacity 1 (saturated by the held
+        # ticket in the busy leg below); the LIGHT mistyped call still
+        # admits on the reserved lane.
+        "max_host_powershell": 1,
+        "admission": {"wait_s": 0.05},
+        "audit_log_path": str(audit),
+    })
+    mcp = server_module.get_mcp()
+    monkeypatch.setattr(pswindows, "run_ps", GatedFakePS())
+
+    # A DECLARED but wrong-typed argument: vm_name is declared str; an int
+    # fails Tool.run's pydantic validation, which the SDK wraps into a
+    # ToolError the guard classifies from its cause - the rejection row is
+    # written while the successful admit's ContextVar is still set.
+    async def _mistyped():
+        return await mcp.call_tool("hyperv_get_vm_info", {"vm_name": 12345})
+
+    _payload(asyncio.run(_mistyped()), "the mistyped-argument rejection")
+
+    rejection = [
+        r for r in _rows(audit)
+        if r["tool"] == "hyperv_get_vm_info" and not r["ok"]
+    ]
+    assert rejection, "the mistyped-argument call must leave a rejection row"
+    row = rejection[-1]
+    assert row["admission_class"] == "LIGHT", (
+        f"a rejection inside an admitted call must carry the admit's class; "
+        f"got {row['admission_class']!r}"
+    )
+    assert isinstance(row["admission_wait_ms"], int), (
+        f"the class and the wait must resolve TOGETHER from the ContextVar; "
+        f"got wait {row['admission_wait_ms']!r} beside class "
+        f"{row['admission_class']!r}"
+    )
+    assert row["admission_wait_ms"] >= 0
+
+    # The busy rejection keeps its EXPLICIT pair: class + retry hint (the
+    # ContextVar handoff would serialize nulls there - no admit ran).
+    held = admission.admit_sync("hyperv_start_vm", "holder", wait_s=0.5)
+    try:
+
+        async def _saturated():
+            return await mcp.call_tool(
+                "hyperv_start_vm", {"vm_name": "any-vm"})
+
+        _payload(asyncio.run(_saturated()), "the busy envelope")
+    finally:
+        admission.release_sync(held)
+    busy_rows = [
+        r for r in _rows(audit)
+        if r["tool"] == "hyperv_start_vm"
+        and not r["ok"] and r["error_class"] == "busy"
+    ]
+    assert busy_rows, "the busy refusal must leave an audit row"
+    assert busy_rows[-1]["admission_class"] == "GENERAL", (
+        f"the busy row keeps its explicit class: {busy_rows[-1]!r}"
+    )
+    assert isinstance(busy_rows[-1]["retry_after_ms"], int)
+
+
+# ---------------------------------------------------------------------------
+# D19 (review round 2, finding 3 / R2) - a cancel in the grant-to-pop
+# window closes the op CANCELLED, body never starts with stop set
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_in_grant_to_pop_window_closes_cancelled(
+    tmp_path, fresh_server, monkeypatch
+):
+    """R2: a cancel signal that lands between admit_sync's RETURN and the
+    park-window pop must close the op CANCELLED with the granted ticket
+    released - never hand the body a stop-set heartbeat event (the beat
+    chain would die and read-time staleness would misclassify the LIVE
+    runner). The choreography is deterministic: the runner's admit_sync is
+    wrapped to fire the REAL _signal_admit_stop (registry entry still
+    registered, set under the registry lock) exactly after the ticket
+    returns and before the runner's pop. RED at the pre-fix head: the
+    ticket proceeded to the body with the stop already set (the body ran,
+    the op completed)."""
+    mod = fresh_server({
+        "allowed_vm_patterns": ["test-*"],
+        "unrestricted": True,
+        "max_host_powershell": 2,
+    })
+    mcp = mod.get_mcp()
+    fake = GatedFakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+
+    real_admit_sync = admission.admit_sync
+
+    def _signal_in_window_admit_sync(*args, **kwargs):
+        ticket = real_admit_sync(*args, **kwargs)
+        # The cancel lands in the grant-to-pop window: the entry is still
+        # registered (the runner pops only after admit_sync returns), so
+        # the real signal path sets the shared stop event under the lock.
+        with operations._ADMIT_STOPS_LOCK:
+            oid = next(iter(operations._ADMIT_STOPS), "")
+        if oid:
+            operations._signal_admit_stop(oid)
+        return ticket
+
+    monkeypatch.setattr(admission, "admit_sync", _signal_in_window_admit_sync)
+
+    token = _as_agent("agent-a")
+    try:
+        handle = _payload(asyncio.run(mcp.call_tool(
+            "hyperv_checkpoint_restore", {**RESTORE_ARGS, "detach": True}
+        )), "the detach handle")
+    finally:
+        auth_context_var.reset(token)
+    op_id = handle["op_id"]
+
+    _wait_until(
+        lambda: operations.op_status(mod.CFG, op_id, "agent-a").get("status")
+        in ("cancelled", "failed", "completed"),
+        timeout_s=10.0, what="the window-cancelled op to reach a terminal state",
+    )
+    operations.drain_for_tests(timeout_s=5.0)
+    status = operations.op_status(mod.CFG, op_id, "agent-a").get("status")
+    assert status == "cancelled", (
+        f"a cancel in the grant-to-pop window must close the op cancelled, "
+        f"not {status!r}"
+    )
+    assert fake.restore_calls == 0, (
+        f"the body must never run with the shared stop already set: "
+        f"{fake.restore_calls} body call(s)"
+    )
+    snap = admission.snapshot()
+    assert snap["in_flight_general"] == 0 and snap["fair_queue_depth"] == 0, (
+        f"the granted-but-unused ticket must be released: {snap}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# D20 (review round 2, finding 2 / R1) - a huge-int light_reserve is a
+# CONFIG ERROR, never a raw OverflowError
+# ---------------------------------------------------------------------------
+
+
+def test_check_env_huge_int_light_reserve_config_error(
+    tmp_path, monkeypatch, capsys
+):
+    """R1: a ~400-digit int light_reserve must surface as CONFIG ERROR +
+    exit 2 through the documented contract - the plain-integer range
+    refusal (ValueError -> bootstrap's ConfigError), never a raw
+    OverflowError from math.isfinite on a huge int (which escaped the
+    ValueError translation and killed --check-env with a traceback)."""
+    cfg_path = tmp_path / "huge-reserve.json"
+    cfg_path.write_text(json.dumps({
+        "unrestricted": True,
+        "max_host_powershell": 2,
+        "admission": {"light_reserve": 10 ** 400},
+    }), encoding="utf-8")
+    monkeypatch.setenv("HYPERV_MCP_CONFIG", str(cfg_path))
+    importlib.reload(server_module)
+    try:
+        rc = server_module.main(["--check-env"])
+    finally:
+        importlib.reload(server_module)
+    assert rc == 2, f"a huge-int light_reserve must exit 2, got {rc}"
+    captured = capsys.readouterr()
+    assert "CONFIG ERROR" in captured.err, (
+        f"the failure must print the CONFIG ERROR line: {captured.err!r}"
+    )
+    assert "light_reserve" in captured.err, (
+        f"the CONFIG ERROR line must name the admission refusal: "
+        f"{captured.err!r}"
+    )
+    assert "Traceback" not in captured.out and "Traceback" not in captured.err, (
+        "a huge-int light_reserve must never surface a raw traceback"
+    )
