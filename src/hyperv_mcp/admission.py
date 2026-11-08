@@ -1,8 +1,8 @@
 """Classed admission fairness layer (issue #68 supplement, workstream C).
 
 The tool-limiter lifespan sizes anyio's default thread limiter to
-2 x max_host_powershell but reserves no class for PS-free tools, so
-lock-queued GENERAL callers can delay them up to vm_lock_wait_s (the
+2 x max_host_powershell but reserves no class for the light/status tools,
+so lock-queued GENERAL callers can delay them up to vm_lock_wait_s (the
 documented bound in the README concurrency section). This module is the
 fairness reserve that closes it, interposed by the server's pre-Tool.run
 guard (event-loop side) and by the detached-operation runner (worker-thread
@@ -11,8 +11,10 @@ limiter remains THE thread bound.
 
 Surfaces:
 
-  - AdmissionClass: LIGHT (the PS-free status/readiness/list/info/
-    jobs-status registry) and GENERAL (everything else); str() gives the
+  - AdmissionClass: LIGHT (the light/status lane — the
+    status/readiness/list/info/jobs-status registry reserved at the
+    thread-limiter axis; a CLASS reservation, not a claim that these tools
+    never touch PowerShell) and GENERAL (everything else); str() gives the
     name. classify_tool is the ONE classification source of truth.
   - configure(total_tokens, light_reserve, wait_s, light_wait_s=None): the
     token budget (bootstrap passes 2 x max_host_powershell, mirroring the
@@ -28,7 +30,7 @@ Surfaces:
     console actor shape): stage 1 waits in a per-actor-key fair queue of
     capacity 1 (actor eligibility BEFORE token acquisition, per the issue
     #68 supplement: K agents fanning in on one VM must not occupy every
-    token and starve unrelated PS-free traffic), and ONLY THEN stage 2
+    token and starve unrelated light/status traffic), and ONLY THEN stage 2
     acquires the token — an actor-queued caller NEVER holds a token while
     queued. GENERAL-stage waiters queue per-agent round-robin (a plain
     FIFO would serve one agent's whole backlog first and starve the
@@ -86,10 +88,13 @@ __all__ = [
     "snapshot",
 ]
 
-#: The LIGHT registry (issue #68 supplement): PS-free status/readiness/
-#: list/info/jobs-status surfaces that must keep admission while GENERAL
-#: callers saturate the budget. Internal to this module — there is no
-#: second classification source of truth.
+#: The LIGHT registry (issue #68 supplement): the light/status lane — the
+#: status/readiness/list/info/jobs-status surfaces whose admission must
+#: survive GENERAL callers saturating the budget. The reserve is a CLASS
+#: reservation at the thread-limiter axis, not a PS-freeness guarantee
+#: (these bodies hold no host-PowerShell leg by construction, but the
+#: class is what the layer enforces). Internal to this module — there is
+#: no second classification source of truth.
 _LIGHT_TOOLS = frozenset({
     "hyperv_list_vms",
     "hyperv_server_info",
@@ -130,7 +135,7 @@ class AdmissionClass(str, Enum):
 
 
 def classify_tool(tool_name: str) -> AdmissionClass:
-    """LIGHT for the PS-free registry, GENERAL for everything else."""
+    """LIGHT for the light/status registry, GENERAL for everything else."""
     if tool_name in _LIGHT_TOOLS:
         return AdmissionClass.LIGHT
     return AdmissionClass.GENERAL
@@ -341,7 +346,13 @@ def _grant_pass() -> None:
         _LANE.remove(waiter)
         _IN_FLIGHT_LIGHT += 1
         waiter.granted = True
-    while _IN_FLIGHT_GENERAL < _general_capacity():
+    while _IN_FLIGHT_GENERAL < _general_capacity() and _headroom() > 0:
+        # The shared-budget gate: in-flight GENERAL + LIGHT never exceeds
+        # total_tokens. The capacity clause alone would oversell the budget
+        # when LIGHT holds MORE than the reserve (e.g. total 4, reserve 2,
+        # 3 LIGHT + 1 GENERAL in flight leaves headroom 0 — a GENERAL grant
+        # on capacity alone would push the sum to 5), so the general lane
+        # also waits for overall headroom (review round 1, MAJOR 1).
         waiter = _pick_fair(
             [w for w in _LANE if w.cls is AdmissionClass.GENERAL], _LANE_AGENTS
         )

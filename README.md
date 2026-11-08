@@ -238,11 +238,14 @@ the task-spawned controller reads it from the environment.
 
 - **Issue #68 supplement (classed admission fairness layer, workstream C)**:
   every tool call now passes a two-class admission layer in front of the
-  thread limiter — PS-free status/list/info surfaces (`hyperv_list_vms`,
+  thread limiter — the light/status surfaces (`hyperv_list_vms`,
   `hyperv_server_info`, `hyperv_get_vm_info`, `hyperv_guest_job_status`)
-  are LIGHT with a reserved lane (`admission.light_reserve` tokens of the
+  are LIGHT with a lane reserved at the thread-limiter axis
+  (`admission.light_reserve` tokens of the
   `2 x max_host_powershell` budget; omitted default `min(2, budget - 1)`,
-  an explicit invalid value fails startup), everything else GENERAL on a
+  an explicit invalid value fails startup; the reserve is a CLASS
+  reservation, not a claim that these tools never touch PowerShell),
+  everything else GENERAL on a
   per-agent fair queue (no agent's backlog starves another's). Console
   raw-input tools queue actor-first: one fair queue per canonical VM
   identity (the issue-#77 hint unifies by-name and by-GUID addressing),
@@ -1380,12 +1383,16 @@ caller-supplied name until a feeding operation supplies one — disclosed in
 the console-identity section, not tracked as an open defect.
 
 Classed admission (issue #68 supplement, workstream C) sits in front of the
-thread limiter on every tool call. Two classes: LIGHT — the PS-free
+thread limiter on every tool call. Two classes: LIGHT — the
 status/readiness/list/info/jobs-status surfaces (`hyperv_list_vms`,
 `hyperv_server_info`, `hyperv_get_vm_info`, `hyperv_guest_job_status`) —
-and GENERAL (everything else). The budget mirrors the limiter sizing
+and GENERAL (everything else). The LIGHT set is a lane reserved at the
+THREAD-LIMITER axis, not a claim of PowerShell-freeness: the registry is a
+fixed class list, and the reserve keeps that class admitted even while
+GENERAL callers saturate the budget. The budget mirrors the limiter sizing
 (`2 x max_host_powershell` tokens); GENERAL callers may occupy at most
-`total - admission.light_reserve` of them, so the reserved lane keeps
+`total - admission.light_reserve` of them (and in-flight GENERAL + LIGHT
+together never exceed the total), so the reserved lane keeps
 LIGHT admission flowing even while GENERAL callers saturate the budget —
 the closed half of the documented `vm_lock_wait_s` admission bound above.
 `admission.light_reserve` omitted (the default) resolves to
@@ -1402,7 +1409,7 @@ per canonical VM identity (the issue-#77 hint map unifies the by-name and
 by-GUID spellings onto the GUID), capacity 1, and the actor-eligible
 caller only then acquires a token — K agents fanning in on one VM hold no
 token while queued and enter one at a time, so they cannot occupy every
-token and starve unrelated PS-free traffic. Every wait observes
+token and starve unrelated light/status traffic. Every wait observes
 cancellation each tick; a saturated or timed-out refuse answers the
 ordinary retryable `busy` envelope with a measured `retry_after_ms`, and
 the detached-operation runner admits through the same core

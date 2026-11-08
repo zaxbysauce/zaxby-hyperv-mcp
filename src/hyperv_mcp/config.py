@@ -323,9 +323,11 @@ class AdmissionSettings:
     """Classed admission knobs (issue #68 supplement, workstream C).
 
     Every knob bounds an admission axis (the OperationsPolicy convention):
-    `light_reserve` tokens of the 2 x max_host_powershell budget are
-    reserved for PS-free LIGHT tools so lock-queued GENERAL callers cannot
-    delay them; `wait_s` bounds a GENERAL/actor-stage admit park and
+    `light_reserve` tokens of the 2 x max_host_powershell budget form the
+    light/status lane reserved at the thread-limiter axis (a CLASS
+    reservation for the LIGHT registry, not a claim of PowerShell-freeness)
+    so lock-queued GENERAL callers cannot delay that class;
+    `wait_s` bounds a GENERAL/actor-stage admit park and
     `light_wait_s` bounds a LIGHT admit park before the caller sees a
     retryable busy envelope. `light_reserve` is None (omitted) by default
     and resolves at bootstrap to min(2, total_tokens - 1) — the
@@ -333,7 +335,7 @@ class AdmissionSettings:
     value is validated against the token budget at startup
     (0 <= light_reserve < 2 x max_host_powershell) and rejected, never
     clamped. `light_reserve: 0` is the explicit disable, accepting that a
-    fully lock-queued budget can then delay PS-free admission up to
+    fully lock-queued budget can then delay light/status admission up to
     `vm_lock_wait_s`."""
 
     light_reserve: int | None = None

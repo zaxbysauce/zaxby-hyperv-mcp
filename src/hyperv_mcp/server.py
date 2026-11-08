@@ -4715,6 +4715,19 @@ def _harden_tools(mcp: MCPServer) -> None:
                         admission_class=str(admission.classify_tool(name)),
                         retry_after_ms=busy.retry_after_ms,
                     )
+                except BaseException as exc:
+                    # rb-1 parity for the PARK window (review round 1,
+                    # MAJOR 2): a cancellation that lands while the bounded
+                    # admit parks must give a keyed sync row the SAME
+                    # recovery the rb-1 arm gives the body — fail_inline
+                    # closes the WORKING row before the cancellation
+                    # propagates. Without this arm a cancelled park leaves
+                    # the op row WORKING forever (runner="" so staleness
+                    # never retires it) and every same-key retry re-attaches
+                    # to the ghost.
+                    if ops_ctx is not None:
+                        operations.fail_inline(ops_ctx, exc)
+                    raise
                 try:
                     try:
                         result = await _run(arguments, context, convert_result=convert_result, **kwargs)

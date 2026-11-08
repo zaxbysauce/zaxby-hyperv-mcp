@@ -27,7 +27,18 @@ cannot see:
       normal, detached, and task paths — client envelope, stored op
       envelope, and audit rows;
   D7  sequential calls never bleed admission telemetry: each row's class
-      is its own call's, never the previous call's.
+      is its own call's, never the previous call's (whole sequence in ONE
+      task, plus a trailing pre-body rejection whose fields must be null);
+  D8  (review round 1, MAJOR 1) the general grant loop gates on SHARED
+      headroom: LIGHT held above the reserve never lets GENERAL oversell
+      the total budget;
+  D9  (review round 1, MAJOR 2) a cancellation during the guard's
+      admission park closes the keyed op row (rb-1 parity) and the
+      same-key retry answers from the terminal row;
+  D10 (review round 1, MAJOR 3) cancelling a parked detached runner wakes
+      the admission park into the CANCELLED transition;
+  D11 (review round 1, MINOR 4/5) casefolded canonical actor keys for
+      mixed-case spellings, and fair_queue_depth counting stage-1 parks.
 
 Hermetic: no PowerShell spawn (content-dispatched run_ps fakes), no host,
 no network; every wait is a bounded poll. Whole-file runtime is well under
@@ -579,6 +590,300 @@ def test_admit_sync_honors_stop_event_mid_wait():
 
 
 # ---------------------------------------------------------------------------
+# D8 (review round 1, MAJOR 1) — the shared budget is never oversold when
+# LIGHT holds MORE than the reserve
+# ---------------------------------------------------------------------------
+
+
+def test_general_never_oversells_shared_budget_when_light_above_reserve():
+    """Two budget-arithmetic legs on one configuration (total 4, reserve 2):
+    (a) the RESERVE CEILING — GENERAL beyond total - light_reserve parks
+    even with overall headroom open (a capacity==total mutant grants here);
+    (b) the SHARED ceiling — with 3 LIGHT + 1 GENERAL held (capacity still
+    open at 1 < 2, headroom 0), a further GENERAL admit must PARK and
+    refuse busy — a capacity-only grant would push in-flight GENERAL +
+    LIGHT to 5 against a budget of 4. Leg (a) also carries the M1 mutant
+    kill the round-1 shared-headroom gate moved off the frozen A1 shape
+    (A1's refusal is headroom-bound there, so its capacity clause is no
+    longer the binding constraint)."""
+
+    async def _main():
+        admission.reset()
+        admission.configure(
+            total_tokens=4, light_reserve=2, wait_s=0.05, light_wait_s=0.05
+        )
+        # (a) the reserve ceiling: capacity 2 saturated, headroom 2 open.
+        ceiling = [
+            await admission.admit("hyperv_start_vm", f"c{i}", wait_s=0.5)
+            for i in range(2)
+        ]
+        snap = admission.snapshot()
+        assert snap["in_flight_general"] == 2 and snap["in_flight_light"] == 0
+        with pytest.raises(admission.AdmissionBusy) as ceiling_busy:
+            await admission.admit("hyperv_start_vm", "over-reserve", wait_s=0.05)
+        assert ceiling_busy.value.retry_after_ms > 0
+        assert admission.snapshot()["in_flight_general"] == 2, (
+            "a GENERAL admit must not pass the reserve even with headroom open"
+        )
+        for ticket in ceiling:
+            await admission.release(ticket)
+        assert admission.snapshot()["in_flight_general"] == 0
+
+        # (b) the shared ceiling: LIGHT above the reserve (3 > reserve 2).
+        lights = [
+            await admission.admit(LIGHT_TOOL, f"l{i}", wait_s=0.5)
+            for i in range(3)
+        ]
+        held = await admission.admit("hyperv_start_vm", "holder", wait_s=0.5)
+        snap = admission.snapshot()
+        assert snap["in_flight_general"] == 1, snap
+        assert snap["in_flight_light"] == 3, snap
+        assert snap["in_flight_general"] + snap["in_flight_light"] == 4
+
+        with pytest.raises(admission.AdmissionBusy) as busy:
+            await admission.admit("hyperv_start_vm", "starved", wait_s=0.05)
+        assert busy.value.retry_after_ms > 0
+        # The refusal never issued a permit: the sum stays at the budget.
+        refused = admission.snapshot()
+        assert refused["in_flight_general"] + refused["in_flight_light"] <= 4, (
+            f"the shared budget was oversold: {refused}"
+        )
+
+        for ticket in lights:
+            await admission.release(ticket)
+        await admission.release(held)
+        final = admission.snapshot()
+        assert final["in_flight_general"] + final["in_flight_light"] == 0
+        assert final["fair_queue_depth"] == 0
+
+    asyncio.run(_main())
+
+
+# ---------------------------------------------------------------------------
+# D9 (review round 1, MAJOR 2) — a cancellation during the guard's admission
+# park closes the keyed op row (rb-1 parity)
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_during_admission_park_closes_keyed_op_row(
+    tmp_path, fresh_server, monkeypatch
+):
+    """Cancelling an idempotency-keyed call while it is parked in the
+    guard's admission window must close its op row (fail_inline — the same
+    recovery the rb-1 arm gives the body), never leave it WORKING; a
+    same-key retry then answers from the terminal row instead of
+    re-attaching to a ghost."""
+    audit = tmp_path / "audit.jsonl"
+    mod = fresh_server({
+        "allowed_vm_patterns": ["test-*"],
+        "unrestricted": True,
+        # total 2, reserve 1 -> general capacity 1, held by the harness.
+        "max_host_powershell": 1,
+        "admission": {"wait_s": 3.0},
+        "audit_log_path": str(audit),
+    })
+    mcp = mod.get_mcp()
+    monkeypatch.setattr(pswindows, "run_ps", GatedFakePS())
+
+    held = admission.admit_sync("hyperv_start_vm", "holder", wait_s=0.5)
+    assert admission.snapshot()["in_flight_general"] == 1
+    idem = "cancel-park-1"
+
+    async def _parked_call():
+        token = _as_agent("agent-a")
+        try:
+            await mcp.call_tool("hyperv_checkpoint_restore", {
+                **RESTORE_ARGS, "idempotency_key": idem,
+            })
+        finally:
+            auth_context_var.reset(token)
+
+    async def _main():
+        cancelled_cls = anyio.get_cancelled_exc_class()
+        task = asyncio.create_task(_parked_call())
+        for _ in range(600):
+            if admission.snapshot()["fair_queue_depth"] >= 1:
+                break
+            await asyncio.sleep(0.005)
+        assert admission.snapshot()["fair_queue_depth"] == 1, (
+            "the keyed call must be parked in the admission window"
+        )
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=6.0)
+            raise AssertionError("the cancelled call must not return")
+        except cancelled_cls:
+            pass
+
+    asyncio.run(_main())
+
+    store = operations.store_for(mod.CFG)
+    row = store.op_find_idem("agent-a", "hyperv_checkpoint_restore", idem)
+    assert row is not None, "the keyed consult must have created the op row"
+    assert row.status == "failed", (
+        f"a cancelled park must close its op row (fail_inline, rb-1 parity); "
+        f"it was left {row.status!r}"
+    )
+
+    # The same-key retry answers from the terminal row (no ghost WORKING
+    # re-attach): it replays the stored envelope and creates no new row.
+    async def _retry():
+        token = _as_agent("agent-a")
+        try:
+            return await mcp.call_tool("hyperv_checkpoint_restore", {
+                **RESTORE_ARGS, "idempotency_key": idem,
+            })
+        finally:
+            auth_context_var.reset(token)
+
+    replay = _payload(asyncio.run(_retry()), "the same-key replay")
+    assert replay.get("ok") is False, (
+        f"the retry must answer the stored cancellation envelope: {replay}"
+    )
+    row_after = store.op_find_idem("agent-a", "hyperv_checkpoint_restore", idem)
+    assert row_after is not None and row_after.op_id == row.op_id
+    assert row_after.status == "failed"
+
+    admission.release_sync(held)
+    snap = admission.snapshot()
+    assert snap["in_flight_general"] == 0 and snap["fair_queue_depth"] == 0
+
+
+# ---------------------------------------------------------------------------
+# D10 (review round 1, MAJOR 3) — cancelling a parked detached runner wakes
+# the admission park into the CANCELLED transition
+# ---------------------------------------------------------------------------
+
+
+def test_detached_cancel_wakes_parked_admission_to_cancelled(
+    tmp_path, fresh_server, monkeypatch
+):
+    """Cancelling a detached op whose runner is still parked in admission
+    (the real cancel backend the hyperv_op_cancel tool delegates to — the
+    tool wrapper is itself guard-admitted, so a saturated lane cannot reach
+    it while the park it must cancel holds the token) must WAKE the park:
+    the op transitions to cancelled at the next tick, not to a busy
+    refusal after running out admission.wait_s."""
+    mod = fresh_server({
+        "allowed_vm_patterns": ["test-*"],
+        "unrestricted": True,
+        # total 2, reserve 1 -> general capacity 1, held by the harness.
+        "max_host_powershell": 1,
+        "admission": {"wait_s": 3.0},
+    })
+    mcp = mod.get_mcp()
+    monkeypatch.setattr(pswindows, "run_ps", GatedFakePS())
+
+    held = admission.admit_sync("hyperv_start_vm", "holder", wait_s=0.5)
+
+    token = _as_agent("agent-a")
+    try:
+        handle = _payload(asyncio.run(mcp.call_tool(
+            "hyperv_checkpoint_restore", {**RESTORE_ARGS, "detach": True}
+        )), "the detach handle")
+    finally:
+        auth_context_var.reset(token)
+    op_id = handle["op_id"]
+
+    _wait_until(
+        lambda: admission.snapshot()["fair_queue_depth"] >= 1,
+        timeout_s=5.0, what="the detached runner to park in admission",
+    )
+    operations.op_cancel(mod.CFG, op_id, "agent-a")
+
+    # The park must end CANCELLED well inside the 3 s admission bound (an
+    # unwoken park runs out wait_s and closes busy-FAILED instead).
+    deadline = time.monotonic() + 2.0
+    status = ""
+    while time.monotonic() < deadline:
+        status = operations.op_status(mod.CFG, op_id, "agent-a").get("status", "")
+        if status in ("cancelled", "failed", "completed"):
+            break
+        time.sleep(0.01)
+    assert status == "cancelled", (
+        f"cancelling a parked detached op must transition it to cancelled, "
+        f"not {status!r} (busy refusal = the stop event never fired)"
+    )
+
+    admission.release_sync(held)
+    operations.drain_for_tests(timeout_s=5.0)
+    snap = admission.snapshot()
+    assert snap["in_flight_general"] == 0 and snap["fair_queue_depth"] == 0
+
+
+# ---------------------------------------------------------------------------
+# D11 (review round 1, MINOR 4/5) — casefolded actor keys + the
+# fair_queue_depth stage-1 contribution
+# ---------------------------------------------------------------------------
+
+
+def test_actor_key_casefolds_mixed_case_identities():
+    """The actor key is the CASEFOLDED canonical identity: an UPPERCASE
+    by-id spelling, a mixed-case unhinted by-name spelling, and a hinted
+    by-name caller in ANY case all derive keys that unify on ONE canonical
+    actor queue (the alias-derivation corroboration the review re-pointed
+    to this census)."""
+    upper = admission.actor_key_for(
+        RAW_INPUT_TOOL, {"vm_id": GUID.upper(), "text": "x"})
+    assert upper == GUID.casefold(), (
+        f"an uppercase by-id spelling must casefold to the canonical key: {upper!r}"
+    )
+    unhinted = admission.actor_key_for(
+        RAW_INPUT_TOOL, {"vm_name": "MiXeD-Vm", "text": "x"})
+    assert unhinted == "mixed-vm", (
+        f"an unhinted mixed-case name keys its casefolded raw identity: "
+        f"{unhinted!r}"
+    )
+    console.note_name_guid_hint("mixed-vm", GUID.upper())
+    hinted = admission.actor_key_for(
+        RAW_INPUT_TOOL, {"vm_name": "MIXED-VM", "text": "x"})
+    assert hinted == GUID.casefold(), (
+        f"a hinted mixed-case name must key the canonical GUID: {hinted!r}"
+    )
+    assert upper == hinted, (
+        "both addressing spellings of one VM must unify on ONE actor key"
+    )
+
+
+def test_fair_queue_depth_counts_stage1_actor_parks():
+    """fair_queue_depth counts EVERY parked admit across both stages: with
+    ONLY a stage-1 actor waiter parked (the actor key held by another
+    caller), the depth is 1 alongside actor_queue_depth 1 — a lane-only
+    count would read 0 and hide the parked admit."""
+
+    async def _main():
+        cancelled_cls = anyio.get_cancelled_exc_class()
+        admission.reset()
+        admission.configure(
+            total_tokens=4, light_reserve=2, wait_s=0.5, light_wait_s=0.5
+        )
+        actor = await admission.admit(
+            RAW_INPUT_TOOL, "actor", wait_s=0.5, actor_key="stage1-key")
+        waiter = asyncio.create_task(admission.admit(
+            RAW_INPUT_TOOL, "w", wait_s=2.0, actor_key="stage1-key"))
+        for _ in range(400):
+            if admission.snapshot()["actor_queue_depth"] == 1:
+                break
+            await asyncio.sleep(0.005)
+        snap = admission.snapshot()
+        assert snap["actor_queue_depth"] == 1, snap
+        assert snap["fair_queue_depth"] == 1, (
+            f"fair_queue_depth must count stage-1 actor parks: {snap}"
+        )
+        assert snap["in_flight_general"] == 1, snap
+        waiter.cancel()
+        try:
+            await asyncio.wait_for(waiter, timeout=6.0)
+        except cancelled_cls:
+            pass
+        await admission.release(actor)
+        final = admission.snapshot()
+        assert final["fair_queue_depth"] == 0 and final["actor_queue_depth"] == 0
+
+    asyncio.run(_main())
+
+
+# ---------------------------------------------------------------------------
 # D5 — cap-1 bootstrap reserve semantics
 # ---------------------------------------------------------------------------
 
@@ -646,12 +951,18 @@ def test_nondefault_retry_after_ms_flows_exact(tmp_path, fresh_server, monkeypat
             f"the normal-path envelope must carry the measured hint "
             f"exactly: {env['retry_after_ms']!r}"
         )
+        # Review round 1 (nit d): the busy contract stays integer-typed at
+        # the envelope boundary (a measured float hint coerces, round-up).
+        assert isinstance(env["retry_after_ms"], int), (
+            f"retry_after_ms must serialize as an int: {env['retry_after_ms']!r}"
+        )
         busy_rows = [
             r for r in _rows(audit)
             if r["tool"] == "hyperv_start_vm" and r["error_class"] == "busy"
         ]
         assert busy_rows, "the busy refusal must leave an audit row"
         assert busy_rows[-1]["retry_after_ms"] == NONDEFAULT_RETRY_MS
+        assert isinstance(busy_rows[-1]["retry_after_ms"], int)
         assert busy_rows[-1]["admission_class"] == "GENERAL"
         assert busy_rows[-1]["agent_id"] == "agent-a"
 
@@ -678,6 +989,7 @@ def test_nondefault_retry_after_ms_flows_exact(tmp_path, fresh_server, monkeypat
             f"the stored detached envelope must carry the hint exactly: "
             f"{stored!r}"
         )
+        assert isinstance(stored["retry_after_ms"], int)
         runner_rows = [
             r for r in _rows(audit)
             if r["tool"] == "hyperv_checkpoint_restore"
@@ -685,6 +997,7 @@ def test_nondefault_retry_after_ms_flows_exact(tmp_path, fresh_server, monkeypat
         ]
         assert runner_rows, "the runner must write its own rejection row"
         assert runner_rows[-1]["retry_after_ms"] == NONDEFAULT_RETRY_MS
+        assert isinstance(runner_rows[-1]["retry_after_ms"], int)
         assert runner_rows[-1]["admission_class"] == "GENERAL"
 
         # -- task path: the tasks-extension runner stores the same envelope -
@@ -698,6 +1011,7 @@ def test_nondefault_retry_after_ms_flows_exact(tmp_path, fresh_server, monkeypat
         task_env = json.loads(view.result.content[0].text)
         assert task_env["error_class"] == "busy"
         assert task_env["retry_after_ms"] == NONDEFAULT_RETRY_MS
+        assert isinstance(task_env["retry_after_ms"], int)
         assert task_id
         operations.drain_for_tests(timeout_s=5.0)
     finally:
@@ -712,6 +1026,12 @@ def test_nondefault_retry_after_ms_flows_exact(tmp_path, fresh_server, monkeypat
 
 
 def test_sequential_calls_no_admission_class_bleed(tmp_path, fresh_server, monkeypatch):
+    """Review round 1 (MINOR 8): the whole sequence runs inside ONE
+    asyncio.run task (one context), so a leaked class/wait from an earlier
+    call could only come from the release/reset handoff — and the trailing
+    pre-body rejection (written after the last GENERAL call in the SAME
+    context, before any admit fires) must carry NULL admission fields, the
+    direct no-bleed falsifier."""
     audit = tmp_path / "audit.jsonl"
     fresh_server({
         "unrestricted": True,
@@ -722,9 +1042,17 @@ def test_sequential_calls_no_admission_class_bleed(tmp_path, fresh_server, monke
     monkeypatch.setattr(pswindows, "run_ps", GatedFakePS())
 
     order = [LIGHT_TOOL, GENERAL_TOOL, LIGHT_TOOL, GENERAL_TOOL]
-    for tool in order:
-        args = {"relay_id": ""} if tool == GENERAL_TOOL else {}
-        asyncio.run(mcp.call_tool(tool, args))
+
+    async def _sequence():
+        for tool in order:
+            args = {"relay_id": ""} if tool == GENERAL_TOOL else {}
+            await mcp.call_tool(tool, args)
+        # A pre-body rejection (unknown argument) in the SAME task/context:
+        # no admit ran for it, so a stale class/wait from call 4 would
+        # surface on this row.
+        await mcp.call_tool(LIGHT_TOOL, {"nope": 1})
+
+    asyncio.run(_sequence())
 
     rows = [r for r in _rows(audit) if r["tool"] in order and r["ok"]]
     assert len(rows) >= 4, f"expected one row per call, got {len(rows)}"
@@ -738,3 +1066,15 @@ def test_sequential_calls_no_admission_class_bleed(tmp_path, fresh_server, monke
         assert row["admission_wait_ms"] >= 0
     classes = [r["admission_class"] for r in rows[-4:]]
     assert classes == ["LIGHT", "GENERAL", "LIGHT", "GENERAL"], classes
+
+    rejection = [
+        r for r in _rows(audit)
+        if r["tool"] == LIGHT_TOOL and not r["ok"]
+    ]
+    assert rejection, "the unknown-argument rejection must leave a row"
+    assert rejection[-1]["admission_class"] is None, (
+        f"a pre-body rejection must carry NULL admission fields (no admit "
+        f"ran); got {rejection[-1]['admission_class']!r}"
+    )
+    assert rejection[-1]["admission_wait_ms"] is None
+    assert rejection[-1]["retry_after_ms"] is None

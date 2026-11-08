@@ -15,6 +15,7 @@ sketch, pinned by tests/unit/test_errors_taxonomy.py.
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from mcp.types import CallToolResult, TextContent
@@ -170,14 +171,16 @@ def envelope(exc: BaseException) -> dict[str, Any]:
         # own measured retry hint; a valid positive value OVERRIDES the
         # fixed BUSY_RETRY_MS (the lease_conflict preservation precedent).
         # VMBusy / PowerShellBusy have no retry_after_ms attribute, so their
-        # semantics are unchanged.
+        # semantics are unchanged. The hint may be measured as a float; the
+        # busy contract stays integer-typed, so the boundary rounds UP
+        # (never advise a shorter wait than was measured — review round 1).
         attr = getattr(exc, "retry_after_ms", None)
         if (
             isinstance(attr, (int, float))
             and not isinstance(attr, bool)
             and attr > 0
         ):
-            out["retry_after_ms"] = attr
+            out["retry_after_ms"] = attr if isinstance(attr, int) else math.ceil(attr)
     holder = _holder_field(exc)
     if holder is not None:
         out["holder"] = holder

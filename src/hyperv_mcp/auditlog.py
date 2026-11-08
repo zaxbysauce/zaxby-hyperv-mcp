@@ -20,6 +20,7 @@ the stderr line is forced on so the bypass stays visible.
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 import uuid
@@ -120,6 +121,10 @@ def log_operation(
             admission_wait_ms = current[1] if current is not None else None
     if retry_after_ms is _UNSET_AGENT:
         retry_after_ms = None
+    elif isinstance(retry_after_ms, float):
+        # Review round 1: the busy contract stays integer-typed at the audit
+        # boundary too (a measured float hint rounds UP, never shorter).
+        retry_after_ms = math.ceil(retry_after_ms)
     if request_id is None:
         # Generated per call, inside the body — never once per process.
         request_id = uuid.uuid4().hex

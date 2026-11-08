@@ -484,6 +484,25 @@ def _result_text(result: Any) -> str:
 # the detached runner
 # ---------------------------------------------------------------------------
 
+#: Issue #68 supplement (review round 1, MAJOR 3): per-op stop events
+#: registered by a detached runner WHILE its admission park is in flight.
+#: The cancel path (op_cancel / tasks cancel) sets cancel_requested in the
+#: store AND fires the registered event, so a runner parked in
+#: admission.admit_sync observes the cancel at its next tick (raises
+#: AdmissionStopped -> the cancelled transition) instead of running out its
+#: full wait_s and closing as a busy refusal. Entries live only for the
+#: park window: the runner deregisters as soon as admit_sync returns.
+_ADMIT_STOPS: dict[str, threading.Event] = {}
+_ADMIT_STOPS_LOCK = threading.Lock()
+
+
+def _signal_admit_stop(op_id: str) -> None:
+    """Fire a parked runner's admission stop event (never raises)."""
+    with _ADMIT_STOPS_LOCK:
+        event = _ADMIT_STOPS.get(op_id)
+    if event is not None:
+        event.set()
+
 
 def _start_runner(
     cfg: Config,
@@ -619,7 +638,12 @@ def _execute_body(
         # follows the console raw-input rule. admit_sync installs the
         # admission ContextVar INSIDE this copied-context run, so the
         # body's auditlog.operation reads the class/wait when it writes
-        # the row.
+        # the row. The runner's stop event is REGISTERED for the park
+        # window (review round 1, MAJOR 3) so hyperv_op_cancel / tasks
+        # cancel can wake this park — the AdmissionStopped arm below then
+        # closes the op as cancelled instead of timing out into busy.
+        with _ADMIT_STOPS_LOCK:
+            _ADMIT_STOPS[op_id] = stop
         try:
             ticket = admission.admit_sync(
                 tool_name,
@@ -632,11 +656,15 @@ def _execute_body(
             _admission_refusal(store, cfg, op_id, tool_name, agent, body_args, busy)
             return
         except admission.AdmissionStopped:
-            # The stop valve fired mid-park (runner teardown): the waiter
-            # reclaimed every stage, so the op closes as cancelled.
+            # The stop valve fired mid-park (a cancel of the parked op, or
+            # runner teardown): the waiter reclaimed every stage, so the op
+            # closes as cancelled.
             _safe_transition(store, op_id, statestore.OP_CANCELLED, agent, cfg,
                              "op.cancelled")
             return
+        finally:
+            with _ADMIT_STOPS_LOCK:
+                _ADMIT_STOPS.pop(op_id, None)
         try:
             result = tool_fn(**body_args)
         finally:
@@ -831,6 +859,11 @@ def op_cancel(cfg: Config, op_id: str, agent: str) -> dict[str, Any]:
             "cancel_requested": bool(row.cancel_requested),
         }
     store.op_request_cancel(op_id, agent, store.now())
+    # Review round 1, MAJOR 3: wake a runner still parked in admission —
+    # the store flag alone is invisible to a parked admit_sync, which would
+    # run out its full wait_s and close the op as a busy refusal instead of
+    # the cancellation the caller asked for.
+    _signal_admit_stop(op_id)
     fresh = store.op_get_scoped(op_id, agent)
     status = fresh.status if fresh is not None else row.status
     return {"ok": True, "op_id": op_id, "status": status, "cancel_requested": True}
@@ -1134,6 +1167,10 @@ def tasks_extension(
                 if row.status in statestore.OP_TERMINAL_STATES:
                     return self._view(ctx, params.task_id, embed_result=True)
                 store.op_request_cancel(params.task_id, agent, store.now())
+                # Review round 1, MAJOR 3: wake a parked runner's admission
+                # (same wiring as op_cancel — the store flag alone is
+                # invisible to a parked admit_sync).
+                _signal_admit_stop(params.task_id)
                 return self._view(ctx, params.task_id, embed_result=False)
 
             async def update_task(ctx: Any, params: Any) -> Any:
@@ -1172,3 +1209,5 @@ def reset_for_tests() -> None:
     calls this so one test's fingerprint key never serves another's store)."""
     with _key_cache_lock:
         _key_cache.clear()
+    with _ADMIT_STOPS_LOCK:
+        _ADMIT_STOPS.clear()
