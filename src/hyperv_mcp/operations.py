@@ -628,22 +628,24 @@ def _execute_body(
     drives the body and the terminal transition."""
     _current_op_id.set(op_id)
     _current_ops_cfg.set(cfg)
+    # Issue #68 supplement (workstream C): the detached/task runner
+    # admits BEFORE tool_fn via the same fair/reserve core the guard
+    # uses, driven synchronously on the runner thread (per-tick
+    # stop-event checks). The agent comes from the copied context (the
+    # same identity resolution a synchronous call sees); the actor key
+    # follows the console raw-input rule. admit_sync installs the
+    # admission ContextVar INSIDE this copied-context run, so the
+    # body's auditlog.operation reads the class/wait when it writes
+    # the row. The runner's stop event is REGISTERED BEFORE the
+    # cancelled pre-check (review round 2): a cancel landing between
+    # the pre-check and a later registration would otherwise find no
+    # event to signal and leave the park timing out into busy; with the
+    # event already visible, such a cancel signals it and the
+    # AdmissionStopped arm below closes the op as cancelled.
+    with _ADMIT_STOPS_LOCK:
+        _ADMIT_STOPS[op_id] = stop
     try:
         _raise_if_cancelled_locked(cfg, op_id, store)
-        # Issue #68 supplement (workstream C): the detached/task runner
-        # admits BEFORE tool_fn via the same fair/reserve core the guard
-        # uses, driven synchronously on the runner thread (per-tick
-        # stop-event checks). The agent comes from the copied context (the
-        # same identity resolution a synchronous call sees); the actor key
-        # follows the console raw-input rule. admit_sync installs the
-        # admission ContextVar INSIDE this copied-context run, so the
-        # body's auditlog.operation reads the class/wait when it writes
-        # the row. The runner's stop event is REGISTERED for the park
-        # window (review round 1, MAJOR 3) so hyperv_op_cancel / tasks
-        # cancel can wake this park — the AdmissionStopped arm below then
-        # closes the op as cancelled instead of timing out into busy.
-        with _ADMIT_STOPS_LOCK:
-            _ADMIT_STOPS[op_id] = stop
         try:
             ticket = admission.admit_sync(
                 tool_name,

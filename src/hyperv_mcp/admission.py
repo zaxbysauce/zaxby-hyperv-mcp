@@ -92,7 +92,7 @@ __all__ = [
 #: status/readiness/list/info/jobs-status surfaces whose admission must
 #: survive GENERAL callers saturating the budget. The reserve is a CLASS
 #: reservation at the thread-limiter axis, not a PS-freeness guarantee
-#: (these bodies hold no host-PowerShell leg by construction, but the
+#: (several of these bodies DO spawn PowerShell or guest work; the
 #: class is what the layer enforces). Internal to this module — there is
 #: no second classification source of truth.
 _LIGHT_TOOLS = frozenset({
