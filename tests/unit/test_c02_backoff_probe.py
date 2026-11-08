@@ -197,9 +197,15 @@ def test_backoff_attempt_schedule_matches_ceiling_model(pool_env, monkeypatch):
         f"{[round(s * 1000, 1) for s in measured_sleeps]}")
     for i in range(1, peak + 1):
         step = measured_sleeps[i] / measured_sleeps[i - 1]
-        assert 1.2 <= step <= 3.2, (
-            f"ramp sleep {i} must roughly double the prior (got {step:.2f}x: "
-            f"{[round(s * 1000, 1) for s in measured_sleeps]})")
+        # The FINAL ramp step (ramp -> ceiling, 160 -> 200 ms by design) is
+        # only 1.25x and additive CI jitter drags it to ~1.18x, so the
+        # transition step requires an increase (>= 1.05x; a fixed-cadence
+        # mutant's flat 1.00x fails) while every true doubling step keeps
+        # the 1.2x floor.
+        floor = 1.05 if i == peak else 1.2
+        assert floor <= step <= 3.2, (
+            f"ramp sleep {i} must grow the prior (got {step:.2f}x, floor "
+            f"{floor}: {[round(s * 1000, 1) for s in measured_sleeps]})")
     peak_ms = measured_sleeps[peak] * 1000
     for i in range(peak + 1, len(measured_sleeps)):
         plateau = measured_sleeps[i] * 1000
