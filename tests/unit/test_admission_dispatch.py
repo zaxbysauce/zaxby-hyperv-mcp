@@ -84,19 +84,30 @@ RESTORE_ARGS = {"vm_name": "test-vm", "checkpoint_name": "snap", "confirm": True
 class GatedFakePS:
     """Content-dispatched, thread-safe run_ps fake (the e03 tasks-bridge
     pattern): the by-name resolver leg answers the stable GUID, restore
-    legs succeed, and the console type-text leg is COUNTED and (for the
-    first call only) gated so the choreography can park the actor queue."""
+    legs succeed (optionally BLOCKED on `restore_gate` — the D12 body
+    window), and the console type-text leg is COUNTED and (for the first
+    call only) gated so the choreography can park the actor queue."""
 
-    def __init__(self) -> None:
+    def __init__(self, restore_gate: threading.Event | None = None) -> None:
         self.gate = threading.Event()
+        self.restore_gate = restore_gate
         self._lock = threading.Lock()
         self.type_calls = 0
         self.type_overlap_now = 0
         self.type_overlap_max = 0
+        self.restore_calls = 0
 
     def __call__(self, script, **kwargs):
         if "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget"):
             return pswindows.PSResult(stdout=GUID, returncode=0)
+        if "Restore-VMSnapshot" in script:
+            with self._lock:
+                self.restore_calls += 1
+            if self.restore_gate is not None:
+                # The D12 choreography holds the BODY here (admission long
+                # completed); bounded so a broken test cannot hang.
+                self.restore_gate.wait(timeout=20.0)
+            return pswindows.PSResult(stdout="", returncode=0)
         if "MethodName TypeText" in script:
             with self._lock:
                 self.type_calls += 1
@@ -806,6 +817,94 @@ def test_detached_cancel_wakes_parked_admission_to_cancelled(
     )
 
     admission.release_sync(held)
+    operations.drain_for_tests(timeout_s=5.0)
+    snap = admission.snapshot()
+    assert snap["in_flight_general"] == 0 and snap["fair_queue_depth"] == 0
+
+
+# ---------------------------------------------------------------------------
+# D12 (review round 5) — a BODY-time cancel must not touch the runner's
+# shared heartbeat-teardown event
+# ---------------------------------------------------------------------------
+
+
+def test_body_time_cancel_keeps_heartbeat_alive(tmp_path, fresh_server, monkeypatch):
+    """A cancel fired DURING the body (admission long completed, so the
+    park-window registry entry must be gone before the body starts) must
+    not set the runner's shared stop event: the heartbeat chain keeps the
+    row fresh, op_status never misclassifies the LIVE runner as
+    failed/interrupted past the heartbeat TTL, and the body's cooperative
+    cancel check produces the CANCELLED terminal state. RED at the r4 head
+    (the entry lived through the body): the cancel killed the beat chain,
+    op_status flipped the live row to failed/interrupted, and the body's
+    cancelled transition was dropped by the stale flip."""
+    mod = fresh_server({
+        "allowed_vm_patterns": ["test-*"],
+        "unrestricted": True,
+        "max_host_powershell": 2,
+        # The compressed TTL from the reviewer's probe: a runner whose beat
+        # chain dies goes stale 5 s after its last heartbeat.
+        "operations": {"heartbeat_ttl_s": 5},
+    })
+    mcp = mod.get_mcp()
+    gate = threading.Event()
+    fake = GatedFakePS(restore_gate=gate)
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+
+    token = _as_agent("agent-a")
+    try:
+        handle = _payload(asyncio.run(mcp.call_tool(
+            "hyperv_checkpoint_restore", {**RESTORE_ARGS, "detach": True}
+        )), "the detach handle")
+    finally:
+        auth_context_var.reset(token)
+    op_id = handle["op_id"]
+
+    # The body is IN the (blocked) restore leg — admission completed.
+    _wait_until(
+        lambda: fake.restore_calls >= 1,
+        timeout_s=5.0, what="the detached body to enter the restore leg",
+    )
+    assert operations.op_status(mod.CFG, op_id, "agent-a").get("status") == "working"
+
+    # Cancel DURING the body. A registry entry still live from the park
+    # window would turn this into a heartbeat kill (the r4 defect).
+    operations.op_cancel(mod.CFG, op_id, "agent-a")
+
+    # Poll past the WORST-CASE staleness bound, not just the TTL: at this
+    # head a cancel can land before the FIRST beat, so the last beat is at
+    # most beat_interval (ttl/3) after the cancel and the row goes stale at
+    # last_beat + ttl — the observation window must cover
+    # ttl/3 + ttl + slack. Every read must keep reporting the LIVE runner
+    # as working (a dead beat chain flips the row to failed/interrupted).
+    mid_statuses = []
+    window_s = (5 / 3) + 5 + 1.5  # beat interval + heartbeat_ttl_s + slack
+    deadline = time.monotonic() + window_s
+    while time.monotonic() < deadline:
+        mid_statuses.append(
+            operations.op_status(mod.CFG, op_id, "agent-a").get("status", ""))
+        time.sleep(0.5)
+    assert mid_statuses and all(s == "working" for s in mid_statuses), (
+        f"a body-time cancel must not kill the heartbeat chain of a live "
+        f"runner; op_status reported {sorted(set(mid_statuses))} while the "
+        f"body was blocked"
+    )
+
+    # The body's own cooperative check (leg boundary after the gated leg)
+    # produces the terminal state: cancelled — never a stale-row
+    # misclassification.
+    gate.set()
+    _wait_until(
+        lambda: operations.op_status(mod.CFG, op_id, "agent-a").get("status")
+        in ("cancelled", "failed", "completed"),
+        timeout_s=5.0, what="the cancelled body to reach a terminal state",
+    )
+    final_status = operations.op_status(mod.CFG, op_id, "agent-a").get("status")
+    assert final_status == "cancelled", (
+        f"a body cancelled through the real cancel path must end cancelled, "
+        f"not {final_status!r} (a stale flip drops the runner's transition)"
+    )
+
     operations.drain_for_tests(timeout_s=5.0)
     snap = admission.snapshot()
     assert snap["in_flight_general"] == 0 and snap["fair_queue_depth"] == 0

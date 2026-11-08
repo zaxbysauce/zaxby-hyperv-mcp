@@ -668,6 +668,18 @@ def _execute_body(
             _safe_transition(store, op_id, statestore.OP_CANCELLED, agent, cfg,
                              "op.cancelled")
             return
+        finally:
+            # The PARK-WINDOW pop (review round 5): the registry entry must
+            # be gone BEFORE the body starts. The registered event IS the
+            # runner's shared heartbeat-teardown `stop` — an entry left live
+            # through the body turns a body-time hyperv_op_cancel into a
+            # beat-chain kill of a LIVE runner: the heartbeats stop, read-time
+            # staleness misclassifies the row failed/interrupted while the
+            # body still runs, and the body's own cancelled transition is
+            # dropped by the stale flip. Body-time cancellation stays with
+            # the cooperative leg-boundary hook (raise_if_cancelled).
+            with _ADMIT_STOPS_LOCK:
+                _ADMIT_STOPS.pop(op_id, None)
         try:
             result = tool_fn(**body_args)
         finally:
@@ -707,11 +719,12 @@ def _execute_body(
             result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
         )
     finally:
-        # EVERY exit path from _execute_body pops the park-window registry
-        # entry: the cancelled pre-check raising before the park, the
-        # AdmissionBusy/Stopped arms, the body, and the terminal
-        # transitions (review r3 — no stranded entries, no dead-event
-        # signals).
+        # The BACKSTOP pop (review r3/r5): idempotent safety net for the
+        # exits that never reach the park-window pop above — the cancelled
+        # pre-check raising before the park (and any future early return).
+        # During the body this is a no-op: the inner pop already removed
+        # the entry precisely so a body-time cancel cannot reach the
+        # runner's shared teardown event.
         with _ADMIT_STOPS_LOCK:
             _ADMIT_STOPS.pop(op_id, None)
 
