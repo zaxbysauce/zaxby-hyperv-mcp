@@ -394,7 +394,11 @@ def _retire(waiter: _Waiter) -> None:
         if actor.holder is waiter:
             actor.holder = None
         if actor.holder is None and not actor.waiters:
-            del _ACTORS[waiter.actor_key]  # type: ignore[index]
+            # CI mypy (arg-type): actor is not None implies the lookup key was
+            # a present str key; narrow it for the del.
+            key = waiter.actor_key
+            assert key is not None
+            del _ACTORS[key]
     _grant_pass()
 
 
