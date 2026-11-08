@@ -1,0 +1,30 @@
+{
+  "record": "issue #68 supplement AC6 (admission transport matrix, HOST_ONLY)",
+  "status": "NOT-EXECUTED - PENDING",
+  "named_by": "the plan-critic round-1 finding-8 approval (trace .agents/issue-traces/64-68-collated/06-critic-review.md: the critic APPROVES the substitution of this named evidence file plus the shipped HOST_ONLY harness for the live transport benchmark; executing it requires a configured approved lab over the MCP transport; no host proof was run during planning or implementation)",
+  "executed": false,
+  "harness": "tests/benchmark/test_admission_transport_matrix.py",
+  "host_proof": null,
+  "evidence_required_when_run": [
+    "host/tool versions",
+    "topology (shared-VM vs independent-VM)",
+    "synthetic fixture",
+    "command transcript",
+    "measured result",
+    "cleanup readback"
+  ],
+  "metrics_required_when_run": [
+    "p50/p95 tool latency",
+    "queue wait",
+    "throughput",
+    "cancellation rate",
+    "per-VM fairness"
+  ],
+  "p50_ms": "unknown (not executed)",
+  "p95_ms": "unknown (not executed)",
+  "queue_wait_ms": "unknown (not executed)",
+  "throughput_calls_per_s": "unknown (not executed)",
+  "cancellation_rate": "unknown (not executed)",
+  "per_vm_fairness": "unknown (not executed)",
+  "note": "This file is the NAMED placeholder the issue's approval row reserves for the live transport leg. It is not a pass, a claim, or a partial result: the live leg has NOT been run and no performance claim is made. The harness itself ships unit-proven semantics via tests/unit/test_admission_fairness.py and tests/unit/test_admission_dispatch.py; the named env var gates the HOST_ONLY leg so it can never present as a live pass by default."
+}

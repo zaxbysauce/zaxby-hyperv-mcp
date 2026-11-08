@@ -34,6 +34,7 @@ docs/rebaseline-runbook.md).
 | 59-64-68-70-hardening-wave | 15 | 15 | 0 | clean |
 | 6-guest-put-get-policy | 13 | 13 | 0 | clean |
 | 63-66-119-collated | 12 | 12 | 0 | clean |
+| 64-68-collated | 11 | 11 | 0 | clean |
 | 67-118-release-vendor-provenance | 10 | 10 | 0 | clean |
 | 7-guest-jobs-truthful-reporting | 13 | 13 | 0 | clean |
 | 74-72-88-cost-latency-accounting | 17 | 17 | 0 | clean |

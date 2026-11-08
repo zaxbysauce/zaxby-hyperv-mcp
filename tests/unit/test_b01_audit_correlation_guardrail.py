@@ -29,6 +29,11 @@ AUDIT_KEYS = {
     # Issue #23 (review PRR-012): lease correlation id -- a 16-hex-char
     # handle PREFIX, null on every non-lease path.
     "lease_ref",
+    # Issue #68 supplement (workstream C): admission telemetry -- the call's
+    # admission class and measured park wait (null when no admit was in
+    # flight) and the exception's retry hint on busy refusals (null
+    # otherwise).
+    "admission_class", "admission_wait_ms", "retry_after_ms",
 }
 
 

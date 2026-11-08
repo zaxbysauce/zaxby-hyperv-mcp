@@ -184,7 +184,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.13.0 today) instead of
+  package's version (0.14.0 today) instead of
   the SDK's (the release contract, the complete bump-site
   enumeration, and how to read `version`/`git_revision` live in
   [docs/versioning-policy.md](docs/versioning-policy.md)).
@@ -233,6 +233,45 @@ restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.14.0 changes
+
+- **Issue #68 supplement (classed admission fairness layer, workstream C)**:
+  every tool call now passes a two-class admission layer in front of the
+  thread limiter — PS-free status/list/info surfaces (`hyperv_list_vms`,
+  `hyperv_server_info`, `hyperv_get_vm_info`, `hyperv_guest_job_status`)
+  are LIGHT with a reserved lane (`admission.light_reserve` tokens of the
+  `2 x max_host_powershell` budget; omitted default `min(2, budget - 1)`,
+  an explicit invalid value fails startup), everything else GENERAL on a
+  per-agent fair queue (no agent's backlog starves another's). Console
+  raw-input tools queue actor-first: one fair queue per canonical VM
+  identity (the issue-#77 hint unifies by-name and by-GUID addressing),
+  capacity 1, and an actor-queued caller never holds a token — K agents
+  fanning in on one VM cannot occupy the whole budget. Every wait is
+  bounded (`admission.wait_s` / `admission.light_wait_s`) and
+  cancellation-safe; a saturated refuse answers a retryable `busy`
+  envelope whose `retry_after_ms` is the measured hint, and every audit
+  row gains `admission_class` + `admission_wait_ms` (busy refusals also
+  record `retry_after_ms`). Pinned by the frozen
+  `tests/unit/test_admission_fairness.py` and the dispatch census
+  `tests/unit/test_admission_dispatch.py`.
+- **Issue #64 AC3 (amendment): the binding backoff probe.** The shipped
+  slot-pool wait's exponential backoff (5 ms doubling to a 200 ms
+  ceiling, each sleep capped to the remaining deadline) is now bound by
+  an executed probe (`tests/unit/test_c02_backoff_probe.py`): the
+  measured schedule matches the ceiling model, a 3 s window performs
+  20 (±1) sweeps, and the amendment's 600 s figures extrapolate from the
+  measurement — ~3005 attempts vs the fixed-50 ms counterfactual's
+  12000, a ~3.99x attempt reduction.
+- **Issue #68 supplement AC6 (transport matrix harness + evidence)**:
+  `tests/benchmark/test_admission_transport_matrix.py` ships as the
+  HOST_ONLY harness (shared-VM vs independent-VM topology, p50/p95,
+  queue wait, throughput, cancellation rate, per-VM fairness over the
+  configured MCP transport), env-gated so it never presents as a live
+  pass by default, with the named evidence placeholder
+  `docs/validation/capability-plan/test_admission_transport_matrix-evidence.json`
+  (executed: false — the plan-critic-approved substitution).
+- Version bump: 0.13.0 -> 0.14.0
 
 ## 0.13.0 changes
 
@@ -1319,8 +1358,9 @@ admitted before newly arriving readers, so polling reads cannot starve a
 checkpoint restore. Documented admission bound (issue #68): the tool-limiter
 resize (2x `max_host_powershell`) reserves no class for PS-free tools, so
 lock-queued calls occupying every limiter token delay PS-free admission up to the `vm_lock_wait_s` bound
-(measured worst case: 1 lock holder + 15 lock-queued calls); the agent-fairness
-reserve is the planned issue-#68-supplement admission layer. The limiter
+(measured worst case: 1 lock holder + 15 lock-queued calls); the classed
+admission layer below is the issue-#68-supplement fairness reserve that
+closes it. The limiter
 bound is restored on server-lifespan exit, so co-tenant `to_thread` users
 keep their own token count; in-process embedders driving `call_tool` never
 enter the lifespan and keep anyio's 40-token default. Console input runs under a read lock on the VM key
@@ -1338,6 +1378,38 @@ caller on a fresh process — waits, by-id input, and WMI-transport
 operations neither feed nor need the mapping) stays keyed on the
 caller-supplied name until a feeding operation supplies one — disclosed in
 the console-identity section, not tracked as an open defect.
+
+Classed admission (issue #68 supplement, workstream C) sits in front of the
+thread limiter on every tool call. Two classes: LIGHT — the PS-free
+status/readiness/list/info/jobs-status surfaces (`hyperv_list_vms`,
+`hyperv_server_info`, `hyperv_get_vm_info`, `hyperv_guest_job_status`) —
+and GENERAL (everything else). The budget mirrors the limiter sizing
+(`2 x max_host_powershell` tokens); GENERAL callers may occupy at most
+`total - admission.light_reserve` of them, so the reserved lane keeps
+LIGHT admission flowing even while GENERAL callers saturate the budget —
+the closed half of the documented `vm_lock_wait_s` admission bound above.
+`admission.light_reserve` omitted (the default) resolves to
+`min(2, budget - 1)` — valid at every host cap including 1; an explicitly
+configured value is validated `0 <= light_reserve < budget` at startup and
+a violation fails loudly (never clamped; `0` is the explicit disable,
+accepting the documented bound). GENERAL waiters queue per-agent
+round-robin (`admission.wait_s` bounds the park, default 30 s; LIGHT parks
+are bounded by `admission.light_wait_s`, default 10 s), so one agent's
+backlog can never starve another's. The console raw-input tools
+(`type_text`, `press_key`, `key_combo`, `type_scancodes`, `mouse_move`,
+`click`, `button`, `scroll`, `sequence`) queue ACTOR-FIRST: one fair queue
+per canonical VM identity (the issue-#77 hint map unifies the by-name and
+by-GUID spellings onto the GUID), capacity 1, and the actor-eligible
+caller only then acquires a token — K agents fanning in on one VM hold no
+token while queued and enter one at a time, so they cannot occupy every
+token and starve unrelated PS-free traffic. Every wait observes
+cancellation each tick; a saturated or timed-out refuse answers the
+ordinary retryable `busy` envelope with a measured `retry_after_ms`, and
+the detached-operation runner admits through the same core
+synchronously before the tool body. Every audit row records
+`admission_class` (LIGHT/GENERAL) and `admission_wait_ms` (the measured
+park wait; null when no admit was in flight), and busy refusals also
+record their `retry_after_ms`.
 
 Host PowerShell itself is bounded host-wide (issue #15): every tool leg,
 every relay request, every server process that shares the slot directory, and

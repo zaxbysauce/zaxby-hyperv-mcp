@@ -28,16 +28,17 @@ from typing import Literal
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 
-from . import credentials, logemit, vmlocks
+from . import admission, credentials, logemit, vmlocks
 from . import timing as timing_mod
 from .config import Config
 
 _lock = threading.Lock()
 _config: Config | None = None
 
-# Sentinel for "no agent_id supplied — resolve it from the auth context at
-# write time". Distinguishes an explicit None (anonymous: serialize null)
-# from an unset value (direct/out-of-band callers: resolve).
+# Sentinel for "no value supplied — resolve it at write time". Distinguishes
+# an explicit None (serialize null) from an unset value: agent_id resolves
+# from the auth context, the admission fields from the admission ContextVar
+# (issue #68 supplement: absent/None when no admit is in flight).
 _UNSET_AGENT = object()
 
 
@@ -89,6 +90,9 @@ def log_operation(
     relay_id: str | None = None,
     lease_ref: str | None = None,
     timing: dict | None = None,
+    admission_class: object = _UNSET_AGENT,
+    admission_wait_ms: object = _UNSET_AGENT,
+    retry_after_ms: object = _UNSET_AGENT,
 ) -> None:
     if _config is None:
         return
@@ -99,6 +103,23 @@ def log_operation(
         agent_value: str | None = current_agent_id()
     else:
         agent_value = agent_id  # type: ignore[assignment]
+    # Issue #68 supplement (workstream C), the lease_ref field precedent:
+    # admission telemetry rides every row — the class and measured park wait
+    # of the call's admit (from the admission ContextVar when the writer did
+    # not pass them explicitly; absent/None when no admit is in flight) and,
+    # on busy refusals, the exception's retry hint. All additive: existing
+    # consumers keep reading the earlier columns.
+    if (
+        admission_class is _UNSET_AGENT
+        or admission_wait_ms is _UNSET_AGENT
+    ):
+        current = admission.current_admission()
+        if admission_class is _UNSET_AGENT:
+            admission_class = current[0] if current is not None else None
+        if admission_wait_ms is _UNSET_AGENT:
+            admission_wait_ms = current[1] if current is not None else None
+    if retry_after_ms is _UNSET_AGENT:
+        retry_after_ms = None
     if request_id is None:
         # Generated per call, inside the body — never once per process.
         request_id = uuid.uuid4().hex
@@ -119,6 +140,15 @@ def log_operation(
         # the full handle -- so an operator can correlate lease audit rows
         # without the log becoming a capability disclosure.
         "lease_ref": (lease_ref if lease_ref is None else r(str(lease_ref))[:16]),
+        # Issue #68 supplement (workstream C): the admit's class (LIGHT or
+        # GENERAL, a fixed vocabulary) and measured park wait in ms; the
+        # exception's retry hint on busy refusals. None when unset — a
+        # missing measurement is absent, never zero.
+        "admission_class": (
+            admission_class if admission_class is None else r(str(admission_class))
+        ),
+        "admission_wait_ms": admission_wait_ms,
+        "retry_after_ms": retry_after_ms,
         # Per-call cost breakdown (issue #20): additive, so existing log
         # consumers keep reading duration_ms. A caller with no collector of its
         # own (the pre-body rejection writer) reports the honest zeroes.

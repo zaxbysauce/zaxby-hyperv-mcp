@@ -56,6 +56,16 @@ def classify(exc: BaseException) -> str:
         return "credential"
     if isinstance(exc, VMBusy):
         return "busy"
+    from .admission import AdmissionBusy  # late import: keeps the import graph unchanged
+
+    if isinstance(exc, AdmissionBusy):
+        # Issue #68 supplement (workstream C): admission-layer saturation is
+        # busy/retryable, same class as a busy VM / saturated PS pool. The
+        # exception's own retry_after_ms survives into the envelope (see
+        # envelope(), the lease_conflict precedent) — VMBusy semantics are
+        # unchanged (it has no retry_after_ms attribute, so it keeps the
+        # fixed BUSY_RETRY_MS below).
+        return "busy"
     # Issue #23: the lease taxonomy. EVERY LeaseError subclasses RuntimeError,
     # so these arms must sit BEFORE the ValueError/TimeoutError/catch-all tail
     # or every lease refusal would report "transport". Ordering, not just
@@ -154,6 +164,19 @@ def envelope(exc: BaseException) -> dict[str, Any]:
     if retry_after_ms is None and error_class == "lease_conflict":
         attr = getattr(exc, "retry_after_ms", None)
         if isinstance(attr, int) and attr >= 0:
+            out["retry_after_ms"] = attr
+    if error_class == "busy":
+        # Issue #68 supplement (workstream C): an AdmissionBusy carries its
+        # own measured retry hint; a valid positive value OVERRIDES the
+        # fixed BUSY_RETRY_MS (the lease_conflict preservation precedent).
+        # VMBusy / PowerShellBusy have no retry_after_ms attribute, so their
+        # semantics are unchanged.
+        attr = getattr(exc, "retry_after_ms", None)
+        if (
+            isinstance(attr, (int, float))
+            and not isinstance(attr, bool)
+            and attr > 0
+        ):
             out["retry_after_ms"] = attr
     holder = _holder_field(exc)
     if holder is not None:

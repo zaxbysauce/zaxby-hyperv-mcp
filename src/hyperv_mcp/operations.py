@@ -60,7 +60,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from . import auditlog, errors, leases, pswindows, statestore
+from . import admission, auditlog, errors, leases, pswindows, statestore
 from .config import Config
 
 #: The detachable set: every tool whose body can run for minutes. The two
@@ -509,7 +509,8 @@ def _start_runner(
     thread = threading.Thread(
         target=_run_detached,
         args=(captured, cfg, store if store is not None else store_for(cfg),
-              row.op_id, tool_fn, body_args, agent, presented, runner_slots),
+              row.op_id, row.tool, tool_fn, body_args, agent, presented,
+              runner_slots),
         name=f"hyperv-op-{row.op_id[:8]}",
         daemon=True,
     )
@@ -523,6 +524,7 @@ def _run_detached(
     cfg: Config,
     store: statestore.Store,
     op_id: str,
+    tool_name: str,
     tool_fn: Callable[..., Any],
     body_args: dict[str, Any],
     agent: str,
@@ -555,7 +557,10 @@ def _run_detached(
     beat_timer.daemon = True
     beat_timer.start()
     try:
-        captured.run(_execute_body, cfg, op_id, tool_fn, body_args, agent, store, stop)
+        captured.run(
+            _execute_body, cfg, op_id, tool_name, tool_fn, body_args, agent,
+            store, stop,
+        )
     finally:
         stop.set()
         beat_timer.cancel()
@@ -591,19 +596,51 @@ def _safe_transition(
 def _execute_body(
     cfg: Config,
     op_id: str,
+    tool_name: str,
     tool_fn: Callable[..., Any],
     body_args: dict[str, Any],
     agent: str,
     store: statestore.Store,
     stop: threading.Event,
 ) -> None:
-    """Runs inside the copied context: sets the cancel-hook ContextVars, then
+    """Runs inside the copied context: sets the cancel-hook ContextVars,
+    admits the call through the classed-admission core (issue #68
+    supplement — the runner-side twin of the request-loop guard), then
     drives the body and the terminal transition."""
     _current_op_id.set(op_id)
     _current_ops_cfg.set(cfg)
     try:
         _raise_if_cancelled_locked(cfg, op_id, store)
-        result = tool_fn(**body_args)
+        # Issue #68 supplement (workstream C): the detached/task runner
+        # admits BEFORE tool_fn via the same fair/reserve core the guard
+        # uses, driven synchronously on the runner thread (per-tick
+        # stop-event checks). The agent comes from the copied context (the
+        # same identity resolution a synchronous call sees); the actor key
+        # follows the console raw-input rule. admit_sync installs the
+        # admission ContextVar INSIDE this copied-context run, so the
+        # body's auditlog.operation reads the class/wait when it writes
+        # the row.
+        try:
+            ticket = admission.admit_sync(
+                tool_name,
+                auditlog.current_agent_id() or "unattributed",
+                cfg.admission.wait_s,
+                actor_key=admission.actor_key_for(tool_name, body_args),
+                stop_event=stop,
+            )
+        except admission.AdmissionBusy as busy:
+            _admission_refusal(store, cfg, op_id, tool_name, agent, body_args, busy)
+            return
+        except admission.AdmissionStopped:
+            # The stop valve fired mid-park (runner teardown): the waiter
+            # reclaimed every stage, so the op closes as cancelled.
+            _safe_transition(store, op_id, statestore.OP_CANCELLED, agent, cfg,
+                             "op.cancelled")
+            return
+        try:
+            result = tool_fn(**body_args)
+        finally:
+            admission.release_sync(ticket)
         text = _result_text(result)
         # A tool-level failure leaves as a NORMAL return carrying the one
         # envelope ({ok: false, error, error_class}) - recording that as
@@ -638,6 +675,45 @@ def _execute_body(
             error_class=str(env.get("error_class") or "transport"),
             result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
         )
+
+
+def _admission_refusal(
+    store: statestore.Store,
+    cfg: Config,
+    op_id: str,
+    tool_name: str,
+    agent: str,
+    body_args: dict[str, Any],
+    busy: admission.AdmissionBusy,
+) -> None:
+    """The runner-side pre-body admission refusal (issue #68 supplement):
+    the op row transitions to failed carrying the busy envelope (whose
+    retry_after_ms errors.envelope preserved from the exception), and an
+    auditable rejection row records tool, agent, error_class, the
+    exception's retry hint, and the admission class — the same fields the
+    guard's _audited_rejection writes, which is not reachable from this
+    thread. Best-effort on the audit sink: a broken sink must not raise
+    into the runner's epilogue."""
+    env = errors.envelope(busy)
+    text = json.dumps(env, separators=(",", ":"), default=str)
+    _safe_transition(
+        store, op_id, statestore.OP_FAILED, agent, cfg, "op.failed",
+        error_class="busy",
+        result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
+    )
+    try:
+        auditlog.log_operation(
+            tool=tool_name,
+            vm_name=str(body_args.get("vm_name") or ""),
+            category="",
+            ok=False,
+            error_class="busy",
+            agent_id=agent or None,
+            admission_class=str(admission.classify_tool(tool_name)),
+            retry_after_ms=busy.retry_after_ms,
+        )
+    except Exception:
+        pass
 
 
 def _raise_if_cancelled_locked(cfg: Config, op_id: str, store: statestore.Store) -> None:

@@ -318,6 +318,29 @@ class OperationsPolicy:
     key_env: str = ""
 
 
+@dataclass
+class AdmissionSettings:
+    """Classed admission knobs (issue #68 supplement, workstream C).
+
+    Every knob bounds an admission axis (the OperationsPolicy convention):
+    `light_reserve` tokens of the 2 x max_host_powershell budget are
+    reserved for PS-free LIGHT tools so lock-queued GENERAL callers cannot
+    delay them; `wait_s` bounds a GENERAL/actor-stage admit park and
+    `light_wait_s` bounds a LIGHT admit park before the caller sees a
+    retryable busy envelope. `light_reserve` is None (omitted) by default
+    and resolves at bootstrap to min(2, total_tokens - 1) — the
+    bootstrap-valid default at every host cap including 1; a SUPPLIED
+    value is validated against the token budget at startup
+    (0 <= light_reserve < 2 x max_host_powershell) and rejected, never
+    clamped. `light_reserve: 0` is the explicit disable, accepting that a
+    fully lock-queued budget can then delay PS-free admission up to
+    `vm_lock_wait_s`."""
+
+    light_reserve: int | None = None
+    wait_s: float = 30.0
+    light_wait_s: float = 10.0
+
+
 @dataclass(frozen=True)
 class CredentialProfile:
     """One named per-VM admin (and optional victim) identity (issue #30).
@@ -407,6 +430,9 @@ class Config:
     credential_profiles: tuple[CredentialProfile, ...] = ()
     # Issue #31 supplement: the optional per-agent cleanup-provider seam.
     agent_isolation: AgentIsolationPolicy = field(default_factory=AgentIsolationPolicy)
+    # Issue #68 supplement (workstream C): classed admission knobs. Appended
+    # last for the same positional-compat reason as the groups above.
+    admission: AdmissionSettings = field(default_factory=AdmissionSettings)
 
     # -- loading ---------------------------------------------------------
 
@@ -715,6 +741,12 @@ class Config:
             # Issue #30: profile posture is an operator axis too — names,
             # patterns and secret SOURCES are surfaced; secret values never.
             f"credential_profiles={[p.name for p in self.credential_profiles] or '[] (single global credential)'}",
+            # Issue #68 supplement (workstream C): the classed-admission
+            # posture is an enforcement axis — operators see the reserve
+            # (omitted default resolves at bootstrap) and both park bounds.
+            f"admission.light_reserve={self.admission.light_reserve if self.admission.light_reserve is not None else '(min(2, budget - 1))'}",
+            f"admission.wait_s={self.admission.wait_s:g}",
+            f"admission.light_wait_s={self.admission.light_wait_s:g}",
         ]
         return "; ".join(lines)
 
@@ -940,6 +972,49 @@ class Config:
             raise ConfigError(f"operations.{name} must be between {low} and {high}")
         object.__setattr__(target, name, value)
 
+    def _set_admission(self, value: Any) -> None:
+        """Validate the optional admission section (issue #68 supplement).
+
+        Same startup-fail shape as _set_operations: every bound is checked
+        at load time. The light_reserve UPPER bound is cross-field against
+        the token budget (2 x max_host_powershell), so it is enforced by
+        admission.configure at bootstrap — an explicit misconfiguration
+        fails loudly there rather than being clamped here.
+        """
+        if not isinstance(value, dict):
+            raise ConfigError("admission must be an object")
+        unknown = set(value) - {"light_reserve", "wait_s", "light_wait_s"}
+        if unknown:
+            raise ConfigError(
+                f"unknown admission key(s): {sorted(unknown)} — "
+                f"offending key: {sorted(unknown)[0]}"
+            )
+        adm = AdmissionSettings()
+        if "light_reserve" in value:
+            reserve = value["light_reserve"]
+            if reserve is not None:
+                if isinstance(reserve, bool) or not isinstance(reserve, int):
+                    raise ConfigError(
+                        "admission.light_reserve must be an integer or null "
+                        "(null = the omitted default, min(2, budget - 1))"
+                    )
+                if reserve < 0:
+                    raise ConfigError(
+                        "admission.light_reserve must be >= 0 (the upper bound "
+                        "is validated against the token budget at startup)"
+                    )
+            adm.light_reserve = reserve
+        for key in ("wait_s", "light_wait_s"):
+            if key not in value:
+                continue
+            val = value[key]
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                raise ConfigError(f"admission.{key} must be a number in 0..600")
+            if not 0 <= val <= 600:
+                raise ConfigError(f"admission.{key} must be a number in 0..600")
+            setattr(adm, key, float(val))
+        object.__setattr__(self, "admission", adm)
+
     def _set_credential_profiles(self, value: Any) -> None:
         """Validate the credential_profiles list (issue #30, FND-21/ENH-17).
 
@@ -1096,4 +1171,5 @@ Config._FIELD_MAP = {  # type: ignore[attr-defined]
     "operations": lambda c, v: c._set_operations(v),
     "credential_profiles": lambda c, v: c._set_credential_profiles(v),
     "agent_isolation": lambda c, v: c._set_agent_isolation(v),
+    "admission": lambda c, v: c._set_admission(v),
 }
