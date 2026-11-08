@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hyperv-mcp"
-version = "0.13.0"
+version = "0.14.0"
 description = "MCP server for Hyper-V VM management, checkpoints, kernel debug setup, guest execution, guest access diagnostics/repair, managed guest jobs, HTTP relay, and console evidence capture over PowerShell Direct."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -120,6 +120,12 @@ ignore = ["E501"]
 # bytes are frozen by the trace protocol, so its author-era import order
 # cannot be re-sorted by the linter.
 "tests/unit/test_f02_checkpoint_type.py" = ["I001"]
+# tests/unit/test_admission_fairness.py is the byte-locked acceptance-check
+# file of the 64-68-collated trace (manifest blob f3278410...): its bytes are
+# frozen by the trace protocol, and its admission import deliberately sits
+# below a comment that pins the base-leg RED signature, so the linter must
+# not re-sort it either.
+"tests/unit/test_admission_fairness.py" = ["I001"]
 # tests/unit/test_b01_agent_identity.py is the byte-locked acceptance-check
 # file of the issue-#10 red checkpoint (manifest blob 3008efa1...): its bytes
 # are frozen by the trace protocol, so its author-era import order cannot be

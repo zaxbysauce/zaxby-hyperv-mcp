@@ -60,7 +60,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from . import auditlog, errors, leases, pswindows, statestore
+from . import admission, auditlog, errors, leases, pswindows, statestore
 from .config import Config
 
 #: The detachable set: every tool whose body can run for minutes. The two
@@ -468,6 +468,22 @@ def fail_inline(op_ctx: dict[str, Any], exc: BaseException) -> None:
         pass
 
 
+def release_busy_idem(op_ctx: dict[str, Any]) -> None:
+    """The guard-side twin of the runner's post-busy idem release (PR #123
+    review PRR-001, F1): call AFTER fail_inline stored the busy envelope on
+    a keyed sync row — the refusal is RETRYABLE, so the row's idem_key is
+    cleared (statestore.op_release_idem; the partial UNIQUE index ignores
+    empty keys) and a same-key retry mints a FRESH row and executes instead
+    of replaying the refusal for the idempotency TTL. The caller keeps the
+    busy envelope fail_inline just wrote. Best-effort like fail_inline: a
+    store failure degrades to the replayable refusal this closes, never
+    into a raw exception on the response path."""
+    try:
+        store_for(op_ctx["cfg"]).op_release_idem(op_ctx["op_id"])
+    except Exception:
+        pass
+
+
 def _result_text(result: Any) -> str:
     """The serialized body of one tool result (CallToolResult or dict)."""
     content = getattr(result, "content", None)
@@ -483,6 +499,35 @@ def _result_text(result: Any) -> str:
 # ---------------------------------------------------------------------------
 # the detached runner
 # ---------------------------------------------------------------------------
+
+#: Issue #68 supplement (review round 1, MAJOR 3): per-op stop events
+#: registered by a detached runner WHILE its admission park is in flight.
+#: The cancel path (op_cancel / tasks cancel) sets cancel_requested in the
+#: store AND fires the registered event, so a runner parked in
+#: admission.admit_sync observes the cancel at its next tick (raises
+#: AdmissionStopped -> the cancelled transition) instead of running out its
+#: full wait_s and closing as a busy refusal. Entries live only for the
+#: park window: the runner deregisters as soon as admit_sync returns.
+_ADMIT_STOPS: dict[str, threading.Event] = {}
+_ADMIT_STOPS_LOCK = threading.Lock()
+
+
+def _signal_admit_stop(op_id: str) -> None:
+    """Fire a parked runner's admission stop event (never raises).
+
+    The set() runs INSIDE the registry lock (PR #123 review PRR-002):
+    releasing the lock between the lookup and the set let the runner's
+    park-window pop (same lock) interleave, so the signal landed on the
+    shared heartbeat-teardown event AFTER the body had started — a live
+    runner's beat chain killed by a park-window cancel (the D12 defect
+    class). Signal-and-pop now serialize on the lock: either the cancel
+    fires while the entry is still registered (the park wakes into
+    AdmissionStopped) or the pop wins and the cancel finds no event (the
+    body-time cooperative path takes over)."""
+    with _ADMIT_STOPS_LOCK:
+        event = _ADMIT_STOPS.get(op_id)
+        if event is not None:
+            event.set()
 
 
 def _start_runner(
@@ -509,7 +554,8 @@ def _start_runner(
     thread = threading.Thread(
         target=_run_detached,
         args=(captured, cfg, store if store is not None else store_for(cfg),
-              row.op_id, tool_fn, body_args, agent, presented, runner_slots),
+              row.op_id, row.tool, tool_fn, body_args, agent, presented,
+              runner_slots),
         name=f"hyperv-op-{row.op_id[:8]}",
         daemon=True,
     )
@@ -523,6 +569,7 @@ def _run_detached(
     cfg: Config,
     store: statestore.Store,
     op_id: str,
+    tool_name: str,
     tool_fn: Callable[..., Any],
     body_args: dict[str, Any],
     agent: str,
@@ -555,7 +602,10 @@ def _run_detached(
     beat_timer.daemon = True
     beat_timer.start()
     try:
-        captured.run(_execute_body, cfg, op_id, tool_fn, body_args, agent, store, stop)
+        captured.run(
+            _execute_body, cfg, op_id, tool_name, tool_fn, body_args, agent,
+            store, stop,
+        )
     finally:
         stop.set()
         beat_timer.cancel()
@@ -591,19 +641,96 @@ def _safe_transition(
 def _execute_body(
     cfg: Config,
     op_id: str,
+    tool_name: str,
     tool_fn: Callable[..., Any],
     body_args: dict[str, Any],
     agent: str,
     store: statestore.Store,
     stop: threading.Event,
 ) -> None:
-    """Runs inside the copied context: sets the cancel-hook ContextVars, then
+    """Runs inside the copied context: sets the cancel-hook ContextVars,
+    admits the call through the classed-admission core (issue #68
+    supplement — the runner-side twin of the request-loop guard), then
     drives the body and the terminal transition."""
     _current_op_id.set(op_id)
     _current_ops_cfg.set(cfg)
+    # Issue #68 supplement (workstream C): the detached/task runner
+    # admits BEFORE tool_fn via the same fair/reserve core the guard
+    # uses, driven synchronously on the runner thread (per-tick
+    # stop-event checks). The agent comes from the copied context (the
+    # same identity resolution a synchronous call sees); the actor key
+    # follows the console raw-input rule. admit_sync installs the
+    # admission ContextVar INSIDE this copied-context run, so the
+    # body's auditlog.operation reads the class/wait when it writes
+    # the row. The runner's stop event is REGISTERED BEFORE the
+    # cancelled pre-check (review round 2): a cancel landing between
+    # the pre-check and a later registration would otherwise find no
+    # event to signal and leave the park timing out into busy; with the
+    # event already visible, such a cancel signals it and the
+    # AdmissionStopped arm below closes the op as cancelled.
+    with _ADMIT_STOPS_LOCK:
+        _ADMIT_STOPS[op_id] = stop
     try:
+        # The outer finally (below) pops the registry entry on EVERY exit
+        # path from here, including the cancelled pre-check raising before
+        # the park — an entry stranded there would be memory-only but would
+        # also let a later cancel signal a dead event (review r3).
         _raise_if_cancelled_locked(cfg, op_id, store)
-        result = tool_fn(**body_args)
+        was_stopped = False
+        try:
+            ticket = admission.admit_sync(
+                tool_name,
+                auditlog.current_agent_id() or "unattributed",
+                cfg.admission.wait_s,
+                actor_key=admission.actor_key_for(tool_name, body_args),
+                stop_event=stop,
+            )
+        except admission.AdmissionBusy as busy:
+            _admission_refusal(store, cfg, op_id, tool_name, agent, body_args, busy)
+            return
+        except admission.AdmissionStopped:
+            # The stop valve fired mid-park (a cancel of the parked op, or
+            # runner teardown): the waiter reclaimed every stage, so the op
+            # closes as cancelled.
+            _safe_transition(store, op_id, statestore.OP_CANCELLED, agent, cfg,
+                             "op.cancelled")
+            return
+        finally:
+            # The PARK-WINDOW pop (review round 5) + the ATOMIC stop
+            # re-read (review round 2, R2): the registry entry must be gone
+            # BEFORE the body starts, and the pop and the stop re-read run
+            # under ONE _ADMIT_STOPS_LOCK hold — the same lock
+            # _signal_admit_stop holds for its lookup+set. That closes the
+            # grant-to-pop window: a park-window cancel either wins the
+            # lock while the entry is still registered (its set() lands,
+            # the re-read observes it, and the granted-but-unused ticket is
+            # released below — the body NEVER starts with the shared
+            # heartbeat-teardown stop already set) or loses the race to
+            # the pop (the signal finds no entry, and body-time
+            # cancellation stays with the cooperative leg-boundary hook).
+            # The registered event IS the runner's shared
+            # heartbeat-teardown `stop` — an entry left live through the
+            # body turns a body-time hyperv_op_cancel into a beat-chain
+            # kill of a LIVE runner: the heartbeats stop, read-time
+            # staleness misclassifies the row failed/interrupted while the
+            # body still runs, and the body's own cancelled transition is
+            # dropped by the stale flip.
+            with _ADMIT_STOPS_LOCK:
+                _ADMIT_STOPS.pop(op_id, None)
+                was_stopped = stop.is_set()
+        if was_stopped:
+            # A cancel signalled inside the grant-to-pop window: the ticket
+            # was granted but never used — release it (the retire path
+            # reclaims the permit) and close the op with the AdmissionStopped
+            # terminal, exactly as a stop observed mid-park would.
+            admission.release_sync(ticket)
+            _safe_transition(store, op_id, statestore.OP_CANCELLED, agent, cfg,
+                             "op.cancelled")
+            return
+        try:
+            result = tool_fn(**body_args)
+        finally:
+            admission.release_sync(ticket)
         text = _result_text(result)
         # A tool-level failure leaves as a NORMAL return carrying the one
         # envelope ({ok: false, error, error_class}) - recording that as
@@ -638,6 +765,71 @@ def _execute_body(
             error_class=str(env.get("error_class") or "transport"),
             result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
         )
+    finally:
+        # The BACKSTOP pop (review r3/r5): idempotent safety net for the
+        # exits that never reach the park-window pop above — the cancelled
+        # pre-check raising before the park (and any future early return).
+        # During the body this is a no-op: the inner pop already removed
+        # the entry precisely so a body-time cancel cannot reach the
+        # runner's shared teardown event.
+        with _ADMIT_STOPS_LOCK:
+            _ADMIT_STOPS.pop(op_id, None)
+
+
+def _admission_refusal(
+    store: statestore.Store,
+    cfg: Config,
+    op_id: str,
+    tool_name: str,
+    agent: str,
+    body_args: dict[str, Any],
+    busy: admission.AdmissionBusy,
+) -> None:
+    """The runner-side pre-body admission refusal (issue #68 supplement):
+    the op row transitions to failed carrying the busy envelope (whose
+    retry_after_ms errors.envelope preserved from the exception), and an
+    auditable rejection row records tool, agent, error_class, the
+    exception's retry hint, and the admission class — the same fields the
+    guard's _audited_rejection writes, which is not reachable from this
+    thread. The busy-vs-cancel tick race below is intended: a cancel
+    signal racing the park deadline may lose — the deadline outcome is
+    authoritative, and a same-key resubmit executes fresh (the idem
+    release below frees the key either way).
+    Best-effort on the audit sink: a broken sink must not raise
+    into the runner's epilogue."""
+    env = errors.envelope(busy)
+    text = json.dumps(env, separators=(",", ":"), default=str)
+    _safe_transition(
+        store, op_id, statestore.OP_FAILED, agent, cfg, "op.failed",
+        error_class="busy",
+        result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
+    )
+    # AFTER the terminal busy write: free the row's idem_key (PR #123
+    # review PRR-001, F1). The busy refusal is RETRYABLE — this caller's
+    # submitted handle keeps polling the stored busy envelope above, but
+    # the (agent, tool, idem_key) UNIQUE slot must not hold the key for
+    # the idempotency TTL: a same-key resubmit mints a FRESH row and
+    # executes instead of replaying the refusal. The cancel path (the
+    # AdmissionStopped arm) deliberately does NOT do this: a cancelled op
+    # is terminal and its retry answers from the row (D9's pin).
+    try:
+        store.op_release_idem(op_id)
+    except Exception:
+        pass  # best-effort: a store failure degrades to the replayable
+        # refusal this closes, never into a runner-crash
+    try:
+        auditlog.log_operation(
+            tool=tool_name,
+            vm_name=str(body_args.get("vm_name") or ""),
+            category="",
+            ok=False,
+            error_class="busy",
+            agent_id=agent or None,
+            admission_class=str(admission.classify_tool(tool_name)),
+            retry_after_ms=busy.retry_after_ms,
+        )
+    except Exception:
+        pass
 
 
 def _raise_if_cancelled_locked(cfg: Config, op_id: str, store: statestore.Store) -> None:
@@ -755,6 +947,11 @@ def op_cancel(cfg: Config, op_id: str, agent: str) -> dict[str, Any]:
             "cancel_requested": bool(row.cancel_requested),
         }
     store.op_request_cancel(op_id, agent, store.now())
+    # Review round 1, MAJOR 3: wake a runner still parked in admission —
+    # the store flag alone is invisible to a parked admit_sync, which would
+    # run out its full wait_s and close the op as a busy refusal instead of
+    # the cancellation the caller asked for.
+    _signal_admit_stop(op_id)
     fresh = store.op_get_scoped(op_id, agent)
     status = fresh.status if fresh is not None else row.status
     return {"ok": True, "op_id": op_id, "status": status, "cancel_requested": True}
@@ -1058,6 +1255,10 @@ def tasks_extension(
                 if row.status in statestore.OP_TERMINAL_STATES:
                     return self._view(ctx, params.task_id, embed_result=True)
                 store.op_request_cancel(params.task_id, agent, store.now())
+                # Review round 1, MAJOR 3: wake a parked runner's admission
+                # (same wiring as op_cancel — the store flag alone is
+                # invisible to a parked admit_sync).
+                _signal_admit_stop(params.task_id)
                 return self._view(ctx, params.task_id, embed_result=False)
 
             async def update_task(ctx: Any, params: Any) -> Any:
@@ -1096,3 +1297,5 @@ def reset_for_tests() -> None:
     calls this so one test's fingerprint key never serves another's store)."""
     with _key_cache_lock:
         _key_cache.clear()
+    with _ADMIT_STOPS_LOCK:
+        _ADMIT_STOPS.clear()

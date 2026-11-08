@@ -46,6 +46,7 @@ from pydantic import AnyHttpUrl
 
 from . import __version__ as _pkg_version
 from . import (
+    admission,
     auditlog,
     console,
     credentials,
@@ -339,6 +340,25 @@ def bootstrap(
     _RUNNER_SLOTS = threading.BoundedSemaphore(
         max(1, int(cfg.operations.runner_bound or cfg.max_host_powershell))
     )
+    # Issue #68 supplement (workstream C): size the classed-admission budget
+    # with the same arithmetic the tool-limiter lifespan uses (2 x
+    # max_host_powershell), so the reserved light lane sits ahead of the
+    # thread bound. light_reserve=None is the OMITTED default (resolved to
+    # min(2, total - 1), bootstrap-valid at every cap including 1); a
+    # supplied invalid value raises here — startup fails loudly, never
+    # clamped. The ValueError is translated to ConfigError (PR #123 review
+    # PRR-005) so main's CONFIG ERROR contract (print + exit 2, never a
+    # raw traceback) covers admission misconfiguration too — the loader's
+    # own validation cannot see the derived budget arithmetic.
+    try:
+        admission.configure(
+            total_tokens=2 * cfg.max_host_powershell,
+            light_reserve=cfg.admission.light_reserve,
+            wait_s=cfg.admission.wait_s,
+            light_wait_s=cfg.admission.light_wait_s,
+        )
+    except ValueError as exc:
+        raise ConfigError(f"admission: {exc}") from None
     _mcp = MCPServer(
         "hyperv_mcp",
         instructions=_INSTRUCTIONS,
@@ -4480,6 +4500,15 @@ def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]
         return errors.envelope(exc), None
 
 
+#: The no-explicit-class sentinel for the guard's rejection writer (PR #123
+#: review PRR-007, F6): when a rejection carries no admission class of its
+#: own, the auditlog kwarg is OMITTED entirely (auditlog's own _UNSET
+#: semantics) so admission_class and admission_wait_ms resolve TOGETHER from
+#: the admission ContextVar — a tool-error rejection inside an admitted call
+#: keeps both fields instead of a null class beside a measured wait.
+_ADMISSION_CLASS_UNSET = object()
+
+
 def _harden_tools(mcp: MCPServer) -> None:
     """Stamp additionalProperties:false and reject bad calls at Tool.run.
 
@@ -4527,7 +4556,14 @@ def _harden_tools(mcp: MCPServer) -> None:
             continue
         original_run = tool.run
 
-        def _audited_rejection(name: str, arguments: dict, env: dict) -> CallToolResult:
+        def _audited_rejection(
+            name: str,
+            arguments: dict,
+            env: dict,
+            *,
+            admission_class: object = _ADMISSION_CLASS_UNSET,
+            retry_after_ms: float | None = None,
+        ) -> CallToolResult:
             args = arguments or {}
             # str()-coerce before redaction (credentials.redact raises on
             # non-str) and normalize the empty string to None, so absent ids
@@ -4571,6 +4607,17 @@ def _harden_tools(mcp: MCPServer) -> None:
                 if not finished:
                     timing.finish(timing_token)
 
+            # F6 (PR #123 review PRR-007): class and wait resolve as a PAIR.
+            # The busy path passes its explicit class + retry hint (no admit
+            # was in flight, so the ContextVar handoff would serialize
+            # nulls there); every other path OMITS the kwarg entirely so
+            # auditlog fills class AND wait together from the admission
+            # ContextVar — inside an admitted call (a tool-error rejection)
+            # both stay populated, and pre-body (no admit in flight) both
+            # serialize null, never a null class beside a measured wait.
+            admission_kwargs: dict[str, Any] = {}
+            if admission_class is not _ADMISSION_CLASS_UNSET:
+                admission_kwargs["admission_class"] = admission_class or None
             try:
                 auditlog.log_operation(
                     tool=name,
@@ -4581,6 +4628,8 @@ def _harden_tools(mcp: MCPServer) -> None:
                     job_id=job_id,
                     relay_id=relay_id,
                     timing=timing_snapshot,
+                    retry_after_ms=retry_after_ms,
+                    **admission_kwargs,
                 )
             except Exception as audit_exc:  # noqa: BLE001 - best-effort: a
                 # broken audit sink must not turn a rejection into a raw
@@ -4653,48 +4702,109 @@ def _harden_tools(mcp: MCPServer) -> None:
                             ops_response, separators=(",", ":"), default=str,
                         ))
                     ])
+                # Issue #68 supplement (workstream C): classed admission
+                # BEFORE the body dispatch. Every diverting leg (detach
+                # handle, replay, conflict) returned above; only a
+                # body-bound call admits here, and the detached/task runner
+                # admits its own via admit_sync before tool_fn — so each
+                # call is admitted exactly once, on the surface that runs
+                # the body. The await parks on the EVENT LOOP: the caller
+                # holds no worker-thread token while queued, the fair
+                # queue/reserve semantics apply ahead of the anyio default
+                # limiter (which stays THE thread bound), and the console
+                # raw-input surface additionally queues actor-first
+                # (capacity 1 per canonical identity, so K agents fanning
+                # in on one VM hold no token while queued).
+                admission_agent = auditlog.current_agent_id() or "unattributed"
+                admission_actor = admission.actor_key_for(name, arguments or {})
                 try:
-                    result = await _run(arguments, context, convert_result=convert_result, **kwargs)
+                    ticket = await admission.admit(
+                        name,
+                        admission_agent,
+                        _cfg().admission.wait_s,
+                        actor_key=admission_actor,
+                    )
+                except admission.AdmissionBusy as busy:
+                    # The bounded park refused: an ordinary busy rejection
+                    # (retryable, the exception's own retry hint) — a keyed
+                    # sync row that already exists closes here, never left
+                    # working. AFTER the terminal write the row's idem_key
+                    # is freed (PR #123 review PRR-001, F1): the busy
+                    # refusal is retryable, so a same-key retry mints a
+                    # FRESH row and executes instead of replaying this
+                    # refusal for the idempotency TTL.
                     if ops_ctx is not None:
-                        operations.complete_inline(ops_ctx, result)
-                    return result
-                except UrlElicitationRequiredError as exc:
-                    if ops_ctx is not None:
-                        operations.fail_inline(ops_ctx, exc)
-                    raise
-                except Exception as exc:
-                    # 2.x Tool.run wraps both failure shapes into a ToolError /
-                    # UnexpectedToolError whose OWN text drops the original: the
-                    # pydantic ValidationError for a declared-but-mistyped
-                    # argument, and any tool-body crash. Classify the CAUSE so
-                    # validation failures say "invalid" and crashes carry the
-                    # real message (1.x ToolError parity).
-                    cause = exc.__cause__
-                    if cause is not None and not isinstance(cause, ValueError):
-                        # A crash also never reaches the SDK's own crash logger
-                        # once this guard returns an envelope, so log it here.
-                        # Issue #57: the root logger's stderr handler prints
-                        # the message AND the traceback unprefixed, so the
-                        # line reached the controller log without a
-                        # timestamp. The shared emitter keeps the traceback
-                        # and prefixes EVERY line of it.
-                        logemit.log_exception(
-                            f"tool {name} raised an unexpected exception"
-                        )
-                    env = errors.envelope(cause if cause is not None else exc)
-                    if ops_ctx is not None:
-                        operations.fail_inline(ops_ctx, cause if cause is not None else exc)
-                    return _audited_rejection(name, arguments, env)
+                        operations.fail_inline(ops_ctx, busy)
+                        operations.release_busy_idem(ops_ctx)
+                    busy_env = errors.envelope(busy)
+                    return _audited_rejection(
+                        name, arguments, busy_env,
+                        admission_class=str(admission.classify_tool(name)),
+                        retry_after_ms=busy.retry_after_ms,
+                    )
                 except BaseException as exc:
-                    # Review rb-1: CancelledError (client disconnect / server
-                    # shutdown) is a BaseException - without this arm a sync
-                    # keyed row stays working forever after a disconnect.
-                    # fail_inline records the outcome; the cancellation still
-                    # propagates. This arm MUST come after `except Exception`
-                    # so ordinary tool errors still get the envelope path.
+                    # rb-1 parity for the PARK window (review round 1,
+                    # MAJOR 2): a cancellation that lands while the bounded
+                    # admit parks must give a keyed sync row the SAME
+                    # recovery the rb-1 arm gives the body — fail_inline
+                    # closes the WORKING row before the cancellation
+                    # propagates. Without this arm a cancelled park leaves
+                    # the op row WORKING forever (runner="" so staleness
+                    # never retires it) and every same-key retry re-attaches
+                    # to the ghost.
                     if ops_ctx is not None:
                         operations.fail_inline(ops_ctx, exc)
                     raise
+                try:
+                    try:
+                        result = await _run(arguments, context, convert_result=convert_result, **kwargs)
+                        if ops_ctx is not None:
+                            operations.complete_inline(ops_ctx, result)
+                        return result
+                    except UrlElicitationRequiredError as exc:
+                        if ops_ctx is not None:
+                            operations.fail_inline(ops_ctx, exc)
+                        raise
+                    except Exception as exc:
+                        # 2.x Tool.run wraps both failure shapes into a ToolError /
+                        # UnexpectedToolError whose OWN text drops the original: the
+                        # pydantic ValidationError for a declared-but-mistyped
+                        # argument, and any tool-body crash. Classify the CAUSE so
+                        # validation failures say "invalid" and crashes carry the
+                        # real message (1.x ToolError parity).
+                        cause = exc.__cause__
+                        if cause is not None and not isinstance(cause, ValueError):
+                            # A crash also never reaches the SDK's own crash logger
+                            # once this guard returns an envelope, so log it here.
+                            # Issue #57: the root logger's stderr handler prints
+                            # the message AND the traceback unprefixed, so the
+                            # line reached the controller log without a
+                            # timestamp. The shared emitter keeps the traceback
+                            # and prefixes EVERY line of it.
+                            logemit.log_exception(
+                                f"tool {name} raised an unexpected exception"
+                            )
+                        env = errors.envelope(cause if cause is not None else exc)
+                        if ops_ctx is not None:
+                            operations.fail_inline(ops_ctx, cause if cause is not None else exc)
+                        return _audited_rejection(name, arguments, env)
+                    except BaseException as exc:
+                        # Review rb-1: CancelledError (client disconnect / server
+                        # shutdown) is a BaseException - without this arm a sync
+                        # keyed row stays working forever after a disconnect.
+                        # fail_inline records the outcome; the cancellation still
+                        # propagates. This arm MUST come after `except Exception`
+                        # so ordinary tool errors still get the envelope path.
+                        if ops_ctx is not None:
+                            operations.fail_inline(ops_ctx, exc)
+                        raise
+                finally:
+                    # Issue #68 supplement: every exit (success, failure,
+                    # rejection, cancellation) releases both admission
+                    # stages and resets the audit ContextVar, so no permit,
+                    # actor slot, or class/wait telemetry ever bleeds into
+                    # the next call on this request context.
+                    await admission.release(ticket)
             finally:
                 # Issue #23: the presented lease rides only THIS call. The
                 # reset must cover every exit (success, failure, rejection,

@@ -64,7 +64,12 @@ from mcp_types import CallToolResult, Request, RequestParams, Result
 from mcp_types.jsonrpc import INVALID_PARAMS
 
 import hyperv_mcp.server as server_module
-from hyperv_mcp import operations, pswindows, statestore  # noqa: F401 — `operations` is the RED anchor
+from hyperv_mcp import (  # noqa: F401 — `operations` is the RED anchor
+    admission,
+    operations,
+    pswindows,
+    statestore,
+)
 
 GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
 TASKS_ID = "io.modelcontextprotocol/tasks"
@@ -576,10 +581,17 @@ def test_task_ids_authorized_and_durable(tmp_path, fresh_server, monkeypatch):
 
         # Simulated restart: the gated runner's heartbeat goes stale on the
         # injected clock, every cached Store closes, the clock store itself
-        # reopens on the same database, and the server rebuilds.
+        # reopens on the same database, and the server rebuilds. The restart
+        # also severs the in-memory admission core (PR #123 review PRR-003):
+        # a REAL restart kills the process, so the still-blocked runner's
+        # held admission ticket dies with it — admission.reset() is that
+        # process death for the in-memory core, after which the rebuilt
+        # server's bootstrap re-sizes the budget on clean state (configure
+        # now refuses to re-size under an outstanding ticket).
         clock.advance(RESTART_CLOCK_ADVANCE_S)
         statestore.clear_store_cache_for_tests()
         mount.reopen()
+        admission.reset()
         mod2 = importlib.reload(server_module)
         mod2.bootstrap({"HYPERV_MCP_CONFIG": str(tmp_path / "e03-tasks-config.json")})
 
@@ -597,4 +609,12 @@ def test_task_ids_authorized_and_durable(tmp_path, fresh_server, monkeypatch):
         )
     finally:
         fake.gate.set()
+        # The orphaned pre-restart runner (kept alive by the simulation;
+        # a real restart kills the thread) now finishes its body and
+        # releases its PRE-restart ticket onto the fresh core, where the
+        # release would land as negative residue for every later
+        # bootstrap. Drain the runner, then re-sever the core the same
+        # way the simulated restart did.
+        operations.drain_for_tests(timeout_s=5.0)
+        admission.reset()
         mount.close()
