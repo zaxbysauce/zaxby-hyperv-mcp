@@ -3976,7 +3976,7 @@ def _validate_sequence_steps(
                         # supported there — fail CLOSED (a silently dropped
                         # opt-in safety parameter is worse than a rejection).
                         raise ValueError(
-                            f"step {i}: commit_guard/verified_frame_hash are "
+                            "commit_guard/verified_frame_hash are "
                             "not supported on a click step without x/y "
                             "coordinates (click-at-current-position has no "
                             "point to verify); give x/y or drop the guard")
@@ -4485,10 +4485,15 @@ def _assert_point_in_rect(x: int, y: int, rect: list[int] | None) -> None:
     """Host-side band-membership rule shared by _scale_to_head and the
     sequence guard's plan-build validation (review round 1, Finding 1): a
     point outside the content rect is refused BEFORE any input dispatch so
-    a refused guard step never bumps the ledger or spawns a script — the
-    identical band rule _scale_to_head applies. A rect-less citation is a
-    no-op (review round 2, Finding 1): the mapping keeps the anchor's
-    full-frame fallback, exactly like _scale_to_head with no rect."""
+    a refused guard step never bumps the ledger or spawns a script. This
+    gate is deliberately STRICTER than _scale_to_head for out-of-frame
+    points: the mapper clamps them (its band refusal is conditional on the
+    point being in-frame), while a GUARDED step refuses any out-of-rect
+    coordinate before dispatch — an out-of-frame coordinate on a commit
+    action is caller error, so fail closed (review round 3 question,
+    resolved as intended-stricter). A rect-less citation is a no-op
+    (review round 2, Finding 1): the mapping keeps the anchor's full-frame
+    fallback, exactly like _scale_to_head with no rect."""
     if rect is None:
         # A rect-less citation keeps the anchor's full-frame mapping (the
         # same fallback _scale_to_head applies), so there is nothing to
