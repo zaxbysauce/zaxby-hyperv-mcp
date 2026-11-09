@@ -240,7 +240,19 @@ def test_wait_frame_stable_wmi_semantics(monkeypatch, unrestricted):
     assert stub.scripts == [], "the WMI transport must not spawn PowerShell"
     assert out["stop_reason"] == "stable" and out["stable"] is True
     assert out["timings"]["transport"] == "wmi"
-    assert locked == [], "a read-only settle wait must never take the vm lock"
+    # AMEND (trace 125-126-console-accuracy-commit-guard, plan F1c/R3-01):
+    # the settle wait now holds the per-VM console INPUT lock for the whole
+    # wait — the wait auto-registers its result in the capture-citation
+    # ledger (issue #126) and the registration must be ordered against input
+    # dispatches, so the original "a read-only settle wait must never take
+    # the vm lock" pin is superseded: the wait takes the console input
+    # lock's exact two keys (VM read + console write) and no other lock.
+    assert locked == [
+        "e953c649-dcab-438d-9a54-3af74a82b624",
+        ("e953c649-dcab-438d-9a54-3af74a82b624", "console"),
+    ], (
+        "the settle wait must hold exactly the console input lock's two keys "
+        f"(resolved-GUID read + console write) for the whole wait; saw {locked!r}")
 
 
 # ---------------------------------------------------------------------------

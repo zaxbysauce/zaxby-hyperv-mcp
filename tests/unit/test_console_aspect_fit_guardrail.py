@@ -1,0 +1,652 @@
+"""Guardrail tests for the letterbox-aware console mapping (issue #125) and
+the wiring of the capture-citation/input ledger (issue #126) — regular
+post-anchor tests; the frozen contract lives in
+tests/unit/test_console_aspect_fit.py and tests/unit/test_console_commit_guard.py.
+
+Pins:
+  - the live-calibrated content-rect geometry at the measured 1-px boundary
+    classes (1080-head sweep rows) plus the frozen 1010-head fixture;
+  - shaped captures refuse pointer citations;
+  - ledger wiring: inputs bump at DISPATCH (including a timed-out leg),
+    captures auto-register (screenshots and wait tools), the guard's live
+    capture runs on the already-held internal seam (no lock re-entry), and
+    capture/input ordering shares ONE monotonic counter;
+  - alias re-keying under note_name_guid_hint in BOTH registration orders;
+  - reset_input_ledger isolation;
+  - the PowerShell-transport wait holds the per-VM input lock for the whole
+    wait (a concurrent click raises VMBusy);
+  - the server tools forward the new citation/guard parameters verbatim, and
+    the screenshot tool's height default is 0 at the MCP level;
+  - the generated positional-mouse scaling block EXECUTES the rect-relative
+    arithmetic and the band refusal in real PowerShell 5.1, for BOTH amended
+    in-script mappers (the single-op template and the independent
+    sequence-step mapper), after the harness pattern in
+    tests/unit/test_console_folded_protocol.py:335-367.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import re
+import threading
+
+import pytest
+
+from hyperv_mcp import console, pswindows
+from hyperv_mcp.config import Config
+from hyperv_mcp.console import ConsoleError, _content_rect, _scale_to_head
+
+GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
+HEAD_WIDE = (1920, 1010)
+HEAD_1080 = (1920, 1080)
+
+_REAL_RUN_PS = pswindows.run_ps
+
+
+def _rgb565_payload(w: int, h: int) -> bytes:
+    return b"\x00\x00\x00\x00" + b"\x00\x00" * (w * h)
+
+
+def _folded_size(script: str) -> tuple[int, int]:
+    w = h = 0
+    for line in script.splitlines():
+        ls = line.strip()
+        if ls.startswith("WidthPixels"):
+            raw = ls.split("=", 1)[1].strip()
+            if raw.isdigit():
+                w = int(raw)
+        elif ls.startswith("HeightPixels"):
+            raw = ls.split("=", 1)[1].strip()
+            if raw.isdigit():
+                h = int(raw)
+    if not (w and h):
+        m = re.search(r"\$sizes = @\([,(@]*(\d+),(\d+)\)", script)
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+    return w, h
+
+
+class FakePS:
+    """The adaptive folded-transport stub after the frozen packs' FakePS,
+    with a configurable head (every head-answering leg reports it)."""
+
+    def __init__(self, responses=(), head=(1024, 768)):
+        self.scripts = []
+        self.kwargs = []
+        self.responses = list(responses)
+        self.head = head
+
+    def __call__(self, script, **kwargs):
+        self.scripts.append(script)
+        self.kwargs.append(kwargs)
+        if self.responses:
+            item = self.responses.pop(0)
+        elif "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget"):
+            item = pswindows.PSResult(stdout=GUID, returncode=0)
+        elif "GetVirtualSystemThumbnailImage" in script:
+            w, h = _folded_size(script)
+            payload = _rgb565_payload(w, h)
+            body = json.dumps({
+                "returnValue": 0,
+                "imageDataB64": base64.b64encode(payload).decode(),
+            })
+            item = pswindows.PSResult(
+                stdout="VMID=" + GUID + "\nHEAD=" + str(self.head[0]) + "x"
+                       + str(self.head[1]) + "\nSIZES=" + str(w) + "x"
+                       + str(h) + "\nUSED=" + str(w) + "x" + str(h) + "\n"
+                       + body,
+                returncode=0)
+        elif "EnabledState" in script:
+            body = json.dumps({
+                "enabled_state": 2,
+                "head_horizontal": self.head[0], "head_vertical": self.head[1],
+                "keyboard_present": True, "keyboard_enabled": 2,
+                "mouse_present": True, "mouse_enabled": 2,
+            })
+            item = pswindows.PSResult(stdout="VMID=" + GUID + "\n" + body, returncode=0)
+        elif "SetAbsolutePosition" in script:
+            item = pswindows.PSResult(stdout="HEADX=1\nHEADY=1\nRC=0", returncode=0)
+        elif "Msvm_VideoHead" in script:
+            item = pswindows.PSResult(
+                stdout=json.dumps(
+                    {"horizontal": self.head[0], "vertical": self.head[1]}),
+                returncode=0)
+        elif "RC=" in script or "CHUNK" in script or "SETPOS" in script or "DOWN" in script:
+            item = pswindows.PSResult(stdout="RC=1 CHUNK=1/1", returncode=0)
+        else:
+            item = pswindows.PSResult(stdout="", returncode=0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+@pytest.fixture()
+def unrestricted():
+    return Config(unrestricted=True)
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    monkeypatch.setattr(console.time, "sleep", lambda s: None)
+
+
+@pytest.fixture(autouse=True)
+def _clean_ledger():
+    console.reset_input_ledger()
+    yield
+    console.reset_input_ledger()
+
+
+# ---------------------------------------------------------------------------
+# calibrated geometry (F1): the measured boundary rows + the frozen fixture
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("frame,head,expected", [
+    # the frozen C1 fixture: 1024x768 @ 1920x1010 -> [0,115,1024,653]
+    ((1024, 768), HEAD_WIDE, [0, 115, 1024, 653]),
+    # exact aspect -> the full frame
+    ((1024, 576), HEAD_1080, [0, 0, 1024, 576]),
+    ((320, 240), (1024, 768), [0, 0, 320, 240]),
+    # the measured 1080-head 1-px boundary classes:
+    # 1024x575 is height-limited: cw=(575*1920)//1080=1022 -> 1-px side bands
+    ((1024, 575), HEAD_1080, [1, 0, 1023, 575]),
+    # 1024x577 is width-limited: ch=576, remainder 1 -> top 0, bottom 1
+    ((1024, 577), HEAD_1080, [0, 0, 1024, 576]),
+    # 1023x576 is width-limited: ch=575, remainder 1 -> top 0, bottom 1
+    ((1023, 576), HEAD_1080, [0, 0, 1023, 575]),
+    # 1025x576 is height-limited: cw=1024, remainder 1 -> left 0, right 1
+    ((1025, 576), HEAD_1080, [0, 0, 1024, 576]),
+    # further calibration rows (floor model, symmetric splits)
+    ((1024, 539), HEAD_1080, [33, 0, 991, 539]),
+    ((1024, 540), HEAD_1080, [32, 0, 992, 540]),
+    ((1024, 500), HEAD_1080, [68, 0, 956, 500]),
+    ((1024, 768), HEAD_1080, [0, 96, 1024, 672]),
+])
+def test_content_rect_calibrated_boundaries(frame, head, expected):
+    assert _content_rect(frame[0], frame[1], head) == expected
+
+
+def test_content_rect_absent_when_head_unknown():
+    """No head -> no rect: the metadata key is absent rather than fabricated
+    (None is the sentinel the attachment sites test)."""
+    assert _content_rect(1024, 768, None) is None
+    assert _content_rect(1024, 768, (0, 0)) is None
+    assert _content_rect(1024, 768, (1920, 0)) is None
+
+
+def test_scale_to_head_full_frame_rect_clamps_like_base():
+    """A full-frame rect and no rect are the SAME mapping, including
+    out-of-frame clamping (the band refusal only fires for in-frame points
+    outside the rect)."""
+    head = (1024, 768)
+    assert _scale_to_head(9999, 9999, 640, 480, head) == (1023, 767)
+    assert _scale_to_head(
+        9999, 9999, 640, 480, head, content_rect=[0, 0, 640, 480]) == (1023, 767)
+
+
+def test_scale_to_head_band_refusal_is_in_frame_only():
+    rect = [0, 115, 1024, 653]
+    with pytest.raises(ConsoleError, match="letterbox band"):
+        _scale_to_head(512, 10, 1024, 768, HEAD_WIDE, content_rect=rect)
+    with pytest.raises(ConsoleError, match="letterbox band"):
+        _scale_to_head(5, 400, 1024, 768, HEAD_WIDE, content_rect=[10, 0, 100, 768])
+
+
+# ---------------------------------------------------------------------------
+# shaped-citation refusal (F5)
+# ---------------------------------------------------------------------------
+
+def test_shaped_capture_refuses_pointer_citation(monkeypatch, unrestricted):
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    console.register_capture(
+        "b" * 64, head_resolution=(1024, 768), vm_name="vm1",
+        frame_size=(320, 240), shaped=True)
+    with pytest.raises(ConsoleError, match="shaped frame has no head-space mapping"):
+        console.click(unrestricted, "vm1", 160, 120,
+                      frame_width=320, frame_height=240, frame_hash="b" * 64)
+    assert not any("SetAbsolutePosition" in s for s in fake.scripts)
+
+
+def test_unknown_citation_refuses(monkeypatch, unrestricted):
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(ConsoleError, match="unknown capture citation"):
+        console.click(unrestricted, "vm1", 160, 120,
+                      frame_width=320, frame_height=240, frame_hash="9" * 64)
+    assert fake.scripts == []
+
+
+# ---------------------------------------------------------------------------
+# ledger wiring: dispatch-time bumps, auto-registration, single counter
+# ---------------------------------------------------------------------------
+
+def test_input_bumps_at_dispatch(monkeypatch, unrestricted):
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    console.click(unrestricted, "vm1", 160, 120)
+    assert console._last_input_seq_for("vm1") > 0, (
+        "a dispatched click must bump the per-VM input ledger"
+    )
+
+
+def test_refused_input_never_bumps(monkeypatch, unrestricted):
+    fake = FakePS(head=HEAD_WIDE)
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    console.register_capture(
+        "b" * 64, head_resolution=HEAD_WIDE,
+        content_rect=[0, 115, 1024, 653], vm_name="vm1")
+    with pytest.raises(ConsoleError, match="letterbox band"):
+        console.click(unrestricted, "vm1", 512, 10,
+                      frame_width=1024, frame_height=768, frame_hash="b" * 64)
+    assert console._last_input_seq_for("vm1") == 0, (
+        "a refused, never-dispatched input must not bump the ledger"
+    )
+
+
+def test_timed_out_leg_still_bumps(monkeypatch, unrestricted):
+    """A leg that times out after dispatch leaves delivery unknowable, so
+    the conservative answer is that the input happened: the bump (placed at
+    dispatch, inside the lock) survives the timeout failure."""
+    fake = FakePS(responses=[pswindows.PSResult(
+        stdout="", stderr="timed out", returncode=1, timed_out=True)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(ConsoleError):
+        console.type_text(unrestricted, "vm1", "hello")
+    assert console._last_input_seq_for("vm1") > 0
+
+
+def test_screenshot_auto_registers_with_size_and_rect(
+        monkeypatch, unrestricted):
+    fake = FakePS(head=HEAD_WIDE)
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    _img, meta = console.screenshot(unrestricted, "vm1", width=1024, height=768)
+    record = console._lookup_capture(meta["frame_hash"], meta["vm_id"])
+    assert record is not None, "a returned capture must auto-register"
+    assert record["frame_size"] == (1024, 768)
+    assert record["head_resolution"] == HEAD_WIDE
+    assert record["content_rect"] == [0, 115, 1024, 653]
+    assert record["shaped"] is False
+
+
+def test_shaped_screenshot_registers_shaped(monkeypatch, unrestricted):
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    _img, meta = console.screenshot(
+        unrestricted, "vm1", width=320, height=240, scale=0.5)
+    record = console._lookup_capture(meta["frame_hash"], meta["vm_id"])
+    assert record is not None and record["shaped"] is True
+
+
+def test_wait_frame_change_auto_registers(monkeypatch, unrestricted):
+    """The wait tools hold the input lock for the whole wait and register
+    the producing poll's hash: the returned frame_hash is citable and its
+    head provenance comes from the poll that produced it."""
+    w, h = 320, 240
+    payload = _rgb565_payload(w, h)
+    import hashlib
+    hsh = hashlib.sha256(payload[4:]).hexdigest()
+    fake = FakePS(responses=[pswindows.PSResult(
+        stdout="VMID=" + GUID + "\nHEAD=1024x768\nHEAD=1024x768\n"
+               "STOP=changed POLLS=2 HASH=" + hsh + "\n"
+               "FRAME=" + base64.b64encode(payload).decode(),
+        returncode=0)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = console.wait_frame_change(unrestricted, "vm1", width=w, height=h)
+    assert out["frame_hash"] == hsh
+    assert out["head_resolution"] == {"horizontal": 1024, "vertical": 768}
+    assert out["content_rect"] == [0, 0, 320, 240]
+    record = console._lookup_capture(hsh, GUID)
+    assert record is not None, "the wait's hash must auto-register"
+    assert record["frame_size"] == (w, h)
+    assert record["head_resolution"] == (1024, 768)
+
+
+def test_guard_live_capture_does_not_reenter_the_input_lock(
+        monkeypatch, tmp_path):
+    """A successful guarded click IS the no-reentry proof: the guard's live
+    capture runs on the already-held internal seam, and vmlocks refuses
+    same-thread re-entry with VMBusy — a re-entering implementation cannot
+    pass this test."""
+    cfg = Config(unrestricted=True)
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    verified = console._frame_hash(_rgb565_payload(320, 240))
+    console.register_capture(
+        verified, vm_name="vm1", frame_size=(320, 240),
+        head_resolution=(1024, 768))
+    out = console.click(
+        cfg, "vm1", 160, 120, frame_width=320, frame_height=240,
+        commit_guard=True, verified_frame_hash=verified)
+    assert out["ok"] is True
+    assert any("ClickButton" in s for s in fake.scripts)
+
+
+def test_single_counter_orders_captures_and_inputs(unrestricted):
+    """Captures and inputs draw from ONE monotonic counter: an input after a
+    capture reads a HIGHER number, so freshness (capture.seq >
+    last_input.seq) is a real ordering and not two clocks drifting."""
+    console.register_capture("1" * 64, vm_name="vm1")
+    capture_seq = console._lookup_capture("1" * 64, "vm1")["seq"]
+    console.record_console_input(vm_name="vm1")
+    assert console._last_input_seq_for("vm1") > capture_seq
+    console.register_capture("2" * 64, vm_name="vm1")
+    later = console._lookup_capture("2" * 64, "vm1")["seq"]
+    assert later > console._last_input_seq_for("vm1")
+
+
+# ---------------------------------------------------------------------------
+# alias re-keying (R4-02) in both registration orders + reset isolation
+# ---------------------------------------------------------------------------
+
+def test_alias_rekey_name_registered_before_guid_learned():
+    """Order 1: the capture is keyed by NAME, then note_name_guid_hint learns
+    the pairing — the record re-keys to the GUID preserving its seq, and the
+    name-keyed lookup stops resolving."""
+    console.register_capture("3" * 64, vm_name="vm1", frame_size=(320, 240))
+    seq = console._lookup_capture("3" * 64, "vm1")["seq"]
+    console.note_name_guid_hint("vm1", GUID)
+    assert console._lookup_capture("3" * 64, GUID)["seq"] == seq
+    assert console._lookup_capture("3" * 64, "vm1") is None
+
+
+def test_alias_rekey_takes_max_last_input():
+    """Order 2: a GUID-keyed last-input high-water mark exists, then a
+    NAME-keyed input arrives, then the hint is learned — the GUID key keeps
+    the MAX of the two (a lower name-keyed stamp must not de-fresh the VM)."""
+    console.record_console_input(vm_id=GUID)
+    guid_stamp = console._last_input_seq_for(GUID)
+    console.record_console_input(vm_name="vm1")
+    name_stamp = console._last_input_seq_for("vm1")
+    console.note_name_guid_hint("vm1", GUID)
+    assert console._last_input_seq_for(GUID) == max(guid_stamp, name_stamp)
+    assert console._last_input_seq_for("vm1") == 0
+
+
+def test_reset_input_ledger_clears_both_maps():
+    console.register_capture("4" * 64, vm_name="vm1")
+    console.record_console_input(vm_name="vm1")
+    console.reset_input_ledger()
+    assert console._lookup_capture("4" * 64, "vm1") is None
+    assert console._last_input_seq_for("vm1") == 0
+
+
+# ---------------------------------------------------------------------------
+# PS-transport whole-wait lock holding (R3-01)
+# ---------------------------------------------------------------------------
+
+def test_wait_holds_the_input_lock_for_the_whole_wait(monkeypatch, unrestricted):
+    """A folded wait in flight holds the per-VM console input lock, so a
+    concurrent click on the same VM raises VMBusy instead of interleaving
+    (the PowerShell-transport proof of the whole-wait lock holding)."""
+    from hyperv_mcp import vmlocks
+
+    wait_spawned = threading.Event()
+    release = threading.Event()
+    real_wait_s = vmlocks._DEFAULT_WAIT_S
+
+    class BlockablePS:
+        def __init__(self) -> None:
+            self.scripts: list[str] = []
+
+        def __call__(self, script, **kwargs):
+            self.scripts.append(script)
+            if "GetVirtualSystemThumbnailImage" in script and "STOP=" in script:
+                wait_spawned.set()
+                release.wait(timeout=30)
+                return pswindows.PSResult(
+                    stdout="STOP=deadline POLLS=1 HASH=" + "a" * 64,
+                    returncode=0)
+            return FakePS()(script, **kwargs)
+
+    stub = BlockablePS()
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    vmlocks.set_default_wait_s(0.2)
+    try:
+        waiter = threading.Thread(
+            target=lambda: console.wait_frame_change(
+                unrestricted, "vm1", timeout_s=30, interval_s=1))
+        waiter.start()
+        assert wait_spawned.wait(timeout=30), "the wait never spawned"
+        with pytest.raises(vmlocks.VMBusy):
+            console.click(unrestricted, "vm1", 5, 5)
+    finally:
+        vmlocks.set_default_wait_s(real_wait_s)
+        release.set()
+        waiter.join(timeout=30)
+
+
+# ---------------------------------------------------------------------------
+# server wiring: parameter forwarding + the MCP-level height default
+# ---------------------------------------------------------------------------
+
+def _fresh_server(monkeypatch, tmp_path):
+    import importlib
+
+    import hyperv_mcp.server as server_module
+
+    monkeypatch.setenv("HYPERV_MCP_UNRESTRICTED", "1")
+    mod = importlib.reload(server_module)
+    mod.bootstrap({"HYPERV_MCP_UNRESTRICTED": "1"})
+    return mod
+
+
+def _call(mcp, tool, arguments):
+    return asyncio.run(mcp.call_tool(tool, arguments))
+
+
+def _meta(result) -> dict:
+    from conftest import content_blocks
+
+    texts = [c for c in content_blocks(result)
+             if getattr(c, "type", "") == "text"]
+    assert texts, "no metadata text block in the success result"
+    return json.loads(texts[0].text)
+
+
+def test_server_click_forwards_guard_parameters(monkeypatch, tmp_path):
+    mod = _fresh_server(monkeypatch, tmp_path)
+    mcp = mod.get_mcp()
+    received: dict = {}
+
+    def fake_click(cfg, vm_name="", x=None, y=None, frame_width=0,
+                   frame_height=0, button=1, vm_id="", frame_hash="",
+                   commit_guard=False, verified_frame_hash=""):
+        received.update(
+            vm_name=vm_name, x=x, y=y, frame_width=frame_width,
+            frame_height=frame_height, button=button, vm_id=vm_id,
+            frame_hash=frame_hash, commit_guard=commit_guard,
+            verified_frame_hash=verified_frame_hash)
+        return {"ok": True, "operation": "click button 1", "vm_name": vm_name}
+
+    monkeypatch.setattr(mod.console, "click", fake_click)
+    _call(mcp, "hyperv_console_click", {
+        "vm_name": "vm1", "x": 10, "y": 20, "frame_width": 320,
+        "frame_height": 240, "frame_hash": "a" * 64,
+        "commit_guard": True, "verified_frame_hash": "b" * 64,
+    })
+    assert received == {
+        "vm_name": "vm1", "x": 10, "y": 20, "frame_width": 320,
+        "frame_height": 240, "button": 1, "vm_id": "",
+        "frame_hash": "a" * 64, "commit_guard": True,
+        "verified_frame_hash": "b" * 64,
+    }, "the server tool must forward every citation/guard parameter verbatim"
+
+
+def test_server_mouse_move_forwards_frame_hash(monkeypatch, tmp_path):
+    mod = _fresh_server(monkeypatch, tmp_path)
+    mcp = mod.get_mcp()
+    received: dict = {}
+
+    def fake_move(cfg, vm_name="", x=None, y=None, frame_width=0,
+                  frame_height=0, vm_id="", frame_hash=""):
+        received.update(
+            vm_name=vm_name, x=x, y=y, frame_width=frame_width,
+            frame_height=frame_height, vm_id=vm_id, frame_hash=frame_hash)
+        return {"ok": True, "operation": "move", "vm_name": vm_name,
+                "head_x": 1, "head_y": 1}
+
+    monkeypatch.setattr(mod.console, "mouse_move", fake_move)
+    _call(mcp, "hyperv_console_mouse_move", {
+        "vm_name": "vm1", "x": 1, "y": 2, "frame_hash": "c" * 64,
+    })
+    assert received["frame_hash"] == "c" * 64
+
+
+def test_server_screenshot_height_defaults_to_head_aspect(
+        monkeypatch, tmp_path):
+    """MCP level: an omitted height is 0, which captures at the head's
+    aspect — 1024 wide at the 1920x1080 head is 1024x576, band-free."""
+    mod = _fresh_server(monkeypatch, tmp_path)
+    mcp = mod.get_mcp()
+    fake = FakePS(head=HEAD_1080)
+    monkeypatch.setattr(mod.pswindows, "run_ps", fake)
+    result = _call(mcp, "hyperv_console_screenshot", {"vm_name": "vm1", "width": 1024})
+    meta = _meta(result)
+    capture = next(
+        s for s in fake.scripts if "GetVirtualSystemThumbnailImage" in s)
+    assert _folded_size(capture) == (1024, 576)
+    assert meta["height"] == 576
+    assert meta["content_rect"] == [0, 0, 1024, 576]
+
+
+# ---------------------------------------------------------------------------
+# the amended in-script mappers, EXECUTED in real PowerShell 5.1
+# (after the harness pattern in test_console_folded_protocol.py)
+# ---------------------------------------------------------------------------
+
+def _ps_available() -> bool:
+    return os.path.isfile(
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+
+
+def _exec_block(block: str, head: tuple[int, int]) -> tuple[int, int] | None:
+    """Run an extracted scaling block against a synthetic $vh and return the
+    (hx, hy) it computes (None when the block reports no position)."""
+    pswindows.init(Config(unrestricted=True))
+    body = (
+        "$vh = [PSCustomObject]@{ CurrentHorizontalResolution = "
+        + str(head[0]) + "; CurrentVerticalResolution = " + str(head[1]) + " }\n"
+        + block + "\n"
+        + "Write-Output ('HX=' + $hx + ' HY=' + $hy)\n"
+    )
+    result = _REAL_RUN_PS(body, timeout_s=60)
+    if result.returncode != 0:
+        return None
+    m = re.search(r"HX=(-?\d+) HY=(-?\d+)", result.stdout)
+    assert m, f"the scaling block emitted no position: {result.stdout[:200]!r}"
+    return int(m.group(1)), int(m.group(2))
+
+
+def _exec_block_stderr(block: str, head: tuple[int, int]) -> str:
+    pswindows.init(Config(unrestricted=True))
+    body = (
+        "$vh = [PSCustomObject]@{ CurrentHorizontalResolution = "
+        + str(head[0]) + "; CurrentVerticalResolution = " + str(head[1]) + " }\n"
+        + block + "\n"
+        + "Write-Output ('HX=' + $hx + ' HY=' + $hy)\n"
+    )
+    result = _REAL_RUN_PS(body, timeout_s=60)
+    assert result.returncode != 0, "the band point must make the block throw"
+    return result.stderr or ""
+
+
+_HY_CLAMP_PREFIX = "$hy = [math]::Max(0, [math]::Min($hy,"
+
+
+def _extract_scale_block(script: str) -> str:
+    """The emitted positional-scaling block: from the `$x = ` seed to the
+    final $hy clamp line (verbatim lines; PS ignores the leading spaces)."""
+    lines = script.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.strip().startswith("$x = "))
+    end = next(
+        i for i, ln in enumerate(lines)
+        if ln.strip().startswith(_HY_CLAMP_PREFIX)
+    )
+    return "\n".join(line.strip() for line in lines[start:end + 1])
+
+
+@pytest.mark.skipif(not _ps_available(), reason="no PowerShell on this host")
+def test_single_op_mapper_executes_rect_relative_arithmetic(
+        monkeypatch, unrestricted):
+    """The single-op template's rect branch executes in real PS 5.1 and
+    matches the Python reference (first content row -> head row 0)."""
+    rect = [0, 115, 1024, 653]
+    console.register_capture(
+        "5" * 64, head_resolution=HEAD_WIDE, content_rect=list(rect),
+        vm_name="vm1", frame_size=(1024, 768))
+    fake = FakePS(head=HEAD_WIDE)
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    console.mouse_move(
+        unrestricted, "vm1", 512, 115, frame_width=1024, frame_height=768,
+        frame_hash="5" * 64)
+    script = next(s for s in fake.scripts if "SetAbsolutePosition" in s)
+    block = _extract_scale_block(script)
+    assert "$bandl = 0" in block and "$bandt = 115" in block
+    assert _exec_block(block, HEAD_WIDE) == _scale_to_head(
+        512, 115, 1024, 768, HEAD_WIDE, content_rect=rect)
+
+
+@pytest.mark.skipif(not _ps_available(), reason="no PowerShell on this host")
+def test_single_op_mapper_executes_band_refusal(
+        monkeypatch, unrestricted):
+    rect = [0, 115, 1024, 653]
+    console.register_capture(
+        "6" * 64, head_resolution=HEAD_WIDE, content_rect=list(rect),
+        vm_name="vm1", frame_size=(1024, 768))
+    fake = FakePS(head=HEAD_WIDE)
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    # The band point is refused host-side, so build the script through a
+    # CONTENT point and prove the same block refuses a band point when run.
+    console.mouse_move(
+        unrestricted, "vm1", 512, 200, frame_width=1024, frame_height=768,
+        frame_hash="6" * 64)
+    script = next(s for s in fake.scripts if "SetAbsolutePosition" in s)
+    block = _extract_scale_block(script).replace("$x = 512", "$x = 512").replace(
+        "$y = 200", "$y = 10")
+    stderr = _exec_block_stderr(block, HEAD_WIDE)
+    assert "letterbox band point refused" in stderr, (
+        "the in-script band refusal must throw naming the letterbox band"
+    )
+
+
+@pytest.mark.skipif(not _ps_available(), reason="no PowerShell on this host")
+def test_sequence_mapper_executes_rect_relative_arithmetic(
+        monkeypatch, unrestricted):
+    """The independent sequence-step mapper executes the same rect-relative
+    arithmetic in real PS 5.1 and refuses band points (the two mappers
+    cannot be allowed to drift)."""
+    rect = [0, 115, 320, 353]
+    head = (1024, 1010)
+    vhash = "7" * 64
+    console.register_capture(
+        vhash, head_resolution=head, content_rect=list(rect),
+        vm_name="vm1", frame_size=(320, 240))
+    scripts: list[str] = []
+
+    def _serve(script, **kwargs):
+        scripts.append(script)
+        return pswindows.PSResult(
+            stdout="VMID=" + GUID + "\nEPOCH=42\nSTEP=0 OK=1\n", returncode=0)
+
+    monkeypatch.setattr(pswindows, "run_ps", _serve)
+    steps = [{
+        "action": "click", "x": 160, "y": 115 + 100,
+        "frame_width": 320, "frame_height": 240, "button": 1,
+        "commit_guard": True, "verified_frame_hash": vhash,
+    }]
+    out = console.run_sequence(
+        unrestricted, "vm1", steps, expect_frame_hash=vhash,
+        width=320, height=240)
+    assert out["ok"] is True
+    script = next(s for s in scripts if "ClickButton" in s)
+    block = _extract_scale_block(script)
+    assert "$bandl = 0" in block and "$bandt = 115" in block
+    assert _exec_block(block, head) == _scale_to_head(
+        160, 215, 320, 240, head, content_rect=rect)
+    band_block = block.replace("$y = 215", "$y = 10")
+    stderr = _exec_block_stderr(band_block, head)
+    assert "letterbox band point refused" in stderr

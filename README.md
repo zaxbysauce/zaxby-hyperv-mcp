@@ -184,7 +184,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.15.0 today) instead of
+  package's version (0.16.0 today) instead of
   the SDK's (the release contract, the complete bump-site
   enumeration, and how to read `version`/`git_revision` live in
   [docs/versioning-policy.md](docs/versioning-policy.md)).
@@ -233,6 +233,39 @@ restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.16.0 changes
+
+- **Letterbox-aware console capture and click mapping (#125):** capture
+  metadata gains `content_rect` — [left, top, right, bottom] (right/bottom
+  exclusive) of the non-letterbox pixels, live-calibrated against the head
+  resolution at capture time (key absent when the head is unknown);
+  `hyperv_console_screenshot` defaults to `height=0`, which captures at the
+  head's aspect for the width (1024 at a 1920x1080 head is 1024x576,
+  band-free); `hyperv_console_click`/`hyperv_console_mouse_move` accept a
+  `frame_hash` capture citation — the cited rect threads into the mapping
+  (the Python reference `_scale_to_head` and BOTH in-script mappers gained
+  the identical rect-relative arithmetic), band points are refused
+  host-side pre-dispatch, a capture taken at a different head resolution
+  refuses as a stale frame, and shaped (cropped/scaled) captures refuse
+  pointer citations outright.
+- **Opt-in commit guard on clicks (#126):** `hyperv_console_click` gains
+  `commit_guard`/`verified_frame_hash` — a guarded click verifies a FRESH
+  cited capture (no input dispatched through this server process since it,
+  per-process in-process input ledger) and re-hashes the live frame at the
+  cited pixel domain inside the locked region before committing; refusals
+  are structured errors that send no mouse input, and allowed guards are
+  audited. Sequence click steps accept the same pair composed with
+  `expect_frame_hash`. Captures auto-register for citation (screenshots,
+  wait results, capture_sequence frames), inputs bump the ledger at
+  dispatch, and the wait tools hold the per-VM console input lock for the
+  whole wait so registrations order against input dispatches — console
+  input to a VM with a wait in flight now raises VMBusy instead of
+  interleaving. Disclosed residual: the freshness leg is per-server-process
+  (the live-frame hash check is transport-fresh and catches any visible
+  cross-process change); a UIA state-receipt channel is split to a follow-up
+  issue tracked on #126.
+- Version bump: 0.15.0 -> 0.16.0.
 
 ## 0.15.0 changes
 
@@ -2091,14 +2124,14 @@ selectors fail with `ambiguous_selector` and up to 20 candidates.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_console_screenshot` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `format?` (png\|jpeg/jpg\|webp), `quality?` (1..100), `scale?` (0,1], `crop?` ([left,top,right,bottom]), `if_changed_from?` (frame_hash) | MCP ImageContent + metadata text (`vm_id`, `frame_hash`, `head_resolution`, `scale_note`, `fallback_used`, `used_fallback`, `capture_method`, `captured_at`, `timings`, `width`, `height`, `vm_name`, `prefix_hex`, plus `format`/`quality`/`scale`/`crop`/`saved_format` only when those options were supplied) — metadata alone when `if_changed_from` matches. `used_fallback` (issue #83, PowerShell transport) is true exactly when the response's `USED=` line was absent or malformed, i.e. the reported dimensions are the REQUESTED size by assumption rather than the chain's own report; false when `USED=` was present and parseable (`fallback_used` remains the separate human-readable note about which chain size actually captured) |
+| `hyperv_console_screenshot` | `vm_name` or `vm_id`, `width=1024`, `height=0` (0.16.0: derive the head's aspect for the width; an explicit 160..4096 also accepted), `save_path?`, `format?` (png\|jpeg/jpg\|webp), `quality?` (1..100), `scale?` (0,1], `crop?` ([left,top,right,bottom]), `if_changed_from?` (frame_hash) | MCP ImageContent + metadata text (`vm_id`, `frame_hash`, `head_resolution`, `content_rect` (issue #125: [left, top, right, bottom] of the non-letterbox pixels, right/bottom exclusive, from the RAW pre-shaping dimensions against the head at capture; key absent when the head is unknown), `scale_note`, `fallback_used`, `used_fallback`, `capture_method`, `captured_at`, `timings`, `width`, `height`, `vm_name`, `prefix_hex`, plus `format`/`quality`/`scale`/`crop`/`saved_format` only when those options were supplied) — metadata alone when `if_changed_from` matches. `used_fallback` (issue #83, PowerShell transport) is true exactly when the response's `USED=` line was absent or malformed, i.e. the reported dimensions are the REQUESTED size by assumption rather than the chain's own report; false when `USED=` was present and parseable (`fallback_used` remains the separate human-readable note about which chain size actually captured) |
 | `hyperv_console_get_display_info` | `vm_name` or `vm_id` | `{ok, enabled_state, head_horizontal, head_vertical, keyboard_present, keyboard_enabled, mouse_present, mouse_enabled, mouse_ps2_present, boot_epoch, guest_channel, guest_channel_note, vm_id}` — `mouse_present` reports the SYNTHETIC mouse only (absolute positioning); `mouse_ps2_present` (issue #83) additionally reports the PS/2 mouse the non-positional input ops (button, scroll, click-at-current-position) fall back to, so a PS/2-only VM no longer reads as "nothing can act on the console" — the field is always present, false meaning no PS/2 mouse was reported, and it is measured per transport: the in-process WMI transport probes it via a `SystemName`-scoped `Msvm_Ps2Mouse` query, the PowerShell transport via the folded script's own PS/2 query. NOTE: `guest_channel` is per-tool vocabulary; this tool still reports the constant `ps_direct_unverified` (Workstream D owns its rework), while `hyperv_wait_vm_state` derives `os_heartbeat_ok`/`no_guest_signal` from the Heartbeat service and `hyperv_deployment_status` reports the richer seven-phase `phase` vocabulary (`off`/`suspended`/`heartbeat_disabled`/`no_guest_signal`/`os_ready`/`os_unresponsive`/`degraded`) instead |
 | `hyperv_console_type_text` | `vm_name` or `vm_id`, `text` (ASCII) | `{ok, chunks, chars}` |
 | `hyperv_console_press_key` | `vm_name` or `vm_id`, `key`, `modifiers[]` (ctrl/alt/shift incl. right- variants, win/leftwin/rightwin — held while key taps) — keys: enter, escape (esc), tab, backspace, space, capslock, up/down/left/right, delete, home, end, pageup, pagedown, insert, f1-f12, a-z, 0-9, punctuation (minus/equals/leftbracket/rightbracket/semicolon/apostrophe/grave/backslash/comma/period/slash, single-char aliases `-` `=` `[` `]` `\` `;` `'` `` ` `` `,` `.` `/`), numpad (num0-num9, numdecimal, nummultiply, numsubtract, numadd, numlock, numdivide, numenter), win (alias leftwin), rightwin, menu (alias apps); modifier-named keys are also valid bare presses | `{ok, scancodes_sent, chunks}` |
 | `hyperv_console_key_combo` | `vm_name` or `vm_id`, `keys[]` — modifiers ctrl/alt/shift (incl. right- variants) and win/leftwin/rightwin; every other key name taps in order, e.g. `["win","r"]` | `{ok, scancodes_sent, chunks}` |
 | `hyperv_console_type_scancodes` | `vm_name` or `vm_id`, `scancodes[]` (0..255) | `{ok, scancodes_sent, chunks}` |
-| `hyperv_console_mouse_move` | `vm_name` or `vm_id`, `x`, `y`, `frame_width?`, `frame_height?` | `{ok, operation, head_x, head_y}` |
-| `hyperv_console_click` | `vm_name` or `vm_id`, `x?`/`y?` (null default — omit both to click at the current position; (0,0) is a real coordinate), `frame_width?=0`, `frame_height?=0`, `button=1` | `{ok, operation, head_x?, head_y?}` |
+| `hyperv_console_mouse_move` | `vm_name` or `vm_id`, `x`, `y`, `frame_width?`, `frame_height?`, `frame_hash?` (issue #125 capture citation — see the mapping contract below) | `{ok, operation, head_x, head_y}` |
+| `hyperv_console_click` | `vm_name` or `vm_id`, `x?`/`y?` (null default — omit both to click at the current position; (0,0) is a real coordinate), `frame_width?=0`, `frame_height?=0`, `button=1`, `frame_hash?` (issue #125 capture citation), `commit_guard=false`, `verified_frame_hash?` (issue #126 commit guard — both below) | `{ok, operation, head_x?, head_y?}` |
 | `hyperv_console_button` | `vm_name` or `vm_id`, `button`, `is_down` | `{ok, operation}` |
 | `hyperv_console_scroll` | `vm_name` or `vm_id`, `delta` | `{ok, operation}` |
 | `hyperv_console_wait_frame_change` | `vm_name` or `vm_id`, `baseline_hash=""`, `width=640`, `height=480`, `timeout_s=60`, `interval_s=2` | list[ImageContent(image/png), TextContent({stop_reason: changed\|deadline, polls, elapsed_ms, frame_hash, hash_domain})] or deadline dict |
@@ -2107,6 +2140,57 @@ selectors fail with `ambiguous_selector` and up to 20 candidates.
 | `hyperv_console_sequence` | `steps` (1..50 step dicts; grammar below), `vm_name` or `vm_id`, `expect_frame_hash=""`, `expect_boot_epoch=None`, `timeout_s=60`, `request_key=""`, `width=640`, `height=480` | {ok: true, vm_name, boot_epoch, steps: [{index, ok, stop_reason?, error?, skipped?}]} or {ok: false, error_class: "precondition"\|"unknown", ...} |
 
 Console notes: text rides the stdin channel (never in argv/script/errors); non-ASCII input must use type_scancodes; mouse coordinates are in the space of the observed image — pass `frame_width`/`frame_height` matching your screenshot dimensions to scale to head space, or omit them to use head coordinates directly; `wait_frame_change` with `baseline_hash=""` treats the first polled frame as the baseline, and a returned `frame_hash` can be passed back as `baseline_hash` to detect changes across calls (both are the full lowercase-hex sha256 of the PIXEL payload, i.e. the thumbnail bytes after the 4-byte opaque prefix — see the 0.4.0 breaking change above; the tool also returns `hash_domain` so a client can refuse a baseline recorded in a different domain — the same applies to `wait_frame_stable`, whose `baseline_hash` and returned `frame_hash` live in the identical domain and whose result also carries `hash_domain`); `capture_sequence`'s `changed_bytes_vs_previous` counts PIXEL bytes, the same domain `frame_hash` covers (an idle console costs one C-level comparison rather than a per-byte walk, and a change confined to one 64 KiB chunk costs that chunk rather than the whole payload — a change in EVERY chunk walks those chunks, but with `sum(map(operator.ne, ...))` the per-byte work is C-level and executes no Python line events at all, so the cost is a single C walk rather than a Python loop); `capture_sequence`'s `frames[]` entries report `vm_id` — on the PowerShell transport, the GUID that frame's own process actually resolved; on the in-process WMI transport, the GUID the sequence resolved once (`null` means the frame carried no identity metadata, which is legal). Issue #82: a mid-sequence identity change — a delete+recreate under the same name — aborts the sequence with a structured error naming both GUIDs instead of returning a spliced diff); a returned `console.Frame` holds only its encoding until something reads a pixel — the raster is derived from the encoding on first pixel access and cached from then on, so an untouched frame retains no `width*height*3` buffer, and a mutation made after the first access survives; WinPE errors and wizard screens are returned as images for visual interpretation (no OCR is performed).
+
+#### Letterbox-aware mapping, capture citations, and the commit guard (0.16.0, issues #125/#126)
+
+**Mapping contract.** A capture whose aspect differs from the display head's
+is LETTERBOXED — the host scales the head into the frame and pads the
+remainder with black bands. Capture metadata therefore carries
+`content_rect` ([left, top, right, bottom], right/bottom exclusive) of the
+non-letterbox pixels, derived from the capture geometry against the head
+resolution at capture time (live-calibrated model: floor on the constrained
+dimension, bands split floor/ceil; absent when the head is unknown).
+`height=0` (the new default on `hyperv_console_screenshot`) captures at the
+head's aspect for the given width — e.g. width=1024 at a 1920x1080 head is
+1024x576, which is band-free. Without a citation, frame coordinates scale
+per-axis over the whole frame (the pre-0.16.0 behavior, unchanged for
+same-aspect frames); WITH a citation (below) they map through the rect —
+offset into it, scaled by head/content size, rounded and clamped — so the
+first content row maps to head row 0 instead of landing ~15% short.
+
+**Capture citations (`frame_hash=`).** `hyperv_console_click` and
+`hyperv_console_mouse_move` accept the `frame_hash` of a capture this
+server process returned (screenshots, wait results, capture_sequence frames
+auto-register). Citing resolves the capture's `content_rect` and
+`head_resolution`: a capture taken at a DIFFERENT head resolution refuses
+with a "stale frame" error before any input script exists; a point inside a
+letterbox band refuses ("letterbox band point … no head-space meaning");
+and a shaped (cropped/scaled) capture refuses outright ("shaped frame has
+no head-space mapping; cite an unshaped capture").
+
+**The commit guard (`commit_guard`/`verified_frame_hash`, opt-in).** A
+guarded click refuses to commit on a stale verification:
+`verified_frame_hash` must cite a capture taken AFTER the most recent
+console input to that VM, and the guard re-captures the live frame at the
+cited pixel domain inside the locked region and refuses on any hash
+mismatch (the refusal names the live hash). Refusals are structured errors
+(`commit_unverified` / `stale …`) and send no mouse input; an allowed guard
+is recorded in the audit log. Scope disclosure: the freshness leg counts
+inputs dispatched through THIS SERVER PROCESS only (a per-process in-process
+ledger) — a cross-process input that changed the pixels is still caught by
+the live-frame hash check, but a cross-process input that left the pixels
+unchanged is a residual window; the shared-state (statestore) follow-up is
+tracked on #126. Sequence click steps accept the same
+`commit_guard`/`verified_frame_hash` pair, composed with
+`expect_frame_hash` (they must be equal — the precondition capture IS the
+live verification); a guarded click must be the plan's FIRST step.
+
+**Whole-wait lock holding.** Because captures now auto-register for
+citation, `wait_frame_change`/`wait_frame_stable` hold the per-VM console
+input lock for the WHOLE wait (both transports), so the registration is
+ordered against input dispatches: console input to that VM blocks until the
+wait returns (a concurrent input raises `VMBusy` instead of queueing).
+Screenshots likewise register inside the input lock.
 
 #### Batched console sequences (issue #28)
 
