@@ -2382,6 +2382,13 @@ hyperv_start_vm(vm_name="lab-vm")
   exact reason) unless `HYPERV_MCP_INTEGRATION=1`, `HYPERV_MCP_TEST_VM=<name>`
   and guest credentials are set. The suite follows the lab protocol: record
   state → checkpoint → read-only → exec/transfer → lifecycle → restore.
+- `pytest tests/host` (0.15.0) runs the VM-agent-isolation live seam leg on
+  a dedicated disposable lab: it skips unless `HYPERV_MCP_INTEGRATION=1` and
+  `HYPERV_MCP_TEST_GOLDEN_VHD=<path>` name an existing READ-ONLY golden
+  `.vhdx` (mint one: `New-VHD -Dynamic`, then
+  `Set-ItemProperty IsReadOnly $true`); no guest credentials are needed.
+  See `docs/validation/capability-plan/test_vm_agent_isolation_host-evidence.json`
+  for the recorded procedure. CI does not collect this suite.
 
 ```powershell
 $env:HYPERV_MCP_INTEGRATION = "1"

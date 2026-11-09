@@ -14,8 +14,8 @@ Legs:
     refuses (the production MediaError naming "vm_remove refused", the
     pending status and the clone GUID) BEFORE any deletion work (VM and
     child disk intact), then CLEAN removal succeeds. Clone-b takes the
-    straight clean path. The golden parent's SHA-256 AND mtime must be
-    unchanged; no residual clone disk or .avhdx survives.
+    straight clean path. The golden parent's SHA-256 (chunked read) AND
+    mtime must be unchanged; no residual clone disk or .avhdx survives.
   * test_nonowner_teardown_rejected_before_host_ops — the synthetic
     owner-keyed harness (AC15) runs live in the host-test process: a
     non-owner teardown raises NotOwnerError with ZERO host calls (a
@@ -26,22 +26,26 @@ cleanup identity, recorded BEFORE any further fallible operation; later
 resolution only verifies it (a mismatch fails the test while the original
 ID stays tracked for cleanup — never replaced).
 
-Absence contract (plan-critic r6): VM absence is NEVER inferred from a
-resolver exception (vmident.resolve raises PowerShellTransportError for a
-missing VM, and any transport error means UNKNOWN, not absent). Absence is
-proven only by an explicit GUID-scoped Get-VM probe that succeeds and
-reports GONE; PRESENT and unknown both RETAIN the tracked entry.
+Absence contract (r6 + review PRR-001): VM absence is NEVER inferred from
+a resolver exception OR from a silenced/suppressed Get-VM failure
+(-ErrorAction SilentlyContinue collapses "query failed" into "absent" —
+reviewer-executed live). Absence is proven only by an explicit
+GUID-scoped Get-VM probe with -ErrorAction Stop whose probe succeeds
+(rc==0) and reports GONE; PRESENT, unknown, and PROBE-ERROR all RETAIN
+the tracked entry.
 
-Cleanup contract (plan v4/r6): the finally forces the provider CLEAN,
-drives best-effort turnoff/remove per tracked clone, emits the full
+Cleanup contract (plan v4/r6 + review): the finally forces the provider
+CLEAN, drives best-effort turnoff/remove per tracked clone, emits the full
 cleanup report (failures AND benign kept inventory) to the result record
-and stderr INSIDE the finally — visible even when a primary exception is
-already propagating — and only when no primary exception is in flight does
+and stderr INSIDE the finally with report-specific line kinds (never filed
+as observed assertions) and a guarded write that never masks an in-flight
+primary exception — and only when no primary exception is in flight does
 the test fail on an incomplete report. Benign kept rows
 (not_owned_ancestor, already_gone) are inventory, never failures; failure
 reasons (delete_failed, merge_pending, cleanup_leg_failed,
 outside_host_write_roots, in_use_by_other_vm) and residual child disks
-always are.
+always are. An already-removed VM (resolver transport error + gone probe)
+is benign inventory on the VM axis too, symmetric with the disk axis.
 """
 
 import hashlib
@@ -60,11 +64,18 @@ NODE_B = "tests/host/test_vm_agent_isolation_host.py::test_nonowner_teardown_rej
 
 BENIGN_KEPT = ("not_owned_ancestor", "already_gone")
 
+# Chunk size for the golden digest: a 1 MiB read window keeps the sha-256
+# pass bounded for any operator-supplied golden size (review PRR-013).
+_DIGEST_CHUNK = 1024 * 1024
+
 
 def _digest(path: str) -> tuple[str, float]:
     st = os.stat(path)
+    digest = hashlib.sha256()
     with open(path, "rb") as fh:
-        return hashlib.sha256(fh.read()).hexdigest(), st.st_mtime
+        for chunk in iter(lambda: fh.read(_DIGEST_CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest(), st.st_mtime
 
 
 def _wait_state(cfg, name: str, states: list[str], timeout_s: int = 300) -> str:
@@ -72,20 +83,40 @@ def _wait_state(cfg, name: str, states: list[str], timeout_s: int = 300) -> str:
 
 
 def _vm_absent(cfg, guid: str) -> str:
-    """Fail-closed absence probe (plan-critic r6): 'gone' ONLY when the
-    GUID-scoped Get-VM query SUCCEEDS and reports the VM absent; 'present'
-    when it succeeds and the VM is there; 'unknown' on any transport
-    failure (never counted as absence)."""
+    """Fail-closed absence probe (r6 + review PRR-001 + fix-round review).
+
+    'gone' ONLY when the Get-VM ENUMERATION succeeds (rc==0) and the GUID
+    is not among the returned VMs. Two failure shapes must never collapse
+    into absence:
+      - a suppressed cmdlet failure (the original PRR-001 fail-open:
+        -ErrorAction SilentlyContinue printed GONE with rc=0 for a FAILED
+        query), and
+      - Hyper-V's own "unable to find" — with -ErrorAction Stop,
+        Get-VM -Id <absent-guid> is a TERMINATING error, so a per-GUID
+        lookup cannot distinguish not-found from query-failed (the
+        fix-round reviewer live-proved rc=3/PROBE-ERROR for a valid
+        absent GUID).
+
+    The probe therefore enumerates ALL VMs once with -ErrorAction Stop and
+    filters by Id in PowerShell: enumeration success + empty filter =
+    genuine absence; any enumeration failure prints PROBE-ERROR and exits
+    rc=3, which maps to 'unknown' here. 'present' only when the successful
+    enumeration contains the GUID."""
     script = (
-        "$v = Get-VM -Id '" + guid + "' -ErrorAction SilentlyContinue\n"
-        "if ($v) { 'PRESENT' } else { 'GONE' }\n"
+        "try {\n"
+        "    $all = @(Get-VM -ErrorAction Stop)\n"
+        "} catch {\n"
+        "    'PROBE-ERROR'\n"
+        "    exit 3\n"
+        "}\n"
+        "if (@($all | Where-Object { $_.Id -eq '" + guid + "' }).Count) { 'PRESENT' } else { 'GONE' }\n"
     )
     try:
         result = pswindows.run_ps(script, timeout_s=120)
     except Exception:
-        return "unknown"  # a raised transport error is unknown, never absence (r7)
+        return "unknown"  # a raised transport error is unknown, never absence
     if result.returncode != 0:
-        return "unknown"
+        return "unknown"  # includes the probe's own PROBE-ERROR rc=3 (PRR-001)
     if "GONE" in result.stdout:
         return "gone"
     if "PRESENT" in result.stdout:
@@ -114,13 +145,15 @@ class _TraceProvider:
 
 
 def _cleanup_tracked(cfg, provider, tracked, report, benign) -> None:
-    """Non-masking, VISIBLE, fail-closed failure-path cleanup (r5/r6):
-    provider CLEAN first; for every tracked [guid, name, child] entry:
-    best-effort turnoff + Off-wait, best-effort removal by vm_id; every
-    error, residual child, and non-benign kept reason is APPENDED to
-    report; benign kept rows go to benign inventory; an entry leaves
+    """Non-masking, VISIBLE, fail-closed failure-path cleanup (r5/r6 +
+    review PRR-009): provider CLEAN first; for every tracked
+    [guid, name, child] entry: best-effort turnoff + Off-wait, best-effort
+    removal by vm_id; every error, residual child, and non-benign kept
+    reason is APPENDED to report; benign kept rows and ALREADY-GONE VMs go
+    to benign inventory (symmetric with the disk axis); an entry leaves
     tracking only when the absence probe says 'gone' AND the child disk is
-    confirmed deleted — 'present' or 'unknown' both retain the entry."""
+    confirmed deleted — 'present', 'unknown', or 'PROBE-ERROR' all retain
+    the entry."""
     provider.force_clean()
     for entry in list(tracked):
         guid, name, child = entry
@@ -128,7 +161,12 @@ def _cleanup_tracked(cfg, provider, tracked, report, benign) -> None:
             lifecycle.stop_vm(cfg, vm_id=guid, method="turnoff", confirm=True)
             _wait_state(cfg, name, ["Off"], timeout_s=180)
         except Exception as exc:
-            report.append(f"stop {guid}: {exc}")
+            if _vm_absent(cfg, guid) == "gone":
+                # PRR-009 symmetry: an already-removed VM is benign on the
+                # stop leg too.
+                benign.append(f"already gone (VM, stop leg) {guid}: {exc}")
+            else:
+                report.append(f"stop {guid}: {exc}")
         try:
             removed = media.vm_remove(cfg, vm_id=guid, delete_disks=True, confirm=True)
             if not removed.get("ok"):
@@ -141,7 +179,12 @@ def _cleanup_tracked(cfg, provider, tracked, report, benign) -> None:
                     else:
                         report.append(f"kept (failure) {guid}: {text}")
         except Exception as exc:
-            report.append(f"remove {guid}: {exc}")
+            if _vm_absent(cfg, guid) == "gone":
+                # PRR-009: an already-removed VM is benign inventory on the
+                # VM axis, symmetric with the disk axis's already_gone.
+                benign.append(f"already gone (VM) {guid}: {exc}")
+            else:
+                report.append(f"remove {guid}: {exc}")
         if os.path.exists(child):
             report.append(f"residual child disk: {child}")
             continue
@@ -155,15 +198,16 @@ def _cleanup_tracked(cfg, provider, tracked, report, benign) -> None:
 def _emit_cleanup_reports(host, report, benign) -> None:
     """Emit cleanup outcome INSIDE the finally (plan-critic r6): visible on
     the result record and stderr even when a primary exception is already
-    propagating."""
+    propagating; report lines use the record's "report: " kind so a
+    cleanup failure is never filed as an observed assertion (PRR-007)."""
     if benign:
         line = "cleanup benign inventory: " + "; ".join(benign)
         sys.stderr.write(line + "\n")
-        host.note(line)
+        host.note(line, kind="report")
     if report:
         line = "cleanup incomplete: " + "; ".join(report)
         sys.stderr.write(line + "\n")
-        host.note(line)
+        host.note(line, kind="report")
 
 
 def test_owner_clone_lifecycle_with_seam(host, tmp_path):
@@ -185,7 +229,7 @@ def test_owner_clone_lifecycle_with_seam(host, tmp_path):
     try:
         # --- clone-a: full lifecycle + live seam refusal, then clean removal
         name_a = f"host-iso-a-{uuid.uuid4().hex[:8]}"
-        child_a = os.path.join(host.scratch, f"{name_a}.vhdx")
+        child_a = os.path.join(host.clone_disks, f"{name_a}.vhdx")
         out_a = media.vm_clone(cfg, name_a, golden, child_a, memory_mb=512,
                                cpu_count=1, switch_name="", confirm=True)
         assert out_a["ok"], out_a
@@ -221,7 +265,7 @@ def test_owner_clone_lifecycle_with_seam(host, tmp_path):
 
         # --- clone-b: straight clean path through the same seam
         name_b = f"host-iso-b-{uuid.uuid4().hex[:8]}"
-        child_b = os.path.join(host.scratch, f"{name_b}.vhdx")
+        child_b = os.path.join(host.clone_disks, f"{name_b}.vhdx")
         out_b = media.vm_clone(cfg, name_b, golden, child_b, memory_mb=512,
                                cpu_count=1, switch_name="", confirm=True)
         assert out_b["ok"], out_b
@@ -245,7 +289,7 @@ def test_owner_clone_lifecycle_with_seam(host, tmp_path):
         assert after == before, "parent digest unchanged"
         host.note("parent digest unchanged")
         leftovers = [p for p in (child_a, child_b) if os.path.exists(p)]
-        avhdx = [p.name for p in pathlib.Path(host.scratch).glob("*.avhdx")
+        avhdx = [p.name for p in pathlib.Path(host.clone_disks).glob("*.avhdx")
                  if name_a in p.name or name_b in p.name]
         assert not leftovers and not avhdx, f"residual clone disk: {leftovers + avhdx}"
         host.note("no residual clone disk")

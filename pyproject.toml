@@ -103,7 +103,7 @@ timeout = 120
 timeout_method = "thread"
 pythonpath = ["src"]
 markers = [
-    "hyperv_real: drives a real disposable Hyper-V VM (opt-in via tests/integration + env guards)",
+    "hyperv_real: drives a real disposable Hyper-V VM (opt-in via tests/integration or tests/host + env guards)",
 ]
 
 [tool.ruff]

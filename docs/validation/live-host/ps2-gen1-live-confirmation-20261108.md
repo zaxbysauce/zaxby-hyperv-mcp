@@ -4,14 +4,29 @@ Record type: boundary evidence (premise falsified live). This transcript
 records the FINAL gate invocation and its observed results only.
 
 tree-id: 96b4917761a76882ee37ce32383a5088f92bcf6f
+provenance note: the tree-id is the trace convention's STAGED WORKING-TREE
+snapshot at run time, NOT a commit tree (not resolvable from a fresh
+clone; see the AC16 transcript's provenance note for the blob-level
+binding of the executor files). This leg's EXECUTOR is the frozen
+tests/integration/test_d02_console_live.py, byte-identical at base and
+head (untouched by the PR).
 - head at run time: 250003bd8073719fd58f2d6d8260a8b97d0c26dd (main; the wave
   ships docs/tests/version only)
 - host build: Windows host 10.0.26300 x64 (Hyper-V), 2026-11-08
 - lab: self-minted disposable Gen1 VM host-ac79-gen1-f73242ef
   (guid e0825eed-7971-4be1-b3af-092d50e51be1), blank 8 GiB VHDX, 512 MB,
   no NIC, minted + STARTED + waited Running via the trace harness
-  (repro/infra_leg.py) under the least-privilege lab config; teardown
-  verified (VM gone, disks deleted, scratch removed).
+  (repro/infra_leg.py, a trace-local gitignored script) under the
+  least-privilege lab config. Authorization posture (review PRR-005, exact
+  per leg): the MINTING ran under the harness's least-privilege config
+  (allowed_vm_patterns, host_read/write_roots, destructive
+  stop/vm_provision/vm_remove/console_input); the PYTEST leg then ran the
+  FROZEN integration test, whose own config is Config(unrestricted=True)
+  (tests/integration/test_d02_console_live.py:49-50 + its conftest —
+  pre-existing at base, not edited by this PR). Teardown verified (VM gone,
+  golden + child VHDs deleted and infra state file removed by the harness;
+  the scratch directory was removed by the operator afterward — see the
+  AC16 transcript's PRR-004 correction).
 
 ## Pre-operation device probe (GUID-scoped, exact queries run via pswindows)
 
@@ -30,6 +45,9 @@ host build.
 ## Gated live run (the final gate invocation)
 
 ```
+# Git Bash on Windows; the credential values are synthetic placeholders
+# (unused by this WMI-only test — the gate requires them to be SET, and the
+# `it` fixture merely parses them).
 $ HYPERV_MCP_INTEGRATION=1 HYPERV_MCP_TEST_VM=host-ac79-gen1-f73242ef \
     HYPERV_MCP_TEST_VM_GEN1=host-ac79-gen1-f73242ef \
     HYPERV_GUEST_USERNAME=unused-synthetic \

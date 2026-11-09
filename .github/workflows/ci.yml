@@ -26,7 +26,9 @@ concurrency:
 jobs:
   test:
     # Lint, types, and mocked/local-PowerShell unit tests only.
-    # These do NOT validate real Hyper-V behavior — see tests/integration.
+    # These do NOT validate real Hyper-V behavior — see tests/integration
+    # and tests/host (the tests/host suite additionally needs a read-only
+    # golden via HYPERV_MCP_TEST_GOLDEN_VHD and is not collected here).
     runs-on: windows-latest
     # Successful jobs observed at <= 5.8 min (261 jobs, 2026-09-25..10-18);
     # 15 min gives ~2.5x headroom.
