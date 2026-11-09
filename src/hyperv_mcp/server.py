@@ -2182,7 +2182,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         {"action": "mouse_move", "x", "y", "frame_width"?, "frame_height"?},
         {"action": "click", "x"?, "y"?, "frame_width"?, "frame_height"?,
         "button"?, "commit_guard"?, "verified_frame_hash"?} (a guarded click
-        step — commit_guard=true — must be the FIRST input step, must carry
+        step — commit_guard=true — must be the FIRST step (plan index 0; a preceding wait step is also refused), must carry
         frame_width/frame_height equal to the sequence's width/height, and
         requires expect_frame_hash equal to its verified_frame_hash; the
         sequence's precondition capture IS the guard's live-frame

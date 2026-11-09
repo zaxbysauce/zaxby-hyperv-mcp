@@ -352,3 +352,55 @@ def test_wmi_guarded_step_requires_frame_dims(wmi_path, unrestricted):
     assert be.calls == [], (
         "the frame-domain ValueError must fire before any backend call"
     )
+
+
+# ---------------------------------------------------------------------------
+# review round 2: the rect-less citation no-op + the no-coordinate refusal
+# ---------------------------------------------------------------------------
+
+def test_wmi_sequence_guard_rectless_verification_maps_through_base(
+        wmi_path, unrestricted):
+    """Review round 2, Finding 1: a verification registered WITHOUT a
+    content_rect (a headless-provenance capture) keeps the anchor's
+    FULL-FRAME mapping — the plan-build band check is a no-op for a rect-less
+    citation instead of crashing on None, and the step's coordinates map
+    through the base scaling (320x240 frame at the 1024x768 head:
+    (160,120) -> (512,384))."""
+    be = wmi_path(FakeWMI())
+    vhash = _live_hash()
+    console.record_console_input(vm_name="wmi-vm", vm_id=GUID)  # selecting input
+    console.register_capture(                     # captured AFTER it, NO rect
+        vhash, vm_name="wmi-vm", vm_id=GUID,
+        frame_size=(FRAME_W, FRAME_H), head_resolution=(1024, 768))
+    out = console.run_sequence(
+        unrestricted, "wmi-vm", [_guarded_step(vhash)],
+        expect_frame_hash=vhash, width=FRAME_W, height=FRAME_H)
+    assert out["ok"] is True, out
+    step = out["steps"][0]
+    assert step["ok"] is True, step
+    assert step["head_x"] == 512 and step["head_y"] == 384, (
+        "a rect-less citation must map through the full-frame base scaling"
+    )
+    assert be.clicks == [(GUID, 1, 512, 384)], (
+        "the click must dispatch at the base-mapped head coordinates"
+    )
+
+
+def test_no_coordinate_guarded_click_step_refused(wmi_path, unrestricted):
+    """Review round 2, Finding 2: a click-at-current-position step carrying
+    commit_guard/verified_frame_hash is refused at plan-build — there is no
+    point to band-check or map through the cited pixel domain, and silently
+    dropping the opt-in safety parameter (the previous behavior: the guard
+    keys vanished from the mouse_click_here plan entry and the click
+    dispatched UNGUARDED) is worse than a rejection. Zero backend calls."""
+    be = wmi_path(FakeWMI())
+    steps = [{"action": "click", "button": 1,
+              "commit_guard": True, "verified_frame_hash": "a" * 64}]
+    with pytest.raises(ValueError, match="not supported on a click step without x/y"):
+        console.run_sequence(
+            unrestricted, "wmi-vm", steps,
+            expect_frame_hash="a" * 64, width=FRAME_W, height=FRAME_H)
+    assert be.calls == [], (
+        "the no-coordinate guard refusal must fire at plan-build, before any "
+        "backend call"
+    )

@@ -189,9 +189,9 @@ def note_name_guid_hint(vm_name: str, guid: str) -> None:
 # per-server-process scope. Shared-state (statestore v5) follow-up is raised
 # separately. Every capture the module returns auto-registers at completion
 # INSIDE the per-VM input lock — except capture_sequence's per-frame
-# registrations, which follow the sequence's own unchanged lock shape (the
-# folded transport holds the input lock across the whole one-process run;
-# the WMI leg registers per frame without the input lock, per plan F1c) —
+# registrations on BOTH legs (each registers when its frame returns, outside
+# the input lock, per plan F1c; run_sequence's folded transport is the one
+# that holds the input lock across its whole one-process run) —
 # and every input op bumps at DISPATCH inside the same lock (a
 # refused/never-dispatched input never bumps; a timed-out leg does —
 # delivery is then unknowable, so the conservative answer is stale).
@@ -3969,6 +3969,17 @@ def _validate_sequence_steps(
                 if x is None or y is None:
                     if x is not None or y is not None:
                         raise ValueError("x and y must be given together")
+                    if step.get("commit_guard") or step.get("verified_frame_hash"):
+                        # Review round 2, Finding 2: a click-at-current-
+                        # position has no point to band-check or map through
+                        # the cited pixel domain, so the guard is NOT
+                        # supported there — fail CLOSED (a silently dropped
+                        # opt-in safety parameter is worse than a rejection).
+                        raise ValueError(
+                            f"step {i}: commit_guard/verified_frame_hash are "
+                            "not supported on a click step without x/y "
+                            "coordinates (click-at-current-position has no "
+                            "point to verify); give x/y or drop the guard")
                     _reject_non_int_button(step.get("button", 1))
                     button = step.get("button", 1)
                     if button not in (1, 2):
@@ -4470,11 +4481,19 @@ def _parse_sequence_steps(stdout: str) -> list[dict]:
     return steps
 
 
-def _assert_point_in_rect(x: int, y: int, rect: list[int]) -> None:
+def _assert_point_in_rect(x: int, y: int, rect: list[int] | None) -> None:
     """Host-side band-membership rule shared by _scale_to_head and the
     sequence guard's plan-build validation (review round 1, Finding 1): a
-    point outside the content rect is refused BEFORE any input dispatch so a
-    refused guard step never bumps the ledger or spawns a script."""
+    point outside the content rect is refused BEFORE any input dispatch so
+    a refused guard step never bumps the ledger or spawns a script — the
+    identical band rule _scale_to_head applies. A rect-less citation is a
+    no-op (review round 2, Finding 1): the mapping keeps the anchor's
+    full-frame fallback, exactly like _scale_to_head with no rect."""
+    if rect is None:
+        # A rect-less citation keeps the anchor's full-frame mapping (the
+        # same fallback _scale_to_head applies), so there is nothing to
+        # refuse here.
+        return
     left, top, right, bottom = rect
     if x < left or x >= right or y < top or y >= bottom:
         raise ConsoleError(
