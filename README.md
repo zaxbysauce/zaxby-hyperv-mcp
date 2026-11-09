@@ -184,7 +184,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.14.0 today) instead of
+  package's version (0.15.0 today) instead of
   the SDK's (the release contract, the complete bump-site
   enumeration, and how to read `version`/`git_revision` live in
   [docs/versioning-policy.md](docs/versioning-policy.md)).
@@ -233,6 +233,35 @@ restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.15.0 changes
+
+- **Issue #31 supplement AC16 (live seam leg) EXECUTED**: the cleanup-provider
+  seam and clone/remove lifecycle ran for real on a live Hyper-V host — two
+  disposable clones completed provision→run→stop→remove with the configured
+  provider refusing deletion while its fault profile was PENDING (refusal
+  before any deletion work, VM + child disk intact), then CLEAN removals;
+  the golden parent's SHA-256 and mtime were byte-identical across both
+  lifecycles and no residual child disk or .avhdx survived. The named
+  evidence file is now executed
+  (docs/validation/capability-plan/test_vm_agent_isolation_host-evidence.json)
+  with the new gated executor tests/host/test_vm_agent_isolation_host.py
+  (skips without HYPERV_MCP_INTEGRATION + HYPERV_MCP_TEST_GOLDEN_VHD).
+- **Issue #79 live confirmation (boundary result)**: a self-minted blank
+  Gen1 VM (no OS, hence no integration services) on host build 10.0.26300
+  STILL exposes Msvm_SyntheticMouse (count 1) alongside Msvm_Ps2Mouse, ops
+  select the synthetic path and fail with ReturnValue=32768, so the
+  absence-triggered PS/2 fallback's trigger condition does not arise on
+  this host build; the fallback's script-structure unit pins stay green and
+  the full boundary record is
+  docs/validation/live-host/ps2-gen1-live-confirmation-20261108.md. The
+  follow-up design question (fallback on synthetic FAILURE, not only
+  absence) is recorded on #79 for the maintainer.
+- New no-host unit pins: tests/unit/test_host_conftest_scope.py (the
+  tests/host skip guard cannot leak onto unit items) and
+  tests/unit/test_vm_agent_isolation_host_helpers.py (fail-closed absence
+  probes, benign-vs-failure kept rows, cleanup-report emission).
+- Version bump: 0.14.0 -> 0.15.0.
 
 ## 0.14.0 changes
 
@@ -2353,6 +2382,13 @@ hyperv_start_vm(vm_name="lab-vm")
   exact reason) unless `HYPERV_MCP_INTEGRATION=1`, `HYPERV_MCP_TEST_VM=<name>`
   and guest credentials are set. The suite follows the lab protocol: record
   state → checkpoint → read-only → exec/transfer → lifecycle → restore.
+- `pytest tests/host` (0.15.0) runs the VM-agent-isolation live seam leg on
+  a dedicated disposable lab: it skips unless `HYPERV_MCP_INTEGRATION=1` and
+  `HYPERV_MCP_TEST_GOLDEN_VHD=<path>` name an existing READ-ONLY golden
+  `.vhdx` (mint one: `New-VHD -Dynamic`, then
+  `Set-ItemProperty IsReadOnly $true`); no guest credentials are needed.
+  See `docs/validation/capability-plan/test_vm_agent_isolation_host-evidence.json`
+  for the recorded procedure. CI does not collect this suite.
 
 ```powershell
 $env:HYPERV_MCP_INTEGRATION = "1"

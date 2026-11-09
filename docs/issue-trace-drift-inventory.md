@@ -27,6 +27,7 @@ docs/rebaseline-runbook.md).
 | 29-uia-helper-element-desktop | 19 | 19 | 0 | clean |
 | 30-per-vm-credential-profiles | 30 | 30 | 0 | clean |
 | 31-32-33-94-workstream-g-deployment | 18 | 18 | 0 | clean |
+| 31-79-live-host-confirmation | 7 | 7 | 0 | clean |
 | 44-vm-display-resolution | 8 | 8 | 0 | clean |
 | 45-console-direct-wmi | 8 | 8 | 0 | clean |
 | 5-ps51-sanitized-env | 8 | 8 | 0 | clean |

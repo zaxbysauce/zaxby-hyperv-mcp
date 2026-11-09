@@ -1,16 +1,30 @@
 {
-  "record": "issue #31 supplement AC16 (per-agent VM lifecycle, live seam leg)",
-  "status": "NOT-EXECUTED - PENDING",
-  "named_by": "the 2026-10-26 supplement's own approval language (plan critic approves this named host-evidence substitution; executing this gate requires a disposable approved lab; no host proof was run during planning)",
-  "executed": false,
-  "host_proof": null,
-  "evidence_required_when_run": [
-    "host/tool versions",
-    "topology",
-    "synthetic fixture",
-    "command transcript",
-    "measured result",
-    "cleanup readback"
+  "record": "issue #31 supplement AC16 (per-agent VM lifecycle, live seam leg) + #79 AC1 boundary record",
+  "status": "EXECUTED - 2026-11-08",
+  "named_by": "the 2026-10-26 supplement's own approval language (plan critic approves this named host-evidence substitution; executing this gate requires a disposable approved lab; no host proof was run during planning). Executed 2026-11-08 under trace 31-79-live-host-confirmation: plan-critic APPROVE (8-round loop), the disposable approved lab minted by the trace harness (repro/infra_leg.py) under a least-privilege config, and the AC16 named executor tests/host/test_vm_agent_isolation_host.py.",
+  "executed": true,
+  "host_proof": {
+    "host/tool versions": "Windows host 10.0.26300 x64 (Hyper-V), 2026-11-08; executed under the trace convention's STAGED WORKING-TREE snapshot (tree 96b4917761a76882ee37ce32383a5088f92bcf6f - a local object, NOT a commit tree and not resolvable from a fresh clone) while HEAD was 250003bd8073719fd58f2d6d8260a8b97d0c26dd; the verifiable executed-code binding is by blob: tests/host/conftest.py 6d39bbf220d02388f315ed39d44fc8757559dcfa and tests/host/test_vm_agent_isolation_host.py 7ec1470bee82bfa96c14a5bd54a483052f2dfee3, byte-identical to shipped head ebad12c20dd011c6cc4b9a10d240079d2adf6e04 (the post-review fix wave hardened the helper contracts without changing the recorded run's claims); repo venv python 3.11 + pswindows PowerShell transport",
+    "topology": "self-minted disposable lab under the Hyper-V default folder's trace-31-79-66648cdc per-run scratch: golden.vhdx (New-VHD -Dynamic 1 GiB, marked read-only), Gen1 VM host-ac79-gen1-f73242ef (guid e0825eed-7971-4be1-b3af-092d50e51be1, blank 8 GiB VHDX, 512 MB, no NIC, started and waited Running BEFORE probing), two clones host-iso-a-ad3fa48c + host-iso-b-5366f5aa (512 MB, 1 vCPU, no NIC). Authorization posture per leg (review PRR-005, exact): the AC16 seam leg ran under the committed tests/host lab config - least-privilege (allowed_vm_patterns, host_read_roots = scratch, host_write_roots = the clone-disks subdirectory at the time of the recorded run the write root was the whole scratch - narrowed by the review fix wave; destructive stop/vm_provision/vm_remove, confirm on every call, NO unrestricted, no console_input); the #79 PYTEST leg ran the FROZEN integration test under its own pre-existing Config(unrestricted=True) (tests/integration/test_d02_console_live.py + conftest, untouched by this PR); VM MINTING ran under the trace harness's least-privilege config (which also carried console_input). Teardown verified (VM gone via Get-VM, disks deleted, infra state file removed by the harness; the scratch DIRECTORY was removed by the operator afterward - see the PRR-004 correction in the transcript; post-teardown inventory: only pre-existing VMs, names redacted as machine-local)",
+    "synthetic fixture": "agent_isolation.FixtureOwnership owner-keyed harness live in the host-test process; a trace-scoped cleanup provider registered as ac16-live-* (PENDING on first consult, CLEAN after force_clean) with its consult journal proving consult-before-deletion ordering",
+    "command transcript": "docs/validation/capability-plan/test_vm_agent_isolation_host-transcript-20261108.md",
+    "measured result": "AC16 seam leg: 2 passed in 63.31s (both clones Running observed + Off observed, the provider refusing deletion while PENDING with the production MediaError naming vm_remove refused + pending + GUID, child disk and VM intact, then CLEAN removals deleting both child disks, parent SHA-256 AND mtime byte-identical, no residual child disk or .avhdx, non-owner teardown rejected with zero host calls via the run_ps spy). #79 AC1 Gen1 leg: premise falsified live - the blank guest-less Gen1 VM exposed Msvm_SyntheticMouse count 1 alongside Msvm_Ps2Mouse count 1, the gated run honestly recorded 1 failed with ReturnValue=32768 (synthetic path selected, non-functional without a guest), both direct probes ConsoleError - the re-planned boundary leg executed to completion and is recorded in the boundary transcript",
+    "cleanup readback": "infra teardown printed ok:true with verified absence (VM GONE via Get-VM by GUID, gen1.vhdx + golden.vhdx deleted, infra_state.json removed); the one recorded error is the benign already-consumed gen1.vhdx writable-mark; the harness does NOT remove the scratch directory itself - at recording time it remained on the host holding audit.jsonl and the operator removed it manually afterward (review PRR-004 correction, verified: no trace-31-79-* directory remains); post-teardown Get-VM inventory lists only pre-existing VMs (names redacted, machine-local)"
+  },
+  "gates": [
+    {
+      "name": "AC16 seam leg (live, trace 31-79-live-host-confirmation)",
+      "class": "NON-EXECUTABLE(HOST_ONLY) executed live",
+      "outcome": "passed",
+      "evidence": "docs/validation/capability-plan/test_vm_agent_isolation_host-transcript-20261108.md"
+    },
+    {
+      "name": "Gen1 PS/2 live confirmation (#79 AC1) - boundary characterization (PS/2-fallback premise falsified on host build 10.0.26300)",
+      "class": "NON-EXECUTABLE(EXTERNAL_SERVICE_UNAVAILABLE) - premise falsified live; boundary record is the honest completion",
+      "class_note": "the outcome 'passed' means the RE-PLANNED boundary leg executed to completion; it does NOT mean the PS/2 premise held",
+      "outcome": "passed",
+      "evidence": "docs/validation/live-host/ps2-gen1-live-confirmation-20261108.md"
+    }
   ],
-  "note": "This file is the NAMED placeholder the supplement reserves for the live seam leg. It is not a pass, a claim, or a partial result: the live leg has NOT been run. The seam itself ships unit-proven (tests/unit/test_vm_agent_isolation.py incl. the C14 wiring check)."
+  "note": "Both gates ran on the live host 2026-11-08 under plan-critic-approved re-plan (Round 9): the #31 AC16 gate executed green; the #79 AC1 gate's premise (a Gen1 VM whose WMI model exposes no Msvm_SyntheticMouse) was falsified live - the fallback stays correct-by-construction (unit pins green) and unreachable on this host build. The follow-up design question (fallback on synthetic FAILURE, not only absence) is recorded on issue #79 for the maintainer."
 }
