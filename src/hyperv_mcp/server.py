@@ -2181,7 +2181,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         script), {"action": "type_scancodes", "scancodes"},
         {"action": "mouse_move", "x", "y", "frame_width"?, "frame_height"?},
         {"action": "click", "x"?, "y"?, "frame_width"?, "frame_height"?,
-        "button"?}, {"action": "mouse_button", "button", "is_down"},
+        "button"?, "commit_guard"?, "verified_frame_hash"?} (a guarded click
+        step — commit_guard=true — must be the FIRST input step, must carry
+        frame_width/frame_height equal to the sequence's width/height, and
+        requires expect_frame_hash equal to its verified_frame_hash; the
+        sequence's precondition capture IS the guard's live-frame
+        verification), {"action": "mouse_button", "button", "is_down"},
         {"action": "scroll", "delta"}, {"action": "wait_frame_stable",
         "stable_ms", "timeout_s"?, "interval_ms"?, "baseline_hash"?} (in-sequence
         wait steps accept interval_ms >= 1; the call timeout_s bounds the whole

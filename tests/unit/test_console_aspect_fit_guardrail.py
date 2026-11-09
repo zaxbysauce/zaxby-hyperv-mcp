@@ -650,3 +650,150 @@ def test_sequence_mapper_executes_rect_relative_arithmetic(
     band_block = block.replace("$y = 215", "$y = 10")
     stderr = _exec_block_stderr(band_block, head)
     assert "letterbox band point refused" in stderr
+
+
+def _wmi_pixels(w: int, h: int, fill: int = 7) -> bytes:
+    """Synthetic RGB565 payload (4-byte opaque prefix + w*h 2-byte pixels),
+    after tests/unit/test_f04_sequence_wmi.py's _pixels, for the WMI-backed
+    tests below: _frame_hash(_wmi_pixels(w, h)) is what the fake serves."""
+    return bytes([0, 0, 0, 0]) + bytes([fill]) * (w * h * 2)
+
+
+# ---------------------------------------------------------------------------
+# review round 1 (trace 125-126-console-accuracy-commit-guard)
+# ---------------------------------------------------------------------------
+
+def test_wait_frame_stable_holds_the_input_lock_for_the_whole_wait(
+        monkeypatch, unrestricted):
+    """Review Finding 3 (mutation M6b): the SETTLE wait holds the per-VM
+    console input lock for the whole wait on the PowerShell transport too —
+    a concurrent click while the folded wait_frame_stable leg is in flight
+    raises VMBusy instead of interleaving (the mirror of the change-wait pin
+    above, driven through console.wait_frame_stable)."""
+    from hyperv_mcp import vmlocks
+
+    wait_spawned = threading.Event()
+    release = threading.Event()
+    real_wait_s = vmlocks._DEFAULT_WAIT_S
+
+    class BlockablePS:
+        def __init__(self) -> None:
+            self.scripts: list[str] = []
+
+        def __call__(self, script, **kwargs):
+            self.scripts.append(script)
+            if "GetVirtualSystemThumbnailImage" in script and "STOP=" in script:
+                wait_spawned.set()
+                release.wait(timeout=30)
+                return pswindows.PSResult(
+                    stdout="STOP=deadline POLLS=1 HASH=" + "a" * 64,
+                    returncode=0)
+            return FakePS()(script, **kwargs)
+
+    stub = BlockablePS()
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    vmlocks.set_default_wait_s(0.2)
+    try:
+        waiter = threading.Thread(
+            target=lambda: console.wait_frame_stable(
+                unrestricted, "vm1", stable_ms=1500, timeout_s=30,
+                interval_ms=250))
+        waiter.start()
+        assert wait_spawned.wait(timeout=30), "the wait never spawned"
+        with pytest.raises(vmlocks.VMBusy):
+            console.click(unrestricted, "vm1", 5, 5)
+    finally:
+        vmlocks.set_default_wait_s(real_wait_s)
+        release.set()
+        waiter.join(timeout=30)
+
+
+def test_refused_sequence_step_does_not_bump_the_ledger(
+        monkeypatch, unrestricted):
+    """Review Finding 1 (the refused-step-bump mutation): on the WMI
+    transport a sequence step refused by its OWN validation — a band point:
+    _scale_to_head refuses inside _sequence_wmi_step, AFTER validation and
+    BEFORE the device call — dispatches nothing and must NOT bump the input
+    ledger, so a later guard citing a capture registered BEFORE the refused
+    sequence stays fresh. The cited rect rides the plan step exactly the way
+    run_sequence's guard injection threads it (guard_step["content_rect"]),
+    reproduced here through the plan-validation seam so the refusal fires at
+    DISPATCH, past the plan-build gate."""
+    from hyperv_mcp import vmident
+
+    class GuardRailWMI:
+        """The f04 FakeWMI surface this test needs (positional click lane)."""
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def resolve_vm(self, cfg, vm_name="", vm_id=""):
+            self.calls.append("resolve_vm")
+            return vmident.VMRef(id=GUID, name=vm_name or "wmi-vm")
+
+        def boot_epoch(self, guid):
+            self.calls.append("boot_epoch")
+            return 1000
+
+        def capture(self, guid, width, height):
+            self.calls.append("capture")
+            return _wmi_pixels(width, height), {}
+
+        def head_resolution(self, guid):
+            self.calls.append("head_resolution")
+            return (1024, 768), {}
+
+        def mouse_move(self, guid, hx, hy):
+            self.calls.append("mouse_move")
+            return None, {}
+
+        def mouse_click(self, guid, button, hx=None, hy=None):
+            self.calls.append("mouse_click")
+            return None, {}
+
+    backend = GuardRailWMI()
+    monkeypatch.setattr(console, "_try_backend", lambda cfg: (backend, 0.0))
+    real_validate = console._validate_sequence_steps
+
+    def _citing_rect(steps, call_timeout_s):
+        plan = real_validate(steps, call_timeout_s)
+        # the guard-injection seam: a cited content_rect on the step, as
+        # run_sequence threads a verified record's rect onto a guarded step
+        plan[0]["content_rect"] = [0, 115, 1024, 653]
+        return plan
+
+    monkeypatch.setattr(console, "_validate_sequence_steps", _citing_rect)
+    # the later guard's citation, registered BEFORE the refused sequence: a
+    # refused step that bumped the ledger would turn this capture stale
+    verified = console._frame_hash(_wmi_pixels(320, 240))
+    console.register_capture(
+        verified, vm_name="wmi-vm", vm_id=GUID, frame_size=(320, 240))
+    out = console.run_sequence(
+        unrestricted, "wmi-vm",
+        [{"action": "click", "x": 512, "y": 10,
+          "frame_width": 1024, "frame_height": 768, "button": 1}],
+        width=1024, height=768)
+    assert out["steps"][0]["ok"] is False
+    assert "letterbox band" in out["steps"][0]["error"]
+    assert backend.calls.count("mouse_move") == 0
+    assert backend.calls.count("mouse_click") == 0, (
+        "a band-refused step must dispatch no device mouse call"
+    )
+    assert console._last_input_seq_for(GUID) == 0, (
+        "a step refused before dispatch must not bump the input ledger"
+    )
+    # the follow-up guarded click on the same WMI path is NOT refused as
+    # stale because of the refused step (it may only fail for other honest
+    # reasons — never the stale-verification text)
+    try:
+        clicked = console.click(
+            unrestricted, "wmi-vm", 160, 120,
+            frame_width=320, frame_height=240,
+            commit_guard=True, verified_frame_hash=verified)
+    except ConsoleError as exc:
+        assert "stale verification" not in str(exc), (
+            "a refused, never-dispatched step must not stale a later guard: "
+            f"refused with {exc}"
+        )
+        raise
+    assert clicked["ok"] is True

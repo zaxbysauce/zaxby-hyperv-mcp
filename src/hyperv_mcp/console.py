@@ -188,10 +188,13 @@ def note_name_guid_hint(vm_name: str, guid: str) -> None:
 # pixels unchanged) is a DISCLOSED, SCOPED LIMITATION; the refusals name the
 # per-server-process scope. Shared-state (statestore v5) follow-up is raised
 # separately. Every capture the module returns auto-registers at completion
-# INSIDE the per-VM input lock (so no input can dispatch between the pixels
-# and the registration), and every input op bumps at DISPATCH inside the
-# same lock (a refused/never-dispatched input never bumps; a timed-out leg
-# does — delivery is then unknowable, so the conservative answer is stale).
+# INSIDE the per-VM input lock — except capture_sequence's per-frame
+# registrations, which follow the sequence's own unchanged lock shape (the
+# folded transport holds the input lock across the whole one-process run;
+# the WMI leg registers per frame without the input lock, per plan F1c) —
+# and every input op bumps at DISPATCH inside the same lock (a
+# refused/never-dispatched input never bumps; a timed-out leg does —
+# delivery is then unknowable, so the conservative answer is stale).
 # ---------------------------------------------------------------------------
 
 _LEDGER_LOCK = threading.Lock()
@@ -1187,8 +1190,11 @@ def _content_rect(
 
 def _derived_height(width: int, head: tuple[int, int]) -> int:
     """height=0 derives the head's aspect for `width` (issue #125 AC4):
-    ROUND — floor would under-capture by one row and always leave a 1-px
-    band — clamped to the 160..4096 window every capture dimension obeys."""
+    ROUND — it maximizes the captured content area (floor would
+    under-capture by one row on a fractional-aspect head; on such heads
+    either choice can still leave a 1-px band, round simply wastes the
+    fewest rows) — clamped to the 160..4096 window every capture dimension
+    obeys."""
     return max(160, min(4096, round(width * head[1] / head[0])))
 
 
@@ -4464,6 +4470,19 @@ def _parse_sequence_steps(stdout: str) -> list[dict]:
     return steps
 
 
+def _assert_point_in_rect(x: int, y: int, rect: list[int]) -> None:
+    """Host-side band-membership rule shared by _scale_to_head and the
+    sequence guard's plan-build validation (review round 1, Finding 1): a
+    point outside the content rect is refused BEFORE any input dispatch so a
+    refused guard step never bumps the ledger or spawns a script."""
+    left, top, right, bottom = rect
+    if x < left or x >= right or y < top or y >= bottom:
+        raise ConsoleError(
+            f"letterbox band point refused: ({x}, {y}) is outside the cited "
+            f"capture's content rect {rect}; it has no head-space meaning"
+        )
+
+
 def _sequence_guard_prepare(
     ref: vmident.VMRef, verified_frame_hash: str, width: int, height: int,
 ) -> dict:
@@ -4570,8 +4589,11 @@ def _run_sequence_wmi(
                     _audit_commit_guard(ref.name)
             for i, step in enumerate(plan):
                 try:
-                    if step["action"] != "wait_stable":
-                        _bump_input(ref)
+                    # The input bump moved INTO _sequence_wmi_step (review
+                    # round 1, Finding 1): a step refused by its own
+                    # validation (band point, unknown key name, …) dispatches
+                    # no device call and must not stale a later guard — the
+                    # bump lands only where a device call is about to go out.
                     _r, t = _sequence_wmi_step(be, ref, step, width, height)
                 except (ConsoleError, wmiconsole.WMIError,
                         wmiconsole.BackendUnavailable) as exc:
@@ -4609,31 +4631,39 @@ def _sequence_wmi_step(be, ref: vmident.VMRef, step: dict, width: int, height: i
     state machine shape; deadline is a reported stop reason, not a failure."""
     action = step["action"]
     if action == "codes":
+        _bump_input(ref)
         _r, t = be.type_scancodes(ref.id, step["codes"])
         return {"ok": True}, t
     if action == "text":
+        _bump_input(ref)
         _r, t = be.type_text(ref.id, step["text"])
         return {"ok": True}, t
     if action == "mouse_positional":
         head, t_head = be.head_resolution(ref.id)
         # head resolution refusal lives in _scale_to_head (single guard for
         # every call site, including this lane); a guarded click step threads
-        # its cited content_rect through the same rect-relative mapping.
+        # its cited content_rect through the same rect-relative mapping. The
+        # input bump lands AFTER _scale_to_head succeeds — a band-refused
+        # step dispatches nothing and must not stale a later guard.
         hx, hy = _scale_to_head(
             step["x"], step["y"], step["fw"], step["fh"], head,
             content_rect=step.get("content_rect"))
+        _bump_input(ref)
         _r, t = be.mouse_move(ref.id, hx, hy)
         if step["click"]:
             _r2, t2 = be.mouse_click(ref.id, step["button"], hx, hy)
             return {"ok": True, "head_x": hx, "head_y": hy}, {**t_head, **t2}
         return {"ok": True, "head_x": hx, "head_y": hy}, {**t_head, **t}
     if action == "mouse_click_here":
+        _bump_input(ref)
         _r, t = be.mouse_click(ref.id, step["button"])
         return {"ok": True}, t
     if action == "button":
+        _bump_input(ref)
         _r, t = be.mouse_button(ref.id, step["button"], step["is_down"])
         return {"ok": True}, t
     if action == "scroll":
+        _bump_input(ref)
         _r, t = be.mouse_scroll(ref.id, step["delta"])
         return {"ok": True}, t
     # wait_stable: poll be.capture under the same in-lock region, mirroring
@@ -4736,6 +4766,12 @@ def run_sequence(
             "a guarded click step requires expect_frame_hash equal to its "
             "verified_frame_hash (the precondition capture IS the live-frame "
             "verification of the guard)")
+    if guard_step is not None and (
+            guard_step.get("fw") != width or guard_step.get("fh") != height):
+        raise ValueError(
+            "a guarded click step must carry frame_width/frame_height equal to "
+            "the sequence's width/height (the guard maps the step's coordinates "
+            "through the cited verification's pixel domain)")
     if request_key:
         recorded = _lookup_unknown(request_key)
         if recorded is not None:
@@ -4753,6 +4789,9 @@ def run_sequence(
                 guard_record = _sequence_guard_prepare(
                     ref_wmi, guard_step["verified_frame_hash"], width, height)
                 guard_step["content_rect"] = guard_record["content_rect"]
+                _assert_point_in_rect(
+                    guard_step["x"], guard_step["y"],
+                    guard_step["content_rect"])
             return _run_sequence_wmi(
                 be, connect_ms, ref_wmi, plan, expect_frame_hash,
                 expect_boot_epoch, timeout_s, width, height,
@@ -4764,6 +4803,8 @@ def run_sequence(
         guard_record = _sequence_guard_prepare(
             ref, guard_step["verified_frame_hash"], width, height)
         guard_step["content_rect"] = guard_record["content_rect"]
+        _assert_point_in_rect(
+            guard_step["x"], guard_step["y"], guard_step["content_rect"])
     started = time.monotonic()
     remote = pswindows.hyperv_host(cfg) is not None
     script = _sequence_script(
