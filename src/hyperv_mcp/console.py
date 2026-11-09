@@ -4512,11 +4512,15 @@ def _sequence_guard_prepare(
 ) -> dict:
     """Plan-build-time guard validation for a sequence click step (F3b):
     the cited verification must be a registered, UNSHAPED capture of THIS VM
-    whose registered frame_size is exactly the sequence's (width, height) —
-    pixel-domain alignment: the sequence's expect_frame_hash precondition
-    capture (which must equal the cited hash, checked by run_sequence)
-    hashes that same size. Returns the record so its content_rect threads
-    into the step's mapping."""
+    whose registered frame_size, WHEN RECORDED, is exactly the sequence's
+    (width, height) — a size-less citation (frame_size None, e.g. an
+    explicitly registered out-of-band capture) falls through to the
+    sequence's precondition capture, the same None fallback the single-click
+    path's _commit_guard_record pins. Pixel-domain alignment when recorded:
+    the sequence's expect_frame_hash precondition capture (which must equal
+    the cited hash, checked by run_sequence) hashes the sequence size.
+    Returns the record so its content_rect threads into the step's
+    mapping."""
     record = _lookup_capture(
         verified_frame_hash, _ledger_key(ref.name, ref.id))
     if record is None:

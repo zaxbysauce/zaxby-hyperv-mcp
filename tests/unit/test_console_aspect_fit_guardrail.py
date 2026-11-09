@@ -797,3 +797,106 @@ def test_refused_sequence_step_does_not_bump_the_ledger(
         )
         raise
     assert clicked["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# final-critic round 1 (trace 125-126): dispatch-time bumps on the MOUSE
+# legs, both transports — a leg that fails AFTER dispatch leaves delivery
+# unknowable, so the conservative answer is that the input happened (the
+# mouse twins of test_timed_out_leg_still_bumps above)
+# ---------------------------------------------------------------------------
+
+def test_timed_out_ps_click_still_bumps(monkeypatch, unrestricted):
+    """(a) A PowerShell positional click whose leg times out AFTER dispatch
+    still bumps the ledger: the bump sits at dispatch, inside the input
+    lock, BEFORE the spawn — never after the result check."""
+    fake = FakePS(responses=[pswindows.PSResult(
+        stdout="", stderr="timed out", returncode=1, timed_out=True)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(ConsoleError):
+        console.click(unrestricted, "vm1", 160, 120)
+    assert console._last_input_seq_for("vm1") > 0, (
+        "a timed-out click leg must leave the dispatch-time bump behind"
+    )
+
+
+def test_timed_out_ps_mouse_move_still_bumps(monkeypatch, unrestricted):
+    """(b) The mouse_move twin of (a) on the PowerShell transport."""
+    fake = FakePS(responses=[pswindows.PSResult(
+        stdout="", stderr="timed out", returncode=1, timed_out=True)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(ConsoleError):
+        console.mouse_move(unrestricted, "vm1", 160, 120)
+    assert console._last_input_seq_for("vm1") > 0, (
+        "a timed-out move leg must leave the dispatch-time bump behind"
+    )
+
+
+def test_failed_wmi_click_after_dispatch_still_bumps(monkeypatch, unrestricted):
+    """(c) A WMI click whose be.mouse_click raises AFTER dispatch (the bump
+    precedes the device call on the WMI path) still bumps the ledger: the
+    failure surfaces as ConsoleError, never erasing the bump."""
+    from hyperv_mcp import vmident, wmiconsole
+
+    class FailingClickWMI:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def resolve_vm(self, cfg, vm_name="", vm_id=""):
+            self.calls.append("resolve_vm")
+            return vmident.VMRef(id=GUID, name=vm_name or "wmi-vm")
+
+        def head_resolution(self, guid):
+            self.calls.append("head_resolution")
+            return (1024, 768), {}
+
+        def mouse_click(self, guid, button, hx=None, hy=None):
+            self.calls.append("mouse_click")
+            raise wmiconsole.WMIError(
+                "ClickButton failed with ReturnValue=5")
+
+    backend = FailingClickWMI()
+    monkeypatch.setattr(console, "_try_backend", lambda cfg: (backend, 0.0))
+    with pytest.raises(ConsoleError, match="ReturnValue=5"):
+        console.click(unrestricted, "wmi-vm", 160, 120)
+    assert backend.calls.count("mouse_click") == 1, (
+        "the failure must come from the dispatched click leg itself"
+    )
+    assert console._last_input_seq_for(GUID) > 0, (
+        "a click failing after dispatch must leave the bump behind"
+    )
+
+
+def test_failed_wmi_mouse_move_after_dispatch_still_bumps(
+        monkeypatch, unrestricted):
+    """(d) The mouse_move twin of (c) on the WMI transport: be.mouse_move
+    raises after the dispatch-time bump."""
+    from hyperv_mcp import vmident, wmiconsole
+
+    class FailingMoveWMI:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def resolve_vm(self, cfg, vm_name="", vm_id=""):
+            self.calls.append("resolve_vm")
+            return vmident.VMRef(id=GUID, name=vm_name or "wmi-vm")
+
+        def head_resolution(self, guid):
+            self.calls.append("head_resolution")
+            return (1024, 768), {}
+
+        def mouse_move(self, guid, hx, hy):
+            self.calls.append("mouse_move")
+            raise wmiconsole.WMIError(
+                "SetAbsolutePosition failed with ReturnValue=5")
+
+    backend = FailingMoveWMI()
+    monkeypatch.setattr(console, "_try_backend", lambda cfg: (backend, 0.0))
+    with pytest.raises(ConsoleError, match="ReturnValue=5"):
+        console.mouse_move(unrestricted, "wmi-vm", 160, 120)
+    assert backend.calls.count("mouse_move") == 1, (
+        "the failure must come from the dispatched move leg itself"
+    )
+    assert console._last_input_seq_for(GUID) > 0, (
+        "a move failing after dispatch must leave the bump behind"
+    )

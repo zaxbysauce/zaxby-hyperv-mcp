@@ -239,6 +239,10 @@ def test_wmi_guarded_click_fresh_matching_allows_and_audits(
         if r.get("vm_name") == "wmi-vm" and "commit_guard" in json.dumps(r)
     ]
     assert guard_rows, "an audit row for wmi-vm must record the guard decision"
+    assert guard_rows[0]["category"] == "console_input", (
+        "the guard's audit row must carry the console_input category "
+        f"(saw {guard_rows[0].get('category')!r})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -403,4 +407,34 @@ def test_no_coordinate_guarded_click_step_refused(wmi_path, unrestricted):
     assert be.calls == [], (
         "the no-coordinate guard refusal must fire at plan-build, before any "
         "backend call"
+    )
+
+
+# ---------------------------------------------------------------------------
+# final-critic round 1: the size-less citation fall-through
+# ---------------------------------------------------------------------------
+
+def test_wmi_sequence_guard_sizeless_verification_falls_through(
+        wmi_path, unrestricted):
+    """Final-critic round 1, Finding 2: a verification registered WITHOUT a
+    frame_size (frame_size=None — e.g. an explicitly registered out-of-band
+    capture) FALLS THROUGH _sequence_guard_prepare's pixel-domain check, the
+    same None fallback the single-click path's _commit_guard_record applies
+    (console.py's two `is not None` guards are deliberately identical): the
+    guarded sequence proceeds, the precondition capture is the live-frame
+    leg, and the click dispatches at the base-mapped head coordinates."""
+    be = wmi_path(FakeWMI())
+    vhash = _live_hash()
+    console.record_console_input(vm_name="wmi-vm", vm_id=GUID)  # selecting input
+    console.register_capture(                  # captured AFTER it, NO frame_size
+        vhash, vm_name="wmi-vm", vm_id=GUID, head_resolution=(1024, 768))
+    out = console.run_sequence(
+        unrestricted, "wmi-vm", [_guarded_step(vhash)],
+        expect_frame_hash=vhash, width=FRAME_W, height=FRAME_H)
+    assert out["ok"] is True, out
+    step = out["steps"][0]
+    assert step["ok"] is True, step
+    assert step["head_x"] == 512 and step["head_y"] == 384
+    assert be.clicks == [(GUID, 1, 512, 384)], (
+        "the size-less citation must let the guarded click dispatch"
     )
