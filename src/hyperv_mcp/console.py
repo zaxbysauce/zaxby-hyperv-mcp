@@ -211,10 +211,12 @@ def note_name_guid_hint(vm_name: str, guid: str) -> None:
 # the input lock, per plan F1c) — and every input op bumps once its dispatch
 # is decided (a refused/never-dispatched input never bumps; a timed-out leg
 # does — delivery is then unknowable, so the conservative answer is stale;
-# run_sequence's folded transport bumps AFTER its result is parsed, only for
-# a plan with input steps that was not refused by the in-script
-# preconditions — a wait-only or precondition-refused plan dispatched
-# nothing and must not stale a later guard, PRR-017).
+# run_sequence's folded transport bumps AFTER its result is parsed — both
+# INSIDE the held console input lock, so the bump lands before the lock
+# releases (review round 2, PRR-017: a parse outside the lock opened a
+# freshness window) — only for a plan with input steps that was not refused
+# by the in-script preconditions (a wait-only or precondition-refused plan
+# dispatched nothing and must not stale a later guard, PRR-017).
 #
 # Registry shape (PRR-006/016): keyed by the tuple (vm_key, frame_hash) so
 # two VMs with pixel-identical frames (login screens, black consoles) keep
@@ -3318,6 +3320,18 @@ def click(
     if be is not None and ref is not None:
         try:
             with _input_lock(ref):
+                # PRR-018 (review round 2, F3): a resolved citation's head
+                # compare runs BEFORE the guard check — parity with the PS
+                # ordering (the head preflight precedes the guard flow) — so
+                # a head-refused click refuses stale BEFORE any guard
+                # decision is audited (disposition by the first refusing
+                # leg; NEW-13's no-coordinates compare rides here too).
+                head = None
+                t_head: dict = {}
+                if record is not None:
+                    raw_head, t_head = be.head_resolution(ref.id)
+                    head = raw_head if raw_head and raw_head[0] and raw_head[1] else None
+                    _check_cited_head(record, head)
                 if commit_guard:
                     # Issue #126: verify INSIDE the locked region, before any
                     # mouse input — freshness against the input ledger, then a
@@ -3327,24 +3341,14 @@ def click(
                         be, ref, frame_width, frame_height, verified_frame_hash)
                 extra: dict = {}
                 if x is not None and y is not None:
-                    head, t_head = be.head_resolution(ref.id)
-                    if record is not None:
-                        _check_cited_head(
-                            record, head if head and head[0] and head[1] else None)
+                    if record is None:
+                        head, t_head = be.head_resolution(ref.id)
                     hx, hy = _scale_to_head(
                         x, y, frame_width, frame_height, head, content_rect=cited_rect)
                     _bump_input(ref)
                     _r, t = be.mouse_click(ref.id, button, hx, hy)
                     extra = {"head_x": hx, "head_y": hy}
                 else:
-                    t_head = {}
-                    if record is not None:
-                        # NEW-13: a citation still gets its stale-head refusal
-                        # even without coordinates — the head compare needs
-                        # no positional script (the PS lane's mirror).
-                        head, t_head = be.head_resolution(ref.id)
-                        _check_cited_head(
-                            record, head if head and head[0] and head[1] else None)
                     _bump_input(ref)
                     _r, t = be.mouse_click(ref.id, button)
         except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
@@ -4779,7 +4783,11 @@ def _run_sequence_wmi(
     between a passed precondition and the first input), per-step results,
     stop-on-failure. A guarded click step (F3b) re-checks freshness inside
     that lock right after the frame precondition matched — the precondition
-    capture IS the guard's live-frame verification."""
+    capture IS the guard's live-frame verification — and compares the cited
+    record's head against the live head before the step dispatches (PRR-028,
+    parity with the single-click path and the PS lane's in-script compare).
+    Its ALLOW audit is step-gated exactly like the PS lane's (PRR-018): the
+    row lands only when the guarded step's parsed entry is ok."""
     started = time.monotonic()
     phase_dicts: list[dict] = []
     steps_out: list[dict] = []
@@ -4811,7 +4819,8 @@ def _run_sequence_wmi(
                     }
                 if guard_verified_hash:
                     # The precondition capture just matched the cited hash —
-                    # the guard's live-frame leg — so only freshness remains.
+                    # the guard's live-frame leg — so the head compare and
+                    # freshness remain.
                     record = _lookup_capture(
                         guard_verified_hash, _ledger_key(ref.name, ref.id))
                     if record is None:
@@ -4820,8 +4829,17 @@ def _run_sequence_wmi(
                             "unknown to this server process's capture registry "
                             "for that VM"
                         )
+                    # PRR-028 (review round 2, F1): the cited record's head
+                    # must match the LIVE head before the guarded positional
+                    # step dispatches — parity with the single-click path's
+                    # _check_cited_head and the PS lane's in-script
+                    # %CITEDHEAD compare (kept there). Both heads known and
+                    # differing refuses with the same "stale frame" wording
+                    # and zero device input; an unknown head on either side
+                    # falls through to the step's own head-unavailable error.
+                    guard_head, _t = _be_head(be, ref.id)
+                    _check_cited_head(record, guard_head)
                     _commit_guard_freshness(record)
-                    _audit_commit_guard(ref.name)
             for i, step in enumerate(plan):
                 try:
                     # The input bump moved INTO _sequence_wmi_step (review
@@ -4849,6 +4867,17 @@ def _run_sequence_wmi(
                     break
     except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
         raise ConsoleError(str(exc)) from None
+    if guard_verified_hash:
+        # PRR-018 (review round 2, F4): the WMI lane's ALLOW audit is
+        # step-gated exactly like the PS lane's (PRR-004) — the row lands
+        # only when the guarded step's parsed entry is ok (plan index 0 by
+        # the plan-shape rule), never on a precondition refusal or a
+        # failed/skipped guarded step. It may sit outside the lock: the
+        # audit does not guard freshness.
+        guard_entry = next(
+            (e for e in steps_out if e.get("index") == 0), None)
+        if guard_entry is not None and guard_entry.get("ok"):
+            _audit_commit_guard(ref.name)
     out: dict = {
         "ok": True, "vm_name": ref.name,
         "steps": steps_out,
@@ -5048,18 +5077,24 @@ def run_sequence(
         cfg, prelude, plan, expect_frame_hash, expect_boot_epoch, timeout_s,
         width, height, remote)
     text_payloads = [pswindows.utf8_b64(s["text"]) for s in plan if s["action"] == "text"]
-    # PRR-017: the ledger bump is decided AFTER the result is parsed. A plan
-    # the in-script precondition refused dispatched no input and must not
-    # stale a later guard; a wait-only plan dispatches no input at all. An
-    # ok result, a timed-out leg (delivery unknowable) and a non-precondition
-    # failure envelope all bump — the conservative answer (see the module
-    # ledger comment above for the full rule).
+    # PRR-017: the ledger bump is decided AFTER the result is parsed, and
+    # (review round 2, F2) the parse AND the bump run INSIDE the held input
+    # lock — the bump lands BEFORE the lock releases. Parsing outside the
+    # lock opened a freshness window: a guarded click on the same VM racing
+    # the parse saw a ledger the about-to-land bump had not reached yet and
+    # allowed against it. A plan the in-script precondition refused
+    # dispatched no input and must not stale a later guard; a wait-only plan
+    # dispatches no input at all. An ok result and a timed-out leg (delivery
+    # unknowable) bump — the conservative answer (see the module ledger
+    # comment above for the full rule).
     has_input_steps = any(s["action"] != "wait_stable" for s in plan)
 
     def _bump_if_input_plan() -> None:
         if has_input_steps:
             _bump_input(ref)
 
+    steps_out: list[dict] = []
+    boot_epoch = None
     with _input_lock(ref):
         if guard_step is not None:
             # Freshness re-check at dispatch, under the sequence lock; the
@@ -5075,60 +5110,62 @@ def run_sequence(
             payload_lines=len(text_payloads),
             timing=timing,
         )
-    if result.timed_out:
-        _bump_if_input_plan()
-        out: dict = {
-            "ok": False, "error_class": "unknown", "vm_name": ref.name,
-            "steps": _parse_sequence_steps(result.stdout or ""),
-            "note": ("the sequence leg timed out after input may have been sent; "
-                     "whether the guest received the plan is unknowable — never "
-                     "automatically replayed; a new plan requires a fresh explicit "
-                     "request and precondition"),
-            "elapsed_ms": int((time.monotonic() - started) * 1000),
-            "timings": _ps_timings(timing),
-        }
-        if request_key:
-            _record_unknown(request_key, out)
-        return out
-    if result.returncode not in (0, None):
-        stderr = result.stderr or ""
-        if "console sequence precondition mismatch" in stderr:
-            kind = "boot_epoch" if "boot_epoch expected" in stderr else "frame_hash"
-            actual = ""
-            match = re.search(r"actual (\S+)", stderr)
-            if match:
-                actual = match.group(1)
-            env: dict = {
-                "ok": False, "error_class": "precondition", "steps": [],
-                "vm_name": ref.name, "precondition": kind,
+        if result.timed_out:
+            steps_out = _parse_sequence_steps(result.stdout or "")
+            _bump_if_input_plan()
+            out: dict = {
+                "ok": False, "error_class": "unknown", "vm_name": ref.name,
+                "steps": steps_out,
+                "note": ("the sequence leg timed out after input may have been sent; "
+                         "whether the guest received the plan is unknowable — never "
+                         "automatically replayed; a new plan requires a fresh explicit "
+                         "request and precondition"),
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
                 "timings": _ps_timings(timing),
             }
-            if kind == "frame_hash":
-                env["frame_hash"] = actual
-                env["hash_domain"] = HASH_DOMAIN
-            else:
-                with_suppress = None
-                try:
-                    with_suppress = int(actual)
-                except ValueError:
-                    pass
-                env["boot_epoch"] = with_suppress
-            return env
-        _check_input_rc(result, "console sequence", vm_name)
-    meta, _payload, _all_values = _meta_lines(result)
-    if "VMID" in meta:
-        guid = _parse_guid(meta, vm_name or ref.name)
-        note_name_guid_hint(vm_name or ref.name, guid)
-    boot_epoch = None
-    if meta.get("EPOCH"):
-        try:
-            boot_epoch = int(meta["EPOCH"])
-        except ValueError:
-            boot_epoch = None
-    steps_out = _parse_sequence_steps(result.stdout or "")
-    if not steps_out:
-        steps_out = [{"index": i, "ok": True} for i in range(len(plan))]
-    _bump_if_input_plan()
+            if request_key:
+                _record_unknown(request_key, out)
+            return out
+        if result.returncode not in (0, None):
+            stderr = result.stderr or ""
+            if "console sequence precondition mismatch" in stderr:
+                kind = "boot_epoch" if "boot_epoch expected" in stderr else "frame_hash"
+                actual = ""
+                match = re.search(r"actual (\S+)", stderr)
+                if match:
+                    actual = match.group(1)
+                env: dict = {
+                    "ok": False, "error_class": "precondition", "steps": [],
+                    "vm_name": ref.name, "precondition": kind,
+                    "timings": _ps_timings(timing),
+                }
+                if kind == "frame_hash":
+                    env["frame_hash"] = actual
+                    env["hash_domain"] = HASH_DOMAIN
+                else:
+                    with_suppress = None
+                    try:
+                        with_suppress = int(actual)
+                    except ValueError:
+                        pass
+                    env["boot_epoch"] = with_suppress
+                return env
+            _check_input_rc(result, "console sequence", vm_name)
+        meta, _payload, _all_values = _meta_lines(result)
+        if "VMID" in meta:
+            guid = _parse_guid(meta, vm_name or ref.name)
+            note_name_guid_hint(vm_name or ref.name, guid)
+        boot_epoch = None
+        if meta.get("EPOCH"):
+            try:
+                boot_epoch = int(meta["EPOCH"])
+            except ValueError:
+                boot_epoch = None
+        steps_out = _parse_sequence_steps(result.stdout or "")
+        if not steps_out:
+            steps_out = [{"index": i, "ok": True} for i in range(len(plan))]
+        _bump_if_input_plan()
+    # The ALLOW audit stays after the lock: it does not guard freshness.
     if guard_step is not None:
         # PRR-004: audit the guard's allow only now — the in-script
         # preconditions passed AND the guarded click's own step parsed OK.

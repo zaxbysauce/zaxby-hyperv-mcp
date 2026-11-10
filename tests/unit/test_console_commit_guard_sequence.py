@@ -27,11 +27,14 @@ sleeps; the ledger is reset around every test.
 from __future__ import annotations
 
 import json
+import threading
+from contextlib import contextmanager
 
 import pytest
 
 from hyperv_mcp import auditlog, console, pswindows
 from hyperv_mcp.config import Config
+from hyperv_mcp.console import ConsoleError
 
 GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
 SEQ_W, SEQ_H = 320, 240
@@ -458,4 +461,91 @@ def test_timed_out_plan_still_bumps(monkeypatch, unrestricted):
     assert max(console._last_input_seq_for("vm1"),
                console._last_input_seq_for(GUID)) > 0, (
         "a timed-out input-bearing plan must leave the bump behind"
+    )
+
+
+def test_bump_lands_before_lock_release(monkeypatch, unrestricted):
+    """PRR-017 (review round 2, F2): the sequence's result parse AND its
+    ledger bump run INSIDE the per-VM console input lock, so the bump lands
+    BEFORE the lock releases. Parking the parse helper opens the reviewer's
+    window; a fresh-guarded click on the SAME VM that runs in that window
+    is REFUSED stale (it sees the landed bump once it acquires the lock),
+    never allowed against a ledger the bump had not reached yet. The hint
+    is pre-learned so BOTH calls key the lock and the ledger on the GUID —
+    the state every real guarded click is in (a citable capture's VMID line
+    teaches the hint; the cold name-keyed window is the disclosed residual
+    in _input_lock's docstring)."""
+    console.note_name_guid_hint("vm1", GUID)
+    vhash = "9" * 64
+    console.register_capture(          # fresh: registered before any input
+        vhash, vm_name="vm1", frame_size=(SEQ_W, SEQ_H),
+        head_resolution=(1024, 768), content_rect=[0, 0, SEQ_W, SEQ_H])
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_parse = console._parse_sequence_steps
+
+    def parked_parse(stdout: str):
+        entered.set()
+        assert release.wait(timeout=10), "the parked parse was never released"
+        return real_parse(stdout)
+
+    monkeypatch.setattr(console, "_parse_sequence_steps", parked_parse)
+    stub = SeqPS()
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+
+    # The lock spy: at the LAST statement of every lock scope that exits
+    # normally, snapshot the ledger while the lock is STILL held — the
+    # sequence's own scope must already carry the bump, observed
+    # deterministically at the release boundary itself (the click's scope
+    # raises through the yield and never appends).
+    real_lock = console._input_lock
+    ledger_at_release: list[int] = []
+
+    @contextmanager
+    def spying_lock(ref):
+        with real_lock(ref):
+            yield
+            ledger_at_release.append(console._last_input_seq_for(GUID))
+
+    monkeypatch.setattr(console, "_input_lock", spying_lock)
+
+    seq_result: list[dict] = []
+    seq_thread = threading.Thread(
+        target=lambda: seq_result.append(console.run_sequence(
+            unrestricted, "vm1", [{"action": "type_text", "text": "window"}])),
+        name="pr0017-sequence")
+    seq_thread.start()
+    assert entered.wait(timeout=10), "the sequence never reached its parse"
+
+    click_error: list[BaseException] = []
+
+    def run_click():
+        try:
+            console.click(
+                unrestricted, "vm1", 160, 120,
+                frame_width=SEQ_W, frame_height=SEQ_H,
+                commit_guard=True, verified_frame_hash=vhash)
+        except ConsoleError as exc:
+            click_error.append(exc)
+
+    click_thread = threading.Thread(target=run_click, name="pr0017-click")
+    click_thread.start()   # blocks on the same VM's console lock, then proceeds
+    release.set()
+    seq_thread.join(timeout=10)
+    click_thread.join(timeout=15)
+    assert not seq_thread.is_alive() and not click_thread.is_alive()
+
+    assert seq_result and seq_result[0]["ok"] is True
+    assert ledger_at_release, "the sequence's lock scope must exit normally"
+    assert ledger_at_release[0] > 0, (
+        "the ledger bump must land INSIDE the lock: the snapshot taken while "
+        "the lock was still held must already see the input stamp"
+    )
+    assert click_error and "stale verification" in str(click_error[0]), (
+        "the guarded click racing the parked parse must be refused stale — "
+        "the bump landed before the lock released"
+    )
+    assert not any("SetAbsolutePosition" in s for s in stub.scripts), (
+        "the refused click must dispatch no positional script"
     )

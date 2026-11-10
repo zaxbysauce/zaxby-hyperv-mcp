@@ -987,6 +987,52 @@ def test_cited_capture_dims_default_from_record(monkeypatch, unrestricted):
     )
 
 
+def test_cited_capture_dims_default_from_record_mouse_move(
+        monkeypatch, unrestricted):
+    """PRR-011 (review round 2, N4): the mouse_move twin of
+    test_cited_capture_dims_default_from_record — omitted frame dims default
+    from the cited record's frame_size on the move path too, the record's
+    content_rect threads into the mapping, and the emitted positional script
+    carries the same defaulted domain and band literals."""
+    calls: list = []
+    real = console._scale_to_head
+
+    def _spy(x, y, fw, fh, head, content_rect=None):
+        out = real(x, y, fw, fh, head, content_rect=content_rect)
+        calls.append(((x, y, fw, fh, head, content_rect), out))
+        return out
+
+    monkeypatch.setattr(console, "_scale_to_head", _spy)
+    fake = FakePS(head=HEAD_WIDE)
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    console.register_capture(
+        "7" * 64, head_resolution=HEAD_WIDE, content_rect=list(RECT_320),
+        vm_name="pr0011m-vm", frame_size=(320, 240))
+    out = console.mouse_move(
+        unrestricted, "pr0011m-vm", 160, 136, frame_hash="7" * 64)
+    assert out["ok"] is True
+    assert len(calls) == 1, (
+        "exactly one host-side mapping call: the pre-dispatch validation"
+    )
+    (args, result) = calls[0]
+    assert args[:4] == (160, 136, 320, 240), (
+        "the omitted dims must default from the record's frame_size"
+    )
+    assert args[4] == HEAD_WIDE
+    assert args[5] == RECT_320, "the record's content_rect must thread in"
+    assert result == _scale_to_head(
+        160, 136, 320, 240, HEAD_WIDE, content_rect=RECT_320), (
+        "the rect-relative mapping must match the Python reference"
+    )
+    script = next(s for s in fake.scripts if "SetAbsolutePosition" in s)
+    assert "$fw = 320" in script and "$fh = 240" in script, (
+        "the emitted move script must carry the DEFAULTED domain literals"
+    )
+    assert "$bandl = 0" in script and "$bandt = 36" in script, (
+        "the record's band literals must thread into the move script"
+    )
+
+
 def test_guard_only_citation_threads_the_rect(monkeypatch, unrestricted):
     """PRR-007: a verified_frame_hash-ONLY guarded click (no frame_hash)
     resolves the verification's record BEFORE the guard check, so its
@@ -1197,3 +1243,88 @@ def test_ledger_key_atomic_under_hint_learn():
         name_stamp, migrated["seq"])
     with pytest.raises(ConsoleError, match="stale verification"):
         console._commit_guard_freshness(migrated)
+
+
+def test_ledger_key_casefold_merges_name_branch_into_guid():
+    """PRR-037 (review round 2, N2): the cold by-name branch CASEFOLDS the
+    ledger key exactly like note_name_guid_hint folds its hint-map key, so a
+    non-ASCII name's cold stamp is found by the hint-learn merge — "vm-ß"
+    (the name branch) and "VM-ß" (the hint's key, a different case) fold to
+    the SAME key "vm-ss" (casefold maps sharp-s to "ss"; a lower()-only
+    fold would keep "vm-ß" and orphan the stamp), and the GUID-keyed
+    freshness read sees the bump after the merge."""
+    vm = "vm-ß"
+    console.record_console_input(vm_name=vm)          # cold name-branch bump
+    assert console._last_input_seq_for("vm-ss") > 0, (
+        "the name branch must casefold (ß -> ss), not merely lower"
+    )
+    assert console._last_input_seq_for(vm) == 0, (
+        "the unfolded spelling must NOT be the ledger key"
+    )
+    console.note_name_guid_hint("VM-ß", GUID)         # different case, same fold
+    assert console._last_input_seq_for(GUID) >= 1, (
+        "the hint-learn merge must find the casefolded name-keyed stamp and "
+        "carry it under the GUID key"
+    )
+    assert console._last_input_seq_for("vm-ss") == 0, (
+        "the merge drains the name key it migrated"
+    )
+
+
+def test_ledger_key_resolution_parks_under_the_hint_lock(monkeypatch):
+    """PRR-005 (review round 2, N3 — the concurrency-shape pin behind the
+    black-box test above): the mutators resolve the ledger key INSIDE the
+    held hint lock. Parking key resolution opens the reviewer's window; a
+    concurrent note_name_guid_hint for the same name must stay BLOCKED on
+    _HINT_LOCK for the whole park — it cannot interleave between the
+    resolution and the ledger mutation, re-keying the map under a key the
+    in-flight mutation will never see. Released, the bump lands under the
+    NAME key it resolved, and the learn (running after it) migrates the
+    stamp to the GUID key."""
+    vm = "pr0005c-vm"
+    entered = threading.Event()
+    release = threading.Event()
+    resolved: list[str] = []
+    real = console._ledger_key_unlocked
+
+    def parked(vm_name, vm_id):
+        entered.set()
+        assert release.wait(timeout=10), "the parked resolution was never released"
+        key = real(vm_name, vm_id)
+        resolved.append(key)
+        return key
+
+    monkeypatch.setattr(console, "_ledger_key_unlocked", parked)
+
+    bump = threading.Thread(
+        target=lambda: console.record_console_input(vm_name=vm),
+        name="pr0005c-bump")
+    bump.start()
+    assert entered.wait(timeout=10), "the bump never reached key resolution"
+
+    learned: list[bool] = []
+    learn = threading.Thread(
+        target=lambda: (console.note_name_guid_hint(vm, GUID),
+                        learned.append(True)),
+        name="pr0005c-learn")
+    learn.start()
+    learn.join(timeout=0.3)
+    assert learned == [], (
+        "the hint learn must stay BLOCKED while key resolution holds "
+        "_HINT_LOCK — resolution and mutation are one atomic chain"
+    )
+    release.set()
+    bump.join(timeout=10)
+    learn.join(timeout=10)
+    assert not bump.is_alive() and not learn.is_alive()
+
+    assert resolved == [vm], (
+        "the bump resolved its key BEFORE the learn ran, so the key is the "
+        f"folded name ({vm!r}), not the GUID"
+    )
+    assert console._last_input_seq_for(vm) == 0, (
+        "the learn must have drained the name key it migrated"
+    )
+    assert console._last_input_seq_for(GUID) >= 1, (
+        "the name-keyed stamp must land under the GUID after the merge"
+    )

@@ -36,7 +36,7 @@ import json
 
 import pytest
 
-from hyperv_mcp import auditlog, console, vmident
+from hyperv_mcp import auditlog, console, vmident, wmiconsole
 from hyperv_mcp.config import Config
 from hyperv_mcp.console import ConsoleError
 
@@ -250,21 +250,34 @@ def test_wmi_guarded_click_fresh_matching_allows_and_audits(
 # ---------------------------------------------------------------------------
 
 def test_wmi_sequence_guard_stale_refusal_before_any_input(
-        wmi_path, unrestricted):
+        wmi_path, monkeypatch, tmp_path, unrestricted):
     """A verification older than a recorded input refuses STALE at dispatch,
     after the frame precondition matched but before any device input: zero
-    mouse/keyboard calls escape the refused guard."""
+    mouse/keyboard calls escape the refused guard, and (the PRR-018
+    audit-on-ok rule) no allow-shaped guard row is written."""
+    audit = tmp_path / "audit.jsonl"
+    cfg = Config(unrestricted=True, audit_log_path=str(audit))
+    monkeypatch.setattr(auditlog, "_config", cfg)
     be = wmi_path(FakeWMI())
     vhash = _live_hash()
     _register_verification(vhash)
     console.record_console_input(vm_name="wmi-vm", vm_id=GUID)  # now stale
     with pytest.raises(ConsoleError, match="stale"):
         console.run_sequence(
-            unrestricted, "wmi-vm", [_guarded_step(vhash)],
+            cfg, "wmi-vm", [_guarded_step(vhash)],
             expect_frame_hash=vhash, width=FRAME_W, height=FRAME_H)
     device = [c for c in be.calls if c in _DEVICE_CALLS]
     assert device == [], (
         f"a stale sequence guard must dispatch ZERO device calls; saw {device}"
+    )
+    rows = (
+        [json.loads(ln) for ln in audit.read_text(encoding="utf-8").splitlines()]
+        if audit.exists() else []
+    )
+    guard_rows = [
+        r for r in rows if r.get("tool") == "console_click_commit_guard"]
+    assert guard_rows == [], (
+        "a stale-refused sequence guard must write no allow-shaped row"
     )
 
 
@@ -614,4 +627,148 @@ def test_guard_audit_row_attributed(
     assert guard_rows, "the allow decision must be audited"
     assert guard_rows[0]["agent_id"] == "pr0012-agent", (
         "the guard row must carry the authenticated caller's id, not null"
+    )
+
+
+# ---------------------------------------------------------------------------
+# review round 2 (trace 125-126-console-accuracy-commit-guard, PR #139):
+# PRR-028 sequence head parity, PRR-018 disposition-by-first-refusal and the
+# step-gated WMI sequence audit
+# ---------------------------------------------------------------------------
+
+def test_wmi_sequence_guard_cited_head_refuses_before_dispatch(
+        wmi_path, unrestricted):
+    """PRR-028: a guarded sequence click whose cited verification was
+    recorded at a DIFFERENT head than the live one refuses with the
+    single-click path's 'stale frame' wording — the head compare runs after
+    the frame precondition matched but BEFORE the positional step
+    dispatches (parity with _check_cited_head and the PS lane's in-script
+    %CITEDHEAD): zero device calls escape."""
+    be = wmi_path(FakeWMI(head=(1920, 1080)))
+    vhash = _live_hash()
+    _register_verification(vhash)          # recorded head (1024, 768)
+    with pytest.raises(ConsoleError) as excinfo:
+        console.run_sequence(
+            unrestricted, "wmi-vm", [_guarded_step(vhash)],
+            expect_frame_hash=vhash, width=FRAME_W, height=FRAME_H)
+    message = str(excinfo.value)
+    assert "stale frame" in message
+    assert "1024x768" in message and "1920x1080" in message, (
+        "the refusal must name both the cited and the current head"
+    )
+    device = [c for c in be.calls if c in _DEVICE_CALLS]
+    assert device == [], (
+        f"a head-refused sequence guard must dispatch ZERO device calls; "
+        f"saw {device}"
+    )
+
+
+def test_wmi_guarded_click_head_refusal_precedes_guard_audit(
+        wmi_path, monkeypatch, tmp_path, unrestricted):
+    """PRR-018 (disposition by the first refusing leg): a guarded click
+    whose citation's head differs from the live head refuses 'stale frame'
+    BEFORE the guard check runs — the guard itself would PASS (fresh,
+    matching live hash), but the refusal must precede any guard decision,
+    so the audit sink carries NO console_click_commit_guard row."""
+    audit = tmp_path / "audit.jsonl"
+    cfg = Config(unrestricted=True, audit_log_path=str(audit))
+    monkeypatch.setattr(auditlog, "_config", cfg)
+    be = wmi_path(FakeWMI(head=(1920, 1010)))
+    vhash = _live_hash()
+    console.record_console_input(vm_name="wmi-vm", vm_id=GUID)  # selecting input
+    _register_verification(vhash)     # fresh, matching — only the head differs
+    with pytest.raises(ConsoleError) as excinfo:
+        console.click(
+            cfg, "wmi-vm", 160, 120,
+            frame_width=FRAME_W, frame_height=FRAME_H,
+            commit_guard=True, verified_frame_hash=vhash)
+    assert "stale frame" in str(excinfo.value)
+    device = [c for c in be.calls if c in _DEVICE_CALLS]
+    assert device == [], "the head refusal must precede any mouse input"
+    rows = (
+        [json.loads(ln) for ln in audit.read_text(encoding="utf-8").splitlines()]
+        if audit.exists() else []
+    )
+    guard_rows = [
+        r for r in rows if r.get("tool") == "console_click_commit_guard"]
+    assert guard_rows == [], (
+        "a head-refused guarded click must write NO guard allow row — the "
+        "refusal precedes the guard decision itself"
+    )
+
+
+def test_wmi_sequence_guard_precondition_refused_writes_no_row(
+        wmi_path, monkeypatch, tmp_path, unrestricted):
+    """PRR-018 (WMI audit-on-ok): a guarded sequence plan whose frame
+    precondition REFUSES (the live hash differs from the cited one) returns
+    the precondition envelope and writes no allow-shaped guard row on the
+    WMI transport — the same audit-on-ok rule the PS lane pins."""
+    audit = tmp_path / "audit.jsonl"
+    cfg = Config(unrestricted=True, audit_log_path=str(audit))
+    monkeypatch.setattr(auditlog, "_config", cfg)
+    be = wmi_path(FakeWMI())
+    _register_verification("e" * 64)      # fresh but NOT the live hash
+    out = console.run_sequence(
+        cfg, "wmi-vm", [_guarded_step("e" * 64)],
+        expect_frame_hash="e" * 64, width=FRAME_W, height=FRAME_H)
+    assert out["ok"] is False and out["error_class"] == "precondition"
+    assert out["precondition"] == "frame_hash"
+    device = [c for c in be.calls if c in _DEVICE_CALLS]
+    assert device == [], "a precondition-refused plan dispatches nothing"
+    rows = (
+        [json.loads(ln) for ln in audit.read_text(encoding="utf-8").splitlines()]
+        if audit.exists() else []
+    )
+    guard_rows = [
+        r for r in rows if r.get("tool") == "console_click_commit_guard"]
+    assert guard_rows == [], (
+        "a precondition-refused WMI sequence must write no allow row"
+    )
+
+
+class FailingClickWMI(FakeWMI):
+    """The guarded step dispatches and the DEVICE fails: the per-step
+    contract reports the failed entry (the plan result stays ok), and the
+    guard's ALLOW audit must NOT have been written before the step ran."""
+
+    def mouse_click(self, guid, button, hx=None, hy=None):
+        self.calls.append("mouse_click")
+        self.clicks.append((guid, button, hx, hy))
+        raise wmiconsole.WMIError("ClickButton failed with ReturnValue=5")
+
+
+def test_wmi_sequence_guard_failed_step_writes_no_row(
+        wmi_path, monkeypatch, tmp_path, unrestricted):
+    """PRR-018 (the moved audit): a guarded sequence click step whose DEVICE
+    leg fails after the guard passed reports the failed step entry and
+    writes NO allow-shaped guard row — the WMI lane's audit is gated on the
+    guarded step's parsed entry being ok, exactly like the PS lane's (the
+    row used to land at the precondition, before the step even ran)."""
+    audit = tmp_path / "audit.jsonl"
+    cfg = Config(unrestricted=True, audit_log_path=str(audit))
+    monkeypatch.setattr(auditlog, "_config", cfg)
+    be = wmi_path(FailingClickWMI())
+    vhash = _live_hash()
+    console.record_console_input(vm_name="wmi-vm", vm_id=GUID)  # selecting input
+    _register_verification(vhash)                               # captured AFTER it
+    out = console.run_sequence(
+        cfg, "wmi-vm", [_guarded_step(vhash)],
+        expect_frame_hash=vhash, width=FRAME_W, height=FRAME_H)
+    assert out["ok"] is True, out
+    assert out["steps"][0]["ok"] is False, (
+        "the failed device leg must surface as the step's own failure"
+    )
+    assert "ReturnValue=5" in out["steps"][0]["error"]
+    assert be.calls.count("mouse_click") == 1, (
+        "the step must really have dispatched and failed its device leg"
+    )
+    rows = (
+        [json.loads(ln) for ln in audit.read_text(encoding="utf-8").splitlines()]
+        if audit.exists() else []
+    )
+    guard_rows = [
+        r for r in rows if r.get("tool") == "console_click_commit_guard"]
+    assert guard_rows == [], (
+        "a guarded step that FAILED after the guard passed must write no "
+        "allow-shaped row"
     )

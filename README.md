@@ -2364,8 +2364,11 @@ operation, with the 0.16.0 accuracy additions as named exceptions: a
 `height=0` screenshot runs a head-preflight process before the capture
 process, a `frame_hash`-cited or commit-guarded positional mouse op adds
 the same head preflight, and a guarded click adds the guard's live-capture
-process as well — 2-3 spawns instead of the ordinary one, all still under
-the one console input lock; oversized inputs instead split into sequential
+process as well — 2-3 spawns instead of the ordinary one. Of these, the
+head preflight runs BEFORE the console input lock is taken (its refusal
+records zero positional scripts), while the capture, mapping and input
+legs stay under the one console input lock; oversized inputs instead split
+into sequential
 processes (see
 the oversized-input delivery paragraph above) and `hyperv_console_sequence`
 refuses an over-budget plan before the sequence command spawns (a by-id plan
