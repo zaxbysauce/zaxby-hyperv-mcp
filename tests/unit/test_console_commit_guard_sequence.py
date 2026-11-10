@@ -276,3 +276,186 @@ def test_guarded_sequence_threads_the_cited_rect_into_the_step(
     assert "($x - $bandl) * $hw / ($bandr - $bandl)" in script, (
         "the rect-relative arithmetic must be present"
     )
+
+
+# ---------------------------------------------------------------------------
+# feedback round (trace 125-126-console-accuracy-commit-guard, PR #139):
+# audit-on-ok placement, strict-bool step keys, and the PRR-017 bump rule
+# ---------------------------------------------------------------------------
+
+class RefusedSeqPS:
+    """Serves the folded sequence leg the in-script precondition's refusal
+    protocol (exit 1 + the mismatch stderr line the frozen script emits)."""
+
+    def __init__(self, expected: str, actual: str) -> None:
+        self.scripts: list[str] = []
+        self.expected = expected
+        self.actual = actual
+
+    def __call__(self, script: str, **kwargs):
+        self.scripts.append(script)
+        return pswindows.PSResult(
+            stdout="VMID=" + GUID + "\n",
+            stderr="console sequence precondition mismatch: frame_hash "
+                   "expected " + self.expected + " actual " + self.actual
+                   + "\n",
+            returncode=1,
+        )
+
+
+class TimeoutSeqPS:
+    """The timed-out leg shim after test_f04_sequences.py's TimeoutSeqPS: the
+    sequence command reports PSResult timed_out=True exactly the way the real
+    run_ps does, so the post-dispatch outcome is unknowable."""
+
+    def __init__(self) -> None:
+        self.scripts: list[str] = []
+
+    def __call__(self, script: str, **kwargs):
+        self.scripts.append(script)
+        return pswindows.PSResult(
+            timed_out=True, returncode=None, duration_ms=7)
+
+
+def test_guarded_step_audit_not_written_on_precondition_refusal(
+        monkeypatch, unrestricted, tmp_path):
+    """PRR-004: the guard's ALLOW audit row lands only after the in-script
+    preconditions pass AND the guarded step parsed ok — a precondition-
+    refused guarded plan returns the precondition envelope and writes NO
+    audit row at all (audit-on-ok, never audit-on-attempt)."""
+    audit = tmp_path / "audit.jsonl"
+    cfg = Config(unrestricted=True, audit_log_path=str(audit))
+    monkeypatch.setattr(auditlog, "_config", cfg)
+    vhash = _verification()
+    stub = RefusedSeqPS(vhash, "f" * 64)
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    out = console.run_sequence(
+        cfg, "vm1", _guarded_steps(vhash),
+        expect_frame_hash=vhash, width=SEQ_W, height=SEQ_H)
+    assert out["ok"] is False
+    assert out["error_class"] == "precondition"
+    assert out["frame_hash"] == "f" * 64
+    rows = (
+        [json.loads(ln) for ln in audit.read_text(encoding="utf-8").splitlines()]
+        if audit.exists() else []
+    )
+    guard_rows = [
+        r for r in rows if r.get("tool") == "console_click_commit_guard"]
+    assert guard_rows == [], (
+        "a precondition-refused plan must write no guard allow row"
+    )
+
+
+def test_allow_row_written_only_when_ok(monkeypatch, unrestricted, tmp_path):
+    """PRR-020: the allowed sequence guard writes EXACTLY ONE audit row,
+    tightened to field asserts — tool console_click_commit_guard, ok True,
+    the VM's name, and the console_input category."""
+    audit = tmp_path / "audit.jsonl"
+    cfg = Config(unrestricted=True, audit_log_path=str(audit))
+    monkeypatch.setattr(auditlog, "_config", cfg)
+    console.record_console_input(vm_name="vm1")   # the selecting input
+    vhash = "0" * 64                              # captured AFTER it
+    console.register_capture(
+        vhash, vm_name="vm1", frame_size=(SEQ_W, SEQ_H),
+        head_resolution=(1024, 768), content_rect=[0, 0, SEQ_W, SEQ_H])
+    stub = SeqPS()
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    out = console.run_sequence(
+        cfg, "vm1", _guarded_steps(vhash),
+        expect_frame_hash=vhash, width=SEQ_W, height=SEQ_H)
+    assert out["ok"] is True
+    rows = [json.loads(ln) for ln in audit.read_text(encoding="utf-8").splitlines()]
+    guard_rows = [
+        r for r in rows if r.get("tool") == "console_click_commit_guard"]
+    assert len(guard_rows) == 1, (
+        f"exactly one allow row must be written; saw {len(guard_rows)}"
+    )
+    row = guard_rows[0]
+    assert row["ok"] is True
+    assert row["vm_name"] == "vm1"
+    assert row["category"] == "console_input"
+
+
+def test_strict_bool_commit_guard_rejected(unrestricted):
+    """PRR-003: a truthy non-bool commit_guard on a click step is a
+    step-indexed ValueError naming the key and the offending type — a string
+    'false' must never silently ENABLE the guard (the guard keys ride
+    untyped list[dict] steps; pydantic covers only the envelope)."""
+    vhash = "a" * 64
+    with pytest.raises(ValueError) as excinfo:
+        console.run_sequence(
+            unrestricted, "vm1",
+            [{"action": "click", "x": 160, "y": 120,
+              "frame_width": SEQ_W, "frame_height": SEQ_H, "button": 1,
+              "commit_guard": "false", "verified_frame_hash": vhash}],
+            expect_frame_hash=vhash, width=SEQ_W, height=SEQ_H)
+    message = str(excinfo.value)
+    assert "step 0" in message
+    assert "commit_guard must be a boolean" in message
+    assert "str" in message, "the refusal must name the offending type"
+
+
+def test_strict_bool_is_down_rejected(unrestricted):
+    """NEW-14: the same strict-bool rule for mouse_button's is_down — the
+    key rides an untyped dict step, and a truthy string must not coerce into
+    a button press."""
+    with pytest.raises(ValueError) as excinfo:
+        console.run_sequence(
+            unrestricted, "vm1",
+            [{"action": "mouse_button", "button": 1, "is_down": "false"}])
+    message = str(excinfo.value)
+    assert "step 0" in message
+    assert "is_down must be a boolean" in message
+    assert "str" in message, "the refusal must name the offending type"
+
+
+def test_wait_only_plan_does_not_bump(monkeypatch, unrestricted):
+    """PRR-017: a wait-only plan dispatches no input and must not stale a
+    later guard — the per-VM high-water is unchanged after the plan
+    succeeds, checked under BOTH possible keys (the pre-hint name and the
+    transport-reported GUID the result parse may have learned)."""
+    stub = SeqPS()
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    out = console.run_sequence(
+        unrestricted, "vm1",
+        [{"action": "wait_frame_stable", "stable_ms": 100, "timeout_s": 2,
+          "interval_ms": 100}])
+    assert out["ok"] is True
+    assert console._last_input_seq_for("vm1") == 0, (
+        "a wait-only plan must not bump the input ledger"
+    )
+    assert console._last_input_seq_for(GUID) == 0
+
+
+def test_precondition_refusal_does_not_bump(monkeypatch, unrestricted):
+    """PRR-017: a plan the in-script precondition REFUSED dispatched no input
+    (the refusal exits the script before the first step block) and must not
+    stale a later guard either — the ledger is unchanged under both keys."""
+    stub = RefusedSeqPS("b" * 64, "f" * 64)
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    out = console.run_sequence(
+        unrestricted, "vm1",
+        [{"action": "press_key", "key": "enter"}],
+        expect_frame_hash="b" * 64)
+    assert out["ok"] is False and out["error_class"] == "precondition"
+    assert console._last_input_seq_for("vm1") == 0, (
+        "a precondition-refused plan must not bump the input ledger"
+    )
+    assert console._last_input_seq_for(GUID) == 0
+
+
+def test_timed_out_plan_still_bumps(monkeypatch, unrestricted):
+    """PRR-017 (the conservative arm): a plan whose leg times out after
+    dispatch leaves delivery unknowable, so an input-bearing plan STILL
+    bumps — the timeout shim after test_f04_sequences.py's TimeoutSeqPS
+    pattern, with one text step that times out."""
+    stub = TimeoutSeqPS()
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    out = console.run_sequence(
+        unrestricted, "vm1",
+        [{"action": "type_text", "text": "maybe-sent"}])
+    assert out["ok"] is False and out["error_class"] == "unknown"
+    assert max(console._last_input_seq_for("vm1"),
+               console._last_input_seq_for(GUID)) > 0, (
+        "a timed-out input-bearing plan must leave the bump behind"
+    )

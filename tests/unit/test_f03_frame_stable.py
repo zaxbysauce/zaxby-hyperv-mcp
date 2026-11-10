@@ -13,7 +13,9 @@ nothing" (``unchanged``) is distinguishable from "already settled"
 
 RED at base ed5a35f33d42ca92b7ba393bd10fa5654a83e4a9 (neither symbol exists),
 GREEN after the fix. Companion pins (max-poll derivation, WMI transport
-semantics, no-vm-lock read admission) ride in the same file so the whole
+semantics, whole-wait console-input-lock holding — the R3-01 amendment that
+superseded the original no-vm-lock read-admission pin) ride in the same
+file so the whole
 contract freezes at one blob; the AC-mapped rows are C1-C5 of the trace.
 """
 

@@ -1897,7 +1897,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                         capture registry, refuses when the capture was taken at a
                         different head resolution ("stale frame"), maps through the
                         capture's content_rect (a point inside a letterbox band is
-                        refused), and refuses shaped (cropped/scaled) captures
+                        refused), and refuses shaped (cropped/scaled) captures.
+                        When frame_width/frame_height are omitted they default
+                        from the cited record's frame_size (a record without one
+                        refuses naming the requirement)
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
             lease_id: Optional lease citation - the lease gate runs before the body
             fencing_token: The lease's fencing token, with lease_id
@@ -1944,12 +1947,19 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                         capture registry, refuses when the capture was taken at a
                         different head resolution ("stale frame"), maps through the
                         capture's content_rect (a point inside a letterbox band is
-                        refused), and refuses shaped (cropped/scaled) captures
+                        refused), and refuses shaped (cropped/scaled) captures.
+                        When frame_width/frame_height are omitted they default
+                        from the cited record's frame_size (a record without one
+                        refuses naming the requirement)
             commit_guard: Opt-in commit guard (issue #126): the click verifies a
-                        cited FRESH capture before committing — no input dispatched
-                        through this server process since the capture (per-process
-                        input ledger), and the live frame hash at the cited pixel
-                        domain still matches. Refusals are structured errors and
+                        cited FRESH capture before committing — no console input
+                        to THAT VM dispatched through this server process since
+                        the capture (a per-VM ledger, still per-process across
+                        processes), and the live frame hash at the cited pixel
+                        domain still matches (the domain defaults from the cited
+                        record's frame_size like frame_hash above). Requires x/y
+                        coordinates — a click-at-current-position has no point to
+                        verify and is refused. Refusals are structured errors and
                         send no mouse input; an allowed guard is audited
             verified_frame_hash: The commit guard's verification: the frame_hash
                         of a capture taken AFTER the most recent input (e.g. the

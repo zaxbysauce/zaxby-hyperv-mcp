@@ -55,7 +55,7 @@ docs/rebaseline-runbook.md).
 ### 63-66-119-collated (exit 1)
 
 - `CHANGED .agents/issue-traces/issue-16-tool-concurrency/repro/checkpoint.manifest c03e291b101a6f62b7d0e3f8ff09b1e18c82fb75 496aee69699a851e1ccfa6a0aefc47c6e1df9e23 (C7)`
-- `CHANGED docs/issue-trace-drift-inventory.md 9d4e37790ead8f64943a2ba9a78acfa1e0ad3855 c565d82d7a27ebaaa45f5507551cf3e11da88c6a (C8)`
+- `CHANGED docs/issue-trace-drift-inventory.md 9d4e37790ead8f64943a2ba9a78acfa1e0ad3855 ca12e339c07b83b68416de5105c9ca846bdd19ce (C8)`
 
 ### 74-72-88-cost-latency-accounting (exit 1)
 

@@ -900,3 +900,300 @@ def test_failed_wmi_mouse_move_after_dispatch_still_bumps(
     assert console._last_input_seq_for(GUID) > 0, (
         "a move failing after dispatch must leave the bump behind"
     )
+
+
+# ---------------------------------------------------------------------------
+# feedback round (trace 125-126-console-accuracy-commit-guard, PR #139):
+# citation-domain fail-closed + record defaulting, guard-only rect threading,
+# the hint-keyed read lock, the production HEAD= preflight parse, the
+# in-script cited-head compare, and the hint-learn ledger-key invariant
+# ---------------------------------------------------------------------------
+
+# a letterboxed 320x240 capture at the 1920x1010 head (floor model):
+# ch = (320*1010)//1920 = 168, top = (240-168)//2 = 36 -> [0, 36, 320, 204]
+RECT_320 = [0, 36, 320, 204]
+
+
+def test_cited_capture_requires_resolvable_domain(monkeypatch, unrestricted):
+    """PRR-001 (fail-closed arm): a frame_hash citation whose record carries
+    NO frame_size cannot default the pixel domain, so omitted dims refuse
+    naming the requirement — head-space coordinates must never be silently
+    reinterpreted through the record's rect-relative mapping. The refusal
+    precedes every spawn."""
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    console.register_capture(
+        "8" * 64, head_resolution=(1024, 768), vm_name="pr0001-vm")
+    with pytest.raises(ConsoleError) as excinfo:
+        console.click(
+            unrestricted, "pr0001-vm", 160, 120, frame_hash="8" * 64)
+    assert "frame_width/frame_height are required" in str(excinfo.value)
+    assert "registered without a frame_size" in str(excinfo.value), (
+        "the refusal must name what the caller has to supply"
+    )
+    assert fake.scripts == [], "the domain refusal must precede every spawn"
+
+
+def test_cited_capture_dims_default_from_record(monkeypatch, unrestricted):
+    """PRR-011: omitted frame dims default from the cited record's
+    frame_size, and the record's content_rect threads into the mapping — the
+    pre-dispatch host-side mapping call receives (320, 240) plus the record's
+    rect (rect-relative result asserted against the Python reference), the
+    emitted positional script carries the same defaulted literals, and a band
+    point of that defaulted domain refuses with zero positional scripts."""
+    calls: list = []
+    real = console._scale_to_head
+
+    def _spy(x, y, fw, fh, head, content_rect=None):
+        out = real(x, y, fw, fh, head, content_rect=content_rect)
+        calls.append(((x, y, fw, fh, head, content_rect), out))
+        return out
+
+    monkeypatch.setattr(console, "_scale_to_head", _spy)
+    fake = FakePS(head=HEAD_WIDE)
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    console.register_capture(
+        "2" * 64, head_resolution=HEAD_WIDE, content_rect=list(RECT_320),
+        vm_name="pr0011-vm", frame_size=(320, 240))
+    out = console.click(
+        unrestricted, "pr0011-vm", 160, 136, frame_hash="2" * 64)
+    assert out["ok"] is True
+    assert len(calls) == 1
+    (args, result) = calls[0]
+    assert args[:4] == (160, 136, 320, 240), (
+        "the omitted dims must default from the record's frame_size"
+    )
+    assert args[4] == HEAD_WIDE
+    assert args[5] == RECT_320, "the record's content_rect must thread in"
+    assert result == _scale_to_head(
+        160, 136, 320, 240, HEAD_WIDE, content_rect=RECT_320), (
+        "the rect-relative mapping must match the Python reference"
+    )
+    script = next(s for s in fake.scripts if "SetAbsolutePosition" in s)
+    assert "$fw = 320" in script and "$fh = 240" in script, (
+        "the emitted script must carry the DEFAULTED domain literals"
+    )
+    assert "$bandl = 0" in script and "$bandt = 36" in script
+    # the band arm: the same defaulted domain + rect refuse host-side, and
+    # only the head-only preflight spawns (no additional positional script)
+    positional_before = sum(
+        "SetAbsolutePosition" in s for s in fake.scripts)
+    with pytest.raises(ConsoleError, match="letterbox band"):
+        console.click(
+            unrestricted, "pr0011-vm", 160, 10, frame_hash="2" * 64)
+    assert sum("SetAbsolutePosition" in s for s in fake.scripts) == (
+        positional_before), (
+        "the band-refused click must record no additional positional script"
+    )
+
+
+def test_guard_only_citation_threads_the_rect(monkeypatch, unrestricted):
+    """PRR-007: a verified_frame_hash-ONLY guarded click (no frame_hash)
+    resolves the verification's record BEFORE the guard check, so its
+    frame_size and content_rect define the click's pixel domain exactly like
+    a frame_hash citation: a band point of the verification's rect refuses
+    with zero positional scripts, and a fresh matching content point proceeds
+    with the record's defaulted dims and band literals in the script."""
+    vhash = console._frame_hash(_rgb565_payload(320, 240))
+    console.register_capture(
+        vhash, head_resolution=HEAD_WIDE, content_rect=list(RECT_320),
+        vm_name="pr0007-vm", frame_size=(320, 240))
+    fake = FakePS(head=HEAD_WIDE)
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    # (a) band point of the verification's rect: refused before any spawn
+    with pytest.raises(ConsoleError, match="letterbox band"):
+        console.click(
+            unrestricted, "pr0007-vm", 160, 10,
+            commit_guard=True, verified_frame_hash=vhash)
+    assert not any("SetAbsolutePosition" in s for s in fake.scripts), (
+        "a band-refused guarded click must record zero positional scripts"
+    )
+    assert not any(
+        "GetVirtualSystemThumbnailImage" in s for s in fake.scripts), (
+        "the band refusal precedes the guard's live capture too"
+    )
+    # (b) fresh + matching: the click proceeds through the record's domain
+    out = console.click(
+        unrestricted, "pr0007-vm", 160, 136,
+        commit_guard=True, verified_frame_hash=vhash)
+    assert out["ok"] is True
+    script = next(s for s in fake.scripts if "SetAbsolutePosition" in s)
+    assert "$fw = 320" in script and "$fh = 240" in script, (
+        "the omitted dims must default from the VERIFICATION record"
+    )
+    assert "$bandl = 0" in script and "$bandt = 36" in script, (
+        "the verification record's content_rect must thread into the mapper"
+    )
+
+
+@pytest.mark.skipif(not _ps_available(), reason="no PowerShell on this host")
+def test_guard_only_citation_mapper_executes_rect_relative(
+        monkeypatch, unrestricted):
+    """PRR-007 (executed arm, after the in-script band-refusal harness): the
+    positional script a GUARD-ONLY citation produced maps through the
+    verification record's rect in real PowerShell 5.1 identically to the
+    Python reference — the coordinate-level proof that the guard-only record
+    threads into the mapper exactly like a frame_hash citation."""
+    vhash = console._frame_hash(_rgb565_payload(320, 240))
+    console.register_capture(
+        vhash, head_resolution=HEAD_WIDE, content_rect=list(RECT_320),
+        vm_name="pr0007x-vm", frame_size=(320, 240))
+    fake = FakePS(head=HEAD_WIDE)
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    console.click(
+        unrestricted, "pr0007x-vm", 160, 136,
+        commit_guard=True, verified_frame_hash=vhash)
+    script = next(s for s in fake.scripts if "SetAbsolutePosition" in s)
+    block = _extract_scale_block(script)
+    assert "$bandl = 0" in block and "$bandt = 36" in block
+    assert _exec_block(block, HEAD_WIDE) == _scale_to_head(
+        160, 136, 320, 240, HEAD_WIDE, content_rect=RECT_320), (
+        "the executed guard-only mapper must agree with the reference"
+    )
+
+
+def test_wait_lock_keyed_by_hinted_guid(monkeypatch, unrestricted):
+    """PRR-002: once the hint map knows the name, a whole-wait READ locks on
+    the GUID — the same identity every hinted input op locks on. The hint is
+    learned FIRST, the parked wait's stub does emit VMID=, and a concurrent
+    by-name click must still collide (VMBusy); a wait still keyed on the
+    caller NAME would exclude nothing here (the hinted click locks the GUID)
+    and this pin would fail."""
+    from hyperv_mcp import vmlocks
+
+    vm = "pr0002-vm"
+    console.note_name_guid_hint(vm, GUID)
+    wait_spawned = threading.Event()
+    release = threading.Event()
+    real_wait_s = vmlocks._DEFAULT_WAIT_S
+
+    class VmidBlockablePS:
+        def __init__(self) -> None:
+            self.scripts: list[str] = []
+
+        def __call__(self, script, **kwargs):
+            self.scripts.append(script)
+            if "GetVirtualSystemThumbnailImage" in script and "STOP=" in script:
+                wait_spawned.set()
+                release.wait(timeout=30)
+                return pswindows.PSResult(
+                    stdout="VMID=" + GUID + "\nSTOP=deadline POLLS=1 HASH="
+                    + "a" * 64,
+                    returncode=0)
+            return FakePS()(script, **kwargs)
+
+    stub = VmidBlockablePS()
+    monkeypatch.setattr(pswindows, "run_ps", stub)
+    vmlocks.set_default_wait_s(0.2)
+    try:
+        waiter = threading.Thread(
+            target=lambda: console.wait_frame_change(
+                unrestricted, vm, timeout_s=30, interval_s=1))
+        waiter.start()
+        assert wait_spawned.wait(timeout=30), "the wait never spawned"
+        with pytest.raises(vmlocks.VMBusy):
+            console.click(unrestricted, vm, 5, 5)
+    finally:
+        vmlocks.set_default_wait_s(real_wait_s)
+        release.set()
+        waiter.join(timeout=30)
+
+
+class MetaHeadPS(FakePS):
+    """PRR-010: the head-only leg answers with the PRODUCTION ``HEAD=WxH``
+    meta line and NO JSON payload, so the parse must ride _parse_head's
+    meta-line branch (what real folded scripts emit) rather than the mock
+    transport's JSON fallback the base FakePS serves."""
+
+    def __init__(self, head=HEAD_1080):
+        super().__init__(head=head)
+        self.meta_head_served = False
+
+    def __call__(self, script, **kwargs):
+        if ("Msvm_VideoHead" in script
+                and "GetVirtualSystemThumbnailImage" not in script):
+            self.scripts.append(script)
+            self.kwargs.append(kwargs)
+            self.meta_head_served = True
+            return pswindows.PSResult(
+                stdout="VMID=" + GUID + "\nHEAD=" + str(self.head[0]) + "x"
+                + str(self.head[1]) + "\n",
+                returncode=0)
+        return super().__call__(script, **kwargs)
+
+
+def test_preflight_meta_line_parse_exercised(monkeypatch, unrestricted):
+    """PRR-010: a height=0 screenshot's head preflight derives the aspect
+    from the production ``HEAD=`` meta line ALONE (no JSON payload): 1024
+    wide at a 1920x1080 head captures at 1024x576 — the production parse
+    path runs, not the mock transport's JSON fallback."""
+    fake = MetaHeadPS(head=HEAD_1080)
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    _img, meta = console.screenshot(
+        unrestricted, "pr0010-vm", width=1024, height=0)
+    assert fake.meta_head_served, "the head-only preflight leg must have run"
+    capture = next(
+        s for s in fake.scripts if "GetVirtualSystemThumbnailImage" in s)
+    assert _folded_size(capture) == (1024, 576), (
+        "the derived height must be the head-aspect 576 on a 1920x1080 head"
+    )
+    assert meta["height"] == 576
+    assert meta["content_rect"] == [0, 0, 1024, 576]
+
+
+@pytest.mark.skipif(not _ps_available(), reason="no PowerShell on this host")
+def test_in_script_cited_head_refuses(monkeypatch, unrestricted):
+    """PRR-027 (executed, after the in-script band-refusal harness in
+    test_single_op_mapper_executes_band_refusal): the %CITEDHEAD compare
+    embedded in the positional script throws 'stale frame' when the live
+    head differs from the cited record's head — BEFORE SetAbsolutePosition
+    (the throw precedes the positioning call in the emitted script itself) —
+    while the matching-head control maps normally through the same block."""
+    rect = [0, 115, 1024, 653]
+    console.register_capture(
+        "3" * 64, head_resolution=HEAD_WIDE, content_rect=list(rect),
+        vm_name="pr0027-vm", frame_size=(1024, 768))
+    fake = FakePS(head=HEAD_WIDE)
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    console.mouse_move(
+        unrestricted, "pr0027-vm", 512, 200,
+        frame_width=1024, frame_height=768, frame_hash="3" * 64)
+    script = next(s for s in fake.scripts if "SetAbsolutePosition" in s)
+    # the compare precedes the positioning call in the emitted script
+    assert script.index("stale frame") < script.index("SetAbsolutePosition")
+    block = _extract_scale_block(script)
+    stderr = _exec_block_stderr(block, HEAD_1080)   # a DIFFERENT live head
+    assert "stale frame" in stderr, (
+        "the in-script cited-head compare must throw naming the stale frame"
+    )
+    assert "the cited capture was taken at head 1920x1010" in stderr
+    # control: the matching head maps normally through the same block
+    assert _exec_block(block, HEAD_WIDE) == _scale_to_head(
+        512, 200, 1024, 768, HEAD_WIDE, content_rect=rect)
+
+
+def test_ledger_key_atomic_under_hint_learn():
+    """PRR-005 (black-box invariant): the hint-learn re-key cannot orphan a
+    name-keyed high-water mark. In the worst-case order — a NAME-keyed bump,
+    a capture registered under the name key, the hint learn, then a
+    GUID-keyed bump — the GUID key carries at least the name stamp (no lower
+    high-water survives) and the mid-flight capture reads STALE against it:
+    BOTH the pre-learn and post-learn bumps count."""
+    vm = "pr0005-vm"
+    console.record_console_input(vm_name=vm)          # name-keyed bump
+    name_stamp = console._last_input_seq_for(vm)
+    assert name_stamp > 0
+    console.register_capture("6" * 64, vm_name=vm, frame_size=(320, 240))
+    mid = console._lookup_capture("6" * 64, vm)
+    assert mid is not None
+    console.note_name_guid_hint(vm, GUID)             # the interleaving point
+    migrated = console._lookup_capture("6" * 64, GUID)
+    assert migrated is not None and migrated["seq"] == mid["seq"]
+    assert console._last_input_seq_for(GUID) >= name_stamp, (
+        "the name-keyed high-water must migrate to the GUID key, never orphan"
+    )
+    console.record_console_input(vm_id=GUID)          # guid-keyed bump
+    assert console._last_input_seq_for(GUID) >= max(
+        name_stamp, migrated["seq"])
+    with pytest.raises(ConsoleError, match="stale verification"):
+        console._commit_guard_freshness(migrated)

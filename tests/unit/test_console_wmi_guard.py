@@ -438,3 +438,180 @@ def test_wmi_sequence_guard_sizeless_verification_falls_through(
     assert be.clicks == [(GUID, 1, 512, 384)], (
         "the size-less citation must let the guarded click dispatch"
     )
+
+
+# ---------------------------------------------------------------------------
+# feedback round (trace 125-126-console-accuracy-commit-guard, PR #139):
+# the WMI no-coordinates head check, the single-click guard coordinate
+# requirement, (vm_key, hash) registry keying + cap, the negative vhash pin,
+# no-row refusals, dims validation, and audit attribution
+# ---------------------------------------------------------------------------
+
+def test_wmi_no_coords_cited_click_runs_head_check(wmi_path, unrestricted):
+    """NEW-13: a frame_hash citation on a click WITHOUT coordinates still
+    gets the stale-head refusal on the WMI lane (parity with the PS lane's
+    head-only preflight): the recorded head differs from the live head →
+    ConsoleError 'stale frame' with ZERO mouse calls (the head compare needs
+    no positional script)."""
+    be = wmi_path(FakeWMI(head=(1920, 1010)))
+    console.register_capture(
+        "1" * 64, vm_name="wmi-vm", vm_id=GUID, frame_size=(FRAME_W, FRAME_H),
+        head_resolution=(1024, 768))
+    with pytest.raises(ConsoleError, match="stale frame"):
+        console.click(unrestricted, "wmi-vm", frame_hash="1" * 64)
+    assert "head_resolution" in be.calls, "the head compare must actually run"
+    assert be.calls.count("mouse_click") == 0
+    assert be.calls.count("mouse_move") == 0
+
+
+def test_single_click_guard_requires_coordinates(unrestricted):
+    """PRR-015: a single guarded click without x/y refuses with the sequence
+    wording's mirror — click-at-current-position has no point to band-check
+    or map through the cited pixel domain, so the guard fails CLOSED rather
+    than silently dispatching an unverified commit click."""
+    with pytest.raises(ValueError) as excinfo:
+        console.click(
+            unrestricted, "wmi-vm",
+            commit_guard=True, verified_frame_hash="2" * 64)
+    message = str(excinfo.value)
+    assert "not supported on a click without x/y" in message
+    assert "give x/y or drop the guard" in message, (
+        "the refusal must mirror the sequence wording's remedy"
+    )
+
+
+def test_registry_keyed_per_vm(unrestricted):
+    """PRR-006: the capture registry keys on the (vm_key, frame_hash) TUPLE —
+    the SAME pixel hash registered for two VMs (login screens, black
+    consoles) keeps BOTH records, and a re-registration for one VM refreshes
+    only its own entry."""
+    h = "3" * 64
+    console.register_capture(h, vm_name="pr0006-a", frame_size=(320, 240))
+    first = console._lookup_capture(h, "pr0006-a")
+    console.register_capture(h, vm_name="pr0006-b", frame_size=(320, 240))
+    second = console._lookup_capture(h, "pr0006-b")
+    assert first is not None and second is not None, (
+        "two VMs citing pixel-identical frames must keep independent records"
+    )
+    again = console._lookup_capture(h, "pr0006-a")
+    assert again is not None and again["seq"] == first["seq"], (
+        "registering the hash for VM B must not refresh VM A's entry"
+    )
+    assert second["seq"] > first["seq"]  # one monotonic counter, sane order
+
+
+def test_registry_capped(unrestricted):
+    """PRR-016: the registry is FIFO-capped at _REGISTRY_CAP entries — 520
+    distinct registrations leave at most the cap, the OLDEST evicted, the
+    newest retained."""
+    vm = "pr0016-vm"
+    hashes = [f"{i:064x}" for i in range(520)]
+    for entry in hashes:
+        console.register_capture(entry, vm_name=vm, frame_size=(320, 240))
+    assert len(console._CAPTURE_REGISTRY) <= console._REGISTRY_CAP, (
+        f"the registry must stay bounded at {console._REGISTRY_CAP}; "
+        f"saw {len(console._CAPTURE_REGISTRY)}"
+    )
+    assert console._lookup_capture(hashes[0], vm) is None, (
+        "FIFO eviction must drop the oldest insertion first"
+    )
+    assert console._lookup_capture(hashes[-1], vm) is not None
+
+
+def test_vhash_without_commit_guard_refuses(unrestricted):
+    """PRR-021 (negative pin, console.py): a verified_frame_hash with the
+    commit guard left OFF refuses — the citation is meaningless without the
+    guard it verifies, and silently ignoring it would invite a false sense
+    of verification."""
+    with pytest.raises(ValueError,
+                       match="verified_frame_hash requires commit_guard=True"):
+        console.click(
+            unrestricted, "wmi-vm", 160, 120,
+            verified_frame_hash="4" * 64)
+
+
+def test_refusal_writes_no_audit_row(
+        wmi_path, monkeypatch, tmp_path, unrestricted):
+    """PRR-020: a guarded click refused for staleness writes NO guard row —
+    only the ALLOW decision is audited (the refusal raises; nothing writes
+    an allow-shaped console_click_commit_guard row)."""
+    audit = tmp_path / "audit.jsonl"
+    cfg = Config(unrestricted=True, audit_log_path=str(audit))
+    monkeypatch.setattr(auditlog, "_config", cfg)
+    be = wmi_path(FakeWMI())
+    vhash = _live_hash()
+    _register_verification(vhash)
+    console.record_console_input(vm_name="wmi-vm", vm_id=GUID)  # now stale
+    with pytest.raises(ConsoleError, match="stale verification"):
+        console.click(
+            cfg, "wmi-vm", 160, 120,
+            frame_width=FRAME_W, frame_height=FRAME_H,
+            commit_guard=True, verified_frame_hash=vhash)
+    assert be.calls.count("mouse_click") == 0
+    rows = (
+        [json.loads(ln) for ln in audit.read_text(encoding="utf-8").splitlines()]
+        if audit.exists() else []
+    )
+    guard_rows = [
+        r for r in rows if r.get("tool") == "console_click_commit_guard"]
+    assert guard_rows == [], (
+        "a refused guard must write no allow-shaped audit row"
+    )
+
+
+def test_guard_capture_dims_validated(wmi_path, unrestricted):
+    """PRR-029: the caller-cited pixel domain is re-validated against the
+    160..4096 window inside _commit_guard_record — on the size-less record
+    path (the record cannot supply the domain) an out-of-window pair refuses
+    BEFORE the live verification capture ever spawns."""
+    be = wmi_path(FakeWMI())
+    console.register_capture(   # size-less: frame_size omitted entirely
+        "5" * 64, vm_name="wmi-vm", vm_id=GUID, head_resolution=(1024, 768))
+    with pytest.raises(ConsoleError) as excinfo:
+        console.click(
+            unrestricted, "wmi-vm", 160, 120,
+            frame_width=100000, frame_height=240,
+            commit_guard=True, verified_frame_hash="5" * 64)
+    assert "160..4096" in str(excinfo.value)
+    assert "100000x240" in str(excinfo.value), (
+        "the refusal must report the offending dimensions"
+    )
+    assert "capture" not in be.calls, (
+        "the dims refusal must fire before the live verification capture"
+    )
+    assert be.calls.count("mouse_click") == 0
+
+
+def test_guard_audit_row_attributed(
+        wmi_path, monkeypatch, tmp_path, unrestricted):
+    """PRR-012: the guard's allow row attributes the authenticated caller —
+    agent_id resolves from the auth-context sentinel (an explicit None used
+    to override it and serialize null, losing the attribution the paired
+    click row carries)."""
+    from mcp.server.auth.middleware.auth_context import AuthenticatedUser, auth_context_var
+    from mcp.server.auth.provider import AccessToken
+
+    audit = tmp_path / "audit.jsonl"
+    cfg = Config(unrestricted=True, audit_log_path=str(audit))
+    monkeypatch.setattr(auditlog, "_config", cfg)
+    wmi_path(FakeWMI())
+    vhash = _live_hash()
+    console.record_console_input(vm_name="wmi-vm", vm_id=GUID)  # selecting input
+    _register_verification(vhash)                               # captured AFTER it
+    token = auth_context_var.set(AuthenticatedUser(AccessToken(
+        token="t", client_id="pr0012-agent", scopes=[])))
+    try:
+        out = console.click(
+            cfg, "wmi-vm", 160, 120,
+            frame_width=FRAME_W, frame_height=FRAME_H,
+            commit_guard=True, verified_frame_hash=vhash)
+    finally:
+        auth_context_var.reset(token)
+    assert out["ok"] is True
+    rows = [json.loads(ln) for ln in audit.read_text(encoding="utf-8").splitlines()]
+    guard_rows = [
+        r for r in rows if r.get("tool") == "console_click_commit_guard"]
+    assert guard_rows, "the allow decision must be audited"
+    assert guard_rows[0]["agent_id"] == "pr0012-agent", (
+        "the guard row must carry the authenticated caller's id, not null"
+    )
