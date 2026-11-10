@@ -5053,7 +5053,6 @@ def run_sequence(
                 guard_record = _sequence_guard_prepare(
                     ref_wmi, guard_step["verified_frame_hash"], width, height)
                 guard_step["content_rect"] = guard_record["content_rect"]
-                guard_step["cited_head"] = guard_record["head_resolution"]
                 _assert_point_in_rect(
                     guard_step["x"], guard_step["y"],
                     guard_step["content_rect"])
