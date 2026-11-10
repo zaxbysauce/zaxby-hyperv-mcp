@@ -63,11 +63,18 @@ probes):
     positional ops report the structured error instead of acting.
   - Coordinate mapping: the thumbnail is a scaled snapshot of the display
     head; mouse coordinates are in head space (Msvm_VideoHead
-    CurrentHorizontal/VerticalResolution). Frame-space inputs are scaled by
-    head/frame — in the PowerShell script, with the same rounding and
-    clamping as the Python reference _scale_to_head — and when neither frame
-    dims nor head resolution are available the tools error instead of
-    clicking somewhere unverified.
+    CurrentHorizontal/VerticalResolution). A capture whose aspect differs
+    from the head's is LETTERBOXED (black bands), so the metadata carries
+    ``content_rect`` — [left, top, right, bottom] (right/bottom exclusive) of
+    the non-letterbox pixels, derived from the capture geometry against the
+    head resolution at capture time (live-calibrated floor model; absent when
+    the head is unknown). Frame-space inputs map through that rect when one
+    is cited (a click inside a band is refused — a band point has no
+    head-space meaning); otherwise they scale by head/frame — in the
+    PowerShell script, with the same rounding and clamping as the Python
+    reference _scale_to_head — and when neither frame dims nor head
+    resolution are available the tools error instead of clicking somewhere
+    unverified.
 
 WinPE / MDT note: screenshots and input work from firmware through WinPE —
 PowerShell Direct is unavailable there by design. Tool results return IMAGES
@@ -96,7 +103,7 @@ from typing import Any
 from PIL import Image as PILImage
 from PIL import features as _PILFeatures
 
-from . import guestexec, policy, pswindows, vmident, vmlocks, wmiconsole
+from . import auditlog, guestexec, policy, pswindows, vmident, vmlocks, wmiconsole
 from . import timing as timing_mod
 from .config import Config
 
@@ -125,6 +132,10 @@ _WMI_NS = "root\\virtualization\\v2"
 
 _HINT_CAP = 512
 _NAME_GUID_HINTS: dict[str, str] = {}
+#: names whose unknown->known transition already ran the registry re-key
+#: scan (PRR-013); maintained under _HINT_LOCK and re-armed when the hint
+#: map evicts (or swaps out) the name.
+_HINTS_LEARNED: set[str] = set()
 _HINT_LOCK = threading.Lock()
 
 
@@ -134,6 +145,19 @@ def note_name_guid_hint(vm_name: str, guid: str) -> None:
     Called by every consumer of a folded script's `VMID=` stdout line and
     available as a seam for hosts that already know the mapping. The GUID is
     shape-validated; an invalid or empty value is ignored, never stored.
+
+    Learning a pairing also canonicalizes the capture-citation/input ledger
+    (issue #126, R4-02): every capture record still keyed by the NAME moves
+    to the GUID key preserving its sequence number and metadata, and the
+    per-VM last-input high-water mark takes max(name-keyed, guid-keyed) under
+    the GUID key — so a name-keyed capture registered before the hint existed
+    stays citable by a click that now locks and keys on the GUID. The
+    registry-wide re-key scan runs ONLY on a name's newly-learned transition
+    (PRR-013): after the first learn every ledger mutation keys on the GUID,
+    so a re-note finds no name-keyed records and the skipped scan is a no-op
+    by construction. Lock order is hint-lock BEFORE ledger-lock everywhere
+    (the ledger mutators resolve their key under the held hint lock and
+    mutate the ledger inside it — one atomic chain, PRR-005).
     """
     try:
         guid = guestexec.validate_vm_guid(guid).lower()
@@ -143,10 +167,264 @@ def note_name_guid_hint(vm_name: str, guid: str) -> None:
         return
     key = vm_name.strip().casefold()
     with _HINT_LOCK:
+        newly_learned = (
+            key not in _HINTS_LEARNED or key not in _NAME_GUID_HINTS)
+        _HINTS_LEARNED.add(key)
         _NAME_GUID_HINTS.pop(key, None)
         _NAME_GUID_HINTS[key] = guid
         while len(_NAME_GUID_HINTS) > _HINT_CAP:
-            _NAME_GUID_HINTS.pop(next(iter(_NAME_GUID_HINTS)))
+            evicted = next(iter(_NAME_GUID_HINTS))
+            _NAME_GUID_HINTS.pop(evicted)
+            _HINTS_LEARNED.discard(evicted)
+        if key != guid:
+            with _LEDGER_LOCK:
+                if newly_learned:
+                    stale_keys = [
+                        k for k, record in _CAPTURE_REGISTRY.items()
+                        if record["vm_key"] == key]
+                    for k in stale_keys:
+                        record = _CAPTURE_REGISTRY.pop(k)
+                        record["vm_key"] = guid
+                        _CAPTURE_REGISTRY[(guid, k[1])] = record
+                if key in _LAST_INPUT_SEQ:
+                    prior = _LAST_INPUT_SEQ.pop(key)
+                    if prior > _LAST_INPUT_SEQ.get(guid, 0):
+                        _LAST_INPUT_SEQ[guid] = prior
+
+
+# ---------------------------------------------------------------------------
+# capture-citation registry + input ledger (issues #125/#126)
+#
+# The commit guard's freshness leg is implemented over a scoped IN-PROCESS
+# ledger: ONE module-level monotonic counter orders capture registrations and
+# console-input dispatches, so "fresh" means "no input was dispatched THROUGH
+# THIS SERVER PROCESS since the capture". The guard's other leg — the live
+# frame hash read inside the locked region at click time — is
+# transport-fresh and process-independent (it reads the actual pixels), so a
+# cross-process input that changed anything visible still refuses. The
+# residual window (another server process dispatched input that left the
+# pixels unchanged) is a DISCLOSED, SCOPED LIMITATION; the refusals name the
+# per-server-process scope. Shared-state (statestore v5) follow-up is raised
+# separately. Every capture the module returns auto-registers at completion
+# INSIDE the per-VM input lock — except capture_sequence's per-frame
+# registrations on BOTH legs (each registers when its frame returns, outside
+# the input lock, per plan F1c) — and every input op bumps once its dispatch
+# is decided (a refused/never-dispatched input never bumps; a timed-out leg
+# does — delivery is then unknowable, so the conservative answer is stale;
+# run_sequence's folded transport bumps AFTER its result is parsed — both
+# INSIDE the held console input lock, so the bump lands before the lock
+# releases (review round 2, PRR-017: a parse outside the lock opened a
+# freshness window) — only for a plan with input steps that was not refused
+# by the in-script preconditions (a wait-only or precondition-refused plan
+# dispatched nothing and must not stale a later guard, PRR-017).
+#
+# Registry shape (PRR-006/016): keyed by the tuple (vm_key, frame_hash) so
+# two VMs with pixel-identical frames (login screens, black consoles) keep
+# independent records, capped at _REGISTRY_CAP entries with FIFO eviction
+# (a re-registration refreshes its entry, mirroring the hint map's recency
+# rule). Key resolution is ATOMIC with the mutation (PRR-005): the mutators
+# resolve the ledger key under the held hint lock and mutate the ledger
+# inside it — the established hint-lock BEFORE ledger-lock order — so a
+# concurrent note_name_guid_hint re-key cannot orphan a registration or a
+# bump under the pre-hint name.
+# ---------------------------------------------------------------------------
+
+_LEDGER_LOCK = threading.Lock()
+_LEDGER_SEQ = itertools.count(1)
+#: registry entry cap (PRR-016): bounded like the hint map (_HINT_CAP), with
+#: the same FIFO eviction of the oldest insertion.
+_REGISTRY_CAP = 512
+#: (vm_key, frame_hash) -> {"seq", "vm_key", "head_resolution",
+#: "content_rect", "frame_size", "shaped"}; the LAST registration of a hash
+#: for a VM wins, and the oldest entries evict at the cap.
+_CAPTURE_REGISTRY: dict[tuple[str, str], dict] = {}
+#: vm key -> the highest input-dispatch sequence number seen for that VM.
+_LAST_INPUT_SEQ: dict[str, int] = {}
+
+
+def _ledger_key_unlocked(vm_name: str, vm_id: str) -> str:
+    """The ledger key computation, called with _HINT_LOCK held (the hint
+    read is then a plain dict lookup): the GUID when one is known (an
+    explicit vm_id, or a host-side name->GUID hint), else the casefolded
+    name. Casefolded on BOTH branches (PRR-037) so a non-ASCII VM name
+    canonicalizes one way on the cold by-name path too."""
+    if vm_id:
+        return vm_id.strip().casefold()
+    name = (vm_name or "").strip()
+    if not name:
+        return ""
+    hint = _NAME_GUID_HINTS.get(name.casefold())
+    if hint:
+        return hint
+    return name.casefold()
+
+
+def _ledger_key(vm_name: str, vm_id: str) -> str:
+    """The canonical per-VM ledger key: the GUID when one is known (an
+    explicit vm_id, or a host-side name->GUID hint), else the casefolded
+    name. Read-only callers resolve here (hint lock only); the MUTATORS
+    resolve the key and mutate the ledger as ONE atomic hint->ledger chain
+    (PRR-005) via _ledger_key_unlocked under the held hint lock."""
+    with _HINT_LOCK:
+        return _ledger_key_unlocked(vm_name, vm_id)
+
+
+def register_capture(
+    frame_hash: str,
+    head_resolution: tuple[int, int] | None = None,
+    content_rect: list[int] | tuple[int, int, int, int] | None = None,
+    vm_name: str = "",
+    vm_id: str = "",
+    frame_size: tuple[int, int] | None = None,
+    shaped: bool = False,
+) -> None:
+    """Register a capture for citation by the mouse tools and the commit
+    guard (issue #125/#126). Production captures auto-register through this
+    function at completion; callers that hold an out-of-band capture may
+    register it explicitly. `head_resolution` is the display head AT CAPTURE
+    (compared against the current head when the hash is cited); shaped=True
+    marks a frame whose pixels were cropped/scaled after capture (it has no
+    head-space mapping and refuses pointer citations). The record lands
+    under the (vm_key, frame_hash) registry key, FIFO-capped at
+    _REGISTRY_CAP entries."""
+    rect: list[int] | None = None
+    if content_rect is not None:
+        rect = [int(v) for v in content_rect]
+    size: tuple[int, int] | None = None
+    if frame_size is not None:
+        size = (int(frame_size[0]), int(frame_size[1]))
+    head: tuple[int, int] | None = None
+    if head_resolution is not None and head_resolution[0] and head_resolution[1]:
+        head = (int(head_resolution[0]), int(head_resolution[1]))
+    # PRR-005: the key resolves and the registry mutates under ONE
+    # hint->ledger lock chain, and the sequence number draws inside it, so
+    # registrations and input bumps keep a single total order and a
+    # concurrent hint re-key cannot orphan this record under the pre-hint
+    # name.
+    with _HINT_LOCK:
+        key = _ledger_key_unlocked(vm_name, vm_id)
+        seq = next(_LEDGER_SEQ)
+        with _LEDGER_LOCK:
+            _CAPTURE_REGISTRY.pop((key, frame_hash), None)
+            _CAPTURE_REGISTRY[(key, frame_hash)] = {
+                "seq": seq,
+                "vm_key": key,
+                "head_resolution": head,
+                "content_rect": rect,
+                "frame_size": size,
+                "shaped": bool(shaped),
+            }
+            while len(_CAPTURE_REGISTRY) > _REGISTRY_CAP:
+                _CAPTURE_REGISTRY.pop(next(iter(_CAPTURE_REGISTRY)))
+
+
+def record_console_input(vm_name: str = "", vm_id: str = "") -> None:
+    """Record a console-input dispatch to that VM in the module's input
+    ledger: the guard treats any capture registered at-or-before this stamp
+    as stale. Bumped at DISPATCH inside the per-VM input lock by every input
+    operation (timeouts included); a refused or never-dispatched input never
+    bumps. The key resolves and the ledger mutates under the same atomic
+    hint->ledger lock chain as register_capture (PRR-005)."""
+    with _HINT_LOCK:
+        key = _ledger_key_unlocked(vm_name, vm_id)
+        if not key:
+            return
+        seq = next(_LEDGER_SEQ)
+        with _LEDGER_LOCK:
+            if seq > _LAST_INPUT_SEQ.get(key, 0):
+                _LAST_INPUT_SEQ[key] = seq
+
+
+def reset_input_ledger() -> None:
+    """Clear the capture-citation registry and the per-VM input ledger (test
+    isolation). The sequence counter keeps running — only the ORDERING
+    guarantees matter, and an empty ledger has nothing to order."""
+    with _LEDGER_LOCK:
+        _CAPTURE_REGISTRY.clear()
+        _LAST_INPUT_SEQ.clear()
+
+
+def _lookup_capture(frame_hash: str, vm_key: str) -> dict | None:
+    """The registry record for `frame_hash` when it belongs to `vm_key`,
+    else None (unknown citation, or a hash registered for another VM — the
+    registry keys on the (vm_key, frame_hash) TUPLE, PRR-006, so two VMs
+    with pixel-identical frames keep independent records)."""
+    if not frame_hash:
+        return None
+    with _LEDGER_LOCK:
+        record = _CAPTURE_REGISTRY.get((vm_key, frame_hash))
+        if record is None or record["vm_key"] != vm_key:
+            return None
+        return dict(record)
+
+
+def _last_input_seq_for(vm_key: str) -> int:
+    with _LEDGER_LOCK:
+        return _LAST_INPUT_SEQ.get(vm_key, 0)
+
+
+def _bump_input(ref: vmident.VMRef) -> None:
+    """The dispatch-time ledger bump shared by every input site (runs INSIDE
+    the per-VM input lock, immediately before the leg that sends input)."""
+    record_console_input(vm_name=ref.name, vm_id=ref.id)
+
+
+def _register_captured_hash(
+    frame_hash: str,
+    head: tuple[int, int] | None,
+    width: int,
+    height: int,
+    ref: vmident.VMRef,
+    vmid: str = "",
+) -> list[int] | None:
+    """Auto-register a returned capture (the wait tools' hashes; runs INSIDE
+    the held input lock so the registration orders against input dispatches).
+    Returns the content_rect (None when the head is unknown) so the caller
+    attaches the SAME rect it registered. `vmid` is the transport-reported
+    GUID when one is available (empty keeps the ref-based keying, which
+    canonicalizes through the hint map)."""
+    rect = _content_rect(width, height, head)
+    register_capture(
+        frame_hash,
+        head_resolution=head,
+        content_rect=rect,
+        vm_name=ref.name,
+        vm_id=vmid,
+        frame_size=(width, height),
+        shaped=False,
+    )
+    return rect
+
+
+def _be_head(be, guid: str) -> tuple[tuple[int, int] | None, dict]:
+    """Tolerant be.head_resolution read for per-poll/per-frame head
+    provenance: a backend without the method (older fakes) answers None —
+    head absence is data (the content_rect key is then absent), never an
+    error. WMIError/BackendUnavailable still propagate per the transport
+    contract."""
+    try:
+        head, t = be.head_resolution(guid)
+    except AttributeError:
+        return None, {}
+    if not head or not head[0] or not head[1]:
+        return None, t
+    return (int(head[0]), int(head[1])), t
+
+
+def _audit_commit_guard(vm_name: str) -> None:
+    """Record an ALLOWED guard decision through auditlog's configured sink
+    (JSONL at cfg.audit_log_path; a stderr summary when unset). The agent id
+    is left to auditlog's sentinel resolution (PRR-012: an explicit None
+    overrode it and lost the authenticated-caller attribution the paired
+    click row carries)."""
+    auditlog.log_operation(
+        tool="console_click_commit_guard",
+        vm_name=vm_name,
+        category="console_input",
+        ok=True,
+        duration_ms=0,
+        error_class="",
+    )
 
 
 def _hint_for(vm_name: str) -> str | None:
@@ -198,6 +476,23 @@ def _input_lock(ref: vmident.VMRef) -> Iterator[None]:
     """
     with vmlocks.vm_lock(ref.id, mode="read"), vmlocks.vm_lock((ref.id, "console")):
         yield
+
+
+def _console_lock_ref(vm_name: str, ref: vmident.VMRef) -> vmident.VMRef:
+    """The ref whose id keys the console input lock for a READ (PRR-002):
+    the GUID when the host-side hint map knows the caller's name — matching
+    the lock key every hinted input op already uses, so a whole-wait read
+    and a concurrent input exclude each other on the SAME identity — else
+    the caller's ref unchanged (a by-id ref already carries the GUID; an
+    unhinted by-name read stays name-keyed, the disclosed cold path). Only
+    the LOCK key is hint-derived: the op script still resolves the VM by
+    name inside the lock."""
+    hint = _hint_for(vm_name)
+    if hint:
+        return vmident.VMRef(id=hint, name=ref.name)
+    return ref
+
+
 _PREFIX_LEN = 4
 
 # Distinguishes the sibling temp files of two concurrent saves to the same
@@ -445,6 +740,18 @@ _VMID_EMIT_LINE = "Write-Output ('VMID=' + $vmTarget)"
 # round() and [math]::Round both round half to even, and the grouping below is
 # the same expression order, so the results are bit-identical to the Python
 # reference (AC16 keeps _scale_to_head as that reference).
+#
+# Issue #125: %BANDINIT seeds the letterbox band bounds ($bandl/$bandt/
+# $bandr/$bandb) when the caller cited a capture whose content_rect threads
+# into the mapping; empty means no rect and the band branch is dead ($bandl
+# stays $null). The band branch mirrors the Python reference's rect-relative
+# arithmetic exactly: points INSIDE the frame but OUTSIDE the rect are
+# refused (they are letterbox bands and have no head-space meaning), while
+# out-of-frame points still clamp (the anchor's semantics).
+#
+# PRR-027: %CITEDHEAD seeds the in-script compare of the live head against
+# the CITED capture's recorded head; empty means the record carries no head
+# and there is nothing to compare.
 _SCALE_TO_HEAD = (
     "$x = %X\n"
     "$y = %Y\n"
@@ -452,7 +759,17 @@ _SCALE_TO_HEAD = (
     "$fh = %FH\n"
     "$hw = $vh.CurrentHorizontalResolution\n"
     "$hh = $vh.CurrentVerticalResolution\n"
-    "if ($fw -or $fh) {\n"
+    "%CITEDHEAD"
+    "%BANDINIT"
+    "if ($null -ne $bandl) {\n"
+    "    if ((($x -ge 0) -and ($y -ge 0) -and (($fw -eq 0) -or ($x -lt $fw)) "
+    "-and (($fh -eq 0) -or ($y -lt $fh))) -and ((($x -lt $bandl) -or "
+    "($x -ge $bandr) -or ($y -lt $bandt) -or ($y -ge $bandb)))) { throw "
+    "'letterbox band point refused: frame coordinates inside the letterbox "
+    "bands have no head-space meaning' }\n"
+    "    $hx = [math]::Round(($x - $bandl) * $hw / ($bandr - $bandl))\n"
+    "    $hy = [math]::Round(($y - $bandt) * $hh / ($bandb - $bandt))\n"
+    "} elseif ($fw -or $fh) {\n"
     "    $hx = [math]::Round($x * $hw / $fw)\n"
     "    $hy = [math]::Round($y * $hh / $fh)\n"
     "} else {\n"
@@ -463,17 +780,60 @@ _SCALE_TO_HEAD = (
     "$hy = [math]::Max(0, [math]::Min($hy, $hh - 1))\n"
 )
 
+_BAND_REFUSAL_MESSAGE = (
+    "letterbox band point refused: frame coordinates inside the letterbox "
+    "bands have no head-space meaning"
+)
+
+
+def _band_init_lines(
+    content_rect: list[int] | tuple[int, int, int, int] | None,
+) -> str:
+    """The %BANDINIT replacement: the four band-bound literals, or '' when no
+    rect is cited (the branch then never fires and the script's scaling block
+    behaves exactly as the pre-#125 one)."""
+    if content_rect is None:
+        return ""
+    left, top, right, bottom = (int(v) for v in content_rect)
+    return (
+        f"$bandl = {left}\n"
+        f"$bandt = {top}\n"
+        f"$bandr = {right}\n"
+        f"$bandb = {bottom}\n"
+    )
+
+
+def _cited_head_lines(head: tuple[int, int] | None) -> str:
+    """The %CITEDHEAD replacement (PRR-027): an in-script compare of the
+    live head against the CITED capture's recorded head, thrown BEFORE
+    SetAbsolutePosition — the single-process closer for the gap between the
+    host-side head preflight and this script's own head read (a resolution
+    change between them would map the cited rect onto the wrong head). ''
+    when the cited record carries no head (nothing to compare)."""
+    if head is None:
+        return ""
+    w, h = int(head[0]), int(head[1])
+    return (
+        f"if (($hw -ne {w}) -or ($hh -ne {h})) {{ throw "
+        f"'stale frame: the cited capture was taken at head {w}x{h} "
+        f"but the current head is ' + $hw + ' x ' + $hh }}\n"
+    )
+
 
 def _folded_mouse_positional_script(
     prelude: str, x: int, y: int, frame_w: int, frame_h: int,
     click: bool, button: int,
+    content_rect: list[int] | tuple[int, int, int, int] | None = None,
+    cited_head: tuple[int, int] | None = None,
 ) -> str:
     """One positional mouse op (mouse_move, click with coordinates) in one
     process. The synthetic mouse is REQUIRED — absolute positioning has no PS/2
     equivalent, so its absence raises the structured error instead of acting.
     The head is looked up in-script and its absence throws rather than clicking
     blind, and _scale_to_head's arithmetic runs here with the same grouping as
-    the Python reference."""
+    the Python reference — including the rect-relative branch when a cited
+    capture's content_rect is threaded in (issue #125) and the cited-head
+    compare when the record carries one (PRR-027)."""
     parts = [
         prelude,
         _VM_LOOKUP,
@@ -494,7 +854,9 @@ def _folded_mouse_positional_script(
         "display resolution to skip scaling' }",
         _SCALE_TO_HEAD
         .replace("%X", str(x)).replace("%Y", str(y))
-        .replace("%FW", str(frame_w)).replace("%FH", str(frame_h)),
+        .replace("%FW", str(frame_w)).replace("%FH", str(frame_h))
+        .replace("%CITEDHEAD", _cited_head_lines(cited_head))
+        .replace("%BANDINIT", _band_init_lines(content_rect)),
         "$r0 = Invoke-CimMethod -InputObject $m -MethodName SetAbsolutePosition "
         "-ErrorAction Stop -Arguments @{ HorizontalPosition = $hx; VerticalPosition = $hy }",
         "if ($r0.ReturnValue -ne 0) { throw ('SetAbsolutePosition failed with "
@@ -597,10 +959,17 @@ def _folded_screenshot_script(prelude: str, width: int, height: int) -> str:
 
 def _folded_capture_script(prelude: str, width: int, height: int) -> str:
     """One self-contained capture at a single size (capture_sequence's per-frame
-    script: each frame resolves the VM itself, so no separate GUID process)."""
+    script: each frame resolves the VM itself, so no separate GUID process).
+    Issue #125: also reads the head and emits HEAD= so each frame carries the
+    head resolution it was captured against (content_rect provenance)."""
     return "\n".join([
         prelude,
         _VM_LOOKUP,
+        "$vh = $null\n",
+        "try { $vh = Get-CimAssociatedInstance -InputObject $vm "
+        "-ResultClassName Msvm_VideoHead | Select-Object -First 1 } catch { }\n",
+        "if ($vh) { Write-Output ('HEAD=' + $vh.CurrentHorizontalResolution "
+        "+ 'x' + $vh.CurrentVerticalResolution) }\n",
         "$svc = Get-CimInstance -Namespace '" + _WMI_NS + "' "
         "-ClassName Msvm_VirtualSystemManagementService\n",
         "$r = Invoke-CimMethod -InputObject $svc -MethodName GetVirtualSystemThumbnailImage "
@@ -658,6 +1027,14 @@ def _folded_wait_frame_script(
         "    }\n",
         "    if ($r.ReturnValue -ne 0) { throw ('GetVirtualSystemThumbnailImage failed with ReturnValue=' + $r.ReturnValue) }\n",
         "    $polls++\n",
+        # Per-poll head provenance (issue #125): each poll re-reads the head
+        # and emits HEAD= ahead of its hash, so a returned frame_hash's
+        # head_resolution/content_rect come from THE POLL THAT PRODUCED IT.
+        # The try/catch tolerates a head that cannot be read (a VM mid-teardown
+        # still answers captures) — absence is data, same as _HEAD_LOOKUP.
+        "    $vh = $null\n",
+        "    try { $vh = Get-CimAssociatedInstance -InputObject $vm -ResultClassName Msvm_VideoHead | Select-Object -First 1 } catch { }\n",
+        "    if ($vh) { Write-Output ('HEAD=' + $vh.CurrentHorizontalResolution + 'x' + $vh.CurrentVerticalResolution) }\n",
         # A short buffer makes the count negative, and ComputeHash's method
         # error is NON-terminating: without this guard the exception is
         # swallowed, $hash keeps its stale value, the loop polls to the
@@ -731,6 +1108,12 @@ def _folded_wait_stable_script(
         "    }\n",
         "    if ($r.ReturnValue -ne 0) { throw ('GetVirtualSystemThumbnailImage failed with ReturnValue=' + $r.ReturnValue) }\n",
         "    $polls++\n",
+        # Per-poll head provenance (issue #125), same shape as the change wait:
+        # the LAST HEAD= line before the terminal STOP= is the producing
+        # poll's head (meta folds repeated keys last-wins).
+        "    $vh = $null\n",
+        "    try { $vh = Get-CimAssociatedInstance -InputObject $vm -ResultClassName Msvm_VideoHead | Select-Object -First 1 } catch { }\n",
+        "    if ($vh) { Write-Output ('HEAD=' + $vh.CurrentHorizontalResolution + 'x' + $vh.CurrentVerticalResolution) }\n",
         # Same payload guard as the change wait: ComputeHash's method error is
         # NON-terminating, so a truncated payload must be a structured error
         # rather than a silently stale digest (see the change-wait template).
@@ -877,6 +1260,48 @@ def _parse_size(meta: dict[str, str], key: str) -> tuple[int, int] | None:
     # expectation, so the caller falls back exactly as it does when the line is
     # absent (the payload-length check then reports the real mismatch).
     return (wi, hi) if wi > 0 and hi > 0 else None
+
+
+def _content_rect(
+    frame_w: int, frame_h: int, head: tuple[int, int] | None,
+) -> list[int] | None:
+    """[left, top, right, bottom] (right/bottom EXCLUSIVE) of the
+    non-letterbox pixels of a frame_w x frame_h capture on a head of the
+    given resolution — None when the head is unknown (the key is then absent
+    from the metadata; nothing is fabricated).
+
+    Geometry-based (issue #125: an all-black payload cannot be pixel-scanned
+    for bands) and live-calibrated (repro/geometry_calibration_20261109.json,
+    a nine-size sweep on a 1920x1080 head incl. both 1-px boundary classes):
+    FLOOR on the constrained dimension; bands top/left = floor(remainder/2),
+    bottom/right = ceil(remainder/2). An exact-aspect frame is the full
+    frame. The frozen C1 fixture (1024x768 @ 1920x1010 -> [0,115,1024,653])
+    and every measured 1080-head row match this rule."""
+    if not head or not head[0] or not head[1]:
+        return None
+    if frame_w * head[1] == frame_h * head[0]:
+        return [0, 0, frame_w, frame_h]
+    if frame_w * head[1] < frame_h * head[0]:
+        # frame narrower than head: width-limited (letterbox bands top/bottom)
+        ch = (frame_w * head[1]) // head[0]
+        cw = frame_w
+    else:
+        # height-limited (letterbox bands left/right)
+        cw = (frame_h * head[0]) // head[1]
+        ch = frame_h
+    top = (frame_h - ch) // 2
+    left = (frame_w - cw) // 2
+    return [left, top, left + cw, top + ch]
+
+
+def _derived_height(width: int, head: tuple[int, int]) -> int:
+    """height=0 derives the head's aspect for `width` (issue #125 AC4):
+    ROUND — it maximizes the captured content area (floor would
+    under-capture by one row on a fractional-aspect head; on such heads
+    either choice can still leave a 1-px band, round simply wastes the
+    fewest rows) — clamped to the 160..4096 window every capture dimension
+    obeys."""
+    return max(160, min(4096, round(width * head[1] / head[0])))
 
 
 # ---------------------------------------------------------------------------
@@ -1774,13 +2199,54 @@ def _capture_raw(
     return payload
 
 
+def _head_preflight_ps(
+    cfg: Config, prelude: str, timing: _PsTiming | None = None,
+) -> tuple[int, int] | None:
+    """A head-only preflight (issue #125 AC5): one folded process that
+    resolves the VM, reads Msvm_VideoHead and emits the explicit ``HEAD=``
+    line — nothing else, so a refusal decided on its answer records ZERO
+    positional scripts (a stale-frame refusal precedes any mouse input).
+
+    Parsing takes the HEAD= meta line; when the line is absent the payload
+    line is tried as a JSON ``{"horizontal", "vertical"}`` object (the mock
+    transport's Msvm_VideoHead shape — production scripts always emit the
+    meta line). Unknown head -> None; the CALLER decides whether that is a
+    refusal (a citation cannot be compared) or a fall-through."""
+    script = prelude + _VM_LOOKUP + _HEAD_LOOKUP + (
+        "if ($vh) { Write-Output ('HEAD=' + $vh.CurrentHorizontalResolution "
+        "+ 'x' + $vh.CurrentVerticalResolution) }\n"
+    )
+    result = _run(cfg, script, timeout_s=60, timing=timing)
+    _check_rc(result, "console head preflight")
+    meta, payload_line, _all_values = _meta_lines(result)
+    head = _parse_head(meta)
+    if head is None and payload_line:
+        try:
+            data = json.loads(payload_line)
+            hi, vi = int(data["horizontal"]), int(data["vertical"])
+            if hi > 0 and vi > 0:
+                head = (hi, vi)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            head = None
+    return head
+
+
 def _scale_to_head(
-    x: int, y: int, frame_w: int, frame_h: int, head: tuple[int, int] | None
+    x: int, y: int, frame_w: int, frame_h: int, head: tuple[int, int] | None,
+    content_rect: list[int] | tuple[int, int, int, int] | None = None,
 ) -> tuple[int, int]:
     """Scale frame-space coordinates to head space. Errors loudly rather than
     clicking at an unverified position. When frame dims are omitted (0), the
     coordinates are taken as head-space directly — and the head must then be
-    available to bound them."""
+    available to bound them.
+
+    Issue #125: with `content_rect` (the capture's non-letterbox box), the
+    mapping goes THROUGH the rect — offset into the rect, scaled by
+    head/content size, rounded, clamped (the anchor's semantics applied
+    rect-relative); a FULL-frame rect reproduces the base mapping exactly,
+    including out-of-frame clamping. A point INSIDE the frame bounds but
+    OUTSIDE the rect is a letterbox band and is refused: it has no head-space
+    meaning."""
     # Defensive against contract-violating backends: head_resolution returns
     # None per contract, but a (None, None) pair (VM off, head reporting
     # nothing) must refuse here rather than TypeError mid-arithmetic — BOTH
@@ -1791,6 +2257,23 @@ def _scale_to_head(
             "display head resolution unavailable: pass frame_width/frame_height "
             "equal to the display resolution to skip scaling"
         )
+    if content_rect is not None:
+        left, top, right, bottom = (int(v) for v in content_rect)
+        if right <= left or bottom <= top:
+            raise ValueError(
+                f"content_rect [{left}, {top}, {right}, {bottom}] is empty; it "
+                "must be a non-empty [left, top, right, bottom] box"
+            )
+        in_frame = (
+            x >= 0 and y >= 0
+            and (not frame_w or x < frame_w)
+            and (not frame_h or y < frame_h)
+        )
+        if in_frame and (x < left or x >= right or y < top or y >= bottom):
+            raise ConsoleError(_BAND_REFUSAL_MESSAGE)
+        hx = round((x - left) * head[0] / (right - left))
+        hy = round((y - top) * head[1] / (bottom - top))
+        return max(0, min(hx, head[0] - 1)), max(0, min(hy, head[1] - 1))
     if frame_w or frame_h:
         if frame_w <= 0 or frame_h <= 0:
             raise ValueError("frame_width/frame_height must be positive when given")
@@ -1887,9 +2370,21 @@ def screenshot(
     `fmt`, `quality`, `scale` and `crop` shape the returned image; `frame` is
     `None` with `unchanged: true` in the metadata when `if_changed_from` matches
     the current capture, in which case no image is decoded, encoded or written.
+
+    `height=0` (issue #125 AC4) captures at the head's aspect for `width`
+    (the derived size is carried as the literal request in the capture
+    script); a non-zero height is byte-identical to the base path.
+
+    The capture auto-registers in the module's citation registry at
+    completion, inside the per-VM input lock (issue #126: no input can
+    dispatch between the pixels and the registration, so a later guarded
+    click citing this frame's `frame_hash` is fresh by construction).
     """
-    if not (160 <= width <= 4096 and 160 <= height <= 4096):
-        raise ValueError("width/height must be within 160..4096")
+    if not (160 <= width <= 4096 and (height == 0 or 160 <= height <= 4096)):
+        raise ValueError(
+            "width/height must be within 160..4096 (height 0 derives the "
+            "head's aspect for the width)"
+        )
     # Fail fast on everything that does not need the captured dimensions, so a
     # deterministic caller error is refused as `invalid` before a PowerShell
     # spawn takes a max_host_powershell slot (or the WMI chain runs).
@@ -1905,64 +2400,98 @@ def screenshot(
             be = None
     if be is not None:
         assert ref is not None
-        return _screenshot_wmi(
-            cfg, be, connect_ms, ref, width, height, save_path, t0,
-            fmt, quality, scale, crop, if_changed_from,
-        )
+        with _input_lock(ref):
+            return _screenshot_wmi(
+                cfg, be, connect_ms, ref, width, height, save_path, t0,
+                fmt, quality, scale, crop, if_changed_from,
+            )
     timing = _PsTiming()
     prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing)
+    if height == 0:
+        # Head-only preflight (same parsing seam the mouse citations use):
+        # one folded process reads the head so the capture script below
+        # carries the literal derived size. A non-zero height never runs it.
+        head0 = _head_preflight_ps(cfg, prelude, timing)
+        if head0 is None:
+            raise ConsoleError(
+                "display head resolution unavailable: cannot derive the "
+                "head-aspect height for height=0 (take an explicit height or "
+                "retry once the head reports a resolution)"
+            )
+        height = _derived_height(width, head0)
     # One process for the whole capture: the chain (requested -> head native if
     # different -> 640x480 -> 320x240, duplicates removed) is built and looped
     # inside the script. The host timeout is the sum of the per-size budgets the
     # base allowed (four entries after de-duplication).
     script = _folded_screenshot_script(prelude, width, height)
-    result = _run(cfg, script, timeout_s=90 * 4, timing=timing)
-    _check_rc(result, "console screenshot")
-    meta_lines, payload_line, _all_values = _meta_lines(result)
-    guid = _parse_guid(meta_lines, vm_name or ref.name)
-    note_name_guid_hint(vm_name or ref.name, guid)
-    head = _parse_head(meta_lines)
-    used_parsed = _parse_size(meta_lines, "USED")
-    used = used_parsed or (width, height)
-    try:
-        data = json.loads(payload_line)
-        raw = base64.b64decode(data["imageDataB64"], validate=True)
-    except (json.JSONDecodeError, KeyError, binascii.Error, ValueError) as exc:
-        raise ConsoleError(f"screenshot result parse failed: {exc}") from None
-    actual_w, actual_h = used
-    expected = actual_w * actual_h * 2 + _PREFIX_LEN
-    if len(raw) != expected:
-        raise ConsoleError(
-            f"thumbnail payload length mismatch: got {len(raw)}, expected {expected} "
-            f"for the {actual_w}x{actual_h} frame"
+    # PRR-002: the read locks on the hint-derived identity when one is
+    # known, so a by-name read excludes a hinted input op on the same VM.
+    with _input_lock(_console_lock_ref(vm_name, ref)):
+        result = _run(cfg, script, timeout_s=90 * 4, timing=timing)
+        _check_rc(result, "console screenshot")
+        meta_lines, payload_line, _all_values = _meta_lines(result)
+        guid = _parse_guid(meta_lines, vm_name or ref.name)
+        note_name_guid_hint(vm_name or ref.name, guid)
+        head = _parse_head(meta_lines)
+        used_parsed = _parse_size(meta_lines, "USED")
+        used = used_parsed or (width, height)
+        try:
+            data = json.loads(payload_line)
+            raw = base64.b64decode(data["imageDataB64"], validate=True)
+        except (json.JSONDecodeError, KeyError, binascii.Error, ValueError) as exc:
+            raise ConsoleError(f"screenshot result parse failed: {exc}") from None
+        actual_w, actual_h = used
+        expected = actual_w * actual_h * 2 + _PREFIX_LEN
+        if len(raw) != expected:
+            raise ConsoleError(
+                f"thumbnail payload length mismatch: got {len(raw)}, expected {expected} "
+                f"for the {actual_w}x{actual_h} frame"
+            )
+        fallback_used = ""
+        if used != (width, height):
+            fallback_used = f"{width}x{height} failed; captured at {used[0]}x{used[1]}"
+        common = {
+            "vm_name": ref.name,
+            "vm_id": guid,
+            "fallback_used": fallback_used,
+            # Issue #83: the USED= line is the only in-band report of which chain
+            # size actually produced the payload; when it is absent or malformed
+            # the dimensions below are an ASSUMPTION (the requested size), and
+            # that degradation must be a result signal, not a silent rename.
+            "used_fallback": used_parsed is None,
+            "head_resolution": {"horizontal": head[0], "vertical": head[1]} if head else None,
+            "scale_note": (
+                "mouse tools accept frame_width/frame_height to scale image coords "
+                f"to head space ({head[0]}x{head[1]})"
+                if head else "head resolution unavailable: pass display resolution as frame dims"
+            ),
+            "capture_method": "GetVirtualSystemThumbnailImage (WMI root\\virtualization\\v2)",
+            "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "timings": _ps_timings(timing),
+            "timing": _meta_timing(t0, timing),
+        }
+        # Issue #125: the letterbox content rect from the RAW (pre-shaping)
+        # dimensions against the head AT CAPTURE; stamped into `common` ahead
+        # of _finish_screenshot so it survives the unchanged short-circuit and
+        # is NOT recomputed against shaped output dimensions. Key absent when
+        # the head is unknown (never fabricated).
+        rect = _content_rect(actual_w, actual_h, head)
+        if rect is not None:
+            common["content_rect"] = rect
+        frame, meta = _finish_screenshot(
+            cfg, raw, actual_w, actual_h, save_path, fmt, quality, scale, crop,
+            if_changed_from, common,
         )
-    fallback_used = ""
-    if used != (width, height):
-        fallback_used = f"{width}x{height} failed; captured at {used[0]}x{used[1]}"
-    common = {
-        "vm_name": ref.name,
-        "vm_id": guid,
-        "fallback_used": fallback_used,
-        # Issue #83: the USED= line is the only in-band report of which chain
-        # size actually produced the payload; when it is absent or malformed
-        # the dimensions below are an ASSUMPTION (the requested size), and
-        # that degradation must be a result signal, not a silent rename.
-        "used_fallback": used_parsed is None,
-        "head_resolution": {"horizontal": head[0], "vertical": head[1]} if head else None,
-        "scale_note": (
-            "mouse tools accept frame_width/frame_height to scale image coords "
-            f"to head space ({head[0]}x{head[1]})"
-            if head else "head resolution unavailable: pass display resolution as frame dims"
-        ),
-        "capture_method": "GetVirtualSystemThumbnailImage (WMI root\\virtualization\\v2)",
-        "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-        "timings": _ps_timings(timing),
-        "timing": _meta_timing(t0, timing),
-    }
-    return _finish_screenshot(
-        cfg, raw, actual_w, actual_h, save_path, fmt, quality, scale, crop,
-        if_changed_from, common,
-    )
+        register_capture(
+            meta["frame_hash"],
+            head_resolution=head,
+            content_rect=rect,
+            vm_name=ref.name,
+            vm_id=guid,
+            frame_size=(actual_w, actual_h),
+            shaped=crop is not None or (scale is not None and scale != 1.0),
+        )
+    return frame, meta
 
 
 def _screenshot_wmi(
@@ -1982,9 +2511,19 @@ def _screenshot_wmi(
 ) -> tuple[Frame | None, dict]:
     """Screenshot over the in-process WMI backend: same metadata contract
     as the PowerShell path (the capture chain keeps its pre-existing
-    per-size retry — same operation, next size)."""
+    per-size retry — same operation, next size). height=0 derives the
+    head's aspect from be.head_resolution (no spawn); the caller holds the
+    per-VM input lock around the whole capture-and-register region."""
     try:
         head, t_head = be.head_resolution(ref.id)
+        if height == 0:
+            if not head or not head[0] or not head[1]:
+                raise ConsoleError(
+                    "display head resolution unavailable: cannot derive the "
+                    "head-aspect height for height=0 (take an explicit height or "
+                    "retry once the head reports a resolution)"
+                )
+            height = _derived_height(width, head)
         chain: list[tuple[int, int]] = [(width, height)]
         if head and (width, height) != head:
             chain.append(head)
@@ -2029,10 +2568,23 @@ def _screenshot_wmi(
             "timings": _wmi_timings(connect_ms, *phase_dicts),
             "timing": _meta_timing(t0, None, wmi=True),
         }
-        return _finish_screenshot(
+        rect = _content_rect(actual_w, actual_h, head)
+        if rect is not None:
+            common["content_rect"] = rect
+        frame, meta = _finish_screenshot(
             cfg, raw, actual_w, actual_h, save_path, fmt, quality, scale, crop,
             if_changed_from, common,
         )
+        register_capture(
+            meta["frame_hash"],
+            head_resolution=head,
+            content_rect=rect,
+            vm_name=ref.name,
+            vm_id=ref.id,
+            frame_size=(actual_w, actual_h),
+            shaped=crop is not None or (scale is not None and scale != 1.0),
+        )
+        return frame, meta
     except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
         raise ConsoleError(str(exc)) from None
 
@@ -2151,6 +2703,7 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
         with _input_lock(ref):
             for i, chunk in enumerate(chunks):
                 try:
+                    _bump_input(ref)
                     _r, t = be.type_text(ref.id, chunk)
                 except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
                     # PRR-105 (review round 2, R1): a failing chunk names
@@ -2213,6 +2766,7 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
                 # pacing between composed commands mirrors the in-script
                 # inter-chunk sleep (let the Hyper-V input buffer drain)
                 time.sleep(0.05)
+            _bump_input(ref)
             payload_init = (
                 "$payloads = @("
                 + ", ".join(f"$__p{i}" for i in range(len(group)))
@@ -2268,6 +2822,179 @@ def _select_backend_and_ref(cfg: Config, vm_name: str, vm_id: str) -> tuple[Any 
         except wmiconsole.BackendUnavailable:
             be = None
     return be, connect_ms, ref
+
+
+def _resolve_pointer_citation(
+    frame_hash: str, vm_name: str, vm_id: str,
+) -> dict:
+    """Resolve a mouse tool's cited capture (issue #125 AC5): the hash must
+    be registered for THIS VM by this server process, and a shaped capture
+    (cropped/scaled output) has no head-space mapping, so it refuses pointer
+    citations outright. Returns the registry record (content_rect and
+    head_resolution thread into the mapping)."""
+    record = _lookup_capture(frame_hash, _ledger_key(vm_name, vm_id))
+    if record is None:
+        raise ConsoleError(
+            f"unknown capture citation: {frame_hash} is not a capture this "
+            "server process registered for that VM"
+        )
+    if record["shaped"]:
+        raise ConsoleError(
+            "shaped frame has no head-space mapping; cite an unshaped capture"
+        )
+    return record
+
+
+def _check_cited_head(record: dict, current: tuple[int, int] | None) -> None:
+    """Refuse a citation whose recorded head differs from the current head
+    (issue #125 AC5): mapping through a rect captured at another head
+    resolution would place the click wrong. Both heads known is the refusal
+    condition; an unknown current head falls through to the positional op's
+    own head-unavailable error."""
+    rec_head = record["head_resolution"]
+    if rec_head is not None and current is not None and tuple(rec_head) != tuple(current):
+        raise ConsoleError(
+            f"stale frame: the cited capture was taken at head "
+            f"{rec_head[0]}x{rec_head[1]} but the current head is "
+            f"{current[0]}x{current[1]} — recapture and cite the fresh frame"
+        )
+
+
+def _citation_domain(
+    record: dict | None, frame_width: int, frame_height: int,
+) -> tuple[int, int, list[int] | None]:
+    """The unified citation-domain resolution (PRR-001/007/011): a resolved
+    citation — a `frame_hash` capture or the commit guard's
+    `verified_frame_hash` record — DEFAULTS omitted frame_width/frame_height
+    from the record's frame_size (the coordinates were observed on THAT
+    frame; without the default, head-space coordinates would be silently
+    reinterpreted through the rect-relative mapping) and supplies the
+    record's content_rect for the band refusal + rect mapping exactly as the
+    sequence path threads it. A cited record without a frame_size cannot
+    default the domain and refuses, naming the requirement. A null record
+    (no citation given) changes nothing — the zero-spawn, no-citation path
+    keeps its base semantics."""
+    if record is None:
+        return frame_width, frame_height, None
+    if not (frame_width or frame_height):
+        size = record["frame_size"]
+        if size is None:
+            raise ConsoleError(
+                "frame_width/frame_height are required when citing this "
+                "capture: it was registered without a frame_size, so its "
+                "pixel domain cannot be defaulted (pass the dimensions the "
+                "coordinates were observed at)"
+            )
+        frame_width, frame_height = int(size[0]), int(size[1])
+    return frame_width, frame_height, record["content_rect"]
+
+
+def _commit_guard_freshness(record: dict) -> None:
+    """The guard's freshness leg (issue #126 AC2): a verification captured
+    at-or-before the most recent input dispatch to that VM proves nothing
+    about the current selection. Scoped: the input ledger counts inputs
+    dispatched through THIS server process only."""
+    last = _last_input_seq_for(record["vm_key"])
+    if record["seq"] <= last:
+        raise ConsoleError(
+            "stale verification: the cited capture predates the most recent "
+            "input dispatched through this server process (the input ledger "
+            "is per-server-process; a cross-process input that changed the "
+            "pixels is still caught by the live-frame check)")
+
+
+def _commit_guard_record(
+    verified_frame_hash: str, ref: vmident.VMRef, width: int, height: int,
+) -> dict:
+    """The guard's citation + pixel-domain leg shared by both transports:
+    the cited hash must be a registered capture of THIS VM, fresh against the
+    input ledger, and registered at exactly the caller's (width, height) —
+    the live verification below hashes that pixel domain, so any other size
+    could never match (C9)."""
+    if not verified_frame_hash:
+        raise ConsoleError(
+            "commit_unverified: a guarded click must cite a fresh "
+            "verified_frame_hash (take a capture after the last input and "
+            "cite its frame_hash)"
+        )
+    # PRR-029: the caller-cited pixel domain is re-validated against the
+    # 160..4096 window every capture dimension obeys — the live verification
+    # spawns a real capture at these dimensions, so an out-of-window pair
+    # must refuse here rather than ride the script unvalidated.
+    if not (160 <= width <= 4096 and 160 <= height <= 4096):
+        raise ConsoleError(
+            "commit_unverified: the commit guard's frame_width/frame_height "
+            f"must be within 160..4096 (the live verification hashes that "
+            f"pixel domain); got {width}x{height}"
+        )
+    record = _lookup_capture(
+        verified_frame_hash, _ledger_key(ref.name, ref.id))
+    if record is None:
+        raise ConsoleError(
+            "commit_unverified: the cited verification is unknown to this "
+            "server process's capture registry (captures auto-register; cite "
+            "a frame_hash this process returned)"
+        )
+    _commit_guard_freshness(record)
+    if record["frame_size"] is not None and record["frame_size"] != (width, height):
+        raise ConsoleError(
+            "commit_unverified: the cited verification was registered at "
+            f"{record['frame_size'][0]}x{record['frame_size'][1]}, not the "
+            f"{width}x{height} pixel domain of this click — the live check "
+            "hashes the click's own frame size"
+        )
+    return record
+
+
+def _commit_guard_live_mismatch(live_hash: str, verified_frame_hash: str) -> None:
+    if live_hash != verified_frame_hash:
+        raise ConsoleError(
+            f"commit_unverified: the live frame hash {live_hash} does not "
+            f"match the cited verification {verified_frame_hash}")
+
+
+def _commit_guard_check_ps(
+    cfg: Config, ref: vmident.VMRef, prelude: str, timing: _PsTiming,
+    frame_width: int, frame_height: int, verified_frame_hash: str,
+) -> None:
+    """The full guard flow for the PowerShell transport, INSIDE the held
+    input lock (issue #126): freshness against the ledger, then a live
+    capture at the caller's cited (frame_width, frame_height) — the cited
+    verification's pixel domain — through the ALREADY-HELD internal capture
+    seam (no re-entry of the per-VM lock; vmlocks refuses same-thread
+    re-entry). On success the decision is audited and the caller dispatches."""
+    if not (frame_width and frame_height):
+        raise ConsoleError(
+            "commit_unverified: the commit guard requires frame_width/"
+            "frame_height (the cited capture's pixel domain)"
+        )
+    _commit_guard_record(verified_frame_hash, ref, frame_width, frame_height)
+    raw, _meta = _capture_raw_with_meta(
+        cfg, prelude, frame_width, frame_height, timing,
+        ctx="console commit guard verification",
+    )
+    _commit_guard_live_mismatch(_frame_hash(raw), verified_frame_hash)
+    _audit_commit_guard(ref.name)
+
+
+def _commit_guard_check_wmi(
+    be, ref: vmident.VMRef,
+    frame_width: int, frame_height: int, verified_frame_hash: str,
+) -> None:
+    """The WMI-transport twin of _commit_guard_check_ps: the live capture is
+    be.capture at the cited size, under the caller's held input lock."""
+    if not (frame_width and frame_height):
+        raise ConsoleError(
+            "commit_unverified: the commit guard requires frame_width/"
+            "frame_height (the cited capture's pixel domain)"
+        )
+    _commit_guard_record(verified_frame_hash, ref, frame_width, frame_height)
+    try:
+        raw, _t = be.capture(ref.id, frame_width, frame_height)
+    except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
+        raise ConsoleError(str(exc)) from None
+    _commit_guard_live_mismatch(_frame_hash(raw), verified_frame_hash)
+    _audit_commit_guard(ref.name)
 
 
 def press_key(
@@ -2340,6 +3067,7 @@ def _send_scancodes_locked(
         with _input_lock(ref):
             for i, chunk in enumerate(chunks):
                 try:
+                    _bump_input(ref)
                     _r, t = be.type_scancodes(ref.id, chunk)
                 except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
                     # PRR-105/CUB2-2: on leg failure the error names how many
@@ -2384,6 +3112,7 @@ def _send_scancodes_locked(
         for si, sl in enumerate(legs):
             if si:
                 time.sleep(0.02)  # pacing: let the Hyper-V input buffer drain
+            _bump_input(ref)
             result = _run(cfg, _scancodes_script(prelude, sl), timeout_s=90, timing=timing)
             # PRR-105/CUB2-2: on leg failure the error names how many
             # complete legs delivered; within-leg progress is not recovered,
@@ -2440,6 +3169,7 @@ def _scancodes_script(prelude: str, codes: list[int]) -> str:
 def mouse_move(
     cfg: Config, vm_name: str = "", x: int | None = None, y: int | None = None,
     frame_width: int = 0, frame_height: int = 0, vm_id: str = "",
+    frame_hash: str = "",
 ) -> dict:
     # x/y are semantically REQUIRED (PRR-014): omission must not silently
     # mean (0,0) — a real SetAbsolutePosition(0,0). Checked before any
@@ -2455,13 +3185,32 @@ def mouse_move(
     _reject_non_int(frame_height, "frame_height")
     if (frame_width or frame_height) and (frame_width <= 0 or frame_height <= 0):
         raise ValueError("frame_width/frame_height must be positive when given")
+    if frame_hash and not re.fullmatch(r"[0-9a-f]{64}", frame_hash):
+        raise ValueError("frame_hash must be an empty string or a 64-char hex sha256")
     policy.require_category(cfg, "console_input", f"move mouse on '{vm_name}' console")
     be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
+    # Issue #125 AC5: an optional cited capture. The citation resolves BEFORE
+    # any input script exists; a shaped capture and an unknown hash refuse
+    # here, and the recorded-vs-current head compare refuses a stale frame.
+    record = (
+        _resolve_pointer_citation(frame_hash, vm_name, (ref.id if ref else vm_id))
+        if frame_hash else None
+    )
+    # PRR-001/011: the citation's pixel domain — omitted frame dims default
+    # from the record's frame_size (a record without one refuses naming the
+    # requirement) and the record's content_rect threads into the mapping.
+    frame_width, frame_height, cited_rect = _citation_domain(
+        record, frame_width, frame_height)
     if be is not None and ref is not None:
         try:
             with _input_lock(ref):
                 head, t_head = be.head_resolution(ref.id)
-                hx, hy = _scale_to_head(x, y, frame_width, frame_height, head)
+                if record is not None:
+                    _check_cited_head(
+                        record, head if head and head[0] and head[1] else None)
+                hx, hy = _scale_to_head(
+                    x, y, frame_width, frame_height, head, content_rect=cited_rect)
+                _bump_input(ref)
                 _r, t = be.mouse_move(ref.id, hx, hy)
         except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
             raise ConsoleError(str(exc)) from None
@@ -2472,10 +3221,27 @@ def mouse_move(
         }
     timing = _PsTiming()
     prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing, guarded=True)
+    if record is not None:
+        # Stale-head preflight (issue #125 AC5): a separate head-only folded
+        # process — never the positional script — so a refusal records zero
+        # positional scripts.
+        current = _head_preflight_ps(cfg, prelude, timing)
+        _check_cited_head(record, current)
+        # Host-side band refusal pre-dispatch (AC3): validate the mapping
+        # through the cited rect before anything spawns that could move the
+        # pointer. The script repeats the arithmetic in-band (the head is
+        # only authoritative in-script), but a band point dies HERE.
+        rec_head = record["head_resolution"] or current
+        if rec_head is not None:
+            _scale_to_head(
+                x, y, frame_width, frame_height, rec_head, content_rect=cited_rect)
     script = _folded_mouse_positional_script(
-        prelude, x, y, frame_width, frame_height, click=False, button=1
+        prelude, x, y, frame_width, frame_height, click=False, button=1,
+        content_rect=cited_rect,
+        cited_head=record["head_resolution"] if record is not None else None,
     )
     with _input_lock(ref):
+        _bump_input(ref)
         result = _run(cfg, script, timeout_s=90, timing=timing)
     _check_input_rc(result, "console mouse move", vm_name)
     meta_lines, _payload, _all_values = _meta_lines(result)
@@ -2494,6 +3260,7 @@ def mouse_move(
 def click(
     cfg: Config, vm_name: str = "", x: int | None = None, y: int | None = None,
     frame_width: int = 0, frame_height: int = 0, button: int = 1, vm_id: str = "",
+    frame_hash: str = "", commit_guard: bool = False, verified_frame_hash: str = "",
 ) -> dict:
     # Issue #83 guards before anything spawns: a bool button passes the
     # membership check (True in (1, 2)) and interpolates as ButtonIndex =
@@ -2507,23 +3274,82 @@ def click(
         _reject_non_int(y, "y")
     _reject_non_int(frame_width, "frame_width")
     _reject_non_int(frame_height, "frame_height")
+    if frame_hash and not re.fullmatch(r"[0-9a-f]{64}", frame_hash):
+        raise ValueError("frame_hash must be an empty string or a 64-char hex sha256")
+    if verified_frame_hash and not re.fullmatch(r"[0-9a-f]{64}", verified_frame_hash):
+        raise ValueError("verified_frame_hash must be an empty string or a 64-char hex sha256")
+    if not commit_guard and verified_frame_hash:
+        raise ValueError("verified_frame_hash requires commit_guard=True")
+    if commit_guard and (x is None or y is None):
+        # PRR-015: a guarded click-at-current-position has no point to
+        # band-check or map through the cited pixel domain, so the guard is
+        # NOT supported there — fail CLOSED, mirroring the sequence wording
+        # (a silently unverified commit click is worse than a rejection).
+        raise ValueError(
+            "commit_guard/verified_frame_hash are not supported on a click "
+            "without x/y coordinates (click-at-current-position has no "
+            "point to verify); give x/y or drop the guard")
     policy.require_category(cfg, "console_input", f"click on '{vm_name}' console")
     if button not in (1, 2):
         raise ValueError("button must be 1 (left) or 2 (right)")
     if (frame_width or frame_height) and (frame_width <= 0 or frame_height <= 0):
         raise ValueError("frame_width/frame_height must be positive when given")
     be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
+    # Issue #125 AC5: citation resolution precedes everything positional —
+    # unknown hash / shaped capture refuse here, the recorded-vs-current
+    # head compare refuses a stale frame, and the cited content_rect threads
+    # into the mapping (band points refuse, host-side, pre-dispatch).
+    record = (
+        _resolve_pointer_citation(frame_hash, vm_name, (ref.id if ref else vm_id))
+        if frame_hash else None
+    )
+    if record is None and commit_guard and verified_frame_hash:
+        # Guard-only citation (PRR-007): fetch the verification's record
+        # once BEFORE the guard check so its frame_size and content_rect
+        # define the click's pixel domain exactly like a frame_hash
+        # citation — the guard itself keeps its freshness/live-hash
+        # semantics inside the lock.
+        record = _resolve_pointer_citation(
+            verified_frame_hash, vm_name, (ref.id if ref else vm_id))
+    # PRR-001/011: the citation's pixel domain — omitted frame dims default
+    # from the record's frame_size (a record without one refuses naming the
+    # requirement) and the record's content_rect threads into the mapping.
+    frame_width, frame_height, cited_rect = _citation_domain(
+        record, frame_width, frame_height)
+    cited_head = record["head_resolution"] if record is not None else None
     if be is not None and ref is not None:
         try:
             with _input_lock(ref):
+                # PRR-018 (review round 2, F3): a resolved citation's head
+                # compare runs BEFORE the guard check — parity with the PS
+                # ordering (the head preflight precedes the guard flow) — so
+                # a head-refused click refuses stale BEFORE any guard
+                # decision is audited (disposition by the first refusing
+                # leg; NEW-13's no-coordinates compare rides here too).
+                head = None
+                t_head: dict = {}
+                if record is not None:
+                    raw_head, t_head = be.head_resolution(ref.id)
+                    head = raw_head if raw_head and raw_head[0] and raw_head[1] else None
+                    _check_cited_head(record, head)
+                if commit_guard:
+                    # Issue #126: verify INSIDE the locked region, before any
+                    # mouse input — freshness against the input ledger, then a
+                    # live capture at the cited pixel domain hashed against
+                    # the citation. A refusal here sends no input at all.
+                    _commit_guard_check_wmi(
+                        be, ref, frame_width, frame_height, verified_frame_hash)
                 extra: dict = {}
                 if x is not None and y is not None:
-                    head, t_head = be.head_resolution(ref.id)
-                    hx, hy = _scale_to_head(x, y, frame_width, frame_height, head)
+                    if record is None:
+                        head, t_head = be.head_resolution(ref.id)
+                    hx, hy = _scale_to_head(
+                        x, y, frame_width, frame_height, head, content_rect=cited_rect)
+                    _bump_input(ref)
                     _r, t = be.mouse_click(ref.id, button, hx, hy)
                     extra = {"head_x": hx, "head_y": hy}
                 else:
-                    t_head = {}
+                    _bump_input(ref)
                     _r, t = be.mouse_click(ref.id, button)
         except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
             raise ConsoleError(str(exc)) from None
@@ -2534,10 +3360,29 @@ def click(
     timing = _PsTiming()
     prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing, guarded=True)
     if x is not None and y is not None:
+        if record is not None:
+            # Stale-head preflight + host-side band refusal (issue #125):
+            # both die on a head-only (or no) script — a refusal records
+            # ZERO positional scripts, so no mouse input is ever sent.
+            current = _head_preflight_ps(cfg, prelude, timing)
+            _check_cited_head(record, current)
+            rec_head = record["head_resolution"] or current
+            if rec_head is not None:
+                _scale_to_head(
+                    x, y, frame_width, frame_height, rec_head, content_rect=cited_rect)
         script = _folded_mouse_positional_script(
-            prelude, x, y, frame_width, frame_height, click=True, button=button
+            prelude, x, y, frame_width, frame_height, click=True, button=button,
+            content_rect=cited_rect, cited_head=cited_head,
         )
         with _input_lock(ref):
+            if commit_guard:
+                # Issue #126: the guard flow INSIDE the held lock, before the
+                # positional script is dispatched (the live capture runs on
+                # the already-held internal seam — no lock re-entry).
+                _commit_guard_check_ps(
+                    cfg, ref, prelude, timing,
+                    frame_width, frame_height, verified_frame_hash)
+            _bump_input(ref)
             result = _run(cfg, script, timeout_s=90, timing=timing)
         _check_input_rc(result, "console mouse click", vm_name)
         meta_lines, _payload, _all_values = _meta_lines(result)
@@ -2553,13 +3398,20 @@ def click(
         }
     # No coordinates means 'click at current position' — no positioning leg
     # at all; (0,0) is a real coordinate and takes the positional leg.
+    if record is not None:
+        # A citation still gets its stale-head refusal even without
+        # coordinates (the head compare needs no positional script).
+        current = _head_preflight_ps(cfg, prelude, timing)
+        _check_cited_head(record, current)
     call = (
         "$r = Invoke-CimMethod -InputObject $m -MethodName ClickButton "
         + "-ErrorAction Stop -Arguments @{ ButtonIndex = " + str(button) + " }\n"
         + "if ($r.ReturnValue -ne 0) { throw ('ClickButton failed with ReturnValue=' + $r.ReturnValue) }\n"
         + "Write-Output ('RC=' + $r.ReturnValue)\n"
     )
-    return _mouse_op(cfg, ref, f"click button {button}", prelude, call=call, timing=timing)
+    return _mouse_op(
+        cfg, ref, f"click button {button}", prelude, call=call, timing=timing,
+    )
 
 
 def mouse_button(
@@ -2573,6 +3425,7 @@ def mouse_button(
     if be is not None and ref is not None:
         try:
             with _input_lock(ref):
+                _bump_input(ref)
                 _r, t = be.mouse_button(ref.id, button, is_down)
         except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
             raise ConsoleError(str(exc)) from None
@@ -2597,6 +3450,7 @@ def scroll(cfg: Config, vm_name: str = "", delta: int = 0, vm_id: str = "") -> d
     if be is not None and ref is not None:
         try:
             with _input_lock(ref):
+                _bump_input(ref)
                 _r, t = be.mouse_scroll(ref.id, delta)
         except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
             raise ConsoleError(str(exc)) from None
@@ -2623,7 +3477,10 @@ def _mouse_op(
     timing: _PsTiming | None = None,
 ) -> dict:
     """One non-positional mouse op in one process: the synthetic mouse, or
-    the PS/2 fallback under the same SystemName filter (AC14)."""
+    the PS/2 fallback under the same SystemName filter (AC14). The issue-#126
+    commit guard never runs here: its only non-positional caller (a
+    coordinate-less click) is refused up front (PRR-015) — a guarded click
+    requires the positional leg's verifiable point."""
     if call is None:
         assert method is not None
         call = (
@@ -2644,6 +3501,7 @@ def _mouse_op(
         call,
     ])
     with _input_lock(ref):
+        _bump_input(ref)
         result = _run(cfg, script, timeout_s=90, timing=timing)
     _check_input_rc(result, f"console mouse {detail}", ref.name)
     _validate_vmid_hint(result, ref.name)
@@ -2687,42 +3545,65 @@ def wait_frame_change(
         prelude, baseline_hash, width, height, timeout_s, interval_s
     )
     started = time.monotonic()
-    result = _run(cfg, script, timeout_s=int(timeout_s) + 15, timing=timing)
-    elapsed_ms = int((time.monotonic() - started) * 1000)
-    _check_rc(result, "console wait_frame_change")
-    _validate_vmid_hint(result, vm_name or ref.name)
+    # Issue #126 (R3-01): the wait holds the per-VM input lock for the WHOLE
+    # wait — the folded one-process poll loop cannot release per poll, and a
+    # wait IS a capture run, so registering its result inside the lock keeps
+    # the ledger's freshness ordering sound. Inputs to the VM block until the
+    # wait returns (documented; a concurrent input raises VMBusy). The lock
+    # keys on the hint-derived identity (PRR-002) so a hinted input op
+    # excludes against this wait on the same key.
+    with _input_lock(_console_lock_ref(vm_name, ref)):
+        result = _run(cfg, script, timeout_s=int(timeout_s) + 15, timing=timing)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        _check_rc(result, "console wait_frame_change")
+        _validate_vmid_hint(result, vm_name or ref.name)
 
-    stop_reason, polls, last_hash, frame_b64 = "deadline", 0, "", ""
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("STOP="):
-            parts = dict(
-                kv.split("=", 1) for kv in line.split(" ") if "=" in kv
-            )
-            stop_reason = parts.get("STOP", "deadline")
-            polls = int(parts.get("POLLS", "0") or 0)
-            last_hash = parts.get("HASH", "")
-        elif line.startswith("FRAME="):
-            frame_b64 = line[len("FRAME="):]
+        stop_reason, polls, last_hash, frame_b64 = "deadline", 0, "", ""
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("STOP="):
+                parts = dict(
+                    kv.split("=", 1) for kv in line.split(" ") if "=" in kv
+                )
+                stop_reason = parts.get("STOP", "deadline")
+                polls = int(parts.get("POLLS", "0") or 0)
+                last_hash = parts.get("HASH", "")
+            elif line.startswith("FRAME="):
+                frame_b64 = line[len("FRAME="):]
 
-    out: dict = {
-        "ok": True,
-        "vm_name": ref.name,
-        "stop_reason": stop_reason,
-        "changed": stop_reason == "changed",
-        "polls": polls,
-        "elapsed_ms": elapsed_ms,
-        "width": width,
-        "height": height,
-        "hash_domain": HASH_DOMAIN,
-        "timings": _ps_timings(timing),
-    }
-    if last_hash:
-        out["frame_hash"] = last_hash
-    if frame_b64:
-        raw = base64.b64decode(frame_b64)
-        out["image"] = _decode_frame(raw, width, height)
-        out["frame_hash"] = _frame_hash(raw)
+        # Per-poll head provenance (issue #125): the script emits HEAD= on
+        # every poll; meta folds repeated keys last-wins, so the surviving
+        # value is the PRODUCING poll's head (the stop line follows that
+        # poll's emission).
+        meta, _payload_line, _all_values = _meta_lines(result)
+        head = _parse_head(meta)
+
+        out: dict = {
+            "ok": True,
+            "vm_name": ref.name,
+            "stop_reason": stop_reason,
+            "changed": stop_reason == "changed",
+            "polls": polls,
+            "elapsed_ms": elapsed_ms,
+            "width": width,
+            "height": height,
+            "hash_domain": HASH_DOMAIN,
+            "timings": _ps_timings(timing),
+        }
+        if last_hash:
+            out["frame_hash"] = last_hash
+            rect = _register_captured_hash(
+                last_hash, head, width, height, ref,
+                meta.get("VMID", ""))
+            if head is not None:
+                out["head_resolution"] = {
+                    "horizontal": head[0], "vertical": head[1]}
+            if rect is not None:
+                out["content_rect"] = rect
+        if frame_b64:
+            raw = base64.b64decode(frame_b64)
+            out["image"] = _decode_frame(raw, width, height)
+            out["frame_hash"] = _frame_hash(raw)
     return out
 
 
@@ -2733,33 +3614,44 @@ def _wait_frame_change_wmi(
     """wait_frame_change over the in-process WMI backend: the poll loop runs
     in Python, preserving the PowerShell contract (first-poll-baseline,
     supplied-baseline discrimination, deadline stop, hash round-tripping,
-    polls bounded by the derived max_polls, deadline keeps the last hash)."""
+    polls bounded by the derived max_polls, deadline keeps the last hash).
+    Issue #125: the head is re-read PER POLL so a returned hash's
+    head_resolution/content_rect come from the poll that produced it; issue
+    #126 (R3-01): the loop holds the per-VM input lock for the whole wait
+    and registers its result inside it."""
     max_polls = math.ceil(timeout_s / interval_s)
     phase_dicts: list[dict] = []
     stop_reason, polls, last_hash = "deadline", 0, ""
     raw: bytes | None = None
+    head: tuple[int, int] | None = None
     started = time.monotonic()
     deadline_t = started + timeout_s
+    rect: list[int] | None = None
     try:
-        baseline = baseline_hash
-        while polls < max_polls:
-            if time.monotonic() >= deadline_t:
-                stop_reason = "deadline"
-                break
-            raw, t = be.capture(ref.id, width, height)
-            phase_dicts.append(t)
-            polls += 1
-            h = _frame_hash(raw)
-            last_hash = h
-            if not baseline:
-                baseline = h
-            if h != baseline:
-                stop_reason = "changed"
-                break
-            if polls >= max_polls or time.monotonic() >= deadline_t:
-                stop_reason = "deadline"
-                break
-            time.sleep(interval_s)
+        with _input_lock(ref):
+            baseline = baseline_hash
+            while polls < max_polls:
+                if time.monotonic() >= deadline_t:
+                    stop_reason = "deadline"
+                    break
+                raw, t = be.capture(ref.id, width, height)
+                phase_dicts.append(t)
+                head, _t_head = _be_head(be, ref.id)
+                polls += 1
+                h = _frame_hash(raw)
+                last_hash = h
+                if not baseline:
+                    baseline = h
+                if h != baseline:
+                    stop_reason = "changed"
+                    break
+                if polls >= max_polls or time.monotonic() >= deadline_t:
+                    stop_reason = "deadline"
+                    break
+                time.sleep(interval_s)
+            if last_hash:
+                rect = _register_captured_hash(
+                    last_hash, head, width, height, ref, ref.id)
     except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
         raise ConsoleError(str(exc)) from None
     elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -2777,6 +3669,11 @@ def _wait_frame_change_wmi(
     }
     if last_hash:
         out["frame_hash"] = last_hash
+        if head is not None:
+            out["head_resolution"] = {
+                "horizontal": head[0], "vertical": head[1]}
+        if rect is not None:
+            out["content_rect"] = rect
     if stop_reason == "changed" and raw is not None:
         out["image"] = _decode_frame(raw, width, height)
         out["frame_hash"] = _frame_hash(raw)
@@ -2829,45 +3726,60 @@ def wait_frame_stable(
         prelude, baseline_hash, stable_ms, width, height, timeout_s, interval_ms
     )
     started = time.monotonic()
-    result = _run(cfg, script, timeout_s=int(timeout_s) + 15, timing=timing)
-    elapsed_ms = int((time.monotonic() - started) * 1000)
-    _check_rc(result, "console wait_frame_stable")
-    _validate_vmid_hint(result, vm_name or ref.name)
+    # Whole-wait lock holding (issue #126 R3-01): see wait_frame_change —
+    # including the hint-derived lock key (PRR-002).
+    with _input_lock(_console_lock_ref(vm_name, ref)):
+        result = _run(cfg, script, timeout_s=int(timeout_s) + 15, timing=timing)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        _check_rc(result, "console wait_frame_stable")
+        _validate_vmid_hint(result, vm_name or ref.name)
 
-    stop_reason, polls, last_hash, stable_ms_reported, frame_b64 = "deadline", 0, "", None, ""
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("STOP="):
-            parts = dict(
-                kv.split("=", 1) for kv in line.split(" ") if "=" in kv
-            )
-            stop_reason = parts.get("STOP", "deadline")
-            polls = int(parts.get("POLLS", "0") or 0)
-            last_hash = parts.get("HASH", "")
-            stable_ms_reported = parts.get("STABLE_MS")
-        elif line.startswith("FRAME="):
-            frame_b64 = line[len("FRAME="):]
+        stop_reason, polls, last_hash, stable_ms_reported, frame_b64 = (
+            "deadline", 0, "", None, "")
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("STOP="):
+                parts = dict(
+                    kv.split("=", 1) for kv in line.split(" ") if "=" in kv
+                )
+                stop_reason = parts.get("STOP", "deadline")
+                polls = int(parts.get("POLLS", "0") or 0)
+                last_hash = parts.get("HASH", "")
+                stable_ms_reported = parts.get("STABLE_MS")
+            elif line.startswith("FRAME="):
+                frame_b64 = line[len("FRAME="):]
 
-    out: dict = {
-        "ok": True,
-        "vm_name": ref.name,
-        "stop_reason": stop_reason,
-        "stable": stop_reason == "stable",
-        "polls": polls,
-        "elapsed_ms": elapsed_ms,
-        "width": width,
-        "height": height,
-        "hash_domain": HASH_DOMAIN,
-        "timings": _ps_timings(timing),
-    }
-    if stable_ms_reported is not None:
-        out["stable_ms_measured"] = int(stable_ms_reported)
-    if last_hash:
-        out["frame_hash"] = last_hash
-    if frame_b64:
-        raw = base64.b64decode(frame_b64)
-        out["image"] = _decode_frame(raw, width, height)
-        out["frame_hash"] = _frame_hash(raw)
+        meta, _payload_line2, _all_values = _meta_lines(result)
+        head = _parse_head(meta)
+
+        out: dict = {
+            "ok": True,
+            "vm_name": ref.name,
+            "stop_reason": stop_reason,
+            "stable": stop_reason == "stable",
+            "polls": polls,
+            "elapsed_ms": elapsed_ms,
+            "width": width,
+            "height": height,
+            "hash_domain": HASH_DOMAIN,
+            "timings": _ps_timings(timing),
+        }
+        if stable_ms_reported is not None:
+            out["stable_ms_measured"] = int(stable_ms_reported)
+        if last_hash:
+            out["frame_hash"] = last_hash
+            rect = _register_captured_hash(
+                last_hash, head, width, height, ref,
+                meta.get("VMID", ""))
+            if head is not None:
+                out["head_resolution"] = {
+                    "horizontal": head[0], "vertical": head[1]}
+            if rect is not None:
+                out["content_rect"] = rect
+        if frame_b64:
+            raw = base64.b64decode(frame_b64)
+            out["image"] = _decode_frame(raw, width, height)
+            out["frame_hash"] = _frame_hash(raw)
     return out
 
 
@@ -2878,7 +3790,9 @@ def _wait_frame_stable_wmi(
     """wait_frame_stable over the in-process WMI backend: the same transition
     table as the PowerShell transport (first-poll window start, supplied
     baseline moves the window start to the first differing frame, quiet window
-    >= stable_ms -> stable, unchanged only with a never-differed baseline)."""
+    >= stable_ms -> stable, unchanged only with a never-differed baseline).
+    Issue #125: per-poll head read; issue #126 (R3-01): whole-wait input-lock
+    holding with the registration inside it."""
     max_polls = math.ceil(timeout_s * 1000 / interval_ms)
     phase_dicts: list[dict] = []
     stop_reason, polls = "deadline", 0
@@ -2891,6 +3805,7 @@ def _wait_frame_stable_wmi(
     last_change: float | None = None
     move_seen = False
     raw: bytes | None = None
+    head: tuple[int, int] | None = None
     started = time.monotonic()
     deadline_t = started + timeout_s
     # "unchanged" means "frames were observed and none moved away from the
@@ -2900,28 +3815,34 @@ def _wait_frame_stable_wmi(
             return "unchanged"
         return "deadline"
 
+    rect: list[int] | None = None
     try:
-        while polls < max_polls:
-            if time.monotonic() >= deadline_t:
-                stop_reason = _terminal()
-                break
-            raw, t = be.capture(ref.id, width, height)
-            phase_dicts.append(t)
-            polls += 1
-            now = time.monotonic()
-            h = _frame_hash(raw)
-            last_hash = h
-            if h != ref_hash:
-                ref_hash = h
-                last_change = now
-                move_seen = True
-            if last_change is not None and (now - last_change) * 1000 >= stable_ms:
-                stop_reason = "stable"
-                break
-            if polls >= max_polls or time.monotonic() >= deadline_t:
-                stop_reason = _terminal()
-                break
-            time.sleep(interval_ms / 1000)
+        with _input_lock(ref):
+            while polls < max_polls:
+                if time.monotonic() >= deadline_t:
+                    stop_reason = _terminal()
+                    break
+                raw, t = be.capture(ref.id, width, height)
+                phase_dicts.append(t)
+                head, _t_head = _be_head(be, ref.id)
+                polls += 1
+                now = time.monotonic()
+                h = _frame_hash(raw)
+                last_hash = h
+                if h != ref_hash:
+                    ref_hash = h
+                    last_change = now
+                    move_seen = True
+                if last_change is not None and (now - last_change) * 1000 >= stable_ms:
+                    stop_reason = "stable"
+                    break
+                if polls >= max_polls or time.monotonic() >= deadline_t:
+                    stop_reason = _terminal()
+                    break
+                time.sleep(interval_ms / 1000)
+            if last_hash:
+                rect = _register_captured_hash(
+                    str(last_hash), head, width, height, ref, ref.id)
     except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
         raise ConsoleError(str(exc)) from None
     elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -2939,6 +3860,11 @@ def _wait_frame_stable_wmi(
     }
     if last_hash:
         out["frame_hash"] = last_hash
+        if head is not None:
+            out["head_resolution"] = {
+                "horizontal": head[0], "vertical": head[1]}
+        if rect is not None:
+            out["content_rect"] = rect
     if stop_reason == "stable" and last_change is not None:
         out["stable_ms_measured"] = int((time.monotonic() - last_change) * 1000)
         if raw is not None:
@@ -2991,13 +3917,34 @@ def capture_sequence(
                 )
         h = _frame_hash(raw)
         changed_bytes = _changed_pixel_bytes(prev_raw, raw)
-        frames.append({
+        # Per-frame head provenance (issue #125): the folded capture script
+        # emits HEAD= per frame; content_rect joins the frame entry when the
+        # head is known (absent otherwise) and the hash auto-registers for
+        # citation at that frame's own head/rect.
+        head = _parse_head(meta)
+        rect = _content_rect(width, height, head)
+        frame_entry: dict = {
             "index": i,
             "vm_id": guid,
             "frame_hash": h,
             "changed_bytes_vs_previous": changed_bytes,
             "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-        })
+        }
+        if head is not None:
+            frame_entry["head_resolution"] = {
+                "horizontal": head[0], "vertical": head[1]}
+        if rect is not None:
+            frame_entry["content_rect"] = rect
+        frames.append(frame_entry)
+        register_capture(
+            h,
+            head_resolution=head,
+            content_rect=rect,
+            vm_name=ref.name,
+            vm_id=guid or "",
+            frame_size=(width, height),
+            shaped=False,
+        )
         if i == 0 or i == count - 1:
             images.append(_decode_frame(raw, width, height))
         prev_raw = raw
@@ -3021,7 +3968,9 @@ def _capture_sequence_wmi(
 ) -> dict:
     """capture_sequence over the in-process WMI backend, preserving the
     per-frame bookkeeping contract (exact changed-byte counts over
-    equal-length pixel slices, first-and-last-only images)."""
+    equal-length pixel slices, first-and-last-only images). Issue #125: the
+    head is read PER FRAME (the content_rect of each frame reflects the head
+    that frame was captured against) and each hash auto-registers."""
     frames: list[dict] = []
     images: list = []
     prev_raw: bytes | None = None
@@ -3031,15 +3980,32 @@ def _capture_sequence_wmi(
         for i in range(count):
             raw, t = be.capture(ref.id, width, height)
             phase_dicts.append(t)
+            head, _t_head = _be_head(be, ref.id)
             h = _frame_hash(raw)
             changed_bytes = _changed_pixel_bytes(prev_raw, raw)
-            frames.append({
+            rect = _content_rect(width, height, head)
+            frame_entry = {
                 "index": i,
                 "vm_id": ref.id,
                 "frame_hash": h,
                 "changed_bytes_vs_previous": changed_bytes,
                 "captured_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-            })
+            }
+            if head is not None:
+                frame_entry["head_resolution"] = {
+                    "horizontal": head[0], "vertical": head[1]}
+            if rect is not None:
+                frame_entry["content_rect"] = rect
+            frames.append(frame_entry)
+            register_capture(
+                h,
+                head_resolution=head,
+                content_rect=rect,
+                vm_name=ref.name,
+                vm_id=ref.id,
+                frame_size=(width, height),
+                shaped=False,
+            )
             if i == 0 or i == count - 1:
                 images.append(_decode_frame(raw, width, height))
             prev_raw = raw
@@ -3176,10 +4142,30 @@ def _validate_sequence_steps(
                 plan.append({"action": "mouse_positional", "x": int(x), "y": int(y),
                              "fw": fw, "fh": fh, "click": False, "button": 1})
             elif action == "click":
+                # NEW-14/PRR-003: the guard keys ride untyped list[dict]
+                # steps (pydantic covers only the envelope), so a truthy
+                # non-bool commit_guard must be a step-indexed refusal — a
+                # string "false" would otherwise silently ENABLE the guard.
+                raw_guard = step.get("commit_guard", False)
+                if not isinstance(raw_guard, bool):
+                    raise ValueError(
+                        f"commit_guard must be a boolean; got "
+                        f"{type(raw_guard).__name__} ({raw_guard!r})")
                 x, y = step.get("x"), step.get("y")
                 if x is None or y is None:
                     if x is not None or y is not None:
                         raise ValueError("x and y must be given together")
+                    if raw_guard or step.get("verified_frame_hash"):
+                        # Review round 2, Finding 2: a click-at-current-
+                        # position has no point to band-check or map through
+                        # the cited pixel domain, so the guard is NOT
+                        # supported there — fail CLOSED (a silently dropped
+                        # opt-in safety parameter is worse than a rejection).
+                        raise ValueError(
+                            "commit_guard/verified_frame_hash are "
+                            "not supported on a click step without x/y "
+                            "coordinates (click-at-current-position has no "
+                            "point to verify); give x/y or drop the guard")
                     _reject_non_int_button(step.get("button", 1))
                     button = step.get("button", 1)
                     if button not in (1, 2):
@@ -3199,15 +4185,44 @@ def _validate_sequence_steps(
                     if (fw or fh) and (fw <= 0 or fh <= 0):
                         raise ValueError(
                             "frame_width/frame_height must be positive when given")
+                    # Issue #126 (F3b): an opt-in commit guard on a click step.
+                    # The guarded click must be the FIRST EXECUTED step with NO
+                    # wait steps preceding it — a wait observes without input,
+                    # so the frame can change during it and a verification
+                    # taken before the wait proves nothing at dispatch.
+                    guard = raw_guard
+                    vhash = str(step.get("verified_frame_hash", "") or "")
+                    if not guard and vhash:
+                        raise ValueError(
+                            "verified_frame_hash requires commit_guard")
+                    if guard:
+                        if not re.fullmatch(r"[0-9a-f]{64}", vhash):
+                            raise ValueError(
+                                "commit_guard requires a 64-char hex "
+                                "verified_frame_hash")
+                        if i != 0:
+                            raise ValueError(
+                                "a guarded click must be the first executed "
+                                "step, with no (wait) steps preceding it")
                     plan.append({"action": "mouse_positional", "x": int(x), "y": int(y),
-                                 "fw": fw, "fh": fh, "click": True, "button": button})
+                                 "fw": fw, "fh": fh, "click": True, "button": button,
+                                 "commit_guard": guard,
+                                 "verified_frame_hash": vhash if guard else ""})
             elif action == "mouse_button":
                 _reject_non_int_button(step.get("button", 1))
                 button = step.get("button", 1)
                 if button not in (1, 2):
                     raise ValueError("button must be 1 (left) or 2 (right)")
+                # NEW-14: same strict-bool rule as commit_guard — is_down
+                # rides an untyped dict step, and a truthy string must not
+                # coerce into a button press.
+                raw_down = step.get("is_down", False)
+                if not isinstance(raw_down, bool):
+                    raise ValueError(
+                        f"is_down must be a boolean; got "
+                        f"{type(raw_down).__name__} ({raw_down!r})")
                 plan.append({"action": "button", "button": button,
-                             "is_down": bool(step.get("is_down", False))})
+                             "is_down": raw_down})
             elif action == "scroll":
                 if "delta" not in step:
                     raise ValueError("delta is required")
@@ -3298,27 +4313,79 @@ def _sequence_step_block(
             "ReturnValue=' + $r.ReturnValue) }",
         ]
     elif step["action"] == "mouse_positional":
-        body = [
-            "        $x = " + str(step["x"]),
-            "        $y = " + str(step["y"]),
-            "        $fw = " + str(step["fw"]),
-            "        $fh = " + str(step["fh"]),
-            "        if ((-not $vh) -or (-not $vh.CurrentHorizontalResolution) "
-            "-or (-not $vh.CurrentVerticalResolution)) { throw 'display head resolution "
-            "unavailable for positional mouse input' }",
-            "        $hw = $vh.CurrentHorizontalResolution",
-            "        $hv = $vh.CurrentVerticalResolution",
-            "        if ($fw -and $fh) {",
-            "            $hx = [math]::Round($x * $hw / $fw)",
-            "            $hy = [math]::Round($y * $hv / $fh)",
-            "        } else { $hx = $x; $hy = $y }",
-            "        $hx = [math]::Max(0, [math]::Min($hx, $hw - 1))",
-            "        $hy = [math]::Max(0, [math]::Min($hy, $hv - 1))",
-            "        $r0 = Invoke-CimMethod -InputObject $m -MethodName SetAbsolutePosition "
-            "-ErrorAction Stop -Arguments @{ HorizontalPosition = $hx; VerticalPosition = $hy }",
-            "        if ($r0.ReturnValue -ne 0) { throw ('SetAbsolutePosition failed with "
-            "ReturnValue=' + $r0.ReturnValue) }",
-        ]
+        # Issue #125: the sequence-step mapper is independent of the
+        # single-op template above, so it carries its OWN copy of the
+        # rect-relative arithmetic + band refusal — emitted ONLY when the
+        # step carries a cited content_rect, so an unguarded plan's script
+        # stays byte-identical to the pre-#125 shape (issue #81's
+        # command-line budget gate measures exact script length). PRR-028:
+        # a step carrying a cited head_resolution ALSO compares it against
+        # the live head in-script, BEFORE SetAbsolutePosition — pixels
+        # unchanged across a head change must not map stale geometry.
+        rect = step.get("content_rect")
+        cited_head = step.get("cited_head")
+        head_compare: list[str] = []
+        if cited_head is not None:
+            head_compare = [
+                "        if (($hw -ne " + str(int(cited_head[0])) + ") -or ($hv -ne "
+                + str(int(cited_head[1])) + ")) { throw 'stale frame: the "
+                "cited capture was taken at head " + str(int(cited_head[0])) + "x"
+                + str(int(cited_head[1])) + " but the current head is ' + $hw "
+                "+ ' x ' + $hv }",
+            ]
+        if rect is not None:
+            body = [
+                "        $x = " + str(step["x"]),
+                "        $y = " + str(step["y"]),
+                "        $fw = " + str(step["fw"]),
+                "        $fh = " + str(step["fh"]),
+                "        if ((-not $vh) -or (-not $vh.CurrentHorizontalResolution) "
+                "-or (-not $vh.CurrentVerticalResolution)) { throw 'display head resolution "
+                "unavailable for positional mouse input' }",
+                "        $hw = $vh.CurrentHorizontalResolution",
+                "        $hv = $vh.CurrentVerticalResolution",
+                *head_compare,
+                "        $bandl = " + str(int(rect[0])),
+                "        $bandt = " + str(int(rect[1])),
+                "        $bandr = " + str(int(rect[2])),
+                "        $bandb = " + str(int(rect[3])),
+                "        if ((($x -ge 0) -and ($y -ge 0) -and (($fw -eq 0) -or "
+                "($x -lt $fw)) -and (($fh -eq 0) -or ($y -lt $fh))) -and ((($x -lt "
+                "$bandl) -or ($x -ge $bandr) -or ($y -lt $bandt) -or ($y -ge "
+                "$bandb)))) { throw 'letterbox band point refused: frame "
+                "coordinates inside the letterbox bands have no head-space meaning' }",
+                "        $hx = [math]::Round(($x - $bandl) * $hw / ($bandr - $bandl))",
+                "        $hy = [math]::Round(($y - $bandt) * $hv / ($bandb - $bandt))",
+                "        $hx = [math]::Max(0, [math]::Min($hx, $hw - 1))",
+                "        $hy = [math]::Max(0, [math]::Min($hy, $hv - 1))",
+                "        $r0 = Invoke-CimMethod -InputObject $m -MethodName SetAbsolutePosition "
+                "-ErrorAction Stop -Arguments @{ HorizontalPosition = $hx; VerticalPosition = $hy }",
+                "        if ($r0.ReturnValue -ne 0) { throw ('SetAbsolutePosition failed with "
+                "ReturnValue=' + $r0.ReturnValue) }",
+            ]
+        else:
+            body = [
+                "        $x = " + str(step["x"]),
+                "        $y = " + str(step["y"]),
+                "        $fw = " + str(step["fw"]),
+                "        $fh = " + str(step["fh"]),
+                "        if ((-not $vh) -or (-not $vh.CurrentHorizontalResolution) "
+                "-or (-not $vh.CurrentVerticalResolution)) { throw 'display head resolution "
+                "unavailable for positional mouse input' }",
+                "        $hw = $vh.CurrentHorizontalResolution",
+                "        $hv = $vh.CurrentVerticalResolution",
+                *head_compare,
+                "        if ($fw -and $fh) {",
+                "            $hx = [math]::Round($x * $hw / $fw)",
+                "            $hy = [math]::Round($y * $hv / $fh)",
+                "        } else { $hx = $x; $hy = $y }",
+                "        $hx = [math]::Max(0, [math]::Min($hx, $hw - 1))",
+                "        $hy = [math]::Max(0, [math]::Min($hy, $hv - 1))",
+                "        $r0 = Invoke-CimMethod -InputObject $m -MethodName SetAbsolutePosition "
+                "-ErrorAction Stop -Arguments @{ HorizontalPosition = $hx; VerticalPosition = $hy }",
+                "        if ($r0.ReturnValue -ne 0) { throw ('SetAbsolutePosition failed with "
+                "ReturnValue=' + $r0.ReturnValue) }",
+            ]
         if step["click"]:
             body += [
                 "        $r = Invoke-CimMethod -InputObject $m -MethodName ClickButton "
@@ -3623,16 +4690,104 @@ def _parse_sequence_steps(stdout: str) -> list[dict]:
     return steps
 
 
+def _assert_point_in_rect(x: int, y: int, rect: list[int] | None) -> None:
+    """Host-side band-membership rule shared by _scale_to_head and the
+    sequence guard's plan-build validation (review round 1, Finding 1): a
+    point outside the content rect is refused BEFORE any input dispatch so
+    a refused guard step never bumps the ledger or spawns a script. This
+    gate is deliberately STRICTER than _scale_to_head for out-of-frame
+    points: the mapper clamps them (its band refusal is conditional on the
+    point being in-frame), while a GUARDED step refuses any out-of-rect
+    coordinate before dispatch — an out-of-frame coordinate on a commit
+    action is caller error, so fail closed (review round 3 question,
+    resolved as intended-stricter). A rect-less citation is a no-op
+    (review round 2, Finding 1): the mapping keeps the anchor's full-frame
+    fallback, exactly like _scale_to_head with no rect."""
+    if rect is None:
+        # A rect-less citation keeps the anchor's full-frame mapping (the
+        # same fallback _scale_to_head applies), so there is nothing to
+        # refuse here.
+        return
+    left, top, right, bottom = rect
+    if x < left or x >= right or y < top or y >= bottom:
+        raise ConsoleError(
+            f"letterbox band point refused: ({x}, {y}) is outside the cited "
+            f"capture's content rect {rect}; it has no head-space meaning"
+        )
+
+
+def _sequence_guard_prepare(
+    ref: vmident.VMRef, verified_frame_hash: str, width: int, height: int,
+) -> dict:
+    """Plan-build-time guard validation for a sequence click step (F3b):
+    the cited verification must be a registered, UNSHAPED capture of THIS VM
+    whose registered frame_size, WHEN RECORDED, is exactly the sequence's
+    (width, height) — a size-less citation (frame_size None, e.g. an
+    explicitly registered out-of-band capture) falls through to the
+    sequence's precondition capture, the same None fallback the single-click
+    path's _commit_guard_record pins. Pixel-domain alignment when recorded:
+    the sequence's expect_frame_hash precondition capture (which must equal
+    the cited hash, checked by run_sequence) hashes the sequence size.
+    Returns the record so its content_rect threads into the step's
+    mapping."""
+    record = _lookup_capture(
+        verified_frame_hash, _ledger_key(ref.name, ref.id))
+    if record is None:
+        raise ConsoleError(
+            "commit_unverified: the cited verification is unknown to this "
+            "server process's capture registry for that VM"
+        )
+    if record["shaped"]:
+        raise ConsoleError(
+            "shaped frame has no head-space mapping; cite an unshaped capture"
+        )
+    if record["frame_size"] is not None and record["frame_size"] != (width, height):
+        raise ConsoleError(
+            "commit_unverified: the cited verification was registered at "
+            f"{record['frame_size'][0]}x{record['frame_size'][1]}, not the "
+            f"sequence's {width}x{height} pixel domain (expect_frame_hash "
+            "captures at the sequence size)"
+        )
+    return record
+
+
+def _sequence_guard_dispatch_check(
+    ref: vmident.VMRef, verified_frame_hash: str,
+) -> None:
+    """Freshness re-check at dispatch, under the sequence lock (F3b): the
+    plan was built milliseconds ago, but the property that matters — no
+    input dispatched since the verification — is checked as late as
+    possible. PRR-004: this is the freshness leg ONLY — the ALLOW audit
+    lands in run_sequence after the in-script preconditions passed and the
+    plan's own result parsed ok, so a refused precondition or a failed
+    guarded step never leaves an allow-shaped audit row."""
+    record = _lookup_capture(
+        verified_frame_hash, _ledger_key(ref.name, ref.id))
+    if record is None:
+        raise ConsoleError(
+            "commit_unverified: the cited verification is unknown to this "
+            "server process's capture registry for that VM"
+        )
+    _commit_guard_freshness(record)
+
+
 def _run_sequence_wmi(
     be, connect_ms: float, ref: vmident.VMRef, plan: list[dict],
     expect_frame_hash: str, expect_boot_epoch: int | None,
     timeout_s: int, width: int, height: int,
+    guard_verified_hash: str = "",
 ) -> dict:
     """run_sequence over the in-process WMI backend: the same contract as the
     folded script — ONE lock acquisition spanning the boot-epoch read, the
     preconditions, and every step (nothing a raw input could do can slip
     between a passed precondition and the first input), per-step results,
-    stop-on-failure."""
+    stop-on-failure. A guarded click step (F3b) re-checks freshness inside
+    that lock right after the frame precondition matched — the precondition
+    capture IS the guard's live-frame verification — and compares the cited
+    record's head against the live head before the step dispatches (PRR-028,
+    parity with the single-click path and the PS lane's in-script compare).
+    Its ALLOW audit is step-gated exactly like the PS lane's (PRR-018): the
+    row lands only when the guarded step's parsed entry is ok."""
     started = time.monotonic()
     phase_dicts: list[dict] = []
     steps_out: list[dict] = []
@@ -3662,8 +4817,36 @@ def _run_sequence_wmi(
                         "frame_hash": actual, "hash_domain": HASH_DOMAIN,
                         "timings": _wmi_timings(connect_ms, *phase_dicts),
                     }
+                if guard_verified_hash:
+                    # The precondition capture just matched the cited hash —
+                    # the guard's live-frame leg — so the head compare and
+                    # freshness remain.
+                    record = _lookup_capture(
+                        guard_verified_hash, _ledger_key(ref.name, ref.id))
+                    if record is None:
+                        raise ConsoleError(
+                            "commit_unverified: the cited verification is "
+                            "unknown to this server process's capture registry "
+                            "for that VM"
+                        )
+                    # PRR-028 (review round 2, F1): the cited record's head
+                    # must match the LIVE head before the guarded positional
+                    # step dispatches — parity with the single-click path's
+                    # _check_cited_head and the PS lane's in-script
+                    # %CITEDHEAD compare (kept there). Both heads known and
+                    # differing refuses with the same "stale frame" wording
+                    # and zero device input; an unknown head on either side
+                    # falls through to the step's own head-unavailable error.
+                    guard_head, _t = _be_head(be, ref.id)
+                    _check_cited_head(record, guard_head)
+                    _commit_guard_freshness(record)
             for i, step in enumerate(plan):
                 try:
+                    # The input bump moved INTO _sequence_wmi_step (review
+                    # round 1, Finding 1): a step refused by its own
+                    # validation (band point, unknown key name, …) dispatches
+                    # no device call and must not stale a later guard — the
+                    # bump lands only where a device call is about to go out.
                     _r, t = _sequence_wmi_step(be, ref, step, width, height)
                 except (ConsoleError, wmiconsole.WMIError,
                         wmiconsole.BackendUnavailable) as exc:
@@ -3684,6 +4867,17 @@ def _run_sequence_wmi(
                     break
     except (wmiconsole.WMIError, wmiconsole.BackendUnavailable) as exc:
         raise ConsoleError(str(exc)) from None
+    if guard_verified_hash:
+        # PRR-018 (review round 2, F4): the WMI lane's ALLOW audit is
+        # step-gated exactly like the PS lane's (PRR-004) — the row lands
+        # only when the guarded step's parsed entry is ok (plan index 0 by
+        # the plan-shape rule), never on a precondition refusal or a
+        # failed/skipped guarded step. It may sit outside the lock: the
+        # audit does not guard freshness.
+        guard_entry = next(
+            (e for e in steps_out if e.get("index") == 0), None)
+        if guard_entry is not None and guard_entry.get("ok"):
+            _audit_commit_guard(ref.name)
     out: dict = {
         "ok": True, "vm_name": ref.name,
         "steps": steps_out,
@@ -3701,28 +4895,39 @@ def _sequence_wmi_step(be, ref: vmident.VMRef, step: dict, width: int, height: i
     state machine shape; deadline is a reported stop reason, not a failure."""
     action = step["action"]
     if action == "codes":
+        _bump_input(ref)
         _r, t = be.type_scancodes(ref.id, step["codes"])
         return {"ok": True}, t
     if action == "text":
+        _bump_input(ref)
         _r, t = be.type_text(ref.id, step["text"])
         return {"ok": True}, t
     if action == "mouse_positional":
         head, t_head = be.head_resolution(ref.id)
         # head resolution refusal lives in _scale_to_head (single guard for
-        # every call site, including this lane).
-        hx, hy = _scale_to_head(step["x"], step["y"], step["fw"], step["fh"], head)
+        # every call site, including this lane); a guarded click step threads
+        # its cited content_rect through the same rect-relative mapping. The
+        # input bump lands AFTER _scale_to_head succeeds — a band-refused
+        # step dispatches nothing and must not stale a later guard.
+        hx, hy = _scale_to_head(
+            step["x"], step["y"], step["fw"], step["fh"], head,
+            content_rect=step.get("content_rect"))
+        _bump_input(ref)
         _r, t = be.mouse_move(ref.id, hx, hy)
         if step["click"]:
             _r2, t2 = be.mouse_click(ref.id, step["button"], hx, hy)
             return {"ok": True, "head_x": hx, "head_y": hy}, {**t_head, **t2}
         return {"ok": True, "head_x": hx, "head_y": hy}, {**t_head, **t}
     if action == "mouse_click_here":
+        _bump_input(ref)
         _r, t = be.mouse_click(ref.id, step["button"])
         return {"ok": True}, t
     if action == "button":
+        _bump_input(ref)
         _r, t = be.mouse_button(ref.id, step["button"], step["is_down"])
         return {"ok": True}, t
     if action == "scroll":
+        _bump_input(ref)
         _r, t = be.mouse_scroll(ref.id, step["delta"])
         return {"ok": True}, t
     # wait_stable: poll be.capture under the same in-lock region, mirroring
@@ -3815,6 +5020,22 @@ def run_sequence(
     if not (160 <= width <= 4096 and 160 <= height <= 4096):
         raise ValueError("width/height must be within 160..4096")
     plan = _validate_sequence_steps(steps or [], timeout_s)
+    # Issue #126 (F3b): a guarded click step REQUIRES the composition
+    # expect_frame_hash == verified_frame_hash — the sequence's precondition
+    # capture is the guard's live-frame verification, so the guard adds no
+    # capture of its own inside the plan.
+    guard_step = next((s for s in plan if s.get("commit_guard")), None)
+    if guard_step is not None and expect_frame_hash != guard_step["verified_frame_hash"]:
+        raise ValueError(
+            "a guarded click step requires expect_frame_hash equal to its "
+            "verified_frame_hash (the precondition capture IS the live-frame "
+            "verification of the guard)")
+    if guard_step is not None and (
+            guard_step.get("fw") != width or guard_step.get("fh") != height):
+        raise ValueError(
+            "a guarded click step must carry frame_width/frame_height equal to "
+            "the sequence's width/height (the guard maps the step's coordinates "
+            "through the cited verification's pixel domain)")
     if request_key:
         recorded = _lookup_unknown(request_key)
         if recorded is not None:
@@ -3828,18 +5049,59 @@ def run_sequence(
             be = None
         if be is not None:
             assert ref_wmi is not None
+            if guard_step is not None:
+                guard_record = _sequence_guard_prepare(
+                    ref_wmi, guard_step["verified_frame_hash"], width, height)
+                guard_step["content_rect"] = guard_record["content_rect"]
+                _assert_point_in_rect(
+                    guard_step["x"], guard_step["y"],
+                    guard_step["content_rect"])
             return _run_sequence_wmi(
                 be, connect_ms, ref_wmi, plan, expect_frame_hash,
-                expect_boot_epoch, timeout_s, width, height)
+                expect_boot_epoch, timeout_s, width, height,
+                guard_verified_hash=(
+                    guard_step["verified_frame_hash"] if guard_step else ""))
     timing = _PsTiming()
     prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing, guarded=True)
+    if guard_step is not None:
+        guard_record = _sequence_guard_prepare(
+            ref, guard_step["verified_frame_hash"], width, height)
+        guard_step["content_rect"] = guard_record["content_rect"]
+        guard_step["cited_head"] = guard_record["head_resolution"]
+        _assert_point_in_rect(
+            guard_step["x"], guard_step["y"], guard_step["content_rect"])
     started = time.monotonic()
     remote = pswindows.hyperv_host(cfg) is not None
     script = _sequence_script(
         cfg, prelude, plan, expect_frame_hash, expect_boot_epoch, timeout_s,
         width, height, remote)
     text_payloads = [pswindows.utf8_b64(s["text"]) for s in plan if s["action"] == "text"]
+    # PRR-017: the ledger bump is decided AFTER the result is parsed, and
+    # (review round 2, F2) the parse AND the bump run INSIDE the held input
+    # lock — the bump lands BEFORE the lock releases. Parsing outside the
+    # lock opened a freshness window: a guarded click on the same VM racing
+    # the parse saw a ledger the about-to-land bump had not reached yet and
+    # allowed against it. A plan the in-script precondition refused
+    # dispatched no input and must not stale a later guard; a wait-only plan
+    # dispatches no input at all. An ok result and a timed-out leg (delivery
+    # unknowable) bump — the conservative answer (see the module ledger
+    # comment above for the full rule).
+    has_input_steps = any(s["action"] != "wait_stable" for s in plan)
+
+    def _bump_if_input_plan() -> None:
+        if has_input_steps:
+            _bump_input(ref)
+
+    steps_out: list[dict] = []
+    boot_epoch = None
     with _input_lock(ref):
+        if guard_step is not None:
+            # Freshness re-check at dispatch, under the sequence lock; the
+            # in-script expect_frame_hash precondition is the live-frame leg
+            # (PRR-004: the ALLOW audit moved past the result parse below —
+            # a refused precondition writes no allow-shaped row).
+            _sequence_guard_dispatch_check(
+                ref, guard_step["verified_frame_hash"])
         result = _run(
             cfg, script,
             timeout_s=timeout_s + 15,
@@ -3847,58 +5109,71 @@ def run_sequence(
             payload_lines=len(text_payloads),
             timing=timing,
         )
-    if result.timed_out:
-        out: dict = {
-            "ok": False, "error_class": "unknown", "vm_name": ref.name,
-            "steps": _parse_sequence_steps(result.stdout or ""),
-            "note": ("the sequence leg timed out after input may have been sent; "
-                     "whether the guest received the plan is unknowable — never "
-                     "automatically replayed; a new plan requires a fresh explicit "
-                     "request and precondition"),
-            "elapsed_ms": int((time.monotonic() - started) * 1000),
-            "timings": _ps_timings(timing),
-        }
-        if request_key:
-            _record_unknown(request_key, out)
-        return out
-    if result.returncode not in (0, None):
-        stderr = result.stderr or ""
-        if "console sequence precondition mismatch" in stderr:
-            kind = "boot_epoch" if "boot_epoch expected" in stderr else "frame_hash"
-            actual = ""
-            match = re.search(r"actual (\S+)", stderr)
-            if match:
-                actual = match.group(1)
-            env: dict = {
-                "ok": False, "error_class": "precondition", "steps": [],
-                "vm_name": ref.name, "precondition": kind,
+        if result.timed_out:
+            steps_out = _parse_sequence_steps(result.stdout or "")
+            _bump_if_input_plan()
+            out: dict = {
+                "ok": False, "error_class": "unknown", "vm_name": ref.name,
+                "steps": steps_out,
+                "note": ("the sequence leg timed out after input may have been sent; "
+                         "whether the guest received the plan is unknowable — never "
+                         "automatically replayed; a new plan requires a fresh explicit "
+                         "request and precondition"),
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
                 "timings": _ps_timings(timing),
             }
-            if kind == "frame_hash":
-                env["frame_hash"] = actual
-                env["hash_domain"] = HASH_DOMAIN
-            else:
-                with_suppress = None
-                try:
-                    with_suppress = int(actual)
-                except ValueError:
-                    pass
-                env["boot_epoch"] = with_suppress
-            return env
-        _check_input_rc(result, "console sequence", vm_name)
-    meta, _payload, _all_values = _meta_lines(result)
-    if "VMID" in meta:
-        guid = _parse_guid(meta, vm_name or ref.name)
-        note_name_guid_hint(vm_name or ref.name, guid)
-    boot_epoch = None
-    if meta.get("EPOCH"):
-        try:
-            boot_epoch = int(meta["EPOCH"])
-        except ValueError:
-            boot_epoch = None
-    steps_out = _parse_sequence_steps(result.stdout or "")
-    if not steps_out:
-        steps_out = [{"index": i, "ok": True} for i in range(len(plan))]
+            if request_key:
+                _record_unknown(request_key, out)
+            return out
+        if result.returncode not in (0, None):
+            stderr = result.stderr or ""
+            if "console sequence precondition mismatch" in stderr:
+                kind = "boot_epoch" if "boot_epoch expected" in stderr else "frame_hash"
+                actual = ""
+                match = re.search(r"actual (\S+)", stderr)
+                if match:
+                    actual = match.group(1)
+                env: dict = {
+                    "ok": False, "error_class": "precondition", "steps": [],
+                    "vm_name": ref.name, "precondition": kind,
+                    "timings": _ps_timings(timing),
+                }
+                if kind == "frame_hash":
+                    env["frame_hash"] = actual
+                    env["hash_domain"] = HASH_DOMAIN
+                else:
+                    with_suppress = None
+                    try:
+                        with_suppress = int(actual)
+                    except ValueError:
+                        pass
+                    env["boot_epoch"] = with_suppress
+                return env
+            _check_input_rc(result, "console sequence", vm_name)
+        meta, _payload, _all_values = _meta_lines(result)
+        if "VMID" in meta:
+            guid = _parse_guid(meta, vm_name or ref.name)
+            note_name_guid_hint(vm_name or ref.name, guid)
+        boot_epoch = None
+        if meta.get("EPOCH"):
+            try:
+                boot_epoch = int(meta["EPOCH"])
+            except ValueError:
+                boot_epoch = None
+        steps_out = _parse_sequence_steps(result.stdout or "")
+        if not steps_out:
+            steps_out = [{"index": i, "ok": True} for i in range(len(plan))]
+        _bump_if_input_plan()
+    # The ALLOW audit stays after the lock: it does not guard freshness.
+    if guard_step is not None:
+        # PRR-004: audit the guard's allow only now — the in-script
+        # preconditions passed AND the guarded click's own step parsed OK.
+        # A precondition refusal (returned above) and a failed or skipped
+        # guarded step write no allow-shaped row.
+        guard_entry = next(
+            (e for e in steps_out if e.get("index") == 0), None)
+        if guard_entry is not None and guard_entry.get("ok"):
+            _audit_commit_guard(ref.name)
     return {
         "ok": True, "vm_name": ref.name,
         **({"boot_epoch": boot_epoch} if boot_epoch is not None else {}),

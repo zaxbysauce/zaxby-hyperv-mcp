@@ -1659,7 +1659,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
     @mcp.tool()
     def hyperv_console_screenshot(
-        vm_name: str = "", width: int = 1024, height: int = 768, save_path: str = "",
+        vm_name: str = "", width: int = 1024, height: int = 0, save_path: str = "",
         vm_id: str = "", format: str = "", quality: int | None = None,
         scale: float | None = None, crop: list[int] | None = None,
         if_changed_from: str = "",
@@ -1668,6 +1668,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         WinPE; independent of VMConnect, host foreground, guest login/network).
         Returns MCP image content plus a metadata text block:
         vm_id, dimensions, frame_hash, head resolution and scale note,
+        content_rect (the non-letterbox pixels, when the head is known),
         fallback_used, capture method, and timing — the per-call cost
         breakdown (lock_wait_ms, ps_ms, ps_spawns, total_ms; the guest-marker
         trio ps_startup_ms/psdirect_session_ms/guest_ms stays null on console
@@ -1679,7 +1680,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_name:  VM name (must match allowed_vm_patterns)
             vm_id:    Optional VM GUID; exactly one of vm_name/vm_id must be given
             width:    requested snapshot width (160..4096)
-            height:   requested snapshot height (160..4096)
+            height:   requested snapshot height (160..4096), or 0 (the default)
+                      to capture at the head's aspect for the width (issue #125;
+                      e.g. width=1024 at a 1920x1080 head captures 1024x576,
+                      which is band-free)
             save_path: optional host path to also save the image (host_write policy);
                       the bytes written are exactly the bytes returned
             format:   png (default), jpeg/jpg, or webp; an unsupported format is
@@ -1868,6 +1872,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_console_mouse_move(
         vm_name: str = "", x: int | None = None, y: int | None = None,
         frame_width: int = 0, frame_height: int = 0, vm_id: str = "",
+        frame_hash: str = "",
         lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Position the synthetic mouse. Coordinates are in the space of the
@@ -1882,11 +1887,20 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
 
         Args:
-            vm_name: Name of the VM (must match allowed_vm_patterns)
+            vm_name: VM name (must match allowed_vm_patterns)
             x: Click X in the coordinate space of the observed frame (optional)
             y: Click Y in the coordinate space of the observed frame (optional)
             frame_width: Frame width the coordinates were observed at (scales them)
             frame_height: Frame height the coordinates were observed at (scales them)
+            frame_hash: Optional frame_hash of the capture the coordinates were
+                        observed on (issue #125): resolves against the server's
+                        capture registry, refuses when the capture was taken at a
+                        different head resolution ("stale frame"), maps through the
+                        capture's content_rect (a point inside a letterbox band is
+                        refused), and refuses shaped (cropped/scaled) captures.
+                        When frame_width/frame_height are omitted they default
+                        from the cited record's frame_size (a record without one
+                        refuses naming the requirement)
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
             lease_id: Optional lease citation - the lease gate runs before the body
             fencing_token: The lease's fencing token, with lease_id
@@ -1896,14 +1910,16 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         return _run_console_tool(
             "hyperv_console_mouse_move", vm_name, "console_input",
             console.mouse_move, _cfg(), vm_name, x, y, frame_width, frame_height,
-            vm_id=vm_id,
+            vm_id=vm_id, frame_hash=frame_hash,
         )
 
     @mcp.tool()
     def hyperv_console_click(
         vm_name: str = "", x: int | None = None, y: int | None = None,
         frame_width: int = 0, frame_height: int = 0, button: int = 1,
-        vm_id: str = "", lease_id: str = "", fencing_token: int = 0,
+        vm_id: str = "", frame_hash: str = "",
+        commit_guard: bool = False, verified_frame_hash: str = "",
+        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Click at frame-space coordinates (optional; positions first when
         both x/y are given — (0,0) is a real coordinate and moves the pointer
@@ -1920,12 +1936,34 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         a fixed sleep so the UI transition is allowed to finish.
 
         Args:
-            vm_name: Name of the VM (must match allowed_vm_patterns)
+            vm_name: VM name (must match allowed_vm_patterns)
             x: Click X in the coordinate space of the observed frame (optional)
             y: Click Y in the coordinate space of the observed frame (optional)
             frame_width: Frame width the coordinates were observed at (scales them)
             frame_height: Frame height the coordinates were observed at (scales them)
             button: Button number (1=left, 2=right)
+            frame_hash: Optional frame_hash of the capture the coordinates were
+                        observed on (issue #125): resolves against the server's
+                        capture registry, refuses when the capture was taken at a
+                        different head resolution ("stale frame"), maps through the
+                        capture's content_rect (a point inside a letterbox band is
+                        refused), and refuses shaped (cropped/scaled) captures.
+                        When frame_width/frame_height are omitted they default
+                        from the cited record's frame_size (a record without one
+                        refuses naming the requirement)
+            commit_guard: Opt-in commit guard (issue #126): the click verifies a
+                        cited FRESH capture before committing — no console input
+                        to THAT VM dispatched through this server process since
+                        the capture (a per-VM ledger, still per-process across
+                        processes), and the live frame hash at the cited pixel
+                        domain still matches (the domain defaults from the cited
+                        record's frame_size like frame_hash above). Requires x/y
+                        coordinates — a click-at-current-position has no point to
+                        verify and is refused. Refusals are structured errors and
+                        send no mouse input; an allowed guard is audited
+            verified_frame_hash: The commit guard's verification: the frame_hash
+                        of a capture taken AFTER the most recent input (e.g. the
+                        selection screenshot), required when commit_guard is true
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
             lease_id: Optional lease citation - the lease gate runs before the body
             fencing_token: The lease's fencing token, with lease_id
@@ -1938,7 +1976,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         return _run_console_tool(
             "hyperv_console_click", vm_name, "console_input",
             console.click, _cfg(), vm_name, x, y, frame_width, frame_height, button,
-            vm_id=vm_id,
+            vm_id=vm_id, frame_hash=frame_hash,
+            commit_guard=commit_guard, verified_frame_hash=verified_frame_hash,
         )
 
     @mcp.tool()
@@ -2152,7 +2191,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         script), {"action": "type_scancodes", "scancodes"},
         {"action": "mouse_move", "x", "y", "frame_width"?, "frame_height"?},
         {"action": "click", "x"?, "y"?, "frame_width"?, "frame_height"?,
-        "button"?}, {"action": "mouse_button", "button", "is_down"},
+        "button"?, "commit_guard"?, "verified_frame_hash"?} (x/y are required when commit_guard=true; a guarded click
+        step — commit_guard=true — must be the FIRST step (plan index 0; a preceding wait step is also refused), must carry
+        frame_width/frame_height equal to the sequence's width/height, and
+        requires expect_frame_hash equal to its verified_frame_hash; the
+        sequence's precondition capture IS the guard's live-frame
+        verification), {"action": "mouse_button", "button", "is_down"},
         {"action": "scroll", "delta"}, {"action": "wait_frame_stable",
         "stable_ms", "timeout_s"?, "interval_ms"?, "baseline_hash"?} (in-sequence
         wait steps accept interval_ms >= 1; the call timeout_s bounds the whole
