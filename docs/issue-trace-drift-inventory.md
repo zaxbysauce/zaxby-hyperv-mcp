@@ -35,11 +35,11 @@ docs/rebaseline-runbook.md).
 | 55-108-31-32-33-collated | 14 | 14 | 0 | clean |
 | 59-64-68-70-hardening-wave | 15 | 15 | 0 | clean |
 | 6-guest-put-get-policy | 13 | 13 | 0 | clean |
-| 63-66-119-collated | 12 | 10 | 2 | exit 1 |
+| 63-66-119-collated | 0 | 0 | 0 | exit 2 |
 | 64-68-collated | 11 | 11 | 0 | clean |
 | 67-118-release-vendor-provenance | 10 | 10 | 0 | clean |
 | 7-guest-jobs-truthful-reporting | 13 | 13 | 0 | clean |
-| 74-72-88-cost-latency-accounting | 17 | 13 | 4 | exit 1 |
+| 74-72-88-cost-latency-accounting | 17 | 17 | 0 | clean |
 | 75-76-78-81-83-84-collated | 26 | 26 | 0 | clean |
 | 77-28-console-actor-batched-sequences | 18 | 18 | 0 | clean |
 | 8-vm-guid-identity | 11 | 11 | 0 | clean |
@@ -52,18 +52,7 @@ docs/rebaseline-runbook.md).
 
 ## Drift detail (CHANGED pairs)
 
-### 63-66-119-collated (exit 1)
-
-- `CHANGED .agents/issue-traces/issue-16-tool-concurrency/repro/checkpoint.manifest c03e291b101a6f62b7d0e3f8ff09b1e18c82fb75 496aee69699a851e1ccfa6a0aefc47c6e1df9e23 (C7)`
-- `CHANGED docs/issue-trace-drift-inventory.md 9d4e37790ead8f64943a2ba9a78acfa1e0ad3855 ca12e339c07b83b68416de5105c9ca846bdd19ce (C8)`
-
-### 74-72-88-cost-latency-accounting (exit 1)
-
-- `CHANGED src/hyperv_mcp/console.py 26180d7f1186d8d40d50132d5511b33feec57f59 3faf9a57206ae8610545efd71e7c27473335b2d3 (C1)`
-- `CHANGED src/hyperv_mcp/console.py 26180d7f1186d8d40d50132d5511b33feec57f59 3faf9a57206ae8610545efd71e7c27473335b2d3 (C5)`
-- `CHANGED src/hyperv_mcp/server.py 0c62c67f77c006ea6b3fc68e306286fac3391fd5 1a572fc67bbc426f26594ef2133251ff53c14fda (C10)`
-- `CHANGED README.md 1106af609a57654503a5fa0c83b556033b35af6b 940ac63285cb96ee2d8936138a6420b4bd8b3d08 (C10)`
-
+None — every frozen pair verifies OK at the current tree.
 <!-- regenerated-state-end -->
 
 ## Discovery snapshot (recorded 2026-11-05, base 8bc60cb7196ae128231c25a15881cded26b0afda)
