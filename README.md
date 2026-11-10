@@ -264,8 +264,8 @@ the task-spawned controller reads it from the environment.
   input to a VM with a wait in flight now raises VMBusy instead of
   interleaving. Disclosed residual: the freshness leg is per-server-process
   (the live-frame hash check is transport-fresh and catches any visible
-  cross-process change); a UIA state-receipt channel is split to a follow-up
-  issue tracked on #126.
+  cross-process change); a UIA state-receipt channel is split to the
+  follow-up issue #140.
 - **Review-feedback hardening round (#125/#126):** sequence steps carrying
   `commit_guard` or `is_down` must be real booleans (a truthy non-bool is a
   step-indexed validation refusal — a string "false" must not silently
