@@ -35,7 +35,7 @@ docs/rebaseline-runbook.md).
 | 55-108-31-32-33-collated | 14 | 14 | 0 | clean |
 | 59-64-68-70-hardening-wave | 15 | 15 | 0 | clean |
 | 6-guest-put-get-policy | 13 | 13 | 0 | clean |
-| 63-66-119-collated | 0 | 0 | 0 | exit 2 |
+| 63-66-119-collated | 13 | 10 | 3 | exit 1 |
 | 64-68-collated | 11 | 11 | 0 | clean |
 | 67-118-release-vendor-provenance | 10 | 10 | 0 | clean |
 | 7-guest-jobs-truthful-reporting | 13 | 13 | 0 | clean |
@@ -52,7 +52,12 @@ docs/rebaseline-runbook.md).
 
 ## Drift detail (CHANGED pairs)
 
-None — every frozen pair verifies OK at the current tree.
+### 63-66-119-collated (exit 1)
+
+- `CHANGED .agents/issue-traces/74-72-88-cost-latency-accounting/repro/checkpoint.manifest eb8f6fc5ce2a0a2f6740de8522f86e0ae147448c a42e447d01a06c695872d1b0f3b570f18ce054fb (C9)`
+- `CHANGED .agents/issue-traces/74-72-88-cost-latency-accounting/repro/checkpoint.manifest eb8f6fc5ce2a0a2f6740de8522f86e0ae147448c a42e447d01a06c695872d1b0f3b570f18ce054fb (C10)`
+- `CHANGED scripts/gen_trace_drift_inventory.py 39f851daba8e3744c1b133332b693fe2ba4652ca0703feb145bb3efb9b92db8fc483ad780b2c7bd4 39f851daba8e3744c1b133332b693fe2ba4652ca (C8)`
+
 <!-- regenerated-state-end -->
 
 ## Discovery snapshot (recorded 2026-11-05, base 8bc60cb7196ae128231c25a15881cded26b0afda)
