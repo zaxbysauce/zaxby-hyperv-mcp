@@ -35,7 +35,7 @@ docs/rebaseline-runbook.md).
 | 55-108-31-32-33-collated | 14 | 14 | 0 | clean |
 | 59-64-68-70-hardening-wave | 15 | 15 | 0 | clean |
 | 6-guest-put-get-policy | 13 | 13 | 0 | clean |
-| 63-66-119-collated | 13 | 10 | 3 | exit 1 |
+| 63-66-119-collated | 13 | 9 | 4 | exit 1 |
 | 64-68-collated | 11 | 11 | 0 | clean |
 | 67-118-release-vendor-provenance | 10 | 10 | 0 | clean |
 | 7-guest-jobs-truthful-reporting | 13 | 13 | 0 | clean |
@@ -57,6 +57,7 @@ docs/rebaseline-runbook.md).
 - `CHANGED .agents/issue-traces/74-72-88-cost-latency-accounting/repro/checkpoint.manifest eb8f6fc5ce2a0a2f6740de8522f86e0ae147448c a42e447d01a06c695872d1b0f3b570f18ce054fb (C9)`
 - `CHANGED .agents/issue-traces/74-72-88-cost-latency-accounting/repro/checkpoint.manifest eb8f6fc5ce2a0a2f6740de8522f86e0ae147448c a42e447d01a06c695872d1b0f3b570f18ce054fb (C10)`
 - `CHANGED scripts/gen_trace_drift_inventory.py 39f851daba8e3744c1b133332b693fe2ba4652ca0703feb145bb3efb9b92db8fc483ad780b2c7bd4 39f851daba8e3744c1b133332b693fe2ba4652ca (C8)`
+- `CHANGED docs/issue-trace-drift-inventory.md 9652f9ecd219c9e243638732679c09e947c39629 fc99737ed4c58fff7b1f56a43b5d8792c74d3fe2 (C8)`
 
 <!-- regenerated-state-end -->
 
