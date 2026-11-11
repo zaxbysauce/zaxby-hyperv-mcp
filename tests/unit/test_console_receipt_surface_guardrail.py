@@ -57,15 +57,26 @@ def _clean_ledger():
     console.reset_input_ledger()
 
 
-def _fresh_server(monkeypatch):
+@pytest.fixture()
+def fresh_server(monkeypatch):
+    """a05 pattern: reload+bootstrap per test, reload again on teardown so
+    no later test inherits an unrestricted/bootstrapped module (verification
+    round-1 nit)."""
     import importlib
 
     import hyperv_mcp.server as server_module
 
-    monkeypatch.setenv("HYPERV_MCP_UNRESTRICTED", "1")
-    mod = importlib.reload(server_module)
-    mod.bootstrap({"HYPERV_MCP_UNRESTRICTED": "1"})
-    return mod
+    def make(environ: dict, config=None):
+        monkeypatch.setenv("HYPERV_MCP_UNRESTRICTED", "1")
+        mod = importlib.reload(server_module)
+        if config is not None:
+            mod.bootstrap(environ, config=config)
+        else:
+            mod.bootstrap(environ)
+        return mod
+
+    yield make
+    importlib.reload(server_module)
 
 
 def _meta(result) -> dict:
@@ -80,7 +91,8 @@ def _meta(result) -> dict:
 # ---- PRR-007: registered read-tool envelope + wrapper pass-through ------
 
 
-def test_registered_read_tool_surfaces_state_receipt(monkeypatch, unrestricted):
+def test_registered_read_tool_surfaces_state_receipt(monkeypatch, unrestricted,
+                                                     fresh_server):
     """End-to-end through the registered FastMCP tool: hyperv_ui_find's
     envelope carries the minted state_receipt, and the id is a live
     registry member (citable), not a fabricated string."""
@@ -89,7 +101,7 @@ def test_registered_read_tool_surfaces_state_receipt(monkeypatch, unrestricted):
     # the tool docs): supply them the way a deployment does.
     monkeypatch.setenv("HYPERV_GUEST_USERNAME", "tester")
     monkeypatch.setenv("HYPERV_GUEST_PASSWORD", "placeholder-pass")
-    mod = _fresh_server(monkeypatch)
+    mod = fresh_server({"HYPERV_MCP_UNRESTRICTED": "1"})
     mcp = mod.get_mcp()
     result = asyncio.run(mcp.call_tool("hyperv_ui_find", {
         "vm_name": "vm1", "selector": {"automation_id": "File"},
@@ -109,12 +121,54 @@ def test_registered_read_tool_surfaces_state_receipt(monkeypatch, unrestricted):
         "VM's ledger key, not a pass-through of some foreign string")
 
 
+def _result_mutations(w: ast.FunctionDef) -> list:
+    """Every syntax that could silently alter the verb result BEFORE it
+    reaches the caller's envelope: method calls on `result`, subscript
+    store/delete, re-binding `result` to anything but the verb call, and
+    rebuilds embedding `**result` (verification round-1: the first version
+    of this pin only checked a `return result` existed, and
+    `result.pop("state_receipt", None)` before it survived both shards)."""
+    MUTATORS = {"pop", "update", "clear", "setdefault", "popitem"}
+    bad = []
+    for node in ast.walk(w):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "result"
+                and node.func.attr in MUTATORS):
+            # READ methods (result.get(...) for the ok/error_class audit)
+            # are legitimate; only mutators can silently drop the key.
+            bad.append(ast.unparse(node))
+        elif isinstance(node, (ast.Assign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for t in targets:
+                base = t.value if isinstance(t, ast.Subscript) else t
+                if isinstance(base, ast.Name) and base.id == "result":
+                    value = node.value
+                    keeps_call = (isinstance(value, ast.Call)
+                                  and getattr(value.func, "id", "") == "fn")
+                    if not keeps_call:
+                        bad.append(ast.unparse(node))
+        elif isinstance(node, ast.Delete):
+            for t in node.targets:
+                base = t.value if isinstance(t, ast.Subscript) else t
+                if isinstance(base, ast.Name) and base.id == "result":
+                    bad.append(ast.unparse(node))
+        elif isinstance(node, ast.Dict):
+            for k in node.keys:
+                if isinstance(k, ast.Name) and k.id == "result":
+                    bad.append(f"rebuild **{ast.unparse(node)}")
+    return bad
+
+
 def test_both_ui_tool_wrappers_return_the_verb_dict_unchanged():
-    """Structural pin over BOTH credential variants of _run_ui_tool (the
-    registered-surface test above reaches only one): the ok-path must
-    return the verb's result dict unchanged — any key filtering or
-    envelope rebuild silently drops state_receipt, which is exactly the
-    drop-mutant both reviewer shards survived the 44 rows with."""
+    """Structural pin over BOTH credential variants of _run_ui_tool: the
+    ok-path must be a bare `return result`, and NOTHING in the wrapper may
+    mutate or rebuild `result` first — any key filtering, .pop, del, or
+    envelope rebuild silently drops state_receipt from one credential
+    variant while the other variant's behavioral test still passes
+    (verification round-1 Finding 2: the earlier existence-only pin was
+    bypassable by a pre-return result.pop in the wrapper this test does
+    not behaviorally reach)."""
     tree = ast.parse(SERVER_SRC.read_text(encoding="utf-8"))
     wrappers = [n for n in ast.walk(tree)
                 if isinstance(n, ast.FunctionDef) and n.name == "_run_ui_tool"]
@@ -131,6 +185,37 @@ def test_both_ui_tool_wrappers_return_the_verb_dict_unchanged():
             f"_run_ui_tool at line {w.lineno} must return the verb result "
             "dict unchanged on the success path (PRR-007): filtering or "
             "rebuilding the envelope silently drops state_receipt")
+        bad = _result_mutations(w)
+        assert not bad, (
+            f"_run_ui_tool at line {w.lineno} mutates the verb result "
+            f"before returning it: {bad} — the registered envelope must "
+            "carry state_receipt for BOTH credential variants")
+
+
+def test_registered_read_tool_surfaces_state_receipt_inline_credentials(
+        monkeypatch, unrestricted, fresh_server):
+    """Behavioral coverage for the OTHER credential variant (PRR-007,
+    verification round-1 Finding 2): with allow_inline_credentials on, the
+    registered hyperv_ui_find takes username/password and its envelope must
+    still carry the minted state_receipt. Without this row the
+    creds_allowed wrapper was only covered by the AST pin."""
+    frozen._ui_transport(monkeypatch, guids={"vm1": GUID})
+    from hyperv_mcp.config import Config
+
+    mod = fresh_server({}, config=Config(unrestricted=True,
+                                         allow_inline_credentials=True))
+    mcp = mod.get_mcp()
+    result = asyncio.run(mcp.call_tool("hyperv_ui_find", {
+        "vm_name": "vm1", "selector": {"automation_id": "File"},
+        "username": "tester", "password": "placeholder-pass",
+    }))
+    meta = _meta(result)
+    assert meta.get("ok") is True, meta
+    rid = meta.get("state_receipt")
+    assert isinstance(rid, str) and rid, (
+        "PRR-007: the inline-credentials variant's envelope must carry "
+        "the minted state_receipt too — one variant silently dropping it "
+        "breaks the receipt channel for deployments with inline creds on")
 
 
 # ---- PRR-008: receipt click without the pixel domain, both twins ------
@@ -216,8 +301,10 @@ def test_receipt_branch_precedes_pixel_demand_in_both_twins(twin):
         "(the reviewer's surviving mutant)")
 
 
-# ---- PRR-001: the observation->stamp window is barrier-deterministic even  ----
-# ---- WITHOUT frame dims (C35's guarantee re-proven on the no-dims click    ----
+# ---- AC15-lineage (C15/C35 class): the observation->stamp window is       ----
+# ---- barrier-deterministic even WITHOUT frame dims (C35's guarantee        ----
+# ---- re-proven on the no-dims click path — NOTE: the feedback round first  ----
+# ---- labeled this "PRR-001", a mislabel; synthesis PRR-001 (guest-CIM) was ----
 # ---- path; thread-free-oracle: events decide ordering, sleeps decide        ----
 # ---- nothing — a dropped _read_console_exclusion makes the bump land       ----
 # ---- BEFORE the stamp and the citation go falsely FRESH (test goes RED))   ----
@@ -293,18 +380,30 @@ def test_no_dims_stamp_window_blocks_concurrent_bump(unrestricted, monkeypatch):
     {"action": "wait_frame_stable", "stable_ms": 1,
      "verified_state_receipt": "f" * 32},
 ])
-def test_every_step_kind_refuses_the_receipt_key(unrestricted, step):
+def test_every_step_kind_refuses_the_receipt_key(unrestricted, monkeypatch, step):
     """Published contract: a step carrying verified_state_receipt is a
     step-indexed refusal, NEVER a silently ignored key — the first version
     scoped the refusal to click steps only (reviewer PRR-005); non-click
-    steps silently dropped the safety parameter."""
+    steps silently dropped the safety parameter. The transport is a
+    recording sentinel (verification round-1 Finding 3): with the hoist
+    removed the step PLANS and dispatches, so the modeled defect surfaces
+    as pytest.raises DID NOT RAISE (plus a recorded script) — not as an
+    environmental transport error."""
+    stub = frozen.SeqPS()
+    monkeypatch.setattr(pswindows, "run_ps", stub)
     with pytest.raises(ValueError) as excinfo:
         console.run_sequence(unrestricted, "vm1", [dict(step)])
     message = str(excinfo.value)
     assert "step 0" in message, message
+    assert message.count("step 0:") == 1, (
+        "the step prefix must appear exactly once — the first version "
+        "double-prefixed ('step 0: step 0: ...')")
     assert "verified_state_receipt" in message, (
         "the refusal must name the refused key for every step action, "
         f"got: {message}")
+    assert stub.scripts == [], (
+        "a refused step key must dispatch nothing (sentinel transport "
+        "records any attempted leg — the hoist-removal mutant lands here)")
 
 
 # ---- PRR-004: guardrail exemptions are (module, function) pairs — no      ----

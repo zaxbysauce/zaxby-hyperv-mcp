@@ -268,7 +268,9 @@ the task-spawned controller reads it from the environment.
   silently ignored key). Per-server-process ledger scope is inherited from
   #126's owner-final decision: there is no cross-process freshness here,
   and the receipt channel has no live-state re-check leg. Internal reads
-  whose answers are discarded (evidence's UI-tree walk) mint nothing.
+  whose receipts would be dead weight (evidence's UI-tree walk surfaces the
+  read's CONTENT in `meta["ui_tree"]` but can never surface its mint) mint
+  nothing citable.
 - Version bump: 0.16.0 -> 0.17.0.
 
 ## 0.16.0 changes
@@ -2285,19 +2287,29 @@ bump the same ledger at their dispatch seam (dispatched legs bump even when
 the result is unknowable — timeout/transport error — while pre-dispatch
 refusals never bump; a UIA write after the read therefore stales the
 citation exactly like a console write). Cost (accepted + disclosed): the
-console key is shared with capture/wait ops (`#125` whole-wait hold), so a
-UIA read issued concurrently with a screenshot or a `wait_frame_*` on the
-same VM waits up to `Config.vm_lock_wait_s` (default 30s) then raises the
-retryable `VMBusy` — the same retryable signal the multi-agent guard family
-already uses; single-operator flows alternate capture->read->click and are
-unaffected. Unlike the frame-hash channel the
+read's console-key hold is shared with console INPUT dispatch AND with
+capture/wait ops (`#125` whole-wait hold) — so a UIA read issued
+concurrently with a console input op, a screenshot, or a `wait_frame_*` on
+the same VM queues behind it, waiting up to `Config.vm_lock_wait_s`
+(default 30s) then raising the retryable `VMBusy` — the same retryable
+signal the multi-agent guard family already uses. The hold spans the whole
+verb request INCLUDING its front-door discovery legs (install-facts, SID
+lookup, session bootstrap — each bounded by its own timeout and cached
+after first success), so a slow-guest read widens the contention window
+beyond the helper round trip itself; single-operator flows alternate
+capture->read->click and are unaffected. Unlike the frame-hash channel the
 receipt verifies ledger ordering ONLY: there is no live-frame re-check leg,
 no pixel-domain requirement (`frame_width`/`frame_height` are not needed
 for the verification itself, only for coordinate mapping), and the
 per-server-process scope limitation from #126 applies with no pixels
-backstop. Unknown, never-minted, or FIFO-evicted (cap 512) citations
-refuse through the structured `commit_unverified` family with zero mouse
-input; allowed decisions are audited like the frame-hash channel's.
+backstop. Unknown, never-minted, or FIFO-evicted citations refuse through
+the structured `commit_unverified` family with zero mouse input — the
+receipt registry's 512-entry cap is PROCESS-GLOBAL (shared across all VMs):
+heavy read churn on one VM (e.g. a long `hyperv_ui_wait_for`, which mints
+per helper slice and returns only the last receipt) can evict another VM's
+still-citable receipt; eviction fails closed and a re-read re-mints. Every
+refusal dispatches zero mouse input; allowed decisions are audited like the
+frame-hash channel's.
 `hyperv_console_sequence` remains frame-hash-only: a step carrying
 `verified_state_receipt` is a step-indexed refusal (never a silently
 ignored key) — use `hyperv_console_click` for receipt-verified commits.
