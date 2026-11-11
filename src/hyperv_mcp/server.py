@@ -2210,7 +2210,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         frame_width/frame_height equal to the sequence's width/height, and
         requires expect_frame_hash equal to its verified_frame_hash; the
         sequence's precondition capture IS the guard's live-frame
-        verification), {"action": "mouse_button", "button", "is_down"},
+        verification; a step carrying verified_state_receipt is a
+        step-indexed refusal — the sequence guard stays frame-hash-only
+        because its precondition model compares expect_frame_hash to the
+        cited hash, which a state-read receipt has no hash to feed; use
+        hyperv_console_click for the receipt channel), {"action": "mouse_button", "button", "is_down"},
         {"action": "scroll", "delta"}, {"action": "wait_frame_stable",
         "stable_ms", "timeout_s"?, "interval_ms"?, "baseline_hash"?} (in-sequence
         wait steps accept interval_ms >= 1; the call timeout_s bounds the whole

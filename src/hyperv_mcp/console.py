@@ -447,6 +447,44 @@ def _last_input_seq_for(vm_key: str) -> int:
         return _LAST_INPUT_SEQ.get(vm_key, 0)
 
 
+def _input_seq_any_identity(vm_name: str, vm_id: str) -> int:
+    """Issue #140: the MAX input-dispatch sequence across EVERY ledger key
+    under which an input to this VM could have been recorded — the casefolded
+    caller name, the explicit id, and the host-side hint-resolved GUID.
+
+    Why this exists (plan-critic/reviewer-found false-fresh): a UIA read
+    resolves its ref to a real GUID and mints the receipt under the GUID key,
+    but a console input dispatched through an ALREADY-IN-FLIGHT cold ref (its
+    ``ref.id`` set to the caller NAME before the read taught the hint) calls
+    ``record_console_input`` with ``vm_id`` set to that echoed NAME — and
+    ``_ledger_key_unlocked`` short-circuits on the truthy ``vm_id`` (an echoed
+    NAME, not a GUID), recording the bump under the name key. A later
+    by-name guarded click resolves through the now-known hint to the GUID key
+    and would miss that name-keyed bump, allowing a stale citation. Taking the
+    max across the identity's key spellings is FAIL-CLOSED (it can only ever
+    add a stale refusal, never a new allow) and never over-stales across VMs
+    because a name and its hint-GUID are the SAME VM. The frame-hash channel's
+    equivalent window is the separately-disclosed #77 name-vs-GUID residual;
+    the receipt channel is new here, so its freshness is domain-complete."""
+    keys: set[str] = set()
+    if vm_name and vm_name.strip():
+        keys.add(vm_name.strip().casefold())
+    if vm_id and vm_id.strip():
+        keys.add(vm_id.strip().casefold())
+    with _HINT_LOCK:
+        if vm_name and vm_name.strip():
+            hint = _NAME_GUID_HINTS.get(vm_name.strip().casefold())
+            if hint:
+                keys.add(hint)
+    high = 0
+    with _LEDGER_LOCK:
+        for k in keys:
+            seq = _LAST_INPUT_SEQ.get(k, 0)
+            if seq > high:
+                high = seq
+    return high
+
+
 def _bump_input(ref: vmident.VMRef) -> None:
     """The dispatch-time ledger bump shared by every input site (runs INSIDE
     the per-VM input lock, immediately before the leg that sends input)."""
@@ -2975,6 +3013,7 @@ def _citation_domain(
 
 def _commit_guard_freshness(
     record: dict, what: str = "capture", tail: str | None = None,
+    last: int | None = None,
 ) -> None:
     """The guard's freshness leg (issue #126 AC2): a verification captured
     at-or-before the most recent input dispatch to that VM proves nothing
@@ -2987,8 +3026,15 @@ def _commit_guard_freshness(
     borrowing the capture text would falsely promise the pixels leg as a
     backstop. The DEFAULTS reproduce the #126 text byte-for-byte (the
     frozen guard/sequence suites pin those words; both transport checkers
-    and the sequence legs call through here for the hash channel)."""
-    last = _last_input_seq_for(record["vm_key"])
+    and the sequence legs call through here for the hash channel).
+
+    ``last`` lets a caller widen the freshness comparison beyond the record's
+    own ``vm_key`` — the receipt channel passes
+    ``_input_seq_any_identity`` so an in-flight cold by-name dispatch cannot
+    leave a GUID-keyed receipt falsely fresh (see that helper). When None the
+    comparison reads the record's own key (the unchanged #126 capture path)."""
+    if last is None:
+        last = _last_input_seq_for(record["vm_key"])
     if record["seq"] <= last:
         if tail is None:
             tail = ("the input ledger is per-server-process; a cross-process "
@@ -3051,8 +3097,8 @@ def _commit_guard_receipt(verified_state_receipt: str, ref: vmident.VMRef) -> No
     dispatches. NO frame_width/frame_height demand and NO live capture: a
     state read has no pixel domain (root-cause boundary 4); its attestation
     is the ledger ordering alone."""
-    record = _lookup_state_receipt(
-        verified_state_receipt, _ledger_key(ref.name, ref.id))
+    key = _ledger_key(ref.name, ref.id)
+    record = _lookup_state_receipt(verified_state_receipt, key)
     if record is None:
         raise ConsoleError(
             "commit_unverified: the cited state receipt is unknown to this "
@@ -3061,7 +3107,8 @@ def _commit_guard_receipt(verified_state_receipt: str, ref: vmident.VMRef) -> No
     _commit_guard_freshness(
         record, what="state read",
         tail=("the input ledger is per-server-process; the receipt channel "
-              "has no live-state re-check leg"))
+              "has no live-state re-check leg"),
+        last=_input_seq_any_identity(ref.name, ref.id))
 
 
 def _commit_guard_live_mismatch(live_hash: str, verified_frame_hash: str) -> None:

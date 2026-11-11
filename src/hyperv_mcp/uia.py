@@ -1228,9 +1228,22 @@ def _read_console_exclusion(ref, mode: str) -> Iterator[None]:
     and no site acquires a console key before a VM key — so the wait-for
     graph stays acyclic (a held console key is always released by an op
     that never requests another lock afterward). Read-mode acquisitions
-    stay mutually parallel; they only queue behind dispatching writers,
-    bounded by the leg timeout. vm_lock default mode is WRITE, so the
-    plain tuple key below is explicitly taken in READ mode."""
+    stay mutually parallel with one another.
+
+    COST (accepted + disclosed for #140): the console key is the SAME
+    ``(id,"console")`` key that console INPUT ops (mouse/keyboard) AND
+    capture/wait ops (``hyperv_console_screenshot``, ``wait_frame_change``,
+    ``wait_frame_stable``) hold in WRITE mode (the ``#125`` whole-wait hold).
+    A read taking it in READ mode therefore serializes against BOTH: a read
+    issued while a capture/long-wait holds the console WRITE key waits up to
+    ``Config.vm_lock_wait_s`` (default 30s) and then raises the retryable
+    ``VMBusy``; symmetrically a capture queues behind an in-flight read. This
+    is the price of ordering observation-to-stamp against dispatch using the
+    existing dispatch exclusion — narrowing it to only inputs (not captures)
+    would require a new lock key threaded through the frozen ``#125/#126``
+    ``_input_lock`` core, deferred to a dedicated trace. Single-operator GUI
+    flows alternate screenshot->read->click on one VM, so contention is the
+    multi-agent case the guard family already surfaces as retryable VMBusy."""
     if mode != "read":
         yield
         return
