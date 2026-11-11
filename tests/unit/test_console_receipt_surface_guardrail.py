@@ -123,13 +123,35 @@ def test_registered_read_tool_surfaces_state_receipt(monkeypatch, unrestricted,
 
 def _result_mutations(w: ast.FunctionDef) -> list:
     """Every syntax that could silently alter the verb result BEFORE it
-    reaches the caller's envelope: method calls on `result`, subscript
-    store/delete, re-binding `result` to anything but the verb call, and
-    rebuilds embedding `**result` (verification round-1: the first version
-    of this pin only checked a `return result` existed, and
-    `result.pop("state_receipt", None)` before it survived both shards)."""
+    reaches the caller's envelope. Enumerated shapes (verification round-2
+    closed the annotated-rebind and **result gaps — the round-1 version
+    missed `result: dict = ...` and its `**`-Dict branch was dead code
+    because `**x` unpacks land in values[] with keys[i] is None): method
+    calls that mutate `result`, subscript store/delete on it, ANY re-binding
+    of the name (plain, augmented, annotated, walrus, for-target, with-target)
+    to anything but the verb call itself, and dict/list literals that unpack
+    `**result` (verification round-1: the first version of this pin only
+    checked a `return result` existed, and `result.pop("state_receipt",
+    None)` before it survived both shards)."""
     MUTATORS = {"pop", "update", "clear", "setdefault", "popitem"}
     bad = []
+
+    def _name_targets(node):
+        if isinstance(node, ast.Assign):
+            return list(node.targets)
+        if isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+            return [node.target]
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            return [node.target]
+        if isinstance(node, ast.withitem):
+            return [node.optional_vars] if node.optional_vars else []
+        return []
+
+    def _rebind_is_verb_call(node):
+        value = getattr(node, "value", None)
+        return (isinstance(value, ast.Call)
+                and getattr(value.func, "id", "") == "fn")
+
     for node in ast.walk(w):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -138,15 +160,13 @@ def _result_mutations(w: ast.FunctionDef) -> list:
             # READ methods (result.get(...) for the ok/error_class audit)
             # are legitimate; only mutators can silently drop the key.
             bad.append(ast.unparse(node))
-        elif isinstance(node, (ast.Assign, ast.AugAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for t in targets:
+        elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign,
+                               ast.NamedExpr, ast.For, ast.AsyncFor,
+                               ast.withitem)):
+            for t in _name_targets(node):
                 base = t.value if isinstance(t, ast.Subscript) else t
                 if isinstance(base, ast.Name) and base.id == "result":
-                    value = node.value
-                    keeps_call = (isinstance(value, ast.Call)
-                                  and getattr(value.func, "id", "") == "fn")
-                    if not keeps_call:
+                    if not _rebind_is_verb_call(node):
                         bad.append(ast.unparse(node))
         elif isinstance(node, ast.Delete):
             for t in node.targets:
@@ -154,9 +174,17 @@ def _result_mutations(w: ast.FunctionDef) -> list:
                 if isinstance(base, ast.Name) and base.id == "result":
                     bad.append(ast.unparse(node))
         elif isinstance(node, ast.Dict):
-            for k in node.keys:
-                if isinstance(k, ast.Name) and k.id == "result":
+            # `{**result, ...}` stores the unpack as keys[i] is None with
+            # the expression in values[i] (round-2: the old check looked at
+            # keys, where ** never appears, and could not fire).
+            for k, v in zip(node.keys, node.values, strict=True):
+                if k is None and isinstance(v, ast.Name) and v.id == "result":
                     bad.append(f"rebuild **{ast.unparse(node)}")
+        elif isinstance(node, (ast.List, ast.Tuple)):
+            for e in node.elts:
+                if (isinstance(e, ast.Starred) and isinstance(e.value, ast.Name)
+                        and e.value.id == "result"):
+                    bad.append(f"rebuild *{ast.unparse(node)}")
     return bad
 
 
@@ -303,11 +331,12 @@ def test_receipt_branch_precedes_pixel_demand_in_both_twins(twin):
 
 # ---- AC15-lineage (C15/C35 class): the observation->stamp window is       ----
 # ---- barrier-deterministic even WITHOUT frame dims (C35's guarantee        ----
-# ---- re-proven on the no-dims click path — NOTE: the feedback round first  ----
-# ---- labeled this "PRR-001", a mislabel; synthesis PRR-001 (guest-CIM) was ----
-# ---- path; thread-free-oracle: events decide ordering, sleeps decide        ----
-# ---- nothing — a dropped _read_console_exclusion makes the bump land       ----
-# ---- BEFORE the stamp and the citation go falsely FRESH (test goes RED))   ----
+# ---- re-proven on the no-dims click path; the feedback round first         ----
+# ---- mislabeled this "PRR-001" — synthesis PRR-001 (guest-CIM) was         ----
+# ---- REJECTED, this row belongs to the C15/C35 lineage). Events decide     ----
+# ---- ordering, sleeps decide nothing: a dropped _read_console_exclusion    ----
+# ---- lands the bump BEFORE the stamp, the citation reads falsely fresh,    ----
+# ---- and the order assertion below goes RED.                               ----
 
 
 def test_no_dims_stamp_window_blocks_concurrent_bump(unrestricted, monkeypatch):
@@ -352,7 +381,7 @@ def test_no_dims_stamp_window_blocks_concurrent_bump(unrestricted, monkeypatch):
     rid = result.get("state_receipt")
     assert isinstance(rid, str) and rid, "the read must still mint (no dims)"
     assert order == ["park-observed-attempt", "bump"], (
-        "PRR-001: the bump must have been BLOCKED by the read's console-key "
+        "AC15: the bump must have been BLOCKED by the read's console-key "
         f"hold until after the stamp — order {order}; a dropped exclusion "
         "lets the bump land first and the citation reads falsely fresh")
     with pytest.raises(ConsoleError, match="stale"):

@@ -2288,11 +2288,13 @@ the result is unknowable — timeout/transport error — while pre-dispatch
 refusals never bump; a UIA write after the read therefore stales the
 citation exactly like a console write). Cost (accepted + disclosed): the
 read's console-key hold is shared with console INPUT dispatch AND with
-capture/wait ops (`#125` whole-wait hold) — so a UIA read issued
-concurrently with a console input op, a screenshot, or a `wait_frame_*` on
-the same VM queues behind it, waiting up to `Config.vm_lock_wait_s`
-(default 30s) then raising the retryable `VMBusy` — the same retryable
-signal the multi-agent guard family already uses. The hold spans the whole
+capture/wait ops (`#125` whole-wait hold) — contention runs BOTH
+directions: a UIA read issued concurrently with a console input op, a
+screenshot, or a `wait_frame_*` on the same VM queues behind the holder,
+and equally a console input op dispatched while a read holds the key waits
+for the stamp to land — either waiter times out after
+`Config.vm_lock_wait_s` (default 30s) raising the retryable `VMBusy`, the
+same retryable signal the multi-agent guard family already uses. The hold spans the whole
 verb request INCLUDING its front-door discovery legs (install-facts, SID
 lookup, session bootstrap — each bounded by its own timeout and cached
 after first success), so a slow-guest read widens the contention window
