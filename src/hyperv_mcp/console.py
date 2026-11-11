@@ -4297,6 +4297,21 @@ def _validate_sequence_steps(
             raise _step_fail(i, "every step must be a dict")
         action = step.get("action")
         try:
+            # Issue #140 (A1, PRR-005 fail-closed): the receipt key is
+            # refused ON PRESENCE for EVERY step dict, before any action
+            # dispatch — a silently dropped safety parameter is exactly the
+            # NEW-14 family this check exists to close (the published
+            # contract has always claimed every step; the first version
+            # scoped it to click steps only). The sequence guard stays
+            # frame-hash-only: its precondition model compares
+            # expect_frame_hash to the cited hash, which a state-read
+            # receipt has no hash to feed.
+            if "verified_state_receipt" in step:
+                raise ValueError(
+                    "verified_state_receipt is not supported "
+                    "on sequence steps (the sequence guard is frame-hash-"
+                    "only; cite verified_frame_hash, or use "
+                    "hyperv_console_click for the receipt channel)")
             if action == "press_key":
                 key = step.get("key")
                 if not isinstance(key, str) or not key:
@@ -4352,20 +4367,9 @@ def _validate_sequence_steps(
                 plan.append({"action": "mouse_positional", "x": int(x), "y": int(y),
                              "fw": fw, "fh": fh, "click": False, "button": 1})
             elif action == "click":
-                # Issue #140 (A1, fail-closed): the sequence guard stays
-                # frame-hash-only — its precondition model compares
-                # expect_frame_hash to the cited hash, which a state-read
-                # receipt has no hash to feed. The step dicts are untyped,
-                # so a receipt key must be REFUSED ON PRESENCE (a silently
-                # ignored safety parameter is the NEW-14 fail-open family):
-                # refused whether or not commit_guard is set, and before
-                # every other step check so no dispatch path can consume it.
-                if "verified_state_receipt" in step:
-                    raise ValueError(
-                        f"step {i}: verified_state_receipt is not supported "
-                        "on sequence steps (the sequence guard is frame-hash-"
-                        "only; cite verified_frame_hash, or use "
-                        "hyperv_console_click for the receipt channel)")
+                # (PRR-005: the verified_state_receipt presence refusal was
+                # hoisted above the action dispatch so it covers EVERY step
+                # kind, matching the published contract; see the loop head.)
                 # NEW-14/PRR-003: the guard keys ride untyped list[dict]
                 # steps (pydantic covers only the envelope), so a truthy
                 # non-bool commit_guard must be a step-indexed refusal — a

@@ -119,11 +119,12 @@ def _uia_via_helper(
     from . import uia
 
     try:
-        # Issue #140: these are INTERNAL reads whose answers are consumed
-        # and discarded by the evidence walk — suppress_receipt_mints()
-        # keeps them out of the receipt registry (and its FIFO cap): no
-        # caller can ever cite a discarded read. The frozen C21 spy pins
-        # zero mints for this path. (Context-var suppression, not a call
+        # Issue #140: these are INTERNAL reads — their content IS returned
+        # (meta["ui_tree"]), but their minted state_receipt is DISCARDED by
+        # the evidence walk, so suppress_receipt_mints() keeps the receipts
+        # out of the registry (and its FIFO cap) entirely: no caller can
+        # ever cite a read nobody surfaced. The frozen C21 spy pins zero
+        # mints for this path. (Context-var suppression, not a call
         # parameter: the trace-29 frozen f05 fixtures stub these wrappers
         # with their own signatures.)
         with uia.suppress_receipt_mints():

@@ -32,7 +32,13 @@ SRC = Path(__file__).resolve().parents[2] / "src" / "hyperv_mcp"
 # AC15). It is a console-namespace suffix key, not a VM-identity lock, and
 # the function below is pinned to that exact shape by
 # test_read_console_exclusion_lock_shape.
-ALLOWED_LOCK_KEYS = {"vm_create", "vm_clone", "_read_console_exclusion"}
+# PRR-010 (PR #142 review): entries are (module, function) PAIRS — matching
+# on bare function names repo-wide let a same-named helper in any other
+# module inherit the exemption (escape reproduced by the reviewer's temp-
+# module probe; the shape pin only inspects uia.py, so both guardrails were
+# bypassed together). A new exemption must name its module.
+ALLOWED_LOCK_KEYS = {("media.py", "vm_create"), ("media.py", "vm_clone"),
+                     ("uia.py", "_read_console_exclusion")}
 
 
 def test_read_console_exclusion_lock_shape():
@@ -164,7 +170,7 @@ def test_no_name_keyed_vm_locks(path):
         # unrecognized expression — is a name-keyed lock unless this exact
         # function is allowlisted.
         func = _func_name_of(node, parents)
-        if func not in ALLOWED_LOCK_KEYS:
+        if (path.name, func) not in ALLOWED_LOCK_KEYS:
             bad.append(f"{func}({ast.unparse(node.args[0])})")
     assert not bad, f"{path.name}: non-identity-keyed vm_lock calls: {bad}"
 

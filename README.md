@@ -244,8 +244,14 @@ the task-spawned controller reads it from the environment.
   read — `hyperv_ui_inspect`/`hyperv_ui_find`/`hyperv_ui_wait_for`/
   `hyperv_ui_session_state` now return `state_receipt` — letting
   accessibility-driven workflows verify a selection without a pixel capture
-  (the channel #126's In-list promised; the frame-hash channel is
-  unchanged). The receipt verifies against the SAME per-VM input ledger:
+  (the channel #126's In-list promised). The frame-hash guard's code and
+  refusal texts are untouched — but the shared ledger has one honest
+  consequence to state: because UIA mutations now bump the SAME input
+  ledger, a UIA write between a CAPTURE and a frame-hash-guarded click
+  now stales that citation too. That is a fail-closed widening of the
+  #126 channel's stale set (a UIA write can change what the pixels showed),
+  disclosed here rather than buried. The receipt verifies against the SAME
+  per-VM input ledger:
   its sequence must be later than the most recent input dispatch, and the
   read's observation-to-stamp window is linearized against input dispatch
   by holding the console-input exclusion on both the VM's GUID and the
