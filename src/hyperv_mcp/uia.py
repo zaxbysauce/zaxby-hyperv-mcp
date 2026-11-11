@@ -47,15 +47,18 @@ Security model (plan revision 7, fix-wave revisions for PR #109):
 from __future__ import annotations
 
 import base64
+import contextvars
 import hashlib
 import json
 import math
 import threading
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from typing import Any, cast
 
-from . import auditlog, guestexec, policy, pswindows, vmident
+from . import auditlog, console, guestexec, policy, pswindows, vmident
 from .credentials import CredentialSet
 from .vmlocks import vm_lock
 
@@ -63,6 +66,29 @@ HELPER_VERSION = "1"
 VERBS = {"inspect", "find", "invoke", "set_value", "wait_for", "focus",
          "session_state"}
 MUTATING_VERBS = {"invoke", "set_value", "focus"}
+
+# Issue #140: internal callers whose reads are consumed-and-discarded
+# (evidence's UI-tree probe) must not churn the receipt registry with
+# citations nobody can reach. Suppression is a CONTEXTVAR (the same
+# per-call-context discipline as the _CALL slot), not a call parameter:
+# the frozen trace-29 f05 fixtures stub the read wrappers with their own
+# signatures, so a mint_receipt kwarg would TypeError inside them and
+# silently fall back the helper path. Same-context = same-thread for the
+# synchronous evidence call chain.
+_MINT_SUPPRESSED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "hyperv_mcp_state_receipt_suppression", default=False)
+
+
+@contextmanager
+def suppress_receipt_mints() -> Iterator[None]:
+    """Suppress state-read receipt minting for reads made inside the block
+    (issue #140, internal callers only — e.g. evidence's UI-tree walk).
+    Public reads mint normally outside the scope."""
+    token = _MINT_SUPPRESSED.set(True)
+    try:
+        yield
+    finally:
+        _MINT_SUPPRESSED.reset(token)
 BASE_CAPABILITIES = {"uia", "msaa"}
 ELECTRON_CAPABILITY = "adapter:electron"
 _CAPABILITIES = BASE_CAPABILITIES | {ELECTRON_CAPABILITY}
@@ -964,6 +990,24 @@ def _pipe_forward(transport: _Transport | None, request: dict,
                or HELPER_VERSION}
     payload = json.dumps(request, ensure_ascii=False, default=str)
     framed_payload = pswindows.utf8_b64(payload)
+    # Issue #140 (dispatch-time invalidation): a MUTATING verb reaching the
+    # actual dispatch seam bumps the shared console input ledger at
+    # DECISION time, before the leg runs — so a dispatched leg whose result
+    # is unknown (timeout/transport error) still invalidates prior
+    # verifications (delivery unknowable => conservative stale; the exact
+    # polarity of the console input ops), while every PRE-dispatch refusal
+    # (validate_forward, adapter gate, mutation gate, RegistrationMismatch)
+    # never reaches this line and never bumps. This is the single seam for
+    # BOTH the direct verb path and the brokered route() forward, so a
+    # UIA click/keyboard/mouse write cannot stale-bypass the #126/#140
+    # guard's freshness rule; it runs inside the verb's
+    # vm_lock(ref.id, "write") region, which excludes every read leg's VM
+    # READ key — bumps and receipt stamps share one total order with no
+    # interleaving (plan S3; the _pipe_request-ENTRY bump mutant is killed
+    # by the adapter/registration no-bump pins).
+    if request.get("verb") in MUTATING_VERBS:
+        console.record_console_input(vm_name=transport.ref.name,
+                                     vm_id=transport.ref.id)
     result = _frame_leg(transport.cfg, transport.ref, transport.cred,
                         CLIENT_LEG_SCRIPT, framed_payload,
                         timeout_ms=_verb_timeout_ms(request))
@@ -1162,6 +1206,47 @@ def _wait_answered(out: dict, gone: bool) -> bool:
     return bool(out.get("elements"))
 
 
+@contextmanager
+def _read_console_exclusion(ref, mode: str) -> Iterator[None]:
+    """Issue #140: a READ leg additionally holds the per-VM console-input
+    key (the key console input ops take in WRITE mode by ``_input_lock``)
+    under BOTH identity spellings — the resolved GUID and the caller's
+    name — across the helper leg, the frame parse, AND the receipt stamp.
+
+    Why both keys: a cold (unhinted) input op dispatches under
+    ``(name, "console")`` while the read's receipt keys the GUID ledger.
+    Holding only the GUID key left an in-flight cold input free to bump
+    between the observation and the stamp — a false-fresh receipt (plan
+    critic Round 2, AC15). With the name key too, ANY input dispatch —
+    cold-name or hinted-GUID — is excluded from the observation-to-stamp
+    window, making the receipt's ledger ordering a truthful attestation
+    ("this state read completed at a point in the ledger order after
+    every input dispatched so far").
+
+    Lock ordering: callers enter this AFTER the outer ``vm_lock(ref.id)``;
+    every input site likewise takes its VM key before any console key,
+    and no site acquires a console key before a VM key — so the wait-for
+    graph stays acyclic (a held console key is always released by an op
+    that never requests another lock afterward). Read-mode acquisitions
+    stay mutually parallel; they only queue behind dispatching writers,
+    bounded by the leg timeout. vm_lock default mode is WRITE, so the
+    plain tuple key below is explicitly taken in READ mode."""
+    if mode != "read":
+        yield
+        return
+    name = (ref.name or "").strip()
+    # Both vm_lock calls below are written as LITERAL (identity, "console")
+    # tuples in READ mode (never a loop variable): the vm-identity guardrail
+    # statically proves this allowlisted function only ever takes console-
+    # namespace keys in read mode, and a loop-indirect key would hide the
+    # tuple shape from that AST check.
+    with ExitStack() as stack:
+        stack.enter_context(vm_lock((ref.id, "console"), mode="read"))
+        if name and name != ref.id:
+            stack.enter_context(vm_lock((name, "console"), mode="read"))
+        yield
+
+
 def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
                   *, shared_vm: bool = False, selector: Any = None,
                   element_id: Any = None, adapter: str = "") -> dict:
@@ -1190,6 +1275,15 @@ def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
         _shared_mutation_gate({"transport": _Transport(cfg, ref, cred),
                                "vm_guid": ref.id}, request)
     mode = "write" if verb in MUTATING_VERBS else "read"
+    # Issue #140: teach the console module the name->GUID pairing BEFORE the
+    # first leg (the read resolves the GUID host-side via vmident, so the
+    # pairing is authoritative the moment we hold it — this mirrors what a
+    # console op's VMID= line learns at dispatch, and it makes the read's
+    # name-key console exclusion below and the mint's ledger key agree with
+    # whatever key a concurrent by-name input op resolves to). Idempotent
+    # and validated inside note_name_guid_hint (shape-checked, FIFO-capped).
+    if ref.name and ref.id:
+        console.note_name_guid_hint(ref.name, ref.id)
     gone = bool((request.get("args") or {}).get("gone"))
     deadline = None
     if verb == "wait_for":
@@ -1210,7 +1304,7 @@ def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
                              "timeout_s": max(1, min(_WAIT_SLICE_S,
                                                      math.ceil(remaining)))},
                 }
-            with vm_lock(ref.id, mode=mode):
+            with vm_lock(ref.id, mode=mode), _read_console_exclusion(ref, mode):
                 try:
                     frame = _pipe_request(cfg, ref, cred, leg_request)
                 except RegistrationMismatch:
@@ -1226,6 +1320,25 @@ def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
                         OSError) as exc:
                     return _transport_failure(exc, cfg, ref, cred)
                 out = _frame_out(frame, cfg, ref, cred)
+                # Issue #140 receipt mint (A2): ONLY a SUCCESSFUL READ
+                # leg mints, and the stamp is drawn INSIDE the exclusion
+                # region so no input dispatch can interleave between this
+                # leg's observation completing and its sequence landing.
+                # wait_for mints per successful slice (the result carries
+                # the LAST leg's id; timed_out distinguishes an expired
+                # budget from a settled answer — churn is bounded by
+                # observed helper legs, registry capped at _REGISTRY_CAP
+                # with fail-closed FIFO eviction). Error envelopes (helper
+                # ok-False, transport failure, ambiguous session) and
+                # MUTATING verbs mint nothing. Internal reads whose answer
+                # is discarded (evidence's UI-tree walk) mint nothing via
+                # the suppress_receipt_mints() context var — hidden reads
+                # must not churn the registry with citations nobody can
+                # reach.
+                if (mode == "read" and not _MINT_SUPPRESSED.get()
+                        and out.get("ok") is True):
+                    out = {**out, "state_receipt": console.record_state_read(
+                        vm_name=ref.name, vm_id=ref.id)}
             if deadline is None or _wait_answered(out, gone):
                 if deadline is not None:
                     # PRR-117: the flag rides BOTH settled outcomes — False
@@ -1251,7 +1364,13 @@ def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
 def inspect(cfg, vm_name="", cred: CredentialSet | None = None,
             selector: Any = None, depth: int = 3, max_elements: int = 200,
             *, vm_id: str = "", adapter: str = ""):
-    """Bounded UIA element tree from the helper's session (read verb)."""
+    """Bounded UIA element tree from the helper's session (read verb).
+
+    A successful read mints a state-read receipt (issue #140): the answer
+    carries ``state_receipt``, citable as ``verified_state_receipt`` on a
+    commit-guarded ``hyperv_console_click``. Internal callers that discard
+    the answer (evidence's UI-tree walk) mint nothing via
+    ``suppress_receipt_mints()``."""
     if cred is None:
         from .credentials import CredentialError
 
@@ -1270,7 +1389,9 @@ def inspect(cfg, vm_name="", cred: CredentialSet | None = None,
 def find(cfg, vm_name="", cred: CredentialSet | None = None,
          selector: Any = None, *, element_id: Any = None, vm_id: str = "",
          adapter: str = ""):
-    """Resolve elements by selector (read verb)."""
+    """Resolve elements by selector (read verb). A successful read carries
+    ``state_receipt`` (issue #140 — the #126 commit guard's second
+    verification channel)."""
     if cred is None:
         from .credentials import CredentialError
 
@@ -1334,6 +1455,11 @@ def wait_for(cfg, vm_name="", cred: CredentialSet | None = None,
              *, vm_id: str = ""):
     """Wait for a selector to appear (or disappear) (read verb).
 
+    A settled OR budget-expired successful wait carries ``state_receipt``
+    (issue #140): every successful slice is a state read, and the returned
+    id is the LAST slice's — citable on a commit-guarded click regardless
+    of whether the wait settled (``timed_out`` distinguishes them).
+
     The wait runs as bounded guest-side slices so the per-VM lock is held
     only around each transport leg, never across the whole wait.
     """
@@ -1368,7 +1494,10 @@ def focus(cfg, vm_name="", cred: CredentialSet | None = None,
 
 def session_state(cfg, vm_name="", cred: CredentialSet | None = None, *,
                   vm_id: str = ""):
-    """Session, lock state, foreground window, and helper facts (read)."""
+    """Session, lock state, foreground window, and helper facts (read).
+
+    A successful read carries ``state_receipt`` (issue #140 — the #126
+    commit guard's second verification channel)."""
     if cred is None:
         from .credentials import CredentialError
 

@@ -1919,6 +1919,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         frame_width: int = 0, frame_height: int = 0, button: int = 1,
         vm_id: str = "", frame_hash: str = "",
         commit_guard: bool = False, verified_frame_hash: str = "",
+        verified_state_receipt: str = "",
         lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Click at frame-space coordinates (optional; positions first when
@@ -1964,6 +1965,18 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             verified_frame_hash: The commit guard's verification: the frame_hash
                         of a capture taken AFTER the most recent input (e.g. the
                         selection screenshot), required when commit_guard is true
+            verified_state_receipt: The commit guard's SECOND verification
+                        channel (issue #140): a state_receipt id minted by a
+                        UIA read tool (hyperv_ui_inspect/find/wait_for/
+                        session_state) AFTER the most recent input — cite it
+                        INSTEAD of (mutually exclusive with)
+                        verified_frame_hash when the selection was verified
+                        by an accessibility read rather than a pixel capture.
+                        The receipt verifies by the per-VM input ledger only
+                        (per-server-process; no live-frame re-check leg, and
+                        no frame_width/frame_height pixel-domain requirement).
+                        Unknown/evicted citations refuse as unverified with
+                        no mouse input; an allowed guard is audited
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
             lease_id: Optional lease citation - the lease gate runs before the body
             fencing_token: The lease's fencing token, with lease_id
@@ -1978,6 +1991,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             console.click, _cfg(), vm_name, x, y, frame_width, frame_height, button,
             vm_id=vm_id, frame_hash=frame_hash,
             commit_guard=commit_guard, verified_frame_hash=verified_frame_hash,
+            verified_state_receipt=verified_state_receipt,
         )
 
     @mcp.tool()
@@ -2895,8 +2909,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
 
-            Returns: {ok, elements, truncated, tree, session, helper?} or
+            Returns: {ok, elements, truncated, tree, session, helper?, state_receipt} or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
+            A successful read carries state_receipt (issue #140): a receipt id
+            citable as verified_state_receipt on a commit-guarded
+            hyperv_console_click. Failed reads mint nothing.
             """
             return _run_ui_tool(
                 "hyperv_ui_inspect", vm_name, "read", uia.inspect,
@@ -2932,9 +2949,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
 
-            Returns: {ok, elements[], session, helper?} (an empty list is a
+            Returns: {ok, elements[], session, helper?, state_receipt} (an empty list is a
             no-match, never the desktop root) or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
+            A successful read carries state_receipt (issue #140): a receipt id
+            citable as verified_state_receipt on a commit-guarded
+            hyperv_console_click. Failed reads mint nothing.
             """
             return _run_ui_tool(
                 "hyperv_ui_find", vm_name, "read", uia.find,
@@ -3045,8 +3065,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
 
-            Returns: {ok, elements[] | gone, session, helper?} or
+            Returns: {ok, elements[] | gone, session, helper?, state_receipt} or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
+            A settled OR budget-expired successful wait carries state_receipt
+            (issue #140): a receipt id citable as verified_state_receipt on a
+            commit-guarded hyperv_console_click. Failed reads mint nothing.
             """
             return _run_ui_tool(
                 "hyperv_ui_wait_for", vm_name, "read", uia.wait_for,
@@ -3107,8 +3130,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Policy: see the summary; denials return policy envelopes.
 
             Returns: {ok, active_session_id, interactive_user, locked,
-            foreground_window, session, helper} or
+            foreground_window, session, helper, state_receipt} or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
+            A successful read carries state_receipt (issue #140): a receipt
+            id citable as verified_state_receipt on a commit-guarded
+            hyperv_console_click. Failed reads mint nothing.
             """
             return _run_ui_tool(
                 "hyperv_ui_session_state", vm_name, "read", uia.session_state,
@@ -3250,8 +3276,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
 
-            Returns: {ok, elements, truncated, tree, session, helper?} or
+            Returns: {ok, elements, truncated, tree, session, helper?, state_receipt} or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
+            A successful read carries state_receipt (issue #140): a receipt id
+            citable as verified_state_receipt on a commit-guarded
+            hyperv_console_click. Failed reads mint nothing.
             """
             return _run_ui_tool(
                 "hyperv_ui_inspect", vm_name, "read", uia.inspect,
@@ -3283,9 +3312,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
 
-            Returns: {ok, elements[], session, helper?} (an empty list is a
+            Returns: {ok, elements[], session, helper?, state_receipt} (an empty list is a
             no-match, never the desktop root) or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
+            A successful read carries state_receipt (issue #140): a receipt id
+            citable as verified_state_receipt on a commit-guarded
+            hyperv_console_click. Failed reads mint nothing.
             """
             return _run_ui_tool(
                 "hyperv_ui_find", vm_name, "read", uia.find,
@@ -3384,8 +3416,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
 
-            Returns: {ok, elements[] | gone, session, helper?} or
+            Returns: {ok, elements[] | gone, session, helper?, state_receipt} or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
+            A settled OR budget-expired successful wait carries state_receipt
+            (issue #140): a receipt id citable as verified_state_receipt on a
+            commit-guarded hyperv_console_click. Failed reads mint nothing.
             """
             return _run_ui_tool(
                 "hyperv_ui_wait_for", vm_name, "read", uia.wait_for,
@@ -3438,8 +3473,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Policy: see the summary; denials return policy envelopes.
 
             Returns: {ok, active_session_id, interactive_user, locked,
-            foreground_window, session, helper} or
+            foreground_window, session, helper, state_receipt} or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
+            A successful read carries state_receipt (issue #140): a receipt
+            id citable as verified_state_receipt on a commit-guarded
+            hyperv_console_click. Failed reads mint nothing.
             """
             return _run_ui_tool(
                 "hyperv_ui_session_state", vm_name, "read", uia.session_state,

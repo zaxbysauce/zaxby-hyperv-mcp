@@ -22,7 +22,49 @@ SRC = Path(__file__).resolve().parents[2] / "src" / "hyperv_mcp"
 # vm_create/vm_clone lock the not-yet-existing name; the shared in-script
 # duplicate-name guard makes name collisions unreachable (issue #31 carries
 # the same disclosed residual as vm_create).
-ALLOWED_LOCK_KEYS = {"vm_create", "vm_clone"}
+# uia._read_console_exclusion (issue #140) locks (name, "console") — the
+# CALLER-NAME spelling of the console-input exclusion key — deliberately and
+# ONLY as the second identity of the same resolved VM: a cold (unhinted)
+# console input keys _input_lock on the caller's name (console.py:477
+# derives it from ref.id, which by-name paths set to the name), so the read
+# must hold the name spelling too or an in-flight cold input can bump
+# between the read's observation and its receipt stamp (plan critic Round 2,
+# AC15). It is a console-namespace suffix key, not a VM-identity lock, and
+# the function below is pinned to that exact shape by
+# test_read_console_exclusion_lock_shape.
+ALLOWED_LOCK_KEYS = {"vm_create", "vm_clone", "_read_console_exclusion"}
+
+
+def test_read_console_exclusion_lock_shape():
+    """The #140 allowlist entry above is narrowly earned: _read_console_
+    exclusion must contain ONLY vm_lock calls keyed on a (x, "console")
+    tuple in READ mode — never a bare-name VM key, never write mode. If this
+    pin goes red the dual-identity exclusion has drifted out of the console
+    namespace and the allowlist exemption is no longer justified."""
+    tree = _tree(SRC / "uia.py")
+    func = next((n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef)
+                 and n.name == "_read_console_exclusion"), None)
+    assert func is not None, "_read_console_exclusion vanished from uia.py"
+    calls = [n for n in ast.walk(func)
+             if isinstance(n, ast.Call) and _call_name(n) == "vm_lock"]
+    assert calls, "the exclusion helper must take the console keys itself"
+    for node in calls:
+        assert node.args and isinstance(node.args[0], ast.Tuple), (
+            "vm_lock here must be the (identity, 'console') tuple — a bare "
+            "name key would re-open the #140 cold-input race under a "
+            "VM-identity lock")
+        elts = node.args[0].elts
+        assert (len(elts) == 2
+                and isinstance(elts[1], ast.Constant)
+                and elts[1].value == "console"), (
+            "the second tuple element must be the console namespace "
+            "constant")
+        modes = [kw for kw in node.keywords if kw.arg == "mode"]
+        assert any(isinstance(kw.value, ast.Constant)
+                   and kw.value.value == "read" for kw in modes), (
+            "the exclusion holds the console key in READ mode (writers are "
+            "the inputs it excludes)")
 
 
 

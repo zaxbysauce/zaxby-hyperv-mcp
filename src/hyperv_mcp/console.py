@@ -93,6 +93,7 @@ import math
 import operator
 import os
 import re
+import secrets
 import threading
 import time
 from collections.abc import Iterator
@@ -148,7 +149,11 @@ def note_name_guid_hint(vm_name: str, guid: str) -> None:
 
     Learning a pairing also canonicalizes the capture-citation/input ledger
     (issue #126, R4-02): every capture record still keyed by the NAME moves
-    to the GUID key preserving its sequence number and metadata, and the
+    to the GUID key preserving its sequence number and metadata — and state-
+    read receipts (issue #140) migrate under the SAME rule with the seq
+    PRESERVED (re-stamping a receipt during migration would forge freshness
+    across the hint transition; the #140 contract's stale-after-migration
+    negative pins it), and the
     per-VM last-input high-water mark takes max(name-keyed, guid-keyed) under
     the GUID key — so a name-keyed capture registered before the hint existed
     stays citable by a click that now locks and keys on the GUID. The
@@ -186,6 +191,18 @@ def note_name_guid_hint(vm_name: str, guid: str) -> None:
                         record = _CAPTURE_REGISTRY.pop(k)
                         record["vm_key"] = guid
                         _CAPTURE_REGISTRY[(guid, k[1])] = record
+                    # Issue #140: receipts migrate under the SAME rule —
+                    # preserve the recorded seq (a re-stamped migration would
+                    # silently make a pre-input receipt look fresh after the
+                    # hint is learned; the #140 spec's stale-after-migration
+                    # negative pins this), re-key onto the GUID tuple.
+                    stale_receipts = [
+                        k for k, record in _STATE_RECEIPT_REGISTRY.items()
+                        if record["vm_key"] == key]
+                    for k in stale_receipts:
+                        record = _STATE_RECEIPT_REGISTRY.pop(k)
+                        record["vm_key"] = guid
+                        _STATE_RECEIPT_REGISTRY[(guid, k[1])] = record
                 if key in _LAST_INPUT_SEQ:
                     prior = _LAST_INPUT_SEQ.pop(key)
                     if prior > _LAST_INPUT_SEQ.get(guid, 0):
@@ -240,6 +257,20 @@ _REGISTRY_CAP = 512
 _CAPTURE_REGISTRY: dict[tuple[str, str], dict] = {}
 #: vm key -> the highest input-dispatch sequence number seen for that VM.
 _LAST_INPUT_SEQ: dict[str, int] = {}
+#: (vm_key, receipt_id) -> {"seq", "vm_key"}: UIA state-read receipts minted
+#: by record_state_read (issue #140, the #126 commit guard's second
+#: verification channel). Draws sequence numbers from the SAME _LEDGER_SEQ
+#: total order as captures and input bumps, so the guard's freshness rule —
+#: a citation is verified only when its seq is later than the VM's last
+#: input-dispatch seq — compares like with like (PRR-005 lesson: separate
+#: counters are incomparable domains). Tuple-keyed like the capture registry
+#: (PRR-006): a receipt belongs to ONE VM; FIFO-capped at _REGISTRY_CAP
+#: (#126 ASK-2 final polarity: a bounded registry whose eviction is
+#: fail-closed — an evicted citation refuses as unknown, never a wrong
+#: click). NOTE: unlike a capture, a receipt carries NO pixel domain and
+#: the receipt channel takes NO live-frame re-check leg: its freshness leg
+#: is ledger-ordering only, per-server-process (#126 ASK-1 final).
+_STATE_RECEIPT_REGISTRY: dict[tuple[str, str], dict] = {}
 
 
 def _ledger_key_unlocked(vm_name: str, vm_id: str) -> str:
@@ -335,13 +366,48 @@ def record_console_input(vm_name: str = "", vm_id: str = "") -> None:
                 _LAST_INPUT_SEQ[key] = seq
 
 
+def record_state_read(vm_name: str = "", vm_id: str = "") -> str:
+    """Mint a UIA state-read receipt (issue #140): the receipt id returned
+    here is what a guarded click cites as ``verified_state_receipt``. The
+    sequence number draws from the shared _LEDGER_SEQ INSIDE the same atomic
+    hint->ledger lock chain as register_capture (PRR-005), so a receipt's
+    seq is comparable with the VM's input-dispatch stamps: later = observed
+    after every input dispatched so far. A receipt attests ONLY that a
+    successful state read happened at this point in the ledger order — it
+    has no pixel domain and the guard's receipt channel takes no live-frame
+    re-check. Unresolvable VM key answers "" (nothing citable), mirroring
+    record_console_input's early return. Internal to the server: the
+    supported entry point is a UIA read tool returning its ``state_receipt``;
+    arbitrary direct minting has no live-state second leg, so no public tool
+    exposes this function."""
+    receipt_id = secrets.token_hex(16)
+    with _HINT_LOCK:
+        key = _ledger_key_unlocked(vm_name, vm_id)
+        if not key:
+            return ""
+        seq = next(_LEDGER_SEQ)
+        with _LEDGER_LOCK:
+            _STATE_RECEIPT_REGISTRY.pop((key, receipt_id), None)
+            _STATE_RECEIPT_REGISTRY[(key, receipt_id)] = {
+                "seq": seq,
+                "vm_key": key,
+            }
+            while len(_STATE_RECEIPT_REGISTRY) > _REGISTRY_CAP:
+                _STATE_RECEIPT_REGISTRY.pop(next(iter(_STATE_RECEIPT_REGISTRY)))
+    return receipt_id
+
+
 def reset_input_ledger() -> None:
-    """Clear the capture-citation registry and the per-VM input ledger (test
-    isolation). The sequence counter keeps running — only the ORDERING
-    guarantees matter, and an empty ledger has nothing to order."""
+    """Clear the capture-citation registry, the state-receipt registry and
+    the per-VM input ledger (test isolation). The sequence counter keeps
+    running — only the ORDERING guarantees matter, and an empty ledger has
+    nothing to order. Every per-VM citation registry the guard family owns
+    MUST be cleared here (the #140 class: a new registry omitted from this
+    reset leaks citations across tests — and across VMs — fail-OPENLY)."""
     with _LEDGER_LOCK:
         _CAPTURE_REGISTRY.clear()
         _LAST_INPUT_SEQ.clear()
+        _STATE_RECEIPT_REGISTRY.clear()
 
 
 def _lookup_capture(frame_hash: str, vm_key: str) -> dict | None:
@@ -353,6 +419,24 @@ def _lookup_capture(frame_hash: str, vm_key: str) -> dict | None:
         return None
     with _LEDGER_LOCK:
         record = _CAPTURE_REGISTRY.get((vm_key, frame_hash))
+        if record is None or record["vm_key"] != vm_key:
+            return None
+        return dict(record)
+
+
+def _lookup_state_receipt(receipt_id: str, vm_key: str) -> dict | None:
+    """The registry record for `receipt_id` when it belongs to `vm_key`,
+    else None (never minted by this process, evicted, or minted for another
+    VM — the (vm_key, receipt_id) TUPLE key keeps VMs independent, PRR-006).
+    NO format gate: registry membership is the citation's security property
+    (issue #140; the capture channel's 64-hex frame-hash format gate does not
+    transfer — a malformed receipt id is simply an unknown citation and
+    refuses through the structured commit_unverified family, as frozen by
+    the #140 spec's never-minted sentinel)."""
+    if not receipt_id:
+        return None
+    with _LEDGER_LOCK:
+        record = _STATE_RECEIPT_REGISTRY.get((vm_key, receipt_id))
         if record is None or record["vm_key"] != vm_key:
             return None
         return dict(record)
@@ -2889,18 +2973,30 @@ def _citation_domain(
     return frame_width, frame_height, record["content_rect"]
 
 
-def _commit_guard_freshness(record: dict) -> None:
+def _commit_guard_freshness(
+    record: dict, what: str = "capture", tail: str | None = None,
+) -> None:
     """The guard's freshness leg (issue #126 AC2): a verification captured
     at-or-before the most recent input dispatch to that VM proves nothing
     about the current selection. Scoped: the input ledger counts inputs
-    dispatched through THIS server process only."""
+    dispatched through THIS server process only.
+
+    ``what``/``tail`` parameterize ONLY the message noun and the scope
+    disclaimer so the receipt channel (issue #140) can make a
+    channel-accurate claim — a receipt has NO live-frame re-check leg, and
+    borrowing the capture text would falsely promise the pixels leg as a
+    backstop. The DEFAULTS reproduce the #126 text byte-for-byte (the
+    frozen guard/sequence suites pin those words; both transport checkers
+    and the sequence legs call through here for the hash channel)."""
     last = _last_input_seq_for(record["vm_key"])
     if record["seq"] <= last:
+        if tail is None:
+            tail = ("the input ledger is per-server-process; a cross-process "
+                    "input that changed the pixels is still caught by the "
+                    "live-frame check")
         raise ConsoleError(
-            "stale verification: the cited capture predates the most recent "
-            "input dispatched through this server process (the input ledger "
-            "is per-server-process; a cross-process input that changed the "
-            "pixels is still caught by the live-frame check)")
+            f"stale verification: the cited {what} predates the most recent "
+            f"input dispatched through this server process ({tail})")
 
 
 def _commit_guard_record(
@@ -2946,6 +3042,28 @@ def _commit_guard_record(
     return record
 
 
+def _commit_guard_receipt(verified_state_receipt: str, ref: vmident.VMRef) -> None:
+    """The guard's receipt-citation leg (issue #140, the #126 In-list's
+    second channel): the cited id must be a state-read receipt THIS process
+    minted for THIS VM (tuple-keyed lookup) and be fresh against the shared
+    input ledger. Raises the commit_unverified family on any miss; returns
+    after the freshness leg — the caller audits (allow-path only) and
+    dispatches. NO frame_width/frame_height demand and NO live capture: a
+    state read has no pixel domain (root-cause boundary 4); its attestation
+    is the ledger ordering alone."""
+    record = _lookup_state_receipt(
+        verified_state_receipt, _ledger_key(ref.name, ref.id))
+    if record is None:
+        raise ConsoleError(
+            "commit_unverified: the cited state receipt is unknown to this "
+            "server process's receipt registry (a UIA read tool mints "
+            "receipts; cite a state_receipt this process returned)")
+    _commit_guard_freshness(
+        record, what="state read",
+        tail=("the input ledger is per-server-process; the receipt channel "
+              "has no live-state re-check leg"))
+
+
 def _commit_guard_live_mismatch(live_hash: str, verified_frame_hash: str) -> None:
     if live_hash != verified_frame_hash:
         raise ConsoleError(
@@ -2956,13 +3074,24 @@ def _commit_guard_live_mismatch(live_hash: str, verified_frame_hash: str) -> Non
 def _commit_guard_check_ps(
     cfg: Config, ref: vmident.VMRef, prelude: str, timing: _PsTiming,
     frame_width: int, frame_height: int, verified_frame_hash: str,
+    verified_state_receipt: str = "",
 ) -> None:
     """The full guard flow for the PowerShell transport, INSIDE the held
     input lock (issue #126): freshness against the ledger, then a live
     capture at the caller's cited (frame_width, frame_height) — the cited
     verification's pixel domain — through the ALREADY-HELD internal capture
     seam (no re-entry of the per-VM lock; vmlocks refuses same-thread
-    re-entry). On success the decision is audited and the caller dispatches."""
+    re-entry). On success the decision is audited and the caller dispatches.
+
+    The receipt branch (issue #140) comes FIRST: a state-read citation
+    verifies through the ledger only — no pixel domain, no live capture
+    (C22/C7 pin that the hash branch keeps taking its capture leg and the
+    receipt branch never does). click() has already refused the both-
+    channels citation, so the branches are exclusive here."""
+    if verified_state_receipt:
+        _commit_guard_receipt(verified_state_receipt, ref)
+        _audit_commit_guard(ref.name)
+        return
     if not (frame_width and frame_height):
         raise ConsoleError(
             "commit_unverified: the commit guard requires frame_width/"
@@ -2980,9 +3109,17 @@ def _commit_guard_check_ps(
 def _commit_guard_check_wmi(
     be, ref: vmident.VMRef,
     frame_width: int, frame_height: int, verified_frame_hash: str,
+    verified_state_receipt: str = "",
 ) -> None:
     """The WMI-transport twin of _commit_guard_check_ps: the live capture is
-    be.capture at the cited size, under the caller's held input lock."""
+    be.capture at the cited size, under the caller's held input lock. The
+    receipt branch mirrors the PS twin exactly (issue #140 C22: same
+    citation, same refusal family, same audit-once, and be.capture is NEVER
+    called on the receipt path)."""
+    if verified_state_receipt:
+        _commit_guard_receipt(verified_state_receipt, ref)
+        _audit_commit_guard(ref.name)
+        return
     if not (frame_width and frame_height):
         raise ConsoleError(
             "commit_unverified: the commit guard requires frame_width/"
@@ -3261,6 +3398,7 @@ def click(
     cfg: Config, vm_name: str = "", x: int | None = None, y: int | None = None,
     frame_width: int = 0, frame_height: int = 0, button: int = 1, vm_id: str = "",
     frame_hash: str = "", commit_guard: bool = False, verified_frame_hash: str = "",
+    verified_state_receipt: str = "",
 ) -> dict:
     # Issue #83 guards before anything spawns: a bool button passes the
     # membership check (True in (1, 2)) and interpolates as ButtonIndex =
@@ -3280,6 +3418,25 @@ def click(
         raise ValueError("verified_frame_hash must be an empty string or a 64-char hex sha256")
     if not commit_guard and verified_frame_hash:
         raise ValueError("verified_frame_hash requires commit_guard=True")
+    # Issue #140 (the receipt channel) — the citation discipline mirrors
+    # the frame-hash rules. NO format gate here or downstream: registry
+    # membership is the citation's security property (a malformed string
+    # citation refuses through the structured commit_unverified family, as
+    # the #140 contract's never-minted sentinel freezes); the isinstance
+    # guard exists so a truthy non-str fails as a clean ValueError naming
+    # the parameter instead of a TypeError leaking out of the registry
+    # lookup (falsy non-str values fall through as an absent citation, the
+    # same posture as the frame-hash channel's falsy handling).
+    if verified_state_receipt and not isinstance(verified_state_receipt, str):
+        raise ValueError(
+            "verified_state_receipt must be a string state_receipt id")
+    if not commit_guard and verified_state_receipt:
+        raise ValueError("verified_state_receipt requires commit_guard=True")
+    if commit_guard and verified_frame_hash and verified_state_receipt:
+        raise ValueError(
+            "commit_guard accepts exactly one verification channel: "
+            "verified_state_receipt is mutually exclusive with "
+            "verified_frame_hash (cite one, not both)")
     if commit_guard and (x is None or y is None):
         # PRR-015: a guarded click-at-current-position has no point to
         # band-check or map through the cited pixel domain, so the guard is
@@ -3337,8 +3494,11 @@ def click(
                     # mouse input — freshness against the input ledger, then a
                     # live capture at the cited pixel domain hashed against
                     # the citation. A refusal here sends no input at all.
+                    # Issue #140: the receipt citation branches inside the
+                    # same locked region (ledger-only, no capture leg).
                     _commit_guard_check_wmi(
-                        be, ref, frame_width, frame_height, verified_frame_hash)
+                        be, ref, frame_width, frame_height, verified_frame_hash,
+                        verified_state_receipt=verified_state_receipt)
                 extra: dict = {}
                 if x is not None and y is not None:
                     if record is None:
@@ -3379,9 +3539,12 @@ def click(
                 # Issue #126: the guard flow INSIDE the held lock, before the
                 # positional script is dispatched (the live capture runs on
                 # the already-held internal seam — no lock re-entry).
+                # Issue #140: the receipt branch verifies ledger-only inside
+                # the same locked region before any dispatch.
                 _commit_guard_check_ps(
                     cfg, ref, prelude, timing,
-                    frame_width, frame_height, verified_frame_hash)
+                    frame_width, frame_height, verified_frame_hash,
+                    verified_state_receipt=verified_state_receipt)
             _bump_input(ref)
             result = _run(cfg, script, timeout_s=90, timing=timing)
         _check_input_rc(result, "console mouse click", vm_name)
@@ -4142,6 +4305,20 @@ def _validate_sequence_steps(
                 plan.append({"action": "mouse_positional", "x": int(x), "y": int(y),
                              "fw": fw, "fh": fh, "click": False, "button": 1})
             elif action == "click":
+                # Issue #140 (A1, fail-closed): the sequence guard stays
+                # frame-hash-only — its precondition model compares
+                # expect_frame_hash to the cited hash, which a state-read
+                # receipt has no hash to feed. The step dicts are untyped,
+                # so a receipt key must be REFUSED ON PRESENCE (a silently
+                # ignored safety parameter is the NEW-14 fail-open family):
+                # refused whether or not commit_guard is set, and before
+                # every other step check so no dispatch path can consume it.
+                if "verified_state_receipt" in step:
+                    raise ValueError(
+                        f"step {i}: verified_state_receipt is not supported "
+                        "on sequence steps (the sequence guard is frame-hash-"
+                        "only; cite verified_frame_hash, or use "
+                        "hyperv_console_click for the receipt channel)")
                 # NEW-14/PRR-003: the guard keys ride untyped list[dict]
                 # steps (pydantic covers only the envelope), so a truthy
                 # non-bool commit_guard must be a step-indexed refusal — a
