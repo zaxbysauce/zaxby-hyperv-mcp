@@ -125,6 +125,13 @@ def test_every_registered_read_tool_surfaces_state_receipt(
         monkeypatch.setenv("HYPERV_GUEST_PASSWORD", "placeholder-pass")
         mod = fresh_server({"HYPERV_MCP_UNRESTRICTED": "1"})
     result = asyncio.run(mod.get_mcp().call_tool(tool, args))
+    # Envelope integrity (reviewer round-4): a successful read must come
+    # back as a NON-error result — errors.failure_result(result) would keep
+    # the state_receipt key yet flip is_error, masking a success as failure.
+    assert not getattr(result, "is_error", False), (
+        f"{tool} ({inline=}) returned an MCP error envelope for a "
+        "successful read — ok-True payload inside is_error is a contract "
+        "break (PRR-007 matrix hardening)")
     meta = _meta(result)
     assert meta.get("ok") is True, (tool, inline, meta)
     rid = meta.get("state_receipt")
@@ -228,8 +235,8 @@ def test_both_ui_tool_wrappers_return_the_verb_dict_unchanged():
         f"expected both credential-variant _run_ui_tool wrappers, found "
         f"{len(wrappers)} — if the registration shape legitimately changed, "
         "update this pin deliberately, never silently")
-    allowed_bare = 0
     for w in wrappers:
+        bare_returns = 0
         for r in ast.walk(w):
             if not isinstance(r, ast.Return):
                 continue
@@ -245,8 +252,11 @@ def test_both_ui_tool_wrappers_return_the_verb_dict_unchanged():
                 "other allowed form); a filtered or conditional return "
                 "silently drops state_receipt from a registered read-tool "
                 "envelope (PRR-007)")
-            allowed_bare += 1
-        assert allowed_bare, "no `return result` at all — the pin is vacuous"
+            bare_returns += is_bare
+        assert bare_returns, (
+            f"_run_ui_tool at line {w.lineno} has no `return result` at all "
+            "— the pin is vacuous (reviewer round-4 nit: per-wrapper, "
+            "counting only the bare form)")
         bad = _result_mutations(w)
         assert not bad, (
             f"_run_ui_tool at line {w.lineno} mutates the verb result "
