@@ -36,7 +36,7 @@ docs/rebaseline-runbook.md).
 | 55-108-31-32-33-collated | 14 | 14 | 0 | clean |
 | 59-64-68-70-hardening-wave | 15 | 15 | 0 | clean |
 | 6-guest-put-get-policy | 13 | 13 | 0 | clean |
-| 63-66-119-collated | 13 | 12 | 1 | exit 1 |
+| 63-66-119-collated | 13 | 13 | 0 | clean |
 | 64-68-collated | 11 | 11 | 0 | clean |
 | 67-118-release-vendor-provenance | 10 | 10 | 0 | clean |
 | 7-guest-jobs-truthful-reporting | 13 | 13 | 0 | clean |
@@ -53,10 +53,7 @@ docs/rebaseline-runbook.md).
 
 ## Drift detail (CHANGED pairs)
 
-### 63-66-119-collated (exit 1)
-
-- `CHANGED docs/issue-trace-drift-inventory.md a2069c05778e736cb41a7e2c08b276a105155417 760e7d37142e418378d36c62800140cc5ed94ed9 (C8)`
-
+None — every frozen pair verifies OK at the current tree.
 <!-- regenerated-state-end -->
 
 ## Discovery snapshot (recorded 2026-11-05, base 8bc60cb7196ae128231c25a15881cded26b0afda)
