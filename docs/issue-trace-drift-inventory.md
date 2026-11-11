@@ -36,7 +36,7 @@ docs/rebaseline-runbook.md).
 | 55-108-31-32-33-collated | 14 | 14 | 0 | clean |
 | 59-64-68-70-hardening-wave | 15 | 15 | 0 | clean |
 | 6-guest-put-get-policy | 13 | 13 | 0 | clean |
-| 63-66-119-collated | 13 | 11 | 2 | exit 1 |
+| 63-66-119-collated | 13 | 12 | 1 | exit 1 |
 | 64-68-collated | 11 | 11 | 0 | clean |
 | 67-118-release-vendor-provenance | 10 | 10 | 0 | clean |
 | 7-guest-jobs-truthful-reporting | 13 | 13 | 0 | clean |
@@ -55,8 +55,7 @@ docs/rebaseline-runbook.md).
 
 ### 63-66-119-collated (exit 1)
 
-- `CHANGED .agents/issue-traces/74-72-88-cost-latency-accounting/repro/checkpoint.manifest 821b7a1fac2a417ec2ac6391edd7caa6d868f927 8ac9dce2469983127a34b528a9ad463032f0ddf4 (C9)`
-- `CHANGED .agents/issue-traces/74-72-88-cost-latency-accounting/repro/checkpoint.manifest 821b7a1fac2a417ec2ac6391edd7caa6d868f927 8ac9dce2469983127a34b528a9ad463032f0ddf4 (C10)`
+- `CHANGED docs/issue-trace-drift-inventory.md 81cb4fbd5b9f25811d14e778c3e73434c23d6b20 9fff879ccca7981f779328465fa5dda56af6128b (C8)`
 
 <!-- regenerated-state-end -->
 
