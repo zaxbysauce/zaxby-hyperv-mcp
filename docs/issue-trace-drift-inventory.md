@@ -14,7 +14,7 @@ docs/rebaseline-runbook.md).
 | 12-remote-hyperv-host | 7 | 7 | 0 | clean |
 | 125-126-console-accuracy-commit-guard | 11 | 11 | 0 | clean |
 | 13-stdio-proxy | 10 | 10 | 0 | clean |
-| 140-126-uia-state-receipt | 41 | 41 | 0 | clean |
+| 140-126-uia-state-receipt | 44 | 44 | 0 | clean |
 | 17-rgb565-native-decode | 12 | 12 | 0 | clean |
 | 18-console-one-ps-process-per-call | 17 | 17 | 0 | clean |
 | 19-screenshot-output-options | 23 | 23 | 0 | clean |
@@ -55,7 +55,7 @@ docs/rebaseline-runbook.md).
 
 ### 63-66-119-collated (exit 1)
 
-- `CHANGED docs/issue-trace-drift-inventory.md 81cb4fbd5b9f25811d14e778c3e73434c23d6b20 9fff879ccca7981f779328465fa5dda56af6128b (C8)`
+- `CHANGED docs/issue-trace-drift-inventory.md a2069c05778e736cb41a7e2c08b276a105155417 760e7d37142e418378d36c62800140cc5ed94ed9 (C8)`
 
 <!-- regenerated-state-end -->
 
