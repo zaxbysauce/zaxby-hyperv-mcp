@@ -91,28 +91,47 @@ def _meta(result) -> dict:
 # ---- PRR-007: registered read-tool envelope + wrapper pass-through ------
 
 
-def test_registered_read_tool_surfaces_state_receipt(monkeypatch, unrestricted,
-                                                     fresh_server):
-    """End-to-end through the registered FastMCP tool: hyperv_ui_find's
-    envelope carries the minted state_receipt, and the id is a live
-    registry member (citable), not a fabricated string."""
+_UI_READ_TOOLS = {
+    "hyperv_ui_session_state": {},
+    "hyperv_ui_inspect": {},
+    "hyperv_ui_find": {"selector": {"automation_id": "File"}},
+    "hyperv_ui_wait_for": {"selector": {"automation_id": "File"},
+                           "timeout_s": 5},
+}
+
+
+@pytest.mark.parametrize("inline", [False, True], ids=["env-creds", "inline-creds"])
+@pytest.mark.parametrize("tool", sorted(_UI_READ_TOOLS))
+def test_every_registered_read_tool_surfaces_state_receipt(
+        monkeypatch, unrestricted, fresh_server, tool, inline):
+    """End-to-end through the registered FastMCP tools — ALL four read verbs
+    in BOTH credential variants (verification round-3: exercising only
+    hyperv_ui_find left a tool-conditional filtered return surviving the
+    combined suite): every successful read envelope carries the minted
+    state_receipt, and the id is a live registry member (citable), not a
+    fabricated string."""
     frozen._ui_transport(monkeypatch, guids={"vm1": GUID})
-    # The registered variant takes NO inline credentials (env-sourced, per
-    # the tool docs): supply them the way a deployment does.
-    monkeypatch.setenv("HYPERV_GUEST_USERNAME", "tester")
-    monkeypatch.setenv("HYPERV_GUEST_PASSWORD", "placeholder-pass")
-    mod = fresh_server({"HYPERV_MCP_UNRESTRICTED": "1"})
-    mcp = mod.get_mcp()
-    result = asyncio.run(mcp.call_tool("hyperv_ui_find", {
-        "vm_name": "vm1", "selector": {"automation_id": "File"},
-    }))
+    from hyperv_mcp.config import Config
+
+    args: dict = {"vm_name": "vm1", **_UI_READ_TOOLS[tool]}
+    if inline:
+        mod = fresh_server({}, config=Config(
+            unrestricted=True, allow_inline_credentials=True))
+        args.update({"username": "tester", "password": "placeholder-pass"})
+    else:
+        # The env-credential variant takes NO inline params (env-sourced,
+        # per the tool docs): supply them the way a deployment does.
+        monkeypatch.setenv("HYPERV_GUEST_USERNAME", "tester")
+        monkeypatch.setenv("HYPERV_GUEST_PASSWORD", "placeholder-pass")
+        mod = fresh_server({"HYPERV_MCP_UNRESTRICTED": "1"})
+    result = asyncio.run(mod.get_mcp().call_tool(tool, args))
     meta = _meta(result)
-    assert meta.get("ok") is True, meta
+    assert meta.get("ok") is True, (tool, inline, meta)
     rid = meta.get("state_receipt")
     assert isinstance(rid, str) and rid, (
-        "PRR-007: the registered read tool's envelope must carry the minted "
-        "state_receipt — the agent's only handle into the receipt channel"
-    )
+        f"PRR-007: the registered {tool} envelope ({inline=}) must carry the "
+        "minted state_receipt — the agent's only handle into the receipt "
+        "channel; a tool-conditional filtered return drops it")
     assert (console._lookup_state_receipt(rid, console._ledger_key("vm1", GUID))
             is not None
             or console._lookup_state_receipt(rid, console._ledger_key("vm1", ""))
@@ -122,14 +141,14 @@ def test_registered_read_tool_surfaces_state_receipt(monkeypatch, unrestricted,
 
 
 def _result_mutations(w: ast.FunctionDef) -> list:
-    """Every syntax that could silently alter the verb result BEFORE it
-    reaches the caller's envelope. Enumerated shapes (verification round-2
-    closed the annotated-rebind and **result gaps — the round-1 version
-    missed `result: dict = ...` and its `**`-Dict branch was dead code
-    because `**x` unpacks land in values[] with keys[i] is None): method
-    calls that mutate `result`, subscript store/delete on it, ANY re-binding
-    of the name (plain, augmented, annotated, walrus, for-target, with-target)
-    to anything but the verb call itself, and dict/list literals that unpack
+    """Enumerated syntaxes that can silently alter the verb result before it
+    reaches the caller's envelope (verification round-2 closed the
+    annotated-rebind and **result gaps — the round-1 version missed
+    `result: dict = ...` and its `**`-Dict branch was dead code because `**x`
+    unpacks land in values[] with keys[i] is None): method calls that mutate
+    `result`, subscript store/delete on it, ANY re-binding of the name
+    (plain, augmented, annotated, walrus, for-target, with-target) to
+    anything but the verb call itself, and dict/list literals that unpack
     `**result` (verification round-1: the first version of this pin only
     checked a `return result` existed, and `result.pop("state_receipt",
     None)` before it survived both shards)."""
@@ -189,14 +208,19 @@ def _result_mutations(w: ast.FunctionDef) -> list:
 
 
 def test_both_ui_tool_wrappers_return_the_verb_dict_unchanged():
-    """Structural pin over BOTH credential variants of _run_ui_tool: the
-    ok-path must be a bare `return result`, and NOTHING in the wrapper may
-    mutate or rebuild `result` first — any key filtering, .pop, del, or
-    envelope rebuild silently drops state_receipt from one credential
-    variant while the other variant's behavioral test still passes
-    (verification round-1 Finding 2: the earlier existence-only pin was
-    bypassable by a pre-return result.pop in the wrapper this test does
-    not behaviorally reach)."""
+    """Structural pin over BOTH credential variants of _run_ui_tool. TWO
+    rules (each added by a verification round that reproduced a bypass of
+    the previous version):
+    (1) EVERY ast.Return in the wrapper is either the bare `return result`
+        or an errors.failure_result(...) envelope — an existence-only check
+        let a tool-conditional `return {k: v for k, v in result.items() if
+        k != "state_receipt"}` branch survive the combined suite
+        (verification round-3); a new success-path branch cannot hide behind
+        the legitimate final return.
+    (2) NOTHING in the wrapper mutates or rebuilds `result` before the
+        return — .pop/subscript/rebind/walrus/for/with/** rebuilds were each
+        reproduced surviving an earlier, weaker pin (verification rounds
+        1-2)."""
     tree = ast.parse(SERVER_SRC.read_text(encoding="utf-8"))
     wrappers = [n for n in ast.walk(tree)
                 if isinstance(n, ast.FunctionDef) and n.name == "_run_ui_tool"]
@@ -204,46 +228,30 @@ def test_both_ui_tool_wrappers_return_the_verb_dict_unchanged():
         f"expected both credential-variant _run_ui_tool wrappers, found "
         f"{len(wrappers)} — if the registration shape legitimately changed, "
         "update this pin deliberately, never silently")
+    allowed_bare = 0
     for w in wrappers:
-        ok_returns = [n for n in ast.walk(w)
-                      if isinstance(n, ast.Return)
-                      and isinstance(n.value, ast.Name)
-                      and n.value.id == "result"]
-        assert ok_returns, (
-            f"_run_ui_tool at line {w.lineno} must return the verb result "
-            "dict unchanged on the success path (PRR-007): filtering or "
-            "rebuilding the envelope silently drops state_receipt")
+        for r in ast.walk(w):
+            if not isinstance(r, ast.Return):
+                continue
+            v = r.value
+            is_bare = isinstance(v, ast.Name) and v.id == "result"
+            is_failure = (isinstance(v, ast.Call)
+                          and getattr(v.func, "attr", "") == "failure_result")
+            assert is_bare or is_failure, (
+                f"_run_ui_tool at line {w.lineno} has a non-bare success "
+                f"return at line {r.lineno}: {ast.unparse(r)} — every "
+                "success path must be exactly `return result` (failure "
+                "envelopes via errors.failure_result(...) are the only "
+                "other allowed form); a filtered or conditional return "
+                "silently drops state_receipt from a registered read-tool "
+                "envelope (PRR-007)")
+            allowed_bare += 1
+        assert allowed_bare, "no `return result` at all — the pin is vacuous"
         bad = _result_mutations(w)
         assert not bad, (
             f"_run_ui_tool at line {w.lineno} mutates the verb result "
             f"before returning it: {bad} — the registered envelope must "
             "carry state_receipt for BOTH credential variants")
-
-
-def test_registered_read_tool_surfaces_state_receipt_inline_credentials(
-        monkeypatch, unrestricted, fresh_server):
-    """Behavioral coverage for the OTHER credential variant (PRR-007,
-    verification round-1 Finding 2): with allow_inline_credentials on, the
-    registered hyperv_ui_find takes username/password and its envelope must
-    still carry the minted state_receipt. Without this row the
-    creds_allowed wrapper was only covered by the AST pin."""
-    frozen._ui_transport(monkeypatch, guids={"vm1": GUID})
-    from hyperv_mcp.config import Config
-
-    mod = fresh_server({}, config=Config(unrestricted=True,
-                                         allow_inline_credentials=True))
-    mcp = mod.get_mcp()
-    result = asyncio.run(mcp.call_tool("hyperv_ui_find", {
-        "vm_name": "vm1", "selector": {"automation_id": "File"},
-        "username": "tester", "password": "placeholder-pass",
-    }))
-    meta = _meta(result)
-    assert meta.get("ok") is True, meta
-    rid = meta.get("state_receipt")
-    assert isinstance(rid, str) and rid, (
-        "PRR-007: the inline-credentials variant's envelope must carry "
-        "the minted state_receipt too — one variant silently dropping it "
-        "breaks the receipt channel for deployments with inline creds on")
 
 
 # ---- PRR-008: receipt click without the pixel domain, both twins ------
