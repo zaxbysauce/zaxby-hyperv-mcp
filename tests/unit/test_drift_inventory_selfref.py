@@ -204,6 +204,9 @@ def test_broken_leg_fails_the_gate(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(mod, "_verify", _verify_with_broken)
     docs = _seed_docs(root)
     assert _main(monkeypatch, "--snapshot") == 0
+    body = docs.read_text(encoding="utf-8")
+    # R8 render pin: the broken leg renders as its exit code, never "clean"
+    assert "| sibling-wave | 0 | 0 | 0 | exit 2 |" in body
     rc = _main(monkeypatch, "--check")
     assert rc == 1
     captured = capsys.readouterr().out + capsys.readouterr().err
