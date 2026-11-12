@@ -2305,7 +2305,7 @@ console key PER poll slice (the bounded guest-side slices), so console
 inputs interleave freely BETWEEN slices and only queue behind a single
 in-flight slice — the receipt's observation-to-stamp atomicity is preserved
 per minted slice, while the wait as a whole does not monopolize the key.
-single-operator flows alternate capture->read->click and are unaffected. Unlike the frame-hash channel the
+Single-operator flows alternate capture->read->click and are unaffected. Unlike the frame-hash channel the
 receipt verifies ledger ordering ONLY: there is no live-frame re-check leg,
 no pixel-domain requirement (`frame_width`/`frame_height` are not needed
 for the verification itself, only for coordinate mapping), and the
