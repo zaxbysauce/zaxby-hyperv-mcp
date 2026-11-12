@@ -379,3 +379,24 @@ def test_allowlisted_env_secret_is_usable(monkeypatch, unrestricted_cfg):
     out = console.type_text(unrestricted_cfg, "vm1",
                             secret_ref="env:APP_TEST_CASE_INSENSITIVE")
     assert out["ok"] is True and out["chars"] == 2
+
+
+def test_docstrings_disclose_the_focus_limitation():
+    """M9 kill pin: the unlock docstrings (module layer + both server
+    registrations) carry the password-field focus limitation — a silent
+    disclosure decay would fail here (final-critic finding 3)."""
+    import inspect
+    from pathlib import Path
+
+    import hyperv_mcp.server as server_module
+
+    module_doc = " ".join((inspect.getdoc(console.unlock) or "").split())
+    assert "not explicitly focused" in module_doc
+    server_src = " ".join(
+        Path(server_module.__file__).read_text(encoding="utf-8").split())
+    assert "not explicitly focused" in server_src, (
+        "the hyperv_console_unlock registration must disclose the focus "
+        "limitation"
+    )
+    # and the module docstring's limitation text names the UIA follow-ups
+    assert "UIA helper" in module_doc
