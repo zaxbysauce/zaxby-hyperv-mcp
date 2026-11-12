@@ -70,6 +70,7 @@ def _fake_verify(monkeypatch: pytest.MonkeyPatch, outputs: dict[str, str]) -> No
 
 OK_SELF = "OK " + mod.SELF_PATH + "\n"
 CHANGED_SELF = f"CHANGED {mod.SELF_PATH} {'f' * 40} {'a' * 40} (C8)\n"
+OK_SIBLING = "OK README.md\n"
 CHANGED_SIBLING = f"CHANGED README.md {'3' * 40} {'9' * 40} (C1)\n"
 
 
@@ -208,3 +209,32 @@ def test_self_pair_extraction_prefers_the_last_row(tmp_path):
     )
     pairs = mod._manifest_self_pairs(manifest)
     assert pairs == [{"check": "C8", "blob": "b" * 40}]
+
+
+def test_table_cell_is_identical_whatever_the_self_pair_reads(tmp_path, monkeypatch):
+    """Final-critic round-2 finding: the summary table's verify-checkpoint
+    cell must not depend on the excluded self pair's own OK/CHANGED state —
+    otherwise a re-anchored document flip-flops between two renderings and
+    --check never passes. Render the same census once with the self pair
+    OK and once CHANGED: the two documents must be byte-identical."""
+    body_by_state = {}
+    for self_state in ("OK", "CHANGED"):
+        root = _sandbox(tmp_path / self_state, monkeypatch)
+        out = OK_SELF if self_state == "OK" else CHANGED_SELF
+        _fake_verify(monkeypatch, {
+            "63-66-119-collated": out,
+            "sibling-wave": OK_SIBLING,
+        })
+        docs = _seed_docs(root)
+        assert _main(monkeypatch, "--snapshot") == 0
+        assert _main(monkeypatch) == 0  # regenerate in place
+        body_by_state[self_state] = docs.read_text(encoding="utf-8")
+    ok_body = body_by_state["OK"]
+    changed_body = body_by_state["CHANGED"]
+    # strip the parts that legitimately differ (the self line inside
+    # verify output never enters the doc; the docs should be identical)
+    assert ok_body == changed_body, (
+        "the rendered document depends on the excluded self pair's state"
+    )
+    assert "| 63-66-119-collated |" in ok_body
+    assert "exit 1" not in ok_body.split("## Self-referential")[0].split("| 63-66-119-collated |")[1]

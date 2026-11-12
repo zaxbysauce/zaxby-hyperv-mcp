@@ -1159,6 +1159,7 @@ Config._FIELD_MAP = {  # type: ignore[attr-defined]
     "host_write_roots": lambda c, v: c._set_str_list("host_write_roots", v),
     "guest_read_roots": lambda c, v: c._set_str_list("guest_read_roots", v),
     "guest_write_roots": lambda c, v: c._set_str_list("guest_write_roots", v),
+    "secret_env_names": lambda c, v: c._set_str_list("secret_env_names", v),
     "destructive": lambda c, v: c._set_destructive(v),
     "allow_inline_credentials": lambda c, v: c._set_bool("allow_inline_credentials", v),
     "unrestricted": lambda c, v: c._set_bool("unrestricted", v),

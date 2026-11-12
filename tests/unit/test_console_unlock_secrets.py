@@ -400,3 +400,14 @@ def test_docstrings_disclose_the_focus_limitation():
     )
     # and the module docstring's limitation text names the UIA follow-ups
     assert "UIA helper" in module_doc
+
+
+def test_secret_env_names_loads_from_a_config_file():
+    """Final-critic round-2 finding: the allowlist is settable through the
+    real config loader (Config.from_dict), not just by attribute — an
+    operator following the README gets a working env: leg, not a startup
+    ConfigError."""
+    from hyperv_mcp.config import Config
+
+    cfg = Config.from_dict({"secret_env_names": ["APP_TEST_*"]})
+    assert cfg.secret_env_names == ["APP_TEST_*"]

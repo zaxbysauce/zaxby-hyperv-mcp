@@ -140,9 +140,16 @@ def _dynamic(rows: list[dict]) -> str:
         # A nonzero verify-checkpoint exit with no CHANGED line is a broken
         # leg (missing manifest, invalid check id -> exit 2), not a clean
         # trace: surface the exit instead of rendering "clean" (reviewer R8).
+        # The cell must be IDENTICAL whether the excluded self pair reads OK
+        # or CHANGED (final-critic round-2 finding: the exit code includes
+        # the self pair's own result, so a re-anchored doc flip-flopped
+        # between two renderings forever). A trace whose only divergence is
+        # the excluded pair renders clean; a broken leg (nonzero exit, no
+        # gate CHANGED, no self divergence) still renders its exit (the R8
+        # anti-laundering pin holds).
         gate_state = (
             "clean"
-            if not row["gate_changed"] and row["code"] == 0
+            if not row["gate_changed"] and (row["code"] == 0 or row["self_changed"])
             else f"exit {row['code']}"
         )
         lines.append(f"| {row['slug']} | {row['pairs']} | {row['ok']} | {len(row['gate_changed'])} | {gate_state} |")
