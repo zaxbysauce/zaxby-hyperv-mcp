@@ -29,10 +29,10 @@ the quine that forced the regenerate -> re-AMEND -> regenerate ritual and
 the --no-verify pre-push bypass. Such pairs are EXCLUDED from the gate
 verdict AND from the rendered counts (their OK/CHANGED lines move with the
 document's own bytes) and reported in their own labelled section. The
-section lists each pair with the document's live working-tree blob id
-(`git hash-object`) and NO rendered match/diverge verdict — a document
-cannot contain a prefix of its own hash, so any rendered comparison could
-never converge (final-critic finding 4); the census text is therefore
+section lists each pair by trace and check id only and renders NO hash or
+verdict at all — ANY document-derived value (a blob id, a comparison)
+moves with the document's own bytes and would re-open the quine; the
+census text is therefore
 regeneration-stable by construction and two consecutive `--check` runs
 agree. The pair stays visible (issue #143 AC3); re-anchoring is the next
 re-baseline wave's bookkeeping, never a gate failure.
@@ -106,8 +106,15 @@ def _collect() -> list[dict]:
         # are excluded from the gate verdict AND from the rendered counts
         # (issue #143): a CHANGED *or* OK line naming that path varies with
         # the document's own bytes, so even the OK count is quine-affected.
-        self_changed = [line for line in changed_lines if SELF_PATH in line]
-        gate_changed = [line for line in changed_lines if SELF_PATH not in line]
+        # Classify by the parsed PATH FIELD (verify-checkpoint prints
+        # 'CHANGED <path> <frozen> <actual> (<check>)'), not substring
+        # membership — a future pinned path merely CONTAINING the doc path
+        # must not be silently excluded (PR-144 review RISK-02).
+        def _line_path(line: str) -> str:
+            return line.split()[1] if len(line.split()) >= 2 else ""
+
+        self_changed = [line for line in changed_lines if _line_path(line) == SELF_PATH]
+        gate_changed = [line for line in changed_lines if _line_path(line) != SELF_PATH]
         gate_ok = sum(
             1 for line in lines
             if line.startswith("OK ") and SELF_PATH not in line

@@ -39,7 +39,7 @@ reported below (issue #143).
 | 55-108-31-32-33-collated | 14 | 14 | 0 | clean |
 | 59-64-68-70-hardening-wave | 15 | 15 | 0 | clean |
 | 6-guest-put-get-policy | 13 | 13 | 0 | clean |
-| 63-66-119-collated | 12 | 12 | 0 | clean |
+| 63-66-119-collated | 12 | 10 | 2 | exit 1 |
 | 64-68-collated | 11 | 11 | 0 | clean |
 | 67-118-release-vendor-provenance | 10 | 10 | 0 | clean |
 | 7-guest-jobs-truthful-reporting | 13 | 13 | 0 | clean |
@@ -67,7 +67,11 @@ wave's bookkeeping and is never a gate failure.
 
 ## Drift detail (CHANGED pairs)
 
-None — every gate-relevant frozen pair verifies OK at the current tree.
+### 63-66-119-collated (exit 1)
+
+- `CHANGED .agents/issue-traces/74-72-88-cost-latency-accounting/repro/checkpoint.manifest 90287b8eeefe588de075a63391ab78a9f22a2321 9edbeba58d24eeddd7fd7cd584782e438a073314 (C9)`
+- `CHANGED .agents/issue-traces/74-72-88-cost-latency-accounting/repro/checkpoint.manifest 90287b8eeefe588de075a63391ab78a9f22a2321 9edbeba58d24eeddd7fd7cd584782e438a073314 (C10)`
+
 <!-- regenerated-state-end -->
 
 ## Discovery snapshot (recorded 2026-11-05, base 8bc60cb7196ae128231c25a15881cded26b0afda)

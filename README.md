@@ -1,7 +1,7 @@
 # hyperv-mcp (hardened fork)
 
 An MCP (Model Context Protocol) server for Hyper-V VM management and guest
-execution. Exposes 80 tools for VM lifecycle, checkpoint management, kernel
+execution. Exposes 82 tools for VM lifecycle, checkpoint management, kernel
 debug setup (KDNET/KDCOM), and guest file transfer/command execution via
 PowerShell Direct (no WinRM required).
 
@@ -268,10 +268,9 @@ the task-spawned controller reads it from the environment.
   made the gate unreachable at its own fresh output and forced the
   regenerate -> re-AMEND -> regenerate ritual and a disclosed
   `--no-verify` pre-push bypass). Those pairs are reported in a labelled
-  "Self-referential pairs" section, whose verdict compares the pair's
-  frozen blob against the WORKING-TREE blob id (`git hash-object` — an
-  identity that moves with neither the regeneration nor the commit of the
-  document). `--check` now also fails when a sibling trace genuinely
+  "Self-referential pairs" section that renders NO hash or verdict — any
+  document-derived value moves with the document's own bytes and would
+  re-open the quine. `--check` now also fails when a sibling trace genuinely
   drifts even when the docs copy already matches the regeneration (an
   up-to-date record of a real drift is still a failure), and when a
   `verify-checkpoint` exits nonzero with no CHANGED lines (a broken local

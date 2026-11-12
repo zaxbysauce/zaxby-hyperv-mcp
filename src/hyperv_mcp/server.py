@@ -1,7 +1,7 @@
 """
 hyperv_mcp.server -- MCP server for Hyper-V VM management (hardened fork).
 
-Exposes 80 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
+Exposes 82 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
 guest execution and file transfer via PowerShell Direct, guest access
 diagnostics/repair and managed guest jobs, reboot recovery verification,
 host-to-guest HTTP relay, console observation and input (WMI), evidence
