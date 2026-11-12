@@ -27,11 +27,14 @@ inventory document itself (63-66-119-collated's C8 pair) would otherwise
 make every regeneration change the very hash the gate compares against —
 the quine that forced the regenerate -> re-AMEND -> regenerate ritual and
 the --no-verify pre-push bypass. Such pairs are EXCLUDED from the gate
-verdict and reported in their own labelled section, verified against the
-COMMITTED blob at HEAD (`git ls-tree HEAD`) rather than the working tree,
-which is stable across regenerations. Their live verdict stays visible
-(issue #143 AC3); the committed-vs-frozen divergence (an AMEND pending at
-the next re-baseline wave) is informational, never a gate failure.
+verdict AND from the rendered counts (their OK/CHANGED lines move with the
+document's own bytes) and reported in their own labelled section. The
+section's verdict compares the pair's frozen blob against the WORKING-TREE
+blob id (`git hash-object`) — an identity that moves with neither the
+regeneration nor the commit of this document — so the census converges at
+its own fresh output and two consecutive `--check` runs agree. The live
+verdict stays visible (issue #143 AC3); a diverged pin is informational
+(re-anchor at the next re-baseline wave), never a gate failure.
 """
 
 from __future__ import annotations
@@ -62,22 +65,21 @@ def _verify(slug: str) -> tuple[int, str]:
     return proc.returncode, proc.stdout + proc.stderr
 
 
-def _committed_blob(path: str) -> str | None:
-    """The blob id `path` carries at HEAD (None when the path is untracked
-    or git fails). The self-referential pairs are verified against THIS
-    identity instead of the working tree so the census is regeneration-
-    stable (issue #143)."""
+def _live_blob(path: str) -> str | None:
+    """The git blob id of the WORKING-TREE file (None when unreadable).
+
+    The self-referential pair's informational verdict uses this identity:
+    unlike the committed blob it does not move when the document is
+    committed, and unlike a working-tree CONTENT hash it uses the repo's
+    own blob filter (LF normalization), so the verdict is stable across
+    both regenerations and commits once the tree converges (issue #143).
+    """
     proc = subprocess.run(
-        ["git", "ls-tree", "HEAD", "--", path],
+        ["git", "hash-object", "--", path],
         cwd=REPO, capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
-    if proc.returncode != 0:
-        return None
-    for line in proc.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[1] == "blob":
-            return parts[2]
-    return None
+    blob = proc.stdout.strip()
+    return blob or None
 
 
 def _manifest_self_pairs(manifest: Path) -> list[dict]:
@@ -168,16 +170,16 @@ def _dynamic(rows: list[dict]) -> str:
     if not self_rows:
         lines.append("None — no trace pins the inventory document itself.")
     for row, pair in self_rows:
-        committed = _committed_blob(SELF_PATH)
         frozen = pair["blob"]
-        if committed == frozen:
-            verdict = "committed pin matches"
+        live = _live_blob(SELF_PATH)
+        if live == frozen:
+            verdict = "live tree matches the frozen pin"
         else:
-            verdict = "diverged — AMEND pending at the next re-baseline wave (informational)"
-        committed_show = committed or "untracked"
+            verdict = ("live tree diverged from the frozen pin — expected after "
+                       "any change to this document; re-anchor at the next "
+                       "re-baseline wave (informational)")
         lines.append(
-            f"- `{row['slug']}` {pair['check']}: frozen {frozen[:12]} vs committed "
-            f"{committed_show[:12]} — {verdict}"
+            f"- `{row['slug']}` {pair['check']}: frozen {frozen[:12]} — {verdict}"
         )
     lines += ["", "## Drift detail (CHANGED pairs)", ""]
     drifted = [row for row in rows if row["gate_changed"]]

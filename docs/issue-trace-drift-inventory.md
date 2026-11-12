@@ -61,7 +61,7 @@ visible; the committed-vs-frozen comparison uses `git ls-tree HEAD`,
 so it is stable across regenerations. A diverged pin is informational
 (re-anchor at the next re-baseline wave), never a gate failure.
 
-- `63-66-119-collated` C8: frozen 062b5d463b29 vs committed 2bc69fafce77 — diverged — AMEND pending at the next re-baseline wave (informational)
+- `63-66-119-collated` C8: frozen 062b5d463b29 — live tree diverged from the frozen pin — expected after any change to this document; re-anchor at the next re-baseline wave (informational)
 
 ## Drift detail (CHANGED pairs)
 

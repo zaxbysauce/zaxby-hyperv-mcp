@@ -55,9 +55,10 @@ def _sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(mod, "REPO", tmp_path)
     monkeypatch.setattr(mod, "TRACES", traces)
     monkeypatch.setattr(mod, "DOCS", tmp_path / "docs" / "issue-trace-drift-inventory.md")
-    # Regeneration-stable informational source: the committed blob equals the
-    # frozen blob, so the labelled section is deterministic.
-    monkeypatch.setattr(mod, "_committed_blob", lambda _path: "f" * 40)
+    # Deterministic informational verdict: the working-tree blob differs
+    # from the frozen blob in the moved-pair scenario and matches in the
+    # clean one (tests override per scenario below).
+    monkeypatch.setattr(mod, "_live_blob", lambda _path: "a" * 40)
     return tmp_path
 
 
@@ -144,7 +145,7 @@ def test_self_pair_verdict_is_visible_in_generated_doc(tmp_path, monkeypatch, ca
     body = docs.read_text(encoding="utf-8")
     assert "Self-referential pairs" in body
     assert "63-66-119-collated" in body
-    assert "committed pin matches" in body
+    assert "live tree diverged from the frozen pin" in body
 
 
 def test_self_pair_extraction_prefers_the_last_row(tmp_path):
