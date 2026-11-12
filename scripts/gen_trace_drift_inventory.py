@@ -232,7 +232,7 @@ def main() -> int:
                 parts += [f"### {row['slug']}", "", "```", ""]
                 code, out = _verify(row["slug"])
                 parts += [out.rstrip("\n"), "```", ""]
-        DOCS.write_text("\n".join(parts), encoding="utf-8")
+        DOCS.write_text("\n".join(parts), encoding="utf-8", newline="\n")
         print(f"wrote {DOCS.relative_to(REPO)}")
         return 0
 
@@ -282,7 +282,7 @@ def main() -> int:
         body = head + "\n\n" + dynamic.rstrip("\n") + "\n"
         if static:
             body += "\n" + static
-        DOCS.write_text(body, encoding="utf-8")
+        DOCS.write_text(body, encoding="utf-8", newline="\n")
         print(f"regenerated {DOCS.relative_to(REPO)}")
     else:
         print(f"FAIL: {DOCS.relative_to(REPO)} missing — run --snapshot first")
