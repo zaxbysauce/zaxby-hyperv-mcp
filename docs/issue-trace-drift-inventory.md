@@ -39,7 +39,7 @@ reported below (issue #143).
 | 55-108-31-32-33-collated | 14 | 14 | 0 | clean |
 | 59-64-68-70-hardening-wave | 15 | 15 | 0 | clean |
 | 6-guest-put-get-policy | 13 | 13 | 0 | clean |
-| 63-66-119-collated | 12 | 12 | 0 | clean |
+| 63-66-119-collated | 12 | 12 | 0 | exit 1 |
 | 64-68-collated | 11 | 11 | 0 | clean |
 | 67-118-release-vendor-provenance | 10 | 10 | 0 | clean |
 | 7-guest-jobs-truthful-reporting | 13 | 13 | 0 | clean |
@@ -57,9 +57,10 @@ reported below (issue #143).
 ## Self-referential pairs (excluded from the gate, issue #143)
 
 Pairs whose frozen path is this document itself. Live verdicts stay
-visible; the committed-vs-frozen comparison uses `git ls-tree HEAD`,
-so it is stable across regenerations. A diverged pin is informational
-(re-anchor at the next re-baseline wave), never a gate failure.
+visible; the working-tree-vs-frozen comparison uses `git hash-object`,
+so it is stable across regenerations and commits. A diverged pin is
+informational (re-anchor at the next re-baseline wave), never a gate
+failure.
 
 - `63-66-119-collated` C8: frozen 062b5d463b29 — live tree diverged from the frozen pin — expected after any change to this document; re-anchor at the next re-baseline wave (informational)
 
