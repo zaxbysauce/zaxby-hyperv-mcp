@@ -56,10 +56,6 @@ def _sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(mod, "REPO", tmp_path)
     monkeypatch.setattr(mod, "TRACES", traces)
     monkeypatch.setattr(mod, "DOCS", tmp_path / "docs" / "issue-trace-drift-inventory.md")
-    # Deterministic informational verdict: the working-tree blob differs
-    # from the frozen blob in the moved-pair scenario and matches in the
-    # clean one (tests override per scenario below).
-    monkeypatch.setattr(mod, "_live_blob", lambda _path: "a" * 40)
     return tmp_path
 
 
@@ -146,7 +142,7 @@ def test_self_pair_verdict_is_visible_in_generated_doc(tmp_path, monkeypatch, ca
     body = docs.read_text(encoding="utf-8")
     assert "Self-referential pairs" in body
     assert "63-66-119-collated" in body
-    assert "live doc blob" in body  # AC3: the pair + its live identity stay visible
+    assert "63-66-119-collated` C8 (informational" in body  # AC3: the pair stays visible, no doc-derived value rendered
     assert "matches the frozen pin" not in body  # no dead rendered comparison (critic finding 4)
     assert "diverged from the frozen pin" not in body
 
@@ -164,27 +160,12 @@ def test_rendered_mechanism_text_names_the_working_tree_blob(tmp_path, monkeypat
     assert _main(monkeypatch, "--snapshot") == 0
     assert _main(monkeypatch) == 0
     body = docs.read_text(encoding="utf-8")
-    assert "git hash-object" in body
+    # R5 pin, second round: NO document-derived value is rendered at all
+    # (critic finding 4, twice over) — and the rejected designs are named
+    # only in the generator's own docstring, never the doc.
+    assert "git hash-object" not in body
     assert "git ls-tree HEAD" not in body
-
-
-def test_live_blob_uses_the_git_blob_filter(tmp_path, monkeypatch):
-    """R9 pin: _live_blob returns the repo's own blob id for a file (the
-    git hash-object filter), not a raw content hash — verified against a
-    real `git hash-object` call in a scratch repo."""
-    repo = tmp_path / "repo"
-    (repo / "docs").mkdir(parents=True)
-    import subprocess as sp
-
-    def git(*args: str) -> str:
-        return sp.run(["git", *args], cwd=repo, capture_output=True,
-                      text=True, encoding="utf-8", check=True).stdout
-
-    git("init", "-q")
-    target = repo / "docs" / "file.md"
-    target.write_bytes(b"line\n")
-    monkeypatch.setattr(mod, "REPO", repo)
-    assert mod._live_blob("docs/file.md") == git("hash-object", "--", "docs/file.md").strip()
+    assert "live doc blob" not in body
 
 
 def test_broken_leg_fails_the_gate(tmp_path, monkeypatch, capsys):

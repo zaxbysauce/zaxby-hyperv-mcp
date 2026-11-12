@@ -66,23 +66,6 @@ def _verify(slug: str) -> tuple[int, str]:
     return proc.returncode, proc.stdout + proc.stderr
 
 
-def _live_blob(path: str) -> str | None:
-    """The git blob id of the WORKING-TREE file (None when unreadable).
-
-    The self-referential pair's informational verdict uses this identity:
-    unlike the committed blob it does not move when the document is
-    committed, and unlike a working-tree CONTENT hash it uses the repo's
-    own blob filter (LF normalization), so the verdict is stable across
-    both regenerations and commits once the tree converges (issue #143).
-    """
-    proc = subprocess.run(
-        ["git", "hash-object", "--", path],
-        cwd=REPO, capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
-    blob = proc.stdout.strip()
-    return blob or None
-
-
 def _manifest_self_pairs(manifest: Path) -> list[dict]:
     """Effective (check-id -> frozen blob) pairs whose pinned path is the
     inventory document itself, from one checkpoint manifest. The manifest
@@ -167,23 +150,20 @@ def _dynamic(rows: list[dict]) -> str:
         "",
         "## Self-referential pairs (excluded from the gate, issue #143)",
         "",
-        "Pairs whose frozen path is this document itself, listed with the",
-        "live working-tree blob id of the document (`git hash-object`). No",
-        "match/diverge verdict is rendered: a document cannot contain a",
-        "prefix of its own hash, so a rendered comparison could never",
-        "converge (final-critic finding 4). The frozen blob lives in the",
-        "trace's manifest; re-anchoring is the next re-baseline wave's",
-        "bookkeeping and is never a gate failure.",
+        "Pairs whose frozen path is this document itself. No hash or",
+        "verdict is rendered at all: any document-derived value (a blob id,",
+        "a comparison) moves with the document's own bytes and re-opens the",
+        "quine (final-critic finding 4, twice over). The frozen blob lives",
+        "in the trace's manifest; re-anchoring is the next re-baseline",
+        "wave's bookkeeping and is never a gate failure.",
         "",
     ]
     self_rows = [(row, pair) for row in rows for pair in row["self_pairs"]]
     if not self_rows:
         lines.append("None — no trace pins the inventory document itself.")
     for row, pair in self_rows:
-        live = _live_blob(SELF_PATH) or "unavailable"
         lines.append(
-            f"- `{row['slug']}` {pair['check']}: live doc blob {live[:12]} "
-            "(informational; excluded from the gate)"
+            f"- `{row['slug']}` {pair['check']} (informational; excluded from the gate)"
         )
     lines += ["", "## Drift detail (CHANGED pairs)", ""]
     drifted = [row for row in rows if row["gate_changed"]]
