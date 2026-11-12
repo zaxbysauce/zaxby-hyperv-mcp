@@ -2294,12 +2294,18 @@ screenshot, or a `wait_frame_*` on the same VM queues behind the holder,
 and equally a console input op dispatched while a read holds the key waits
 for the stamp to land — either waiter times out after
 `Config.vm_lock_wait_s` (default 30s) raising the retryable `VMBusy`, the
-same retryable signal the multi-agent guard family already uses. The hold spans the whole
-verb request INCLUDING its front-door discovery legs (install-facts, SID
-lookup, session bootstrap — each bounded by its own timeout and cached
+same retryable signal the multi-agent guard family already uses. The hold
+spans the whole verb request for the NON-POLLING reads (inspect/find/
+session_state, including their front-door discovery legs — install-facts,
+SID lookup, session bootstrap, each bounded by its own timeout and cached
 after first success), so a slow-guest read widens the contention window
-beyond the helper round trip itself; single-operator flows alternate
-capture->read->click and are unaffected. Unlike the frame-hash channel the
+beyond the helper round trip itself. `hyperv_ui_wait_for` is the exception,
+not a whole-wait holder: `_verb_request` re-acquires and releases the
+console key PER poll slice (the bounded guest-side slices), so console
+inputs interleave freely BETWEEN slices and only queue behind a single
+in-flight slice — the receipt's observation-to-stamp atomicity is preserved
+per minted slice, while the wait as a whole does not monopolize the key.
+single-operator flows alternate capture->read->click and are unaffected. Unlike the frame-hash channel the
 receipt verifies ledger ordering ONLY: there is no live-frame re-check leg,
 no pixel-domain requirement (`frame_width`/`frame_height` are not needed
 for the verification itself, only for coordinate mapping), and the

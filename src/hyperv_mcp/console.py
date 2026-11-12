@@ -4310,8 +4310,8 @@ def _validate_sequence_steps(
                 raise ValueError(
                     "verified_state_receipt is not supported "
                     "on sequence steps (the sequence guard is frame-hash-"
-                    "only; cite verified_frame_hash, or use "
-                    "hyperv_console_click for the receipt channel)")
+                    "only, and only on its guarded click step; receipt-"
+                    "verified commits go through hyperv_console_click)")
             if action == "press_key":
                 key = step.get("key")
                 if not isinstance(key, str) or not key:
