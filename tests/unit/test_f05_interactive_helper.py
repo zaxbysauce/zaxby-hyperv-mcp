@@ -253,7 +253,7 @@ def test_helper_capability_and_vm_isolation_support_shared_and_per_agent_paths(m
     RED/absent at base, GREEN after the fix."""
     from hyperv_mcp import uia
 
-    assert set(uia.MUTATING_VERBS) == {"invoke", "set_value", "focus"}
+    assert set(uia.MUTATING_VERBS) == {"invoke", "set_value", "focus", "act"}
 
     # -- per-agent VMs: two registrations service bounded requests concurrently
     reg_a = uia.register_helper(

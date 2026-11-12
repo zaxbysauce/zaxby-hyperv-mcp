@@ -39,7 +39,10 @@ from .config import Config
 from .credentials import CredentialError, CredentialSet
 from .diagnostics import run_guest_inner
 
-_UIA_MAX_DEPTH = 6
+# PRR-117 one-clamp invariant (extended by issue #136): the PS Direct
+# walk shares uia.INSPECT_MAX_DEPTH / _MAX_ELEMENTS — depth 32 because the
+# Electron/Chromium accessibility tree lives deeper than the old 6.
+_UIA_MAX_DEPTH = 32
 _UIA_MAX_ELEMENTS = 500
 
 

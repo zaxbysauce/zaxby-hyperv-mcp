@@ -22,10 +22,11 @@ CRED_TOOLS = {
     "hyperv_guest_job_start", "hyperv_wait_guest_recovery",
     "hyperv_relay_start", "hyperv_capture_evidence",
     # issue #29: every hyperv_ui_* tool follows the dual credential
-    # variants (issue #29 AC12)
+    # variants (issue #29 AC12); issue #137's pair carries them too
     "hyperv_ui_inspect", "hyperv_ui_find", "hyperv_ui_invoke",
     "hyperv_ui_set_value", "hyperv_ui_wait_for", "hyperv_ui_focus",
     "hyperv_ui_session_state", "hyperv_ui_helper_provision",
+    "hyperv_ui_snapshot", "hyperv_ui_act",
 }
 TOOL_NAMES = {
     "hyperv_list_vms", "hyperv_get_vm_info", "hyperv_start_vm", "hyperv_stop_vm",
@@ -70,10 +71,12 @@ TOOL_NAMES = {
     # issue #24: the durable-operation / event-cursor surface
     "hyperv_op_status", "hyperv_op_result",
     "hyperv_op_cancel", "hyperv_op_list", "hyperv_events",
-    # issue #29: the in-session UIA helper surface
+    # issue #29: the in-session UIA helper surface; issue #137 added the
+    # element-contract pair (snapshot read + lease-gated act, no confirm)
     "hyperv_ui_inspect", "hyperv_ui_find", "hyperv_ui_invoke",
     "hyperv_ui_set_value", "hyperv_ui_wait_for", "hyperv_ui_focus",
     "hyperv_ui_session_state", "hyperv_ui_helper_provision",
+    "hyperv_ui_snapshot", "hyperv_ui_act",
 }
 CONFIRM_TOOLS = {
     "hyperv_stop_vm", "hyperv_reset_vm", "hyperv_checkpoint_restore",
@@ -117,8 +120,9 @@ def test_tool_inventory_registered(fresh_server):
     # 68 with issue #28's batched console sequence (C287 checkpoint:
     # tests/unit/test_f04_sequences.py::test_sequence_tool_schema_and_boot_epoch_reporting);
     # 76 with issue #29's eight hyperv_ui_* tools; 80 with PR #112's four
-    # Workstream G tools (vm_clone, vm_remove, deployment_status, harvest).
-    assert len(schemas) == 82
+    # Workstream G tools (vm_clone, vm_remove, deployment_status, harvest);
+    # 84 with issue #137's hyperv_ui_snapshot + hyperv_ui_act.
+    assert len(schemas) == 84
 
 
 def test_every_vm_tool_schema_has_vm_id(fresh_server):

@@ -64,10 +64,12 @@ if ($env:HYPERVMCP_HELPER_DIR) { $HelperDir = $env:HYPERVMCP_HELPER_DIR }
 
 $PipeName = 'hyperv-mcp-uia'
 $PipeInstanceCount = 4
-# ONE clamp for both tree paths (PRR-117): the host clamps inspect to
-# these same bounds (uia.INSPECT_MAX_DEPTH / INSPECT_MAX_ELEMENTS) before
-# the request leaves; the ceiling here is defense in depth.
-$MaxDepth = 6
+# ONE clamp for both tree paths (PRR-117, extended by issue #136): the host
+# clamps inspect to these same bounds (uia.INSPECT_MAX_DEPTH /
+# INSPECT_MAX_ELEMENTS) before the request leaves; the ceiling here is
+# defense in depth. Depth 32: the Electron/Chromium accessibility tree
+# lives deeper than the old 6 (#136 AC9 records the depth actually needed).
+$MaxDepth = 32
 $MaxElements = 500
 $MaxMatches = 200
 $MaxValueChars = 65536
@@ -84,6 +86,9 @@ Add-Type -Namespace HypervMcp.Uia -Name Native -MemberDefinition @'
 [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool GetUserObjectInformationW(IntPtr hObj, int idx, System.Text.StringBuilder buf, uint len, out uint needed);
 [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr h);
 [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+[DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+[DllImport("shcore.dll")] public static extern int SetProcessDpiAwareness(int value);
 [DllImport("wtsapi32.dll")] public static extern bool WTSQuerySessionInformationW(IntPtr server, int sessionId, int infoClass, out IntPtr buffer, out uint bytesReturned);
 [DllImport("wtsapi32.dll")] public static extern void WTSFreeMemory(IntPtr buffer);
 [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] public static extern IntPtr CreateNamedPipeW(string lpName, uint dwOpenMode, uint dwPipeMode, uint nMaxInstances, uint nOutBufferSize, uint nInBufferSize, uint nDefaultTimeOut, IntPtr lpSecurityAttributes);
@@ -347,54 +352,155 @@ function ConvertTo-Condition([hashtable]$selector) {
     return @{ resolvable = $true; conditions = $conditions }
 }
 
-function Find-WindowScope([hashtable]$selector) {
-    # The element the search is scoped under: an hwnd, or the first
-    # top-level window whose Name equals window_title. $null when an
-    # explicit scope matched NOTHING (the whole selector then yields no
-    # match - never the desktop root as a fake scope).
+function Get-WindowScopeSet([hashtable]$selector) {
+    # Issue #136 scope model: returns the ARRAY of elements a search is
+    # scoped under. NOTHING here ever returns the desktop root element as
+    # a search root - a selector with no window scope resolves to the
+    # FOREGROUND window, never every window on the desktop (Microsoft's
+    # documented desktop-subtree stack-overflow hazard). An explicit scope
+    # that matched nothing yields an EMPTY set (the caller answers no
+    # match; never the desktop root as a fake scope).
     $root = [System.Windows.Automation.AutomationElement]::RootElement
+    $scopes = @()
     if ($null -ne $selector['hwnd']) {
         try {
             $byHandle = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr][long]$selector['hwnd'])
-            if ($null -ne $byHandle) { return $byHandle }
+            if ($null -ne $byHandle) { return @($byHandle) }
         } catch { }
-        return $null
+        return @()
     }
     if ($selector['window_title']) {
         $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, [string]$selector['window_title'])
         $found = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)
-        if ($null -ne $found -and $found.Count -gt 0) { return $found[0] }
-        return $null
+        if ($null -ne $found -and $found.Count -gt 0) { return @($found[0]) }
+        return @()
     }
-    return $root
+    $needle = $null
+    if ($null -ne $selector['window_title_contains'] -and ([string]$selector['window_title_contains']) -ne '') {
+        $needle = ([string]$selector['window_title_contains']).ToLowerInvariant()
+    }
+    $procNeedle = $null
+    if ($null -ne $selector['process_name'] -and ([string]$selector['process_name']) -ne '') {
+        $procNeedle = ([string]$selector['process_name']).Trim().ToLowerInvariant() -replace '\.exe$', ''
+    }
+    if ($null -ne $needle -or $null -ne $procNeedle) {
+        # window_title_contains / process_name select the TARGET WINDOWS:
+        # top-level children of the desktop filtered by title substring
+        # (case-insensitive) and/or owning process name. The element
+        # search then runs INSIDE each selected window.
+        $windows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
+        foreach ($w in $windows) {
+            $ok = $true
+            if ($null -ne $needle) {
+                $nm = $null
+                try { $nm = ([string]$w.Current.Name).ToLowerInvariant() } catch { $nm = $null }
+                if ($null -eq $nm -or $nm.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { $ok = $false }
+            }
+            if ($ok -and $null -ne $procNeedle) {
+                $pn = Get-ElementProcessName $w
+                if ($null -eq $pn -or $pn -ne $procNeedle) { $ok = $false }
+            }
+            if ($ok) { $scopes += $w }
+        }
+        return $scopes
+    }
+    $explicitWindow = ($null -ne $selector['hwnd'] -or $null -ne $selector['window_title'] -or $null -ne $selector['window_title_contains'])
+    $scopeName = 'foreground'
+    if ($null -ne $selector['scope'] -and ([string]$selector['scope']) -ne '') { $scopeName = [string]$selector['scope'] }
+    if ($scopeName -eq 'all_windows') {
+        # The breadth escape hatch: search inside EVERY top-level window.
+        $all = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
+        foreach ($w in $all) { $scopes += $w }
+        return $scopes
+    }
+    if ($scopeName -eq 'window' -and -not $explicitWindow) {
+        # 'window' without a window selector still means the foreground
+        # window (there is nothing else it could name).
+        $scopeName = 'foreground'
+    }
+    # foreground (the default): the current foreground window only.
+    try {
+        $h = [HypervMcp.Uia.Native]::GetForegroundWindow()
+        if ($h -ne [IntPtr]::Zero) {
+            $fw = [System.Windows.Automation.AutomationElement]::FromHandle($h)
+            if ($null -ne $fw) { return @($fw) }
+        }
+    } catch { }
+    return @()
 }
 
-function Resolve-Target([hashtable]$selector) {
-    # Returns the matched elements (an array, possibly empty). An absent
-    # selector, an unresolvable condition, or nothing matching yields NO
-    # MATCH - never the desktop root element. name_contains is a literal
-    # case-insensitive substring and applies TOGETHER with the other
-    # conditions; process_name matches the owning process by name.
+function New-WalkCache {
+    # Issue #136 batched reads: ONE CacheRequest carrying the element
+    # properties, the state properties and the pattern-availability
+    # properties. ValuePattern.Value is DELIBERATELY EXCLUDED: caching IS
+    # prefetching, so the walk must never fetch a password field's value -
+    # the value leg runs only for elements the cache already proved are
+    # NOT password fields (see Get-ElementResult).
+    $cache = New-Object System.Windows.Automation.CacheRequest
+    $cache.TreeScope = [System.Windows.Automation.TreeScope]::Element
+    $cache.TreeFilter = [System.Windows.Automation.Condition]::TrueCondition
+    $cache.AutomationElementMode = [System.Windows.Automation.AutomationElementMode]::Full
+    foreach ($prop in @(
+        [System.Windows.Automation.AutomationElement]::NameProperty,
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+        [System.Windows.Automation.AutomationElement]::ClassNameProperty,
+        [System.Windows.Automation.AutomationElement]::IsEnabledProperty,
+        [System.Windows.Automation.AutomationElement]::IsKeyboardFocusableProperty,
+        [System.Windows.Automation.AutomationElement]::IsOffscreenProperty,
+        [System.Windows.Automation.AutomationElement]::BoundingRectangleProperty,
+        [System.Windows.Automation.AutomationElement]::IsPasswordProperty,
+        [System.Windows.Automation.AutomationElement]::HasKeyboardFocusProperty,
+        [System.Windows.Automation.AutomationElement]::IsValuePatternAvailableProperty,
+        [System.Windows.Automation.AutomationElement]::IsTogglePatternAvailableProperty,
+        [System.Windows.Automation.AutomationElement]::IsSelectionItemPatternAvailableProperty,
+        [System.Windows.Automation.AutomationElement]::IsExpandCollapsePatternAvailableProperty,
+        [System.Windows.Automation.AutomationElement]::IsRangeValuePatternAvailableProperty,
+        [System.Windows.Automation.AutomationElement]::IsScrollItemPatternAvailableProperty,
+        [System.Windows.Automation.AutomationElement]::IsInvokePatternAvailableProperty,
+        [System.Windows.Automation.TogglePattern]::ToggleStateProperty,
+        [System.Windows.Automation.SelectionItemPattern]::IsSelectedProperty,
+        [System.Windows.Automation.ExpandCollapsePattern]::ExpandCollapseStateProperty,
+        [System.Windows.Automation.RangeValuePattern]::ValueProperty
+    )) {
+        # PS 5.1's UIAutomationClient CacheRequest exposes ONE "Add"
+        # overload set (property or pattern) - no AddProperty/AddPattern.
+        $cache.Add($prop)
+    }
+    foreach ($pat in @(
+        [System.Windows.Automation.TogglePattern]::Pattern,
+        [System.Windows.Automation.SelectionItemPattern]::Pattern,
+        [System.Windows.Automation.ExpandCollapsePattern]::Pattern,
+        [System.Windows.Automation.RangeValuePattern]::Pattern,
+        [System.Windows.Automation.ScrollItemPattern]::Pattern
+    )) {
+        $cache.Add($pat)
+    }
+    return $cache
+}
+
+function Resolve-Target([hashtable]$selector, $cache) {
+    # Returns the matched elements (an array, possibly empty), read through
+    # the ACTIVE walk cache (retrieval inside the Activate() scope caches).
+    # A selector with no window scope searches the FOREGROUND window; the
+    # search never touches the desktop root's descendants. name_contains
+    # is a literal case-insensitive substring applied TOGETHER with the
+    # other conditions; process_name selected the WINDOWS upstream (in
+    # Get-WindowScopeSet), so no post-filter remains.
     $list = @()
-    $root = [System.Windows.Automation.AutomationElement]::RootElement
     if ($null -eq $selector) { return $list }
-    $scope = Find-WindowScope $selector
-    if ($null -eq $scope) { return $list }
+    $scopeSet = Get-WindowScopeSet $selector
+    if ($scopeSet.Count -eq 0) { return $list }
     $condResult = ConvertTo-Condition $selector
     if ($null -ne $condResult -and -not $condResult.resolvable) { return $list }
     $conditions = @()
     if ($null -ne $condResult) { $conditions = @($condResult.conditions) }
     $nameNeedle = $null
     if ($null -ne $selector['name_contains'] -and ([string]$selector['name_contains']) -ne '') { $nameNeedle = [string]$selector['name_contains'] }
-    $procNeedle = $null
-    if ($null -ne $selector['process_name'] -and ([string]$selector['process_name']) -ne '') {
-        $procNeedle = ([string]$selector['process_name']).Trim().ToLowerInvariant() -replace '\.exe$', ''
-    }
-    if ($conditions.Count -eq 0 -and $null -eq $nameNeedle -and $null -eq $procNeedle) {
-        # No match condition at all: only an explicitly scoped window
-        # (hwnd / window_title) is itself a match.
-        if (-not [object]::ReferenceEquals($scope, $root)) { $list += $scope }
-        return $list
+    if ($conditions.Count -eq 0 -and $null -eq $nameNeedle) {
+        # No match condition at all: the first scope element is itself the
+        # match (the explicit-window shape).
+        return @($scopeSet[0])
     }
     $cond = [System.Windows.Automation.Condition]::TrueCondition
     if ($conditions.Count -eq 1) {
@@ -403,20 +509,26 @@ function Resolve-Target([hashtable]$selector) {
     } elseif ($conditions.Count -gt 1) {
         $cond = New-Object System.Windows.Automation.AndCondition($conditions)
     }
-    $found = $scope.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
-    foreach ($el in $found) {
+    foreach ($scope in $scopeSet) {
+        $found = $null
+        $pushed = $cache.Activate()
+        try {
+            $found = $scope.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+        } finally {
+            if ($null -ne $pushed) { $pushed.Dispose() }
+        }
+        if ($null -eq $found) { continue }
+        foreach ($el in $found) {
+            if ($list.Count -ge $MaxMatches) { break }
+            if ($null -ne $nameNeedle) {
+                $nm = $null
+                try { $nm = [string]$el.Cached.Name } catch { $nm = $null; try { $nm = [string]$el.Current.Name } catch { $nm = $null } }
+                if ($null -eq $nm) { continue }
+                if ($nm.IndexOf($nameNeedle, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+            }
+            $list += $el
+        }
         if ($list.Count -ge $MaxMatches) { break }
-        if ($null -ne $nameNeedle) {
-            $nm = $null
-            try { $nm = [string]$el.Current.Name } catch { $nm = $null }
-            if ($null -eq $nm) { continue }
-            if ($nm.IndexOf($nameNeedle, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
-        }
-        if ($null -ne $procNeedle) {
-            $pn = Get-ElementProcessName $el
-            if ($null -eq $pn -or $pn -ne $procNeedle) { continue }
-        }
-        $list += $el
     }
     return $list
 }
@@ -443,47 +555,141 @@ function Select-One($elements, [hashtable]$selector) {
     return $elements[0]
 }
 
-function Get-ElementResult($el) {
-    $rect = ''
-    try { $r = $el.Current.BoundingRectangle; $rect = '{0},{1},{2},{3}' -f [int]$r.X, [int]$r.Y, [int]$r.Width, [int]$r.Height } catch { }
+function Get-ElementResult($el, $cache) {
+    # Issue #136: ONE batched read. The element is refreshed through
+    # GetUpdatedCache($cache) - a single cross-process round trip that
+    # fills EVERY property in the walk cache at once (the old shape made
+    # ~15 separate Current.* calls per element). GetRuntimeId is never
+    # cached (the one deliberate non-cached read).
     $runtimeId = @()
     try { $runtimeId = @($el.GetRuntimeId()) } catch { }
-    $focusable = $false
-    try { $focusable = [bool]$el.Current.IsKeyboardFocusable } catch { $focusable = $false }
-    $offscreen = $false
-    try { $offscreen = [bool]$el.Current.IsOffscreen } catch { $offscreen = $false }
-    $patterns = @()
+    $c = $el
+    if ($null -ne $cache) {
+        try { $c = $el.GetUpdatedCache($cache) } catch { $c = $el }
+    }
+    $rect = ''
     try {
-        $patterns = @($el.GetSupportedPatterns() | ForEach-Object { (($_.ProgrammaticName -replace 'Identifiers\.Pattern$', '') -replace 'Pattern$', '') })
-    } catch { $patterns = @() }
+        $r = $c.Cached.BoundingRectangle
+        if ($r.IsEmpty) { $r = $c.Current.BoundingRectangle }
+        $rect = '{0},{1},{2},{3}' -f [int]$r.X, [int]$r.Y, [int]$r.Width, [int]$r.Height
+    } catch { }
+    $name = ''
+    $controlType = ''
+    $automationId = ''
+    $className = ''
+    $enabled = $false
+    $focusable = $false
+    $offscreen = $false
+    try { $name = [string]$c.Cached.Name } catch { try { $name = [string]$c.Current.Name } catch { } }
+    try { $controlType = [string]$c.Cached.ControlType.ProgrammaticName -replace '^ControlType\.', '' } catch { try { $controlType = [string]$c.Current.ControlType.ProgrammaticName -replace '^ControlType\.', '' } catch { } }
+    try { $automationId = [string]$c.Cached.AutomationId } catch { try { $automationId = [string]$c.Current.AutomationId } catch { } }
+    try { $className = [string]$c.Cached.ClassName } catch { try { $className = [string]$c.Current.ClassName } catch { } }
+    try { $enabled = [bool]$c.Cached.IsEnabled } catch { try { $enabled = [bool]$c.Current.IsEnabled } catch { } }
+    try { $focusable = [bool]$c.Cached.IsKeyboardFocusable } catch { try { $focusable = [bool]$c.Current.IsKeyboardFocusable } catch { } }
+    try { $offscreen = [bool]$c.Cached.IsOffscreen } catch { try { $offscreen = [bool]$c.Current.IsOffscreen } catch { } }
+    $patterns = @()
+    foreach ($pair in @(@('Invoke', [System.Windows.Automation.AutomationElement]::IsInvokePatternAvailableProperty),
+                       @('Value', [System.Windows.Automation.AutomationElement]::IsValuePatternAvailableProperty),
+                       @('Toggle', [System.Windows.Automation.AutomationElement]::IsTogglePatternAvailableProperty),
+                       @('SelectionItem', [System.Windows.Automation.AutomationElement]::IsSelectionItemPatternAvailableProperty),
+                       @('ExpandCollapse', [System.Windows.Automation.AutomationElement]::IsExpandCollapsePatternAvailableProperty),
+                       @('RangeValue', [System.Windows.Automation.AutomationElement]::IsRangeValuePatternAvailableProperty),
+                       @('LegacyIAccessible', 'msaa'))) {
+        $avail = $false
+        if ($pair[1] -eq 'msaa') {
+            # The msaa bridge: advertised only when the LegacyIAccessible
+            # pattern type resolved at startup (Get-HelperCapabilities).
+            $avail = ($null -ne $legacyPattern)
+        } else {
+            try { $avail = [bool]$c.GetCachedPropertyValue($pair[1]) } catch { try { $avail = [bool]$c.Current.GetPropertyValue($pair[1]) } catch { $avail = $false } }
+        }
+        if ($avail) { $patterns += $pair[0] }
+    }
+
+    # --- the state block (issue #136 design 1) ---
+    $state = @{}
+    $isPassword = $false
+    try { $isPassword = [bool]$c.Cached.IsPassword } catch { try { $isPassword = [bool]$c.Current.IsPassword } catch { } }
+    $state['is_password'] = $isPassword
+    try { $state['has_keyboard_focus'] = [bool]$c.Cached.HasKeyboardFocus } catch { }
+    # A password field's value is NEVER fetched: IsPassword arrives with
+    # the batched read BEFORE any value leg, and the value read below runs
+    # only for confirmed non-password elements.
+    if (-not $isPassword) {
+        if ([bool]$c.GetCachedPropertyValue([System.Windows.Automation.AutomationElement]::IsValuePatternAvailableProperty)) {
+            $raw = $null
+            try { $raw = $c.GetCurrentPropertyValue([System.Windows.Automation.ValuePattern]::ValueProperty) } catch { $raw = $null }
+            if ($null -ne $raw) {
+                $text = [string]$raw
+                $state['value'] = $text.Substring(0, [Math]::Min(512, $text.Length))
+                $state['value_truncated'] = ($text.Length -gt 512)
+            }
+        }
+    }
+    try {
+        if ([bool]$c.GetCachedPropertyValue([System.Windows.Automation.AutomationElement]::IsTogglePatternAvailableProperty)) {
+            $ts = $null
+            try { $ts = $c.GetCachedPattern([System.Windows.Automation.TogglePattern]::Pattern).Cached.ToggleState } catch { $ts = $null }
+            if ($null -ne $ts) { $state['toggle_state'] = ([string]$ts).Split('+')[-1].ToLowerInvariant() }
+        }
+    } catch { }
+    try {
+        if ([bool]$c.GetCachedPropertyValue([System.Windows.Automation.AutomationElement]::IsSelectionItemPatternAvailableProperty)) {
+            $sel = $null
+            try { $sel = $c.GetCachedPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Cached.IsSelected } catch { $sel = $null }
+            if ($null -ne $sel) { $state['selected'] = [bool]$sel }
+        }
+    } catch { }
+    try {
+        if ([bool]$c.GetCachedPropertyValue([System.Windows.Automation.AutomationElement]::IsExpandCollapsePatternAvailableProperty)) {
+            $ecs = $null
+            try { $ecs = $c.GetCachedPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Cached.ExpandCollapseState } catch { $ecs = $null }
+            if ($null -ne $ecs) { $state['expand_state'] = ([string]$ecs).Split('+')[-1].ToLowerInvariant() }
+        }
+    } catch { }
+    try {
+        if ([bool]$c.GetCachedPropertyValue([System.Windows.Automation.AutomationElement]::IsRangeValuePatternAvailableProperty)) {
+            $rv = $null
+            try { $rv = $c.GetCachedPattern([System.Windows.Automation.RangeValuePattern]::Pattern).Cached.Value } catch { $rv = $null }
+            if ($null -ne $rv) { $state['range_value'] = [double]$rv }
+        }
+    } catch { }
+
     @{
         element_id = ($runtimeId -join ':')
-        name = [string]$el.Current.Name
-        control_type = [string]$el.Current.ControlType.ProgrammaticName -replace '^ControlType\.', ''
-        automation_id = [string]$el.Current.AutomationId
-        class_name = [string]$el.Current.ClassName
-        enabled = [bool]$el.Current.IsEnabled
+        name = $name
+        control_type = $controlType
+        automation_id = $automationId
+        class_name = $className
+        enabled = $enabled
         keyboard_focusable = $focusable
         offscreen = $offscreen
         patterns = $patterns
         rect = $rect
+        state = $state
     }
 }
 
-function Walk-Tree($el, $d, $cap, [ref]$seen) {
+function Walk-Tree($el, $d, $cap, [ref]$seen, $cache, $walker) {
     if ($seen.Value -ge $cap -or $d -lt 0) { return $null }
     $seen.Value = $seen.Value + 1
-    $node = Get-ElementResult $el
+    $node = Get-ElementResult $el $cache
     $children = New-Object System.Collections.Generic.List[object]
     if ($d -gt 0) {
-        $kids = $null
-        try { $kids = $el.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition) } catch { $kids = $null }
-        if ($null -ne $kids) {
-            foreach ($k in $kids) {
-                if ($seen.Value -ge $cap) { break }
-                $child = Walk-Tree $k ($d - 1) $cap $seen
-                if ($null -ne $child) { [void]$children.Add($child) }
-            }
+        # One level at a time THROUGH THE CACHE REQUEST (issue #136): the
+        # TreeWalker overloads that take the request cache the children at
+        # retrieval - no per-node uncached re-reads.
+        $kids = @()
+        $kid = $null
+        try { $kid = $walker.GetFirstChild($el, $cache) } catch { $kid = $null }
+        while ($null -ne $kid -and $kids.Count -lt $cap) {
+            $kids += $kid
+            try { $kid = $walker.GetNextSibling($kid, $cache) } catch { $kid = $null }
+        }
+        foreach ($k in $kids) {
+            if ($seen.Value -ge $cap) { break }
+            $child = Walk-Tree $k ($d - 1) $cap $seen $cache $walker
+            if ($null -ne $child) { [void]$children.Add($child) }
         }
     }
     # NB: '@()' around a List[object] throws on PS 5.1 (build-dependent
@@ -511,6 +717,117 @@ function Invoke-Pattern($el, $automationPattern, [string]$action, $argument) {
         return $null
     }
     return $true
+}
+
+# ---------------------------------------------------------------------------
+# snapshot-bound element refs (issue #137)
+# ---------------------------------------------------------------------------
+
+# Per-window snapshot tables: live{snapshot_id -> {index -> element}} plus
+# an ISSUED-IDS tombstone set. A ref whose snapshot id is in the
+# tombstones but not in live is EVICTED -> stale_ref; a ref whose id was
+# never issued -> unknown_ref; a live hit whose element fails
+# GetRuntimeId -> stale_ref (round-2 F3 semantics). Two live snapshots per
+# window key, FIFO eviction.
+$script:SnapshotTables = @{}
+$script:SnapshotCounter = 0
+
+function Get-ElementIdScopeSelector($selector) {
+    # element_id / ref resolution scope: the selector's own window
+    # scoping when it names one, else all_windows (per-window bounded
+    # searches with the MaxMatches cap - never the desktop root as one
+    # search root).
+    if ($null -ne $selector -and ($null -ne $selector['hwnd'] -or $null -ne $selector['window_title'] -or $null -ne $selector['window_title_contains'] -or $null -ne $selector['process_name'] -or $null -ne $selector['scope'])) {
+        return $selector
+    }
+    return @{ scope = 'all_windows' }
+}
+
+function Enter-Snapshot([hashtable]$selector, [int]$cap, $cache) {
+    # Walks ONE window (the foreground window by default) and registers
+    # the walk as the window's newest snapshot. Returns the answer frame
+    # (snapshot_id + entries).
+    $set = @(Get-WindowScopeSet $selector)
+    if ($set.Count -eq 0) {
+        return @{ ok = $false; error_class = 'no_foreground_window'; error = 'no window is scoped for the snapshot' }
+    }
+    $window = $set[0]
+    $windowKey = $null
+    try { $windowKey = (@($window.GetRuntimeId()) -join ':') } catch { }
+    $entries = @()
+    $table = @{}
+    $index = 0
+    $pushed = $cache.Activate()
+    try {
+        $found = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+        foreach ($el in $found) {
+            if ($entries.Count -ge $cap) { break }
+            $rid = ''
+            try { $rid = (@($el.GetRuntimeId()) -join ':') } catch { }
+            if ($rid -eq '') { continue }
+            $table[$index] = $el
+            $result = Get-ElementResult $el $cache
+            $result['ref'] = ('s{0:x}:{1}' -f $script:SnapshotCounter, $index)
+            $result['depth'] = 0
+            $entries += $result
+            $index += 1
+        }
+    } finally {
+        if ($null -ne $pushed) { $pushed.Dispose() }
+    }
+    if ($null -ne $windowKey -and $index -gt 0) {
+        $script:SnapshotCounter += 1
+        $snapshotId = ('{0:x}' -f $script:SnapshotCounter)
+        foreach ($e in $entries) { $e['ref'] = ('s{0}:{1}' -f $snapshotId, ($e['ref'] -split ':')[-1]) }
+        $tbl = $script:SnapshotTables[$windowKey]
+        if ($null -eq $tbl) {
+            $tbl = @{ live = @{}; tombstones = New-Object System.Collections.Generic.HashSet[string] }
+            $script:SnapshotTables[$windowKey] = $tbl
+        }
+        # FIFO eviction at two live snapshots per window: evicted ids move
+        # to the tombstones (stale_ref on later use), never vanish.
+        while ($tbl.live.Count -ge 2) {
+            $oldest = @($tbl.live.Keys | Sort-Object { [Convert]::ToInt64($_, 16) })[0]
+            [void]$tbl.tombstones.Add($oldest)
+            [void]$tbl.live.Remove($oldest)
+        }
+        $tbl.live[$snapshotId] = $table
+    }
+    if ($entries.Count -eq 0) {
+        return @{ ok = $false; error_class = 'no_foreground_window'; error = 'the scoped window exposed no elements for the snapshot' }
+    }
+    return @{ ok = $true; result = @{ snapshot_id = ('s' + $snapshotId); entries = $entries } }
+}
+
+function Resolve-Ref([string]$refText) {
+    # Constant-time table lookup: s<hex>:<dec>. never-issued -> unknown_ref;
+    # issued-but-evicted -> stale_ref; live -> dead element check ->
+    # stale_ref, else the live element.
+    $parts = $refText -split ':'
+    if ($parts.Count -ne 2 -or $parts[0] -notmatch '^s[0-9a-fA-F]+$' -or $parts[1] -notmatch '^[0-9]+$') {
+        return @{ element = $null; error_class = 'unknown_ref'; error = "the ref $refText was never issued by any hyperv_ui_snapshot" }
+    }
+    $sid = $parts[0].Substring(1).ToLowerInvariant()
+    $idx = [int]$parts[1]
+    foreach ($tbl in $script:SnapshotTables.Values) {
+        if ($tbl.live.ContainsKey($sid)) {
+            $table = $tbl.live[$sid]
+            if (-not $table.ContainsKey($idx)) {
+                return @{ element = $null; error_class = 'unknown_ref'; error = "the ref $refText was never issued by any hyperv_ui_snapshot" }
+            }
+            $el = $table[$idx]
+            $rid = ''
+            try { $rid = (@($el.GetRuntimeId()) -join ':') } catch { $rid = '' }
+            if ($rid -eq '') {
+                return @{ element = $null; error_class = 'stale_ref'; error = "the referenced element is gone; take a fresh hyperv_ui_snapshot" }
+            }
+            return @{ element = $el; error_class = $null; error = $null }
+        }
+        if ($tbl.tombstones.Contains($sid)) {
+            return @{ element = $null; error_class = 'stale_ref'; error = "the snapshot $refText was evicted (two newer snapshots taken for this window); take a fresh hyperv_ui_snapshot" }
+        }
+    }
+    return @{ element = $null; error_class = 'unknown_ref'; error = "the ref $refText was never issued by any hyperv_ui_snapshot" }
 }
 
 function Invoke-Request([hashtable]$req) {
@@ -591,11 +908,14 @@ function Invoke-Request([hashtable]$req) {
             if ($null -ne $req['args']['max_elements']) { $cap = [Math]::Min([int]$req['args']['max_elements'], $MaxElements) }
         }
         # inspect HONOURS the selector it is given: the walk is scoped to
-        # the matched element; no match (or an ambiguous one) yields an
-        # empty tree, never a walk of the whole desktop by accident.
-        $startEl = [System.Windows.Automation.AutomationElement]::RootElement
+        # the matched element; with NO selector it starts at the FOREGROUND
+        # window (issue #136: never the desktop root). No match (or an
+        # ambiguous one) yields an empty tree.
+        $cache = New-WalkCache
+        $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+        $startEl = $null
         if ($null -ne $selector) {
-            $elements = @(Resolve-Target $selector)
+            $elements = @(Resolve-Target $selector $cache)
             if ($elements.Count -eq 0) {
                 return @{ ok = $true; result = @{ elements = 0; truncated = $false; tree = $null } }
             }
@@ -607,14 +927,22 @@ function Invoke-Request([hashtable]$req) {
                 return @{ ok = $true; result = @{ elements = 0; truncated = $false; tree = $null } }
             }
             $startEl = $one
+        } else {
+            $fg = @(Get-WindowScopeSet @{})
+            if ($fg.Count -gt 0) { $startEl = $fg[0] }
+        }
+        if ($null -eq $startEl) {
+            return @{ ok = $true; result = @{ elements = 0; truncated = $false; tree = $null } }
         }
         $seen = 0
-        $tree = Walk-Tree $startEl $depth $cap ([ref]$seen)
+        $tree = Walk-Tree $startEl $depth $cap ([ref]$seen) $cache $walker
         return @{ ok = $true; result = @{ elements = $seen; truncated = ($seen -ge $cap); tree = $tree } }
     }
 
+    $cache = New-WalkCache
+
     if ($verb -eq 'find' -or $verb -eq 'wait_for') {
-        $elements = @(Resolve-Target $selector)
+        $elements = @()
         if ($verb -eq 'wait_for') {
             $argsPair = $req['args']
             $gone = $false; $budget = 30
@@ -624,26 +952,48 @@ function Invoke-Request([hashtable]$req) {
             }
             $deadline = [DateTime]::UtcNow.AddSeconds($budget)
             while ([DateTime]::UtcNow -lt $deadline) {
-                $elements = @(Resolve-Target $selector)
+                $elements = @(Resolve-Target $selector $cache)
                 $present = ($null -ne $elements -and $elements.Count -gt 0)
                 if ($gone -and -not $present) { return @{ ok = $true; result = @{ gone = $true } } }
                 if (-not $gone -and $present) { break }
                 Start-Sleep -Milliseconds 400
             }
         }
+        if ($null -ne $selector) {
+            $elements = @(Resolve-Target $selector $cache)
+        }
+        if ($req.ContainsKey('ref') -and $null -ne $req['ref']) {
+            # issue #137: snapshot-bound ref, resolved through the
+            # per-window snapshot table (stale_ref = issued-but-evicted or
+            # a dead element; unknown_ref = never issued).
+            $resolved = Resolve-Ref ([string]$req['ref'])
+            if ($null -ne $resolved.error_class) {
+                return @{ ok = $false; error_class = $resolved.error_class; error = $resolved.error }
+            }
+            $elements = @($resolved.element)
+        }
         if ($req.ContainsKey('element_id') -and $null -ne $req['element_id']) {
-            # element_id IS a UIA RuntimeId: resolve the live element by it,
-            # exactly as the mutating path does. An unresolvable id answers
-            # like a selector no-match (an empty element list), which is
-            # the find verb's contract; the mutating verbs refuse an
-            # unknown id with element_not_found.
+            # element_id IS a UIA RuntimeId: resolve the live element by it
+            # INSIDE the scoped windows (issue #136: never a desktop-root
+            # scan). An unresolvable id answers like a selector no-match
+            # (an empty element list), which is the find verb's contract;
+            # the mutating verbs refuse an unknown id with
+            # element_not_found.
             $idWanted = [string]$req['element_id']
             $elements = @()
-            $scan = [System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-            foreach ($candidate in $scan) {
-                $rid = ''
-                try { $rid = (@($candidate.GetRuntimeId()) -join ':') } catch { }
-                if ($rid -eq $idWanted) { $elements = @($candidate); break }
+            foreach ($scope in (Get-WindowScopeSet (Get-ElementIdScopeSelector $selector))) {
+                $pushed = $cache.Activate()
+                try {
+                    $scan = $scope.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+                } finally {
+                    if ($null -ne $pushed) { $pushed.Dispose() }
+                }
+                foreach ($candidate in $scan) {
+                    $rid = ''
+                    try { $rid = (@($candidate.GetRuntimeId()) -join ':') } catch { }
+                    if ($rid -eq $idWanted) { $elements = @($candidate); break }
+                }
+                if ($elements.Count -gt 0) { break }
             }
         }
         if ($null -eq $elements -or $elements.Count -eq 0) {
@@ -653,26 +1003,46 @@ function Invoke-Request([hashtable]$req) {
         if ($null -ne $one -and $one.ambiguous) {
             return @{ ok = $false; error_class = 'ambiguous_selector'; error = 'the selector matched more than one element'; candidates = $one.candidates }
         }
-        return @{ ok = $true; result = @{ elements = @(Get-ElementResult $one) } }
+        return @{ ok = $true; result = @{ elements = @(Get-ElementResult $one $cache) } }
     }
 
     $elementIdWanted = $null
     if ($req.ContainsKey('element_id')) { $elementIdWanted = [string]$req['element_id'] }
     elseif ($null -ne $req['args'] -and $req['args'] -is [hashtable] -and $null -ne $req['args']['element_id']) { $elementIdWanted = [string]$req['args']['element_id'] }
+    $refWanted = $null
+    if ($req.ContainsKey('ref') -and $null -ne $req['ref']) { $refWanted = [string]$req['ref'] }
+    elseif ($null -ne $req['args'] -and $req['args'] -is [hashtable] -and $null -ne $req['args']['ref']) { $refWanted = [string]$req['args']['ref'] }
 
     $el = $null
-    if ($elementIdWanted) {
-        $all = [System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-        foreach ($candidate in $all) {
-            $rid = ''
-            try { $rid = (@($candidate.GetRuntimeId()) -join ':') } catch { }
-            if ($rid -eq $elementIdWanted) { $el = $candidate; break }
+    if ($refWanted) {
+        $resolved = Resolve-Ref $refWanted
+        if ($null -ne $resolved.error_class) {
+            return @{ ok = $false; error_class = $resolved.error_class; error = $resolved.error }
+        }
+        $el = $resolved.element
+    } elseif ($elementIdWanted) {
+        # element_id IS a UIA RuntimeId: resolve the live element by it
+        # INSIDE the scoped windows (issue #136: never a desktop-root
+        # scan).
+        foreach ($scope in (Get-WindowScopeSet (Get-ElementIdScopeSelector $selector))) {
+            $pushed = $cache.Activate()
+            try {
+                $scan = $scope.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+            } finally {
+                if ($null -ne $pushed) { $pushed.Dispose() }
+            }
+            foreach ($candidate in $scan) {
+                $rid = ''
+                try { $rid = (@($candidate.GetRuntimeId()) -join ':') } catch { }
+                if ($rid -eq $elementIdWanted) { $el = $candidate; break }
+            }
+            if ($null -ne $el) { break }
         }
         if ($null -eq $el) {
             return @{ ok = $false; error_class = 'element_not_found'; error = "no live element matches element_id $elementIdWanted" }
         }
     } else {
-        $elements = @(Resolve-Target $selector)
+        $elements = @(Resolve-Target $selector $cache)
         $one = Select-One $elements $selector
         if ($null -ne $one -and $one.ambiguous) {
             return @{ ok = $false; error_class = 'ambiguous_selector'; error = 'the selector matched more than one element'; candidates = $one.candidates }
@@ -685,10 +1055,174 @@ function Invoke-Request([hashtable]$req) {
 
     # Every mutating verb consults the lock state: the console can still
     # drive a locked Default desktop, so mutating silently would be wrong.
-    if ($verb -eq 'focus' -or $verb -eq 'invoke' -or $verb -eq 'set_value') {
+    if ($verb -eq 'focus' -or $verb -eq 'invoke' -or $verb -eq 'set_value' -or $verb -eq 'act') {
         if ($locked -or -not (Test-OwnsInputDesktop)) {
             return @{ ok = $false; error_class = 'no_interactive_desktop'; error = 'the session is locked; this verb needs the interactive desktop' }
         }
+    }
+
+    if ($verb -eq 'snapshot') {
+        $cap = 250
+        if ($null -ne $req['args'] -and $req['args'] -is [hashtable]) {
+            if ($null -ne $req['args']['max_elements']) { $cap = [Math]::Min([int]$req['args']['max_elements'], $MaxElements) }
+        }
+        return (Enter-Snapshot $selector $cap $cache)
+    }
+
+    if ($verb -eq 'act') {
+        # Issue #137: one explicit action. The action set is closed here
+        # as well as on the host (both ends refuse before any dispatch).
+        $argsPair = $req['args']
+        $actionName = ''
+        $actionValue = $null
+        if ($null -ne $argsPair -and $argsPair -is [hashtable]) {
+            if ($null -ne $argsPair['action']) { $actionName = [string]$argsPair['action'] }
+            if ($argsPair.ContainsKey('value')) { $actionValue = $argsPair['value'] }
+        }
+        $actionSet = @('collapse', 'click', 'expand', 'focus', 'invoke',
+                       'scroll_into_view', 'select', 'set_value', 'toggle_off', 'toggle_on')
+        if ($actionSet -notcontains $actionName) {
+            return @{ ok = $false; error_class = 'invalid_request'; error = "unknown action $actionName" }
+        }
+        if ($actionName -eq 'set_value' -and $null -eq $actionValue) {
+            return @{ ok = $false; error_class = 'invalid_request'; error = 'act set_value requires a value' }
+        }
+        if ($actionName -ne 'set_value' -and $null -ne $actionValue) {
+            return @{ ok = $false; error_class = 'invalid_request'; error = 'value= applies only to the set_value action' }
+        }
+        # Post-action state refresh: GetUpdatedCache re-reads the element
+        # through the walk cache in ONE round trip (issue #136).
+        $refreshed = $el
+        try { $refreshed = $el.GetUpdatedCache($cache) } catch { $refreshed = $el }
+
+        if ($actionName -eq 'click') {
+            # Scroll into view FIRST, then check enabled + onscreen + a
+            # clickable point; ANY failed check answers not_actionable and
+            # NO input is sent (the host dispatches the click it receives
+            # a point for).
+            try {
+                if ([bool]$refreshed.GetUpdatedCache($cache).GetCachedPropertyValue([System.Windows.Automation.AutomationElement]::IsScrollItemPatternAvailableProperty)) {
+                    $si = $refreshed.GetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern)
+                    if ($null -ne $si) { $si.ScrollIntoView() }
+                }
+            } catch { }
+            $clickable = $false
+            $pt = $null
+            try {
+                if (-not [bool]$refreshed.Cached.IsEnabled) { throw 'disabled' }
+                if ([bool]$refreshed.Cached.IsOffscreen) { throw 'offscreen' }
+                $pt = $refreshed.GetClickablePoint()
+                $clickable = $true
+            } catch { $clickable = $false }
+            if (-not $clickable -or $null -eq $pt) {
+                return @{ ok = $false; error_class = 'not_actionable'; error = 'the element is disabled, off screen, or exposes no clickable point' }
+            }
+            return @{ ok = $true; result = @{ point = @([int]$pt.X, [int]$pt.Y) } }
+        }
+
+        if ($actionName -eq 'scroll_into_view') {
+            try {
+                $si = $refreshed.GetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern)
+                if ($null -eq $si) { return @{ ok = $false; error_class = 'unsupported_capability'; error = 'the element exposes no ScrollItemPattern' } }
+                $si.ScrollIntoView()
+            } catch {
+                return @{ ok = $false; error_class = 'unsupported_capability'; error = 'the element exposes no ScrollItemPattern' }
+            }
+            return @{ ok = $true; result = @{ action = 'scroll_into_view'; state = (Get-ElementResult $refreshed $cache) } }
+        }
+
+        if ($actionName -eq 'toggle_on' -or $actionName -eq 'toggle_off') {
+            # No-op when already in the target state (issue #137 design 3).
+            $want = 'On'
+            if ($actionName -eq 'toggle_off') { $want = 'Off' }
+            try {
+                $pat = $refreshed.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
+            } catch {
+                return @{ ok = $false; error_class = 'unsupported_capability'; error = 'the element exposes no TogglePattern' }
+            }
+            $current = ([string]$pat.Cached.ToggleState).Split('+')[-1]
+            if ($current -ieq $want) {
+                return @{ ok = $true; result = @{ action = $actionName; pattern = 'Toggle'; noop = $true; state = (Get-ElementResult $refreshed $cache) } }
+            }
+            try { $pat.Toggle() } catch {
+                return @{ ok = $false; error_class = 'unsupported_capability'; error = 'the element refused the toggle' }
+            }
+            $after = $null
+            try { $after = $el.GetUpdatedCache($cache) } catch { $after = $el }
+            return @{ ok = $true; result = @{ action = $actionName; pattern = 'Toggle'; state = (Get-ElementResult $after $cache) } }
+        }
+
+        if ($actionName -eq 'set_value') {
+            $text = [string]$actionValue
+            if ($text.Length -gt $MaxValueChars) {
+                return @{ ok = $false; error_class = 'invalid_request'; error = 'the value exceeds the 64 KiB bound' }
+            }
+            $fired = $null
+            if ($null -ne (Invoke-Pattern $refreshed ([System.Windows.Automation.ValuePattern]::Pattern) 'setvalue' $text)) {
+                $fired = 'Value'
+            } elseif ($null -ne $legacyPattern) {
+                $legacy = $null
+                try { $legacy = $refreshed.GetCurrentPattern($legacyPattern) } catch { $legacy = $null }
+                if ($null -ne $legacy) {
+                    try { $legacy.SetValue($text); $fired = 'LegacyIAccessible' } catch { $fired = $null }
+                }
+            }
+            if ($null -eq $fired) {
+                return @{ ok = $false; error_class = 'unsupported_capability'; error = 'the element exposes no ValuePattern or the msaa LegacyIAccessible bridge' }
+            }
+            $after = $null
+            try { $after = $el.GetUpdatedCache($cache) } catch { $after = $el }
+            return @{ ok = $true; result = @{ action = 'set_value'; pattern = $fired; length_set = $text.Length; state = (Get-ElementResult $after $cache) } }
+        }
+
+        if ($actionName -eq 'focus') {
+            try { $refreshed.SetFocus() } catch { }
+            $focused = $false
+            try { $focused = [bool]$refreshed.Cached.HasKeyboardFocus } catch { try { $focused = [bool]$refreshed.Current.HasKeyboardFocus } catch { } }
+            return @{ ok = $true; result = @{ action = 'focus'; focused = $focused; state = (Get-ElementResult $refreshed $cache) } }
+        }
+
+        if ($actionName -eq 'select' -or $actionName -eq 'expand' -or $actionName -eq 'collapse') {
+            $patternMap = @{
+                'select' = [System.Windows.Automation.SelectionItemPattern]::Pattern
+                'expand' = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+                'collapse' = [System.Windows.Automation.ExpandCollapsePattern]::Pattern
+            }
+            $verbMap = @{ 'select' = 'select'; 'expand' = 'expand'; 'collapse' = 'collapse' }
+            $patternType = $patternMap[$actionName]
+            $fired = Invoke-Pattern $refreshed $patternType $verbMap[$actionName] $null
+            if ($null -eq $fired) {
+                return @{ ok = $false; error_class = 'unsupported_capability'; error = "the element exposes no pattern for $actionName" }
+            }
+            $after = $null
+            try { $after = $el.GetUpdatedCache($cache) } catch { $after = $el }
+            return @{ ok = $true; result = @{ action = $actionName; pattern = ($patternType.ProgrammaticName -replace 'Identifiers\\.Pattern$', '' -replace 'Pattern$', ''); state = (Get-ElementResult $after $cache) } }
+        }
+
+        if ($actionName -eq 'invoke') {
+            # Invoke with the invoke/toggle/select/expand fallback the
+            # legacy verb chain used, reporting WHICH pattern fired.
+            $fired = $null
+            if ($null -ne (Invoke-Pattern $refreshed ([System.Windows.Automation.InvokePattern]::Pattern) 'invoke' $null)) { $fired = 'Invoke' }
+            if ($null -eq $fired -and $null -ne (Invoke-Pattern $refreshed ([System.Windows.Automation.TogglePattern]::Pattern) 'toggle' $null)) { $fired = 'Toggle' }
+            if ($null -eq $fired -and $null -ne (Invoke-Pattern $refreshed ([System.Windows.Automation.SelectionItemPattern]::Pattern) 'select' $null)) { $fired = 'SelectionItem' }
+            if ($null -eq $fired -and $null -ne (Invoke-Pattern $refreshed ([System.Windows.Automation.ExpandCollapsePattern]::Pattern) 'expand' $null)) { $fired = 'ExpandCollapse' }
+            if ($null -eq $fired -and $null -ne $legacyPattern) {
+                $legacy = $null
+                try { $legacy = $refreshed.GetCurrentPattern($legacyPattern) } catch { $legacy = $null }
+                if ($null -ne $legacy) {
+                    try { $legacy.DoDefaultAction(); $fired = 'LegacyIAccessible' } catch { $fired = $null }
+                }
+            }
+            if ($null -eq $fired) {
+                return @{ ok = $false; error_class = 'unsupported_capability'; error = 'the element exposes none of the tried patterns: Invoke, Toggle, SelectionItem, ExpandCollapse, LegacyIAccessible (msaa bridge)' }
+            }
+            $after = $null
+            try { $after = $el.GetUpdatedCache($cache) } catch { $after = $el }
+            return @{ ok = $true; result = @{ action = 'invoke'; pattern = $fired; state = (Get-ElementResult $after $cache) } }
+        }
+
+        return @{ ok = $false; error_class = 'invalid_request'; error = "unknown action $actionName" }
     }
 
     if ($verb -eq 'focus') {
@@ -784,7 +1318,7 @@ if ($null -eq $ownNonce) { $ownNonce = '' }
 $recordedUuid = Read-HelperFile 'uuid.txt'
 if ($null -eq $recordedUuid -or $recordedUuid -eq '') { $recordedUuid = '' } else { $recordedUuid = $recordedUuid.ToLowerInvariant() }
 $identity = Get-OwnIdentity
-$capabilities = @('uia', 'msaa')
+# (the capabilities list is computed by Get-HelperCapabilities above)
 $ownSha256 = ''
 try {
     $selfPath = $MyInvocation.MyCommand.Path
@@ -801,6 +1335,30 @@ try {
 # does not the legacy fallback is skipped cleanly.
 $legacyPattern = $null
 try { $legacyPattern = [System.Windows.Automation.LegacyIAccessiblePattern]::Pattern } catch { $legacyPattern = $null }
+
+# Issue #136: advertise msaa ONLY when the bridge pattern type resolved -
+# never a hardcoded capability list the client cannot trust.
+function Get-HelperCapabilities {
+    $caps = @('uia')
+    if ($null -ne $legacyPattern) { $caps += 'msaa' }
+    return $caps
+}
+$capabilities = Get-HelperCapabilities
+
+# Issue #136: per-monitor DPI awareness so the helper's click points are
+# PHYSICAL pixels - per-monitor V2 first, per-monitor (Win8.1+) second,
+# the legacy system-DPI declaration last; every failure falls through.
+$dpiDeclared = $false
+try {
+    $dpiCtx = New-Object IntPtr(-4)
+    if ([HypervMcp.Uia.Native]::SetThreadDpiAwarenessContext($dpiCtx) -ne [IntPtr]::Zero) { $dpiDeclared = $true }
+} catch { }
+if (-not $dpiDeclared) {
+    try { $dpiDeclared = ([HypervMcp.Uia.Native]::SetProcessDpiAwareness(2) -eq 0) } catch { }
+}
+if (-not $dpiDeclared) {
+    try { $dpiDeclared = [HypervMcp.Uia.Native]::SetProcessDPIAware() } catch { }
+}
 
 # The pipe DACL: GENERIC_ALL for LOCAL_SYSTEM, BUILTIN\Administrators and
 # the running user (the existing New-PipeSecurity intent), expressed as

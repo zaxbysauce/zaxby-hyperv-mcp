@@ -29,8 +29,9 @@ GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
 # The live tool inventory (57 at authoring time; issue #35 added
 # hyperv_server_info on top of the issue text's stale count of 54, issue
 # #29 brought the surface to 76 with the eight hyperv_ui_* tools, PR
-# #112 brought it to 80 with the four Workstream G tools, and issue #130
-# brought it to 82 with hyperv_console_lock_state + hyperv_console_unlock).
+# #112 brought it to 80 with the four Workstream G tools, issue #130
+# brought it to 82 with hyperv_console_lock_state + hyperv_console_unlock,
+# and issue #137 brought it to 84 with hyperv_ui_snapshot + hyperv_ui_act).
 TOOL_NAMES = {
     "hyperv_list_vms",
     "hyperv_get_vm_info",
@@ -104,6 +105,8 @@ TOOL_NAMES = {
     "hyperv_ui_inspect", "hyperv_ui_find", "hyperv_ui_invoke",
     "hyperv_ui_set_value", "hyperv_ui_wait_for", "hyperv_ui_focus",
     "hyperv_ui_session_state", "hyperv_ui_helper_provision",
+    # issue #137: the element-contract pair
+    "hyperv_ui_snapshot", "hyperv_ui_act",
 }
 CRED_TOOLS = {
     "hyperv_configure_kdnet",
@@ -129,6 +132,9 @@ CRED_TOOLS = {
     "hyperv_ui_focus",
     "hyperv_ui_session_state",
     "hyperv_ui_helper_provision",
+    # issue #137: the element-contract pair carries them too
+    "hyperv_ui_snapshot",
+    "hyperv_ui_act",
 }
 
 
@@ -256,12 +262,13 @@ def test_ac12_tool_inventory_per_credential_mode(tmp_path, fresh_server):
         f"extra={sorted(set(base_schemas) - TOOL_NAMES)}, "
         f"missing={sorted(TOOL_NAMES - set(base_schemas))}"
     )
-    assert len(base_schemas) == len(TOOL_NAMES) == 82, (
-        f"AC12: tool count {len(base_schemas)} != 82 "
+    assert len(base_schemas) == len(TOOL_NAMES) == 84, (
+        f"AC12: tool count {len(base_schemas)} != 84 "
         f"(66 through issue #24; 67 with issue #27's settle wait; "
         f"76 with issue #29's eight hyperv_ui_* tools; 80 with PR #112's "
         f"four Workstream G tools; 82 with issue #130's "
-        f"hyperv_console_lock_state + hyperv_console_unlock "
+        f"hyperv_console_lock_state + hyperv_console_unlock; 84 with "
+        f"issue #137's hyperv_ui_snapshot + hyperv_ui_act "
         f"(was: 68 with issue #28's hyperv_console_sequence; "
         f"eight hyperv_ui_* tools)"
     )
