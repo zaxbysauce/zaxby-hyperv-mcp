@@ -119,7 +119,16 @@ def _uia_via_helper(
     from . import uia
 
     try:
-        answer = uia.session_state(cfg, ref, cred)
+        # Issue #140: these are INTERNAL reads — their content IS returned
+        # (meta["ui_tree"]), but their minted state_receipt is DISCARDED by
+        # the evidence walk, so suppress_receipt_mints() keeps the receipts
+        # out of the registry (and its FIFO cap) entirely: no caller can
+        # ever cite a read nobody surfaced. The frozen C21 spy pins zero
+        # mints for this path. (Context-var suppression, not a call
+        # parameter: the trace-29 frozen f05 fixtures stub these wrappers
+        # with their own signatures.)
+        with uia.suppress_receipt_mints():
+            answer = uia.session_state(cfg, ref, cred)
     except Exception:
         return None
     if not isinstance(answer, dict) or not answer.get("ok"):
@@ -130,9 +139,11 @@ def _uia_via_helper(
     if str(helper.get("version", "")) != uia.HELPER_VERSION:
         return None
     try:
-        tree_result = uia.inspect(
-            cfg, ref, cred, selector=None, depth=depth, max_elements=max_elements,
-        )
+        with uia.suppress_receipt_mints():
+            tree_result = uia.inspect(
+                cfg, ref, cred, selector=None, depth=depth,
+                max_elements=max_elements,
+            )
     except Exception:
         return None
     if not isinstance(tree_result, dict) or not tree_result.get("ok"):

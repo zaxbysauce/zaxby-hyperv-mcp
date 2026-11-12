@@ -184,7 +184,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.16.0 today) instead of
+  package's version (0.17.0 today) instead of
   the SDK's (the release contract, the complete bump-site
   enumeration, and how to read `version`/`git_revision` live in
   [docs/versioning-policy.md](docs/versioning-policy.md)).
@@ -233,6 +233,45 @@ restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.17.0 changes
+
+- **UIA state-receipt verification channel for the commit guard (#140,
+  closes #126):** `hyperv_console_click` accepts
+  `verified_state_receipt=<id>` as an ALTERNATIVE to `verified_frame_hash`
+  when `commit_guard=true` (the two are mutually exclusive; citing both is
+  a refusal naming the parameter). The id comes from any successful UIA
+  read — `hyperv_ui_inspect`/`hyperv_ui_find`/`hyperv_ui_wait_for`/
+  `hyperv_ui_session_state` now return `state_receipt` — letting
+  accessibility-driven workflows verify a selection without a pixel capture
+  (the channel #126's In-list promised). The frame-hash guard's code and
+  refusal texts are untouched — but the shared ledger has one honest
+  consequence to state: because UIA mutations now bump the SAME input
+  ledger, a UIA write between a CAPTURE and a frame-hash-guarded click
+  now stales that citation too. That is a fail-closed widening of the
+  #126 channel's stale set (a UIA write can change what the pixels showed),
+  disclosed here rather than buried. The receipt verifies against the SAME
+  per-VM input ledger:
+  its sequence must be later than the most recent input dispatch, and the
+  read's observation-to-stamp window is linearized against input dispatch
+  by holding the console-input exclusion on both the VM's GUID and the
+  caller-name key spellings — including cold by-name inputs. UIA
+  mutations (`hyperv_ui_invoke`/`hyperv_ui_set_value`/`hyperv_ui_focus`)
+  now bump the same input ledger at their dispatch seam, so a UIA write
+  between the read and the click stales the citation (a dispatched leg
+  whose delivery is unknowable — timeout/transport error — bumps
+  conservatively; pre-dispatch refusals never bump). Unknown/evicted
+  citations refuse as `commit_unverified` with zero mouse input; the
+  receipt path takes no live-frame capture and has no pixel-domain
+  requirement, and `hyperv_console_sequence` stays frame-hash-only (a step
+  carrying `verified_state_receipt` is a step-indexed refusal, never a
+  silently ignored key). Per-server-process ledger scope is inherited from
+  #126's owner-final decision: there is no cross-process freshness here,
+  and the receipt channel has no live-state re-check leg. Internal reads
+  whose receipts would be dead weight (evidence's UI-tree walk surfaces the
+  read's CONTENT in `meta["ui_tree"]` but can never surface its mint) mint
+  nothing citable.
+- Version bump: 0.16.0 -> 0.17.0.
 
 ## 0.16.0 changes
 
@@ -2146,7 +2185,7 @@ selectors fail with `ambiguous_selector` and up to 20 candidates.
 | `hyperv_console_key_combo` | `vm_name` or `vm_id`, `keys[]` — modifiers ctrl/alt/shift (incl. right- variants) and win/leftwin/rightwin; every other key name taps in order, e.g. `["win","r"]` | `{ok, scancodes_sent, chunks}` |
 | `hyperv_console_type_scancodes` | `vm_name` or `vm_id`, `scancodes[]` (0..255) | `{ok, scancodes_sent, chunks}` |
 | `hyperv_console_mouse_move` | `vm_name` or `vm_id`, `x`, `y`, `frame_width?`, `frame_height?` (both MAY be omitted when `frame_hash` is cited — they then default from the cited record's registered `frame_size`, and a record without one refuses naming the requirement), `frame_hash?` (issue #125 capture citation — see the mapping contract below) | `{ok, operation, head_x, head_y}` |
-| `hyperv_console_click` | `vm_name` or `vm_id`, `x?`/`y?` (null default — omit both to click at the current position; (0,0) is a real coordinate; x/y are REQUIRED when `commit_guard` is true), `frame_width?=0`, `frame_height?=0` (both MAY be omitted when a `frame_hash` citation or the commit guard's `verified_frame_hash` is given — they then default from the cited record's registered `frame_size`, and a record without one refuses naming the requirement), `button=1`, `frame_hash?` (issue #125 capture citation), `commit_guard=false`, `verified_frame_hash?` (issue #126 commit guard — both below) | `{ok, operation, head_x?, head_y?}` |
+| `hyperv_console_click` | `vm_name` or `vm_id`, `x?`/`y?` (null default — omit both to click at the current position; (0,0) is a real coordinate; x/y are REQUIRED when `commit_guard` is true), `frame_width?=0`, `frame_height?=0` (both MAY be omitted when a `frame_hash` citation or the commit guard's `verified_frame_hash` is given — they then default from the cited record's registered `frame_size`, and a record without one refuses naming the requirement), `button=1`, `frame_hash?` (issue #125 capture citation), `commit_guard=false`, `verified_frame_hash?` (issue #126 commit guard — both below), `verified_state_receipt?` (issue #140 receipt channel — mutually exclusive with `verified_frame_hash`; see the receipt channel below) | `{ok, operation, head_x?, head_y?}` |
 | `hyperv_console_button` | `vm_name` or `vm_id`, `button`, `is_down` | `{ok, operation}` |
 | `hyperv_console_scroll` | `vm_name` or `vm_id`, `delta` | `{ok, operation}` |
 | `hyperv_console_wait_frame_change` | `vm_name` or `vm_id`, `baseline_hash=""`, `width=640`, `height=480`, `timeout_s=60`, `interval_s=2` | list[ImageContent(image/png), TextContent({stop_reason: changed\|deadline, polls, elapsed_ms, frame_hash, head_resolution, content_rect, hash_domain})] — `head_resolution`/`content_rect` (issue #125) join a returned hash from the poll that produced it (keys absent when the head is unknown) — or deadline dict |
@@ -2222,6 +2261,66 @@ the sequence call's `width`/`height` — the cited verification's registered
 `frame_size` must match that pair when it was recorded (a size-less
 citation falls through to the precondition capture, which hashes the
 sequence size).
+
+**The receipt channel (`verified_state_receipt`, issue #140).** A guarded
+click may instead cite a UIA state-read receipt: `hyperv_ui_inspect`,
+`hyperv_ui_find`, `hyperv_ui_wait_for`, and `hyperv_ui_session_state`
+return a `state_receipt` id on every successful read, and a
+`commit_guard=true` click accepts `verified_state_receipt=<id>` in place
+of `verified_frame_hash` — exactly one channel per click (citing both is a
+refusal naming the parameter; citing neither keeps the classic
+`commit_unverified` refusal). The receipt's freshness rule is the same
+input ledger: the receipt's sequence must postdate the VM's most recent
+input dispatch, so the read that saw the selection provably happened after
+the click that made it. That comparison reads the MAX input-dispatch
+sequence across every ledger key under which an input to the VM could have
+been recorded (the caller name, the explicit id, and the hint-resolved
+GUID), because an input already in flight on a cold name-keyed ref records
+its bump under the name key while the receipt is keyed by GUID — taking the
+max closes that split fail-closed (it can only ever add a stale refusal).
+A successful UIA read holds the per-VM
+console-input exclusion across its helper leg, its parse, and its receipt
+stamp — on both the GUID and the caller-name key spellings — so no console
+input can dispatch between the observation and the stamp, and the UIA
+mutating tools (`hyperv_ui_invoke`/`hyperv_ui_set_value`/`hyperv_ui_focus`)
+bump the same ledger at their dispatch seam (dispatched legs bump even when
+the result is unknowable — timeout/transport error — while pre-dispatch
+refusals never bump; a UIA write after the read therefore stales the
+citation exactly like a console write). Cost (accepted + disclosed): the
+read's console-key hold is shared with console INPUT dispatch AND with
+capture/wait ops (`#125` whole-wait hold) — contention runs BOTH
+directions: a UIA read issued concurrently with a console input op, a
+screenshot, or a `wait_frame_*` on the same VM queues behind the holder,
+and equally a console input op dispatched while a read holds the key waits
+for the stamp to land — either waiter times out after
+`Config.vm_lock_wait_s` (default 30s) raising the retryable `VMBusy`, the
+same retryable signal the multi-agent guard family already uses. The hold
+spans the whole verb request for the NON-POLLING reads (inspect/find/
+session_state, including their front-door discovery legs — install-facts,
+SID lookup, session bootstrap, each bounded by its own timeout and cached
+after first success), so a slow-guest read widens the contention window
+beyond the helper round trip itself. `hyperv_ui_wait_for` is the exception,
+not a whole-wait holder: `_verb_request` re-acquires and releases the
+console key PER poll slice (the bounded guest-side slices), so console
+inputs interleave freely BETWEEN slices and only queue behind a single
+in-flight slice — the receipt's observation-to-stamp atomicity is preserved
+per minted slice, while the wait as a whole does not monopolize the key.
+Single-operator flows alternate capture->read->click and are unaffected. Unlike the frame-hash channel the
+receipt verifies ledger ordering ONLY: there is no live-frame re-check leg,
+no pixel-domain requirement (`frame_width`/`frame_height` are not needed
+for the verification itself, only for coordinate mapping), and the
+per-server-process scope limitation from #126 applies with no pixels
+backstop. Unknown, never-minted, or FIFO-evicted citations refuse through
+the structured `commit_unverified` family with zero mouse input — the
+receipt registry's 512-entry cap is PROCESS-GLOBAL (shared across all VMs):
+heavy read churn on one VM (e.g. a long `hyperv_ui_wait_for`, which mints
+per helper slice and returns only the last receipt) can evict another VM's
+still-citable receipt; eviction fails closed and a re-read re-mints. Every
+refusal dispatches zero mouse input; allowed decisions are audited like the
+frame-hash channel's.
+`hyperv_console_sequence` remains frame-hash-only: a step carrying
+`verified_state_receipt` is a step-indexed refusal (never a silently
+ignored key) — use `hyperv_console_click` for receipt-verified commits.
 
 **Whole-wait lock holding.** Because captures now auto-register for
 citation, `wait_frame_change`/`wait_frame_stable` hold the per-VM console

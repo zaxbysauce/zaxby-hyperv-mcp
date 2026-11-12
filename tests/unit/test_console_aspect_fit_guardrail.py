@@ -454,12 +454,14 @@ def test_server_click_forwards_guard_parameters(monkeypatch, tmp_path):
 
     def fake_click(cfg, vm_name="", x=None, y=None, frame_width=0,
                    frame_height=0, button=1, vm_id="", frame_hash="",
-                   commit_guard=False, verified_frame_hash=""):
+                   commit_guard=False, verified_frame_hash="",
+                   verified_state_receipt=""):
         received.update(
             vm_name=vm_name, x=x, y=y, frame_width=frame_width,
             frame_height=frame_height, button=button, vm_id=vm_id,
             frame_hash=frame_hash, commit_guard=commit_guard,
-            verified_frame_hash=verified_frame_hash)
+            verified_frame_hash=verified_frame_hash,
+            verified_state_receipt=verified_state_receipt)
         return {"ok": True, "operation": "click button 1", "vm_name": vm_name}
 
     monkeypatch.setattr(mod.console, "click", fake_click)
@@ -473,6 +475,9 @@ def test_server_click_forwards_guard_parameters(monkeypatch, tmp_path):
         "frame_height": 240, "button": 1, "vm_id": "",
         "frame_hash": "a" * 64, "commit_guard": True,
         "verified_frame_hash": "b" * 64,
+        # Issue #140: every citation/guard parameter forwards verbatim,
+        # including the receipt channel (absent at the call => default "").
+        "verified_state_receipt": "",
     }, "the server tool must forward every citation/guard parameter verbatim"
 
 
