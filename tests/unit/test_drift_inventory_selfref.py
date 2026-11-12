@@ -146,7 +146,9 @@ def test_self_pair_verdict_is_visible_in_generated_doc(tmp_path, monkeypatch, ca
     body = docs.read_text(encoding="utf-8")
     assert "Self-referential pairs" in body
     assert "63-66-119-collated" in body
-    assert "live tree diverged from the frozen pin" in body
+    assert "live doc blob" in body  # AC3: the pair + its live identity stay visible
+    assert "matches the frozen pin" not in body  # no dead rendered comparison (critic finding 4)
+    assert "diverged from the frozen pin" not in body
 
 
 def test_rendered_mechanism_text_names_the_working_tree_blob(tmp_path, monkeypatch):

@@ -1466,8 +1466,13 @@ def set_value(cfg, vm_name="", cred: CredentialSet | None = None,
             return Path(path).read_text(encoding="utf-8")
 
         from . import credentials as _credentials
+        from .console import _denied_env_names
 
-        value = _credentials.resolve_secret_ref(secret_ref, guard=_guard)
+        value = _credentials.resolve_secret_ref(
+            secret_ref, guard=_guard,
+            allowed_env=cfg.secret_env_names,
+            denied_env=_denied_env_names(cfg),
+        )
     if value is None:
         raise ValueError("set_value requires value=")
     if isinstance(value, str) and len(value.encode("utf-8")) > _MAX_VALUE_BYTES:

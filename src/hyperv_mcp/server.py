@@ -1820,7 +1820,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         secret, submits with Enter, and verifies through the lock state AND a
         frame change. One attempt per call; a still-locked result is
         unlock_failed with no retry (repeated wrong attempts lock the guest
-        account out). Policy: console_input category.
+        account out). The password field is not explicitly focused — the
+        wake press plus the guest's default focus must land the caret
+        there (explicit focus needs the UIA helper, #136/#129). Policy:
+        console_input category.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 

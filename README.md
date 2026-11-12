@@ -242,7 +242,13 @@ the task-spawned controller reads it from the environment.
   The resolved value is typed or set; only its length is reported — the
   value never appears in a response, a script, argv, or an error record.
   `secret_ref` and literal text/value are mutually exclusive. Typing
-  literal text without `secret_ref` behaves exactly as before.
+  literal text without `secret_ref` behaves exactly as before. The
+  `env:` path is DENY-ALL by default: only variables matching the
+  configured `secret_env_names` globs are readable, and the server's own
+  credential/token variables (`HYPERV_GUEST_PASSWORD`,
+  `HYPERV_HOST_PASSWORD`, `HYPERV_MCP_HTTP_TOKEN`, the configured
+  `http.token_env`, every `http.agents` token variable) are ALWAYS
+  refused even when the allowlist matches them (final-critic Critical 1).
 - **Console lock state and one-attempt unlock (#130):** new tools
   `hyperv_console_lock_state` (reports `locked`/`unlocked`/`unknown` from
   the guest's process table — a running `LogonUI.exe` is the lock evidence,
@@ -252,7 +258,10 @@ the task-spawned controller reads it from the environment.
   one wake press, the secret typed once, submit, and verification through
   lock state AND a frame change; a still-locked result is `unlock_failed`
   with no retry, because repeated wrong attempts lock the guest account
-  out).
+  out). Limitation: the password field is not explicitly FOCUSED — the
+  wake press plus the guest's default focus must land the caret there
+  (explicit focus needs the UIA helper, #136/#129); disclosed in the tool
+  docstrings.
 - **The drift-inventory gate is self-reference-safe (#143):**
   `scripts/gen_trace_drift_inventory.py` no longer counts the inventory
   document's own pinned pairs in its `--check` verdict (the quine that
@@ -2189,7 +2198,7 @@ Direct.
 | `hyperv_ui_wait_for` | vm policy + credentials | wait for a selector to appear / disappear |
 | `hyperv_ui_session_state` | vm policy + credentials | active session, interactive user, locked, foreground window, helper version |
 | `hyperv_ui_invoke` | `ui_input` | Invoke/Toggle/SelectionItem/ExpandCollapse on an element |
-| `hyperv_ui_set_value` | `ui_input` | set a Value-pattern property (result reports the length, never the value) |
+| `hyperv_ui_set_value` `secret_ref?` (0.18.0: `env:NAME` allowlisted by `secret_env_names`, or policy-allowlisted `file:PATH`; mutually exclusive with `value`; the resolved value is set, only the length is reported) | `ui_input` | set a Value-pattern property (result reports the length, never the value) |
 | `hyperv_ui_focus` | `ui_input` | focus an element (locked sessions refuse: `no_interactive_desktop` — as do invoke and set_value) |
 | `hyperv_ui_helper_provision` | `ui_provision` + confirm | install + start the helper (`teardown=true` removes it); optional autologon |
 

@@ -2959,7 +2959,20 @@ def _resolve_secret(cfg: Config, secret_ref: str) -> str:
         policy.check_host_read(cfg, path)
         return Path(path).read_text(encoding="utf-8")
 
-    return credentials.resolve_secret_ref(secret_ref, guard=_guard)
+    return credentials.resolve_secret_ref(
+        secret_ref, guard=_guard,
+        allowed_env=cfg.secret_env_names,
+        denied_env=_denied_env_names(cfg),
+    )
+
+
+def _denied_env_names(cfg: Config) -> set[str]:
+    """The server's own credential/token variables: never typeable into a
+    guest even when the secret_env_names allowlist matches them (final
+    critic Critical 1)."""
+    names = {"HYPERV_MCP_HTTP_TOKEN", (cfg.http.token_env or "").strip().upper()}
+    names |= {name.strip().upper() for name in cfg.http.agents.values()}
+    return {name for name in names if name}
 
 
 def lock_state(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
@@ -3019,7 +3032,10 @@ def unlock(cfg: Config, vm_name: str = "", secret_ref: str = "",
     press (Escape), types the resolved secret, submits with Enter, and
     verifies through the lock state AND a frame change — the desktop must
     visibly change. One attempt per call; a still-locked result is
-    ``unlock_failed`` with no retry.
+    ``unlock_failed`` with no retry. Limitation: the password field is not
+    explicitly focused — the wake press plus the guest's default focus
+    must land the caret there; explicit focus needs the UIA helper
+    (#136/#129).
     """
     policy.require_category(cfg, "console_input", f"unlock '{vm_name}' console")
     if not secret_ref:

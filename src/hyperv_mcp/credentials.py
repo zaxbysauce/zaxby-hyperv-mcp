@@ -439,6 +439,8 @@ def resolve_secret_ref(
     *,
     environ: dict[str, str] | None = None,
     guard: Callable[[str], str] | None = None,
+    allowed_env: list[str] | None = None,
+    denied_env: set[str] | None = None,
 ) -> str:
     """Resolve a named secret reference host-side (issue #130).
 
@@ -447,12 +449,19 @@ def resolve_secret_ref(
       env:NAME   read NAME from the process environment (or ``environ``)
       file:PATH  read PATH through the caller's policy guard
 
-    ``guard`` is the caller-supplied reader for the ``file:`` form; it must
-    run the host_read_roots policy gate (an unguarded file reader is a
-    host-file exfiltration channel, so None refuses). Trailing newline
-    characters are stripped from file contents; env values keep their
-    exact bytes. The value itself is never returned by a tool response and
-    never logged — callers report only ``len()``.
+    ``allowed_env`` is the configured env-name allowlist (fnmatch globs,
+    matched case-insensitively); None or an empty list DENIES every env
+    source — the deny-all default (final-critic Critical 1: without it the
+    env path could type the server's own credential variables into a
+    guest). ``denied_env`` is the caller-supplied hard-deny set (the
+    server's own credential/token variable names, case-insensitive); those
+    names are refused even when the allowlist matches them. ``guard`` is
+    the caller-supplied reader for the ``file:`` form; it must run the
+    host_read_roots policy gate (an unguarded file reader is a host-file
+    exfiltration channel, so None refuses). Trailing newline characters
+    are stripped from file contents; env values keep their exact bytes.
+    The value itself is never returned by a tool response and never
+    logged — callers report only ``len()``.
     """
     if not isinstance(secret_ref, str) or not secret_ref.strip():
         raise CredentialError("secret_ref is required when typing a secret")
@@ -466,11 +475,32 @@ def resolve_secret_ref(
             "pass the host read policy)"
         )
     if scheme == "env":
+        from fnmatch import fnmatch
+
+        upper = target.strip().upper()
+        denied = {name.strip().upper() for name in (denied_env or set())}
+        from . import pswindows as _psw  # local import: no cycle (pswindows imports credentials only lazily)
+
+        denied |= {name.upper() for name in _psw._SECRET_ENV_NAMES}
+        denied.add("HYPERV_MCP_HTTP_TOKEN")
+        if upper in denied:
+            raise CredentialError(
+                f"secret ref env variable '{target.strip()}' is a server "
+                "credential/token variable and is always refused"
+            )
+        patterns = [p for p in (allowed_env or []) if p]
+        if not patterns or not any(
+            fnmatch(upper, pattern.strip().upper()) for pattern in patterns
+        ):
+            raise CredentialError(
+                f"secret ref env variable '{target.strip()}' is not in the "
+                "configured secret_env_names allowlist (deny-all by default)"
+            )
         env = os.environ if environ is None else environ
-        value = env.get(target)
+        value = next((v for k, v in env.items() if k.upper() == upper), None)
         if value is None or value == "":
             raise CredentialError(
-                f"secret ref env variable '{target}' is not set"
+                f"secret ref env variable '{target.strip()}' is not set"
             )
         return value
     if guard is None:

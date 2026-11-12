@@ -373,6 +373,11 @@ class Config:
     host_write_roots: list[str] = field(default_factory=list)
     guest_read_roots: list[str] = field(default_factory=list)
     guest_write_roots: list[str] = field(default_factory=list)
+    #: env:NAME allowlist for secret_ref (issue #130): an empty list denies
+    #: every env source (deny-all default); entries are fnmatch globs matched
+    #: case-insensitively. The server's own credential/token variables are
+    #: ALWAYS refused regardless of this list (credentials.resolve_secret_ref).
+    secret_env_names: list[str] = field(default_factory=list)
     destructive: DestructivePolicy = field(default_factory=DestructivePolicy)
     allow_inline_credentials: bool = False
     unrestricted: bool = False

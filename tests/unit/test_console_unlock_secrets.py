@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 
 import pytest
 
@@ -68,6 +69,7 @@ def test_secret_ref_typed_and_never_echoed(monkeypatch, unrestricted_cfg):
     monkeypatch.setenv("APP_TEST_SECRET", "S3cr3t-Typed-P4ss!")
     fake = FakePS()
     monkeypatch.setattr(pswindows, "run_ps", fake)
+    unrestricted_cfg.secret_env_names = ["APP_TEST_*"]
     out = console.type_text(unrestricted_cfg, "vm1", secret_ref="env:APP_TEST_SECRET")
     assert out["ok"] is True
     assert out["chars"] == len("S3cr3t-Typed-P4ss!")
@@ -100,6 +102,7 @@ def test_unlock_refused_when_not_locked(monkeypatch, unrestricted_cfg):
     """AC3: unlock on an unlocked (or unknown-state) console refuses with
     not_locked and sends no input."""
     monkeypatch.setenv("APP_TEST_SECRET", "pw")
+    unrestricted_cfg.secret_env_names = ["APP_TEST_*"]
     monkeypatch.setattr(console, "lock_state",
                         lambda cfg, vm_name="", vm_id="": {
                             "ok": True, "state": "unlocked",
@@ -165,6 +168,7 @@ def test_failed_unlock_does_not_retry(monkeypatch, unrestricted_cfg):
         typed.append(text)  # R13: record the VALUE typed, not the ref
 
     monkeypatch.setattr(console, "type_text", fake_type_text)
+    unrestricted_cfg.secret_env_names = ["APP_TEST_*"]
     with pytest.raises(Exception, match="unlock_failed"):
         console.unlock(unrestricted_cfg, "vm1", secret_ref="env:APP_TEST_SECRET")
     assert typed == ["pw"]  # exactly one attempt, the RESOLVED secret typed
@@ -221,6 +225,7 @@ def test_unlock_success_path_real_lock_state(monkeypatch, unrestricted_cfg):
         return None, {"frame_hash": next(hashes)}
 
     monkeypatch.setattr(console, "screenshot", fake_screenshot)
+    unrestricted_cfg.secret_env_names = ["APP_TEST_*"]
     out = console.unlock(unrestricted_cfg, "vm1", secret_ref="env:APP_TEST_SECRET")
     assert out["ok"] is True and out["state"] == "unlocked" and out["attempts"] == 1
     assert typed_ok == ["good-pw"]
@@ -233,6 +238,7 @@ def test_restricted_config_lock_and_unlock_usable(monkeypatch):
     usable without unrestricted=True."""
     cfg = Config()
     cfg.destructive.console_input = True  # NOT unrestricted
+    cfg.secret_env_names = ["APP_TEST_*"]
     monkeypatch.setenv("APP_TEST_SECRET", "pw")
     monkeypatch.setenv("HYPERV_GUEST_USERNAME", "tester")
     monkeypatch.setenv("HYPERV_GUEST_PASSWORD", "not-a-real-password")
@@ -306,6 +312,7 @@ def test_set_value_secret_ref_resolved_host_side(monkeypatch):
                             "R", (), {"name": "vm1", "id": "guid"})())
     cfg = Config()
     cfg.destructive.ui_input = True
+    cfg.secret_env_names = ["APP_TEST_*"]
     # R3: the registered tool always supplies value="" (its default) — the
     # exact wrapper-kwarg shape that used to be refused before resolving.
     out = uia.set_value(cfg, "vm1", cred=_Cred(), selector={"name": "box"},
@@ -316,3 +323,59 @@ def test_set_value_secret_ref_resolved_host_side(monkeypatch):
     with pytest.raises(ValueError, match="mutually exclusive"):
         uia.set_value(cfg, "vm1", cred=_Cred(), selector={"name": "box"},
                       value="x", secret_ref="env:APP_TEST_SECRET")
+
+
+def test_env_secret_denied_by_default(monkeypatch):
+    """Final-critic Critical 1: the env: path is DENY-ALL by default — a
+    config that never lists secret_env_names cannot read any variable, so
+    the server's own credential variables are not typeable into a guest."""
+    cfg = Config()
+    cfg.destructive.console_input = True  # NOT unrestricted, no allowlist
+    monkeypatch.setenv("SOME_RANDOM_VAR", "value")
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(CredentialError, match="secret_env_names allowlist"):
+        console.type_text(cfg, "vm1", secret_ref="env:SOME_RANDOM_VAR")
+    assert fake.scripts == []
+
+
+def test_server_credential_vars_always_refused(monkeypatch):
+    """Final-critic Critical 1: HYPERV_GUEST_PASSWORD / HYPERV_HOST_PASSWORD
+    / HYPERV_MCP_HTTP_TOKEN are refused EVEN WHEN the allowlist matches
+    them (the hard-deny set outranks the allowlist)."""
+    from hyperv_mcp.credentials import resolve_secret_ref
+
+    allow_all = ["*"]
+    for name in ("HYPERV_GUEST_PASSWORD", "HYPERV_HOST_PASSWORD",
+                 "HYPERV_MCP_HTTP_TOKEN", "hyperv_guest_password"):
+        monkeypatch.setenv(name.upper(), "x")
+        with pytest.raises(CredentialError, match="always refused"):
+            resolve_secret_ref(f"env:{name}", environ=dict(os.environ),
+                               allowed_env=allow_all)
+
+
+def test_agent_token_env_refused(monkeypatch):
+    """The configured http.token_env / per-agent token variables ride the
+    hard-deny set through the callers."""
+    cfg = Config()
+    cfg.destructive.console_input = True
+    cfg.secret_env_names = ["*"]
+    cfg.http.token_env = "MY_CUSTOM_TOKEN_VAR"
+    monkeypatch.setenv("MY_CUSTOM_TOKEN_VAR", "tok")
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    with pytest.raises(CredentialError, match="always refused"):
+        console.type_text(cfg, "vm1", secret_ref="env:MY_CUSTOM_TOKEN_VAR")
+    assert fake.scripts == []
+
+
+def test_allowlisted_env_secret_is_usable(monkeypatch, unrestricted_cfg):
+    """The allowlist admits ordinary app-test variables (glob, case-
+    insensitive)."""
+    unrestricted_cfg.secret_env_names = ["app_test_*"]
+    monkeypatch.setenv("app_test_case_insensitive", "ok")
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = console.type_text(unrestricted_cfg, "vm1",
+                            secret_ref="env:APP_TEST_CASE_INSENSITIVE")
+    assert out["ok"] is True and out["chars"] == 2

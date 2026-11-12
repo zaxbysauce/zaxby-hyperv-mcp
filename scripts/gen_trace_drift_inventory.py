@@ -29,12 +29,13 @@ the quine that forced the regenerate -> re-AMEND -> regenerate ritual and
 the --no-verify pre-push bypass. Such pairs are EXCLUDED from the gate
 verdict AND from the rendered counts (their OK/CHANGED lines move with the
 document's own bytes) and reported in their own labelled section. The
-section's verdict compares the pair's frozen blob against the WORKING-TREE
-blob id (`git hash-object`) — an identity that moves with neither the
-regeneration nor the commit of this document — so the census converges at
-its own fresh output and two consecutive `--check` runs agree. The live
-verdict stays visible (issue #143 AC3); a diverged pin is informational
-(re-anchor at the next re-baseline wave), never a gate failure.
+section lists each pair with the document's live working-tree blob id
+(`git hash-object`) and NO rendered match/diverge verdict — a document
+cannot contain a prefix of its own hash, so any rendered comparison could
+never converge (final-critic finding 4); the census text is therefore
+regeneration-stable by construction and two consecutive `--check` runs
+agree. The pair stays visible (issue #143 AC3); re-anchoring is the next
+re-baseline wave's bookkeeping, never a gate failure.
 """
 
 from __future__ import annotations
@@ -166,27 +167,23 @@ def _dynamic(rows: list[dict]) -> str:
         "",
         "## Self-referential pairs (excluded from the gate, issue #143)",
         "",
-        "Pairs whose frozen path is this document itself. Live verdicts stay",
-        "visible; the working-tree-vs-frozen comparison uses `git hash-object`,",
-        "so it is stable across regenerations and commits. A diverged pin is",
-        "informational (re-anchor at the next re-baseline wave), never a gate",
-        "failure.",
+        "Pairs whose frozen path is this document itself, listed with the",
+        "live working-tree blob id of the document (`git hash-object`). No",
+        "match/diverge verdict is rendered: a document cannot contain a",
+        "prefix of its own hash, so a rendered comparison could never",
+        "converge (final-critic finding 4). The frozen blob lives in the",
+        "trace's manifest; re-anchoring is the next re-baseline wave's",
+        "bookkeeping and is never a gate failure.",
         "",
     ]
     self_rows = [(row, pair) for row in rows for pair in row["self_pairs"]]
     if not self_rows:
         lines.append("None — no trace pins the inventory document itself.")
     for row, pair in self_rows:
-        frozen = pair["blob"]
-        live = _live_blob(SELF_PATH)
-        if live == frozen:
-            verdict = "live tree matches the frozen pin"
-        else:
-            verdict = ("live tree diverged from the frozen pin — expected after "
-                       "any change to this document; re-anchor at the next "
-                       "re-baseline wave (informational)")
+        live = _live_blob(SELF_PATH) or "unavailable"
         lines.append(
-            f"- `{row['slug']}` {pair['check']}: frozen {frozen[:12]} — {verdict}"
+            f"- `{row['slug']}` {pair['check']}: live doc blob {live[:12]} "
+            "(informational; excluded from the gate)"
         )
     lines += ["", "## Drift detail (CHANGED pairs)", ""]
     drifted = [row for row in rows if row["gate_changed"]]
