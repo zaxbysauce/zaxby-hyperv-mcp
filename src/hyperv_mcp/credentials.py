@@ -502,7 +502,7 @@ def resolve_secret_ref(
             raise CredentialError(
                 f"secret ref env variable '{target.strip()}' is not set"
             )
-        return value
+        return _validated_secret_value(value)
     if guard is None:
         raise CredentialError(
             "secret_ref file: sources require the host read policy guard; "
@@ -511,4 +511,21 @@ def resolve_secret_ref(
     raw = guard(target)
     if not raw.strip():
         raise CredentialError(f"secret file '{target}' is empty")
-    return raw.rstrip("\r\n")
+    return _validated_secret_value(raw.rstrip("\r\n"))
+
+
+def _validated_secret_value(value: str) -> str:
+    """Shared post-read invariants for resolved secret_ref values (PR-144
+    review SEC-02/SEC-04): register in the redaction registry like every
+    other resolved secret (the module contract), and reject line breaks —
+    a multi-line value typed into a logon field is an early-submit or
+    partial-secret hazard, matching the credential invariant that rejects
+    line breaks."""
+    registry().register(value)
+    if "\n" in value or "\r" in value:
+        raise CredentialError(
+            "secret_ref resolved value must not contain line breaks "
+            "(a multi-line secret cannot be typed safely); use a single-line "
+            "secret file or variable"
+        )
+    return value

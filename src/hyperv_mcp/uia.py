@@ -1463,7 +1463,14 @@ def set_value(cfg, vm_name="", cred: CredentialSet | None = None,
 
         def _guard(path: str) -> str:
             policy.check_host_read(cfg, path)
-            return Path(path).read_text(encoding="utf-8")
+            try:
+                return Path(path).read_text(encoding="utf-8-sig")
+            except OSError as exc:
+                from .credentials import CredentialError
+                raise CredentialError(f"secret file {path!r} is unreadable: {exc}") from None
+            except UnicodeDecodeError as exc:
+                from .credentials import CredentialError
+                raise CredentialError(f"secret file {path!r} is not decodable as UTF-8 (UTF-16 is common on Windows editors): {exc}") from None
 
         from . import credentials as _credentials
         from .console import _denied_env_names

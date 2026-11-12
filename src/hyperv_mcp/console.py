@@ -2957,7 +2957,14 @@ def _resolve_secret(cfg: Config, secret_ref: str) -> str:
 
     def _guard(path: str) -> str:
         policy.check_host_read(cfg, path)
-        return Path(path).read_text(encoding="utf-8")
+        try:
+            return Path(path).read_text(encoding="utf-8-sig")
+        except OSError as exc:
+            from .credentials import CredentialError
+            raise CredentialError(f"secret file {path!r} is unreadable: {exc}") from None
+        except UnicodeDecodeError as exc:
+            from .credentials import CredentialError
+            raise CredentialError(f"secret file {path!r} is not decodable as UTF-8 (UTF-16 is common on Windows editors): {exc}") from None
 
     return credentials.resolve_secret_ref(
         secret_ref, guard=_guard,
@@ -2969,9 +2976,18 @@ def _resolve_secret(cfg: Config, secret_ref: str) -> str:
 def _denied_env_names(cfg: Config) -> set[str]:
     """The server's own credential/token variables: never typeable into a
     guest even when the secret_env_names allowlist matches them (final
-    critic Critical 1)."""
-    names = {"HYPERV_MCP_HTTP_TOKEN", (cfg.http.token_env or "").strip().upper()}
+    critic Critical 1; PR-144 review SEC-03 adds the operations HMAC key
+    and the per-VM credential-profile password variables)."""
+    names = {
+        "HYPERV_MCP_HTTP_TOKEN",
+        (cfg.http.token_env or "").strip().upper(),
+        (cfg.operations.key_env or "").strip().upper(),
+    }
     names |= {name.strip().upper() for name in cfg.http.agents.values()}
+    for profile in getattr(cfg, "credential_profiles", ()) or ():
+        for attr in ("password_env", "victim_password_env"):
+            value = getattr(profile, attr, "") or ""
+            names.add(value.strip().upper())
     return {name for name in names if name}
 
 
