@@ -19,6 +19,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .config import Config, CredentialProfile
@@ -431,3 +432,50 @@ def resolve_host(environ: dict[str, str] | None = None) -> CredentialSet | None:
         else "env"
     )
     return CredentialSet(u, _validated_password(p, p_source), cred_ref)
+
+
+def resolve_secret_ref(
+    secret_ref: str,
+    *,
+    environ: dict[str, str] | None = None,
+    guard: Callable[[str], str] | None = None,
+) -> str:
+    """Resolve a named secret reference host-side (issue #130).
+
+    Supported forms (the prefix is mandatory; bare names and bare paths
+    are refused fail-closed):
+      env:NAME   read NAME from the process environment (or ``environ``)
+      file:PATH  read PATH through the caller's policy guard
+
+    ``guard`` is the caller-supplied reader for the ``file:`` form; it must
+    run the host_read_roots policy gate (an unguarded file reader is a
+    host-file exfiltration channel, so None refuses). Trailing newline
+    characters are stripped from file contents; env values keep their
+    exact bytes. The value itself is never returned by a tool response and
+    never logged — callers report only ``len()``.
+    """
+    if not isinstance(secret_ref, str) or not secret_ref.strip():
+        raise CredentialError("secret_ref is required when typing a secret")
+    scheme, sep, target = secret_ref.partition(":")
+    if not sep or scheme not in ("env", "file") or not target.strip():
+        raise CredentialError(
+            "secret_ref must be env:NAME or file:PATH (the file path must "
+            f"pass the host read policy), got: {secret_ref!r}"
+        )
+    if scheme == "env":
+        env = os.environ if environ is None else environ
+        value = env.get(target)
+        if value is None or value == "":
+            raise CredentialError(
+                f"secret ref env variable '{target}' is not set"
+            )
+        return value
+    if guard is None:
+        raise CredentialError(
+            "secret_ref file: sources require the host read policy guard; "
+            "refusing an unguarded file reader"
+        )
+    raw = guard(target)
+    if not raw.strip():
+        raise CredentialError(f"secret file '{target}' is empty")
+    return raw.rstrip("\r\n")

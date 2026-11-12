@@ -1754,6 +1754,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     def hyperv_console_type_text(
         vm_name: str = "", text: str = "", vm_id: str = "",
         lease_id: str = "", fencing_token: int = 0,
+        secret_ref: str = "",
     ) -> dict:
         """Type ASCII text into the VM console via Msvm_Keyboard.TypeText
         (works pre-login, in WinPE). Text rides the stdin channel — it never
@@ -1761,20 +1762,84 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         Chunks over 512 chars with pacing. For non-ASCII input use
         hyperv_console_type_scancodes. Policy: console_input category.
 
+        With secret_ref (env:NAME or an allowlisted file:PATH, resolved
+        host-side), the resolved value is typed and only its length is
+        reported; secret_ref and text are mutually exclusive.
+
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
 
         Args:
             vm_name: Name of the VM (must match allowed_vm_patterns)
             text: Text to type into the guest console
+            secret_ref: env:NAME or allowlisted file:PATH resolved host-side; the value is typed, only its length is reported (mutually exclusive with text)
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
             lease_id: Optional lease citation - the lease gate runs before the body
             fencing_token: The lease's fencing token, with lease_id
-        Returns: {ok, chunks, chars} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
+        Returns: {ok, chunks, chars} (+ secret_typed when secret_ref) or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
         """
         return _run_console_tool(
             "hyperv_console_type_text", vm_name, "console_input",
             console.type_text, _cfg(), vm_name, text, vm_id=vm_id,
+            secret_ref=secret_ref,
+        )
+
+    @mcp.tool()
+    def hyperv_console_lock_state(
+        vm_name: str = "", vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
+    ) -> dict:
+        """Report the console lock state from the guest's process table
+        (issue #130): locked when LogonUI.exe is running in the guest's
+        session, unlocked when absent, unknown when the process-table leg
+        fails. Evidence names what the verdict came from. Read category;
+        needs guest credentials and a running supported guest OS.
+
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
+        Returns: {ok, state: locked|unlocked|unknown, evidence, vm_name} or
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
+        """
+        return _run_console_tool(
+            "hyperv_console_lock_state", vm_name, "read",
+            console.lock_state, _cfg(), vm_name, vm_id=vm_id,
+        )
+
+    @mcp.tool()
+    def hyperv_console_unlock(
+        vm_name: str = "", secret_ref: str = "", vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
+    ) -> dict:
+        """One-attempt console unlock (issue #130). Refuses with not_locked
+        (no input sent) when the console is already unlocked or the state is
+        unknown; otherwise sends one wake press (Escape), types the resolved
+        secret, submits with Enter, and verifies through the lock state AND a
+        frame change. One attempt per call; a still-locked result is
+        unlock_failed with no retry (repeated wrong attempts lock the guest
+        account out). Policy: console_input category.
+
+        vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            secret_ref: env:NAME or allowlisted file:PATH resolved host-side; required
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
+        Returns: {ok, state: unlocked, attempts: 1, evidence, vm_name} or
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
+        """
+        return _run_console_tool(
+            "hyperv_console_unlock", vm_name, "console_input",
+            console.unlock, _cfg(), vm_name, vm_id=vm_id,
+            secret_ref=secret_ref,
         )
 
     @mcp.tool()
@@ -3012,6 +3077,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_name: str = "", selector: dict | None = None, value: str = "",
             element_id: str = "", lease_id: str = "", fencing_token: int = 0,
             username: str = "", password: str = "", vm_id: str = "",
+            secret_ref: str = "",
         ) -> dict:
             """Set a UIA Value-pattern property. The value rides the framed
             stdin payload (never script text, never argv, never error text)
@@ -3024,6 +3090,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 selector: UIA selector — address the target by exactly one
                     of selector= or element_id=
                 value: the text to set (<= 64 KiB)
+                secret_ref: env:NAME or allowlisted file:PATH resolved host-side; the resolved value is set, only the length is reported (mutually exclusive with value)
                 element_id: a RuntimeId from a previous find/inspect
                 lease_id: optional lease citation (issue #23) — the lease
                     gate runs before the body
@@ -3044,7 +3111,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 ref_arg=True,
                 selector=selector, value=value,
-                element_id=element_id or None, vm_id=vm_id)
+                element_id=element_id or None, vm_id=vm_id,
+                secret_ref=secret_ref)
 
         @mcp.tool()
         def hyperv_ui_wait_for(
@@ -3371,6 +3439,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_name: str = "", selector: dict | None = None, value: str = "",
             element_id: str = "", lease_id: str = "", fencing_token: int = 0,
             vm_id: str = "",
+            secret_ref: str = "",
         ) -> dict:
             """Set a UIA Value-pattern property. The value rides the framed
             stdin payload (never script text, never argv, never error text)
@@ -3383,6 +3452,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 selector: UIA selector — address the target by exactly one
                     of selector= or element_id=
                 value: the text to set (<= 64 KiB)
+                secret_ref: env:NAME or allowlisted file:PATH resolved host-side; the resolved value is set, only the length is reported (mutually exclusive with value)
                 element_id: a RuntimeId from a previous find/inspect
                 lease_id: optional lease citation (issue #23) — the lease
                     gate runs before the body
@@ -3399,7 +3469,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
                 ref_arg=True,
                 selector=selector, value=value,
-                element_id=element_id or None, vm_id=vm_id)
+                element_id=element_id or None, vm_id=vm_id,
+                secret_ref=secret_ref)
 
         @mcp.tool()
         def hyperv_ui_wait_for(  # type: ignore[misc]  # dual registration — see _register_tools
@@ -4434,6 +4505,7 @@ TOOL_SCOPES: dict[str, str] = {
     "hyperv_console_mouse_move": "console", "hyperv_console_click": "console",
     "hyperv_console_button": "console", "hyperv_console_scroll": "console",
     "hyperv_console_sequence": "console",
+    "hyperv_console_unlock": "console",
     "hyperv_ui_invoke": "console",
     "hyperv_ui_set_value": "console",
     "hyperv_ui_focus": "console",

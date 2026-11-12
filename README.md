@@ -184,7 +184,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.17.0 today) instead of
+  package's version (0.18.0 today) instead of
   the SDK's (the release contract, the complete bump-site
   enumeration, and how to read `version`/`git_revision` live in
   [docs/versioning-policy.md](docs/versioning-policy.md)).
@@ -233,6 +233,38 @@ restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.18.0 changes
+
+- **Named-secret typing (#130):** `hyperv_console_type_text` and
+  `hyperv_ui_set_value` accept `secret_ref` (`env:NAME` or an allowlisted
+  `file:PATH`, resolved host-side through the `host_read_roots` policy).
+  The resolved value is typed or set; only its length is reported — the
+  value never appears in a response, a script, argv, or an error record.
+  `secret_ref` and literal text/value are mutually exclusive. Typing
+  literal text without `secret_ref` behaves exactly as before.
+- **Console lock state and one-attempt unlock (#130):** new tools
+  `hyperv_console_lock_state` (reports `locked`/`unlocked`/`unknown` from
+  the guest's process table — a running `LogonUI.exe` is the lock evidence,
+  replacing the retired screenshot-byte-size guess) and
+  `hyperv_console_unlock` (refuses with `not_locked` when the console is
+  already unlocked or the state is unknown — no input is sent; otherwise
+  one wake press, the secret typed once, submit, and verification through
+  lock state AND a frame change; a still-locked result is `unlock_failed`
+  with no retry, because repeated wrong attempts lock the guest account
+  out).
+- **The drift-inventory gate is self-reference-safe (#143):**
+  `scripts/gen_trace_drift_inventory.py` no longer counts the inventory
+  document's own pinned pairs in its `--check` verdict (the quine that
+  made the gate unreachable at its own fresh output and forced the
+  regenerate -> re-AMEND -> regenerate ritual and a disclosed
+  `--no-verify` pre-push bypass). Those pairs are reported in a labelled
+  "Self-referential pairs" section, verified against the COMMITTED blob at
+  HEAD (regeneration-stable). `--check` now also fails when a sibling
+  trace genuinely drifts even when the docs copy already matches the
+  regeneration — an up-to-date record of a real drift is still a failure.
+  The tool inventory is 82 tools (80 through PR #112, plus the two new
+  console tools).
 
 ## 0.17.0 changes
 
@@ -2180,7 +2212,9 @@ selectors fail with `ambiguous_selector` and up to 20 candidates.
 |------|-----------|---------|
 | `hyperv_console_screenshot` | `vm_name` or `vm_id`, `width=1024`, `height=0` (0.16.0: derive the head's aspect for the width — requires a readable display head and refuses without one, so on a host whose head never reports pass an explicit height, e.g. 768, to restore the pre-0.16.0 fallback-chain behavior; the derived height clamps to the 160..4096 window, so a very small width is NOT captured at the head's aspect; an explicit 160..4096 height is also accepted), `save_path?`, `format?` (png\|jpeg/jpg\|webp), `quality?` (1..100), `scale?` (0,1], `crop?` ([left,top,right,bottom]), `if_changed_from?` (frame_hash) | MCP ImageContent + metadata text (`vm_id`, `frame_hash`, `head_resolution`, `content_rect` (issue #125: [left, top, right, bottom] of the non-letterbox pixels, right/bottom exclusive, from the RAW pre-shaping dimensions against the head at capture; key absent when the head is unknown), `scale_note`, `fallback_used`, `used_fallback`, `capture_method`, `captured_at`, `timings`, `width`, `height`, `vm_name`, `prefix_hex`, plus `format`/`quality`/`scale`/`crop`/`saved_format` only when those options were supplied) — metadata alone when `if_changed_from` matches. `used_fallback` (issue #83, PowerShell transport) is true exactly when the response's `USED=` line was absent or malformed, i.e. the reported dimensions are the REQUESTED size by assumption rather than the chain's own report; false when `USED=` was present and parseable (`fallback_used` remains the separate human-readable note about which chain size actually captured) |
 | `hyperv_console_get_display_info` | `vm_name` or `vm_id` | `{ok, enabled_state, head_horizontal, head_vertical, keyboard_present, keyboard_enabled, mouse_present, mouse_enabled, mouse_ps2_present, boot_epoch, guest_channel, guest_channel_note, vm_id}` — `mouse_present` reports the SYNTHETIC mouse only (absolute positioning); `mouse_ps2_present` (issue #83) additionally reports the PS/2 mouse the non-positional input ops (button, scroll, click-at-current-position) fall back to, so a PS/2-only VM no longer reads as "nothing can act on the console" — the field is always present, false meaning no PS/2 mouse was reported, and it is measured per transport: the in-process WMI transport probes it via a `SystemName`-scoped `Msvm_Ps2Mouse` query, the PowerShell transport via the folded script's own PS/2 query. NOTE: `guest_channel` is per-tool vocabulary; this tool still reports the constant `ps_direct_unverified` (Workstream D owns its rework), while `hyperv_wait_vm_state` derives `os_heartbeat_ok`/`no_guest_signal` from the Heartbeat service and `hyperv_deployment_status` reports the richer seven-phase `phase` vocabulary (`off`/`suspended`/`heartbeat_disabled`/`no_guest_signal`/`os_ready`/`os_unresponsive`/`degraded`) instead |
-| `hyperv_console_type_text` | `vm_name` or `vm_id`, `text` (ASCII) | `{ok, chunks, chars}` |
+| `hyperv_console_type_text` | `vm_name` or `vm_id`, `text` (ASCII), `secret_ref?` (0.18.0: `env:NAME` or an allowlisted `file:PATH` resolved host-side through `host_read_roots`; mutually exclusive with `text`; the resolved value is typed, only its length is reported) | `{ok, chunks, chars}` (+ `secret_typed` when `secret_ref` was given) |
+| `hyperv_console_lock_state` | `vm_name` or `vm_id` | `{ok, state: locked\|unlocked\|unknown, evidence, vm_name}` — locked = `LogonUI.exe` running in the guest's session (process-table check via PowerShell Direct; needs guest credentials and a running supported guest OS); `unknown` names why the leg failed |
+| `hyperv_console_unlock` | `vm_name` or `vm_id`, `secret_ref` (required) | `{ok, state: unlocked, attempts: 1, evidence, vm_name}` or the `not_locked` refusal (console already unlocked or state unknown — no input sent) or `unlock_failed` after ONE attempt (no retry) |
 | `hyperv_console_press_key` | `vm_name` or `vm_id`, `key`, `modifiers[]` (ctrl/alt/shift incl. right- variants, win/leftwin/rightwin — held while key taps) — keys: enter, escape (esc), tab, backspace, space, capslock, up/down/left/right, delete, home, end, pageup, pagedown, insert, f1-f12, a-z, 0-9, punctuation (minus/equals/leftbracket/rightbracket/semicolon/apostrophe/grave/backslash/comma/period/slash, single-char aliases `-` `=` `[` `]` `\` `;` `'` `` ` `` `,` `.` `/`), numpad (num0-num9, numdecimal, nummultiply, numsubtract, numadd, numlock, numdivide, numenter), win (alias leftwin), rightwin, menu (alias apps); modifier-named keys are also valid bare presses | `{ok, scancodes_sent, chunks}` |
 | `hyperv_console_key_combo` | `vm_name` or `vm_id`, `keys[]` — modifiers ctrl/alt/shift (incl. right- variants) and win/leftwin/rightwin; every other key name taps in order, e.g. `["win","r"]` | `{ok, scancodes_sent, chunks}` |
 | `hyperv_console_type_scancodes` | `vm_name` or `vm_id`, `scancodes[]` (0..255) | `{ok, scancodes_sent, chunks}` |

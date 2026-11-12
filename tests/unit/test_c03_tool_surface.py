@@ -28,8 +28,9 @@ GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
 
 # The live tool inventory (57 at authoring time; issue #35 added
 # hyperv_server_info on top of the issue text's stale count of 54, issue
-# #29 brought the surface to 76 with the eight hyperv_ui_* tools, and PR
-# #112 brought it to 80 with the four Workstream G tools).
+# #29 brought the surface to 76 with the eight hyperv_ui_* tools, PR
+# #112 brought it to 80 with the four Workstream G tools, and issue #130
+# brought it to 82 with hyperv_console_lock_state + hyperv_console_unlock).
 TOOL_NAMES = {
     "hyperv_list_vms",
     "hyperv_get_vm_info",
@@ -53,6 +54,8 @@ TOOL_NAMES = {
     "hyperv_console_screenshot",
     "hyperv_console_get_display_info",
     "hyperv_console_type_text",
+    "hyperv_console_lock_state",
+    "hyperv_console_unlock",
     "hyperv_console_press_key",
     "hyperv_console_key_combo",
     "hyperv_console_type_scancodes",
@@ -253,11 +256,13 @@ def test_ac12_tool_inventory_per_credential_mode(tmp_path, fresh_server):
         f"extra={sorted(set(base_schemas) - TOOL_NAMES)}, "
         f"missing={sorted(TOOL_NAMES - set(base_schemas))}"
     )
-    assert len(base_schemas) == len(TOOL_NAMES) == 80, (
-        f"AC12: tool count {len(base_schemas)} != 80 "
+    assert len(base_schemas) == len(TOOL_NAMES) == 82, (
+        f"AC12: tool count {len(base_schemas)} != 82 "
         f"(66 through issue #24; 67 with issue #27's settle wait; "
         f"76 with issue #29's eight hyperv_ui_* tools; 80 with PR #112's "
-        f"four Workstream G tools (was: 68 with issue #28's hyperv_console_sequence; "
+        f"four Workstream G tools; 82 with issue #130's "
+        f"hyperv_console_lock_state + hyperv_console_unlock "
+        f"(was: 68 with issue #28's hyperv_console_sequence; "
         f"eight hyperv_ui_* tools)"
     )
     doc = {"allow_inline_credentials": True}

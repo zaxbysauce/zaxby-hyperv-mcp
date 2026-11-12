@@ -2803,8 +2803,15 @@ def get_display_info(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
     return {"ok": True, **data, "vm_name": ref.name}
 
 
-def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -> dict:
+def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "",
+              secret_ref: str = "") -> dict:
     policy.require_category(cfg, "console_input", f"type text into '{vm_name}' console")
+    if secret_ref and text:
+        raise ValueError(
+            "secret_ref and text are mutually exclusive; pass exactly one"
+        )
+    if secret_ref:
+        text = _resolve_secret(cfg, secret_ref)
     if not text:
         raise ValueError("text is required")
     if any(ord(c) > 127 for c in text):
@@ -2843,6 +2850,7 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
                     time.sleep(0.05)
         return {
             "ok": True, "chunks": calls, "chars": len(text), "vm_name": ref.name,
+            **({"secret_typed": True} if secret_ref else {}),
             "timings": _wmi_timings(connect_ms, *phase_dicts),
         }
     timing = _PsTiming()
@@ -2928,7 +2936,124 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "") -
             delivered_chunks += len(group)
     return {
         "ok": True, "chunks": len(chunks), "chars": len(text), "vm_name": ref.name,
+        **({"secret_typed": True} if secret_ref else {}),
         "timings": _ps_timings(timing),
+    }
+
+
+def _resolve_secret(cfg: Config, secret_ref: str) -> str:
+    """Resolve a ``secret_ref`` host-side through the read policy (issue #130).
+
+    The resolved value is typed but never returned, logged, or echoed:
+    ``credentials.resolve_secret_ref`` enforces the env:/file: shape, the
+    ``env:`` leg reads the process environment, and the ``file:`` leg goes
+    through ``policy.check_host_read`` (host_read_roots) — an arbitrary host
+    file typed into the guest is an exfiltration channel, so the guard is
+    mandatory.
+    """
+    from pathlib import Path
+
+    from . import credentials
+
+    def _guard(path: str) -> str:
+        policy.check_host_read(cfg, path)
+        return Path(path).read_text(encoding="utf-8")
+
+    return credentials.resolve_secret_ref(secret_ref, guard=_guard)
+
+
+def lock_state(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
+    """Report the console lock state from the guest's process table
+    (issue #130): ``locked`` when LogonUI.exe is running in the guest's
+    session, ``unlocked`` when the process is absent, ``unknown`` when the
+    process-table leg fails (unsupported guest OS, credentials, transport).
+    Evidence names what the verdict came from. Replaces the retired
+    screenshot-byte-size guess (#130 Why: a compressed file size is
+    content-confounded evidence)."""
+    policy.require_category(cfg, "read", f"check the lock state of '{vm_name}'")
+    from .credentials import CredentialError, resolve_guest
+
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    script = (
+        "$p = Get-Process -Name LogonUI -ErrorAction SilentlyContinue | "
+        "Select-Object -First 1; "
+        "if ($null -ne $p) { 'LOCKED' } else { 'UNLOCKED' }"
+    )
+    try:
+        cred = resolve_guest(vm_name=ref.name)
+        result = guestexec.guest_run_ps(cfg, vm_name=ref.name, script=script,
+                                        cred=cred, timeout_ms=20000)
+    except CredentialError as exc:
+        return {
+            "ok": True, "state": "unknown", "vm_name": ref.name,
+            "evidence": f"process-table leg unavailable: {exc}",
+        }
+    if not result.get("ok"):
+        return {
+            "ok": True, "state": "unknown", "vm_name": ref.name,
+            "evidence": (
+                "process-table leg failed: "
+                + str(result.get("error") or result.get("stderr") or "unknown error")[:200]
+            ),
+        }
+    stdout = str(result.get("stdout") or "").strip()
+    if "LOCKED" in stdout:
+        state, evidence = "locked", "LogonUI.exe present in the guest session"
+    elif "UNLOCKED" in stdout:
+        state, evidence = "unlocked", "LogonUI.exe absent from the guest session"
+    else:
+        state, evidence = "unknown", f"unrecognized process-table output: {stdout[:120]!r}"
+    return {"ok": True, "state": state, "evidence": evidence, "vm_name": ref.name}
+
+
+def unlock(cfg: Config, vm_name: str = "", secret_ref: str = "",
+           vm_id: str = "") -> dict:
+    """One-attempt console unlock (issue #130).
+
+    Refuses with ``not_locked`` (no input sent) when the console is already
+    unlocked or the state is unknown; otherwise sends exactly one wake
+    press (Escape), types the resolved secret, submits with Enter, and
+    verifies through the lock state AND a frame change — the desktop must
+    visibly change. One attempt per call; a still-locked result is
+    ``unlock_failed`` with no retry.
+    """
+    policy.require_category(cfg, "console_input", f"unlock '{vm_name}' console")
+    if not secret_ref:
+        raise ValueError("secret_ref is required to type the logon secret")
+    # Resolve ONCE, before any input: a fail-closed secret leg and the typed
+    # value must be the same read (a second read could diverge mid-call).
+    value = _resolve_secret(cfg, secret_ref)
+    state = lock_state(cfg, vm_name=vm_name, vm_id=vm_id)
+    if state.get("state") != "locked":
+        raise ConsoleError(
+            f"not_locked: the console is {state.get('state')!r} "
+            f"({state.get('evidence')}) — refusing to send logon input"
+        )
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    _before_frame, before_meta = screenshot(cfg, vm_name=ref.name)
+    before_hash = str(before_meta.get("frame_hash") or "")
+    press_key(cfg, vm_name=ref.name, key="escape")
+    type_text(cfg, vm_name=ref.name, text=value)
+    press_key(cfg, vm_name=ref.name, key="enter")
+    time.sleep(2.0)
+    _after_frame, after_meta = screenshot(cfg, vm_name=ref.name)
+    after_hash = str(after_meta.get("frame_hash") or "")
+    final = lock_state(cfg, vm_name=ref.name)
+    final_state = str(final.get("state") or "unknown")
+    frame_changed = bool(before_hash and after_hash and before_hash != after_hash)
+    if final_state != "unlocked" or not frame_changed:
+        raise ConsoleError(
+            "unlock_failed: one attempt was made and the console is "
+            f"{final_state!r} with frame_changed={frame_changed} — no retry "
+            "is sent (repeated wrong attempts lock the guest account out)"
+        )
+    return {
+        "ok": True, "state": "unlocked", "vm_name": ref.name,
+        "attempts": 1,
+        "evidence": (
+            f"LogonUI.exe absent after submit; frame changed "
+            f"{before_hash[:12]}… -> {after_hash[:12]}…"
+        ),
     }
 
 

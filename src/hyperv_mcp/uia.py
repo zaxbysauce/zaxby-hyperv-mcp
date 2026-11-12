@@ -1438,12 +1438,15 @@ def invoke(cfg, vm_name="", cred: CredentialSet | None = None,
 def set_value(cfg, vm_name="", cred: CredentialSet | None = None,
               selector: Any = None, value: Any = None, *,
               element_id: Any = None, vm_id: str = "",
+              secret_ref: str = "",
               shared_vm: bool = False):
     """Set a UIA Value-pattern property (mutating; ui_input).
 
     The value rides the framed stdin payload — never script text, never
     argv, never error text — and the result reports the length set, never
-    the value.
+    the value. With ``secret_ref`` (issue #130) the value is resolved
+    host-side through the env:/file: contract and the host read policy;
+    ``secret_ref`` and ``value`` are mutually exclusive.
     """
     policy.require_category(cfg, "ui_input", f"set value on '{vm_name}'")
     if cred is None:
@@ -1451,6 +1454,18 @@ def set_value(cfg, vm_name="", cred: CredentialSet | None = None,
 
         raise CredentialError("guest credentials are required for UI verbs")
     _check_element_op(selector, element_id)
+    if secret_ref and value is not None:
+        raise ValueError("secret_ref and value are mutually exclusive")
+    if secret_ref:
+        from pathlib import Path
+
+        def _guard(path: str) -> str:
+            policy.check_host_read(cfg, path)
+            return Path(path).read_text(encoding="utf-8")
+
+        from . import credentials as _credentials
+
+        value = _credentials.resolve_secret_ref(secret_ref, guard=_guard)
     if value is None:
         raise ValueError("set_value requires value=")
     if isinstance(value, str) and len(value.encode("utf-8")) > _MAX_VALUE_BYTES:

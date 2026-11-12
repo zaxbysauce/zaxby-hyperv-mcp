@@ -320,6 +320,7 @@ def test_tool_scopes_map_is_pinned():
         # transfer
         "hyperv_guest_put": "transfer", "hyperv_guest_get": "transfer",
         # console
+        "hyperv_console_unlock": "console",
         "hyperv_console_type_text": "console", "hyperv_console_press_key": "console",
         "hyperv_console_key_combo": "console",
         "hyperv_console_type_scancodes": "console",

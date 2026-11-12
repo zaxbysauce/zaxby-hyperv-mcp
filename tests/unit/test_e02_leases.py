@@ -89,6 +89,7 @@ LEASED_TOOLS = [
     "hyperv_guest_get",
     # console (8)
     "hyperv_console_type_text",
+    "hyperv_console_unlock",
     "hyperv_console_press_key",
     "hyperv_console_key_combo",
     "hyperv_console_type_scancodes",

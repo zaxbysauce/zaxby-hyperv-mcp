@@ -134,10 +134,11 @@ def test_clone_and_remove_tools_registered_with_confirm(fresh_server):
     schemas = _schemas(mod)
     missing = [t for t in ("hyperv_vm_clone", "hyperv_vm_remove") if t not in schemas]
     assert missing == [], f"unregistered tools: {missing}"
-    assert len(schemas) == 80, (
-        f"tool inventory is {len(schemas)} tools; expected 80 "
+    assert len(schemas) == 82, (
+        f"tool inventory is {len(schemas)} tools; expected 82 "
         "(76 plus hyperv_vm_clone, hyperv_vm_remove, hyperv_deployment_status, "
-        "hyperv_harvest_offline_logs)"
+        "hyperv_harvest_offline_logs, plus issue #130's hyperv_console_lock_state "
+        "and hyperv_console_unlock)"
     )
     clone_props = schemas["hyperv_vm_clone"].get("properties", {})
     remove_props = schemas["hyperv_vm_remove"].get("properties", {})
