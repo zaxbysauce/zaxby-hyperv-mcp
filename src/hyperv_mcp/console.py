@@ -97,7 +97,7 @@ import secrets
 import threading
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from typing import Any
 
@@ -130,6 +130,13 @@ _WMI_NS = "root\\virtualization\\v2"
 # trusted for action: only the in-script compare against the live $vmTarget
 # decides identity.
 # ---------------------------------------------------------------------------
+
+#: unlock verification poll bounds (PR-144 review BASE-03): a slow logon
+#: keeps LogonUI up through Welcome long after the password was accepted,
+#: so the post-submit check polls the lock state up to this deadline
+#: instead of taking one fixed-sleep sample.
+_UNLOCK_VERIFY_DEADLINE_S = 15.0
+_UNLOCK_VERIFY_INTERVAL_S = 1.5
 
 _HINT_CAP = 512
 _NAME_GUID_HINTS: dict[str, str] = {}
@@ -2804,7 +2811,7 @@ def get_display_info(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
 
 
 def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "",
-              secret_ref: str = "") -> dict:
+              secret_ref: str = "", assume_lock: bool = False) -> dict:
     policy.require_category(cfg, "console_input", f"type text into '{vm_name}' console")
     if secret_ref and text:
         raise ValueError(
@@ -2829,7 +2836,7 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "",
         calls = 0
         chars = 0
         phase_dicts: list[dict] = []
-        with _input_lock(ref):
+        with (nullcontext() if assume_lock else _input_lock(ref)):
             for i, chunk in enumerate(chunks):
                 try:
                     _bump_input(ref)
@@ -2889,7 +2896,7 @@ def type_text(cfg: Config, vm_name: str = "", text: str = "", vm_id: str = "",
         "    Write-Output ('RC=' + $r.ReturnValue + ' CHUNK=' + ($i+1) + '/' + $n)\n"
         "    if ($i -lt $n - 1) { Start-Sleep -Milliseconds 50 }\n"
     )
-    with _input_lock(ref):
+    with (nullcontext() if assume_lock else _input_lock(ref)):
         delivered_chunks = 0
         for gi, group in enumerate(groups):
             if gi:
@@ -3003,10 +3010,21 @@ def lock_state(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
     from .credentials import CredentialError, resolve_guest
 
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    # Console-SESSION scoping (PR-144 review SEC-01): Get-Process is
+    # machine-wide, so a LogonUI left in a disconnected RDP/logon session
+    # would read as locked while the console is unlocked — and unlock would
+    # then type the secret into the unlocked desktop's foreground window.
+    # Scope to the active console session: the session that owns the
+    # interactive explorer; a guest without explorer cannot be unlocked
+    # anyway, so answer unknown rather than machine-wide.
     script = (
-        "$p = Get-Process -Name LogonUI -ErrorAction SilentlyContinue | "
+        "$expl = Get-Process -Name explorer -ErrorAction SilentlyContinue | "
         "Select-Object -First 1; "
-        "if ($null -ne $p) { 'LOCKED' } else { 'UNLOCKED' }"
+        "if ($null -eq $expl) { 'UNKNOWN' } else { "
+        "$p = Get-Process -Name LogonUI -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.SessionId -eq $expl.SessionId } | "
+        "Select-Object -First 1; "
+        "if ($null -ne $p) { 'LOCKED' } else { 'UNLOCKED' } }"
     )
     try:
         cred = resolve_guest(vm_name=ref.name)
@@ -3033,7 +3051,14 @@ def lock_state(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
     if token == "LOCKED":
         state, evidence = "locked", "LogonUI.exe present in the guest session"
     elif token == "UNLOCKED":
-        state, evidence = "unlocked", "LogonUI.exe absent from the guest session"
+        state, evidence = "unlocked", (
+            "LogonUI.exe absent from the active console session"
+        )
+    elif token == "UNKNOWN":
+        state, evidence = "unknown", (
+            "no explorer process found — the active console session could "
+            "not be determined, so the lock verdict is not machine-readable"
+        )
     else:
         state, evidence = "unknown", f"unrecognized process-table output: {stdout[:120]!r}"
     return {"ok": True, "state": state, "evidence": evidence, "vm_name": ref.name}
@@ -3068,14 +3093,30 @@ def unlock(cfg: Config, vm_name: str = "", secret_ref: str = "",
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     _before_frame, before_meta = screenshot(cfg, vm_name=ref.name)
     before_hash = str(before_meta.get("frame_hash") or "")
-    press_key(cfg, vm_name=ref.name, key="escape")
-    type_text(cfg, vm_name=ref.name, text=value)
-    press_key(cfg, vm_name=ref.name, key="enter")
-    time.sleep(2.0)
-    _after_frame, after_meta = screenshot(cfg, vm_name=ref.name)
-    after_hash = str(after_meta.get("frame_hash") or "")
-    final = lock_state(cfg, vm_name=ref.name)
-    final_state = str(final.get("state") or "unknown")
+    # The wake/type/submit plan is ONE atomic console-input plan: a single
+    # _input_lock acquisition spans all three legs (assume_lock=True lets
+    # the callees skip their own acquisition — vmlocks are NOT reentrant),
+    # so a concurrent console op cannot interleave keystrokes into the
+    # typed secret (PR-144 review CONC-01/BASE-01).
+    with _input_lock(ref):
+        press_key(cfg, vm_name=ref.name, key="escape", assume_lock=True)
+        type_text(cfg, vm_name=ref.name, text=value, assume_lock=True)
+        press_key(cfg, vm_name=ref.name, key="enter", assume_lock=True)
+    # Verification polls up to _UNLOCK_VERIFY_DEADLINE_S (a slow logon keeps
+    # LogonUI up through Welcome long after the password was accepted), and
+    # succeeds at the FIRST unlocked sample with a changed frame — a fixed
+    # single sample reported false unlock_failed (PR-144 review BASE-03).
+    deadline = time.monotonic() + _UNLOCK_VERIFY_DEADLINE_S
+    final_state = "locked"
+    after_hash = before_hash
+    while time.monotonic() < deadline:
+        time.sleep(_UNLOCK_VERIFY_INTERVAL_S)
+        _after_frame, after_meta = screenshot(cfg, vm_name=ref.name)
+        after_hash = str(after_meta.get("frame_hash") or "")
+        final = lock_state(cfg, vm_name=ref.name)
+        final_state = str(final.get("state") or "unknown")
+        if final_state == "unlocked":
+            break
     frame_changed = bool(before_hash and after_hash and before_hash != after_hash)
     if final_state != "unlocked" or not frame_changed:
         raise ConsoleError(
@@ -3344,6 +3385,7 @@ def _commit_guard_check_wmi(
 
 def press_key(
     cfg: Config, vm_name: str = "", key: str = "", modifiers: list[str] | None = None, vm_id: str = "",
+    assume_lock: bool = False,
 ) -> dict:
     policy.require_category(cfg, "console_input", f"press {key} on '{vm_name}' console")
     # A bare key press has no modifiers to hold, so it encodes through the
@@ -3361,7 +3403,8 @@ def press_key(
         codes = _combo_codes(held, tapped)
     be, connect_ms, ref = _select_backend_and_ref(cfg, vm_name, vm_id)
     if be is not None and ref is not None:
-        return _send_scancodes_locked(cfg, ref, codes, be=be, connect_ms=connect_ms)
+        return _send_scancodes_locked(cfg, ref, codes, be=be, connect_ms=connect_ms,
+                                      assume_lock=assume_lock)
     timing = _PsTiming()
     prelude, ref = _vm_prelude(cfg, vm_name, vm_id, timing, guarded=True)
     return _send_scancodes_locked(cfg, ref, codes, timing=timing, prelude=prelude)
@@ -3404,12 +3447,17 @@ def _send_scancodes_locked(
     connect_ms: float = 0.0,
     timing: _PsTiming | None = None,
     prelude: str | None = None,
+    assume_lock: bool = False,
 ) -> dict:
     chunks = [codes[i:i + 64] for i in range(0, len(codes), 64)]
     if be is not None:
         sent = 0
         phase_dicts: list[dict] = []
-        with _input_lock(ref):
+        # assume_lock=True: the caller (hyperv_console_unlock) already holds
+        # the console input lock so its whole wake/type/submit plan is
+        # atomic; vmlocks are NOT reentrant (probe-proven), so the callee
+        # must not re-acquire (PR-144 review CONC-01).
+        with (nullcontext() if assume_lock else _input_lock(ref)):
             for i, chunk in enumerate(chunks):
                 try:
                     _bump_input(ref)
@@ -3433,7 +3481,7 @@ def _send_scancodes_locked(
             "vm_name": ref.name, "timings": _wmi_timings(connect_ms, *phase_dicts),
         }
     assert prelude is not None, "the PowerShell path requires the $vmTarget prelude"
-    with _input_lock(ref):
+    with (nullcontext() if assume_lock else _input_lock(ref)):
         # Issue #81: the seed line grows ~4 script chars per code (~10.7 argv
         # chars after base64), so one folded process cannot carry an unbounded
         # array — the composed command line passes the 32766-character spawn

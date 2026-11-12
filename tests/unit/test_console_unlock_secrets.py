@@ -411,3 +411,187 @@ def test_secret_env_names_loads_from_a_config_file():
 
     cfg = Config.from_dict({"secret_env_names": ["APP_TEST_*"]})
     assert cfg.secret_env_names == ["APP_TEST_*"]
+
+
+def test_unlock_plan_is_one_atomic_lock_acquisition(monkeypatch, unrestricted_cfg):
+    """CONC-01/BASE-01 kill pin: the whole wake/type/submit plan runs under
+    ONE console-input-lock acquisition (the callees run with assume_lock),
+    so a concurrent console op can never interleave keystrokes into the
+    typed secret. A counting wrapper around console._input_lock asserts the
+    acquisition count for the three-leg plan is exactly 1."""
+    import itertools
+
+    monkeypatch.setenv("APP_TEST_SECRET", "pw")
+    unrestricted_cfg.secret_env_names = ["APP_TEST_*"]
+    acquisitions = itertools.count()
+    real_lock = console._input_lock
+
+    def counting_lock(ref):
+        acquisitions.__next__()
+        return real_lock(ref)
+
+    monkeypatch.setattr(console.vmident, "resolve",
+                        lambda cfg, vm_name="", vm_id="": type(
+                            "R", (), {"name": "vm1", "id": "guid"})())
+    monkeypatch.setattr(console, "_input_lock", counting_lock)
+    submitted = {"n": 0}
+
+    def fake_press(cfg, vm_name="", key="", **k):
+        if key == "enter":
+            submitted["n"] += 1
+
+    monkeypatch.setattr(console, "lock_state", lambda cfg, vm_name="", vm_id="": {
+        "ok": True,
+        "state": "unlocked" if submitted["n"] else "locked",
+        "evidence": "LogonUI.exe present"})
+    monkeypatch.setattr(console, "screenshot",
+                        lambda cfg, vm_name="", **k: (
+                            None, {"frame_hash": "before" if not submitted["n"] else "after"}))
+    monkeypatch.setattr(console, "press_key", fake_press)
+    monkeypatch.setattr(console, "type_text",
+                        lambda cfg, vm_name="", text="", **k: {"ok": True})
+    out = console.unlock(unrestricted_cfg, "vm1", secret_ref="env:APP_TEST_SECRET")
+    assert out["ok"] is True
+    # exactly ONE acquisition for the plan scope (lock_state/screenshot run
+    # outside the input lock and are stubbed here): the counter issued one
+    # number, so the next unused value is 1.
+    assert next(acquisitions) == 1
+
+
+def test_lock_state_is_console_session_scoped(monkeypatch, unrestricted_cfg):
+    """SEC-01 kill pin: the guest script scopes LogonUI to the explorer
+    session (the active console), never machine-wide — a LogonUI left in a
+    disconnected RDP session must not read as locked."""
+    monkeypatch.setenv("HYPERV_GUEST_USERNAME", "tester")
+    monkeypatch.setenv("HYPERV_GUEST_PASSWORD", "not-a-real-password")
+    monkeypatch.setattr(console.vmident, "resolve",
+                        lambda cfg, vm_name="", vm_id="": type(
+                            "R", (), {"name": "vm1", "id": "guid"})())
+    captured: dict[str, str] = {}
+
+    def fake_guest_run_ps(cfg, vm_name="", script="", **k):
+        captured["script"] = script
+        return {"ok": True, "exit_code": 0, "stdout": "UNLOCKED\n", "stderr": ""}
+
+    monkeypatch.setattr(guestexec, "guest_run_ps", fake_guest_run_ps)
+    out = console.lock_state(unrestricted_cfg, "vm1")
+    assert out["state"] == "unlocked"
+    assert "explorer" in captured["script"]
+    assert "SessionId -eq $expl.SessionId" in captured["script"]
+
+
+def test_unlock_verifies_with_a_bounded_poll(monkeypatch, unrestricted_cfg):
+    """BASE-03 kill pin: the post-submit verification polls the lock state
+    (up to the deadline) instead of one fixed-sleep sample, so a slow logon
+    that unlocks at the first poll tick still succeeds."""
+    samples = {"n": 0}
+    monkeypatch.setenv("APP_TEST_SECRET", "pw")
+    unrestricted_cfg.secret_env_names = ["APP_TEST_*"]
+
+    monkeypatch.setattr(console, "lock_state", lambda cfg, vm_name="", vm_id="": {
+        "ok": True,
+        "state": "unlocked" if samples["n"] >= 1 else "locked",
+        "evidence": "polled"})
+
+    def fake_press(cfg, vm_name="", key="", **k):
+        if key == "enter":
+            samples["n"] += 1  # the guest unlocks after the first poll tick
+
+    monkeypatch.setattr(console.vmident, "resolve",
+                        lambda cfg, vm_name="", vm_id="": type(
+                            "R", (), {"name": "vm1", "id": "guid"})())
+    monkeypatch.setattr(console, "type_text", lambda cfg, vm_name="", text="", **k: None)
+    monkeypatch.setattr(console, "press_key", fake_press)
+    monkeypatch.setattr(console, "screenshot",
+                        lambda cfg, vm_name="", **k: (
+                            None, {"frame_hash": "before" if samples["n"] == 0 else "after"}))
+    ticks = iter(range(100))
+
+    import types as _types
+
+    class FakeClock:
+        def __init__(self):
+            self.t = 0.0
+
+        def monotonic(self):
+            return self.t
+
+        def sleep(self, s):
+            self.t += s
+            next(ticks, None)
+
+    clock = FakeClock()
+    monkeypatch.setattr(console, "time", _types.SimpleNamespace(
+        monotonic=clock.monotonic, sleep=clock.sleep))
+    out = console.unlock(unrestricted_cfg, "vm1", secret_ref="env:APP_TEST_SECRET")
+    assert out["ok"] is True and out["state"] == "unlocked"
+    assert clock.t > 0  # at least one poll tick elapsed (a poll, not a sample)
+
+
+def test_positive_file_secret_typed(tmp_path, monkeypatch, unrestricted_cfg):
+    """BASE-04 kill pin: the positive file: leg — an allowlisted secret
+    file resolves and is typed verbatim (single line, BOM-free)."""
+    secret_file = tmp_path / "pw.txt"
+    secret_file.write_bytes(b"file-pw-123\n")
+    unrestricted_cfg.host_read_roots = [str(tmp_path)]
+    fake = FakePS()
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = console.type_text(unrestricted_cfg, "vm1",
+                            secret_ref=f"file:{secret_file}")
+    assert out["ok"] is True and out["chars"] == len("file-pw-123")
+    assert out["secret_typed"] is True
+
+
+def test_type_text_secret_ref_and_text_are_mutually_exclusive(unrestricted_cfg):
+    """BASE-04 kill pin: type_text refuses secret_ref + text together."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        console.type_text(unrestricted_cfg, "vm1", text="x",
+                          secret_ref="env:ANY")
+
+
+def test_unlock_requires_frame_change(monkeypatch, unrestricted_cfg):
+    """BASE-04 kill pin: lock state flipping to unlocked with an UNCHANGED
+    frame still fails (the AND clause is load-bearing — deleting it used to
+    leave the suite green)."""
+    monkeypatch.setenv("APP_TEST_SECRET", "pw")
+    unrestricted_cfg.secret_env_names = ["APP_TEST_*"]
+    submitted = {"n": 0}
+    monkeypatch.setattr(console, "lock_state", lambda cfg, vm_name="", vm_id="": {
+        "ok": True,
+        "state": "unlocked" if submitted["n"] else "locked",
+        "evidence": "flaky same-frame"})
+    monkeypatch.setattr(console.vmident, "resolve",
+                        lambda cfg, vm_name="", vm_id="": type(
+                            "R", (), {"name": "vm1", "id": "guid"})())
+
+    def fake_press(cfg, vm_name="", key="", **k):
+        if key == "enter":
+            submitted["n"] += 1
+
+    monkeypatch.setattr(console, "press_key", fake_press)
+    monkeypatch.setattr(console, "type_text", lambda cfg, vm_name="", text="", **k: None)
+    monkeypatch.setattr(console, "screenshot",
+                        lambda cfg, vm_name="", **k: (None, {"frame_hash": "same"}))
+    with pytest.raises(Exception, match="unlock_failed"):
+        console.unlock(unrestricted_cfg, "vm1", secret_ref="env:APP_TEST_SECRET")
+
+
+def test_agent_and_operations_and_profile_env_names_denied(monkeypatch):
+    """BASE-04 + SEC-03 kill pins: the cfg.http.agents, operations.key_env,
+    and credential-profile password_env legs of the hard-deny set — each
+    used to be deletable with the suite green."""
+    cfg = Config()
+    cfg.destructive.console_input = True
+    cfg.secret_env_names = ["*"]
+    cfg.http.agents = {"agent-a": "AGENT_A_TOKEN"}
+    cfg.operations.key_env = "HMAC_KEY_VAR"
+    profile = type("P", (), {"name": "vm1", "password_env": "VM1_PW_ENV",
+                             "victim_password_env": "VM1_VPW_ENV"})
+    cfg.credential_profiles = (profile,)
+    for var in ("AGENT_A_TOKEN", "HMAC_KEY_VAR", "VM1_PW_ENV", "VM1_VPW_ENV"):
+        monkeypatch.setenv(var, "v")
+        fake = FakePS()
+        monkeypatch.setattr(pswindows, "run_ps", fake)
+        with pytest.raises(CredentialError, match="always refused"):
+            console.type_text(cfg, "vm1", secret_ref=f"env:{var}")
+        assert fake.scripts == []
