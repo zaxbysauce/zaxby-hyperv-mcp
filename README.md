@@ -259,12 +259,16 @@ the task-spawned controller reads it from the environment.
   made the gate unreachable at its own fresh output and forced the
   regenerate -> re-AMEND -> regenerate ritual and a disclosed
   `--no-verify` pre-push bypass). Those pairs are reported in a labelled
-  "Self-referential pairs" section, verified against the COMMITTED blob at
-  HEAD (regeneration-stable). `--check` now also fails when a sibling
-  trace genuinely drifts even when the docs copy already matches the
-  regeneration — an up-to-date record of a real drift is still a failure.
-  The tool inventory is 82 tools (80 through PR #112, plus the two new
-  console tools).
+  "Self-referential pairs" section, whose verdict compares the pair's
+  frozen blob against the WORKING-TREE blob id (`git hash-object` — an
+  identity that moves with neither the regeneration nor the commit of the
+  document). `--check` now also fails when a sibling trace genuinely
+  drifts even when the docs copy already matches the regeneration (an
+  up-to-date record of a real drift is still a failure), and when a
+  `verify-checkpoint` exits nonzero with no CHANGED lines (a broken local
+  setup fails the gate instead of rendering clean). The tool inventory is
+  82 tools (80 through PR #112, plus the two new console tools).
+- Version bump: 0.17.0 -> 0.18.0.
 
 ## 0.17.0 changes
 

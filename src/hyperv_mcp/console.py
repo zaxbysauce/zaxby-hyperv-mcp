@@ -2969,8 +2969,8 @@ def lock_state(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
     process-table leg fails (unsupported guest OS, credentials, transport).
     Evidence names what the verdict came from. Replaces the retired
     screenshot-byte-size guess (#130 Why: a compressed file size is
-    content-confounded evidence)."""
-    policy.require_category(cfg, "read", f"check the lock state of '{vm_name}'")
+    content-confounded evidence). Read-only: no destructive category (like
+    screenshot/get_display_info — the VM allowlist is the gate)."""
     from .credentials import CredentialError, resolve_guest
 
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
@@ -2997,9 +2997,13 @@ def lock_state(cfg: Config, vm_name: str = "", vm_id: str = "") -> dict:
             ),
         }
     stdout = str(result.get("stdout") or "").strip()
-    if "LOCKED" in stdout:
+    # Exact-token match: 'UNLOCKED' CONTAINS 'LOCKED', so substring
+    # containment would report every unlocked guest as locked (reviewer
+    # R2). The script emits exactly one bare token on its last line.
+    token = stdout.splitlines()[-1].strip().upper() if stdout.strip() else ""
+    if token == "LOCKED":
         state, evidence = "locked", "LogonUI.exe present in the guest session"
-    elif "UNLOCKED" in stdout:
+    elif token == "UNLOCKED":
         state, evidence = "unlocked", "LogonUI.exe absent from the guest session"
     else:
         state, evidence = "unknown", f"unrecognized process-table output: {stdout[:120]!r}"

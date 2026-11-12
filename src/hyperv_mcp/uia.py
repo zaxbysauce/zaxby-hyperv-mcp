@@ -1454,7 +1454,9 @@ def set_value(cfg, vm_name="", cred: CredentialSet | None = None,
 
         raise CredentialError("guest credentials are required for UI verbs")
     _check_element_op(selector, element_id)
-    if secret_ref and value is not None:
+    # The registered tool passes value="" by default (reviewer R3): treat
+    # the empty string as absent so secret_ref is usable through the tool.
+    if secret_ref and value:
         raise ValueError("secret_ref and value are mutually exclusive")
     if secret_ref:
         from pathlib import Path

@@ -160,13 +160,91 @@ def test_failed_unlock_does_not_retry(monkeypatch, unrestricted_cfg):
                             "R", (), {"name": "vm1", "id": "guid"})())
     monkeypatch.setattr(console, "press_key",
                         lambda cfg, vm_name="", key="", **k: pressed.append(key))
-    monkeypatch.setattr(console, "type_text",
-                        lambda cfg, vm_name="", text="", secret_ref="", **k:
-                        typed.append(secret_ref))
+
+    def fake_type_text(cfg, vm_name="", text="", secret_ref="", **k):
+        typed.append(text)  # R13: record the VALUE typed, not the ref
+
+    monkeypatch.setattr(console, "type_text", fake_type_text)
     with pytest.raises(Exception, match="unlock_failed"):
         console.unlock(unrestricted_cfg, "vm1", secret_ref="env:APP_TEST_SECRET")
-    assert len(typed) == 1  # exactly one attempt
+    assert typed == ["pw"]  # exactly one attempt, the RESOLVED secret typed
     assert pressed == ["escape", "enter"]
+
+
+def test_unlocked_token_is_not_misparsed_as_locked(monkeypatch, unrestricted_cfg):
+    """R2 pin: the guest reporting UNLOCKED must read as unlocked — the
+    substring containment 'LOCKED' in 'UNLOCKED' inverted every unlocked
+    verdict (reviewer blocker 2)."""
+    monkeypatch.setenv("HYPERV_GUEST_USERNAME", "tester")
+    monkeypatch.setenv("HYPERV_GUEST_PASSWORD", "not-a-real-password")
+    monkeypatch.setattr(console.vmident, "resolve",
+                        lambda cfg, vm_name="", vm_id="": type(
+                            "R", (), {"name": "vm1", "id": "guid"})())
+    monkeypatch.setattr(guestexec, "guest_run_ps", lambda cfg, vm_name="", script="", **k: {
+        "ok": True, "exit_code": 0, "stdout": "UNLOCKED\n", "stderr": ""})
+    out = console.lock_state(unrestricted_cfg, "vm1")
+    assert out["state"] == "unlocked"
+
+
+def test_unlock_success_path_real_lock_state(monkeypatch, unrestricted_cfg):
+    """R2/R7: the success path through the REAL lock_state parser — wake,
+    type the resolved secret once, submit, and the guest transitions to
+    UNLOCKED with a frame change."""
+    monkeypatch.setenv("APP_TEST_SECRET", "good-pw")
+    monkeypatch.setenv("HYPERV_GUEST_USERNAME", "tester")
+    monkeypatch.setenv("HYPERV_GUEST_PASSWORD", "not-a-real-password")
+    monkeypatch.setattr(console.vmident, "resolve",
+                        lambda cfg, vm_name="", vm_id="": type(
+                            "R", (), {"name": "vm1", "id": "guid"})())
+    submitted = {"done": False}
+
+    def fake_guest_run_ps(cfg, vm_name="", script="", **k):
+        token = "UNLOCKED\n" if submitted["done"] else "LOCKED\n"
+        return {"ok": True, "exit_code": 0, "stdout": token, "stderr": ""}
+
+    monkeypatch.setattr(guestexec, "guest_run_ps", fake_guest_run_ps)
+
+    def fake_press_key(cfg, vm_name="", key="", **k):
+        if key == "enter":
+            submitted["done"] = True
+
+    typed_ok: list[str] = []
+
+    def fake_type_text(cfg, vm_name="", text="", secret_ref="", **k):
+        typed_ok.append(text)
+
+    monkeypatch.setattr(console, "press_key", fake_press_key)
+    monkeypatch.setattr(console, "type_text", fake_type_text)
+    hashes = iter(["h1", "h2"])
+
+    def fake_screenshot(cfg, vm_name="", **k):
+        return None, {"frame_hash": next(hashes)}
+
+    monkeypatch.setattr(console, "screenshot", fake_screenshot)
+    out = console.unlock(unrestricted_cfg, "vm1", secret_ref="env:APP_TEST_SECRET")
+    assert out["ok"] is True and out["state"] == "unlocked" and out["attempts"] == 1
+    assert typed_ok == ["good-pw"]
+    assert "frame changed" in out["evidence"]
+
+
+def test_restricted_config_lock_and_unlock_usable(monkeypatch):
+    """R1/R7 black-box pin with a NON-unrestricted config: lock_state
+    (read-only, no category) and unlock (console_input enabled) must be
+    usable without unrestricted=True."""
+    cfg = Config()
+    cfg.destructive.console_input = True  # NOT unrestricted
+    monkeypatch.setenv("APP_TEST_SECRET", "pw")
+    monkeypatch.setenv("HYPERV_GUEST_USERNAME", "tester")
+    monkeypatch.setenv("HYPERV_GUEST_PASSWORD", "not-a-real-password")
+    monkeypatch.setattr(console.vmident, "resolve",
+                        lambda cfg, vm_name="", vm_id="": type(
+                            "R", (), {"name": "vm1", "id": "guid"})())
+    monkeypatch.setattr(guestexec, "guest_run_ps", lambda cfg, vm_name="", script="", **k: {
+        "ok": True, "exit_code": 0, "stdout": "UNLOCKED\n", "stderr": ""})
+    out = console.lock_state(cfg, "vm1")  # R1: no PolicyDenied on 'read'
+    assert out["state"] == "unlocked"
+    with pytest.raises(Exception, match="not_locked"):
+        console.unlock(cfg, "vm1", secret_ref="env:APP_TEST_SECRET")
 
 
 def test_literal_text_unchanged(monkeypatch, unrestricted_cfg):
@@ -228,8 +306,10 @@ def test_set_value_secret_ref_resolved_host_side(monkeypatch):
                             "R", (), {"name": "vm1", "id": "guid"})())
     cfg = Config()
     cfg.destructive.ui_input = True
+    # R3: the registered tool always supplies value="" (its default) — the
+    # exact wrapper-kwarg shape that used to be refused before resolving.
     out = uia.set_value(cfg, "vm1", cred=_Cred(), selector={"name": "box"},
-                        secret_ref="env:APP_TEST_SECRET")
+                        value="", secret_ref="env:APP_TEST_SECRET")
     assert out["ok"] is True
     assert out["length_set"] == len("uia-secret")
     assert captured["args"]["value"] == "uia-secret"

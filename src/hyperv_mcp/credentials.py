@@ -458,9 +458,12 @@ def resolve_secret_ref(
         raise CredentialError("secret_ref is required when typing a secret")
     scheme, sep, target = secret_ref.partition(":")
     if not sep or scheme not in ("env", "file") or not target.strip():
+        # Never echo the raw argument (reviewer R10): a caller passing the
+        # bare secret as secret_ref would otherwise have it copied into the
+        # error envelope. Name the expected shape only.
         raise CredentialError(
             "secret_ref must be env:NAME or file:PATH (the file path must "
-            f"pass the host read policy), got: {secret_ref!r}"
+            "pass the host read policy)"
         )
     if scheme == "env":
         env = os.environ if environ is None else environ

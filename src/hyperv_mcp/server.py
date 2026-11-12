@@ -1787,12 +1787,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     @mcp.tool()
     def hyperv_console_lock_state(
         vm_name: str = "", vm_id: str = "",
-        lease_id: str = "", fencing_token: int = 0,
     ) -> dict:
         """Report the console lock state from the guest's process table
         (issue #130): locked when LogonUI.exe is running in the guest's
         session, unlocked when absent, unknown when the process-table leg
-        fails. Evidence names what the verdict came from. Read category;
+        fails. Evidence names what the verdict came from. Read-only (no
+        destructive category and no lease — like screenshot/get_display_info);
         needs guest credentials and a running supported guest OS.
 
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
@@ -1801,8 +1801,6 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         Args:
             vm_name: Name of the VM (must match allowed_vm_patterns)
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
-            lease_id: Optional lease citation - the lease gate runs before the body
-            fencing_token: The lease's fencing token, with lease_id
         Returns: {ok, state: locked|unlocked|unknown, evidence, vm_name} or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
         """

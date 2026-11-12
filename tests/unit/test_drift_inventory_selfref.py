@@ -9,8 +9,9 @@ the --no-verify pre-push bypass. These pins hold the fix's contract:
 - a real sibling drift still fails `--check` and names the trace even when
   the docs copy matches the regeneration (AC2),
 - the self pair's verdict stays visible in the generated document (AC3),
-- the informational verdict reads the COMMITTED blob (`git ls-tree HEAD`),
-  not the working tree, so two consecutive checks agree.
+- the informational verdict reads the WORKING-TREE blob id
+  (`git hash-object`, applying the repo's LF filter), which moves with
+  neither the regeneration nor the commit of the document.
 """
 
 from __future__ import annotations
@@ -146,6 +147,67 @@ def test_self_pair_verdict_is_visible_in_generated_doc(tmp_path, monkeypatch, ca
     assert "Self-referential pairs" in body
     assert "63-66-119-collated" in body
     assert "live tree diverged from the frozen pin" in body
+
+
+def test_rendered_mechanism_text_names_the_working_tree_blob(tmp_path, monkeypatch):
+    """R5 pin: the generated section describes the mechanism the code
+    actually uses (`git hash-object` on the working tree), not a stale
+    description of a rejected design (`git ls-tree HEAD`)."""
+    root = _sandbox(tmp_path, monkeypatch)
+    _fake_verify(monkeypatch, {
+        "63-66-119-collated": CHANGED_SELF,
+        "sibling-wave": "OK README.md\n",
+    })
+    docs = _seed_docs(root)
+    assert _main(monkeypatch, "--snapshot") == 0
+    assert _main(monkeypatch) == 0
+    body = docs.read_text(encoding="utf-8")
+    assert "git hash-object" in body
+    assert "git ls-tree HEAD" not in body
+
+
+def test_live_blob_uses_the_git_blob_filter(tmp_path, monkeypatch):
+    """R9 pin: _live_blob returns the repo's own blob id for a file (the
+    git hash-object filter), not a raw content hash — verified against a
+    real `git hash-object` call in a scratch repo."""
+    repo = tmp_path / "repo"
+    (repo / "docs").mkdir(parents=True)
+    import subprocess as sp
+
+    def git(*args: str) -> str:
+        return sp.run(["git", *args], cwd=repo, capture_output=True,
+                      text=True, encoding="utf-8", check=True).stdout
+
+    git("init", "-q")
+    target = repo / "docs" / "file.md"
+    target.write_bytes(b"line\n")
+    monkeypatch.setattr(mod, "REPO", repo)
+    assert mod._live_blob("docs/file.md") == git("hash-object", "--", "docs/file.md").strip()
+
+
+def test_broken_leg_fails_the_gate(tmp_path, monkeypatch, capsys):
+    """R8 pin: a nonzero verify-checkpoint exit with no CHANGED lines
+    (missing manifest -> exit 2) fails --check instead of rendering
+    clean; a trace whose only divergence is the excluded self pair does
+    NOT trip the broken-leg branch."""
+    root = _sandbox(tmp_path, monkeypatch)
+    _fake_verify(monkeypatch, {
+        "63-66-119-collated": CHANGED_SELF,
+        "sibling-wave": "",  # exit 0: clean sibling
+    })
+
+    def _verify_with_broken(slug: str):
+        if slug == "63-66-119-collated":
+            return 1, CHANGED_SELF  # self-pair divergence only: NOT broken
+        return 2, "FAIL: no such manifest"  # broken leg, no CHANGED lines
+
+    monkeypatch.setattr(mod, "_verify", _verify_with_broken)
+    docs = _seed_docs(root)
+    assert _main(monkeypatch, "--snapshot") == 0
+    rc = _main(monkeypatch, "--check")
+    assert rc == 1
+    captured = capsys.readouterr().out + capsys.readouterr().err
+    assert "sibling-wave" in captured
 
 
 def test_self_pair_extraction_prefers_the_last_row(tmp_path):

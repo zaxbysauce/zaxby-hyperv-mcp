@@ -117,7 +117,6 @@ def _collect() -> list[dict]:
         slug = manifest.parent.parent.name
         code, out = _verify(slug)
         lines = out.splitlines()
-        ok = sum(1 for line in lines if line.startswith("OK "))
         changed_lines = [line for line in lines if line.startswith("CHANGED ")]
         # The self-referential pairs (rows pinning the inventory document)
         # are excluded from the gate verdict AND from the rendered counts
@@ -154,16 +153,24 @@ def _dynamic(rows: list[dict]) -> str:
         "|---|---:|---:|---:|---|",
     ]
     for row in rows:
-        gate_state = "clean" if not row["gate_changed"] else f"exit {row['code']}"
+        # A nonzero verify-checkpoint exit with no CHANGED line is a broken
+        # leg (missing manifest, invalid check id -> exit 2), not a clean
+        # trace: surface the exit instead of rendering "clean" (reviewer R8).
+        gate_state = (
+            "clean"
+            if not row["gate_changed"] and row["code"] == 0
+            else f"exit {row['code']}"
+        )
         lines.append(f"| {row['slug']} | {row['pairs']} | {row['ok']} | {len(row['gate_changed'])} | {gate_state} |")
     lines += [
         "",
         "## Self-referential pairs (excluded from the gate, issue #143)",
         "",
         "Pairs whose frozen path is this document itself. Live verdicts stay",
-        "visible; the committed-vs-frozen comparison uses `git ls-tree HEAD`,",
-        "so it is stable across regenerations. A diverged pin is informational",
-        "(re-anchor at the next re-baseline wave), never a gate failure.",
+        "visible; the working-tree-vs-frozen comparison uses `git hash-object`,",
+        "so it is stable across regenerations and commits. A diverged pin is",
+        "informational (re-anchor at the next re-baseline wave), never a gate",
+        "failure.",
         "",
     ]
     self_rows = [(row, pair) for row in rows for pair in row["self_pairs"]]
@@ -249,6 +256,23 @@ def main() -> int:
         if drifted:
             for row in drifted:
                 print(f"CHANGED {row['slug']}: " + "; ".join(row["gate_changed"]))
+            print("FAIL: inventory drift — regenerate with python scripts/gen_trace_drift_inventory.py")
+            return 1
+        # A nonzero verify-checkpoint exit with no CHANGED lines is a broken
+        # leg (missing manifest / invalid check id -> exit 2), not a clean
+        # census: fail the gate instead of laundering it (reviewer R8). A
+        # trace whose only divergence is the excluded self pair keeps its
+        # nonzero exit (the excluded pair IS its exit cause) without
+        # tripping this branch.
+        broken = [
+            row for row in rows
+            if row["code"] != 0 and not row["gate_changed"] and not row["self_changed"]
+        ]
+        if broken:
+            for row in broken:
+                print(f"ERROR {row['slug']}: verify-checkpoint exited "
+                      f"{row['code']} with no CHANGED lines — inspect that "
+                      "trace's local checkpoint setup")
             print("FAIL: inventory drift — regenerate with python scripts/gen_trace_drift_inventory.py")
             return 1
         existing = DOCS.read_text(encoding="utf-8")
