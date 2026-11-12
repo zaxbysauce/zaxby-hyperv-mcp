@@ -4,7 +4,9 @@
 
 Live verify-checkpoint state of every local trace (regenerate with
 `python scripts/gen_trace_drift_inventory.py`; gate with `--check`; runbook:
-docs/rebaseline-runbook.md).
+docs/rebaseline-runbook.md). Self-referential pairs (traces whose
+manifest pins this document itself) are excluded from the gate and
+reported below (issue #143).
 
 | trace | pairs | OK | CHANGED | verify-checkpoint |
 |---|---:|---:|---:|---|
@@ -15,6 +17,7 @@ docs/rebaseline-runbook.md).
 | 125-126-console-accuracy-commit-guard | 11 | 11 | 0 | clean |
 | 13-stdio-proxy | 10 | 10 | 0 | clean |
 | 140-126-uia-state-receipt | 44 | 44 | 0 | clean |
+| 143-130-collated | 12 | 12 | 0 | clean |
 | 17-rgb565-native-decode | 12 | 12 | 0 | clean |
 | 18-console-one-ps-process-per-call | 17 | 17 | 0 | clean |
 | 19-screenshot-output-options | 23 | 23 | 0 | clean |
@@ -36,7 +39,7 @@ docs/rebaseline-runbook.md).
 | 55-108-31-32-33-collated | 14 | 14 | 0 | clean |
 | 59-64-68-70-hardening-wave | 15 | 15 | 0 | clean |
 | 6-guest-put-get-policy | 13 | 13 | 0 | clean |
-| 63-66-119-collated | 13 | 13 | 0 | clean |
+| 63-66-119-collated | 12 | 12 | 0 | clean |
 | 64-68-collated | 11 | 11 | 0 | clean |
 | 67-118-release-vendor-provenance | 10 | 10 | 0 | clean |
 | 7-guest-jobs-truthful-reporting | 13 | 13 | 0 | clean |
@@ -51,9 +54,20 @@ docs/rebaseline-runbook.md).
 | issue-15-ps-cap-cancel | 9 | 9 | 0 | clean |
 | issue-16-tool-concurrency | 13 | 13 | 0 | clean |
 
+## Self-referential pairs (excluded from the gate, issue #143)
+
+Pairs whose frozen path is this document itself. No hash or
+verdict is rendered at all: any document-derived value (a blob id,
+a comparison) moves with the document's own bytes and re-opens the
+quine (final-critic finding 4, twice over). The frozen blob lives
+in the trace's manifest; re-anchoring is the next re-baseline
+wave's bookkeeping and is never a gate failure.
+
+- `63-66-119-collated` C8 (informational; excluded from the gate)
+
 ## Drift detail (CHANGED pairs)
 
-None — every frozen pair verifies OK at the current tree.
+None — every gate-relevant frozen pair verifies OK at the current tree.
 <!-- regenerated-state-end -->
 
 ## Discovery snapshot (recorded 2026-11-05, base 8bc60cb7196ae128231c25a15881cded26b0afda)

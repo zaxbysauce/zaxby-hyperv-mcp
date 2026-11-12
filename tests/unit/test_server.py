@@ -38,6 +38,8 @@ TOOL_NAMES = {
     # console (WMI screenshot / keyboard / mouse)
     "hyperv_console_screenshot", "hyperv_console_get_display_info",
     "hyperv_console_type_text", "hyperv_console_press_key",
+    # issue #130: lock-state detection + one-attempt unlock
+    "hyperv_console_lock_state", "hyperv_console_unlock",
     "hyperv_console_key_combo", "hyperv_console_type_scancodes",
     "hyperv_console_mouse_move", "hyperv_console_click",
     "hyperv_console_button", "hyperv_console_scroll",
@@ -116,7 +118,7 @@ def test_tool_inventory_registered(fresh_server):
     # tests/unit/test_f04_sequences.py::test_sequence_tool_schema_and_boot_epoch_reporting);
     # 76 with issue #29's eight hyperv_ui_* tools; 80 with PR #112's four
     # Workstream G tools (vm_clone, vm_remove, deployment_status, harvest).
-    assert len(schemas) == 80
+    assert len(schemas) == 82
 
 
 def test_every_vm_tool_schema_has_vm_id(fresh_server):
@@ -199,6 +201,7 @@ def test_interactive_tools_have_no_confirm_param(fresh_server):
     mod = fresh_server({})
     for name in ("hyperv_console_type_text", "hyperv_console_press_key",
                  "hyperv_console_mouse_move", "hyperv_console_click",
+                 "hyperv_console_lock_state", "hyperv_console_unlock",
                  "hyperv_vm_media_attach", "hyperv_vm_media_detach",
                  "hyperv_vm_network_set", "hyperv_console_sequence"):
         props = _schemas(mod)[name].get("properties", {})

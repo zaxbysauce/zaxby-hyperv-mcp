@@ -117,6 +117,7 @@ _ACTOR_KEYED_TOOLS = frozenset({
     "hyperv_console_button",
     "hyperv_console_scroll",
     "hyperv_console_sequence",
+    "hyperv_console_unlock",
 })
 
 #: Park-tick for both admit flavors: small enough that cancellation and

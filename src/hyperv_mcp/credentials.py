@@ -19,6 +19,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .config import Config, CredentialProfile
@@ -431,3 +432,100 @@ def resolve_host(environ: dict[str, str] | None = None) -> CredentialSet | None:
         else "env"
     )
     return CredentialSet(u, _validated_password(p, p_source), cred_ref)
+
+
+def resolve_secret_ref(
+    secret_ref: str,
+    *,
+    environ: dict[str, str] | None = None,
+    guard: Callable[[str], str] | None = None,
+    allowed_env: list[str] | None = None,
+    denied_env: set[str] | None = None,
+) -> str:
+    """Resolve a named secret reference host-side (issue #130).
+
+    Supported forms (the prefix is mandatory; bare names and bare paths
+    are refused fail-closed):
+      env:NAME   read NAME from the process environment (or ``environ``)
+      file:PATH  read PATH through the caller's policy guard
+
+    ``allowed_env`` is the configured env-name allowlist (fnmatch globs,
+    matched case-insensitively); None or an empty list DENIES every env
+    source — the deny-all default (final-critic Critical 1: without it the
+    env path could type the server's own credential variables into a
+    guest). ``denied_env`` is the caller-supplied hard-deny set (the
+    server's own credential/token variable names, case-insensitive); those
+    names are refused even when the allowlist matches them. ``guard`` is
+    the caller-supplied reader for the ``file:`` form; it must run the
+    host_read_roots policy gate (an unguarded file reader is a host-file
+    exfiltration channel, so None refuses). Trailing newline characters
+    are stripped from file contents; env values keep their exact bytes.
+    The value itself is never returned by a tool response and never
+    logged — callers report only ``len()``.
+    """
+    if not isinstance(secret_ref, str) or not secret_ref.strip():
+        raise CredentialError("secret_ref is required when typing a secret")
+    scheme, sep, target = secret_ref.partition(":")
+    if not sep or scheme not in ("env", "file") or not target.strip():
+        # Never echo the raw argument (reviewer R10): a caller passing the
+        # bare secret as secret_ref would otherwise have it copied into the
+        # error envelope. Name the expected shape only.
+        raise CredentialError(
+            "secret_ref must be env:NAME or file:PATH (the file path must "
+            "pass the host read policy)"
+        )
+    if scheme == "env":
+        from fnmatch import fnmatch
+
+        upper = target.strip().upper()
+        denied = {name.strip().upper() for name in (denied_env or set())}
+        from . import pswindows as _psw  # local import: no cycle (pswindows imports credentials only lazily)
+
+        denied |= {name.upper() for name in _psw._SECRET_ENV_NAMES}
+        denied.add("HYPERV_MCP_HTTP_TOKEN")
+        if upper in denied:
+            raise CredentialError(
+                f"secret ref env variable '{target.strip()}' is a server "
+                "credential/token variable and is always refused"
+            )
+        patterns = [p for p in (allowed_env or []) if p]
+        if not patterns or not any(
+            fnmatch(upper, pattern.strip().upper()) for pattern in patterns
+        ):
+            raise CredentialError(
+                f"secret ref env variable '{target.strip()}' is not in the "
+                "configured secret_env_names allowlist (deny-all by default)"
+            )
+        env = os.environ if environ is None else environ
+        value = next((v for k, v in env.items() if k.upper() == upper), None)
+        if value is None or value == "":
+            raise CredentialError(
+                f"secret ref env variable '{target.strip()}' is not set"
+            )
+        return _validated_secret_value(value)
+    if guard is None:
+        raise CredentialError(
+            "secret_ref file: sources require the host read policy guard; "
+            "refusing an unguarded file reader"
+        )
+    raw = guard(target)
+    if not raw.strip():
+        raise CredentialError(f"secret file '{target}' is empty")
+    return _validated_secret_value(raw.rstrip("\r\n"))
+
+
+def _validated_secret_value(value: str) -> str:
+    """Shared post-read invariants for resolved secret_ref values (PR-144
+    review SEC-02/SEC-04): register in the redaction registry like every
+    other resolved secret (the module contract), and reject line breaks —
+    a multi-line value typed into a logon field is an early-submit or
+    partial-secret hazard, matching the credential invariant that rejects
+    line breaks."""
+    registry().register(value)
+    if "\n" in value or "\r" in value:
+        raise CredentialError(
+            "secret_ref resolved value must not contain line breaks "
+            "(a multi-line secret cannot be typed safely); use a single-line "
+            "secret file or variable"
+        )
+    return value

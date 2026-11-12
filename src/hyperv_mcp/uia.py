@@ -1438,12 +1438,15 @@ def invoke(cfg, vm_name="", cred: CredentialSet | None = None,
 def set_value(cfg, vm_name="", cred: CredentialSet | None = None,
               selector: Any = None, value: Any = None, *,
               element_id: Any = None, vm_id: str = "",
+              secret_ref: str = "",
               shared_vm: bool = False):
     """Set a UIA Value-pattern property (mutating; ui_input).
 
     The value rides the framed stdin payload — never script text, never
     argv, never error text — and the result reports the length set, never
-    the value.
+    the value. With ``secret_ref`` (issue #130) the value is resolved
+    host-side through the env:/file: contract and the host read policy;
+    ``secret_ref`` and ``value`` are mutually exclusive.
     """
     policy.require_category(cfg, "ui_input", f"set value on '{vm_name}'")
     if cred is None:
@@ -1451,6 +1454,32 @@ def set_value(cfg, vm_name="", cred: CredentialSet | None = None,
 
         raise CredentialError("guest credentials are required for UI verbs")
     _check_element_op(selector, element_id)
+    # The registered tool passes value="" by default (reviewer R3): treat
+    # the empty string as absent so secret_ref is usable through the tool.
+    if secret_ref and value:
+        raise ValueError("secret_ref and value are mutually exclusive")
+    if secret_ref:
+        from pathlib import Path
+
+        def _guard(path: str) -> str:
+            policy.check_host_read(cfg, path)
+            try:
+                return Path(path).read_text(encoding="utf-8-sig")
+            except OSError as exc:
+                from .credentials import CredentialError
+                raise CredentialError(f"secret file {path!r} is unreadable: {exc}") from None
+            except UnicodeDecodeError as exc:
+                from .credentials import CredentialError
+                raise CredentialError(f"secret file {path!r} is not decodable as UTF-8 (UTF-16 is common on Windows editors): {exc}") from None
+
+        from . import credentials as _credentials
+        from .console import _denied_env_names
+
+        value = _credentials.resolve_secret_ref(
+            secret_ref, guard=_guard,
+            allowed_env=cfg.secret_env_names,
+            denied_env=_denied_env_names(cfg),
+        )
     if value is None:
         raise ValueError("set_value requires value=")
     if isinstance(value, str) and len(value.encode("utf-8")) > _MAX_VALUE_BYTES:

@@ -11,10 +11,13 @@ Run the drift inventory (one command, below) whenever a PR touches a file that a
 checkpoint manifest — e.g. before merging any PR whose diff intersects `src/`,
 `tests/unit/test_*.py`, `tests/integration/*.py`, frozen `repro/check-*.sh` scripts,
 `README.md`, or the docs/scripts this wave pinned. The authoritative membership test is
-the manifest itself: grep `.agents/issue-traces/*/repro/checkpoint.manifest` for the path. The `--check` gate compares the docs copy against a live regeneration and exits
-1 on drift between the two; it does not by itself assert that every trace is
-clean — read the inventory's CHANGED tallies (or run the verifier per trace)
-for that. Verifier exit codes are `0` (clean) and `1` (drift found); exit `2` means a
+the manifest itself: grep `.agents/issue-traces/*/repro/checkpoint.manifest` for the path. The `--check` gate compares the docs copy against a live regeneration AND
+fails on real drift: any sibling (non-self-referential) frozen pair whose
+verify-checkpoint reports CHANGED exits 1 even when the docs copy matches
+the regeneration, and a verify-checkpoint that exits nonzero with no
+CHANGED lines (a broken local setup) fails the gate too. Regeneration
+clears only the docs-copy staleness; a genuine CHANGED pair is repaired by
+the per-pair AMEND procedure below, never by regenerating. Verifier exit codes are `0` (clean) and `1` (drift found); exit `2` means a
 missing or malformed trace/manifest (invalid local checkpoint setup — not a
 clean-or-drift result), and the generator's `--check` treats it as a gate failure. No
 legacy manifest format remains in the tree (a repo-wide sweep finds only exit 0/1).
@@ -29,9 +32,12 @@ or re-sync the local traces first; it cannot run there.
 python scripts/gen_trace_drift_inventory.py --check
 ```
 
-`--check` regenerates the inventory in-memory and compares it against
-`docs/issue-trace-drift-inventory.md`; exit 1 + a diff means the docs copy is stale (either the
-tree moved under a frozen pair — new drift — or the docs copy was hand-edited). Regenerate and
+`--check` regenerates the inventory in-memory, compares it against
+`docs/issue-trace-drift-inventory.md`, and fails on any sibling CHANGED
+pair or broken leg even when the docs copy matches. exit 1 with a
+`CHANGED <trace>: ...` line means REAL drift — repair it with the per-pair
+AMEND procedure below (regeneration cannot clear it); exit 1 with a diff
+but no CHANGED lines means only the docs copy is stale — regenerate and
 commit:
 
 ```
