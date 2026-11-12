@@ -17,7 +17,7 @@ reported below (issue #143).
 | 125-126-console-accuracy-commit-guard | 11 | 11 | 0 | clean |
 | 13-stdio-proxy | 10 | 10 | 0 | clean |
 | 140-126-uia-state-receipt | 44 | 44 | 0 | clean |
-| 143-130-collated | 0 | 0 | 0 | clean |
+| 143-130-collated | 12 | 12 | 0 | clean |
 | 17-rgb565-native-decode | 12 | 12 | 0 | clean |
 | 18-console-one-ps-process-per-call | 17 | 17 | 0 | clean |
 | 19-screenshot-output-options | 23 | 23 | 0 | clean |
@@ -61,7 +61,7 @@ visible; the committed-vs-frozen comparison uses `git ls-tree HEAD`,
 so it is stable across regenerations. A diverged pin is informational
 (re-anchor at the next re-baseline wave), never a gate failure.
 
-- `63-66-119-collated` C8: frozen 062b5d463b29 vs committed 0eaf46a7f0fe — diverged — AMEND pending at the next re-baseline wave (informational)
+- `63-66-119-collated` C8: frozen 062b5d463b29 vs committed 2bc69fafce77 — diverged — AMEND pending at the next re-baseline wave (informational)
 
 ## Drift detail (CHANGED pairs)
 
