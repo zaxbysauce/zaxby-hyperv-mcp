@@ -56,13 +56,15 @@ reported below (issue #143).
 
 ## Self-referential pairs (excluded from the gate, issue #143)
 
-Pairs whose frozen path is this document itself. Live verdicts stay
-visible; the working-tree-vs-frozen comparison uses `git hash-object`,
-so it is stable across regenerations and commits. A diverged pin is
-informational (re-anchor at the next re-baseline wave), never a gate
-failure.
+Pairs whose frozen path is this document itself, listed with the
+live working-tree blob id of the document (`git hash-object`). No
+match/diverge verdict is rendered: a document cannot contain a
+prefix of its own hash, so a rendered comparison could never
+converge (final-critic finding 4). The frozen blob lives in the
+trace's manifest; re-anchoring is the next re-baseline wave's
+bookkeeping and is never a gate failure.
 
-- `63-66-119-collated` C8: frozen 062b5d463b29 — live tree diverged from the frozen pin — expected after any change to this document; re-anchor at the next re-baseline wave (informational)
+- `63-66-119-collated` C8: live doc blob 96497a690caf (informational; excluded from the gate)
 
 ## Drift detail (CHANGED pairs)
 
