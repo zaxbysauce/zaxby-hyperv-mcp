@@ -1,7 +1,7 @@
 """
 hyperv_mcp.server -- MCP server for Hyper-V VM management (hardened fork).
 
-Exposes 82 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
+Exposes 84 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
 guest execution and file transfer via PowerShell Direct, guest access
 diagnostics/repair and managed guest jobs, reboot recovery verification,
 host-to-guest HTTP relay, console observation and input (WMI), evidence
@@ -2898,7 +2898,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         # In-session UI Automation helper surface (issue #29, Workstream F
         # PR 5). Read verbs need only VM policy + guest credentials; the
         # mutating verbs require destructive.ui_input; provisioning requires
-        # destructive.ui_provision + confirm. All eight follow the dual
+        # destructive.ui_provision + confirm. All ten follow the dual (issue #137
+        # added hyperv_ui_snapshot and hyperv_ui_act)
         # credential variants.
         # ------------------------------------------------------------------
 
@@ -2962,11 +2963,13 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 vm_name: Name of the VM
                 selector: UIA selector scoping the walk (accepted keys:
                     automation_id, name, name_contains, control_type,
-                    class_name, window_title, process_name, hwnd, index);
-                    with a selector the walk starts at the matched element,
-                    without it at the desktop root
-                depth: Walk depth (1..6, default 3; one clamp shared with
-                    evidence's PS Direct walk)
+                    class_name, window_title, window_title_contains,
+                    process_name, hwnd, index, scope); with a selector the
+                    walk starts at the matched element, without it at the
+                    FOREGROUND window (the scope key picks the breadth:
+                    foreground default / window / all_windows)
+                depth: Walk depth (1..32, default 3; one clamp shared with
+                    evidence's PS Direct walk and the helper)
                 max_elements: Element cap (1..500, default 200; the same
                     clamp as evidence's walk)
                 adapter: "" (default) or "electron" — an Electron adapter
@@ -2985,6 +2988,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             citable as verified_state_receipt on a commit-guarded
             hyperv_console_click. Failed reads mint nothing.
             """
+            gate = _uia_prevalidate_result(
+                "hyperv_ui_inspect", {"selector": selector})
+            if gate is not None:
+                return gate
             return _run_ui_tool(
                 "hyperv_ui_inspect", vm_name, "read", uia.inspect,
                 _cfg(), vm_name,
@@ -2996,19 +3003,31 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         @mcp.tool()
         def hyperv_ui_find(
             vm_name: str = "", selector: dict | None = None,
-            element_id: str = "", adapter: str = "",
+            element_id: str = "", ref: str = "", adapter: str = "",
             username: str = "", password: str = "", vm_id: str = "",
         ) -> dict:
-            """Resolve element(s) by UIA selector or element_id through the
-            in-session helper (read verb: vm policy + guest credentials).
+            """Resolve element(s) by UIA selector, element_id or snapshot ref
+            through the in-session helper (read verb: vm policy + guest
+            credentials). Address the target by exactly one of selector,
+            element_id or ref (issue #137); the refusal fires before any
+            resolution or transport leg.
 
             Args:
                 vm_name: Name of the VM
                 selector: UIA selector (accepted keys: automation_id, name,
                     name_contains, control_type, class_name, window_title,
-                    process_name, hwnd, index)
+                    window_title_contains, process_name, hwnd, index,
+                    scope); a selector with no window scope searches the
+                    FOREGROUND window (scope: foreground default / window /
+                    all_windows)
                 element_id: a RuntimeId from a previous find/inspect
                     ("42:1024" form) — resolves the live element by id
+                ref: a snapshot element ref, s<snapshot>:<index> (issue
+                    #137; the snapshot id may be hex, the index decimal) —
+                    resolves the element captured by that hyperv_ui_snapshot;
+                    a stale or unknown ref passes through as error_class
+                    stale_ref/unknown_ref pointing at a fresh snapshot,
+                    never retried
                 adapter: "" (default) or "electron" — refused
                     adapter_unapproved unless the registration carries the
                     adapter:electron capability
@@ -3026,18 +3045,24 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             citable as verified_state_receipt on a commit-guarded
             hyperv_console_click. Failed reads mint nothing.
             """
+            gate = _uia_prevalidate_result(
+                "hyperv_ui_find", {"selector": selector,
+                                   "element_id": element_id, "ref": ref})
+            if gate is not None:
+                return gate
             return _run_ui_tool(
                 "hyperv_ui_find", vm_name, "read", uia.find,
                 _cfg(), vm_name,
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 ref_arg=True,
-                selector=selector, element_id=element_id or None,
+                selector=selector, element_id=element_id or None, ref=ref,
                 adapter=adapter, vm_id=vm_id)
 
         @mcp.tool()
         def hyperv_ui_invoke(
             vm_name: str = "", selector: dict | None = None,
-            element_id: str = "", lease_id: str = "", fencing_token: int = 0,
+            element_id: str = "", ref: str = "", lease_id: str = "",
+            fencing_token: int = 0,
             username: str = "", password: str = "", vm_id: str = "",
         ) -> dict:
             """Invoke a UIA pattern on the target element. Needs
@@ -3051,8 +3076,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 selector: UIA selector — address the target by exactly one
-                    of selector= or element_id=
+                    of selector=, element_id= or ref= (a selector with no
+                    window scope searches the FOREGROUND window; scope:
+                    foreground / window / all_windows)
                 element_id: a RuntimeId from a previous find/inspect
+                ref: a snapshot element ref, s<snapshot>:<index> (issue
+                    #137), as rendered by hyperv_ui_snapshot; a stale or
+                    unknown ref passes through as error_class
+                    stale_ref/unknown_ref, never retried
                 lease_id: optional lease citation (issue #23) — the lease
                     gate runs before the body
                 fencing_token: the lease's fencing token, with lease_id
@@ -3066,17 +3097,24 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Returns: {ok, invoked, pattern, session, helper?} or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
+            gate = _uia_prevalidate_result(
+                "hyperv_ui_invoke", {"selector": selector,
+                                     "element_id": element_id, "ref": ref})
+            if gate is not None:
+                return gate
             return _run_ui_tool(
                 "hyperv_ui_invoke", vm_name, "console_input", uia.invoke,
                 _cfg(), vm_name,
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 ref_arg=True,
-                selector=selector, element_id=element_id or None, vm_id=vm_id)
+                selector=selector, element_id=element_id or None, ref=ref,
+                vm_id=vm_id)
 
         @mcp.tool()
         def hyperv_ui_set_value(
             vm_name: str = "", selector: dict | None = None, value: str = "",
-            element_id: str = "", lease_id: str = "", fencing_token: int = 0,
+            element_id: str = "", ref: str = "", lease_id: str = "",
+            fencing_token: int = 0,
             username: str = "", password: str = "", vm_id: str = "",
             secret_ref: str = "",
         ) -> dict:
@@ -3089,10 +3127,16 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 selector: UIA selector — address the target by exactly one
-                    of selector= or element_id=
+                    of selector=, element_id= or ref= (a selector with no
+                    window scope searches the FOREGROUND window; scope:
+                    foreground / window / all_windows)
                 value: the text to set (<= 64 KiB)
                 secret_ref: env:NAME or allowlisted file:PATH resolved host-side; the resolved value is set, only the length is reported (mutually exclusive with value)
                 element_id: a RuntimeId from a previous find/inspect
+                ref: a snapshot element ref, s<snapshot>:<index> (issue
+                    #137), as rendered by hyperv_ui_snapshot; a stale or
+                    unknown ref passes through as error_class
+                    stale_ref/unknown_ref, never retried
                 lease_id: optional lease citation (issue #23) — the lease
                     gate runs before the body
                 fencing_token: the lease's fencing token, with lease_id
@@ -3106,31 +3150,60 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Returns: {ok, length_set, pattern, session, helper?} or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
+            gate = _uia_prevalidate_result(
+                "hyperv_ui_set_value", {"selector": selector,
+                                        "element_id": element_id,
+                                        "ref": ref})
+            if gate is not None:
+                return gate
             return _run_ui_tool(
                 "hyperv_ui_set_value", vm_name, "console_input", uia.set_value,
                 _cfg(), vm_name,
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 ref_arg=True,
                 selector=selector, value=value,
-                element_id=element_id or None, vm_id=vm_id,
+                element_id=element_id or None, ref=ref, vm_id=vm_id,
                 secret_ref=secret_ref)
 
         @mcp.tool()
         def hyperv_ui_wait_for(
             vm_name: str = "", selector: dict | None = None, gone: bool = False,
-            timeout_s: int = 30,
+            timeout_s: int = 30, element_id: str = "", ref: str = "",
+            value: str | None = None, value_contains: str | None = None,
+            state: dict | None = None,
             username: str = "", password: str = "", vm_id: str = "",
         ) -> dict:
-            """Wait for a selector to appear (or, with gone=true, disappear).
-            The wait runs as bounded guest-side slices (the per-VM lock is
-            never held across the whole wait); an expired budget returns the
-            last slice's answer (ok with empty elements / gone=false).
+            """Wait for a selector to appear (or, with gone=true, disappear),
+            or for a value/state predicate to hold on the resolved element
+            (issue #137). The wait runs as bounded guest-side slices (the
+            per-VM lock is never held across the whole wait); a present
+            element whose value/state does not match keeps the wait polling,
+            and an expired predicate budget returns the LAST observed
+            element with timed_out: true. Absence of a predicate is
+            expressed by omitting the parameter (default None) — an empty
+            string is a legitimate predicate value.
 
             Args:
                 vm_name: Name of the VM
-                selector: UIA selector waited for (accepted keys as find)
+                selector: UIA selector waited for (accepted keys as find;
+                    a selector with no window scope searches the FOREGROUND
+                    window; scope: foreground / window / all_windows)
                 gone: true waits for DISAPPEARANCE instead of appearance
                 timeout_s: wait budget in seconds (1..120, default 30)
+                element_id: a RuntimeId from a previous find/inspect —
+                    address the target by exactly one of selector=,
+                    element_id= or ref=
+                ref: a snapshot element ref, s<snapshot>:<index> (issue
+                    #137), as rendered by hyperv_ui_snapshot; a stale or
+                    unknown ref passes through as error_class
+                    stale_ref/unknown_ref, never retried
+                value: wait until the element's state.value equals this
+                    (empty string is a legitimate predicate; omit for none)
+                value_contains: wait until the element's state.value
+                    contains this substring
+                state: wait until every given element/state property
+                    matches (a non-empty dict; matching spans element-level
+                    properties and the nested state block)
                 username: Inline guest username (requires allow_inline_credentials=true)
                 password: Inline guest password (requires allow_inline_credentials=true)
                 vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
@@ -3138,23 +3211,33 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
 
-            Returns: {ok, elements[] | gone, session, helper?, state_receipt} or
+            Returns: {ok, elements[] | gone, timed_out?, session, helper?, state_receipt} or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             A settled OR budget-expired successful wait carries state_receipt
             (issue #140): a receipt id citable as verified_state_receipt on a
             commit-guarded hyperv_console_click. Failed reads mint nothing.
             """
+            gate = _uia_prevalidate_result(
+                "hyperv_ui_wait_for", {"selector": selector,
+                                       "element_id": element_id, "ref": ref,
+                                       "state": state})
+            if gate is not None:
+                return gate
             return _run_ui_tool(
                 "hyperv_ui_wait_for", vm_name, "read", uia.wait_for,
                 _cfg(), vm_name,
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 ref_arg=True,
-                selector=selector, gone=gone, timeout_s=timeout_s, vm_id=vm_id)
+                selector=selector, gone=gone, timeout_s=timeout_s,
+                element_id=element_id or None, ref=ref,
+                value=value, value_contains=value_contains, state=state,
+                vm_id=vm_id)
 
         @mcp.tool()
         def hyperv_ui_focus(
             vm_name: str = "", selector: dict | None = None,
-            element_id: str = "", lease_id: str = "", fencing_token: int = 0,
+            element_id: str = "", ref: str = "", lease_id: str = "",
+            fencing_token: int = 0,
             username: str = "", password: str = "", vm_id: str = "",
         ) -> dict:
             """Focus the target element. Needs destructive.ui_input; a locked
@@ -3163,8 +3246,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 selector: UIA selector — address the target by exactly one
-                    of selector= or element_id=
+                    of selector=, element_id= or ref= (a selector with no
+                    window scope searches the FOREGROUND window; scope:
+                    foreground / window / all_windows)
                 element_id: a RuntimeId from a previous find/inspect
+                ref: a snapshot element ref, s<snapshot>:<index> (issue
+                    #137), as rendered by hyperv_ui_snapshot; a stale or
+                    unknown ref passes through as error_class
+                    stale_ref/unknown_ref, never retried
                 lease_id: optional lease citation (issue #23) — the lease
                     gate runs before the body
                 fencing_token: the lease's fencing token, with lease_id
@@ -3178,12 +3267,18 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Returns: {ok, focused, raised, session, helper?} or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
+            gate = _uia_prevalidate_result(
+                "hyperv_ui_focus", {"selector": selector,
+                                    "element_id": element_id, "ref": ref})
+            if gate is not None:
+                return gate
             return _run_ui_tool(
                 "hyperv_ui_focus", vm_name, "console_input", uia.focus,
                 _cfg(), vm_name,
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 ref_arg=True,
-                selector=selector, element_id=element_id or None, vm_id=vm_id)
+                selector=selector, element_id=element_id or None, ref=ref,
+                vm_id=vm_id)
 
         @mcp.tool()
         def hyperv_ui_session_state(
@@ -3209,6 +3304,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             id citable as verified_state_receipt on a commit-guarded
             hyperv_console_click. Failed reads mint nothing.
             """
+            gate = _uia_prevalidate_result("hyperv_ui_session_state", {})
+            if gate is not None:
+                return gate
             return _run_ui_tool(
                 "hyperv_ui_session_state", vm_name, "read", uia.session_state,
                 _cfg(), vm_name,
@@ -3259,6 +3357,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             lsa_secret_deleted, autologon_restored} — or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
+            gate = _uia_prevalidate_result("hyperv_ui_helper_provision", {})
+            if gate is not None:
+                return gate
             return _run_ui_tool(
                 "hyperv_ui_helper_provision", vm_name, "destructive",
                 uia.provision_helper,
@@ -3267,12 +3368,140 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 autologon=autologon, confirm=confirm, teardown=teardown,
                 vm_id=vm_id)
 
+        @mcp.tool()
+        def hyperv_ui_snapshot(
+            vm_name: str = "", selector: dict | None = None,
+            max_elements: int = 250, adapter: str = "",
+            username: str = "", password: str = "", vm_id: str = "",
+        ) -> dict:
+            """One compact element snapshot of one window through the
+            in-session helper (read verb, issue #137: vm policy + guest
+            credentials; the helper must be provisioned). The foreground
+            window by default; window selectors (hwnd / window_title /
+            window_title_contains / process_name) pick the window — a
+            selector with no window scope searches the FOREGROUND window
+            (scope: foreground / window / all_windows restores the breadth).
+            Returns snapshot_id plus one entry per element (ref /
+            control_type / name / state / rect / depth) and a rendered
+            "text" block with ONE compact line per element
+            (<ref> <ControlType> <Name> [<state-summary>] <rect>), entries
+            in order, indented by depth. The refs (grammar
+            s<snapshot>:<index>; the snapshot id may be hex, the index
+            decimal) are the element addresses for hyperv_ui_act and the
+            ref= parameter of the other element tools. A successful read
+            mints a state_receipt (issue #140).
+
+            Args:
+                vm_name: Name of the VM
+                selector: optional UIA selector picking the window
+                    (accepted keys: hwnd, window_title,
+                    window_title_contains, process_name, scope; a selector
+                    with no window scope searches the FOREGROUND window)
+                max_elements: element cap (1..500, default 250)
+                adapter: "" (default) or "electron" — an Electron adapter
+                    request is refused adapter_unapproved unless the helper
+                    registration carries the adapter:electron capability
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+                username/password: inline guest credentials (this variant)
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, snapshot_id, entries[], text, session, helper?,
+            state_receipt} or
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
+            Failed reads mint nothing.
+            """
+            gate = _uia_prevalidate_result(
+                "hyperv_ui_snapshot", {"selector": selector})
+            if gate is not None:
+                return gate
+            return _run_ui_tool(
+                "hyperv_ui_snapshot", vm_name, "read", uia.snapshot,
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
+                ref_arg=True,
+                selector=selector, max_elements=max_elements,
+                adapter=adapter, vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_act(
+            vm_name: str = "", selector: dict | None = None,
+            element_id: str = "", ref: str = "", action: str = "",
+            value: str | None = None, lease_id: str = "",
+            fencing_token: int = 0,
+            username: str = "", password: str = "", vm_id: str = "",
+        ) -> dict:
+            """One explicit element action (issue #137; mutating, lease-gated
+            — no confirm flag). The action set is closed: invoke, toggle_on,
+            toggle_off, select, expand, collapse, set_value, focus,
+            scroll_into_view, click. Every action requires
+            destructive.ui_input; click ADDITIONALLY requires
+            console_input (both refusals fire before any resolution or
+            transport leg). Address the target by exactly one of selector,
+            element_id or ref. The click action is the seam: the helper
+            validates the element is enabled, onscreen and exposes a
+            clickable point (not_actionable otherwise, NO input sent) and
+            the host dispatches exactly ONE synthetic-mouse click at the
+            returned point through the console input surface. set_value's
+            value rides the framed stdin payload only and the result
+            reports the length set, never the value.
+
+            Args:
+                vm_name: Name of the VM
+                selector: UIA selector — address the target by exactly one
+                    of selector=, element_id= or ref= (a selector with no
+                    window scope searches the FOREGROUND window; scope:
+                    foreground / window / all_windows)
+                element_id: a RuntimeId from a previous find/inspect
+                ref: a snapshot element ref, s<snapshot>:<index> (issue
+                    #137), as rendered by hyperv_ui_snapshot; a stale or
+                    unknown ref passes through as error_class
+                    stale_ref/unknown_ref, never retried — take a fresh
+                    hyperv_ui_snapshot
+                action: one of invoke, toggle_on, toggle_off, select,
+                    expand, collapse, set_value, focus, scroll_into_view,
+                    click
+                value: the text to set (set_value only, <= 64 KiB; rides
+                    the framed payload, never script text; the result
+                    reports the length only)
+                lease_id: optional lease citation (issue #23) — the lease
+                    gate runs before the body
+                fencing_token: the lease's fencing token, with lease_id
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+                username/password: inline guest credentials (this variant)
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: destructive.ui_input for every action; the click action
+            additionally requires console_input; denials return policy envelopes.
+
+            Returns: {ok, action, pattern?, state?, point?/click? (the click
+            action), length_set? (set_value), session, helper?} or
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
+            """
+            gate = _uia_prevalidate_result(
+                "hyperv_ui_act", {"selector": selector,
+                                  "element_id": element_id, "ref": ref,
+                                  "action": action, "value": value})
+            if gate is not None:
+                return gate
+            return _run_ui_tool(
+                "hyperv_ui_act", vm_name, "console_input", uia.act,
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
+                ref_arg=True,
+                selector=selector, element_id=element_id or None, ref=ref,
+                action=action, value=value, vm_id=vm_id)
+
     else:
         # ------------------------------------------------------------------
         # In-session UI Automation helper surface (issue #29, Workstream F
         # PR 5). Read verbs need only VM policy + guest credentials; the
         # mutating verbs require destructive.ui_input; provisioning requires
-        # destructive.ui_provision + confirm. All eight follow the dual
+        # destructive.ui_provision + confirm. All ten follow the dual (issue #137
+        # added hyperv_ui_snapshot and hyperv_ui_act)
         # credential variants.
         # ------------------------------------------------------------------
 
@@ -3336,11 +3565,13 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 vm_name: Name of the VM
                 selector: UIA selector scoping the walk (accepted keys:
                     automation_id, name, name_contains, control_type,
-                    class_name, window_title, process_name, hwnd, index);
-                    with a selector the walk starts at the matched element,
-                    without it at the desktop root
-                depth: Walk depth (1..6, default 3; one clamp shared with
-                    evidence's PS Direct walk)
+                    class_name, window_title, window_title_contains,
+                    process_name, hwnd, index, scope); with a selector the
+                    walk starts at the matched element, without it at the
+                    FOREGROUND window (the scope key picks the breadth:
+                    foreground default / window / all_windows)
+                depth: Walk depth (1..32, default 3; one clamp shared with
+                    evidence's PS Direct walk and the helper)
                 max_elements: Element cap (1..500, default 200; the same
                     clamp as evidence's walk)
                 adapter: "" (default) or "electron" — an Electron adapter
@@ -3355,6 +3586,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             citable as verified_state_receipt on a commit-guarded
             hyperv_console_click. Failed reads mint nothing.
             """
+            gate = _uia_prevalidate_result(
+                "hyperv_ui_inspect", {"selector": selector})
+            if gate is not None:
+                return gate
             return _run_ui_tool(
                 "hyperv_ui_inspect", vm_name, "read", uia.inspect,
                 _cfg(), vm_name,
@@ -3366,19 +3601,31 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         @mcp.tool()
         def hyperv_ui_find(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", selector: dict | None = None,
-            element_id: str = "", adapter: str = "",
+            element_id: str = "", ref: str = "", adapter: str = "",
             vm_id: str = "",
         ) -> dict:
-            """Resolve element(s) by UIA selector or element_id through the
-            in-session helper (read verb: vm policy + guest credentials).
+            """Resolve element(s) by UIA selector, element_id or snapshot ref
+            through the in-session helper (read verb: vm policy + guest
+            credentials). Address the target by exactly one of selector,
+            element_id or ref (issue #137); the refusal fires before any
+            resolution or transport leg.
 
             Args:
                 vm_name: Name of the VM
                 selector: UIA selector (accepted keys: automation_id, name,
                     name_contains, control_type, class_name, window_title,
-                    process_name, hwnd, index)
+                    window_title_contains, process_name, hwnd, index,
+                    scope); a selector with no window scope searches the
+                    FOREGROUND window (scope: foreground default / window /
+                    all_windows)
                 element_id: a RuntimeId from a previous find/inspect
                     ("42:1024" form) — resolves the live element by id
+                ref: a snapshot element ref, s<snapshot>:<index> (issue
+                    #137; the snapshot id may be hex, the index decimal) —
+                    resolves the element captured by that hyperv_ui_snapshot;
+                    a stale or unknown ref passes through as error_class
+                    stale_ref/unknown_ref pointing at a fresh snapshot,
+                    never retried
                 adapter: "" (default) or "electron" — refused
                     adapter_unapproved unless the registration carries the
                     adapter:electron capability
@@ -3392,18 +3639,24 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             citable as verified_state_receipt on a commit-guarded
             hyperv_console_click. Failed reads mint nothing.
             """
+            gate = _uia_prevalidate_result(
+                "hyperv_ui_find", {"selector": selector,
+                                   "element_id": element_id, "ref": ref})
+            if gate is not None:
+                return gate
             return _run_ui_tool(
                 "hyperv_ui_find", vm_name, "read", uia.find,
                 _cfg(), vm_name,
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
                 ref_arg=True,
-                selector=selector, element_id=element_id or None,
+                selector=selector, element_id=element_id or None, ref=ref,
                 adapter=adapter, vm_id=vm_id)
 
         @mcp.tool()
         def hyperv_ui_invoke(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", selector: dict | None = None,
-            element_id: str = "", lease_id: str = "", fencing_token: int = 0,
+            element_id: str = "", ref: str = "", lease_id: str = "",
+            fencing_token: int = 0,
             vm_id: str = "",
         ) -> dict:
             """Invoke a UIA pattern on the target element. Needs
@@ -3417,8 +3670,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 selector: UIA selector — address the target by exactly one
-                    of selector= or element_id=
+                    of selector=, element_id= or ref= (a selector with no
+                    window scope searches the FOREGROUND window; scope:
+                    foreground / window / all_windows)
                 element_id: a RuntimeId from a previous find/inspect
+                ref: a snapshot element ref, s<snapshot>:<index> (issue
+                    #137), as rendered by hyperv_ui_snapshot; a stale or
+                    unknown ref passes through as error_class
+                    stale_ref/unknown_ref, never retried
                 lease_id: optional lease citation (issue #23) — the lease
                     gate runs before the body
                 fencing_token: the lease's fencing token, with lease_id
@@ -3428,17 +3687,24 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Returns: {ok, invoked, pattern, session, helper?} or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
+            gate = _uia_prevalidate_result(
+                "hyperv_ui_invoke", {"selector": selector,
+                                     "element_id": element_id, "ref": ref})
+            if gate is not None:
+                return gate
             return _run_ui_tool(
                 "hyperv_ui_invoke", vm_name, "console_input", uia.invoke,
                 _cfg(), vm_name,
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
                 ref_arg=True,
-                selector=selector, element_id=element_id or None, vm_id=vm_id)
+                selector=selector, element_id=element_id or None, ref=ref,
+                vm_id=vm_id)
 
         @mcp.tool()
         def hyperv_ui_set_value(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", selector: dict | None = None, value: str = "",
-            element_id: str = "", lease_id: str = "", fencing_token: int = 0,
+            element_id: str = "", ref: str = "", lease_id: str = "",
+            fencing_token: int = 0,
             vm_id: str = "",
             secret_ref: str = "",
         ) -> dict:
@@ -3451,10 +3717,16 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 selector: UIA selector — address the target by exactly one
-                    of selector= or element_id=
+                    of selector=, element_id= or ref= (a selector with no
+                    window scope searches the FOREGROUND window; scope:
+                    foreground / window / all_windows)
                 value: the text to set (<= 64 KiB)
                 secret_ref: env:NAME or allowlisted file:PATH resolved host-side; the resolved value is set, only the length is reported (mutually exclusive with value)
                 element_id: a RuntimeId from a previous find/inspect
+                ref: a snapshot element ref, s<snapshot>:<index> (issue
+                    #137), as rendered by hyperv_ui_snapshot; a stale or
+                    unknown ref passes through as error_class
+                    stale_ref/unknown_ref, never retried
                 lease_id: optional lease citation (issue #23) — the lease
                     gate runs before the body
                 fencing_token: the lease's fencing token, with lease_id
@@ -3464,51 +3736,90 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Returns: {ok, length_set, pattern, session, helper?} or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
+            gate = _uia_prevalidate_result(
+                "hyperv_ui_set_value", {"selector": selector,
+                                        "element_id": element_id,
+                                        "ref": ref})
+            if gate is not None:
+                return gate
             return _run_ui_tool(
                 "hyperv_ui_set_value", vm_name, "console_input", uia.set_value,
                 _cfg(), vm_name,
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
                 ref_arg=True,
                 selector=selector, value=value,
-                element_id=element_id or None, vm_id=vm_id,
+                element_id=element_id or None, ref=ref, vm_id=vm_id,
                 secret_ref=secret_ref)
 
         @mcp.tool()
         def hyperv_ui_wait_for(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", selector: dict | None = None, gone: bool = False,
-            timeout_s: int = 30,
+            timeout_s: int = 30, element_id: str = "", ref: str = "",
+            value: str | None = None, value_contains: str | None = None,
+            state: dict | None = None,
             vm_id: str = "",
         ) -> dict:
-            """Wait for a selector to appear (or, with gone=true, disappear).
-            The wait runs as bounded guest-side slices (the per-VM lock is
-            never held across the whole wait); an expired budget returns the
-            last slice's answer (ok with empty elements / gone=false).
+            """Wait for a selector to appear (or, with gone=true, disappear),
+            or for a value/state predicate to hold on the resolved element
+            (issue #137). The wait runs as bounded guest-side slices (the
+            per-VM lock is never held across the whole wait); a present
+            element whose value/state does not match keeps the wait polling,
+            and an expired predicate budget returns the LAST observed
+            element with timed_out: true. Absence of a predicate is
+            expressed by omitting the parameter (default None) — an empty
+            string is a legitimate predicate value.
 
             Args:
                 vm_name: Name of the VM
-                selector: UIA selector waited for (accepted keys as find)
+                selector: UIA selector waited for (accepted keys as find;
+                    a selector with no window scope searches the FOREGROUND
+                    window; scope: foreground / window / all_windows)
                 gone: true waits for DISAPPEARANCE instead of appearance
                 timeout_s: wait budget in seconds (1..120, default 30)
+                element_id: a RuntimeId from a previous find/inspect —
+                    address the target by exactly one of selector=,
+                    element_id= or ref=
+                ref: a snapshot element ref, s<snapshot>:<index> (issue
+                    #137), as rendered by hyperv_ui_snapshot; a stale or
+                    unknown ref passes through as error_class
+                    stale_ref/unknown_ref, never retried
+                value: wait until the element's state.value equals this
+                    (empty string is a legitimate predicate; omit for none)
+                value_contains: wait until the element's state.value
+                    contains this substring
+                state: wait until every given element/state property
+                    matches (a non-empty dict; matching spans element-level
+                    properties and the nested state block)
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
             Policy: see the summary; denials return policy envelopes.
 
-            Returns: {ok, elements[] | gone, session, helper?, state_receipt} or
+            Returns: {ok, elements[] | gone, timed_out?, session, helper?, state_receipt} or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             A settled OR budget-expired successful wait carries state_receipt
             (issue #140): a receipt id citable as verified_state_receipt on a
             commit-guarded hyperv_console_click. Failed reads mint nothing.
             """
+            gate = _uia_prevalidate_result(
+                "hyperv_ui_wait_for", {"selector": selector,
+                                       "element_id": element_id, "ref": ref,
+                                       "state": state})
+            if gate is not None:
+                return gate
             return _run_ui_tool(
                 "hyperv_ui_wait_for", vm_name, "read", uia.wait_for,
                 _cfg(), vm_name,
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
                 ref_arg=True,
-                selector=selector, gone=gone, timeout_s=timeout_s, vm_id=vm_id)
+                selector=selector, gone=gone, timeout_s=timeout_s,
+                element_id=element_id or None, ref=ref,
+                value=value, value_contains=value_contains, state=state,
+                vm_id=vm_id)
 
         @mcp.tool()
         def hyperv_ui_focus(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", selector: dict | None = None,
-            element_id: str = "", lease_id: str = "", fencing_token: int = 0,
+            element_id: str = "", ref: str = "", lease_id: str = "",
+            fencing_token: int = 0,
             vm_id: str = "",
         ) -> dict:
             """Focus the target element. Needs destructive.ui_input; a locked
@@ -3517,8 +3828,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM
                 selector: UIA selector — address the target by exactly one
-                    of selector= or element_id=
+                    of selector=, element_id= or ref= (a selector with no
+                    window scope searches the FOREGROUND window; scope:
+                    foreground / window / all_windows)
                 element_id: a RuntimeId from a previous find/inspect
+                ref: a snapshot element ref, s<snapshot>:<index> (issue
+                    #137), as rendered by hyperv_ui_snapshot; a stale or
+                    unknown ref passes through as error_class
+                    stale_ref/unknown_ref, never retried
                 lease_id: optional lease citation (issue #23) — the lease
                     gate runs before the body
                 fencing_token: the lease's fencing token, with lease_id
@@ -3528,12 +3845,18 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Returns: {ok, focused, raised, session, helper?} or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
+            gate = _uia_prevalidate_result(
+                "hyperv_ui_focus", {"selector": selector,
+                                    "element_id": element_id, "ref": ref})
+            if gate is not None:
+                return gate
             return _run_ui_tool(
                 "hyperv_ui_focus", vm_name, "console_input", uia.focus,
                 _cfg(), vm_name,
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
                 ref_arg=True,
-                selector=selector, element_id=element_id or None, vm_id=vm_id)
+                selector=selector, element_id=element_id or None, ref=ref,
+                vm_id=vm_id)
 
         @mcp.tool()
         def hyperv_ui_session_state(  # type: ignore[misc]  # dual registration — see _register_tools
@@ -3555,6 +3878,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             id citable as verified_state_receipt on a commit-guarded
             hyperv_console_click. Failed reads mint nothing.
             """
+            gate = _uia_prevalidate_result("hyperv_ui_session_state", {})
+            if gate is not None:
+                return gate
             return _run_ui_tool(
                 "hyperv_ui_session_state", vm_name, "read", uia.session_state,
                 _cfg(), vm_name,
@@ -3601,6 +3927,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             lsa_secret_deleted, autologon_restored} — or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
+            gate = _uia_prevalidate_result("hyperv_ui_helper_provision", {})
+            if gate is not None:
+                return gate
             return _run_ui_tool(
                 "hyperv_ui_helper_provision", vm_name, "destructive",
                 uia.provision_helper,
@@ -3608,6 +3937,125 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
                 autologon=autologon, confirm=confirm, teardown=teardown,
                 vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_snapshot(  # type: ignore[misc]  # dual registration — see _register_tools
+            vm_name: str = "", selector: dict | None = None,
+            max_elements: int = 250, adapter: str = "",
+            vm_id: str = "",
+        ) -> dict:
+            """One compact element snapshot of one window through the
+            in-session helper (read verb, issue #137: vm policy + guest
+            credentials; the helper must be provisioned). The foreground
+            window by default; window selectors (hwnd / window_title /
+            window_title_contains / process_name) pick the window — a
+            selector with no window scope searches the FOREGROUND window
+            (scope: foreground / window / all_windows restores the breadth).
+            Returns snapshot_id plus one entry per element (ref /
+            control_type / name / state / rect / depth) and a rendered
+            "text" block with ONE compact line per element
+            (<ref> <ControlType> <Name> [<state-summary>] <rect>), entries
+            in order, indented by depth. The refs (grammar
+            s<snapshot>:<index>; the snapshot id may be hex, the index
+            decimal) are the element addresses for hyperv_ui_act and the
+            ref= parameter of the other element tools. A successful read
+            mints a state_receipt (issue #140).
+
+            Args:
+                vm_name: Name of the VM
+                selector: optional UIA selector picking the window
+                    (accepted keys: hwnd, window_title,
+                    window_title_contains, process_name, scope; a selector
+                    with no window scope searches the FOREGROUND window)
+                max_elements: element cap (1..500, default 250)
+                adapter: "" (default) or "electron" — an Electron adapter
+                    request is refused adapter_unapproved unless the helper
+                    registration carries the adapter:electron capability
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: see the summary; denials return policy envelopes.
+
+            Returns: {ok, snapshot_id, entries[], text, session, helper?,
+            state_receipt} or
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
+            Failed reads mint nothing.
+            """
+            gate = _uia_prevalidate_result(
+                "hyperv_ui_snapshot", {"selector": selector})
+            if gate is not None:
+                return gate
+            return _run_ui_tool(
+                "hyperv_ui_snapshot", vm_name, "read", uia.snapshot,
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
+                ref_arg=True,
+                selector=selector, max_elements=max_elements,
+                adapter=adapter, vm_id=vm_id)
+
+        @mcp.tool()
+        def hyperv_ui_act(  # type: ignore[misc]  # dual registration — see _register_tools
+            vm_name: str = "", selector: dict | None = None,
+            element_id: str = "", ref: str = "", action: str = "",
+            value: str | None = None, lease_id: str = "",
+            fencing_token: int = 0,
+            vm_id: str = "",
+        ) -> dict:
+            """One explicit element action (issue #137; mutating, lease-gated
+            — no confirm flag). The action set is closed: invoke, toggle_on,
+            toggle_off, select, expand, collapse, set_value, focus,
+            scroll_into_view, click. Every action requires
+            destructive.ui_input; click ADDITIONALLY requires
+            console_input (both refusals fire before any resolution or
+            transport leg). Address the target by exactly one of selector,
+            element_id or ref. The click action is the seam: the helper
+            validates the element is enabled, onscreen and exposes a
+            clickable point (not_actionable otherwise, NO input sent) and
+            the host dispatches exactly ONE synthetic-mouse click at the
+            returned point through the console input surface. set_value's
+            value rides the framed stdin payload only and the result
+            reports the length set, never the value.
+
+            Args:
+                vm_name: Name of the VM
+                selector: UIA selector — address the target by exactly one
+                    of selector=, element_id= or ref= (a selector with no
+                    window scope searches the FOREGROUND window; scope:
+                    foreground / window / all_windows)
+                element_id: a RuntimeId from a previous find/inspect
+                ref: a snapshot element ref, s<snapshot>:<index> (issue
+                    #137), as rendered by hyperv_ui_snapshot; a stale or
+                    unknown ref passes through as error_class
+                    stale_ref/unknown_ref, never retried — take a fresh
+                    hyperv_ui_snapshot
+                action: one of invoke, toggle_on, toggle_off, select,
+                    expand, collapse, set_value, focus, scroll_into_view,
+                    click
+                value: the text to set (set_value only, <= 64 KiB; rides
+                    the framed payload, never script text; the result
+                    reports the length only)
+                lease_id: optional lease citation (issue #23) — the lease
+                    gate runs before the body
+                fencing_token: the lease's fencing token, with lease_id
+                vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
+            Policy: destructive.ui_input for every action; the click action
+            additionally requires console_input; denials return policy envelopes.
+
+            Returns: {ok, action, pattern?, state?, point?/click? (the click
+            action), length_set? (set_value), session, helper?} or
+            {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
+            """
+            gate = _uia_prevalidate_result(
+                "hyperv_ui_act", {"selector": selector,
+                                  "element_id": element_id, "ref": ref,
+                                  "action": action, "value": value})
+            if gate is not None:
+                return gate
+            return _run_ui_tool(
+                "hyperv_ui_act", vm_name, "console_input", uia.act,
+                _cfg(), vm_name,
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
+                ref_arg=True,
+                selector=selector, element_id=element_id or None, ref=ref,
+                action=action, value=value, vm_id=vm_id)
 
 
     if creds_allowed:
@@ -3811,7 +4259,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 height: requested screenshot height in pixels (160..4096)
                 save_path: optional host path to also write the PNG/encoded image
                 ui_tree: also fetch a bounded guest UI element tree (needs credentials)
-                ui_tree_depth: tree walk depth, clamped to 1..6
+                ui_tree_depth: tree walk depth, clamped to 1..32
                 ui_tree_max_elements: element cap, clamped to 1..500
                 username: guest username for the UI-tree leg (or set HYPERV_GUEST_USERNAME)
                 password: guest password for the UI-tree leg (or set HYPERV_GUEST_PASSWORD)
@@ -4048,7 +4496,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 height: requested screenshot height in pixels (160..4096)
                 save_path: optional host path to also write the encoded image
                 ui_tree: also fetch a bounded guest UI element tree (needs credentials)
-                ui_tree_depth: tree walk depth, clamped to 1..6
+                ui_tree_depth: tree walk depth, clamped to 1..32
                 ui_tree_max_elements: element cap, clamped to 1..500
                 format:  png (default), jpeg/jpg, or webp; an unsupported format
                          is refused as an invalid-input error
@@ -4510,8 +4958,102 @@ TOOL_SCOPES: dict[str, str] = {
     "hyperv_ui_invoke": "console",
     "hyperv_ui_set_value": "console",
     "hyperv_ui_focus": "console",
+    "hyperv_ui_act": "console",
     "hyperv_ui_helper_provision": "console",
 }
+
+
+def _uia_prevalidate(tool: str, arguments: dict) -> None:
+    """Server-path prevalidation for the hyperv_ui_* tools (issue #137 F4).
+
+    Refuses invalid policy and invalid element arguments BEFORE the
+    wrapper's VM-resolution leg and before any transport leg, so a
+    refusal spawns no PowerShell at all. The checks MIRROR the uia
+    layer's own gates by calling the same seams
+    (``uia._ACTIONS`` / ``uia.validate_selector`` / ``uia._validate_ref``
+    / ``uia._check_element_op``), so both layers stay identical: the
+    server path just fires them earlier (by-id calls resolve the VM
+    inside _run_ui_tool, which would otherwise spawn PowerShell before
+    the verb's own validation runs).
+
+    For hyperv_ui_act the policy gates run FIRST -- ui_input before the
+    click-only console_input gate (the ordering the frozen checks pin
+    via the refusal's category) -- then the closed action set, the
+    exactly-one-address rule and the act value rules. For
+    find/invoke/set_value/focus/wait_for: the selector scope set, the
+    ref grammar and the exactly-one-address rule (wait_for's state
+    predicate must be a non-empty dict when given). For
+    snapshot/inspect: the selector scope set alone. session_state and
+    helper_provision have nothing to prevalidate.
+
+    Raises policy.PolicyDenied or ValueError; returns None when the
+    call may proceed to resolution.
+    """
+    selector = arguments.get("selector")
+    element_id = arguments.get("element_id") or None
+    ref = arguments.get("ref") or None
+    if tool == "hyperv_ui_act":
+        cfg = _cfg()
+        action = str(arguments.get("action") or "")
+        # Policy BEFORE everything else, ui_input FIRST and the
+        # click-only console_input gate second (issue #137's ordering pin).
+        policy.require_category(cfg, "ui_input", f"act {action!r}")
+        if action == "click":
+            policy.require_category(cfg, "console_input", "act click")
+        if action not in uia._ACTIONS:
+            raise ValueError(
+                f"unknown action: {action!r} (allowed: "
+                f"{', '.join(sorted(uia._ACTIONS))})")
+        ref_id = uia._validate_ref(ref) if ref else None
+        uia._check_element_op(selector, element_id, ref_id)
+        if selector is not None:
+            uia.validate_selector(selector)
+        value = arguments.get("value")
+        if action == "set_value":
+            if value is None:
+                raise ValueError("act set_value requires value=")
+        elif value is not None:
+            raise ValueError("value= applies only to the set_value action")
+        return
+    if tool in ("hyperv_ui_find", "hyperv_ui_invoke",
+                "hyperv_ui_set_value", "hyperv_ui_focus",
+                "hyperv_ui_wait_for"):
+        if selector is not None:
+            uia.validate_selector(selector)
+        ref_id = uia._validate_ref(ref) if ref else None
+        uia._check_element_op(selector, element_id, ref_id)
+        if tool == "hyperv_ui_wait_for":
+            state = arguments.get("state")
+            if state is not None and (not isinstance(state, dict)
+                                      or not state):
+                raise ValueError(
+                    "state must be a non-empty mapping of element or "
+                    "state properties to match")
+        return
+    if tool in ("hyperv_ui_snapshot", "hyperv_ui_inspect"):
+        if selector is not None:
+            uia.validate_selector(selector)
+        return
+    # hyperv_ui_session_state / hyperv_ui_helper_provision: nothing to
+    # prevalidate before resolution.
+
+
+def _uia_prevalidate_result(tool: str, arguments: dict) -> Any:
+    """Run _uia_prevalidate for one wrapper call; None when it may proceed.
+
+    A refusal is returned as the tool's failure envelope instead of
+    raising out of the tool body (the MINOR-13 doctrine: gates answer,
+    they never raise), so the server path behaves identically on every
+    SDK generation and every refusal is one JSON envelope. The return is
+    the wrappers' dual shape — None (proceed) or a CallToolResult — which
+    is why the annotation is Any, matching the unannotated _run_ui_tool
+    convention these wrappers already return alongside their `-> dict`.
+    """
+    try:
+        _uia_prevalidate(tool, arguments)
+    except (ValueError, policy.PolicyDenied) as exc:
+        return errors.failure_result(errors.envelope(exc))
+    return None
 
 
 def _row_vm_allowed(cfg: Config, row) -> bool:

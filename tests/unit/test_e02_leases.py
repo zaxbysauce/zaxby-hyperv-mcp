@@ -54,7 +54,8 @@ _SRC = Path(__file__).resolve().parents[2] / "src"
 # against the 57-tool surface of the day yielded 36 — the enumerated set
 # below IS the contract. Issue #29 added the four lease-gated console-scope
 # UI tools (invoke/set_value/focus/helper_provision), bringing the surface
-# to 80 tools and this list to 42.
+# to 80 tools and this list to 42; issue #137's hyperv_ui_act (console
+# scope, lease-gated, no confirm) makes it 43.
 LEASED_TOOLS = [
     # lifecycle (17)
     "hyperv_start_vm",
@@ -97,11 +98,12 @@ LEASED_TOOLS = [
     "hyperv_console_click",
     "hyperv_console_button",
     "hyperv_console_scroll",
-    # console-scope UIA mutation (4, issue #29)
+    # console-scope UIA mutation (4, issue #29; act joined with #137)
     "hyperv_ui_invoke",
     "hyperv_ui_set_value",
     "hyperv_ui_focus",
     "hyperv_ui_helper_provision",
+    "hyperv_ui_act",
 ]
 
 # The 19 destructive tools whose `confirm` gate must survive the lease work

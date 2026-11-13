@@ -1194,12 +1194,15 @@ def test_helper_session_block_lock_is_per_response_fresh(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_inspect_clamps_match_the_documented_bounds(clean_uia_state, monkeypatch):
-    """PRR-117d (clamp unification): ONE clamp for both tree paths. The
-    helper path (uia.inspect) clamps its framed request to depth 1..6 and
-    max_elements 1..500 — the numbers the tool docstrings and evidence's
-    PS Direct walk (frozen pins) promise. The old helper-path divergence
-    (1..8 / 1..2000) is gone, and the two modules' constants are pinned
-    EQUAL so they cannot drift apart again."""
+    """PRR-117d (clamp unification, extended by issue #136): ONE clamp for
+    both tree paths. The helper path (uia.inspect) clamps its framed
+    request to depth 1..32 and max_elements 1..500 — depth 32 because the
+    Electron/Chromium accessibility tree lives deeper than the old 6
+    (#136 AC9 records the depth actually needed); the numbers the tool
+    docstrings and evidence's PS Direct walk (frozen pins) promise. The
+    old helper-path divergence (1..8 / 1..2000) is gone, and the two
+    modules' constants are pinned EQUAL so they cannot drift apart
+    again."""
     monkeypatch.setattr(pswindows, "run_ps", PSResolveRecorder())
     monkeypatch.setattr(uia, "_run_quser",
                         lambda cfg, ref, cred: {"user": "tester", "session_id": 2})
@@ -1214,7 +1217,7 @@ def test_inspect_clamps_match_the_documented_bounds(clean_uia_state, monkeypatch
     inspect_requests = [r for r in legs.requests if r.get("verb") == "inspect"]
     assert inspect_requests, legs.requests
     args = inspect_requests[0].get("args") or {}
-    assert args.get("depth") == uia.INSPECT_MAX_DEPTH == 6, args
+    assert args.get("depth") == uia.INSPECT_MAX_DEPTH == 32, args
     assert args.get("max_elements") == uia.INSPECT_MAX_ELEMENTS == 500, args
     assert (uia.INSPECT_MAX_DEPTH, uia.INSPECT_MAX_ELEMENTS) == (
         evidence._UIA_MAX_DEPTH, evidence._UIA_MAX_ELEMENTS), (

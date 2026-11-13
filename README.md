@@ -1,7 +1,7 @@
 # hyperv-mcp (hardened fork)
 
 An MCP (Model Context Protocol) server for Hyper-V VM management and guest
-execution. Exposes 82 tools for VM lifecycle, checkpoint management, kernel
+execution. Exposes 84 tools for VM lifecycle, checkpoint management, kernel
 debug setup (KDNET/KDCOM), and guest file transfer/command execution via
 PowerShell Direct (no WinRM required).
 
@@ -184,7 +184,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.18.0 today) instead of
+  package's version (0.19.0 today) instead of
   the SDK's (the release contract, the complete bump-site
   enumeration, and how to read `version`/`git_revision` live in
   [docs/versioning-policy.md](docs/versioning-policy.md)).
@@ -234,6 +234,46 @@ definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
 
+## 0.19.0 changes
+
+- **UIA element contract (#136/#137):** the `hyperv_ui_*` family gains a
+  snapshot/act element-reference contract and a scoped tree search.
+  `hyperv_ui_inspect` now walks depth <= 32 with at most 500 elements (the
+  packaged helper enforces the same ceilings), reads are batched through a
+  CacheRequest (never a per-element `GetSupportedPatterns` round trip), the
+  walk never searches the desktop root's descendants, and an element marked
+  `is_password` never returns its value (the host drops every `value` key
+  from password-flagged elements). BEHAVIOR CHANGE: a selector with no
+  window scope now searches the FOREGROUND window, not every top-level
+  window — the closed `scope` key (`foreground` (default) / `window` /
+  `all_windows`) picks the breadth, and `scope: "all_windows"` restores the
+  old desktop-wide search; `window_title_contains` is a new selector key
+  forwarded to the helper unchanged. Two tools join the family (82 -> 84):
+  `hyperv_ui_snapshot` (read) captures ONE window into `snapshot_id` +
+  entries plus a rendered `text` block with one compact line per element
+  (`<ref> <ControlType> <Name> [<state-summary>] <rect>`, indented by
+  depth, bounded at 12 capture levels (deeper descendants are skipped by design; `hyperv_ui_inspect` reaches 32), and `hyperv_ui_act` (mutating, lease-gated: `lease_id` +
+  `fencing_token`, no confirm) performs one explicit action from the closed
+  set invoke / toggle_on / toggle_off / select / expand / collapse /
+  set_value / focus / scroll_into_view / click. Every act action requires
+  `destructive.ui_input`; the `click` action ADDITIONALLY requires
+  `console_input` (both refusals fire before any resolution or transport
+  leg, ui_input first); the click answer's helper-validated point is where
+  the host dispatches exactly one synthetic-mouse click (a
+  not-actionable element gets no input). The snapshot entries' refs
+  (`s<snapshot>:<index>` grammar; the snapshot id may be hex, the index
+  decimal) are the element addresses: `hyperv_ui_find` / `invoke` /
+  `set_value` / `focus` / `wait_for` accept `ref=` alongside `selector` /
+  `element_id` (exactly one of the three, enforced server-side before any
+  leg), and a helper `stale_ref` / `unknown_ref` verdict passes through
+  as its own `error_class` pointing at a fresh `hyperv_ui_snapshot`, never
+  retried. `hyperv_ui_wait_for` additionally settles on predicates:
+  `value=` (exact, the empty string is a legitimate value),
+  `value_contains=` (substring), and `state=` (a non-empty dict matched
+  against the element's state block and its top-level properties); expiry
+  returns the LAST observed element with `timed_out: true`.
+- Version bump: 0.18.0 -> 0.19.0.
+
 ## 0.18.0 changes
 
 - **Named-secret typing (#130):** `hyperv_console_type_text` and
@@ -275,7 +315,8 @@ the task-spawned controller reads it from the environment.
   up-to-date record of a real drift is still a failure), and when a
   `verify-checkpoint` exits nonzero with no CHANGED lines (a broken local
   setup fails the gate instead of rendering clean). The tool inventory is
-  82 tools (80 through PR #112, plus the two new console tools).
+  84 tools (80 through PR #112, the two new console tools, and the #137
+  UIA element-contract pair).
 - Version bump: 0.17.0 -> 0.18.0.
 
 ## 0.17.0 changes
@@ -2154,7 +2195,7 @@ reaches every tool's audit row but never the relay path.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_capture_evidence` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `ui_tree=false`, `ui_tree_depth=3` (clamped 1..6), `ui_tree_max_elements=200` (clamped 1..500), `format?` (png\|jpeg/jpg\|webp), `quality?` (1..100), `scale?` (0,1], `crop?` ([left,top,right,bottom]), `if_changed_from?` (frame_hash) | `[ImageContent, TextContent(meta)]` — metadata alone when `if_changed_from` matches (the UI-tree leg is skipped too, and `meta.ui_tree` says why) |
+| `hyperv_capture_evidence` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `ui_tree=false`, `ui_tree_depth=3` (clamped 1..32), `ui_tree_max_elements=200` (clamped 1..500), `format?` (png\|jpeg/jpg\|webp), `quality?` (1..100), `scale?` (0,1], `crop?` ([left,top,right,bottom]), `if_changed_from?` (frame_hash) | `[ImageContent, TextContent(meta)]` — metadata alone when `if_changed_from` matches (the UI-tree leg is skipped too, and `meta.ui_tree` says why) |
 
 One call pairing the console screenshot with `captured_at` (UTC ISO-8601),
 `vm_id`, capture dimensions, `frame_hash`, and — when `ui_tree=true` — a
@@ -2183,19 +2224,26 @@ unchanged result is exactly as informative about the request as a changed one.
 
 ### In-session UI Automation helper (0.7.0, issue #29)
 
-Eight `hyperv_ui_*` tools drive the guest's interactive desktop BY ELEMENT
+Ten `hyperv_ui_*` tools drive the guest's interactive desktop BY ELEMENT
 instead of by screen coordinates. They require guest credentials (like every
 PowerShell Direct tool) and the `hyperv-mcp-uia-helper` PowerShell process
 running inside the guest's interactive session; it serves UI Automation
 requests on a local named pipe that the host reaches through PowerShell
-Direct.
+Direct. Element tools address their target by exactly one of `selector=`,
+`element_id=` or `ref=` (a snapshot ref, grammar `s<snapshot>:<index>`; a
+`stale_ref`/`unknown_ref` verdict passes through as its own error_class
+pointing at a fresh `hyperv_ui_snapshot`, never retried). A selector with
+no window scope searches the FOREGROUND window; the closed `scope` key
+(`foreground` (default) / `window` / `all_windows`) picks the breadth.
 
 | Tool | Policy | Purpose |
 | --- | --- | --- |
-| `hyperv_ui_inspect` | vm policy + credentials | bounded UIA element tree (depth <= 8, 2000 elements) |
-| `hyperv_ui_find` | vm policy + credentials | resolve elements by selector or element_id |
-| `hyperv_ui_wait_for` | vm policy + credentials | wait for a selector to appear / disappear |
+| `hyperv_ui_inspect` | vm policy + credentials | bounded UIA element tree (depth <= 32, 500 elements) |
+| `hyperv_ui_find` | vm policy + credentials | resolve elements by selector, element_id or snapshot ref |
+| `hyperv_ui_snapshot` | vm policy + credentials | one compact window snapshot: `snapshot_id` + entries + a rendered `text` block (one `<ref> <ControlType> <Name> [<state-summary>] <rect>` line per element, indented by depth); the refs address `hyperv_ui_act` and the other element tools |
+| `hyperv_ui_wait_for` | vm policy + credentials | wait for a selector to appear / disappear, or for `value`/`value_contains`/`state` predicates to hold on the resolved element (expiry returns the last observed element with `timed_out: true`) |
 | `hyperv_ui_session_state` | vm policy + credentials | active session, interactive user, locked, foreground window, helper version |
+| `hyperv_ui_act` | `ui_input` (+ `console_input` for the `click` action); lease-gated, no confirm | one explicit action from the closed set invoke/toggle_on/toggle_off/select/expand/collapse/set_value/focus/scroll_into_view/click; the click action validates a clickable point in the helper and dispatches exactly one synthetic-mouse click at it (not_actionable sends no input); set_value rides the framed payload and reports the length only |
 | `hyperv_ui_invoke` | `ui_input` | Invoke/Toggle/SelectionItem/ExpandCollapse on an element |
 | `hyperv_ui_set_value` `secret_ref?` (0.18.0: `env:NAME` allowlisted by `secret_env_names`, or policy-allowlisted `file:PATH`; mutually exclusive with `value`; the resolved value is set, only the length is reported) | `ui_input` | set a Value-pattern property (result reports the length, never the value) |
 | `hyperv_ui_focus` | `ui_input` | focus an element (locked sessions refuse: `no_interactive_desktop` — as do invoke and set_value) |
@@ -2310,7 +2358,8 @@ sequence size).
 
 **The receipt channel (`verified_state_receipt`, issue #140).** A guarded
 click may instead cite a UIA state-read receipt: `hyperv_ui_inspect`,
-`hyperv_ui_find`, `hyperv_ui_wait_for`, and `hyperv_ui_session_state`
+`hyperv_ui_find`, `hyperv_ui_wait_for`, `hyperv_ui_snapshot`, and
+`hyperv_ui_session_state`
 return a `state_receipt` id on every successful read, and a
 `commit_guard=true` click accepts `verified_state_receipt=<id>` in place
 of `verified_frame_hash` — exactly one channel per click (citing both is a
@@ -2328,7 +2377,8 @@ A successful UIA read holds the per-VM
 console-input exclusion across its helper leg, its parse, and its receipt
 stamp — on both the GUID and the caller-name key spellings — so no console
 input can dispatch between the observation and the stamp, and the UIA
-mutating tools (`hyperv_ui_invoke`/`hyperv_ui_set_value`/`hyperv_ui_focus`)
+mutating tools (`hyperv_ui_invoke`/`hyperv_ui_set_value`/`hyperv_ui_focus`/
+`hyperv_ui_act`)
 bump the same ledger at their dispatch seam (dispatched legs bump even when
 the result is unknowable — timeout/transport error — while pre-dispatch
 refusals never bump; a UIA write after the read therefore stales the

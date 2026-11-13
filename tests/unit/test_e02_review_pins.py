@@ -330,6 +330,7 @@ def test_tool_scopes_map_is_pinned():
         "hyperv_ui_invoke": "console",
         "hyperv_ui_set_value": "console",
         "hyperv_ui_focus": "console",
+        "hyperv_ui_act": "console",  # issue #137: lease-gated, no confirm
         "hyperv_ui_helper_provision": "console",
     }
     assert TOOL_SCOPES == expected, (

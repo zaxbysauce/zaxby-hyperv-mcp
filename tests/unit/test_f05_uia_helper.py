@@ -280,7 +280,8 @@ def test_request_verbs_are_closed_set():
     from hyperv_mcp import uia
 
     assert uia.VERBS == {"inspect", "find", "invoke", "set_value",
-                         "wait_for", "focus", "session_state"}
+                         "wait_for", "focus", "session_state",
+                         "snapshot", "act"}
     with pytest.raises(ValueError, match="verb"):
         uia.build_request("runspace", args={})
     req = uia.build_request("inspect", args={"selector": {"name": "Desktop"}},

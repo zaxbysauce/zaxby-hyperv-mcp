@@ -51,6 +51,7 @@ import contextvars
 import hashlib
 import json
 import math
+import re
 import threading
 import time
 import uuid
@@ -64,8 +65,8 @@ from .vmlocks import vm_lock
 
 HELPER_VERSION = "1"
 VERBS = {"inspect", "find", "invoke", "set_value", "wait_for", "focus",
-         "session_state"}
-MUTATING_VERBS = {"invoke", "set_value", "focus"}
+         "session_state", "snapshot", "act"}
+MUTATING_VERBS = {"invoke", "set_value", "focus", "act"}
 
 # Issue #140: internal callers whose reads are consumed-and-discarded
 # (evidence's UI-tree probe) must not churn the receipt registry with
@@ -96,9 +97,20 @@ _MAX_SELECTOR_FIELD = 1024
 _MAX_VALUE_BYTES = 64 * 1024
 _SELECTORS = {
     "automation_id", "name", "name_contains", "control_type", "class_name",
-    "window_title", "process_name", "hwnd", "element_id", "index",
+    "window_title", "window_title_contains", "process_name", "hwnd",
+    "element_id", "index", "scope",
 }
+_SCOPES = {"foreground", "window", "all_windows"}
 _ADAPTERS = {"", "electron"}
+
+# Issue #137: a snapshot-bound element ref, s<snapshot-id>:<index> -- the
+# snapshot id is the helper's hex token, the index decimal.
+_REF_RE = re.compile(r"^s[0-9a-fA-F]+:[0-9]+$")
+
+#: hyperv_ui_act's closed action set (issue #137): anything else is refused
+#: before any transport leg.
+_ACTIONS = {"invoke", "toggle_on", "toggle_off", "select", "expand",
+            "collapse", "set_value", "focus", "scroll_into_view", "click"}
 
 #: One wait_for slice: the guest polls inside a single pipe request for at
 #: most this long, then the host re-slices without holding the VM lock
@@ -107,12 +119,14 @@ _ADAPTERS = {"", "electron"}
 _WAIT_SLICE_S = 10
 _WAIT_POLL_S = 0.25
 
-#: The inspect bounds (PRR-117): ONE clamp for BOTH tree paths — the
-#: helper path here and evidence's PS Direct walk (evidence._UIA_MAX_DEPTH
-#: / _UIA_MAX_ELEMENTS carry the same numbers). The tool docstrings
-#: promise 1..6 / 1..500; the host clamps before the request leaves, and
+#: The inspect bounds (PRR-117, extended by issue #136): ONE clamp for
+#: BOTH tree paths — the helper path here and evidence's PS Direct walk
+#: (evidence._UIA_MAX_DEPTH / _UIA_MAX_ELEMENTS carry the same numbers).
+#: Depth 32: the Electron/Chromium accessibility tree lives deeper than
+#: 6 levels (#136 AC9 records the depth actually needed); 500 elements
+#: stays the real bound. The host clamps before the request leaves, and
 #: the packaged helper enforces the same ceiling on its side.
-INSPECT_MAX_DEPTH = 6
+INSPECT_MAX_DEPTH = 32
 INSPECT_MAX_ELEMENTS = 500
 
 
@@ -153,7 +167,11 @@ def validate_selector(selector: Any) -> dict:
 
     Empty (or None) selectors and unknown keys raise ValueError naming
     "selector"; an individual field longer than 1024 characters raises
-    ValueError naming the field.
+    ValueError naming the field. The optional ``scope`` key is a closed
+    set (issue #136): ``foreground`` (the default when no window is
+    named), ``window`` (implied by hwnd/window_title/window_title_contains),
+    ``all_windows``; anything else raises ValueError NAMING the invalid
+    value.
     """
     if not isinstance(selector, dict) or not selector:
         raise ValueError(
@@ -163,6 +181,11 @@ def validate_selector(selector: Any) -> dict:
         raise ValueError(
             f"unknown selector key(s): {sorted(unknown)} "
             f"(allowed: {', '.join(sorted(_SELECTORS))})")
+    scope = selector.get("scope")
+    if scope is not None and scope not in _SCOPES:
+        raise ValueError(
+            f"invalid selector scope {scope!r} (allowed: "
+            f"{', '.join(sorted(_SCOPES))})")
     for key, value in selector.items():
         if isinstance(value, str) and len(value) > _MAX_SELECTOR_FIELD:
             raise ValueError(f"selector field {key!r} exceeds "
@@ -170,11 +193,25 @@ def validate_selector(selector: Any) -> dict:
     return dict(selector)
 
 
-def _check_element_op(selector: Any, element_id: Any) -> None:
-    """invoke/set_value/focus address exactly one of selector | element_id."""
-    if (selector is None) == (element_id is None):
+def _check_element_op(selector: Any, element_id: Any = None,
+                      ref: Any = None) -> None:
+    """Element verbs address exactly one of selector | element_id | ref
+    (issue #137 widened the pair rule to the three-way rule)."""
+    given = [a for a in (selector, element_id, ref) if a is not None]
+    if len(given) != 1:
         raise ValueError(
-            "address the target by exactly one of selector= or element_id=")
+            "address the target by exactly one of selector=, element_id= "
+            "or ref=")
+
+
+def _validate_ref(ref: Any) -> str:
+    """Validate the s<snapshot>:<index> ref grammar; return it as str."""
+    text = str(ref or "")
+    if not _REF_RE.match(text):
+        raise ValueError(
+            f"invalid element ref {text!r} (expected s<snapshot>:<index>, "
+            "as returned by hyperv_ui_snapshot)")
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -1175,6 +1212,61 @@ def _transport_failure(exc: Exception, cfg, ref, cred: CredentialSet) -> dict:
             "session": _fallback_block(cfg, ref, cred)}
 
 
+def _strip_password_values(node: Any) -> None:
+    """Issue #136 (defense in depth): remove every ``value`` key at ANY
+    depth under ``node``. Applied to every element of an element-returning
+    answer when that element is marked a password field (element-level or
+    inside its ``state`` block) — a misbehaving helper must not be able to
+    smuggle a password's value through the host."""
+    if isinstance(node, dict):
+        for key in [k for k in node if k == "value"]:
+            del node[key]
+        for child in node.values():
+            _strip_password_values(child)
+    elif isinstance(node, list):
+        for item in node:
+            _strip_password_values(item)
+
+
+def _is_password_element(element: Any) -> bool:
+    if not isinstance(element, dict):
+        return False
+    state = element.get("state")
+    return bool(element.get("is_password")) or (
+        isinstance(state, dict) and bool(state.get("is_password")))
+
+
+def _sanitize_elements(out: dict) -> dict:
+    """Issue #136: apply the password-value drop to every element list of
+    a successful answer (find/inspect/wait_for/snapshot share this seam).
+    """
+    if out.get("ok") is not True:
+        return out
+    for key in ("elements", "entries"):
+        items = out.get(key)
+        if isinstance(items, list):
+            for element in items:
+                if _is_password_element(element):
+                    _strip_password_values(element)
+            # password drops can touch nested trees in inspect answers
+    tree = out.get("tree")
+    if isinstance(tree, dict):
+        _sanitize_password_tree(tree)
+    return out
+
+
+def _sanitize_password_tree(node: Any) -> None:
+    """Recursive variant for inspect's nested element tree."""
+    if not isinstance(node, dict):
+        return
+    if _is_password_element(node):
+        _strip_password_values(node)
+    children = node.get("children")
+    if isinstance(children, list):
+        for child in children:
+            _sanitize_password_tree(child)
+
+
 def _frame_out(frame: Any, cfg, ref, cred: CredentialSet) -> dict:
     """Finish a helper frame into the verb answer (fallback legs inside)."""
     if not isinstance(frame, dict) or not isinstance(frame.get("ok"), bool):
@@ -1194,16 +1286,57 @@ def _frame_out(frame: Any, cfg, ref, cred: CredentialSet) -> dict:
         # answer["helper"]. The frame's own running value is preserved
         # (never forced true); sha256_match rides along when reported.
         out["helper"] = dict(helper)
-    return out
+    return _sanitize_elements(out)
 
 
-def _wait_answered(out: dict, gone: bool) -> bool:
-    """Whether a wait_for slice's answer settles the wait."""
+def _wait_answered(out: dict, gone: bool,
+                   predicate: dict | None = None) -> bool:
+    """Whether a wait_for slice's answer settles the wait.
+
+    With a predicate (issue #137), the answer settles only when a returned
+    element MATCHES: matching spans element-level properties AND the
+    nested ``state`` block (state keys take precedence on collision).
+    """
     if out.get("ok") is not True:
         return True  # errors stop the poll
     if gone:
         return bool(out.get("gone"))
-    return bool(out.get("elements"))
+    elements = out.get("elements")
+    if not isinstance(elements, list) or not elements:
+        return False
+    if predicate is None:
+        return True
+    return any(_element_matches(el, predicate) for el in elements
+               if isinstance(el, dict))
+
+
+def _element_matches(element: dict, predicate: dict) -> bool:
+    """One element against one wait predicate: every predicate key must
+    match — element-level properties first, the nested ``state`` block
+    overriding on key collision (issue #137 design 5's {"enabled": true}
+    is element-level). ``value_contains`` is a MATCHER, not a property: it
+    substring-tests the element's value (state block first, element-level
+    fallback)."""
+    contains = predicate.get("value_contains")
+    for key, wanted in predicate.items():
+        if key == "value_contains":
+            continue
+        state = element.get("state")
+        if isinstance(state, dict) and key in state:
+            actual = state.get(key)
+        else:
+            actual = element.get(key)
+        if actual != wanted:
+            return False
+    if contains is not None:
+        state = element.get("state")
+        if isinstance(state, dict) and "value" in state:
+            actual = state.get("value")
+        else:
+            actual = element.get("value")
+        if actual is None or contains not in str(actual):
+            return False
+    return True
 
 
 @contextmanager
@@ -1262,7 +1395,9 @@ def _read_console_exclusion(ref, mode: str) -> Iterator[None]:
 
 def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
                   *, shared_vm: bool = False, selector: Any = None,
-                  element_id: Any = None, adapter: str = "") -> dict:
+                  element_id: Any = None, adapter: str = "",
+                  ref_id: str | None = None,
+                  predicate: dict | None = None) -> dict:
     """Run one verb: gates, per-leg VM lock, wait_for slice polling.
 
     The mutating verbs ALWAYS consult the #28 actor/lease gate (F10a: the
@@ -1278,6 +1413,8 @@ def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
         request["selector"] = validate_selector(selector)
     if element_id is not None:
         request["element_id"] = str(element_id)
+    if ref_id is not None:
+        request["ref"] = ref_id
     if adapter:
         if adapter not in _ADAPTERS:
             raise ValueError(f"unknown adapter: {adapter!r}")
@@ -1333,6 +1470,20 @@ def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
                         OSError) as exc:
                     return _transport_failure(exc, cfg, ref, cred)
                 out = _frame_out(frame, cfg, ref, cred)
+                # Issue #137: a helper ref-verdict on a ref-addressed call
+                # PASSES THROUGH as its own error_class (never collapsed,
+                # never retried) -- and the host appends the actionable
+                # hint, telling the caller to take a fresh snapshot.
+                if (ref_id is not None and out.get("ok") is False
+                        and str(out.get("error_class") or "")
+                        in ("stale_ref", "unknown_ref")
+                        and "hyperv_ui_snapshot"
+                        not in str(out.get("error") or "")):
+                    out = {**out, "error": (
+                        str(out.get("error") or "").rstrip(". ")
+                        + " -- the ref no longer resolves; take a fresh "
+                          "hyperv_ui_snapshot and re-address the element "
+                          "by its new ref")}
                 # Issue #140 receipt mint (A2): ONLY a SUCCESSFUL READ
                 # leg mints, and the stamp is drawn INSIDE the exclusion
                 # region so no input dispatch can interleave between this
@@ -1352,11 +1503,12 @@ def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
                         and out.get("ok") is True):
                     out = {**out, "state_receipt": console.record_state_read(
                         vm_name=ref.name, vm_id=ref.id)}
-            if deadline is None or _wait_answered(out, gone):
+            if deadline is None or _wait_answered(out, gone, predicate):
                 if deadline is not None:
                     # PRR-117: the flag rides BOTH settled outcomes — False
-                    # when the wait was answered (a hit, an error, or a
-                    # gone verdict), True only on the budget-expiry path.
+                    # when the wait was answered (a hit, an error, a gone
+                    # verdict, or a predicate match), True only on the
+                    # budget-expiry path.
                     out = {**out, "timed_out": False}
                 return out
             remaining = deadline - time.monotonic()
@@ -1400,44 +1552,49 @@ def inspect(cfg, vm_name="", cred: CredentialSet | None = None,
 
 
 def find(cfg, vm_name="", cred: CredentialSet | None = None,
-         selector: Any = None, *, element_id: Any = None, vm_id: str = "",
-         adapter: str = ""):
-    """Resolve elements by selector (read verb). A successful read carries
-    ``state_receipt`` (issue #140 — the #126 commit guard's second
-    verification channel)."""
+         selector: Any = None, *, element_id: Any = None, ref: str = "",
+         vm_id: str = "", adapter: str = ""):
+    """Resolve elements by selector, element_id or snapshot ref (read
+    verb). A successful read carries ``state_receipt`` (issue #140 — the
+    #126 commit guard's second verification channel). A helper
+    stale_ref/unknown_ref answer for a ref-addressed call passes through
+    verbatim (never retried, no further frame)."""
     if cred is None:
         from .credentials import CredentialError
 
         raise CredentialError("guest credentials are required for UI verbs")
     if adapter not in _ADAPTERS:
         raise ValueError(f"unknown adapter: {adapter!r}")
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id) if not isinstance(
-        vm_name, vmident.VMRef) else vm_name
-    return _verb_request(cfg, ref, cred, "find", {},
+    ref_id = _validate_ref(ref) if ref else None
+    _check_element_op(selector, element_id, ref_id)
+    vmref = (vm_name if isinstance(vm_name, vmident.VMRef)
+             else vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id))
+    return _verb_request(cfg, vmref, cred, "find", {},
                          selector=selector, element_id=element_id,
-                         adapter=adapter)
+                         ref_id=ref_id, adapter=adapter)
 
 
 def invoke(cfg, vm_name="", cred: CredentialSet | None = None,
-           selector: Any = None, *, element_id: Any = None, vm_id: str = "",
-           shared_vm: bool = False):
+           selector: Any = None, *, element_id: Any = None, ref: str = "",
+           vm_id: str = "", shared_vm: bool = False):
     """Invoke a UIA pattern on the target element (mutating; ui_input)."""
     policy.require_category(cfg, "ui_input", f"invoke on '{vm_name}'")
     if cred is None:
         from .credentials import CredentialError
 
         raise CredentialError("guest credentials are required for UI verbs")
-    _check_element_op(selector, element_id)
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id) if not isinstance(
-        vm_name, vmident.VMRef) else vm_name
-    return _verb_request(cfg, ref, cred, "invoke", {},
+    ref_id = _validate_ref(ref) if ref else None
+    _check_element_op(selector, element_id, ref_id)
+    vmref = (vm_name if isinstance(vm_name, vmident.VMRef)
+             else vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id))
+    return _verb_request(cfg, vmref, cred, "invoke", {},
                          shared_vm=shared_vm, selector=selector,
-                         element_id=element_id)
+                         element_id=element_id, ref_id=ref_id)
 
 
 def set_value(cfg, vm_name="", cred: CredentialSet | None = None,
               selector: Any = None, value: Any = None, *,
-              element_id: Any = None, vm_id: str = "",
+              element_id: Any = None, ref: str = "", vm_id: str = "",
               secret_ref: str = "",
               shared_vm: bool = False):
     """Set a UIA Value-pattern property (mutating; ui_input).
@@ -1453,7 +1610,8 @@ def set_value(cfg, vm_name="", cred: CredentialSet | None = None,
         from .credentials import CredentialError
 
         raise CredentialError("guest credentials are required for UI verbs")
-    _check_element_op(selector, element_id)
+    ref_id = _validate_ref(ref) if ref else None
+    _check_element_op(selector, element_id, ref_id)
     # The registered tool passes value="" by default (reviewer R3): treat
     # the empty string as absent so secret_ref is usable through the tool.
     if secret_ref and value:
@@ -1484,18 +1642,27 @@ def set_value(cfg, vm_name="", cred: CredentialSet | None = None,
         raise ValueError("set_value requires value=")
     if isinstance(value, str) and len(value.encode("utf-8")) > _MAX_VALUE_BYTES:
         raise ValueError(f"value exceeds the {_MAX_VALUE_BYTES} byte bound")
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id) if not isinstance(
-        vm_name, vmident.VMRef) else vm_name
+    vmref = (vm_name if isinstance(vm_name, vmident.VMRef)
+             else vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id))
     args = {"value": value}
-    return _verb_request(cfg, ref, cred, "set_value", args,
+    return _verb_request(cfg, vmref, cred, "set_value", args,
                          shared_vm=shared_vm, selector=selector,
-                         element_id=element_id)
+                         element_id=element_id, ref_id=ref_id)
 
 
 def wait_for(cfg, vm_name="", cred: CredentialSet | None = None,
              selector: Any = None, gone: bool = False, timeout_s: int = 30,
-             *, vm_id: str = ""):
-    """Wait for a selector to appear (or disappear) (read verb).
+             *, element_id: Any = None, ref: str = "", vm_id: str = "",
+             value: str | None = None, value_contains: str | None = None,
+             state: dict | None = None):
+    """Wait for a selector to appear (or disappear), or for a value or
+    state predicate to hold on the resolved element (read verb, issue
+    #137). ``value``/``value_contains``/``state`` are None when absent —
+    an empty string is a legitimate predicate, never a sentinel.
+    Predicate matching spans element-level properties and the nested
+    ``state`` block (state keys take precedence on collision); a
+    non-matching present element keeps the wait polling; expiry returns
+    the last observed elements with ``timed_out: true``.
 
     A settled OR budget-expired successful wait carries ``state_receipt``
     (issue #140): every successful slice is a state read, and the returned
@@ -1509,16 +1676,30 @@ def wait_for(cfg, vm_name="", cred: CredentialSet | None = None,
         from .credentials import CredentialError
 
         raise CredentialError("guest credentials are required for UI verbs")
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id) if not isinstance(
-        vm_name, vmident.VMRef) else vm_name
+    ref_id = _validate_ref(ref) if ref else None
+    _check_element_op(selector, element_id, ref_id)
+    predicate: dict | None = None
+    if value is not None:
+        predicate = {"value": value}
+    if value_contains is not None:
+        predicate = {**(predicate or {}), "value_contains": value_contains}
+    if state is not None:
+        if not isinstance(state, dict) or not state:
+            raise ValueError(
+                "state must be a non-empty mapping of element or state "
+                "properties to match")
+        predicate = {**(predicate or {}), **state}
+    vmref = (vm_name if isinstance(vm_name, vmident.VMRef)
+             else vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id))
     args = {"gone": bool(gone), "timeout_s": max(1, min(int(timeout_s), 120))}
-    return _verb_request(cfg, ref, cred, "wait_for", args,
-                         selector=selector)
+    return _verb_request(cfg, vmref, cred, "wait_for", args,
+                         selector=selector, element_id=element_id,
+                         ref_id=ref_id, predicate=predicate)
 
 
 def focus(cfg, vm_name="", cred: CredentialSet | None = None,
-          selector: Any = None, *, element_id: Any = None, vm_id: str = "",
-          shared_vm: bool = False):
+          selector: Any = None, *, element_id: Any = None, ref: str = "",
+          vm_id: str = "", shared_vm: bool = False):
     """Focus the target element (mutating; ui_input). Locked sessions are
     refused by the helper with error_class "no_interactive_desktop"."""
     policy.require_category(cfg, "ui_input", f"focus on '{vm_name}'")
@@ -1526,12 +1707,153 @@ def focus(cfg, vm_name="", cred: CredentialSet | None = None,
         from .credentials import CredentialError
 
         raise CredentialError("guest credentials are required for UI verbs")
-    _check_element_op(selector, element_id)
-    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id) if not isinstance(
-        vm_name, vmident.VMRef) else vm_name
-    return _verb_request(cfg, ref, cred, "focus", {},
+    ref_id = _validate_ref(ref) if ref else None
+    _check_element_op(selector, element_id, ref_id)
+    vmref = (vm_name if isinstance(vm_name, vmident.VMRef)
+             else vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id))
+    return _verb_request(cfg, vmref, cred, "focus", {},
                          shared_vm=shared_vm, selector=selector,
-                         element_id=element_id)
+                         element_id=element_id, ref_id=ref_id)
+
+
+def _render_snapshot_text(entries: Any) -> str:
+    """Render one compact line per snapshot entry (issue #137):
+    ``<ref> <ControlType> <Name> [<state-summary>] <rect>``, entries in
+    order, indented by depth. Applied AFTER the password-value drop, so a
+    password field's value can never ride the rendered text either. Guest
+    text is flattened to spaces: a name or value carrying a newline must
+    not split one entry into two lines (a forged-looking second line
+    could carry a ref the guest chose)."""
+    lines: list[str] = []
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            indent = "  " * max(0, int(entry.get("depth") or 0))
+        except (TypeError, ValueError):
+            indent = ""
+
+        def _flat(value: Any) -> str:
+            return " ".join(str(value if value is not None else "")
+                            .split())
+
+        parts = [_flat(entry.get("ref") or ""),
+                 _flat(entry.get("control_type") or ""),
+                 _flat(entry.get("name") or "")]
+        state = entry.get("state")
+        if isinstance(state, dict) and state:
+            summary = " ".join(f"{_flat(key)}={_flat(value)}"
+                               for key, value in state.items())
+            parts.append(f"[{summary}]")
+        rect = entry.get("rect")
+        if rect not in (None, ""):
+            parts.append(_flat(rect))
+        lines.append(indent + " ".join(p for p in parts if p))
+    return "\n".join(lines)
+
+
+def snapshot(cfg, vm_name="", cred: CredentialSet | None = None,
+             selector: Any = None, max_elements: int = 250, *,
+             vm_id: str = "", adapter: str = ""):
+    """One compact text snapshot of ONE window (read verb, issue #137):
+    the foreground window by default; window selectors (hwnd /
+    window_title / window_title_contains / process_name) pick the window.
+    The helper walks the window with the batched reads of #136, keeps the
+    two most recent snapshots per window, and returns ``snapshot_id`` plus
+    one entry per element (ref / control_type / name / state / rect /
+    depth); the host renders one compact line per element under ``text``.
+    Refs are the element addresses for ``hyperv_ui_act`` and the ``ref``
+    parameter of the other element tools. A successful read mints a
+    state_receipt (issue #140).
+    """
+    if cred is None:
+        from .credentials import CredentialError
+
+        raise CredentialError("guest credentials are required for UI verbs")
+    if adapter not in _ADAPTERS:
+        raise ValueError(f"unknown adapter: {adapter!r}")
+    vmref = (vm_name if isinstance(vm_name, vmident.VMRef)
+             else vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id))
+    args = {"max_elements": max(1, min(int(max_elements),
+                                       INSPECT_MAX_ELEMENTS))}
+    out = _verb_request(cfg, vmref, cred, "snapshot", args,
+                        selector=selector, adapter=adapter)
+    if (isinstance(out, dict) and out.get("ok") is True
+            and isinstance(out.get("entries"), list)):
+        out = {**out, "text": _render_snapshot_text(out["entries"])}
+    return out
+
+
+def act(cfg, vm_name="", cred: CredentialSet | None = None, *,
+        action: str = "", value: Any = None, selector: Any = None,
+        element_id: Any = None, ref: str = "", vm_id: str = "",
+        shared_vm: bool = False):
+    """One explicit element action (mutating verb, issue #137). The
+    action set is closed and validated before any transport leg;
+    ``ui_input`` is required for every action and ``click`` ADDITIONALLY
+    requires ``console_input`` (both refusals fire before the VM
+    resolution leg). Pattern actions report the pattern that fired and
+    the element state afterwards; ``toggle_on``/``toggle_off`` no-op when
+    the control is already in the target state; ``click`` validates
+    enabled + onscreen + a clickable point in the helper (not_actionable
+    otherwise, NO input sent) and the host dispatches exactly one
+    synthetic-mouse click at the returned point through console.click
+    (after the helper leg's VM lock releases — vmlocks are not
+    reentrant). ``set_value`` rides the framed payload and reports the
+    length only.
+    """
+    # Policy BEFORE resolution: ui_input first, console_input second for
+    # click (issue #137 AC6's ordering pin asserts this exact order).
+    policy.require_category(cfg, "ui_input", f"act {action!r} on '{vm_name}'")
+    if action == "click":
+        policy.require_category(cfg, "console_input",
+                                f"act click on '{vm_name}'")
+    if action not in _ACTIONS:
+        raise ValueError(
+            f"unknown action: {action!r} (allowed: {', '.join(sorted(_ACTIONS))})")
+    if cred is None:
+        from .credentials import CredentialError
+
+        raise CredentialError("guest credentials are required for UI verbs")
+    ref_id = _validate_ref(ref) if ref else None
+    _check_element_op(selector, element_id, ref_id)
+    vmref = (vm_name if isinstance(vm_name, vmident.VMRef)
+             else vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id))
+    args: dict = {"action": action}
+    if action == "set_value":
+        if value is None:
+            raise ValueError("act set_value requires value=")
+        if isinstance(value, str) and len(value.encode("utf-8")) > _MAX_VALUE_BYTES:
+            raise ValueError(f"value exceeds the {_MAX_VALUE_BYTES} byte bound")
+        args["value"] = value
+    elif value is not None:
+        raise ValueError("value= applies only to the set_value action")
+    out = _verb_request(cfg, vmref, cred, "act", args,
+                        shared_vm=shared_vm, selector=selector,
+                        element_id=element_id, ref_id=ref_id)
+    if action == "click" and out.get("ok") is True:
+        point = (out.get("point") or [])
+        if not (isinstance(point, list) and len(point) == 2
+                and all(isinstance(c, int) and not isinstance(c, bool)
+                        for c in point)):
+            return {"ok": False, "error_class": "helper_error",
+                    "error": "the click answer carried no usable point",
+                    "session": out.get("session")}
+        # The helper leg's locks released with _verb_request (vmlocks are
+        # NOT reentrant, PR #144): console.click takes its own locks. The
+        # click target is the CALLER-ADDRESSED VM only: the helper
+        # response's vm_name echo is guest-controlled text and must never
+        # route a host console input. The vm_name slot carries a VMRef
+        # when the wrapper resolved by id - console.click needs a NAME
+        # (or the GUID through vm_id).
+        target = vm_name
+        if not isinstance(target, str) or not target.strip():
+            target = getattr(vm_name, "name", "") or ""
+        click = console.click(cfg, vm_name=target,
+                              x=point[0], y=point[1],
+                              vm_id=vm_id or (getattr(vm_name, "id", "") or ""))
+        out = {**out, "click": click}
+    return out
 
 
 def session_state(cfg, vm_name="", cred: CredentialSet | None = None, *,
