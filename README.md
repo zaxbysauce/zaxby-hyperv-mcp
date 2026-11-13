@@ -2191,7 +2191,7 @@ reaches every tool's audit row but never the relay path.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_capture_evidence` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `ui_tree=false`, `ui_tree_depth=3` (clamped 1..6), `ui_tree_max_elements=200` (clamped 1..500), `format?` (png\|jpeg/jpg\|webp), `quality?` (1..100), `scale?` (0,1], `crop?` ([left,top,right,bottom]), `if_changed_from?` (frame_hash) | `[ImageContent, TextContent(meta)]` — metadata alone when `if_changed_from` matches (the UI-tree leg is skipped too, and `meta.ui_tree` says why) |
+| `hyperv_capture_evidence` | `vm_name` or `vm_id`, `width=1024`, `height=768`, `save_path?`, `ui_tree=false`, `ui_tree_depth=3` (clamped 1..32), `ui_tree_max_elements=200` (clamped 1..500), `format?` (png\|jpeg/jpg\|webp), `quality?` (1..100), `scale?` (0,1], `crop?` ([left,top,right,bottom]), `if_changed_from?` (frame_hash) | `[ImageContent, TextContent(meta)]` — metadata alone when `if_changed_from` matches (the UI-tree leg is skipped too, and `meta.ui_tree` says why) |
 
 One call pairing the console screenshot with `captured_at` (UTC ISO-8601),
 `vm_id`, capture dimensions, `frame_hash`, and — when `ui_tree=true` — a

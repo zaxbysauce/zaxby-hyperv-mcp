@@ -729,8 +729,15 @@ function Invoke-Pattern($el, $automationPattern, [string]$action, $argument) {
 # never issued -> unknown_ref; a live hit whose element fails
 # GetRuntimeId -> stale_ref (round-2 F3 semantics). Two live snapshots per
 # window key, FIFO eviction.
-$script:SnapshotTables = @{}
-$script:SnapshotCounter = 0
+# ONE synchronized object shared with every worker/child runspace (via
+# $sessionVariables): live{snapshot_id -> {index -> element}} tables plus
+# an issued-ids tombstone set per window, and the snapshot counter riding
+# inside the same lock (issue #137; the per-request child runspaces would
+# otherwise each see their own empty copy).
+$script:SnapshotTables = [hashtable]::Synchronized(@{
+    counter = 0
+    windows = @{}
+})
 
 function Get-ElementIdScopeSelector($selector) {
     # element_id / ref resolution scope: the selector's own window
@@ -757,32 +764,54 @@ function Enter-Snapshot([hashtable]$selector, [int]$cap, $cache) {
     $entries = @()
     $table = @{}
     $index = 0
-    $pushed = $cache.Activate()
-    try {
-        $found = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-        foreach ($el in $found) {
-            if ($entries.Count -ge $cap) { break }
-            $rid = ''
-            try { $rid = (@($el.GetRuntimeId()) -join ':') } catch { }
-            if ($rid -eq '') { continue }
-            $table[$index] = $el
-            $result = Get-ElementResult $el $cache
-            $result['ref'] = ('s{0:x}:{1}' -f $script:SnapshotCounter, $index)
-            $result['depth'] = 0
-            $entries += $result
-            $index += 1
+    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    # Depth-aware bounded walk (issue #137 C10: entries carry depth so the
+    # host renders them indented): one level at a time THROUGH the cache
+    # request, breadth-first, capped.
+    $queue = New-Object System.Collections.Generic.List[object]
+    $queue.Add(@{ el = $window; depth = 0 })
+    while ($queue.Count -gt 0 -and $entries.Count -lt $cap) {
+        $item = $queue[0]
+        $queue.RemoveAt(0)
+        $el = $item['el']
+        $depth = [int]$item['depth']
+        $rid = ''
+        try { $rid = (@($el.GetRuntimeId()) -join ':') } catch { }
+        if ($rid -eq '') { continue }
+        $table[$index] = $el
+        $result = Get-ElementResult $el $cache
+        $result['ref'] = ('s{0:x}:{1}' -f $SnapshotStore.counter, $index)
+        $result['depth'] = $depth
+        $entries += $result
+        $index += 1
+        if ($depth -ge 12) { continue }
+        $kid = $null
+        try { $kid = $walker.GetFirstChild($el, $cache) } catch { $kid = $null }
+        while ($null -ne $kid -and $entries.Count -lt $cap) {
+            $queue.Add(@{ el = $kid; depth = $depth + 1 })
+            try { $kid = $walker.GetNextSibling($kid, $cache) } catch { $kid = $null }
         }
-    } finally {
-        if ($null -ne $pushed) { $pushed.Dispose() }
     }
     if ($null -ne $windowKey -and $index -gt 0) {
-        $script:SnapshotCounter += 1
-        $snapshotId = ('{0:x}' -f $script:SnapshotCounter)
+        $sid = [System.Threading.Monitor]::Enter($SnapshotStore.SyncRoot)
+        try {
+            $SnapshotStore.counter += 1
+            $script:__snapId = '{0:x}' -f $SnapshotStore.counter
+        } finally {
+            [System.Threading.Monitor]::Exit($SnapshotStore.SyncRoot)
+        }
+        $snapshotId = $script:__snapId
         foreach ($e in $entries) { $e['ref'] = ('s{0}:{1}' -f $snapshotId, ($e['ref'] -split ':')[-1]) }
-        $tbl = $script:SnapshotTables[$windowKey]
-        if ($null -eq $tbl) {
-            $tbl = @{ live = @{}; tombstones = New-Object System.Collections.Generic.HashSet[string] }
-            $script:SnapshotTables[$windowKey] = $tbl
+        $tbl = $null
+        [System.Threading.Monitor]::Enter($SnapshotStore.SyncRoot)
+        try {
+            $tbl = $SnapshotStore.windows[$windowKey]
+            if ($null -eq $tbl) {
+                $tbl = @{ live = @{}; tombstones = New-Object System.Collections.Generic.HashSet[string] }
+                $SnapshotStore.windows[$windowKey] = $tbl
+            }
+        } finally {
+            [System.Threading.Monitor]::Exit($SnapshotStore.SyncRoot)
         }
         # FIFO eviction at two live snapshots per window: evicted ids move
         # to the tombstones (stale_ref on later use), never vanish.
@@ -809,7 +838,7 @@ function Resolve-Ref([string]$refText) {
     }
     $sid = $parts[0].Substring(1).ToLowerInvariant()
     $idx = [int]$parts[1]
-    foreach ($tbl in $script:SnapshotTables.Values) {
+    foreach ($tbl in $SnapshotStore.windows.Values) {
         if ($tbl.live.ContainsKey($sid)) {
             $table = $tbl.live[$sid]
             if (-not $table.ContainsKey($idx)) {
@@ -891,6 +920,7 @@ function Invoke-Request([hashtable]$req) {
                 interactive_user = $identity.user
                 locked = $locked
                 foreground_window = (Get-ForegroundWindow)
+                dpi_aware = $dpiDeclared
             }
         }
     }
@@ -1103,7 +1133,13 @@ function Invoke-Request([hashtable]$req) {
             try {
                 if ([bool]$refreshed.GetUpdatedCache($cache).GetCachedPropertyValue([System.Windows.Automation.AutomationElement]::IsScrollItemPatternAvailableProperty)) {
                     $si = $refreshed.GetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern)
-                    if ($null -ne $si) { $si.ScrollIntoView() }
+                    if ($null -ne $si) {
+                        $si.ScrollIntoView()
+                        # Re-read AFTER the scroll: the offscreen/point
+                        # checks below must see the scrolled-into-view
+                        # state, not the pre-scroll cache.
+                        try { $refreshed = $refreshed.GetUpdatedCache($cache) } catch { }
+                    }
                 }
             } catch { }
             $clickable = $false
@@ -1346,16 +1382,18 @@ function Get-HelperCapabilities {
 $capabilities = Get-HelperCapabilities
 
 # Issue #136: per-monitor DPI awareness so the helper's click points are
-# PHYSICAL pixels - per-monitor V2 first, per-monitor (Win8.1+) second,
-# the legacy system-DPI declaration last; every failure falls through.
+# PHYSICAL pixels. PROCESS-level declaration FIRST (the request dispatch
+# runs on worker/child runspaces - a per-thread declaration on the main
+# thread would not cover them); the per-monitor-V2 thread context on the
+# serving thread is the refinement; the legacy system-DPI declaration is
+# the last resort. The outcome rides the session block (dpi_aware) for
+# honest disclosure when every declaration fails.
 $dpiDeclared = $false
+try { $dpiDeclared = ([HypervMcp.Uia.Native]::SetProcessDpiAwareness(2) -eq 0) } catch { }
 try {
     $dpiCtx = New-Object IntPtr(-4)
     if ([HypervMcp.Uia.Native]::SetThreadDpiAwarenessContext($dpiCtx) -ne [IntPtr]::Zero) { $dpiDeclared = $true }
 } catch { }
-if (-not $dpiDeclared) {
-    try { $dpiDeclared = ([HypervMcp.Uia.Native]::SetProcessDpiAwareness(2) -eq 0) } catch { }
-}
 if (-not $dpiDeclared) {
     try { $dpiDeclared = [HypervMcp.Uia.Native]::SetProcessDPIAware() } catch { }
 }
@@ -1512,7 +1550,9 @@ $functionNames = @(
     'Read-HelperFile', 'Get-OwnIdentity', 'Get-LiveUuid', 'Test-OwnsInputDesktop',
     'Get-LockState', 'Get-ForegroundWindow', 'New-PipeSecurity', 'New-SecurityAttributes',
     'Free-SecurityAttributes', 'New-PipeInstance', 'ConvertTo-HashtableDeep',
-    'Get-ElementProcessName', 'ConvertTo-Condition', 'Find-WindowScope', 'Resolve-Target',
+    'Get-ElementProcessName', 'ConvertTo-Condition', 'Resolve-Target',
+    'Get-WindowScopeSet', 'New-WalkCache', 'Get-ElementIdScopeSelector',
+    'Enter-Snapshot', 'Resolve-Ref', 'Get-HelperCapabilities',
     'Select-One', 'Get-ElementResult', 'Walk-Tree', 'Invoke-Pattern', 'Invoke-Request',
     'Get-SessionBlock'
 )
@@ -1524,6 +1564,7 @@ foreach ($name in $functionNames) {
     }
 }
 $sessionVariables = @{
+    SnapshotStore = $script:SnapshotTables
     HelperDir = $HelperDir
     HelperVersion = $HelperVersion
     ownNonce = $ownNonce

@@ -1314,14 +1314,27 @@ def _element_matches(element: dict, predicate: dict) -> bool:
     """One element against one wait predicate: every predicate key must
     match — element-level properties first, the nested ``state`` block
     overriding on key collision (issue #137 design 5's {"enabled": true}
-    is element-level)."""
+    is element-level). ``value_contains`` is a MATCHER, not a property: it
+    substring-tests the element's value (state block first, element-level
+    fallback)."""
+    contains = predicate.get("value_contains")
     for key, wanted in predicate.items():
+        if key == "value_contains":
+            continue
         state = element.get("state")
         if isinstance(state, dict) and key in state:
             actual = state.get(key)
         else:
             actual = element.get(key)
         if actual != wanted:
+            return False
+    if contains is not None:
+        state = element.get("state")
+        if isinstance(state, dict) and "value" in state:
+            actual = state.get("value")
+        else:
+            actual = element.get("value")
+        if actual is None or contains not in str(actual):
             return False
     return True
 
@@ -1819,10 +1832,15 @@ def act(cfg, vm_name="", cred: CredentialSet | None = None, *,
                     "error": "the click answer carried no usable point",
                     "session": out.get("session")}
         # The helper leg's locks released with _verb_request (vmlocks are
-        # NOT reentrant, PR #144): console.click takes its own locks.
-        click = console.click(cfg, vm_name=out.get("vm_name") or vm_name,
+        # NOT reentrant, PR #144): console.click takes its own locks. The
+        # vm_name slot carries a VMRef when the wrapper resolved by id -
+        # console.click needs a NAME (or the GUID through vm_id).
+        target = out.get("vm_name") or vm_name
+        if not isinstance(target, str) or not target.strip():
+            target = getattr(vm_name, "name", "") or ""
+        click = console.click(cfg, vm_name=target,
                               x=point[0], y=point[1],
-                              vm_id=vm_id or "")
+                              vm_id=vm_id or (getattr(vm_name, "id", "") or ""))
         out = {**out, "click": click}
     return out
 

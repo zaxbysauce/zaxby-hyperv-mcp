@@ -32,6 +32,8 @@ Contract map (check-author brief, issue #137):
   C13b  test_unactionable_element_gets_no_click
   C11   test_act_set_value_rides_the_payload_only
   P8    test_act_dispatch_invalidates_fresh_state_receipts
+  B1    test_serve_loop_worker_wires_the_element_verbs
+  B2    test_snapshot_store_rides_the_session_variables
   C12a  test_wait_settles_on_the_predicate_not_on_presence
   C12b  test_predicate_wait_reports_expiry
   C7    test_snapshot_and_act_are_registered
@@ -86,6 +88,7 @@ import asyncio
 import base64
 import binascii
 import importlib
+import importlib.resources
 import inspect
 import json
 import re
@@ -945,6 +948,53 @@ def test_wait_settles_on_the_predicate_not_on_presence(monkeypatch):
             "the value predicate's absence must be expressed by omitting "
             "the parameter (default None), never by value=''")
 
+    # POSITIVE value_contains (implementation-review round-1): a slice
+    # whose value CONTAINS the needle settles -- the reviewer proved an
+    # exact-equality mutant survived the expiry-only coverage
+    contains_pipe = PipeRecorder(sequence=[_elem_frame("Loading Ready")])
+    monkeypatch.setattr(uia, "_pipe_request", contains_pipe)
+    contains_out = uia.wait_for(Config(unrestricted=True), VM, CRED,
+                                {"name": "Status"},
+                                value_contains="Ready", timeout_s=5)
+    assert contains_out.get("ok") is True
+    assert contains_out.get("timed_out") is False, (
+        "value_contains must SUBSTRING-match: 'Loading Ready' contains "
+        f"'Ready' and must settle, got {contains_out!r}")
+    c_elements = contains_out.get("elements") or []
+    assert c_elements and (
+        c_elements[0].get("state", {}).get("value") == "Loading Ready"), (
+        "the settled answer must carry the containing element")
+
+    # state-block PRECEDENCE (implementation-review round-1): when the
+    # element carries the key at BOTH levels, the nested state block wins
+    both_frame = {"ok": True,
+                  "result": {"elements": [
+                      {"name": "Dual", "control_type": "Edit",
+                       "value": "elem-level",
+                       "state": {"value": "state-level"}}]},
+                  "session": dict(HELPER_SESSION)}
+    state_win_pipe = PipeRecorder(sequence=[both_frame])
+    monkeypatch.setattr(uia, "_pipe_request", state_win_pipe)
+    state_win = uia.wait_for(Config(unrestricted=True), VM, CRED,
+                             {"name": "Dual"},
+                             state={"value": "state-level"}, timeout_s=5)
+    assert state_win.get("ok") is True
+    assert state_win.get("timed_out") is False, (
+        "state={'value': 'state-level'} must settle: the state block wins "
+        "the collision with the element-level value")
+
+    elem_level_pipe = PipeRecorder(sequence=[both_frame])
+    monkeypatch.setattr(uia, "_pipe_request", elem_level_pipe)
+    elem_level_out = uia.wait_for(Config(unrestricted=True), VM, CRED,
+                                  {"name": "Dual"},
+                                  state={"value": "elem-level"},
+                                  timeout_s=1)
+    assert elem_level_out.get("ok") is True
+    assert elem_level_out.get("timed_out") is True, (
+        "state={'value': 'elem-level'} must NOT settle: the collision "
+        "reads the state block ('state-level'), never the element-level "
+        "copy")
+
 
 def test_predicate_wait_reports_expiry(monkeypatch):
     """C12b: a predicate wait that exhausts its budget returns the LAST
@@ -1282,3 +1332,120 @@ def test_server_schema_ref_and_wait_predicates(tmp_path, fresh_server):
         assert param in cred_wait, (
             f"hyperv_ui_wait_for must expose the {param} predicate "
             "parameter in inline-credential mode too (issue #137)")
+
+
+# ---------------------------------------------------------------------------
+# Implementation-review round-1 BLOCKER static guards: the serve-loop
+# wiring and the snapshot store's runspace persistence (the mocked
+# transport checks cannot see either -- the serve-loop tests only
+# exercise session_state, which is exactly how BLOCKER-1 shipped green)
+# ---------------------------------------------------------------------------
+
+def _helper_text() -> str:
+    """The PACKAGED helper script bytes (what the host installs)."""
+    return (
+        importlib.resources.files("hyperv_mcp")
+        .joinpath("guest")
+        .joinpath("uia_helper.ps1")
+        .read_text(encoding="utf-8")
+    )
+
+
+def _extract_ps_function(text: str, name: str) -> str:
+    """Extract `function <name> { ... }` (balanced braces) from script
+    text."""
+    idx = text.find("function " + name)
+    assert idx != -1, f"{name} is missing from the shipped helper script"
+    start = text.find("{", idx)
+    assert start != -1, f"{name} has no body"
+    depth = 0
+    for pos in range(start, len(text)):
+        ch = text[pos]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[idx:pos + 1]
+    raise AssertionError(
+        f"{name} has unbalanced braces in the shipped helper script")
+
+
+#: every helper function the #137 element verbs depend on. The serve
+#: loop builds each worker runspace by injecting EXACTLY $functionNames;
+#: a function missing from that list is simply absent in the worker and
+#: every element verb dies with command-not-found (BLOCKER-1).
+_ELEMENT_VERB_FUNCTIONS = {
+    "Resolve-Target", "Get-WindowScopeSet", "New-WalkCache",
+    "Get-ElementIdScopeSelector", "Enter-Snapshot", "Resolve-Ref",
+    "Get-HelperCapabilities", "Select-One", "Get-ElementResult",
+    "Walk-Tree", "Invoke-Pattern", "Invoke-Request",
+}
+
+
+def test_serve_loop_worker_wires_the_element_verbs():
+    """B1 (implementation-review round-1): the packaged helper's worker
+    injection list is complete -- (a) every function the element verbs
+    call is in $functionNames; (b) the deleted Find-WindowScope is NOT;
+    (c) cross-check: every 'function <Name>' definition whose name the
+    Invoke-Request body names is present in the list. Static guard for
+    the reviewer's BLOCKER-1 (the serve-loop tests only exercise
+    session_state, which is why the gap shipped green)."""
+    text = _helper_text()
+
+    m = re.search(r"\$functionNames\s*=\s*@\((.*?)^\)", text, re.S | re.M)
+    assert m, (
+        "the helper must declare its worker injection list "
+        "($functionNames)")
+    wired = set(re.findall(r"'([A-Za-z][A-Za-z0-9-]*)'", m.group(1)))
+    assert wired, "the $functionNames list parsed empty"
+
+    missing = sorted(_ELEMENT_VERB_FUNCTIONS - wired)
+    assert missing == [], (
+        "every element-verb function must be wired into the worker "
+        f"runspaces via $functionNames; missing: {missing}")
+    assert "Find-WindowScope" not in wired, (
+        "the deleted Find-WindowScope must not linger in the worker "
+        "injection list")
+
+    body = _extract_ps_function(text, "Invoke-Request")
+    defined = set(re.findall(r"^function\s+([A-Za-z][A-Za-z0-9-]*)",
+                             text, re.M))
+    invoked = {name for name in defined
+               if name != "Invoke-Request"
+               and re.search(r"\b" + re.escape(name) + r"\b", body)}
+    unwired = sorted(invoked - wired)
+    assert unwired == [], (
+        "functions the Invoke-Request body calls but the worker "
+        f"injection list omits (BLOCKER-1's shape): {unwired}")
+
+
+def test_snapshot_store_rides_the_session_variables():
+    """B2 (implementation-review round-1): the helper declares the
+    snapshot store as a session variable AND the store is a synchronized
+    hashtable -- the literal 'SnapshotStore' rides the $sessionVariables
+    block, and the variable it binds is declared with
+    [hashtable]::Synchronized -- so snapshot tables persist across the
+    per-request child runspace boundaries instead of each worker seeing
+    its own empty copy."""
+    text = _helper_text()
+
+    m = re.search(r"\$sessionVariables\s*=\s*@\{(.*?)^\}", text, re.S | re.M)
+    assert m, (
+        "the helper must declare its worker session variables "
+        "($sessionVariables)")
+    block = m.group(1)
+    line = next((ln for ln in block.splitlines()
+                 if re.match(r"\s*SnapshotStore\s*=", ln)), None)
+    assert line is not None, (
+        "the $sessionVariables block must carry the SnapshotStore entry")
+    bound = re.search(r"SnapshotStore\s*=\s*([A-Za-z0-9_:$]+)", line)
+    assert bound is not None, (
+        f"the SnapshotStore entry must bind a store variable: {line!r}")
+    var = bound.group(1)
+    decl = re.search(r"^\s*" + re.escape(var)
+                     + r"\s*=\s*\[hashtable\]::Synchronized", text, re.M)
+    assert decl is not None, (
+        f"the snapshot store {var} must be declared as "
+        "[hashtable]::Synchronized so one shared store survives across "
+        "the per-request child runspaces")
