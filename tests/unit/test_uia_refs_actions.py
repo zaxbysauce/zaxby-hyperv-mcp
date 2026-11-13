@@ -1449,3 +1449,48 @@ def test_snapshot_store_rides_the_session_variables():
         f"the snapshot store {var} must be declared as "
         "[hashtable]::Synchronized so one shared store survives across "
         "the per-request child runspaces")
+
+
+# ---------------------------------------------------------------------------
+# delta-review r2: the by-ref act click resolves a NAME for the console seam
+# ---------------------------------------------------------------------------
+
+def test_act_click_by_ref_name_resolves_for_the_console_seam(monkeypatch):
+    """Delta-review r2 regression pin: the vm_name slot carries a VMRef
+    INSTANCE when the server wrapper resolved the VM by id, and the act
+    click leg must resolve that VMRef into a NAME before console.click --
+    a mutant that passes the raw VMRef through raises AttributeError
+    inside console.click's vmident.checked_caller_name (a VMRef has no
+    .strip). The dispatched click must carry the NAME 'test-vm-1' as a
+    str and the VMRef's GUID through vm_id, exactly once."""
+    from hyperv_mcp import uia, vmident
+
+    act = getattr(uia, "act", None)
+    assert act is not None, (
+        "uia.act (tool hyperv_ui_act) is missing (issue #137)")
+    ref = vmident.VMRef(id=VM_GUID, name=VM)
+    pipe = PipeRecorder({"ok": True, "result": {"point": [320, 240]},
+                         "session": dict(HELPER_SESSION)})
+    clicks = ClickRecorder()
+    monkeypatch.setattr(uia, "_pipe_request", pipe)
+    monkeypatch.setattr(pswindows, "run_ps", PSRecorder(VM_GUID))
+    _mock_mouse(monkeypatch, uia, clicks)
+
+    out = act(Config(unrestricted=True), ref, CRED,
+              selector={"automation_id": "Save"}, action="click")
+    assert out.get("ok") is True
+    assert len(clicks.calls) == 1, (
+        f"the by-ref act click must dispatch exactly ONE console.click, "
+        f"got {len(clicks.calls)}")
+    call = clicks.calls[0]
+    assert isinstance(call["vm_name"], str), (
+        "the console seam needs a NAME: the click's vm_name must be a "
+        f"str, got {type(call['vm_name']).__name__} -- the raw VMRef was "
+        "passed through and console.click's vmident.checked_caller_name "
+        "would raise AttributeError on it")
+    assert call["vm_name"] == VM, (
+        f"the click must carry the VMRef's resolved name {VM!r}, got "
+        f"{call['vm_name']!r}")
+    assert call["kwargs"].get("vm_id") == VM_GUID, (
+        "the click must carry the VMRef's GUID through vm_id "
+        f"({VM_GUID!r}), got {call['kwargs'].get('vm_id')!r}")

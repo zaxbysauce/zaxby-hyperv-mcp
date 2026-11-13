@@ -792,35 +792,39 @@ function Enter-Snapshot([hashtable]$selector, [int]$cap, $cache) {
             try { $kid = $walker.GetNextSibling($kid, $cache) } catch { $kid = $null }
         }
     }
+    if ($null -eq $windowKey -and $entries.Count -gt 0) {
+        # A window whose RuntimeId cannot be read cannot register a
+        # snapshot table - its refs would be unresolvable, so refuse
+        # rather than stamp refs no later call can address.
+        return @{ ok = $false; error_class = 'no_foreground_window'; error = 'the scoped window exposed no readable identity for the snapshot' }
+    }
     if ($null -ne $windowKey -and $index -gt 0) {
-        $sid = [System.Threading.Monitor]::Enter($SnapshotStore.SyncRoot)
-        try {
-            $SnapshotStore.counter += 1
-            $script:__snapId = '{0:x}' -f $SnapshotStore.counter
-        } finally {
-            [System.Threading.Monitor]::Exit($SnapshotStore.SyncRoot)
-        }
-        $snapshotId = $script:__snapId
-        foreach ($e in $entries) { $e['ref'] = ('s{0}:{1}' -f $snapshotId, ($e['ref'] -split ':')[-1]) }
-        $tbl = $null
+        # The WHOLE read-modify-write holds the store lock: the counter,
+        # the per-window table creation, the FIFO eviction and the insert
+        # are one transaction, and Resolve-Ref's lookup takes the same
+        # lock - concurrent read verbs may otherwise race the plain
+        # hashtable/HashSet members.
         [System.Threading.Monitor]::Enter($SnapshotStore.SyncRoot)
         try {
+            $SnapshotStore.counter += 1
+            $snapshotId = '{0:x}' -f $SnapshotStore.counter
             $tbl = $SnapshotStore.windows[$windowKey]
             if ($null -eq $tbl) {
                 $tbl = @{ live = @{}; tombstones = New-Object System.Collections.Generic.HashSet[string] }
                 $SnapshotStore.windows[$windowKey] = $tbl
             }
+            # FIFO eviction at two live snapshots per window: evicted ids
+            # move to the tombstones (stale_ref on later use), never
+            # vanish.
+            while ($tbl.live.Count -ge 2) {
+                $oldest = @($tbl.live.Keys | Sort-Object { [Convert]::ToInt64($_, 16) })[0]
+                [void]$tbl.tombstones.Add($oldest)
+                [void]$tbl.live.Remove($oldest)
+            }
+            $tbl.live[$snapshotId] = $table
         } finally {
             [System.Threading.Monitor]::Exit($SnapshotStore.SyncRoot)
         }
-        # FIFO eviction at two live snapshots per window: evicted ids move
-        # to the tombstones (stale_ref on later use), never vanish.
-        while ($tbl.live.Count -ge 2) {
-            $oldest = @($tbl.live.Keys | Sort-Object { [Convert]::ToInt64($_, 16) })[0]
-            [void]$tbl.tombstones.Add($oldest)
-            [void]$tbl.live.Remove($oldest)
-        }
-        $tbl.live[$snapshotId] = $table
     }
     if ($entries.Count -eq 0) {
         return @{ ok = $false; error_class = 'no_foreground_window'; error = 'the scoped window exposed no elements for the snapshot' }
@@ -838,23 +842,31 @@ function Resolve-Ref([string]$refText) {
     }
     $sid = $parts[0].Substring(1).ToLowerInvariant()
     $idx = [int]$parts[1]
-    foreach ($tbl in $SnapshotStore.windows.Values) {
-        if ($tbl.live.ContainsKey($sid)) {
-            $table = $tbl.live[$sid]
-            if (-not $table.ContainsKey($idx)) {
-                return @{ element = $null; error_class = 'unknown_ref'; error = "the ref $refText was never issued by any hyperv_ui_snapshot" }
+    # The lookup holds the SAME store lock Enter-Snapshot's
+    # read-modify-write holds: concurrent read verbs race these plain
+    # hashtable/HashSet members otherwise.
+    [System.Threading.Monitor]::Enter($SnapshotStore.SyncRoot)
+    try {
+        foreach ($tbl in $SnapshotStore.windows.Values) {
+            if ($tbl.live.ContainsKey($sid)) {
+                $table = $tbl.live[$sid]
+                if (-not $table.ContainsKey($idx)) {
+                    return @{ element = $null; error_class = 'unknown_ref'; error = "the ref $refText was never issued by any hyperv_ui_snapshot" }
+                }
+                $el = $table[$idx]
+                $rid = ''
+                try { $rid = (@($el.GetRuntimeId()) -join ':') } catch { $rid = '' }
+                if ($rid -eq '') {
+                    return @{ element = $null; error_class = 'stale_ref'; error = "the referenced element is gone; take a fresh hyperv_ui_snapshot" }
+                }
+                return @{ element = $el; error_class = $null; error = $null }
             }
-            $el = $table[$idx]
-            $rid = ''
-            try { $rid = (@($el.GetRuntimeId()) -join ':') } catch { $rid = '' }
-            if ($rid -eq '') {
-                return @{ element = $null; error_class = 'stale_ref'; error = "the referenced element is gone; take a fresh hyperv_ui_snapshot" }
+            if ($tbl.tombstones.Contains($sid)) {
+                return @{ element = $null; error_class = 'stale_ref'; error = "the snapshot $refText was evicted (two newer snapshots taken for this window); take a fresh hyperv_ui_snapshot" }
             }
-            return @{ element = $el; error_class = $null; error = $null }
         }
-        if ($tbl.tombstones.Contains($sid)) {
-            return @{ element = $null; error_class = 'stale_ref'; error = "the snapshot $refText was evicted (two newer snapshots taken for this window); take a fresh hyperv_ui_snapshot" }
-        }
+    } finally {
+        [System.Threading.Monitor]::Exit($SnapshotStore.SyncRoot)
     }
     return @{ element = $null; error_class = 'unknown_ref'; error = "the ref $refText was never issued by any hyperv_ui_snapshot" }
 }
@@ -1386,8 +1398,9 @@ $capabilities = Get-HelperCapabilities
 # runs on worker/child runspaces - a per-thread declaration on the main
 # thread would not cover them); the per-monitor-V2 thread context on the
 # serving thread is the refinement; the legacy system-DPI declaration is
-# the last resort. The outcome rides the session block (dpi_aware) for
-# honest disclosure when every declaration fails.
+# the last resort. The outcome rides session_state (dpi_aware, through
+# the injected $dpiDeclared session variable) for honest disclosure when
+# every declaration fails.
 $dpiDeclared = $false
 try { $dpiDeclared = ([HypervMcp.Uia.Native]::SetProcessDpiAwareness(2) -eq 0) } catch { }
 try {
@@ -1565,6 +1578,7 @@ foreach ($name in $functionNames) {
 }
 $sessionVariables = @{
     SnapshotStore = $script:SnapshotTables
+    dpiDeclared = $dpiDeclared
     HelperDir = $HelperDir
     HelperVersion = $HelperVersion
     ownNonce = $ownNonce
