@@ -1027,6 +1027,18 @@ function Invoke-Request([hashtable]$req) {
             while ([DateTime]::UtcNow -lt $deadline) {
                 if ($null -ne $waitRef) {
                     $resolved = Resolve-Ref $waitRef
+                    # A ref the helper never issued is a CALLER error, not
+                    # an absent element: answer unknown_ref immediately
+                    # instead of a misleading gone verdict. A stale_ref
+                    # (evicted snapshot or dead element) means the element
+                    # IS gone - an immediate, TRUE gone verdict.
+                    if ($resolved.error_class -eq 'unknown_ref') {
+                        return @{ ok = $false; error_class = 'unknown_ref'; error = $resolved.error }
+                    }
+                    if ($resolved.error_class -eq 'stale_ref') {
+                        if ($gone) { return @{ ok = $true; result = @{ gone = $true } } }
+                        return @{ ok = $false; error_class = 'stale_ref'; error = $resolved.error }
+                    }
                     $present = ($null -eq $resolved.error_class)
                 } elseif ($null -ne $waitElementId) {
                     $found = $null
