@@ -808,6 +808,11 @@ function Enter-Snapshot([hashtable]$selector, [int]$cap, $cache) {
         try {
             $SnapshotStore.counter += 1
             $snapshotId = '{0:x}' -f $SnapshotStore.counter
+            # Stamp every entry's ref with the ASSIGNED snapshot id (the
+            # walk loop stamped a pre-increment placeholder; without this
+            # re-stamp every returned ref would resolve against the
+            # PREVIOUS snapshot or unknown_ref).
+            foreach ($e in $entries) { $e['ref'] = ('s{0}:{1}' -f $snapshotId, ($e['ref'] -split ':')[-1]) }
             $tbl = $SnapshotStore.windows[$windowKey]
             if ($null -eq $tbl) {
                 $tbl = @{ live = @{}; tombstones = New-Object System.Collections.Generic.HashSet[string] }
