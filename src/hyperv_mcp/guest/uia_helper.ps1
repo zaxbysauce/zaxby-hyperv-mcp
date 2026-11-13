@@ -353,6 +353,7 @@ function ConvertTo-Condition([hashtable]$selector) {
 }
 
 function Get-WindowScopeSet([hashtable]$selector) {
+    if ($null -eq $selector) { $selector = @{} }
     # Issue #136 scope model: returns the ARRAY of elements a search is
     # scoped under. NOTHING here ever returns the desktop root element as
     # a search root - a selector with no window scope resolves to the
@@ -534,6 +535,7 @@ function Resolve-Target([hashtable]$selector, $cache) {
 }
 
 function Select-One($elements, [hashtable]$selector) {
+    if ($null -eq $selector) { $selector = @{} }
     if ($null -eq $elements -or $elements.Count -eq 0) { return $null }
     if ($null -ne $selector['index']) {
         $idx = [int]$selector['index']
@@ -785,6 +787,10 @@ function Enter-Snapshot([hashtable]$selector, [int]$cap, $cache) {
         $entries += $result
         $index += 1
         if ($depth -ge 12) { continue }
+        # The snapshot's RENDER depth cap (12): deeper content still
+        # exists but is not rendered into the compact text - a display
+        # bound distinct from the inspect clamp (32), which remains the
+        # deep-tree reading bound (#136 AC9).
         $kid = $null
         try { $kid = $walker.GetFirstChild($el, $cache) } catch { $kid = $null }
         while ($null -ne $kid -and $entries.Count -lt $cap) {
@@ -948,6 +954,19 @@ function Invoke-Request([hashtable]$req) {
     }
     if ($null -ne $selector -and $selector -isnot [hashtable]) { $selector = $null }
 
+    if ($verb -eq 'snapshot') {
+        # BEFORE element resolution (the selector here is a WINDOW
+        # selector, not an element address): a no-selector snapshot
+        # targets the foreground window and must never run the
+        # element-resolution path (which refuses selector-less requests).
+        $cap = 250
+        if ($null -ne $req['args'] -and $req['args'] -is [hashtable]) {
+            if ($null -ne $req['args']['max_elements']) { $cap = [Math]::Min([int]$req['args']['max_elements'], $MaxElements) }
+        }
+        $snapCache = New-WalkCache
+        return (Enter-Snapshot $selector $cap $snapCache)
+    }
+
     if ($verb -eq 'inspect') {
         $depth = 3; $cap = 200
         if ($null -ne $req['args'] -and $req['args'] -is [hashtable]) {
@@ -998,9 +1017,40 @@ function Invoke-Request([hashtable]$req) {
                 if ($null -ne $argsPair['timeout_s']) { $budget = [Math]::Min([int]$argsPair['timeout_s'], 120) }
             }
             $deadline = [DateTime]::UtcNow.AddSeconds($budget)
+            # ref/element_id addresses resolve INSIDE the poll loop: a
+            # null selector does not mean the element is absent (a
+            # gone-wait on a live ref answered gone immediately).
+            $waitRef = $null
+            if ($req.ContainsKey('ref') -and $null -ne $req['ref']) { $waitRef = [string]$req['ref'] }
+            $waitElementId = $null
+            if ($req.ContainsKey('element_id') -and $null -ne $req['element_id']) { $waitElementId = [string]$req['element_id'] }
             while ([DateTime]::UtcNow -lt $deadline) {
-                $elements = @(Resolve-Target $selector $cache)
-                $present = ($null -ne $elements -and $elements.Count -gt 0)
+                if ($null -ne $waitRef) {
+                    $resolved = Resolve-Ref $waitRef
+                    $present = ($null -eq $resolved.error_class)
+                } elseif ($null -ne $waitElementId) {
+                    $found = $null
+                    foreach ($scope in (Get-WindowScopeSet (Get-ElementIdScopeSelector $selector))) {
+                        $scan = $null
+                        $pushedWait = $cache.Activate()
+                        try {
+                            $scan = $scope.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+                        } finally {
+                            if ($null -ne $pushedWait) { $pushedWait.Dispose() }
+                        }
+                        foreach ($candidate in $scan) {
+                            $rid = ''
+                            try { $rid = (@($candidate.GetRuntimeId()) -join ':') } catch { }
+                            if ($rid -eq $waitElementId) { $found = $candidate; break }
+                        }
+                        if ($null -ne $found) { break }
+                    }
+                    $elements = @($found)
+                    $present = ($null -ne $found)
+                } else {
+                    $elements = @(Resolve-Target $selector $cache)
+                    $present = ($null -ne $elements -and $elements.Count -gt 0)
+                }
                 if ($gone -and -not $present) { return @{ ok = $true; result = @{ gone = $true } } }
                 if (-not $gone -and $present) { break }
                 Start-Sleep -Milliseconds 400
@@ -1106,14 +1156,6 @@ function Invoke-Request([hashtable]$req) {
         if ($locked -or -not (Test-OwnsInputDesktop)) {
             return @{ ok = $false; error_class = 'no_interactive_desktop'; error = 'the session is locked; this verb needs the interactive desktop' }
         }
-    }
-
-    if ($verb -eq 'snapshot') {
-        $cap = 250
-        if ($null -ne $req['args'] -and $req['args'] -is [hashtable]) {
-            if ($null -ne $req['args']['max_elements']) { $cap = [Math]::Min([int]$req['args']['max_elements'], $MaxElements) }
-        }
-        return (Enter-Snapshot $selector $cap $cache)
     }
 
     if ($verb -eq 'act') {

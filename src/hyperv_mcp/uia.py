@@ -1720,7 +1720,10 @@ def _render_snapshot_text(entries: Any) -> str:
     """Render one compact line per snapshot entry (issue #137):
     ``<ref> <ControlType> <Name> [<state-summary>] <rect>``, entries in
     order, indented by depth. Applied AFTER the password-value drop, so a
-    password field's value can never ride the rendered text either."""
+    password field's value can never ride the rendered text either. Guest
+    text is flattened to spaces: a name or value carrying a newline must
+    not split one entry into two lines (a forged-looking second line
+    could carry a ref the guest chose)."""
     lines: list[str] = []
     for entry in entries if isinstance(entries, list) else []:
         if not isinstance(entry, dict):
@@ -1729,17 +1732,22 @@ def _render_snapshot_text(entries: Any) -> str:
             indent = "  " * max(0, int(entry.get("depth") or 0))
         except (TypeError, ValueError):
             indent = ""
-        parts = [str(entry.get("ref") or ""),
-                 str(entry.get("control_type") or ""),
-                 str(entry.get("name") or "")]
+
+        def _flat(value: Any) -> str:
+            return " ".join(str(value if value is not None else "")
+                            .split())
+
+        parts = [_flat(entry.get("ref") or ""),
+                 _flat(entry.get("control_type") or ""),
+                 _flat(entry.get("name") or "")]
         state = entry.get("state")
         if isinstance(state, dict) and state:
-            summary = " ".join(f"{key}={value}"
+            summary = " ".join(f"{_flat(key)}={_flat(value)}"
                                for key, value in state.items())
             parts.append(f"[{summary}]")
         rect = entry.get("rect")
         if rect not in (None, ""):
-            parts.append(str(rect))
+            parts.append(_flat(rect))
         lines.append(indent + " ".join(p for p in parts if p))
     return "\n".join(lines)
 

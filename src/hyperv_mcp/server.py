@@ -5008,6 +5008,8 @@ def _uia_prevalidate(tool: str, arguments: dict) -> None:
                 f"{', '.join(sorted(uia._ACTIONS))})")
         ref_id = uia._validate_ref(ref) if ref else None
         uia._check_element_op(selector, element_id, ref_id)
+        if selector is not None:
+            uia.validate_selector(selector)
         value = arguments.get("value")
         if action == "set_value":
             if value is None:
