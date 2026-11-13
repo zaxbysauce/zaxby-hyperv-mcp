@@ -861,7 +861,7 @@ function Resolve-Ref([string]$refText) {
     # issued-but-evicted -> stale_ref with reason 'evicted'; live table
     # entry -> the element reference is copied out under the store lock,
     # then probed for liveness OUTSIDE the lock: an uncached property read
-    # (GetCurrentPropertyValue with ignoreMetadata=$true) is the only call
+    # (GetCurrentPropertyValue with ignoreDefaultValue=$true) is the only call
     # verified by executed probes to throw ElementNotAvailableException on
     # a dead element (GetRuntimeId and Current.* keep ANSWERING stale
     # values). dead -> stale_ref with reason 'dead'; alive -> the element.
@@ -909,9 +909,12 @@ function Resolve-Ref([string]$refText) {
     # The liveness probe runs OUTSIDE the store lock: an uncached property
     # read forces a provider call that throws ElementNotAvailableException
     # on a dead element (executed probe, 2026-11-13: GetRuntimeId and
-    # Current.* keep answering stale values on a dead element).
+    # Current.* keep answering stale values on a dead element). The catch
+    # is NARROW (critic round 2): only ElementNotAvailableException means
+    # dead -- a hung-but-alive provider raising TimeoutException/COM
+    # failures must surface as helper_error, not lie gone.
     $elAlive = $true
-    try { $null = $resolvedEl.GetCurrentPropertyValue([System.Windows.Automation.AutomationElement]::NameProperty, $true) } catch { $elAlive = $false }
+    try { $null = $resolvedEl.GetCurrentPropertyValue([System.Windows.Automation.AutomationElement]::NameProperty, $true) } catch [System.Windows.Automation.ElementNotAvailableException] { $elAlive = $false }
     if (-not $elAlive) {
         return @{ element = $null; error_class = 'stale_ref'; reason = 'dead'; error = "the referenced element is gone; take a fresh hyperv_ui_snapshot" }
     }

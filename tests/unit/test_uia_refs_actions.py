@@ -2150,7 +2150,7 @@ def test_ref_liveness_probe_and_gone_wait_semantics(tmp_path):
     experiment (2026-11-13, live WinForms child + hard kill, recorded in
     the review packet) proved GetRuntimeId and Current.* keep ANSWERING
     stale values on a dead element; only an uncached property read
-    (GetCurrentPropertyValue with ignoreMetadata=$true) throws
+    (GetCurrentPropertyValue with ignoreDefaultValue=$true) throws
     ElementNotAvailableException. The shipped Resolve-Ref therefore
     copies the element out under the store lock and probes it OUTSIDE
     the lock, and the gone-wait semantics split on WHY a ref failed:
@@ -2202,6 +2202,11 @@ try { $liveRid = (@($winEl.GetRuntimeId()) -join ':') } catch { $liveRid = $null
 # (b) kill the owning process hard; ref verdicts flip to probe-dead
 Stop-Process -Id $child.Id -Force
 Start-Sleep -Seconds 2
+# the OLD liveness check's shape still ANSWERS on the dead element --
+# the executed in-pin proof that a RuntimeId-based check could never
+# fire (the experiment this pin's probe legs rest on, re-run live)
+$deadRid = $null
+try { $deadRid = (@($winEl.GetRuntimeId()) -join ':') } catch { $deadRid = $null }
 $deadRef = Probe-Ref $ref1
 $findFrame = Invoke-Request (Probe-Request 'find' @{} $null $ref1)
 $findClass = [string]$findFrame.error_class
@@ -2232,6 +2237,7 @@ if ($fg -ne [IntPtr]::Zero) {
 '===PROBE-JSON==='
 @{
   live_rid_present = ($null -ne $liveRid)
+  dead_rid_present = ($null -ne $deadRid)
   dead_error_class = $deadRef.error_class
   dead_reason = $deadRef.reason
   find_class = $findClass
@@ -2251,6 +2257,10 @@ if ($fg -ne [IntPtr]::Zero) {
     assert out.get("live_rid_present") is True, (
         f"the live element's RuntimeId read must answer (the old check's "
         f"shape), got {out!r}")
+    assert out.get("dead_rid_present") is True, (
+        "the OLD liveness check's shape (GetRuntimeId) still ANSWERS on a "
+        "dead element -- the executed in-pin proof that a RuntimeId-based "
+        f"check could never fire, got {out!r}")
     # (b) dead element: stale_ref + reason 'dead', find refuses, gone
     # wait answers gone:true promptly
     assert out.get("dead_error_class") == "stale_ref", (
