@@ -2966,9 +2966,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                     class_name, window_title, window_title_contains,
                     process_name, hwnd, index, scope); with a selector the
                     walk starts at the matched element, without it at the
-                    desktop root — a selector with no window scope searches
-                    the FOREGROUND window (scope: foreground default /
-                    window / all_windows)
+                    FOREGROUND window (the scope key picks the breadth:
+                    foreground default / window / all_windows)
                 depth: Walk depth (1..32, default 3; one clamp shared with
                     evidence's PS Direct walk and the helper)
                 max_elements: Element cap (1..500, default 200; the same
@@ -3569,9 +3568,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                     class_name, window_title, window_title_contains,
                     process_name, hwnd, index, scope); with a selector the
                     walk starts at the matched element, without it at the
-                    desktop root — a selector with no window scope searches
-                    the FOREGROUND window (scope: foreground default /
-                    window / all_windows)
+                    FOREGROUND window (the scope key picks the breadth:
+                    foreground default / window / all_windows)
                 depth: Walk depth (1..32, default 3; one clamp shared with
                     evidence's PS Direct walk and the helper)
                 max_elements: Element cap (1..500, default 200; the same
@@ -4261,7 +4259,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 height: requested screenshot height in pixels (160..4096)
                 save_path: optional host path to also write the PNG/encoded image
                 ui_tree: also fetch a bounded guest UI element tree (needs credentials)
-                ui_tree_depth: tree walk depth, clamped to 1..6
+                ui_tree_depth: tree walk depth, clamped to 1..32
                 ui_tree_max_elements: element cap, clamped to 1..500
                 username: guest username for the UI-tree leg (or set HYPERV_GUEST_USERNAME)
                 password: guest password for the UI-tree leg (or set HYPERV_GUEST_PASSWORD)
@@ -4498,7 +4496,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 height: requested screenshot height in pixels (160..4096)
                 save_path: optional host path to also write the encoded image
                 ui_tree: also fetch a bounded guest UI element tree (needs credentials)
-                ui_tree_depth: tree walk depth, clamped to 1..6
+                ui_tree_depth: tree walk depth, clamped to 1..32
                 ui_tree_max_elements: element cap, clamped to 1..500
                 format:  png (default), jpeg/jpg, or webp; an unsupported format
                          is refused as an invalid-input error

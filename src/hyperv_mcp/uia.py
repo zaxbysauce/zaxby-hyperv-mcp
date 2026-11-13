@@ -1841,9 +1841,12 @@ def act(cfg, vm_name="", cred: CredentialSet | None = None, *,
                     "session": out.get("session")}
         # The helper leg's locks released with _verb_request (vmlocks are
         # NOT reentrant, PR #144): console.click takes its own locks. The
-        # vm_name slot carries a VMRef when the wrapper resolved by id -
-        # console.click needs a NAME (or the GUID through vm_id).
-        target = out.get("vm_name") or vm_name
+        # click target is the CALLER-ADDRESSED VM only: the helper
+        # response's vm_name echo is guest-controlled text and must never
+        # route a host console input. The vm_name slot carries a VMRef
+        # when the wrapper resolved by id - console.click needs a NAME
+        # (or the GUID through vm_id).
+        target = vm_name
         if not isinstance(target, str) or not target.strip():
             target = getattr(vm_name, "name", "") or ""
         click = console.click(cfg, vm_name=target,

@@ -184,7 +184,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.18.0 today) instead of
+  package's version (0.19.0 today) instead of
   the SDK's (the release contract, the complete bump-site
   enumeration, and how to read `version`/`git_revision` live in
   [docs/versioning-policy.md](docs/versioning-policy.md)).
@@ -234,7 +234,7 @@ definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
 
-## 0.18.0 changes
+## 0.19.0 changes
 
 - **UIA element contract (#136/#137):** the `hyperv_ui_*` family gains a
   snapshot/act element-reference contract and a scoped tree search.
@@ -252,7 +252,7 @@ the task-spawned controller reads it from the environment.
   `hyperv_ui_snapshot` (read) captures ONE window into `snapshot_id` +
   entries plus a rendered `text` block with one compact line per element
   (`<ref> <ControlType> <Name> [<state-summary>] <rect>`, indented by
-  depth), and `hyperv_ui_act` (mutating, lease-gated: `lease_id` +
+  depth, bounded at 12 capture levels (deeper descendants are skipped by design; `hyperv_ui_inspect` reaches 32), and `hyperv_ui_act` (mutating, lease-gated: `lease_id` +
   `fencing_token`, no confirm) performs one explicit action from the closed
   set invoke / toggle_on / toggle_off / select / expand / collapse /
   set_value / focus / scroll_into_view / click. Every act action requires
@@ -272,6 +272,10 @@ the task-spawned controller reads it from the environment.
   `value_contains=` (substring), and `state=` (a non-empty dict matched
   against the element's state block and its top-level properties); expiry
   returns the LAST observed element with `timed_out: true`.
+- Version bump: 0.18.0 -> 0.19.0.
+
+## 0.18.0 changes
+
 - **Named-secret typing (#130):** `hyperv_console_type_text` and
   `hyperv_ui_set_value` accept `secret_ref` (`env:NAME` or an allowlisted
   `file:PATH`, resolved host-side through the `host_read_roots` policy).

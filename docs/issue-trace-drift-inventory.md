@@ -53,7 +53,7 @@ reported below (issue #143).
 | gpt6sol-guest-access-tools | 22 | 22 | 0 | clean |
 | issue-14-vm-rw-locks | 11 | 11 | 0 | clean |
 | issue-15-ps-cap-cancel | 9 | 9 | 0 | clean |
-| issue-16-tool-concurrency | 13 | 10 | 3 | exit 1 |
+| issue-16-tool-concurrency | 13 | 7 | 6 | exit 1 |
 
 ## Self-referential pairs (excluded from the gate, issue #143)
 
@@ -158,14 +158,17 @@ wave's bookkeeping and is never a gate failure.
 
 ### 74-72-88-cost-latency-accounting (exit 1)
 
-- `CHANGED README.md 1960d4c6f808c0ee2b2f2b4de64c877d73bc1682 c14eda212e563211d583f953c0fa6046146b2ea6 (C10)`
-- `CHANGED src/hyperv_mcp/server.py 47b2c188ae2c1cb8ede580229e8ca3b50823c941 b83a0b952cbff39c6b11771a925751bca85f3f17 (C10)`
+- `CHANGED README.md 1960d4c6f808c0ee2b2f2b4de64c877d73bc1682 6464541f06772175e573f2e88cf64146645177d0 (C10)`
+- `CHANGED src/hyperv_mcp/server.py 47b2c188ae2c1cb8ede580229e8ca3b50823c941 4fa9da7e50594a5007d38822a50811e1c92368cf (C10)`
 
 ### issue-16-tool-concurrency (exit 1)
 
 - `CHANGED tests/unit/test_c03_tool_surface.py bbdc239578fc7ddfc56931232803ac6abd91ad18 70960812cadaf5dd740bec1a1f9e0c147065913f (C10)`
 - `CHANGED tests/unit/test_c03_tool_surface.py bbdc239578fc7ddfc56931232803ac6abd91ad18 70960812cadaf5dd740bec1a1f9e0c147065913f (C11)`
 - `CHANGED tests/unit/test_c03_tool_surface.py bbdc239578fc7ddfc56931232803ac6abd91ad18 70960812cadaf5dd740bec1a1f9e0c147065913f (C12)`
+- `CHANGED tests/unit/test_c03_sdk_port.py 6e823a10732d9796927ca22b7258ca5719dc98b5 2e7eb6ec37ca9b3f43d03600dddf82772c4283f5 (C7)`
+- `CHANGED tests/unit/test_c03_sdk_port.py 6e823a10732d9796927ca22b7258ca5719dc98b5 2e7eb6ec37ca9b3f43d03600dddf82772c4283f5 (C8)`
+- `CHANGED tests/unit/test_c03_sdk_port.py 6e823a10732d9796927ca22b7258ca5719dc98b5 2e7eb6ec37ca9b3f43d03600dddf82772c4283f5 (C9)`
 
 <!-- regenerated-state-end -->
 

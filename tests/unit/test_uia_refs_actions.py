@@ -536,6 +536,11 @@ def test_action_set_is_closed(monkeypatch):
         assert len(pipe.requests) == 1, (
             f"the action {action!r} must reach the helper with exactly "
             f"one request; got {len(pipe.requests)}")
+        frame = pipe.requests[0]
+        assert isinstance(frame, dict) \
+            and (frame.get("args") or {}).get("action") == action, (
+            f"the {action!r} act frame must forward the action in args "
+            "(the helper dispatches on args.action)")
 
     pipe.requests.clear()
     for bad in ("press_keys", "click_at", "invoke ", ""):
@@ -1583,7 +1588,7 @@ def _build_real_helper_probe(body: str) -> str:
         "    $r = Resolve-Ref $refText",
         "    $rid = $null",
         "    if ($null -ne $r.element) { try { $rid = (@($r.element.GetRuntimeId()) -join ':') } catch { $rid = $null } }",
-        "    return @{ ref = $refText; error_class = $r.error_class; element_rid = $rid }",
+        "    return @{ ref = $refText; error_class = $r.error_class; reason = $r.reason; element_rid = $rid }",
         "}",
         # the synchronized store, declared exactly as the shipped script
         # declares it (round-1 B2: one shared store across runspaces)
@@ -1649,17 +1654,20 @@ def test_helper_no_selector_snapshot_serves_the_foreground_window(tmp_path):
     and when this box truly exposes no foreground window (the honest
     no_foreground_window verdict), never silently.
 
-    RESIDUAL DEFECT (disclosed, outside this round's no-production-edits
-    scope, reported to the coordinator): the LITERAL selector-less frame
-    -- the exact shape the host's default hyperv_ui_snapshot sends, since
-    the server prevalidation passes selector=None through -- terminates
-    PS 5.1 execution inside Get-WindowScopeSet at `$selector['hwnd']`
-    ("Cannot index into a null array": PowerShell throws when indexing
-    $null with a string key). The serve loop would catch that and answer
-    helper_error. This pin therefore drives the no-WINDOW-selector shape
-    (an element-name selector matching nothing), which is the shape that
-    distinguishes the fixed dispatch from the pre-fix element_not_found
-    verdict; the selector-less crash is left to a production fix."""
+    Historical note (round 8 recorded a residual selector-less-frame
+    crash inside Get-WindowScopeSet; the null-selector guard shipped in
+    the r2-minor wave closed it, and the probe's second leg now pins the
+    fix by execution): the LITERAL selector-less frame -- the exact
+    shape the host's default hyperv_ui_snapshot sends, since the server
+    prevalidation passes selector=None through -- used to terminate PS
+    5.1 execution inside Get-WindowScopeSet at `$selector['hwnd']`.
+    Get-WindowScopeSet now null-guards $selector at entry, so the frame
+    serves like any other snapshot. The pin's second leg drives the
+    literal selector-less frame and asserts it never answers
+    probe_exception; the first leg still drives the no-WINDOW-selector
+    shape (an element-name selector matching nothing), which is the
+    shape that distinguishes the fixed dispatch from the pre-fix
+    element_not_found verdict."""
     body = r"""
 $fg = [HypervMcp.Uia.Native]::GetForegroundWindow()
 if ($fg -eq [IntPtr]::Zero) {
@@ -1676,22 +1684,46 @@ if ($frame.ok -eq $false -and [string]$frame.error_class -eq 'no_foreground_wind
     @{ skip = 'no_foreground_window'; reason = [string]$frame.error } | ConvertTo-Json -Compress
     exit 0
 }
+# second leg: the LITERAL selector-less frame (no selector key at all) --
+# the round-8 recorded crash inside Get-WindowScopeSet; the null-selector
+# guard must make it serve like any other snapshot
+$reqNull = Probe-Request 'snapshot' @{ max_elements = 5 } $null $null
+$nullFrameOk = $false
+$nullFrameClass = $null
+try {
+    $nf = Invoke-Request $reqNull
+    $nullFrameOk = ($nf.ok -eq $true)
+    $nullFrameClass = [string]$nf.error_class
+} catch { $nullFrameClass = 'probe_exception' }
 '===PROBE-JSON==='
-$frame | ConvertTo-Json -Depth 12 -Compress
+@{
+  frame = $frame
+  null_ok = $nullFrameOk
+  null_class = $nullFrameClass
+} | ConvertTo-Json -Depth 14 -Compress
 """
     frame = _run_real_helper_probe(body, tmp_path)
     if frame.get("skip") == "no_foreground_window":
         pytest.skip(f"no interactive desktop: {frame.get('reason')}")
-    assert frame.get("ok") is True, (
+    assert frame.get("null_ok") is True, (
+        "the LITERAL selector-less snapshot frame must serve under the "
+        f"null-selector guard (round 8 recorded a PS 5.1 crash here); "
+        f"got ok={frame.get('null_ok')!r} "
+        f"class={frame.get('null_class')!r}")
+    assert frame.get("null_class") != "probe_exception", (
+        "the selector-less frame must never terminate PS 5.1 execution "
+        "(the Get-WindowScopeSet null-selector guard)")
+    snap = frame.get("frame") or {}
+    assert snap.get("ok") is True, (
         "the real helper's no-window-selector snapshot must serve the "
-        f"foreground window with ok:true; got {frame!r} -- the pre-fix "
+        f"foreground window with ok:true; got {snap!r} -- the pre-fix "
         "dispatch-order bug answered element_not_found for exactly this "
         "shape")
-    snapshot_id = frame.get("result", {}).get("snapshot_id")
+    snapshot_id = snap.get("result", {}).get("snapshot_id")
     assert isinstance(snapshot_id, str) and re.match(
         r"^s[0-9a-fA-F]+$", snapshot_id), (
         f"the snapshot answer must carry a snapshot_id, got {snapshot_id!r}")
-    entries = frame.get("result", {}).get("entries") or []
+    entries = snap.get("result", {}).get("entries") or []
     entries = [e for e in entries if isinstance(e, dict)]
     assert entries, "the snapshot answer must carry at least one entry"
     bad = [e.get("ref") for e in entries
@@ -1774,14 +1806,12 @@ def test_helper_wait_gone_by_ref_polls_ref_liveness(tmp_path):
       returned ref must NOT answer gone: the measured wait runs its
       ~3 s budget polling (the pre-fix shape returned in well under a
       second with result.gone=true).
-    Behavioral-leg disclosure: after the loop expires, the current tree's
-    post-loop element-result path terminates on PS 5.1 when the wait
-    carries no selector (Select-One indexes the null selector -- the
-    same residual null-index family documented on
-    test_helper_no_selector_snapshot_serves_the_foreground_window). The
-    probe catches that termination and this pin asserts only the LOOP
-    behavior (elapsed budget + never answered gone); the crash itself is
-    reported to the coordinator, not asserted here."""
+    Post-loop note (the round-8 disclosure named a PS 5.1 crash in the
+    post-loop element-result path when the wait carries no selector --
+    Select-One indexing a null selector; the null-selector guard shipped
+    in the r2-minor wave closed it): this pin now asserts
+    crashed_after_loop is false, so the expiry path must reach a usable
+    frame, not a termination."""
     text = _helper_text()
 
     # structural leg 1: the unique anchor comment + Resolve-Ref inside
@@ -1864,6 +1894,10 @@ $sw.Stop()
     assert out.get("answered_gone") is not True, (
         "a gone=true wait on a ref that RESOLVES must never answer gone "
         "(the ref is live); this is the pre-fix MAJOR-2 shape")
+    assert out.get("crashed_after_loop") is not True, (
+        "the expired gone-wait must reach a usable frame after the loop "
+        "(the Select-One null-selector guard closed the round-8 crash "
+        f"family); crash message: {out.get('crash_message')!r}")
     assert int(out.get("wait_elapsed_ms") or 0) >= 2000, (
         f"the gone-wait must poll its ~3 s budget resolving the ref "
         f"inside the loop instead of answering immediately; measured "
@@ -1978,3 +2012,273 @@ if ($snap2.ok -eq $true) { $live2 = Probe-Ref ([string]$snap2.result.entries[0].
     live2 = out.get("live2_ref") or {}
     assert live2.get("error_class") is None and live2.get("element_rid"), (
         f"the second snapshot's ref must still resolve live, got {live2!r}")
+
+
+# ---------------------------------------------------------------------------
+# PR-review feedback round pins (F1 / F2 / F5 of the 2026-11-13 review)
+# ---------------------------------------------------------------------------
+
+def test_process_filter_applies_in_hwnd_and_title_branches(tmp_path):
+    """Critic-confirmed CD-003 pin (swarm-pr-review round): the
+    process_name selector filter applies in the hwnd and the exact
+    window_title branches too, not only in the title-substring scan.
+    Before the fix a selector carrying hwnd (or an exact window_title)
+    PLUS process_name returned the hwnd/title match unfiltered -- the
+    process filter was computed below those early-return branches and
+    never ran on them.
+
+    Behavioral (real helper under PS 5.1, skipped when powershell.exe
+    is absent or no foreground window exists): find with
+    {hwnd, process_name: 'zz-no-such-process-zz'} answers no elements;
+    find with {hwnd, process_name: <the real owner>} answers elements;
+    the same pair through the exact window_title branch."""
+    body = r"""
+$fg = [HypervMcp.Uia.Native]::GetForegroundWindow()
+if ($fg -eq [IntPtr]::Zero) {
+    '===PROBE-JSON==='
+    @{ skip = 'no_foreground_window'; reason = 'GetForegroundWindow returned zero on this box' } | ConvertTo-Json -Compress
+    exit 0
+}
+$fgEl = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr][long]$fg)
+if ($null -eq $fgEl) {
+    '===PROBE-JSON==='
+    @{ skip = 'no_foreground_window'; reason = 'FromHandle refused the foreground hwnd' } | ConvertTo-Json -Compress
+    exit 0
+}
+$owner = Get-ElementProcessName $fgEl
+$title = [string]$fgEl.Current.Name
+if ([string]::IsNullOrEmpty($owner) -or [string]::IsNullOrEmpty($title)) {
+    '===PROBE-JSON==='
+    @{ skip = 'no_foreground_window'; reason = 'the foreground window exposed no owner name or title' } | ConvertTo-Json -Compress
+    exit 0
+}
+$wrong = 'zz-no-such-process-zz'
+$hwndWrong = Invoke-Request (Probe-Request 'find' @{} @{ hwnd = ([int64]$fg); process_name = $wrong } $null)
+$hwndRight = Invoke-Request (Probe-Request 'find' @{} @{ hwnd = ([int64]$fg); process_name = $owner } $null)
+$titleWrong = Invoke-Request (Probe-Request 'find' @{} @{ window_title = $title; process_name = $wrong } $null)
+$titleRight = Invoke-Request (Probe-Request 'find' @{} @{ window_title = $title; process_name = $owner } $null)
+function Count-Of($frame) {
+    if ($null -eq $frame) { return -1 }
+    if ($frame.ok -ne $true) { return -2 }
+    $els = $frame.result['elements']
+    if ($null -eq $els) { return 0 }
+    return @($els).Count
+}
+'===PROBE-JSON==='
+@{
+  owner = $owner
+  hwnd_wrong = (Count-Of $hwndWrong)
+  hwnd_right = (Count-Of $hwndRight)
+  title_wrong = (Count-Of $titleWrong)
+  title_right = (Count-Of $titleRight)
+} | ConvertTo-Json -Compress
+"""
+    out = _run_real_helper_probe(body, tmp_path)
+    if out.get("skip") == "no_foreground_window":
+        pytest.skip(f"no interactive desktop: {out.get('reason')}")
+    assert out.get("hwnd_wrong") == 0, (
+        "find with hwnd + a wrong process_name must answer NO elements "
+        f"(the process filter must apply in the hwnd branch), got "
+        f"{out.get('hwnd_wrong')!r} (probe answer: {out!r})")
+    assert (out.get("hwnd_right") or 0) > 0, (
+        "find with hwnd + the real owner process name must answer "
+        f"elements, got {out.get('hwnd_right')!r} (probe answer: {out!r})")
+    assert out.get("title_wrong") == 0, (
+        "find with an exact window_title + a wrong process_name must "
+        f"answer NO elements (the process filter must apply in the "
+        f"title branch), got {out.get('title_wrong')!r}")
+    assert (out.get("title_right") or 0) > 0, (
+        "find with an exact window_title + the real owner process name "
+        f"must answer elements, got {out.get('title_right')!r}")
+
+
+def test_helper_response_serializer_depth_pinned(tmp_path):
+    """Critic-confirmed COR-CS-001 pin (swarm-pr-review round): the
+    helper's response serializer is pinned at -Depth 100 so a
+    max-elements snapshot/inspect answer (state blocks nested deeper
+    than 16 levels) serializes instead of truncating into
+    'System.Collections.Hashtable' strings on the wire (PS 5.1
+    ConvertTo-Json silently stringifies past its depth budget).
+
+    Legs: structural (the shipped serializer line carries -Depth 100
+    and no -Depth 16 budget remains) + functional (real PS 5.1: a
+    32-level nested table round-trips through -Depth 100 and
+    truncates through -Depth 16 -- the exact defect shape)."""
+    text = _helper_text()
+    m = re.search(r"ConvertTo-Json -Compress -Depth (\d+)", text)
+    assert m is not None, (
+        "the helper's response serializer (ConvertTo-Json) is missing")
+    depth = int(m.group(1))
+    assert depth >= 100, (
+        f"the helper response serializer must run at depth >= 100 (the "
+        f"old -Depth 16 budget stringified deep answers on PS 5.1), "
+        f"found -Depth {depth}")
+    assert "-Depth 16" not in text, (
+        "the old -Depth 16 serializer budget must be gone")
+
+    import subprocess
+    probe = (
+        "$ErrorActionPreference = 'Stop'\n"
+        "$deep = @{}\n"
+        "$cur = $deep\n"
+        "for ($i = 0; $i -lt 31; $i++) { $cur['child'] = @{}; $cur = $cur['child'] }\n"
+        "$cur['leaf'] = 'ok'\n"
+        "$json100 = ($deep | ConvertTo-Json -Compress -Depth 100)\n"
+        "$json16 = ($deep | ConvertTo-Json -Compress -Depth 16)\n"
+        "'===PROBE-JSON==='\n"
+        "@{ depth100_ok = ($json100.Contains('\"leaf\":\"ok\"')); "
+        "depth16_truncated = (-not $json16.Contains('\"leaf\":\"ok\"')) } | ConvertTo-Json -Compress\n")
+    proc = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive",
+         "-ExecutionPolicy", "Bypass", "-Command", probe],
+        capture_output=True, timeout=60)
+    out_raw = proc.stdout.decode("utf-8", "replace")
+    assert _PROBE_JSON_MARKER in out_raw, (
+        f"the depth probe printed no JSON marker; stdout: {out_raw[-800:]!r}")
+    out = json.loads(out_raw.rsplit(_PROBE_JSON_MARKER, 1)[1].strip())
+    assert out.get("depth100_ok") is True, (
+        "PS 5.1 must serialize a 32-level table through -Depth 100 "
+        f"without truncation, got {out!r}")
+    assert out.get("depth16_truncated") is True, (
+        "the same table must truncate through the old -Depth 16 budget "
+        f"(the defect this pin guards); got {out!r}")
+
+
+def test_ref_liveness_probe_and_gone_wait_semantics(tmp_path):
+    """Critic-confirmed CRITIC-NEW-1 pin (swarm-pr-review round): ref
+    liveness is a REAL probe, not the RuntimeId read. The executed
+    experiment (2026-11-13, live WinForms child + hard kill, recorded in
+    the review packet) proved GetRuntimeId and Current.* keep ANSWERING
+    stale values on a dead element; only an uncached property read
+    (GetCurrentPropertyValue with ignoreMetadata=$true) throws
+    ElementNotAvailableException. The shipped Resolve-Ref therefore
+    copies the element out under the store lock and probes it OUTSIDE
+    the lock, and the gone-wait semantics split on WHY a ref failed:
+      - a probe-verified DEAD element: a gone=true wait answers
+        gone:true (the element really is gone); a plain find-by-ref
+        answers stale_ref;
+      - an EVICTED snapshot (tombstone): never gone:true -- eviction is
+        not absence -- the gone-wait answers stale_ref.
+    Legs (real helper under PS 5.1, skipped when powershell.exe is
+    absent or the probe child never appears):
+      (a) liveness shape on a LIVE element: the RuntimeId read answers
+          (why the old check never fired);
+      (b) after a hard kill of the owning process: a find-by-ref
+          answers stale_ref with reason 'dead'; a gone=true wait_for on
+          that ref answers gone:true promptly;
+      (c) eviction + gone-wait: after two newer snapshots on the same
+          window, the evicted ref's gone=true wait answers stale_ref
+          (NOT gone:true) -- the pre-fix lie."""
+    body = r"""
+$child = Start-Process powershell.exe -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-Command', "Add-Type -AssemblyName System.Windows.Forms; `$f = New-Object System.Windows.Forms.Form; `$f.Text = 'Probe14641RefDead'; `$b = New-Object System.Windows.Forms.Button; `$b.Text = 'ProbeBtn'; `$f.Controls.Add(`$b); `$null = `$f.Show(); [System.Windows.Forms.Application]::Run(`$f)"
+$deadline = [DateTime]::UtcNow.AddSeconds(20)
+$winEl = $null
+$rootEl = [System.Windows.Automation.AutomationElement]::RootElement
+$cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, 'Probe14641RefDead')
+while ([DateTime]::UtcNow -lt $deadline -and -not $winEl) {
+    Start-Sleep -Milliseconds 300
+    $winEl = $rootEl.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond)
+}
+if ($null -eq $winEl) {
+    Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue
+    '===PROBE-JSON==='
+    @{ skip = 'no_child_window'; reason = 'the probe child window never appeared' } | ConvertTo-Json -Compress
+    exit 0
+}
+$hwnd = [int64]$winEl.Current.NativeWindowHandle
+$snap = Invoke-Request (Probe-Request 'snapshot' @{ max_elements = 20 } @{ hwnd = $hwnd } $null)
+if ($snap.ok -ne $true) {
+    Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue
+    '===PROBE-JSON==='
+    @{ skip = 'snapshot_refused'; reason = ('snapshot refused: ' + [string]$snap.error_class) } | ConvertTo-Json -Compress
+    exit 0
+}
+$ref1 = [string]$snap.result.entries[0].ref
+
+# (a) liveness shape on the LIVE element: the RuntimeId read answers
+$liveRid = $null
+try { $liveRid = (@($winEl.GetRuntimeId()) -join ':') } catch { $liveRid = $null }
+
+# (b) kill the owning process hard; ref verdicts flip to probe-dead
+Stop-Process -Id $child.Id -Force
+Start-Sleep -Seconds 2
+$deadRef = Probe-Ref $ref1
+$findFrame = Invoke-Request (Probe-Request 'find' @{} $null $ref1)
+$findClass = [string]$findFrame.error_class
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$goneFrame = Invoke-Request (Probe-Request 'wait_for' @{ gone = $true; timeout_s = 10 } $null $ref1)
+$sw.Stop()
+$goneOk = ($null -ne $goneFrame -and $goneFrame.ok -eq $true)
+$goneAnswered = ($null -ne $goneFrame -and $null -ne $goneFrame.result -and $goneFrame.result['gone'] -eq $true)
+
+# (c) eviction + gone-wait on a LIVE window (the foreground window,
+# pinned via its hwnd so the FIFO eviction is deterministic)
+$evictClass = $null
+$evictGone = $false
+$fg = [HypervMcp.Uia.Native]::GetForegroundWindow()
+if ($fg -ne [IntPtr]::Zero) {
+    $s1 = Invoke-Request (Probe-Request 'snapshot' @{ max_elements = 20 } @{ hwnd = ([int64]$fg) } $null)
+    if ($s1.ok -eq $true) {
+        $refE = [string]$s1.result.entries[0].ref
+        $s2 = Invoke-Request (Probe-Request 'snapshot' @{ max_elements = 20 } @{ hwnd = ([int64]$fg) } $null)
+        $s3 = Invoke-Request (Probe-Request 'snapshot' @{ max_elements = 20 } @{ hwnd = ([int64]$fg) } $null)
+        if ($s2.ok -eq $true -and $s3.ok -eq $true) {
+            $gw = Invoke-Request (Probe-Request 'wait_for' @{ gone = $true; timeout_s = 5 } $null $refE)
+            $evictClass = [string]$gw.error_class
+            $evictGone = ($null -ne $gw -and $gw.ok -eq $true -and $null -ne $gw.result -and $gw.result['gone'] -eq $true)
+        }
+    }
+}
+'===PROBE-JSON==='
+@{
+  live_rid_present = ($null -ne $liveRid)
+  dead_error_class = $deadRef.error_class
+  dead_reason = $deadRef.reason
+  find_class = $findClass
+  gone_ok = $goneOk
+  gone_answered = $goneAnswered
+  gone_elapsed_ms = $sw.ElapsedMilliseconds
+  evict_class = $evictClass
+  evict_gone = $evictGone
+} | ConvertTo-Json -Compress
+"""
+    out = _run_real_helper_probe(body, tmp_path)
+    if out.get("skip"):
+        pytest.skip(f"{out.get('skip')}: {out.get('reason')}")
+    # (a) the old liveness check could never fire: RuntimeId ANSWERS on
+    # a live element (and the experiment showed it answers on a dead
+    # one too -- which is why the probe is uncached, not the id read)
+    assert out.get("live_rid_present") is True, (
+        f"the live element's RuntimeId read must answer (the old check's "
+        f"shape), got {out!r}")
+    # (b) dead element: stale_ref + reason 'dead', find refuses, gone
+    # wait answers gone:true promptly
+    assert out.get("dead_error_class") == "stale_ref", (
+        f"a dead element's ref must answer stale_ref, got "
+        f"{out.get('dead_error_class')!r} (probe answer: {out!r})")
+    assert out.get("dead_reason") == "dead", (
+        f"the stale_ref verdict must carry reason 'dead' (the gone-wait "
+        f"branches on it), got {out.get('dead_reason')!r}")
+    assert out.get("find_class") == "stale_ref", (
+        f"a plain find-by-ref on a dead element must answer stale_ref "
+        f"(never an element), got {out.get('find_class')!r}")
+    assert out.get("gone_answered") is True, (
+        f"a gone=true wait on a dead element's ref must answer "
+        f"gone:true (the element really is gone), got "
+        f"gone_ok={out.get('gone_ok')!r} "
+        f"gone_answered={out.get('gone_answered')!r}")
+    assert (out.get("gone_elapsed_ms") or 0) < 5000, (
+        f"the dead-element gone-wait must settle promptly (the element "
+        f"is already dead when the wait starts), measured "
+        f"{out.get('gone_elapsed_ms')} ms")
+    # (c) eviction: the gone-wait answers stale_ref, NEVER gone:true --
+    # the exact lie the round's critic confirmed (eviction is not
+    # absence: the element may still be on screen)
+    if out.get("evict_class") is None:
+        pytest.skip("the eviction leg could not run (snapshots refused)")
+    assert out.get("evict_gone") is not True, (
+        "a gone=true wait on an EVICTED snapshot's ref must never "
+        f"answer gone:true (eviction is not absence), got {out!r}")
+    assert out.get("evict_class") == "stale_ref", (
+        f"the evicted ref's gone-wait must answer stale_ref, got "
+        f"{out.get('evict_class')!r}")

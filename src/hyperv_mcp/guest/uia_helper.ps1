@@ -363,26 +363,38 @@ function Get-WindowScopeSet([hashtable]$selector) {
     # match; never the desktop root as a fake scope).
     $root = [System.Windows.Automation.AutomationElement]::RootElement
     $scopes = @()
+    $procNeedle = $null
+    if ($null -ne $selector['process_name'] -and ([string]$selector['process_name']) -ne '') {
+        $procNeedle = ([string]$selector['process_name']).Trim().ToLowerInvariant() -replace '\.exe$', ''
+    }
     if ($null -ne $selector['hwnd']) {
         try {
             $byHandle = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr][long]$selector['hwnd'])
-            if ($null -ne $byHandle) { return @($byHandle) }
+            if ($null -ne $byHandle) {
+                if ($null -ne $procNeedle) {
+                    $pn = Get-ElementProcessName $byHandle
+                    if ($null -eq $pn -or $pn -ne $procNeedle) { return @() }
+                }
+                return @($byHandle)
+            }
         } catch { }
         return @()
     }
     if ($selector['window_title']) {
         $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, [string]$selector['window_title'])
         $found = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)
-        if ($null -ne $found -and $found.Count -gt 0) { return @($found[0]) }
+        if ($null -ne $found -and $found.Count -gt 0) {
+            if ($null -ne $procNeedle) {
+                $pn = Get-ElementProcessName $found[0]
+                if ($null -eq $pn -or $pn -ne $procNeedle) { return @() }
+            }
+            return @($found[0])
+        }
         return @()
     }
     $needle = $null
     if ($null -ne $selector['window_title_contains'] -and ([string]$selector['window_title_contains']) -ne '') {
         $needle = ([string]$selector['window_title_contains']).ToLowerInvariant()
-    }
-    $procNeedle = $null
-    if ($null -ne $selector['process_name'] -and ([string]$selector['process_name']) -ne '') {
-        $procNeedle = ([string]$selector['process_name']).Trim().ToLowerInvariant() -replace '\.exe$', ''
     }
     if ($null -ne $needle -or $null -ne $procNeedle) {
         # window_title_contains / process_name select the TARGET WINDOWS:
@@ -787,10 +799,11 @@ function Enter-Snapshot([hashtable]$selector, [int]$cap, $cache) {
         $entries += $result
         $index += 1
         if ($depth -ge 12) { continue }
-        # The snapshot's RENDER depth cap (12): deeper content still
-        # exists but is not rendered into the compact text - a display
-        # bound distinct from the inspect clamp (32), which remains the
-        # deep-tree reading bound (#136 AC9).
+        # The snapshot's CAPTURE bound (12): elements below 12 levels are
+        # not captured at all (no entry, no ref, nothing rendered) - a
+        # deliberately smaller display bound than the inspect clamp (32),
+        # which remains the deep-tree reading bound (#136 AC9). Disclosed
+        # in the README's hyperv_ui_snapshot description.
         $kid = $null
         try { $kid = $walker.GetFirstChild($el, $cache) } catch { $kid = $null }
         while ($null -ne $kid -and $entries.Count -lt $cap) {
@@ -845,8 +858,13 @@ function Enter-Snapshot([hashtable]$selector, [int]$cap, $cache) {
 
 function Resolve-Ref([string]$refText) {
     # Constant-time table lookup: s<hex>:<dec>. never-issued -> unknown_ref;
-    # issued-but-evicted -> stale_ref; live -> dead element check ->
-    # stale_ref, else the live element.
+    # issued-but-evicted -> stale_ref with reason 'evicted'; live table
+    # entry -> the element reference is copied out under the store lock,
+    # then probed for liveness OUTSIDE the lock: an uncached property read
+    # (GetCurrentPropertyValue with ignoreMetadata=$true) is the only call
+    # verified by executed probes to throw ElementNotAvailableException on
+    # a dead element (GetRuntimeId and Current.* keep ANSWERING stale
+    # values). dead -> stale_ref with reason 'dead'; alive -> the element.
     $parts = $refText -split ':'
     if ($parts.Count -ne 2 -or $parts[0] -notmatch '^s[0-9a-fA-F]+$' -or $parts[1] -notmatch '^[0-9]+$') {
         return @{ element = $null; error_class = 'unknown_ref'; error = "the ref $refText was never issued by any hyperv_ui_snapshot" }
@@ -855,31 +873,49 @@ function Resolve-Ref([string]$refText) {
     $idx = [int]$parts[1]
     # The lookup holds the SAME store lock Enter-Snapshot's
     # read-modify-write holds: concurrent read verbs race these plain
-    # hashtable/HashSet members otherwise.
+    # hashtable/HashSet members otherwise. The element reference is
+    # copied out under this lock; the liveness probe runs AFTER the
+    # lock releases (a cross-process provider call can block - never
+    # hold the store lock across one).
+    $resolvedEl = $null
+    $lookupClass = 'unknown_ref'
+    $lookupError = "the ref $refText was never issued by any hyperv_ui_snapshot"
+    $lookupReason = $null
     [System.Threading.Monitor]::Enter($SnapshotStore.SyncRoot)
     try {
         foreach ($tbl in $SnapshotStore.windows.Values) {
             if ($tbl.live.ContainsKey($sid)) {
                 $table = $tbl.live[$sid]
                 if (-not $table.ContainsKey($idx)) {
-                    return @{ element = $null; error_class = 'unknown_ref'; error = "the ref $refText was never issued by any hyperv_ui_snapshot" }
+                    $lookupClass = 'unknown_ref'
+                    $lookupError = "the ref $refText was never issued by any hyperv_ui_snapshot"
+                } else {
+                    $resolvedEl = $table[$idx]
+                    $lookupClass = $null
                 }
-                $el = $table[$idx]
-                $rid = ''
-                try { $rid = (@($el.GetRuntimeId()) -join ':') } catch { $rid = '' }
-                if ($rid -eq '') {
-                    return @{ element = $null; error_class = 'stale_ref'; error = "the referenced element is gone; take a fresh hyperv_ui_snapshot" }
-                }
-                return @{ element = $el; error_class = $null; error = $null }
             }
             if ($tbl.tombstones.Contains($sid)) {
-                return @{ element = $null; error_class = 'stale_ref'; error = "the snapshot $refText was evicted (two newer snapshots taken for this window); take a fresh hyperv_ui_snapshot" }
+                $lookupClass = 'stale_ref'
+                $lookupReason = 'evicted'
+                $lookupError = "the snapshot $refText was evicted (two newer snapshots taken for this window); take a fresh hyperv_ui_snapshot"
             }
         }
     } finally {
         [System.Threading.Monitor]::Exit($SnapshotStore.SyncRoot)
     }
-    return @{ element = $null; error_class = 'unknown_ref'; error = "the ref $refText was never issued by any hyperv_ui_snapshot" }
+    if ($null -ne $lookupClass) {
+        return @{ element = $null; error_class = $lookupClass; reason = $lookupReason; error = $lookupError }
+    }
+    # The liveness probe runs OUTSIDE the store lock: an uncached property
+    # read forces a provider call that throws ElementNotAvailableException
+    # on a dead element (executed probe, 2026-11-13: GetRuntimeId and
+    # Current.* keep answering stale values on a dead element).
+    $elAlive = $true
+    try { $null = $resolvedEl.GetCurrentPropertyValue([System.Windows.Automation.AutomationElement]::NameProperty, $true) } catch { $elAlive = $false }
+    if (-not $elAlive) {
+        return @{ element = $null; error_class = 'stale_ref'; reason = 'dead'; error = "the referenced element is gone; take a fresh hyperv_ui_snapshot" }
+    }
+    return @{ element = $resolvedEl; error_class = $null; reason = $null; error = $null }
 }
 
 function Invoke-Request([hashtable]$req) {
@@ -1029,14 +1065,16 @@ function Invoke-Request([hashtable]$req) {
                     $resolved = Resolve-Ref $waitRef
                     # A ref the helper never issued is a CALLER error, not
                     # an absent element: answer unknown_ref immediately
-                    # instead of a misleading gone verdict. A stale_ref
-                    # (evicted snapshot or dead element) means the element
-                    # IS gone - an immediate, TRUE gone verdict.
+                    # instead of a misleading gone verdict. An EVICTED
+                    # snapshot is not absence - the element may still be
+                    # on screen - so a gone-wait answers stale_ref there
+                    # too. Only a probe-verified DEAD element answers
+                    # gone:true (the element really is gone).
                     if ($resolved.error_class -eq 'unknown_ref') {
                         return @{ ok = $false; error_class = 'unknown_ref'; error = $resolved.error }
                     }
                     if ($resolved.error_class -eq 'stale_ref') {
-                        if ($gone) { return @{ ok = $true; result = @{ gone = $true } } }
+                        if ($gone -and $resolved.reason -eq 'dead') { return @{ ok = $true; result = @{ gone = $true } } }
                         return @{ ok = $false; error_class = 'stale_ref'; error = $resolved.error }
                     }
                     $present = ($null -eq $resolved.error_class)
@@ -1586,7 +1624,7 @@ while ($true) {
             try { $response.id = $requestId } catch { }
             try { $response.session = Get-SessionBlock } catch { }
             $json = ''
-            try { $json = ($response | ConvertTo-Json -Compress -Depth 16) } catch { $json = '{"id":"","ok":false,"error_class":"helper_error","error":"response serialization failed"}' }
+            try { $json = ($response | ConvertTo-Json -Compress -Depth 100) } catch { $json = '{"id":"","ok":false,"error_class":"helper_error","error":"response serialization failed"}' }
             $payload = [System.Text.Encoding]::UTF8.GetBytes($json + "`n")
             $written = [uint32]0
             [void][HypervMcp.Uia.Native]::WriteFile($handle, $payload, [uint32]$payload.Length, [ref]$written, [IntPtr]::Zero)

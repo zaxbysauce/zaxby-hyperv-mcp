@@ -172,7 +172,18 @@ def test_helper_never_searches_desktop_descendants():
     RED at base (two RootElement Descendants FindAll calls, plus
     GetSupportedPatterns and no CacheRequest), GREEN after the fix."""
     text = _helper_text()
-    hits = re.findall(r"RootElement\s*\.\s*FindAll\s*\(([^)]*)\)", text)
+    # alias-aware census (review round TF-001): the helper binds $root
+    # from RootElement once and searches through the alias - a census
+    # matching only the literal 'RootElement.FindAll' would miss an
+    # aliased desktop-wide search, so pin the alias binding itself and
+    # census both spellings.
+    aliases = re.findall(
+        r"\$(\w+)\s*=\s*\[System\.Windows\.Automation\.AutomationElement"
+        r"\]::RootElement", text)
+    assert set(aliases) <= {"root"}, (
+        "the helper must bind the desktop root element only to $root (the "
+        f"census's alias allowlist); unexpected bindings: {sorted(set(aliases))}")
+    hits = re.findall(r"(?:RootElement|\$root)\s*\.\s*FindAll\s*\(([^)]*)\)", text)
     offenders = [args for args in hits if "Descendants" in args]
     assert offenders == [], (
         "the helper must never search the desktop root element's "
@@ -394,6 +405,45 @@ def test_password_field_value_is_never_returned(lab_cfg, monkeypatch):
         "the snapshot entry's is_password flag must survive the drop")
     assert got3[1].get("state", {}).get("value") == "kept", (
         "a non-password snapshot entry keeps its value")
+
+    # TF-003 (swarm-pr-review round): the inspect TREE frame gets the
+    # same drop -- a password-marked node anywhere in the nested tree
+    # loses its value keys recursively (its descendants too), while
+    # non-password nodes keep theirs
+    tree = {
+        "name": "Win", "control_type": "Window",
+        "children": [
+            {"name": "User", "control_type": "Edit",
+             "state": {"value": "user typed"}},
+            {"name": "Password", "control_type": "Edit",
+             "state": {"is_password": True, "value": "tree-secret"},
+             "children": [
+                 {"name": "Child", "control_type": "Text",
+                  "state": {"value": "under-password"}},
+             ]},
+        ],
+    }
+    pipe4 = PipeRecorder({"ok": True,
+                          "result": {"elements": 3, "truncated": False,
+                                     "tree": tree},
+                          "session": dict(HELPER_SESSION)})
+    monkeypatch.setattr(uia, "_pipe_request", pipe4)
+    insp = getattr(uia, "inspect", None)
+    assert insp is not None, (
+        "uia.inspect (tool hyperv_ui_inspect) is missing (issue #136)")
+    out4 = insp(lab_cfg, "test-vm-1", CRED)
+    assert out4.get("ok") is True, f"inspect must succeed, got {out4!r}"
+    got_tree = out4.get("tree") or {}
+    pw_node = (got_tree.get("children") or [None, None])[1]
+    assert isinstance(pw_node, dict), (
+        f"the tree answer must preserve the probe shape, got {got_tree!r}")
+    assert _value_key_paths(pw_node) == [], (
+        "the tree frame's password node must lose its value keys "
+        f"recursively, got: {pw_node!r}")
+    non_pw = (got_tree.get("children") or [None])[0]
+    assert non_pw.get("state", {}).get("value") == "user typed", (
+        "the drop is targeted: a non-password tree node keeps its value, "
+        f"got {non_pw!r}")
 
 
 # ---------------------------------------------------------------------------
