@@ -207,3 +207,123 @@ def test_helper_line_tolerance_matches_the_host():
         f"the helper's line tolerance ({m.group(1)}) must equal the host's "
         f"_GLYPH_LINE_TOLERANCE_PX ({uia._GLYPH_LINE_TOLERANCE_PX}); a "
         f"mismatch silently disables the per-glyph merge in production")
+
+
+# ---------------------------------------------------------------------------
+# Round-2/round-3 delta invariants. Each node kills a mutant that survived the
+# shipped suite during the review rounds; each was executed before being
+# written here.
+# ---------------------------------------------------------------------------
+
+def _launch_script(**kw):
+    from hyperv_mcp import guestexec
+
+    return guestexec._interactive_launch_script(
+        "hyperv-mcp-interactive-" + "a" * 32,
+        kw.get("command", "notepad"), kw.get("args"),
+        kw.get("cwd"), kw.get("timeout_s", 60))
+
+
+def test_multi_arg_task_action_is_one_quoted_token():
+    """`New-ScheduledTaskAction -Argument` is System.String. Several quoted
+    tokens make PowerShell treat the later ones as extra POSITIONAL arguments
+    ("A positional parameter cannot be found that accepts argument 'arg2'")
+    or, without a cwd, silently bind the second as the working directory.
+    Verified live in PowerShell 5.1. The whole argument list must therefore be
+    ONE quoted token."""
+    script = _launch_script(args=["--flag", r"C:\proj"])
+    line = [ln for ln in script.splitlines()
+            if "New-ScheduledTaskAction" in ln][0]
+    # exactly one -Argument, carrying exactly one quoted token
+    assert line.count("-Argument") == 1, line
+    arg = line.split("-Argument", 1)[1].split("-WorkingDirectory")[0].strip()
+    assert arg.startswith("'") and arg.endswith("'"), (
+        f"the argument list must be ONE single-quoted token: {arg!r}")
+    assert arg.count("'") == 2, (
+        f"exactly one quoted token (no second positional argument): {arg!r}")
+    assert "--flag" in arg and "proj" in arg, arg
+    # and with no arguments the parameter is omitted entirely (PS 5.1 rejects
+    # an empty string for it)
+    bare = [ln for ln in _launch_script(args=[]).splitlines()
+            if "New-ScheduledTaskAction" in ln][0]
+    assert "-Argument" not in bare, (
+        f"with no arguments -Argument must be omitted: {bare!r}")
+
+
+def test_observer_payload_is_base64_and_carries_iso_timestamp():
+    """`Start-Process -ArgumentList` joins elements with spaces without
+    quoting, so a path or a timestamp containing a space splits into two $args
+    slots -- which made `[DateTime]$args[3]` evaluate to midnight and the
+    "created since the launch" filter return a PRE-EXISTING process's pid.
+    The observer's inputs therefore ride as ONE base64 token (a single-quoted
+    JSON token loses its quotes twice through PowerShell's own -File parser),
+    and the timestamp is ISO-8601 (no space). Both verified live."""
+    script = _launch_script()
+    assert "$observerArgs = [Convert]::ToBase64String(" in script, (
+        "the observer payload must be base64 so no space can split it")
+    assert "ToString('o')" in script, (
+        "the launch timestamp must be ISO-8601 (no space) on the wire")
+    assert "-File', $ObserverPath, $observerArgs)" in script, (
+        "the observer must take its inputs as ONE token, not four")
+    assert "-EncodedCommand" not in script, (
+        "PowerShell 5.1 refuses -EncodedCommand followed by positional args")
+    # the observer decodes it
+    obs = _observer_body()
+    assert "FromBase64String" in obs, (
+        "the observer must decode the base64 payload")
+
+
+def _observer_body() -> str:
+    from hyperv_mcp import guestexec
+
+    return guestexec._INTERACTIVE_OBSERVER
+
+
+def test_helper_runspace_variables_carry_the_line_tolerance():
+    """The per-glyph line tolerance is read by Merge-GlyphRuns INSIDE the
+    per-request worker runspace, and a runspace built from
+    InitialSessionState receives ONLY the keys listed in $sessionVariables.
+    A script-scope variable is $null there, which silently disables the merge
+    in production. Verified live: glyphs at y=10 and y=11 merged in one script
+    and did NOT merge in a child runspace."""
+    text = _helper_text()
+    i = text.index("$sessionVariables = @{")
+    block = text[i:i + 400]
+    assert "GlyphLineTolerancePx = $GlyphLineTolerancePx" in block, (
+        "the line tolerance must be copied into the worker runspace's "
+        "session variables, or the merge never runs in production")
+
+
+def test_merge_switch_rides_on_the_electron_request():
+    """`uia.GLYPH_MERGE_DEFAULT` must reach the GUEST as well as the host, or
+    turning it off leaves the helper merging anyway."""
+    from hyperv_mcp import uia
+
+    src = open(uia.__file__, encoding="utf-8").read()
+    assert 'request["args"]["merge_glyph_runs"]' in src, (
+        "the merge switch must ride on the electron request's args")
+    helper = _helper_text()
+    assert "merge_glyph_runs" in helper, (
+        "the helper's electron find arm must honour the switch")
+
+
+def test_bootstrap_refusal_surfaces_verbatim():
+    """`_front_door`'s adapter-neutral bootstrap must surface its OWN refusal.
+    Letting `registration` stay None makes `_adapter_gate(None, ...)` answer
+    `adapter_unapproved`, hiding a helper integrity or session-verification
+    failure behind a capability error."""
+    from hyperv_mcp import uia
+
+    src = open(uia.__file__, encoding="utf-8").read()
+    assert 'if boot.get("ok") is not True:' in src, (
+        "the bootstrap's own refusal must be surfaced, not masked as "
+        "adapter_unapproved")
+
+
+def test_placeholder_substitution_order():
+    """The caller-supplied argument clause must be substituted LAST, or an
+    argument whose text contains a placeholder token is rewritten."""
+    script = _launch_script(args=["__EXE__", "__COMMAND__", "__TASKNAME__"])
+    assert "__EXE__" in script and "__COMMAND__" in script, (
+        "an argument containing a placeholder token must be inserted verbatim")
+    assert "notepad.exe" in script, "the real exe must still be substituted"
