@@ -1,7 +1,7 @@
 # hyperv-mcp (hardened fork)
 
 An MCP (Model Context Protocol) server for Hyper-V VM management and guest
-execution. Exposes 84 tools for VM lifecycle, checkpoint management, kernel
+execution. Exposes 85 tools for VM lifecycle, checkpoint management, kernel
 debug setup (KDNET/KDCOM), and guest file transfer/command execution via
 PowerShell Direct (no WinRM required).
 
@@ -184,7 +184,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.19.0 today) instead of
+  package's version (0.20.0 today) instead of
   the SDK's (the release contract, the complete bump-site
   enumeration, and how to read `version`/`git_revision` live in
   [docs/versioning-policy.md](docs/versioning-policy.md)).
@@ -233,6 +233,46 @@ restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.20.0 changes
+
+- **GUI application drivability (#128/#129/#134):** an agent can now start and
+  drive a graphical application inside a guest. One tool joins the family
+  (84 -> 85): `hyperv_guest_start_interactive` registers a one-shot scheduled
+  task with an INTERACTIVE principal for the currently logged-on user, runs
+  it, returns the started process id and its session id, and unregisters the
+  task on every path. A process started through the ordinary guest-execution
+  tools runs in the PowerShell Direct remoting logon session and never appears
+  on the console desktop, so neither console input nor the UI Automation
+  helper could reach it; this is the primitive that fixes that. It refuses
+  with `no_interactive_session` (registering nothing) when nobody is logged
+  on, with `not_started` when the process cannot be observed, and reports a
+  cleanup failure as `unregistered: false` plus `cleanup_error` without hiding
+  an already-started process id. BEHAVIOR CHANGE: it sits behind the same
+  `elevated_exec` destructive category and `confirm` semantics as the other
+  process-starting tools, because the task runs with the interactive user's
+  highest run level.
+- **Electron/Chromium UI Automation (#129):** the `adapter: "electron"`
+  request now has guest-side behavior instead of being a permission gate. The
+  helper is asked to enable the renderer accessibility tree BEFORE a selector
+  resolves; adjacent single-glyph text nodes on one line are merged into word
+  runs (on the electron path only, behind the module-level
+  `uia.GLYPH_MERGE_DEFAULT`, on by default); and a tree that stays
+  unavailable is reported as `accessibility_unavailable` rather than an empty
+  match list. The helper now advertises the `adapter:electron` capability it
+  implements, and the front door performs an adapter-neutral bootstrap so a
+  fresh process's first electron request can be approved at all. Starting the
+  application with `--force-renderer-accessibility` through
+  `hyperv_guest_start_interactive` remains the deterministic route.
+- **Built-in GUI testing playbook (#134):** the server registers one MCP
+  prompt, `gui-testing-playbook`, ordering the interaction paths BY SURFACE
+  (DevTools for web content, UI Automation for native windows, console tools
+  before logon) and covering verify-after-every-action, the commit-guarded
+  click discipline, transient-versus-absent errors, and evidence capture. The
+  console click, type and screenshot tool descriptions now point at their
+  element-level alternatives (`hyperv_ui_find` / `hyperv_ui_invoke`), so the
+  most capable path is discoverable among the 85 tools.
+- Version bump: 0.19.0 -> 0.20.0.
 
 ## 0.19.0 changes
 
@@ -1536,6 +1576,7 @@ These tools refuse to run unless their category is enabled **and** (when
 | `hyperv_checkpoint_remove` (esp. subtree) | `checkpoint_remove` |
 | `hyperv_configure_kdnet` / `hyperv_configure_kdcom` | `kd_reboot` |
 | `hyperv_guest_run(_ps)` with `elevated=true` | `elevated_exec` |
+| `hyperv_guest_start_interactive` | `elevated_exec` |
 | `hyperv_guest_put` (guest write) | `guest_write` |
 | `hyperv_console_type_text` / `press_key` / `key_combo` / `type_scancodes` / `mouse_move` / `click` / `button` / `scroll` | `console_input` (no confirm — non-destructive interactive input) |
 | `hyperv_vm_media_attach` / `media_detach` / `network_set` | `media` (reversible, no confirm) |
@@ -1726,7 +1767,7 @@ become a published credential):
 
 ---
 
-## Available Tools (80 total)
+## Available Tools (85 total)
 
 Every registered tool in the tables below returns failures the same way:
 the one-envelope contract (`ok/error/error_class/retryable/retry_after_ms`,
@@ -1842,9 +1883,26 @@ Direct with separately-quoted arguments. Both tools are gated by the
 cases and requires the VM Off/Saved for the `Set-VMComPort` step.
 
 ### Guest Execution (PowerShell Direct — no WinRM required)
+**`hyperv_guest_start_interactive` — two disclosed windows.** The one-shot
+task is unregistered from a host-side `finally`, so a guest-reported failure
+or a transport death still cleans up. Two windows are NOT closable from the
+host and are disclosed rather than claimed away: (1) if the HOST process dies
+between `Register-ScheduledTask` and the cleanup leg, the task is left behind;
+(2) the task's trigger is `-Once` ten minutes out, so a stranded task launches
+the application again ten minutes later. Recover by unregistering
+`hyperv-mcp-interactive-<uuid>` in the guest (`Get-ScheduledTask |
+Where-Object TaskName -like 'hyperv-mcp-interactive-*' | Unregister-ScheduledTask
+-Confirm:$false`). The started process is identified as the newest process of
+that executable name in the interactive session, created at or after the launch
+began -- an application that starts several same-named processes reports the
+newest.
+
+
+
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
+| `hyperv_guest_start_interactive` | `vm_name` or `vm_id`, `command`, `args[]`, `cwd`, `timeout_ms` (default 60000), `confirm` | `{ok, pid, session_id, vm_name, unregistered}` (+ `cleanup_error`) |
 | `hyperv_guest_run` | `vm_name` or `vm_id`, `command`, `args[]`, `cwd?`, `timeout_ms` (default 60000), `elevated`, `confirm` | `{ok, exit_code, stdout, stderr, timed_out, truncated}` |
 | `hyperv_guest_run_ps` | `vm_name` or `vm_id`, `script`, `timeout_ms` (default 60000), `elevated`, `confirm` | same envelope |
 | `hyperv_guest_put` | `vm_name` or `vm_id`, `local_path`, `remote_path`, `confirm`, `verify?` | `{ok, bytes_copied, sha256_local?, sha256_remote?}` |
@@ -2221,6 +2279,40 @@ measure; `crop`, `scale`, `format` and `quality` are echoed there too, so an
 unchanged result is exactly as informative about the request as a changed one.
 
 ---
+
+#### Electron / Chromium adapter (`adapter: "electron"`, 0.20.0, issue #129)
+
+Chromium builds its accessibility tree on demand, so a UI Automation client
+sees almost nothing inside the renderer unless the tree is turned on. With
+`adapter="electron"` on `hyperv_ui_find` / `hyperv_ui_inspect` /
+`hyperv_ui_snapshot`:
+
+- the helper is asked to enable the renderer accessibility tree BEFORE the
+  selector resolves;
+- adjacent single-glyph `Text` nodes on one line are merged into word runs,
+  so a selector by name finds a label instead of nothing. The merge is
+  electron-scoped and governed by the module-level `uia.GLYPH_MERGE_DEFAULT`
+  (on by default; turning it off returns the helper's per-glyph nodes
+  unchanged);
+- a tree that stays unavailable is reported as `accessibility_unavailable`,
+  never as an empty match list -- an empty list is indistinguishable from
+  "no such control" and sends callers back to coordinates.
+
+Starting the application with `--force-renderer-accessibility` through
+`hyperv_guest_start_interactive` is the deterministic route; the enable request
+itself is best-effort by Chromium's design. The helper advertises the
+`adapter:electron` capability it implements, and the front door performs an
+adapter-neutral bootstrap so a fresh process's first electron request can be
+approved at all.
+
+**Reprovisioning.** An already-running helper keeps serving the build it was
+provisioned with: the host integrity-checks every frame against the packaged
+helper bytes, so a helper that predates this change will not gain the enable
+arm or the capability, and an electron request against it is refused —
+`helper_integrity_mismatch` on a fresh host process (the packaged bytes no
+longer match), or `adapter_unapproved` where a registration from the old
+build is still seeded. Re-run `hyperv_ui_helper_provision` to pick up a new
+build.
 
 ### In-session UI Automation helper (0.7.0, issue #29)
 
@@ -2671,6 +2763,18 @@ width/height/frame dimensions when you need head-sized captures.
 | Tool | Parameters | Returns |
 |------|-----------|---------|
 | `hyperv_server_info` | — | `{version, git_revision, powershell: {path, edition, version, psmodulepath}, config_path, config_sha256, mcp_sdk_version, protocol_version, feature_flags}` — read-only; never contains secrets |
+
+### Prompts
+
+The server registers one MCP prompt, `gui-testing-playbook` (0.20.0, issue
+#134): how to drive a guest's graphical interface, ordering the interaction
+paths BY SURFACE (DevTools for web content, UI Automation for native windows,
+console tools before logon) and covering verify-after-every-action, the
+commit-guarded click discipline, transient-versus-absent errors, and evidence
+capture. List it with your client's prompt listing and fetch it before a GUI
+session; the console click/type/screenshot tool descriptions also point at
+their element-level alternatives so the most capable path is discoverable
+among the 85 tools.
 
 ### MDT Deployment Playbook (agent-driven)
 

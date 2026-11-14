@@ -93,6 +93,24 @@ def suppress_receipt_mints() -> Iterator[None]:
 BASE_CAPABILITIES = {"uia", "msaa"}
 ELECTRON_CAPABILITY = "adapter:electron"
 _CAPABILITIES = BASE_CAPABILITIES | {ELECTRON_CAPABILITY}
+
+#: Issue #129: the electron adapter merges Chromium's per-glyph text nodes
+#: into word runs. The merge ships ON for the adapter and is governed by this
+#: module-level switch, read at CALL time so a caller (or a test) can turn it
+#: off and receive the helper's per-glyph nodes unchanged.
+GLYPH_MERGE_DEFAULT = True
+
+#: Issue #129: the renderer-accessibility enable request. It is a READ-ONLY
+#: side-channel verb -- deliberately NOT added to the closed ``VERBS`` set
+#: (frozen by test_f05_uia_helper.py) -- admitted by ``validate_forward`` so
+#: the helper accepts the frame, and never mutating, so it never bumps the
+#: console-input ledger and never mints a state receipt.
+_ENABLE_ACCESSIBILITY = "enable_accessibility"
+_SIDE_CHANNEL_VERBS = frozenset({_ENABLE_ACCESSIBILITY})
+
+#: Adjacent glyph nodes whose bounding rectangles share a line within this
+#: many pixels belong to the same run (issue #129 AC2: "on one line").
+_GLYPH_LINE_TOLERANCE_PX = 2
 _MAX_SELECTOR_FIELD = 1024
 _MAX_VALUE_BYTES = 64 * 1024
 _SELECTORS = {
@@ -151,9 +169,10 @@ def build_request(verb: str, args: dict | None = None,
     per-request ``id`` doubles as the replay nonce on the frame; the helper
     echoes it and the host refuses a response whose id does not correlate.
     """
-    if verb not in VERBS:
+    if verb not in VERBS and verb not in _SIDE_CHANNEL_VERBS:
         raise ValueError(
-            f"unknown verb: {verb!r} (allowed: {', '.join(sorted(VERBS))})")
+            f"unknown verb: {verb!r} (allowed: "
+            f"{', '.join(sorted(VERBS | _SIDE_CHANNEL_VERBS))})")
     return {
         "id": uuid.uuid4().hex,
         "verb": verb,
@@ -891,6 +910,19 @@ def ensure_registration(cfg, ref, cred: CredentialSet,
             if existing is not None:
                 if target_guid is not None:
                     existing["target_guid"] = target_guid
+                # Issue #129: a validated helper frame may advertise a
+                # capability the seeded row lacks -- a reprovisioned helper
+                # gains adapter:electron without the host restarting. The
+                # frame's integrity was already proven by
+                # _parse_helper_frame, and the incoming set is checked
+                # against the host's closed _CAPABILITIES, so upgrade in
+                # place rather than leaving the adapter permanently
+                # unapprovable.
+                incoming = set(capabilities or ())
+                if incoming and incoming <= _CAPABILITIES:
+                    merged = set(existing.get("capabilities") or ()) | incoming
+                    if "uia" in merged:
+                        existing["capabilities"] = merged
                 return existing
         try:
             return register_helper(
@@ -935,7 +967,7 @@ def validate_forward(registration: dict, request: dict) -> str:
         if mine is not None and theirs is not None and mine != theirs:
             raise RegistrationMismatch(
                 f"request target {key} does not match the helper registration")
-    if request.get("verb") not in VERBS:
+    if request.get("verb") not in VERBS and request.get("verb") not in _SIDE_CHANNEL_VERBS:
         raise RegistrationMismatch(
             f"request verb is outside the closed allowlist: "
             f"{request.get('verb')!r}")
@@ -1181,6 +1213,31 @@ def _front_door(cfg, vm, cred: CredentialSet, request: dict) -> dict:
         # DIFFERENT recorded SID is a genuine mismatch and stays one.
         with _REGISTRY_LOCK:
             registration["user_sid"] = current_sid
+    if registration is None and request.get("adapter"):
+        # Adapter-neutral bootstrap (issue #129). A request carrying NO
+        # adapter is never gated, so it can reach the helper and seed the
+        # registration from the response's session block. Without it a FRESH
+        # process's first adapter="electron" call is gated before any frame
+        # could ever seed the capability -- the adapter would be unreachable
+        # in production, and only a hand-seeded test registration could be
+        # approved.
+        probe = {k: v for k, v in request.items() if k != "adapter"}
+        probe["verb"] = "session_state"
+        probe["args"] = {}
+        for key in ("selector", "element_id", "ref"):
+            probe.pop(key, None)
+        probe["id"] = uuid.uuid4().hex
+        boot = _pipe_forward(_Transport(cfg, ref, cred), probe,
+                             uuid.uuid4().hex)
+        if boot.get("ok") is not True:
+            # The bootstrap's OWN refusal surfaces verbatim. Letting
+            # `registration` stay None here would make `_adapter_gate(None, …)`
+            # answer `adapter_unapproved`, hiding a helper integrity or
+            # session-verification failure behind a capability error.
+            return boot
+        if isinstance(boot.get("session"), dict):
+            registration = ensure_registration(
+                cfg, ref, cred, frame=boot, target_guid=target_guid)
     request["target"]["session_id"] = session_id
     refusal = _adapter_gate(registration, request)
     if refusal is not None:
@@ -1234,6 +1291,84 @@ def _is_password_element(element: Any) -> bool:
     state = element.get("state")
     return bool(element.get("is_password")) or (
         isinstance(state, dict) and bool(state.get("is_password")))
+
+
+def _rect_y(rect: Any) -> int | None:
+    """The y of a helper rect in its frozen "x,y,w,h" convention."""
+    try:
+        return int(str(rect).split(",")[1])
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def _spanning_rect(rects: list[str]) -> str:
+    """The rect spanning a run: x/width over the union, the first node's
+    line y, the run's tallest height."""
+    parsed = []
+    for raw in rects:
+        try:
+            parsed.append(tuple(int(p) for p in str(raw).split(",")))
+        except (TypeError, ValueError):
+            return str(rects[0]) if rects else ""
+    if not parsed:
+        return ""
+    x = min(r[0] for r in parsed)
+    right = max(r[0] + r[2] for r in parsed)
+    return f"{x},{parsed[0][1]},{right - x},{max(r[3] for r in parsed)}"
+
+
+def _is_glyph_node(element: dict) -> bool:
+    """A Chromium per-glyph text node: control_type Text, one-character name."""
+    return (isinstance(element, dict)
+            and element.get("control_type") == "Text"
+            and isinstance(element.get("name"), str)
+            and len(element["name"]) == 1)
+
+
+def merge_glyph_runs(elements: list) -> list:
+    """Merge adjacent single-glyph text nodes on one line into word runs.
+
+    Issue #129: Chromium builds its accessibility tree one node per glyph, so
+    a label becomes many nodes and a selector by name matches nothing. Each
+    maximal run of ADJACENT glyph nodes whose rects share a line (within
+    ``_GLYPH_LINE_TOLERANCE_PX``) becomes ONE node carrying the run's joined
+    name, the run's first identity and a spanning rect. Multi-character names
+    and non-Text control types terminate a run and pass through verbatim, and
+    a glyph on a different line terminates it too.
+
+    The merge is adapter-scoped: the caller applies it only on the electron
+    path, and only while ``GLYPH_MERGE_DEFAULT`` is on.
+    """
+    out: list = []
+    run: list = []
+
+    def _flush() -> None:
+        if not run:
+            return
+        first = dict(run[0])
+        first["name"] = "".join(str(e.get("name") or "") for e in run)
+        first["rect"] = _spanning_rect([e.get("rect") for e in run])
+        out.append(first)
+        run.clear()
+
+    for element in elements:
+        if not isinstance(element, dict):
+            _flush()
+            out.append(element)
+            continue
+        line_y = _rect_y(element.get("rect")) if element.get("rect") else None
+        if _is_glyph_node(element) and line_y is not None:
+            run_y = _rect_y(run[0].get("rect")) if run else None
+            if run and run_y is not None and abs(line_y - run_y) <= _GLYPH_LINE_TOLERANCE_PX:
+                run.append(element)
+                continue
+            _flush()
+            run.append(element)
+            continue
+        _flush()
+        out.append(element)
+    _flush()
+    return out
 
 
 def _sanitize_elements(out: dict) -> dict:
@@ -1393,6 +1528,62 @@ def _read_console_exclusion(ref, mode: str) -> Iterator[None]:
         yield
 
 
+#: The read verbs the electron adapter's enable request precedes. A mutating
+#: verb never triggers it: the enable is housekeeping for a selector read.
+_ADAPTER_READ_VERBS = frozenset({"find", "inspect", "snapshot", "wait_for"})
+
+
+def _enable_renderer_accessibility(cfg, ref, cred: CredentialSet,
+                                   request: dict) -> dict | None:
+    """Ask the helper to switch Chromium's renderer accessibility tree on.
+
+    Issue #129 AC1: whenever a read verb carries ``adapter="electron"`` the
+    enable request is dispatched BEFORE the verb's own frame, so the selector
+    resolves against a tree that actually exists. The request carries the
+    adapter top-level, exactly like the verb's own frame.
+
+    Returns ``None`` when the tree became available, and a structured
+    ``accessibility_unavailable`` refusal when it did not -- in which case the
+    caller must NOT issue the verb's frame, because an unavailable tree
+    reported as an empty match list is indistinguishable from "no such
+    control" and sends callers back to coordinates.
+
+    The enable is a read-only side-channel verb: it is not mutating, so it
+    never bumps the console-input ledger, and it never mints a state receipt.
+    """
+    enable = build_request(_ENABLE_ACCESSIBILITY, args={})
+    enable["adapter"] = request.get("adapter") or "electron"
+    with vm_lock(ref.id, mode="read"), _read_console_exclusion(ref, "read"):
+        try:
+            frame = _pipe_request(cfg, ref, cred, enable)
+        except RegistrationMismatch:
+            raise
+        except (UiAError, TimeoutError, pswindows.PowerShellTransportError,
+                OSError) as exc:
+            return _transport_failure(exc, cfg, ref, cred)
+    if isinstance(frame, dict) and frame.get("ok") is False:
+        # The enable's own refusal (the adapter gate's adapter_unapproved, a
+        # helper refusal, a transport failure) surfaces VERBATIM: collapsing
+        # it here would hide a gate refusal behind a tree-availability error.
+        return dict(frame)
+    available = False
+    if isinstance(frame, dict) and frame.get("ok") is True:
+        result = frame.get("result")
+        if isinstance(result, dict):
+            available = result.get("available") is True
+    if not available:
+        return {
+            "ok": False,
+            "error_class": "accessibility_unavailable",
+            "error": (
+                "the renderer accessibility tree did not become available "
+                "after the enable request; start the application with "
+                "--force-renderer-accessibility (through "
+                "hyperv_guest_start_interactive) for the deterministic route"),
+        }
+    return None
+
+
 def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
                   *, shared_vm: bool = False, selector: Any = None,
                   element_id: Any = None, adapter: str = "",
@@ -1409,6 +1600,11 @@ def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
     the whole wait.
     """
     request = build_request(verb, args=args)
+    if adapter == "electron":
+        # Issue #129: the per-glyph merge switch must reach the GUEST as well
+        # as the host, or turning it off leaves the helper merging anyway.
+        request.setdefault("args", {})
+        request["args"]["merge_glyph_runs"] = bool(GLYPH_MERGE_DEFAULT)
     if selector is not None:
         request["selector"] = validate_selector(selector)
     if element_id is not None:
@@ -1443,6 +1639,10 @@ def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
     _CALL.ref = ref
     _CALL.cred = cred
     try:
+        if adapter == "electron" and verb in _ADAPTER_READ_VERBS:
+            refusal = _enable_renderer_accessibility(cfg, ref, cred, request)
+            if refusal is not None:
+                return refusal
         while True:
             leg_request = request
             if deadline is not None:
@@ -1470,6 +1670,16 @@ def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
                         OSError) as exc:
                     return _transport_failure(exc, cfg, ref, cred)
                 out = _frame_out(frame, cfg, ref, cred)
+                # Issue #129: Chromium exposes one Text node per glyph, so a
+                # label arrives as many nodes and a name selector matches
+                # nothing. On the electron path (and only there, and only
+                # while the module switch is on) adjacent glyphs on one line
+                # are merged into word runs. The switch is read at CALL time,
+                # so turning it off returns the helper's nodes unchanged.
+                if (adapter == "electron" and GLYPH_MERGE_DEFAULT
+                        and out.get("ok") is True
+                        and isinstance(out.get("elements"), list)):
+                    out["elements"] = merge_glyph_runs(out["elements"])
                 # Issue #137: a helper ref-verdict on a ref-addressed call
                 # PASSES THROUGH as its own error_class (never collapsed,
                 # never retried) -- and the host appends the actionable

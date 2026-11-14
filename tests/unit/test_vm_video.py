@@ -104,7 +104,7 @@ def test_c1_tool_inventory():
         names = {t.name for t in tools}
         assert "hyperv_vm_set_resolution" in names, "missing tool hyperv_vm_set_resolution"
         assert "hyperv_vm_get_video" in names, "missing tool hyperv_vm_get_video"
-        assert len(names) == 84, f"tool inventory is {len(names)}, expected 84 (76 through issue #29, 80 with issue #112's four Workstream G tools, 82 with issue #130's lock_state + unlock, 84 with issue #137's hyperv_ui_snapshot + hyperv_ui_act)"
+        assert len(names) == 85, f"tool inventory is {len(names)}, expected 84 (76 through issue #29, 80 with issue #112's four Workstream G tools, 82 with issue #130's lock_state + unlock, 84 with issue #137's hyperv_ui_snapshot + hyperv_ui_act, 85 with issue #128's hyperv_guest_start_interactive)"
         def _schema(t):
             return getattr(t, "input_schema", None) or t.inputSchema
 

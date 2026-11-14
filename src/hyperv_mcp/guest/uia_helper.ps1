@@ -546,6 +546,140 @@ function Resolve-Target([hashtable]$selector, $cache) {
     return $list
 }
 
+# Issue #129: Chromium builds its accessibility tree one Text node per glyph,
+# so a label arrives as many nodes and a name selector matches nothing.
+# Merge-GlyphRuns joins each maximal run of ADJACENT glyph nodes whose
+# bounding rectangles share a line (within $GlyphLineTolerancePx) into ONE
+# virtual element: the joined name, the run's FIRST RuntimeId (so the merged
+# node stays actionable for a later invoke/act) and a rect spanning the run.
+# A multi-character name, a non-Text control type, or a glyph on a different
+# line terminates the run and passes through verbatim.
+$GlyphLineTolerancePx = 2
+
+function Get-ElementName($el) {
+    try { return [string]$el.Current.Name } catch { return $null }
+}
+
+function Get-ElementLineY($el) {
+    try { return [int]$el.Current.BoundingRectangle.Y } catch { return $null }
+}
+
+function Test-IsGlyphNode($el) {
+    $nm = Get-ElementName $el
+    if ($null -eq $nm -or $nm.Length -ne 1) { return $false }
+    try { return (([string]$el.Current.ControlType.ProgrammaticName) -eq 'ControlType.Text') } catch { return $false }
+}
+
+function New-MergedGlyphElement($run) {
+    $first = $run[0]
+    if ($run.Count -eq 1) { return $first }
+    $name = ($run | ForEach-Object { Get-ElementName $_ }) -join ''
+    $minX = $null; $right = 0; $tallest = 0
+    # The run's line is its FIRST node's line (issue #129 review): a
+    # later glyph on a wrapped line must not move the merged rect.
+    $lineY = 0
+    try { $lineY = [int]$run[0].Current.BoundingRectangle.Y } catch { }
+    foreach ($e in $run) {
+        try {
+            $r = $e.Current.BoundingRectangle
+            if ($null -eq $minX -or [int]$r.X -lt $minX) { $minX = [int]$r.X }
+            if ([int]($r.X + $r.Width) -gt $right) { $right = [int]($r.X + $r.Width) }
+            if ([int]$r.Height -gt $tallest) { $tallest = [int]$r.Height }
+        } catch { }
+    }
+    if ($null -eq $minX) { $minX = 0 }
+    $rect = New-Object PSObject
+    $rect | Add-Member -MemberType NoteProperty -Name X -Value $minX
+    $rect | Add-Member -MemberType NoteProperty -Name Y -Value $lineY
+    $rect | Add-Member -MemberType NoteProperty -Name Width -Value ($right - $minX)
+    $rect | Add-Member -MemberType NoteProperty -Name Height -Value $tallest
+    $ct = New-Object PSObject
+    $ct | Add-Member -MemberType NoteProperty -Name ProgrammaticName -Value 'ControlType.Text'
+    $cur = New-Object PSObject
+    $cur | Add-Member -MemberType NoteProperty -Name Name -Value $name
+    $cur | Add-Member -MemberType NoteProperty -Name ControlType -Value $ct
+    $cur | Add-Member -MemberType NoteProperty -Name BoundingRectangle -Value $rect
+    $cur | Add-Member -MemberType NoteProperty -Name IsEnabled -Value $true
+    $cur | Add-Member -MemberType NoteProperty -Name AutomationId -Value ''
+    $cur | Add-Member -MemberType NoteProperty -Name ClassName -Value ''
+    # A merged node is read through the SAME batched-read path as a real
+    # element, so the cached view answers the property queries
+    # Get-ElementResult makes (a plain NoteProperty set would throw
+    # MethodNotFound on GetCachedPropertyValue).
+    $cur | Add-Member -MemberType ScriptMethod -Name GetCachedPropertyValue -Value {
+        param($p)
+        if ($p -eq [System.Windows.Automation.AutomationElement]::NameProperty) { return $this.Name }
+        if ($p -eq [System.Windows.Automation.AutomationElement]::ControlTypeProperty) { return $this.ControlType }
+        if ($p -eq [System.Windows.Automation.AutomationElement]::BoundingRectangleProperty) { return $this.BoundingRectangle }
+        if ($p -eq [System.Windows.Automation.AutomationElement]::IsEnabledProperty) { return $true }
+        return $null
+    }
+    $cur | Add-Member -MemberType ScriptMethod -Name GetPropertyValue -Value {
+        param($p)
+        if ($p -eq [System.Windows.Automation.AutomationElement]::NameProperty) { return $this.Name }
+        if ($p -eq [System.Windows.Automation.AutomationElement]::ControlTypeProperty) { return $this.ControlType }
+        if ($p -eq [System.Windows.Automation.AutomationElement]::BoundingRectangleProperty) { return $this.BoundingRectangle }
+        if ($p -eq [System.Windows.Automation.AutomationElement]::IsEnabledProperty) { return $true }
+        return $null
+    }
+    $merged = New-Object PSObject
+    $merged | Add-Member -MemberType NoteProperty -Name Current -Value $cur
+    $merged | Add-Member -MemberType NoteProperty -Name Cached -Value $cur
+    # The run's FIRST RuntimeId, captured eagerly: the merged node must stay
+    # actionable (a later invoke/act resolves the element by this id).
+    $firstRid = @()
+    try { $firstRid = @($first.GetRuntimeId()) } catch { }
+    $merged | Add-Member -MemberType NoteProperty -Name firstRid -Value $firstRid
+    $merged | Add-Member -MemberType ScriptMethod -Name GetRuntimeId -Value { @($this.firstRid) }
+    $merged | Add-Member -MemberType ScriptMethod -Name GetUpdatedCache -Value { $this }
+    # A real UIA element answers GetCachedPropertyValue on ITSELF (the cache
+    # is filled by GetUpdatedCache), and Get-ElementResult reads both
+    # $c.Cached.* and $c.GetCachedPropertyValue on the refreshed object.
+    $merged | Add-Member -MemberType ScriptMethod -Name GetCachedPropertyValue -Value {
+        param($p)
+        $c = $this.Cached
+        if ($p -eq [System.Windows.Automation.AutomationElement]::NameProperty) { return $c.Name }
+        if ($p -eq [System.Windows.Automation.AutomationElement]::ControlTypeProperty) { return $c.ControlType }
+        if ($p -eq [System.Windows.Automation.AutomationElement]::BoundingRectangleProperty) { return $c.BoundingRectangle }
+        if ($p -eq [System.Windows.Automation.AutomationElement]::IsEnabledProperty) { return $true }
+        return $null
+    }
+    $merged | Add-Member -MemberType ScriptMethod -Name GetPropertyValue -Value {
+        param($p)
+        $c = $this.Current
+        if ($p -eq [System.Windows.Automation.AutomationElement]::NameProperty) { return $c.Name }
+        if ($p -eq [System.Windows.Automation.AutomationElement]::ControlTypeProperty) { return $c.ControlType }
+        if ($p -eq [System.Windows.Automation.AutomationElement]::BoundingRectangleProperty) { return $c.BoundingRectangle }
+        if ($p -eq [System.Windows.Automation.AutomationElement]::IsEnabledProperty) { return $true }
+        return $null
+    }
+    return $merged
+}
+
+function Merge-GlyphRuns($elements) {
+    if ($null -eq $elements -or $elements.Count -eq 0) { return @() }
+    $out = @()
+    $run = @()
+    $runY = $null
+    foreach ($el in $elements) {
+        if (Test-IsGlyphNode $el) {
+            $y = Get-ElementLineY $el
+            if ($null -ne $y -and $run.Count -gt 0 -and $null -ne $runY -and [Math]::Abs($y - $runY) -le $GlyphLineTolerancePx) {
+                $run += $el
+                continue
+            }
+            if ($run.Count -gt 0) { $out += (New-MergedGlyphElement $run); $run = @() }
+            $run = @($el)
+            $runY = $y
+            continue
+        }
+        if ($run.Count -gt 0) { $out += (New-MergedGlyphElement $run); $run = @(); $runY = $null }
+        $out += $el
+    }
+    if ($run.Count -gt 0) { $out += (New-MergedGlyphElement $run) }
+    return $out
+}
+
 function Select-One($elements, [hashtable]$selector) {
     if ($null -eq $selector) { $selector = @{} }
     if ($null -eq $elements -or $elements.Count -eq 0) { return $null }
@@ -993,6 +1127,44 @@ function Invoke-Request([hashtable]$req) {
     }
     if ($null -ne $selector -and $selector -isnot [hashtable]) { $selector = $null }
 
+    if ($verb -eq 'enable_accessibility') {
+        # Issue #129: Chromium builds its accessibility tree on demand. The
+        # host sends this BEFORE resolving a selector on the electron path;
+        # the helper asks the renderer for its tree by READING a property
+        # from it (a UI Automation client turns the tree on by actually
+        # reading it -- chromium/ui/accessibility/platform/ax_platform.cc
+        # records that the old screen-reader signal alone is no longer
+        # trusted). The answer reports whether a tree is now reachable.
+        $available = $false
+        try {
+            $root = [System.Windows.Automation.AutomationElement]::RootElement
+            if ($null -ne $root) {
+                $null = $root.Current.Name
+                $available = $true
+            }
+        } catch { $available = $false }
+        if (-not $available) {
+            return @{ ok = $true; result = @{ available = $false } }
+        }
+        # The renderer tree is reachable only when the foreground window's
+        # subtree yields element nodes; an application that never turned its
+        # renderer accessibility on answers available:false rather than an
+        # empty match list.
+        $found = 0
+        try {
+            $fg = Get-ForegroundWindow
+            if ($null -ne $fg) {
+                $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+                $node = $walker.GetFirstChild($fg)
+                while ($null -ne $node -and $found -lt 1) {
+                    $found++
+                    $node = $walker.GetNextSibling($node)
+                }
+            }
+        } catch { $found = 0 }
+        return @{ ok = $true; result = @{ available = ($found -gt 0) } }
+    }
+
     if ($verb -eq 'snapshot') {
         # BEFORE element resolution (the selector here is a WINDOW
         # selector, not an element address): a no-selector snapshot
@@ -1110,7 +1282,44 @@ function Invoke-Request([hashtable]$req) {
             }
         }
         if ($null -ne $selector) {
-            $elements = @(Resolve-Target $selector $cache)
+            if ($req['adapter'] -eq 'electron') {
+                # Issue #129: Chromium's per-glyph nodes must be merged
+                # BEFORE the selector's name is matched -- a name condition
+                # applied to unmerged glyphs matches nothing. Collect the
+                # scope WITHOUT the name condition, merge the runs, then
+                # match the name/name_contains predicates against the JOINED
+                # names. The host's module switch rides on the request, so
+                # turning it off leaves the per-glyph nodes untouched here
+                # too (not only on the host side).
+                $mergeRuns = $true
+                if ($req.ContainsKey('args') -and $null -ne $req['args'] -and $req['args'] -is [hashtable] -and $req['args'].ContainsKey('merge_glyph_runs')) {
+                    $mergeRuns = [bool]$req['args']['merge_glyph_runs']
+                }
+                if (-not $mergeRuns) {
+                    $elements = @(Resolve-Target $selector $cache)
+                } else {
+                $collector = @{}
+                foreach ($k in @($selector.Keys)) {
+                    if ($k -ne 'name' -and $k -ne 'name_contains') { $collector[$k] = $selector[$k] }
+                }
+                $elements = @(Merge-GlyphRuns (Resolve-Target $collector $cache))
+                $wantName = $null
+                if ($selector.ContainsKey('name') -and $null -ne $selector['name']) { $wantName = [string]$selector['name'] }
+                $needle = $null
+                if ($selector.ContainsKey('name_contains') -and $null -ne $selector['name_contains']) { $needle = [string]$selector['name_contains'] }
+                $matched = @()
+                foreach ($el in $elements) {
+                    $nm = Get-ElementName $el
+                    if ($null -eq $nm) { continue }
+                    if ($null -ne $wantName -and $nm -ne $wantName) { continue }
+                    if ($null -ne $needle -and $nm.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+                    $matched += $el
+                }
+                $elements = $matched
+                }
+            } else {
+                $elements = @(Resolve-Target $selector $cache)
+            }
         }
         if ($req.ContainsKey('ref') -and $null -ne $req['ref']) {
             # issue #137: snapshot-bound ref, resolved through the
@@ -1489,6 +1698,12 @@ try { $legacyPattern = [System.Windows.Automation.LegacyIAccessiblePattern]::Pat
 function Get-HelperCapabilities {
     $caps = @('uia')
     if ($null -ne $legacyPattern) { $caps += 'msaa' }
+    # Issue #129: the helper implements the electron adapter's behaviour (the
+    # renderer-accessibility enable and the per-glyph run merge), so it
+    # reports the capability the host's _adapter_gate requires. A helper that
+    # does not implement it must NOT advertise it -- that is what keeps the
+    # gate meaningful.
+    $caps += 'adapter:electron'
     return $caps
 }
 $capabilities = Get-HelperCapabilities
@@ -1667,7 +1882,12 @@ $functionNames = @(
     'Get-WindowScopeSet', 'New-WalkCache', 'Get-ElementIdScopeSelector',
     'Enter-Snapshot', 'Resolve-Ref', 'Get-HelperCapabilities',
     'Select-One', 'Get-ElementResult', 'Walk-Tree', 'Invoke-Pattern', 'Invoke-Request',
-    'Get-SessionBlock'
+    'Get-SessionBlock',
+    # Issue #129: the per-glyph run merge (the electron adapter's merge runs
+    # INSIDE the per-request worker runspace, so its functions must be
+    # injected there like every other verb helper).
+    'Get-ElementName', 'Get-ElementLineY', 'Test-IsGlyphNode',
+    'New-MergedGlyphElement', 'Merge-GlyphRuns'
 )
 $sessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
 foreach ($name in $functionNames) {
@@ -1677,6 +1897,8 @@ foreach ($name in $functionNames) {
     }
 }
 $sessionVariables = @{
+    # Issue #129: the per-glyph line tolerance is read by Merge-GlyphRuns INSIDE the per-request worker runspace, and a runspace built from InitialSessionState receives ONLY the keys listed here -- a script-scope variable is $null there, which silently disables the merge in production.
+    GlyphLineTolerancePx = $GlyphLineTolerancePx
     SnapshotStore = $script:SnapshotTables
     dpiDeclared = $dpiDeclared
     HelperDir = $HelperDir

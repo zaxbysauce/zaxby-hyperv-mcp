@@ -187,7 +187,7 @@ def test_child_env_carries_no_server_secrets(monkeypatch):
 
 def test_server_info_tool_registered():
     """AC3: a bootstrapped server registers hyperv_server_info and the tool
-    inventory counts exactly 84 tools (66 through issue #24 +
+    inventory counts exactly 85 tools (66 through issue #24 +
     hyperv_server_info, issue #27's settle wait, issue #28's batched
     sequence, issue #29's eight hyperv_ui_* tools, PR #112's four
     Workstream G tools, and issue #137's hyperv_ui_snapshot +
@@ -201,7 +201,7 @@ def test_server_info_tool_registered():
             f"hyperv_server_info is not registered; tool inventory has "
             f"{len(names)} tools, expected 84 including hyperv_server_info"
         )
-        assert len(names) == 84, (
+        assert len(names) == 85, (
             f"tool inventory is {len(names)} tools; expected exactly 84 "
             "(76 through issue #29's eight hyperv_ui_* tools, plus issue #112's "
             "four Workstream G tools, plus issue #130's lock_state + unlock, "

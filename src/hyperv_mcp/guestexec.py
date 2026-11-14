@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 
 from . import credentials, policy, psdsessions, pswindows, timing, vmident, vmlocks
 from .config import Config
@@ -789,6 +790,263 @@ def guest_run(
             vm_name=ref.name, session_role=session_role,
         )
 
+
+LAUNCH_TEMPLATE = '$ErrorActionPreference = \'Stop\'\n$TaskName = \'__TASKNAME__\'\n$StatusPath = Join-Path $env:TEMP ($TaskName + \'.json\')\n$TimeoutSec = __TIMEOUT__\n$InteractiveUser = $null\n$InteractiveSession = $null\nforeach ($qline in (quser 2>$null)) {\n    if ("$qline" -match \'^\\s*(\\S+)\\s+\\S+\\s+(\\d+)\\s+Active\') {\n        $InteractiveUser = $Matches[1]\n        $InteractiveSession = [int]$Matches[2]\n        break\n    }\n}\nif (-not $InteractiveUser -or -not $InteractiveSession) {\n    Write-Output (@{ ok = $false\n        error_class = \'no_interactive_session\'\n        error = \'no user is logged on interactively\' } |\n        ConvertTo-Json -Compress)\n    return\n}\n$action = New-ScheduledTaskAction -Execute __COMMAND____ARGCLAUSE____WORKDIR__\n$principal = New-ScheduledTaskPrincipal -UserId $InteractiveUser -LogonType Interactive -RunLevel Highest\n$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10)\nRegister-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Trigger $trigger -Force | Out-Null\n$LaunchedAt = Get-Date\nStart-ScheduledTask -TaskName $TaskName\n$Observer = @\'\n__OBSERVER__\n\'@\n$observer = Start-Process -FilePath \'powershell.exe\' -PassThru -WindowStyle Hidden -ArgumentList @(\'-NoProfile\', \'-NonInteractive\', \'-EncodedCommand\', $Observer, $StatusPath, __EXE__, "$InteractiveSession", "$LaunchedAt")\n$Deadline = (Get-Date).AddSeconds($TimeoutSec)\n$Status = $null\nwhile (-not $Status -and (Get-Date) -lt $Deadline) {\n    if (Test-Path -LiteralPath $StatusPath) {\n        try {\n            $Status = Get-Content -LiteralPath $StatusPath -Raw |\n                ConvertFrom-Json\n        } catch { $Status = $null }\n    }\n    if (-not $Status) { Start-Sleep -Milliseconds 200 }\n}\nif ($Status -and $Status.ok -and $Status.pid) {\n    Write-Output (@{ ok = $true; pid = [int]$Status.pid\n        session_id = [int]$Status.session_id } | ConvertTo-Json -Compress)\n} else {\n    $msg = \'the started process was not observed within \' + $TimeoutSec + \'s\'\n    Write-Output (@{ ok = $false; error_class = \'not_started\'\n        error = $msg } | ConvertTo-Json -Compress)\n}\n'
+
+UNREGISTER_TEMPLATE = "$ErrorActionPreference = 'Continue'\nUnregister-ScheduledTask -TaskName '__TASKNAME__' `\n    -Confirm:$false -ErrorAction SilentlyContinue\nRemove-Item -LiteralPath (Join-Path $env:TEMP ('__TASKNAME__' + '.json')), (Join-Path $env:TEMP ('__TASKNAME__' + '-observer.ps1')) `\n    -Force -ErrorAction SilentlyContinue\nWrite-Output (@{ ok = $true; unregistered = $true } |\n    ConvertTo-Json -Compress)\n"
+
+_TASK_PREFIX = "hyperv-mcp-interactive-"
+
+#: The observer one interactive launch leg starts to read the started process
+#: back. It receives the status path, the target executable name and the
+#: interactive session id as ``-Command`` positional arguments, so no literal
+#: in the launch script ever repeats the task name.
+_INTERACTIVE_OBSERVER = """$ErrorActionPreference = 'SilentlyContinue'
+# The inputs ride as ONE base64 token: Start-Process -ArgumentList joins its
+# elements with spaces and does not quote, so four separate arguments would
+# split on any space in a path or a timestamp -- and even a single-quoted JSON
+# token loses its quotes twice on the way through PowerShell's own -File
+# argument parser (verified live: the inner double quotes arrived stripped).
+$cfg = ([Text.Encoding]::UTF8.GetString(
+    [Convert]::FromBase64String([string]$args[0]))) | ConvertFrom-Json
+$StatusPath = [string]$cfg.status
+$Exe = [string]$cfg.exe
+$SessionId = [int]$cfg.session
+$LaunchedAt = [DateTime]$cfg.launched
+$TimeoutSec = [int]$cfg.timeout_s
+$Deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+$Found = $null
+while ($null -eq $Found -and [DateTime]::UtcNow -lt $Deadline) {
+    $Found = Get-CimInstance Win32_Process -Filter ("Name='" + $Exe + "'") |
+        Where-Object { $_.SessionId -eq $SessionId -and $_.CreationDate -ge $LaunchedAt } |
+        Sort-Object CreationDate -Descending |
+        Select-Object -First 1
+    if ($null -eq $Found) { Start-Sleep -Milliseconds 200 }
+}
+if ($null -ne $Found) {
+    Set-Content -LiteralPath $StatusPath -Value (
+        (@{ ok = $true; pid = [int]$Found.ProcessId;
+            session_id = [int]$Found.SessionId } |
+         ConvertTo-Json -Compress)) -Encoding UTF8
+} else {
+    Set-Content -LiteralPath $StatusPath -Value (
+        (@{ ok = $false; error_class = 'not_started' } |
+         ConvertTo-Json -Compress)) -Encoding UTF8
+}
+"""
+
+
+def _interactive_launch_script(task_name: str, command: str,
+                               args: list[str] | None, cwd: str | None,
+                               timeout_s: int) -> str:
+    """The guest script one interactive launch leg runs.
+
+    It discovers the interactively logged-on user, registers a ONE-SHOT
+    scheduled task with an INTERACTIVE principal for that user (the ``uia.py``
+    helper-task precedent, generalized to an arbitrary command), runs it, and
+    reports the started process id and the session it runs in.
+
+    The ``no_interactive_session`` refusal is emitted BEFORE the first
+    ``Register-ScheduledTask`` statement, so the no-session path can never
+    reach registration.
+
+    The task action carries the command and its arguments directly, because a
+    task action is what puts the process on the interactive desktop.
+    ``New-ScheduledTaskAction``'s ``-Argument`` and ``-WorkingDirectory``
+    parameters are ``System.String`` -- an array or a ``$null`` throws in
+    PowerShell 5.1 -- so the arguments ride as ONE quoted string and the
+    working directory is omitted when none was supplied.
+    """
+    exe = command.replace("\\", "/").rsplit("/", 1)[-1]
+    if "." not in exe:
+        exe += ".exe"
+    # One quoted argument string: the task scheduler hands the whole string to
+    # CreateProcess, so each argument is quoted and they are space-joined.
+    # The -Argument parameter is OMITTED when there are no arguments, because
+    # PowerShell 5.1 rejects an empty string for it ("Cannot validate argument
+    # on parameter 'Argument'. The argument is null or empty.").
+    # ONE CreateProcess command line, delivered as ONE quoted PowerShell
+    # string. `New-ScheduledTaskAction -Argument` is System.String: passing
+    # several quoted tokens makes PowerShell treat the later ones as extra
+    # POSITIONAL arguments ("A positional parameter cannot be found that
+    # accepts argument 'arg2'") or, without a cwd, silently bind the second
+    # one as the working directory. Verified live in PowerShell 5.1.
+    arg_clause = ""
+    if args:
+        arg_clause = " -Argument " + pswindows.ps_quote(
+            subprocess.list2cmdline(args))
+    work = (" -WorkingDirectory " + pswindows.ps_quote(cwd)) if cwd else ""
+    text = (LAUNCH_TEMPLATE
+            .replace("__TASKNAME__", task_name)
+            .replace("__TIMEOUT__", str(int(timeout_s)))
+            .replace("__WORKDIR__", work))
+    # The command, the observer and the exe are substituted BEFORE anything a
+    # caller supplied, so an argument whose text happens to contain a
+    # placeholder token is inserted verbatim and never rewritten.
+    text = text.replace("__OBSERVER__", _INTERACTIVE_OBSERVER.strip(chr(10)))
+    text = (text.replace("__EXE__", pswindows.ps_quote(exe))
+                .replace("__COMMAND__", pswindows.ps_quote(command)))
+    # The observer is written to a temp .ps1 and invoked with -File, so the
+    # multi-line script and its arguments reach the child intact. Verified
+    # live in PowerShell 5.1: -ArgumentList mangles a multi-line payload and
+    # -EncodedCommand followed by positional args is refused outright.
+    # The observer runs from a temp .ps1 and takes its inputs as ONE
+    # single-quoted JSON token. Start-Process -ArgumentList joins its elements
+    # with spaces WITHOUT quoting, so a path or a timestamp containing a space
+    # splits into two $args slots (verified live: "$LaunchedAt" arrived as
+    # "11/13/2026" and "22:36:16", and [DateTime] of the first evaluated to
+    # midnight, which made the "created since the launch" filter return a
+    # PRE-EXISTING same-named process). A regex is used because __EXE__ has
+    # already been substituted by the time this runs.
+    text, n = re.subn(
+        r"\$observer = Start-Process.*\)",
+        "$ObserverPath = Join-Path $env:TEMP ($TaskName + '-observer.ps1')" + chr(10) +
+        "Set-Content -LiteralPath $ObserverPath -Value @'" + chr(10) +
+        "__OBSERVER__" + chr(10) +
+        "'@ -Encoding UTF8" + chr(10) +
+        "$observerArgs = @{ status = $StatusPath; exe = __EXE__;" + chr(10) +
+        "    session = $InteractiveSession; launched = $LaunchedAt.ToString('o');" + chr(10) +
+        "    timeout_s = $TimeoutSec } | ConvertTo-Json -Compress" + chr(10) +
+        "$observerArgs = [Convert]::ToBase64String(" + chr(10) +
+        "    [Text.Encoding]::UTF8.GetBytes($observerArgs))" + chr(10) +
+        "$observer = Start-Process -FilePath 'powershell.exe' -PassThru "
+        "-WindowStyle Hidden -ArgumentList @('-NoProfile', '-NonInteractive', "
+        "'-File', $ObserverPath, $observerArgs)",
+        text, count=1)
+    assert n == 1, "the launch template must carry one observer invocation"
+    # the replacement re-introduces the __EXE__ placeholder, so substitute it
+    # here (after the caller-supplied argument clause is already in place).
+    text = text.replace("__EXE__", pswindows.ps_quote(exe))
+    assert "-EncodedCommand" not in text, (
+        "the observer must not be invoked through -EncodedCommand")
+    return text.replace("__ARGCLAUSE__", arg_clause)
+
+
+def _interactive_unregister_script(task_name: str) -> str:
+    """The cleanup leg: unregister the EXACT one-shot task the launch named."""
+    return UNREGISTER_TEMPLATE.replace("__TASKNAME__", task_name)
+
+
+def start_interactive(
+    cfg: Config,
+    vm_name: str = "",
+    command: str = "",
+    args: list[str] | None = None,
+    cwd: str | None = None,
+    *,
+    timeout_ms: int = 60000,
+    confirm: bool = False,
+    cred: CredentialSet | None = None,
+    vm_id: str = "",
+) -> dict:
+    """Launch a GUI process into the guest's INTERACTIVE session.
+
+    PowerShell Direct runs every guest leg in the remoting logon session, so a
+    process started there never appears on the console desktop and neither
+    console input nor the UI Automation helper can reach it (issue #128). This
+    registers a one-shot scheduled task with an INTERACTIVE principal for the
+    currently logged-on user, runs it, reads the started process id and its
+    session id back, and unregisters the task on EVERY path.
+
+    The launch sits behind the same destructive category and confirmation
+    semantics as the other process-starting tools' elevated path, because the
+    task runs with the interactive user's highest run level.
+    """
+    if (not vm_name and not vm_id) or not command:
+        raise ValueError("vm_name (or vm_id) and command are required")
+    if cred is None:
+        raise ValueError("guest credentials are required")
+    # POLICY FIRST: a refusal must reach the caller before the VM is resolved,
+    # so no host PowerShell leg of any kind runs (issue #128 AC4).
+    policy.require_destructive(
+        cfg, "elevated_exec", confirm,
+        f"start '{command}' in the interactive session of "
+        f"'{vm_name or vm_id}'")
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    import uuid as _uuid
+
+    task_name = f"{_TASK_PREFIX}{_uuid.uuid4().hex}"
+    timeout_s = max(5, timeout_ms // 1000)
+    launch_inner = _interactive_launch_script(
+        task_name, command, args, cwd, timeout_s)
+    unregister_inner = _interactive_unregister_script(task_name)
+
+    out: dict = {}
+    attempted = False
+    try:
+        attempted = True
+        try:
+            with vmlocks.vm_lock(ref.id, mode="read"):
+                result = _run_inner(
+                    cfg, ref.id, launch_inner, cred, timeout_ms, False,
+                    vm_name=ref.name, session_role="guest",
+                )
+        except Exception as exc:  # an exception that ESCAPES _run_inner
+            # issue #128 AC3: convert it host-side to an envelope. The task
+            # may already be registered in the guest, so the finally below
+            # still drives the cleanup leg.
+            from . import errors
+
+            out = _result_err(cfg, str(exc), errors.classify(exc))
+        else:
+            out = dict(result)
+        if out.get("ok"):
+            try:
+                protocol = json.loads(out.get("stdout") or "")
+            except (json.JSONDecodeError, TypeError):
+                protocol = None
+            if isinstance(protocol, dict) and protocol.get("ok"):
+                for key in ("stdout", "stderr", "exit_code"):
+                    out.pop(key, None)
+                out["pid"] = int(str(protocol.get("pid")))
+                out["session_id"] = int(str(protocol.get("session_id")))
+            else:
+                klass = ((protocol or {}).get("error_class")
+                         if isinstance(protocol, dict) else None) or "not_started"
+                detail = ((protocol or {}).get("error")
+                          if isinstance(protocol, dict) else None) or (
+                    out.get("stdout") or "the launch protocol answered no pid")
+                out = _result_err(cfg, detail, klass)
+        else:
+            for key in ("stdout", "stderr", "exit_code"):
+                out.pop(key, None)
+    finally:
+        # CLEANUP ON EVERY PATH. A guest-side finally alone is not enough: a
+        # launch leg that dies in transport (or an exception that escapes
+        # _run_inner outright) would strand the one-shot task. The one outcome
+        # that proves nothing was registered is the no_interactive_session
+        # refusal, which the guest emits before Register-ScheduledTask.
+        # No `return` lives in this block (B012): the envelope is assembled
+        # here and returned by the caller below, so an exception raised by the
+        # cleanup leg can never silence the launch's own answer.
+        if attempted and out.get("error_class") != "no_interactive_session":
+            try:
+                with vmlocks.vm_lock(ref.id, mode="read"):
+                    cleanup = _run_inner(
+                        cfg, ref.id, unregister_inner, cred, timeout_ms, False,
+                        vm_name=ref.name, session_role="guest",
+                    )
+                ack = None
+                if cleanup.get("ok"):
+                    try:
+                        ack = json.loads(cleanup.get("stdout") or "")
+                    except (json.JSONDecodeError, TypeError):
+                        ack = None
+                if cleanup.get("ok") and isinstance(ack, dict) and ack.get("ok"):
+                    out["unregistered"] = True
+                else:
+                    out["unregistered"] = False
+                    out["cleanup_error"] = str(
+                        cleanup.get("error")
+                        or (ack or {}).get("error")
+                        or cleanup.get("stdout")
+                        or "the cleanup leg reported no acknowledgement")
+            except Exception as exc:  # never hide an already-started process
+                out["unregistered"] = False
+                out["cleanup_error"] = str(exc)
+        elif attempted:
+            out["unregistered"] = True
+    return out
 
 def victim_run_ps(
     cfg: Config,
