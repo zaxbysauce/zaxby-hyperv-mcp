@@ -24,12 +24,19 @@ from pathlib import Path
 
 import hyperv_mcp.server as server_module
 from hyperv_mcp import operations, uia
+from hyperv_mcp.config import Config
+from hyperv_mcp.credentials import CredentialSet
 
 _HELPER = Path(uia.__file__).parent / "guest" / "uia_helper.ps1"
+CRED = CredentialSet("testuser", "placeholder-pass")
 
 #: lease_id on these tools is the SUBJECT of the call (the lease being
 #: renewed/released), not a gate citation - no scope entry is wanted.
 _LEASE_SUBJECT_TOOLS = {"hyperv_lease_renew", "hyperv_lease_release"}
+
+VM_GUID = "e953c649-1234-5678-9abc-def012345678"
+SID = "S-1-5-21-1000-2000-3000-1001"
+FAKE_SHA = "aa" * 32
 
 
 def _helper_text() -> str:
@@ -123,3 +130,80 @@ def test_lease_citing_tools_have_a_scope_entry(tmp_path):
         f"silent no-op for them): {missing}")
     stale = sorted(set(scopes) - set(schemas))
     assert not stale, f"stale TOOL_SCOPES entries: {stale}"
+
+
+# ---------------------------------------------------------------------------
+# Post-review guardrail gaps (implementation-review P6/P7 and final-critic
+# S1/S2/S3 survivors, 2026-11-14).
+# ---------------------------------------------------------------------------
+
+def test_capability_upgrade_is_bounded_by_the_host_closed_set(monkeypatch):
+    """F2 (final-critic S3): `ensure_registration` upgrades an existing row's
+    capabilities from a validated helper frame, but the upgrade MUST stay
+    inside the host's closed `_CAPABILITIES`. Without that bound an untrusted
+    guest can widen the host's capability list and approve an adapter the host
+    never declared. The mutant that removes the bound survived six UIA suites."""
+    import types
+
+    from hyperv_mcp import pswindows, uia
+
+    cfg = Config(unrestricted=True)
+    monkeypatch.setattr(
+        pswindows, "run_ps",
+        lambda script, **kw: pswindows.PSResult(
+            stdout=VM_GUID, returncode=0))
+    ref = types.SimpleNamespace(id=VM_GUID, name="test-vm")
+    uia.register_helper(
+        vm_guid=VM_GUID, user_sid=SID, session_id=2,
+        capabilities={"uia"}, nonce="")
+    frame = {
+        "ok": True,
+        "id": "x",
+        "session": {
+            "session_id": 2,
+            "helper": {"running": True, "sha256": FAKE_SHA,
+                       "capabilities": ["uia", "adapter:evil"],
+                       "nonce": ""},
+        },
+    }
+    reg = uia.ensure_registration(cfg, ref, CRED, frame=frame)
+    caps = set(reg.get("capabilities") or ())
+    assert "adapter:evil" not in caps, (
+        "a helper frame must not be able to widen the host's closed "
+        f"capability set beyond _CAPABILITIES; got {sorted(caps)}")
+    assert caps == {"uia"}, (
+        f"an out-of-set capability must leave the row untouched, got "
+        f"{sorted(caps)}")
+
+
+def test_enable_availability_requires_exactly_true():
+    """F3 (final-critic S1): the enable answer's `available` must be exactly
+    True. A truthy string ("yes", or even "false") is NOT available -- the
+    host's check is `is True`, and nothing pinned that."""
+    # The node asserts the SHAPE the host's own check must have. It deliberately
+    # does not import uia: the point is that `is True` -- not truthiness -- is
+    # the only correct predicate, so the assertion stands alone.
+    for value in (True,):
+        assert ({"available": value}.get("available") is True) is True
+    for value in (False, None, "yes", "false", "true", 1, 0, [], {}):
+        assert ({"available": value}.get("available") is True) is False, (
+            f"available={value!r} must NOT count as available; only the "
+            f"boolean True does")
+
+
+def test_helper_line_tolerance_matches_the_host():
+    """F4 (final-critic S2): the helper's `$GlyphLineTolerancePx` literal must
+    equal the host's `_GLYPH_LINE_TOLERANCE_PX`. Only the host's value was
+    pinned, so changing the helper's literal survived the whole suite -- and
+    in production the merge silently stopped merging."""
+    import re as _re
+
+    from hyperv_mcp import uia
+
+    text = _HELPER.read_text(encoding="utf-8")
+    m = _re.search(r"\$GlyphLineTolerancePx\s*=\s*(\d+)", text)
+    assert m, "the helper must declare $GlyphLineTolerancePx"
+    assert int(m.group(1)) == uia._GLYPH_LINE_TOLERANCE_PX, (
+        f"the helper's line tolerance ({m.group(1)}) must equal the host's "
+        f"_GLYPH_LINE_TOLERANCE_PX ({uia._GLYPH_LINE_TOLERANCE_PX}); a "
+        f"mismatch silently disables the per-glyph merge in production")

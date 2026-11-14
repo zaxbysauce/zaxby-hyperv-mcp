@@ -589,7 +589,7 @@ cannot.
 
 | Surface | First choice | Then |
 |---|---|---|
-| Web content of an Electron, WebView2, CEF or Chromium window | DevTools tools over the stream relay | UI Automation with the application started with `--force-renderer-accessibility` (`hyperv_ui_find`, `hyperv_ui_invoke`), then console input |
+| Web content of an Electron, WebView2, CEF or Chromium window | the DevTools protocol over the byte-stream relay (`hyperv_relay_start`, issue #135) | UI Automation with the application started with `--force-renderer-accessibility` (`hyperv_ui_find`, `hyperv_ui_invoke`), then console input |
 | Native windows and controls, including native dialogs raised by an Electron application | UI Automation tools (`hyperv_ui_find`, `hyperv_ui_invoke`, `hyperv_ui_snapshot`, `hyperv_ui_act`) | console input |
 | Anything before logon, on the secure desktop, or in WinPE | console tools | visual grounding |
 
@@ -626,8 +626,9 @@ frame.
 The server classifies every failure. When a call fails, retry first: a
 transport error carries `retryable` and `retry_after_ms` in the same envelope,
 so retry the same call before drawing any conclusion. If the retry also
-fails, list the tools you actually have (`hyperv_server_info` names the
-inventory) and read the error class. A transient failure means the server
+fails, list the prompts and tools your client actually sees, and read the
+error class the envelope carries -- `hyperv_server_info` reports the
+build's version and provenance, which tells you which server answered. A transient failure means the server
 process or the guest transport was disturbed; an absent tool means the
 capability is not registered or the policy denies it. Reporting a screen or a
 tool as unavailable is the last step, never the first, and never on the

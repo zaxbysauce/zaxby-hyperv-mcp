@@ -1800,6 +1800,7 @@ omission is rejected rather than defaulting to a disable.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
+| `hyperv_guest_start_interactive` | `vm_name` or `vm_id`, `command`, `args[]`, `cwd`, `timeout_ms` (default 60000), `confirm` | `{ok, pid, session_id, vm_name, unregistered}` (+ `cleanup_error`) |
 | `hyperv_list_vms` | — | `[{id, name, state, status, memory_mb, cpu_count, uptime_seconds}]` |
 | `hyperv_get_vm_info` | `vm_name` or `vm_id` | `{id, name, state, generation, memory_mb, cpu_count, checkpoint_count, checkpoint_type, com_ports, network_adapters, hard_drives, ...}` |
 | `hyperv_start_vm` | `vm_name` or `vm_id` | `{status: started\|already_running, vm_name, state}` — waits for Running |
@@ -1883,7 +1884,21 @@ Direct with separately-quoted arguments. Both tools are gated by the
 cases and requires the VM Off/Saved for the `Set-VMComPort` step.
 
 ### Guest Execution (PowerShell Direct — no WinRM required)
-| `hyperv_guest_start_interactive` | `vm_name` or `vm_id`, `command`, `args[]`, `cwd`, `timeout_ms` (default 60000), `confirm` | `{ok, pid, session_id, vm_name, unregistered}` (+ `cleanup_error`) |
+**`hyperv_guest_start_interactive` — two disclosed windows.** The one-shot
+task is unregistered from a host-side `finally`, so a guest-reported failure
+or a transport death still cleans up. Two windows are NOT closable from the
+host and are disclosed rather than claimed away: (1) if the HOST process dies
+between `Register-ScheduledTask` and the cleanup leg, the task is left behind;
+(2) the task's trigger is `-Once` ten minutes out, so a stranded task launches
+the application again ten minutes later. Recover by unregistering
+`hyperv-mcp-interactive-<uuid>` in the guest (`Get-ScheduledTask |
+Where-Object TaskName -like 'hyperv-mcp-interactive-*' | Unregister-ScheduledTask
+-Confirm:$false`). The started process is identified as the newest process of
+that executable name in the interactive session, created at or after the launch
+began -- an application that starts several same-named processes reports the
+newest.
+
+
 
 
 | Tool | Parameters | Returns |
@@ -2264,6 +2279,38 @@ measure; `crop`, `scale`, `format` and `quality` are echoed there too, so an
 unchanged result is exactly as informative about the request as a changed one.
 
 ---
+
+#### Electron / Chromium adapter (`adapter: "electron"`, 0.20.0, issue #129)
+
+Chromium builds its accessibility tree on demand, so a UI Automation client
+sees almost nothing inside the renderer unless the tree is turned on. With
+`adapter="electron"` on `hyperv_ui_find` / `hyperv_ui_inspect` /
+`hyperv_ui_snapshot`:
+
+- the helper is asked to enable the renderer accessibility tree BEFORE the
+  selector resolves;
+- adjacent single-glyph `Text` nodes on one line are merged into word runs,
+  so a selector by name finds a label instead of nothing. The merge is
+  electron-scoped and governed by the module-level `uia.GLYPH_MERGE_DEFAULT`
+  (on by default; turning it off returns the helper's per-glyph nodes
+  unchanged);
+- a tree that stays unavailable is reported as `accessibility_unavailable`,
+  never as an empty match list -- an empty list is indistinguishable from
+  "no such control" and sends callers back to coordinates.
+
+Starting the application with `--force-renderer-accessibility` through
+`hyperv_guest_start_interactive` is the deterministic route; the enable request
+itself is best-effort by Chromium's design. The helper advertises the
+`adapter:electron` capability it implements, and the front door performs an
+adapter-neutral bootstrap so a fresh process's first electron request can be
+approved at all.
+
+**Reprovisioning.** An already-running helper keeps serving the build it was
+provisioned with: the host integrity-checks every frame against the packaged
+helper bytes, so a helper that predates this change will not gain the enable
+arm or the capability, and an electron request against it is refused
+`adapter_unapproved`. Re-run `hyperv_ui_helper_provision` to pick up a new
+build.
 
 ### In-session UI Automation helper (0.7.0, issue #29)
 
@@ -2714,6 +2761,18 @@ width/height/frame dimensions when you need head-sized captures.
 | Tool | Parameters | Returns |
 |------|-----------|---------|
 | `hyperv_server_info` | — | `{version, git_revision, powershell: {path, edition, version, psmodulepath}, config_path, config_sha256, mcp_sdk_version, protocol_version, feature_flags}` — read-only; never contains secrets |
+
+### Prompts
+
+The server registers one MCP prompt, `gui-testing-playbook` (0.20.0, issue
+#134): how to drive a guest's graphical interface, ordering the interaction
+paths BY SURFACE (DevTools for web content, UI Automation for native windows,
+console tools before logon) and covering verify-after-every-action, the
+commit-guarded click discipline, transient-versus-absent errors, and evidence
+capture. List it with your client's prompt listing and fetch it before a GUI
+session; the console click/type/screenshot tool descriptions also point at
+their element-level alternatives so the most capable path is discoverable
+among the 85 tools.
 
 ### MDT Deployment Playbook (agent-driven)
 

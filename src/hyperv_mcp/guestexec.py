@@ -790,9 +790,9 @@ def guest_run(
         )
 
 
-LAUNCH_TEMPLATE = '$ErrorActionPreference = \'Stop\'\n$TaskName = \'__TASKNAME__\'\n$StatusPath = Join-Path $env:TEMP ($TaskName + \'.json\')\n$TimeoutSec = __TIMEOUT__\n$InteractiveUser = $null\n$InteractiveSession = $null\nforeach ($qline in (quser 2>$null)) {\n    if ("$qline" -match \'^\\s*(\\S+)\\s+\\S+\\s+(\\d+)\\s+Active\') {\n        $InteractiveUser = $Matches[1]\n        $InteractiveSession = [int]$Matches[2]\n        break\n    }\n}\nif (-not $InteractiveUser -or -not $InteractiveSession) {\n    Write-Output (@{ ok = $false\n        error_class = \'no_interactive_session\'\n        error = \'no user is logged on interactively\' } |\n        ConvertTo-Json -Compress)\n    return\n}\n$action = New-ScheduledTaskAction -Execute \'__COMMAND__\' -Argument __ARGLIST__ -WorkingDirectory __WORKDIR__\n$principal = New-ScheduledTaskPrincipal -UserId $InteractiveUser -LogonType Interactive -RunLevel Highest\n$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10)\nRegister-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Trigger $trigger -Force | Out-Null\nStart-ScheduledTask -TaskName $TaskName\n$Observer = @\'\n__OBSERVER__\n\'@\n$observer = Start-Process -FilePath \'powershell.exe\' -PassThru `\n    -WindowStyle Hidden -ArgumentList @(\'-NoProfile\', \'-NonInteractive\',\n    \'-Command\', $Observer, $StatusPath, \'__EXE__\', "$InteractiveSession")\n$Deadline = (Get-Date).AddSeconds($TimeoutSec)\n$Status = $null\nwhile (-not $Status -and (Get-Date) -lt $Deadline) {\n    if (Test-Path -LiteralPath $StatusPath) {\n        try {\n            $Status = Get-Content -LiteralPath $StatusPath -Raw |\n                ConvertFrom-Json\n        } catch { $Status = $null }\n    }\n    if (-not $Status) { Start-Sleep -Milliseconds 200 }\n}\nif ($Status -and $Status.ok -and $Status.pid) {\n    Write-Output (@{ ok = $true; pid = [int]$Status.pid\n        session_id = [int]$Status.session_id } | ConvertTo-Json -Compress)\n} else {\n    $msg = \'the started process was not observed within \' + $TimeoutSec + \'s\'\n    Write-Output (@{ ok = $false; error_class = \'not_started\'\n        error = $msg } | ConvertTo-Json -Compress)\n}\n'
+LAUNCH_TEMPLATE = '$ErrorActionPreference = \'Stop\'\n$TaskName = \'__TASKNAME__\'\n$StatusPath = Join-Path $env:TEMP ($TaskName + \'.json\')\n$TimeoutSec = __TIMEOUT__\n$InteractiveUser = $null\n$InteractiveSession = $null\nforeach ($qline in (quser 2>$null)) {\n    if ("$qline" -match \'^\\s*(\\S+)\\s+\\S+\\s+(\\d+)\\s+Active\') {\n        $InteractiveUser = $Matches[1]\n        $InteractiveSession = [int]$Matches[2]\n        break\n    }\n}\nif (-not $InteractiveUser -or -not $InteractiveSession) {\n    Write-Output (@{ ok = $false\n        error_class = \'no_interactive_session\'\n        error = \'no user is logged on interactively\' } |\n        ConvertTo-Json -Compress)\n    return\n}\n$action = New-ScheduledTaskAction -Execute __COMMAND____ARGCLAUSE____WORKDIR__\n$principal = New-ScheduledTaskPrincipal -UserId $InteractiveUser -LogonType Interactive -RunLevel Highest\n$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10)\nRegister-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Trigger $trigger -Force | Out-Null\n$LaunchedAt = Get-Date\nStart-ScheduledTask -TaskName $TaskName\n$Observer = @\'\n__OBSERVER__\n\'@\n$observer = Start-Process -FilePath \'powershell.exe\' -PassThru -WindowStyle Hidden -ArgumentList @(\'-NoProfile\', \'-NonInteractive\', \'-EncodedCommand\', $Observer, $StatusPath, __EXE__, "$InteractiveSession", "$LaunchedAt")\n$Deadline = (Get-Date).AddSeconds($TimeoutSec)\n$Status = $null\nwhile (-not $Status -and (Get-Date) -lt $Deadline) {\n    if (Test-Path -LiteralPath $StatusPath) {\n        try {\n            $Status = Get-Content -LiteralPath $StatusPath -Raw |\n                ConvertFrom-Json\n        } catch { $Status = $null }\n    }\n    if (-not $Status) { Start-Sleep -Milliseconds 200 }\n}\nif ($Status -and $Status.ok -and $Status.pid) {\n    Write-Output (@{ ok = $true; pid = [int]$Status.pid\n        session_id = [int]$Status.session_id } | ConvertTo-Json -Compress)\n} else {\n    $msg = \'the started process was not observed within \' + $TimeoutSec + \'s\'\n    Write-Output (@{ ok = $false; error_class = \'not_started\'\n        error = $msg } | ConvertTo-Json -Compress)\n}\n'
 
-UNREGISTER_TEMPLATE = "$ErrorActionPreference = 'Continue'\nUnregister-ScheduledTask -TaskName '__TASKNAME__' `\n    -Confirm:$false -ErrorAction SilentlyContinue\nRemove-Item -LiteralPath (Join-Path $env:TEMP ('__TASKNAME__' + '.json')) `\n    -Force -ErrorAction SilentlyContinue\nWrite-Output (@{ ok = $true; unregistered = $true } |\n    ConvertTo-Json -Compress)\n"
+UNREGISTER_TEMPLATE = "$ErrorActionPreference = 'Continue'\nUnregister-ScheduledTask -TaskName '__TASKNAME__' `\n    -Confirm:$false -ErrorAction SilentlyContinue\nRemove-Item -LiteralPath (Join-Path $env:TEMP ('__TASKNAME__' + '.json')), (Join-Path $env:TEMP ('__TASKNAME__' + '-observer.ps1')) `\n    -Force -ErrorAction SilentlyContinue\nWrite-Output (@{ ok = $true; unregistered = $true } |\n    ConvertTo-Json -Compress)\n"
 
 _TASK_PREFIX = "hyperv-mcp-interactive-"
 
@@ -804,16 +804,17 @@ _INTERACTIVE_OBSERVER = """$ErrorActionPreference = 'SilentlyContinue'
 $StatusPath = $args[0]
 $Exe = $args[1]
 $SessionId = [int]$args[2]
-$Deadline = (Get-Date).AddSeconds(120)
+$LaunchedAt = [DateTime]$args[3]
+$Deadline = [DateTime]::UtcNow.AddSeconds(120)
 $Found = $null
-while (-not $Found -and (Get-Date) -lt $Deadline) {
+while ($null -eq $Found -and [DateTime]::UtcNow -lt $Deadline) {
     $Found = Get-CimInstance Win32_Process -Filter ("Name='" + $Exe + "'") |
-        Where-Object { $_.SessionId -eq $SessionId } |
-        Sort-Object CreationDate |
+        Where-Object { $_.SessionId -eq $SessionId -and $_.CreationDate -ge $LaunchedAt } |
+        Sort-Object CreationDate -Descending |
         Select-Object -First 1
-    if (-not $Found) { Start-Sleep -Milliseconds 200 }
+    if ($null -eq $Found) { Start-Sleep -Milliseconds 200 }
 }
-if ($Found) {
+if ($null -ne $Found) {
     Set-Content -LiteralPath $StatusPath -Value (
         (@{ ok = $true; pid = [int]$Found.ProcessId;
             session_id = [int]$Found.SessionId } |
@@ -822,7 +823,8 @@ if ($Found) {
     Set-Content -LiteralPath $StatusPath -Value (
         (@{ ok = $false; error_class = 'not_started' } |
          ConvertTo-Json -Compress)) -Encoding UTF8
-}"""
+}
+"""
 
 
 def _interactive_launch_script(task_name: str, command: str,
@@ -838,18 +840,53 @@ def _interactive_launch_script(task_name: str, command: str,
     The ``no_interactive_session`` refusal is emitted BEFORE the first
     ``Register-ScheduledTask`` statement, so the no-session path can never
     reach registration.
+
+    The task action carries the command and its arguments directly, because a
+    task action is what puts the process on the interactive desktop.
+    ``New-ScheduledTaskAction``'s ``-Argument`` and ``-WorkingDirectory``
+    parameters are ``System.String`` -- an array or a ``$null`` throws in
+    PowerShell 5.1 -- so the arguments ride as ONE quoted string and the
+    working directory is omitted when none was supplied.
     """
-    quoted = [pswindows.ps_quote(a) for a in (args or [])]
-    arg_list = "@(" + ", ".join(quoted) + ")" if quoted else "@()"
     exe = command.replace("\\", "/").rsplit("/", 1)[-1]
-    return (LAUNCH_TEMPLATE
+    if "." not in exe:
+        exe += ".exe"
+    # One quoted argument string: the task scheduler hands the whole string to
+    # CreateProcess, so each argument is quoted and they are space-joined.
+    # The -Argument parameter is OMITTED when there are no arguments, because
+    # PowerShell 5.1 rejects an empty string for it ("Cannot validate argument
+    # on parameter 'Argument'. The argument is null or empty.").
+    arg_clause = ""
+    if args:
+        arg_clause = " -Argument " + " ".join(pswindows.ps_quote(a) for a in args)
+    work = (" -WorkingDirectory " + pswindows.ps_quote(cwd)) if cwd else ""
+    text = (LAUNCH_TEMPLATE
             .replace("__TASKNAME__", task_name)
             .replace("__TIMEOUT__", str(int(timeout_s)))
-            .replace("__ARGLIST__", arg_list)
-            .replace("__COMMAND__", command)
-            .replace("__WORKDIR__", pswindows.ps_quote(cwd) if cwd else "$null")
-            .replace("__OBSERVER__", _INTERACTIVE_OBSERVER.strip("\n"))
-            .replace("__EXE__", exe))
+            .replace("__WORKDIR__", work))
+    # The command, the observer and the exe are substituted BEFORE anything a
+    # caller supplied, so an argument whose text happens to contain a
+    # placeholder token is inserted verbatim and never rewritten.
+    text = text.replace("__OBSERVER__", _INTERACTIVE_OBSERVER.strip(chr(10)))
+    text = (text.replace("__EXE__", pswindows.ps_quote(exe))
+                .replace("__COMMAND__", pswindows.ps_quote(command)))
+    # The observer is written to a temp .ps1 and invoked with -File, so the
+    # multi-line script and its arguments reach the child intact. Verified
+    # live in PowerShell 5.1: -ArgumentList mangles a multi-line payload and
+    # -EncodedCommand followed by positional args is refused outright.
+    text = text.replace(
+        "$Observer = @'",
+        "$ObserverPath = Join-Path $env:TEMP ($TaskName + '-observer.ps1')" + chr(10) +
+        "Set-Content -LiteralPath $ObserverPath -Value @'")
+    text = text.replace(
+        "'@" + chr(10) + "$observer = Start-Process -FilePath 'powershell.exe' -PassThru "
+        "-WindowStyle Hidden -ArgumentList @('-NoProfile', '-NonInteractive', "
+        "'-EncodedCommand', $Observer, $StatusPath,",
+        "'@ -Encoding UTF8" + chr(10) + "$observer = Start-Process -FilePath "
+        "'powershell.exe' -PassThru -WindowStyle Hidden -ArgumentList "
+        "@('-NoProfile', '-NonInteractive', '-File', $ObserverPath, "
+        "$StatusPath,")
+    return text.replace("__ARGCLAUSE__", arg_clause)
 
 
 def _interactive_unregister_script(task_name: str) -> str:

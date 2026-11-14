@@ -574,13 +574,16 @@ function New-MergedGlyphElement($run) {
     $first = $run[0]
     if ($run.Count -eq 1) { return $first }
     $name = ($run | ForEach-Object { Get-ElementName $_ }) -join ''
-    $minX = $null; $right = 0; $lineY = 0; $tallest = 0
+    $minX = $null; $right = 0; $tallest = 0
+    # The run's line is its FIRST node's line (issue #129 review): a
+    # later glyph on a wrapped line must not move the merged rect.
+    $lineY = 0
+    try { $lineY = [int]$run[0].Current.BoundingRectangle.Y } catch { }
     foreach ($e in $run) {
         try {
             $r = $e.Current.BoundingRectangle
             if ($null -eq $minX -or [int]$r.X -lt $minX) { $minX = [int]$r.X }
             if ([int]($r.X + $r.Width) -gt $right) { $right = [int]($r.X + $r.Width) }
-            $lineY = [int]$r.Y
             if ([int]$r.Height -gt $tallest) { $tallest = [int]$r.Height }
         } catch { }
     }
@@ -596,6 +599,9 @@ function New-MergedGlyphElement($run) {
     $cur | Add-Member -MemberType NoteProperty -Name Name -Value $name
     $cur | Add-Member -MemberType NoteProperty -Name ControlType -Value $ct
     $cur | Add-Member -MemberType NoteProperty -Name BoundingRectangle -Value $rect
+    $cur | Add-Member -MemberType NoteProperty -Name IsEnabled -Value $true
+    $cur | Add-Member -MemberType NoteProperty -Name AutomationId -Value ''
+    $cur | Add-Member -MemberType NoteProperty -Name ClassName -Value ''
     # A merged node is read through the SAME batched-read path as a real
     # element, so the cached view answers the property queries
     # Get-ElementResult makes (a plain NoteProperty set would throw
@@ -1881,6 +1887,8 @@ foreach ($name in $functionNames) {
     }
 }
 $sessionVariables = @{
+    # Issue #129: the per-glyph line tolerance is read by Merge-GlyphRuns INSIDE the per-request worker runspace, and a runspace built from InitialSessionState receives ONLY the keys listed here -- a script-scope variable is $null there, which silently disables the merge in production.
+    GlyphLineTolerancePx = $GlyphLineTolerancePx
     SnapshotStore = $script:SnapshotTables
     dpiDeclared = $dpiDeclared
     HelperDir = $HelperDir

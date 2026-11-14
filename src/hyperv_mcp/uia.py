@@ -1229,7 +1229,13 @@ def _front_door(cfg, vm, cred: CredentialSet, request: dict) -> dict:
         probe["id"] = uuid.uuid4().hex
         boot = _pipe_forward(_Transport(cfg, ref, cred), probe,
                              uuid.uuid4().hex)
-        if boot.get("ok") and isinstance(boot.get("session"), dict):
+        if boot.get("ok") is not True:
+            # The bootstrap's OWN refusal surfaces verbatim. Letting
+            # `registration` stay None here would make `_adapter_gate(None, …)`
+            # answer `adapter_unapproved`, hiding a helper integrity or
+            # session-verification failure behind a capability error.
+            return boot
+        if isinstance(boot.get("session"), dict):
             registration = ensure_registration(
                 cfg, ref, cred, frame=boot, target_guid=target_guid)
     request["target"]["session_id"] = session_id
