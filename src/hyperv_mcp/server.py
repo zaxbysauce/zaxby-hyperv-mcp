@@ -1,7 +1,7 @@
 """
 hyperv_mcp.server -- MCP server for Hyper-V VM management (hardened fork).
 
-Exposes 84 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
+Exposes 85 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
 guest execution and file transfer via PowerShell Direct, guest access
 diagnostics/repair and managed guest jobs, reboot recovery verification,
 host-to-guest HTTP relay, console observation and input (WMI), evidence
@@ -572,6 +572,77 @@ def _server_info_payload(cfg: Config) -> dict[str, Any]:
 # tool registration
 # ---------------------------------------------------------------------------
 
+
+    #: The built-in GUI-testing playbook (issue #134). It orders the interaction
+#: paths BY SURFACE rather than by one global ranking, because the DevTools
+#: protocol reaches web content that UI Automation cannot and UI Automation
+#: reaches native windows that DevTools cannot. Registered as the
+#: ``gui-testing-playbook`` MCP prompt.
+_GUI_TESTING_PLAYBOOK = """# GUI Testing Playbook
+
+How to drive a guest's graphical interface from this server, and how to verify
+each step. Choose the path from the surface you are driving, not from a global
+ranking: the DevTools protocol and UI Automation each reach things the other
+cannot.
+
+## Path selection
+
+| Surface | First choice | Then |
+|---|---|---|
+| Web content of an Electron, WebView2, CEF or Chromium window | DevTools tools over the stream relay | UI Automation with the application started with `--force-renderer-accessibility` (`hyperv_ui_find`, `hyperv_ui_invoke`), then console input |
+| Native windows and controls, including native dialogs raised by an Electron application | UI Automation tools (`hyperv_ui_find`, `hyperv_ui_invoke`, `hyperv_ui_snapshot`, `hyperv_ui_act`) | console input |
+| Anything before logon, on the secure desktop, or in WinPE | console tools | visual grounding |
+
+To tell which surface a window is, read the foreground process from
+`hyperv_ui_session_state` and check whether a DevTools target exists for it.
+Keep the guest display at the size screenshots are taken at
+(`hyperv_vm_set_resolution`), so no scaling sits between a screenshot and a
+click. Start a GUI application into the interactive session with
+`hyperv_guest_start_interactive`; a process started through the ordinary
+guest-execution tools runs in the PowerShell Direct remoting session and never
+appears on the desktop.
+
+## Verification
+
+Verify after every action. Screenshot before you act and again after the
+action settles (`hyperv_console_wait_frame_stable`, not a fixed sleep), and
+confirm the observed change is the one you asked for. On the UI Automation
+path the element result carries its own state block, so prefer asserting on
+the returned state over taking another screenshot. If a step cannot be
+verified, stop and report what you observed rather than continuing.
+
+## Commit-click
+
+For a click that commits something, use the commit guard on
+`hyperv_console_click`: take a fresh screenshot, cite it with
+`verified_frame_hash` (or cite a `verified_state_receipt` minted by a UI
+Automation read after your last input), and pass `commit_guard=true`. The
+guard refuses when console input has reached that VM since the capture, so a
+stale image cannot commit a wrong target. Never assume focus from a prior
+frame.
+
+## Transient versus absent errors
+
+The server classifies every failure. When a call fails, retry first: a
+transport error carries `retryable` and `retry_after_ms` in the same envelope,
+so retry the same call before drawing any conclusion. If the retry also
+fails, list the tools you actually have (`hyperv_server_info` names the
+inventory) and read the error class. A transient failure means the server
+process or the guest transport was disturbed; an absent tool means the
+capability is not registered or the policy denies it. Reporting a screen or a
+tool as unavailable is the last step, never the first, and never on the
+strength of one failed call.
+
+## Evidence
+
+Capture evidence as you go: the screenshot before and after each committed
+action, the tool result envelopes, and the error class of anything that
+failed. `hyperv_console_screenshot` with `save_path` writes the exact bytes it
+returned, so the evidence and the observation cannot drift apart. A guest run
+that produced nothing observable is not evidence that the step worked.
+"""
+
+
 def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     """Register the full tool surface.
 
@@ -587,6 +658,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     redefinition; the ignores on the base-variant definitions below are
     intentional.
     """
+    @mcp.prompt(name="gui-testing-playbook")
+    def gui_testing_playbook() -> str:
+        """How to drive a guest's graphical interface, and how to verify each
+        step: which interaction path to take for the surface being driven,
+        verify-after-every-action, the commit-guarded click discipline,
+        transient-versus-absent errors, and evidence capture."""
+        return _GUI_TESTING_PLAYBOOK
+
     creds_allowed = cfg.allow_inline_credentials
 
     def _vm_key(vm_name: str = "", vm_id: str = "") -> str:
@@ -1096,6 +1175,62 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
             )
 
+        @mcp.tool()
+        def hyperv_guest_start_interactive(
+            vm_name: str = "", command: str = "", args: list[str] | None = None,
+            cwd: str | None = None, timeout_ms: int = 60000,
+            confirm: bool = False,
+            username: str = "", password: str = "",
+            vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
+        ) -> dict:
+            """Start a process in the guest's INTERACTIVE session.
+
+            A process started through the ordinary guest-execution tools runs
+            in the PowerShell Direct remoting logon session, so it never
+            appears on the console desktop and neither console input nor the
+            UI Automation helper can reach it. This registers a one-shot
+            scheduled task with an interactive principal for the currently
+            logged-on user, runs it, returns the started process id and its
+            session id, and unregisters the task on every path. Starting an
+            Electron application with ``--force-renderer-accessibility``
+            through this tool is the deterministic route to a Chromium
+            accessibility tree the UI Automation tools can read.
+
+            Refuses with ``no_interactive_session`` (registering nothing) when
+            no user is logged on, and with ``not_started`` when the process
+            cannot be observed after the run. A cleanup failure is reported as
+            ``unregistered: false`` plus ``cleanup_error`` and never hides an
+            already-started process id.
+
+            Policy: the same guest-execution destructive category as the other
+            process-starting tools, because the task runs with the interactive
+            user's highest run level.
+
+            Args:
+                vm_name: Name of the VM
+                command: The GUI executable to launch in the guest's interactive session
+                args: Argument list passed to the command
+                cwd: Working directory for the launched process
+                timeout_ms: Per-call timeout in milliseconds
+                username: Inline guest username (requires allow_inline_credentials=true)
+                password: Inline guest password (requires allow_inline_credentials=true)
+                confirm: Must be true (the tool's destructive category + require_confirm)
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
+
+            Returns: {ok, pid, session_id, vm_name, unregistered} (+ cleanup_error when the cleanup failed) or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
+            """
+            return _run_guest_tool(
+                "hyperv_guest_start_interactive", vm_name, "exec",
+                guestexec.start_interactive, _cfg(), vm_name, command, args, cwd,
+                timeout_ms=timeout_ms, confirm=confirm, vm_id=vm_id,
+                lease_id=lease_id, fencing_token=fencing_token,
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
+            )
+
+
     else:
 
         @mcp.tool()
@@ -1560,6 +1695,60 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 vm_id=vm_id, cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
             )
 
+
+        @mcp.tool()
+        def hyperv_guest_start_interactive(  # type: ignore[misc]  # dual registration — see _register_tools
+            vm_name: str = "", command: str = "", args: list[str] | None = None,
+            cwd: str | None = None, timeout_ms: int = 60000,
+            confirm: bool = False,
+            vm_id: str = "",
+            lease_id: str = "", fencing_token: int = 0,
+        ) -> dict:
+            """Start a process in the guest's INTERACTIVE session.
+
+            A process started through the ordinary guest-execution tools runs
+            in the PowerShell Direct remoting logon session, so it never
+            appears on the console desktop and neither console input nor the
+            UI Automation helper can reach it. This registers a one-shot
+            scheduled task with an interactive principal for the currently
+            logged-on user, runs it, returns the started process id and its
+            session id, and unregisters the task on every path. Starting an
+            Electron application with ``--force-renderer-accessibility``
+            through this tool is the deterministic route to a Chromium
+            accessibility tree the UI Automation tools can read.
+
+            Refuses with ``no_interactive_session`` (registering nothing) when
+            no user is logged on, and with ``not_started`` when the process
+            cannot be observed after the run. A cleanup failure is reported as
+            ``unregistered: false`` plus ``cleanup_error`` and never hides an
+            already-started process id.
+
+            Policy: the same guest-execution destructive category as the other
+            process-starting tools, because the task runs with the interactive
+            user's highest run level.
+
+            Args:
+                vm_name: Name of the VM (must match allowed_vm_patterns)
+                command: The GUI executable to launch in the guest's interactive session
+                args: Argument list passed to the command
+                cwd: Working directory for the launched process
+                timeout_ms: Per-call timeout in milliseconds
+                confirm: Must be true (the tool's destructive category + require_confirm)
+                vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+                lease_id: Optional lease citation - the lease gate runs before the body
+                fencing_token: The lease's fencing token, with lease_id
+
+            Returns: {ok, pid, session_id, vm_name, unregistered} (+ cleanup_error when the cleanup failed) or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
+            """
+            return _run_guest_tool(
+                "hyperv_guest_start_interactive", vm_name, "exec",
+                guestexec.start_interactive, _cfg(), vm_name, command, args, cwd,
+                timeout_ms=timeout_ms, confirm=confirm, vm_id=vm_id,
+                lease_id=lease_id, fencing_token=fencing_token,
+                cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
+            )
+
+
     # ---- victim execution (env-only credentials, never elevated) --------
 
     @mcp.tool()
@@ -1703,6 +1892,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
         Returns: [ImageContent, TextContent(json metadata)] — the metadata alone
         when if_changed_from matches (unchanged: true).
+        See also: for controls the console cannot address by name, prefer the
+        element-level UI Automation tools hyperv_ui_find and hyperv_ui_invoke
+        (with hyperv_ui_snapshot and hyperv_ui_act for reads and composite
+        actions); the gui-testing-playbook prompt carries the path-selection
+        order.
         """
         try:
             with _audit("hyperv_console_screenshot", vm_name, "read") as op:
@@ -1777,6 +1971,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             lease_id: Optional lease citation - the lease gate runs before the body
             fencing_token: The lease's fencing token, with lease_id
         Returns: {ok, chunks, chars} (+ secret_typed when secret_ref) or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
+        See also: for controls the console cannot address by name, prefer the
+        element-level UI Automation tools hyperv_ui_find and hyperv_ui_invoke
+        (with hyperv_ui_snapshot and hyperv_ui_act for reads and composite
+        actions); the gui-testing-playbook prompt carries the path-selection
+        order.
         """
         return _run_console_tool(
             "hyperv_console_type_text", vm_name, "console_input",
@@ -2051,6 +2250,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
         Returns: {ok, operation, head_x?, head_y?} or {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy)
+        See also: for controls the console cannot address by name, prefer the
+        element-level UI Automation tools hyperv_ui_find and hyperv_ui_invoke
+        (with hyperv_ui_snapshot and hyperv_ui_act for reads and composite
+        actions); the gui-testing-playbook prompt carries the path-selection
+        order.
         """
         return _run_console_tool(
             "hyperv_console_click", vm_name, "console_input",
@@ -4941,6 +5145,7 @@ TOOL_SCOPES: dict[str, str] = {
     "hyperv_vm_tpm_set": "lifecycle", "hyperv_vm_secureboot_set": "lifecycle",
     "hyperv_vm_set_resolution": "lifecycle",
     # guest_exec
+    "hyperv_guest_start_interactive": "guest_exec",
     "hyperv_guest_run_ps": "guest_exec", "hyperv_guest_run": "guest_exec",
     "hyperv_victim_run": "guest_exec", "hyperv_victim_run_ps": "guest_exec",
     "hyperv_guest_job_start": "guest_exec", "hyperv_guest_job_stop": "guest_exec",

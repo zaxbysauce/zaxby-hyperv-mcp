@@ -790,6 +790,194 @@ def guest_run(
         )
 
 
+LAUNCH_TEMPLATE = '$ErrorActionPreference = \'Stop\'\n$TaskName = \'__TASKNAME__\'\n$StatusPath = Join-Path $env:TEMP ($TaskName + \'.json\')\n$TimeoutSec = __TIMEOUT__\n$InteractiveUser = $null\n$InteractiveSession = $null\nforeach ($qline in (quser 2>$null)) {\n    if ("$qline" -match \'^\\s*(\\S+)\\s+\\S+\\s+(\\d+)\\s+Active\') {\n        $InteractiveUser = $Matches[1]\n        $InteractiveSession = [int]$Matches[2]\n        break\n    }\n}\nif (-not $InteractiveUser -or -not $InteractiveSession) {\n    Write-Output (@{ ok = $false\n        error_class = \'no_interactive_session\'\n        error = \'no user is logged on interactively\' } |\n        ConvertTo-Json -Compress)\n    return\n}\n$action = New-ScheduledTaskAction -Execute \'__COMMAND__\' -Argument __ARGLIST__ -WorkingDirectory __WORKDIR__\n$principal = New-ScheduledTaskPrincipal -UserId $InteractiveUser -LogonType Interactive -RunLevel Highest\n$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10)\nRegister-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal -Trigger $trigger -Force | Out-Null\nStart-ScheduledTask -TaskName $TaskName\n$Observer = @\'\n__OBSERVER__\n\'@\n$observer = Start-Process -FilePath \'powershell.exe\' -PassThru `\n    -WindowStyle Hidden -ArgumentList @(\'-NoProfile\', \'-NonInteractive\',\n    \'-Command\', $Observer, $StatusPath, \'__EXE__\', "$InteractiveSession")\n$Deadline = (Get-Date).AddSeconds($TimeoutSec)\n$Status = $null\nwhile (-not $Status -and (Get-Date) -lt $Deadline) {\n    if (Test-Path -LiteralPath $StatusPath) {\n        try {\n            $Status = Get-Content -LiteralPath $StatusPath -Raw |\n                ConvertFrom-Json\n        } catch { $Status = $null }\n    }\n    if (-not $Status) { Start-Sleep -Milliseconds 200 }\n}\nif ($Status -and $Status.ok -and $Status.pid) {\n    Write-Output (@{ ok = $true; pid = [int]$Status.pid\n        session_id = [int]$Status.session_id } | ConvertTo-Json -Compress)\n} else {\n    $msg = \'the started process was not observed within \' + $TimeoutSec + \'s\'\n    Write-Output (@{ ok = $false; error_class = \'not_started\'\n        error = $msg } | ConvertTo-Json -Compress)\n}\n'
+
+UNREGISTER_TEMPLATE = "$ErrorActionPreference = 'Continue'\nUnregister-ScheduledTask -TaskName '__TASKNAME__' `\n    -Confirm:$false -ErrorAction SilentlyContinue\nRemove-Item -LiteralPath (Join-Path $env:TEMP ('__TASKNAME__' + '.json')) `\n    -Force -ErrorAction SilentlyContinue\nWrite-Output (@{ ok = $true; unregistered = $true } |\n    ConvertTo-Json -Compress)\n"
+
+_TASK_PREFIX = "hyperv-mcp-interactive-"
+
+#: The observer one interactive launch leg starts to read the started process
+#: back. It receives the status path, the target executable name and the
+#: interactive session id as ``-Command`` positional arguments, so no literal
+#: in the launch script ever repeats the task name.
+_INTERACTIVE_OBSERVER = """$ErrorActionPreference = 'SilentlyContinue'
+$StatusPath = $args[0]
+$Exe = $args[1]
+$SessionId = [int]$args[2]
+$Deadline = (Get-Date).AddSeconds(120)
+$Found = $null
+while (-not $Found -and (Get-Date) -lt $Deadline) {
+    $Found = Get-CimInstance Win32_Process -Filter ("Name='" + $Exe + "'") |
+        Where-Object { $_.SessionId -eq $SessionId } |
+        Sort-Object CreationDate |
+        Select-Object -First 1
+    if (-not $Found) { Start-Sleep -Milliseconds 200 }
+}
+if ($Found) {
+    Set-Content -LiteralPath $StatusPath -Value (
+        (@{ ok = $true; pid = [int]$Found.ProcessId;
+            session_id = [int]$Found.SessionId } |
+         ConvertTo-Json -Compress)) -Encoding UTF8
+} else {
+    Set-Content -LiteralPath $StatusPath -Value (
+        (@{ ok = $false; error_class = 'not_started' } |
+         ConvertTo-Json -Compress)) -Encoding UTF8
+}"""
+
+
+def _interactive_launch_script(task_name: str, command: str,
+                               args: list[str] | None, cwd: str | None,
+                               timeout_s: int) -> str:
+    """The guest script one interactive launch leg runs.
+
+    It discovers the interactively logged-on user, registers a ONE-SHOT
+    scheduled task with an INTERACTIVE principal for that user (the ``uia.py``
+    helper-task precedent, generalized to an arbitrary command), runs it, and
+    reports the started process id and the session it runs in.
+
+    The ``no_interactive_session`` refusal is emitted BEFORE the first
+    ``Register-ScheduledTask`` statement, so the no-session path can never
+    reach registration.
+    """
+    quoted = [pswindows.ps_quote(a) for a in (args or [])]
+    arg_list = "@(" + ", ".join(quoted) + ")" if quoted else "@()"
+    exe = command.replace("\\", "/").rsplit("/", 1)[-1]
+    return (LAUNCH_TEMPLATE
+            .replace("__TASKNAME__", task_name)
+            .replace("__TIMEOUT__", str(int(timeout_s)))
+            .replace("__ARGLIST__", arg_list)
+            .replace("__COMMAND__", command)
+            .replace("__WORKDIR__", pswindows.ps_quote(cwd) if cwd else "$null")
+            .replace("__OBSERVER__", _INTERACTIVE_OBSERVER.strip("\n"))
+            .replace("__EXE__", exe))
+
+
+def _interactive_unregister_script(task_name: str) -> str:
+    """The cleanup leg: unregister the EXACT one-shot task the launch named."""
+    return UNREGISTER_TEMPLATE.replace("__TASKNAME__", task_name)
+
+
+def start_interactive(
+    cfg: Config,
+    vm_name: str = "",
+    command: str = "",
+    args: list[str] | None = None,
+    cwd: str | None = None,
+    *,
+    timeout_ms: int = 60000,
+    confirm: bool = False,
+    cred: CredentialSet | None = None,
+    vm_id: str = "",
+) -> dict:
+    """Launch a GUI process into the guest's INTERACTIVE session.
+
+    PowerShell Direct runs every guest leg in the remoting logon session, so a
+    process started there never appears on the console desktop and neither
+    console input nor the UI Automation helper can reach it (issue #128). This
+    registers a one-shot scheduled task with an INTERACTIVE principal for the
+    currently logged-on user, runs it, reads the started process id and its
+    session id back, and unregisters the task on EVERY path.
+
+    The launch sits behind the same destructive category and confirmation
+    semantics as the other process-starting tools' elevated path, because the
+    task runs with the interactive user's highest run level.
+    """
+    if (not vm_name and not vm_id) or not command:
+        raise ValueError("vm_name (or vm_id) and command are required")
+    if cred is None:
+        raise ValueError("guest credentials are required")
+    # POLICY FIRST: a refusal must reach the caller before the VM is resolved,
+    # so no host PowerShell leg of any kind runs (issue #128 AC4).
+    policy.require_destructive(
+        cfg, "elevated_exec", confirm,
+        f"start '{command}' in the interactive session of "
+        f"'{vm_name or vm_id}'")
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    import uuid as _uuid
+
+    task_name = f"{_TASK_PREFIX}{_uuid.uuid4().hex}"
+    timeout_s = max(5, timeout_ms // 1000)
+    launch_inner = _interactive_launch_script(
+        task_name, command, args, cwd, timeout_s)
+    unregister_inner = _interactive_unregister_script(task_name)
+
+    out: dict = {}
+    attempted = False
+    try:
+        attempted = True
+        try:
+            with vmlocks.vm_lock(ref.id, mode="read"):
+                result = _run_inner(
+                    cfg, ref.id, launch_inner, cred, timeout_ms, False,
+                    vm_name=ref.name, session_role="guest",
+                )
+        except Exception as exc:  # an exception that ESCAPES _run_inner
+            # issue #128 AC3: convert it host-side to an envelope. The task
+            # may already be registered in the guest, so the finally below
+            # still drives the cleanup leg.
+            from . import errors
+
+            out = _result_err(cfg, str(exc), errors.classify(exc))
+        else:
+            out = dict(result)
+        if out.get("ok"):
+            try:
+                protocol = json.loads(out.get("stdout") or "")
+            except (json.JSONDecodeError, TypeError):
+                protocol = None
+            if isinstance(protocol, dict) and protocol.get("ok"):
+                for key in ("stdout", "stderr", "exit_code"):
+                    out.pop(key, None)
+                out["pid"] = int(str(protocol.get("pid")))
+                out["session_id"] = int(str(protocol.get("session_id")))
+            else:
+                klass = ((protocol or {}).get("error_class")
+                         if isinstance(protocol, dict) else None) or "not_started"
+                detail = ((protocol or {}).get("error")
+                          if isinstance(protocol, dict) else None) or (
+                    out.get("stdout") or "the launch protocol answered no pid")
+                out = _result_err(cfg, detail, klass)
+        else:
+            for key in ("stdout", "stderr", "exit_code"):
+                out.pop(key, None)
+    finally:
+        # CLEANUP ON EVERY PATH. A guest-side finally alone is not enough: a
+        # launch leg that dies in transport (or an exception that escapes
+        # _run_inner outright) would strand the one-shot task. The one outcome
+        # that proves nothing was registered is the no_interactive_session
+        # refusal, which the guest emits before Register-ScheduledTask.
+        # No `return` lives in this block (B012): the envelope is assembled
+        # here and returned by the caller below, so an exception raised by the
+        # cleanup leg can never silence the launch's own answer.
+        if attempted and out.get("error_class") != "no_interactive_session":
+            try:
+                with vmlocks.vm_lock(ref.id, mode="read"):
+                    cleanup = _run_inner(
+                        cfg, ref.id, unregister_inner, cred, timeout_ms, False,
+                        vm_name=ref.name, session_role="guest",
+                    )
+                ack = None
+                if cleanup.get("ok"):
+                    try:
+                        ack = json.loads(cleanup.get("stdout") or "")
+                    except (json.JSONDecodeError, TypeError):
+                        ack = None
+                if cleanup.get("ok") and isinstance(ack, dict) and ack.get("ok"):
+                    out["unregistered"] = True
+                else:
+                    out["unregistered"] = False
+                    out["cleanup_error"] = str(
+                        cleanup.get("error")
+                        or (ack or {}).get("error")
+                        or cleanup.get("stdout")
+                        or "the cleanup leg reported no acknowledgement")
+            except Exception as exc:  # never hide an already-started process
+                out["unregistered"] = False
+                out["cleanup_error"] = str(exc)
+        elif attempted:
+            out["unregistered"] = True
+    return out
+
 def victim_run_ps(
     cfg: Config,
     vm_name: str = "",

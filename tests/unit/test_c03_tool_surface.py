@@ -33,6 +33,7 @@ GUID = "e953c649-dcab-438d-9a54-3af74a82b624"
 # brought it to 82 with hyperv_console_lock_state + hyperv_console_unlock,
 # and issue #137 brought it to 84 with hyperv_ui_snapshot + hyperv_ui_act).
 TOOL_NAMES = {
+    "hyperv_guest_start_interactive",
     "hyperv_list_vms",
     "hyperv_get_vm_info",
     "hyperv_start_vm",
@@ -109,6 +110,7 @@ TOOL_NAMES = {
     "hyperv_ui_snapshot", "hyperv_ui_act",
 }
 CRED_TOOLS = {
+    "hyperv_guest_start_interactive",
     "hyperv_configure_kdnet",
     "hyperv_configure_kdcom",
     "hyperv_guest_run",
@@ -262,7 +264,7 @@ def test_ac12_tool_inventory_per_credential_mode(tmp_path, fresh_server):
         f"extra={sorted(set(base_schemas) - TOOL_NAMES)}, "
         f"missing={sorted(TOOL_NAMES - set(base_schemas))}"
     )
-    assert len(base_schemas) == len(TOOL_NAMES) == 84, (
+    assert len(base_schemas) == len(TOOL_NAMES) == 85, (
         f"AC12: tool count {len(base_schemas)} != 84 "
         f"(66 through issue #24; 67 with issue #27's settle wait; "
         f"76 with issue #29's eight hyperv_ui_* tools; 80 with PR #112's "

@@ -1,7 +1,7 @@
 # hyperv-mcp (hardened fork)
 
 An MCP (Model Context Protocol) server for Hyper-V VM management and guest
-execution. Exposes 84 tools for VM lifecycle, checkpoint management, kernel
+execution. Exposes 85 tools for VM lifecycle, checkpoint management, kernel
 debug setup (KDNET/KDCOM), and guest file transfer/command execution via
 PowerShell Direct (no WinRM required).
 
@@ -184,7 +184,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.19.0 today) instead of
+  package's version (0.20.0 today) instead of
   the SDK's (the release contract, the complete bump-site
   enumeration, and how to read `version`/`git_revision` live in
   [docs/versioning-policy.md](docs/versioning-policy.md)).
@@ -233,6 +233,46 @@ restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.20.0 changes
+
+- **GUI application drivability (#128/#129/#134):** an agent can now start and
+  drive a graphical application inside a guest. One tool joins the family
+  (84 -> 85): `hyperv_guest_start_interactive` registers a one-shot scheduled
+  task with an INTERACTIVE principal for the currently logged-on user, runs
+  it, returns the started process id and its session id, and unregisters the
+  task on every path. A process started through the ordinary guest-execution
+  tools runs in the PowerShell Direct remoting logon session and never appears
+  on the console desktop, so neither console input nor the UI Automation
+  helper could reach it; this is the primitive that fixes that. It refuses
+  with `no_interactive_session` (registering nothing) when nobody is logged
+  on, with `not_started` when the process cannot be observed, and reports a
+  cleanup failure as `unregistered: false` plus `cleanup_error` without hiding
+  an already-started process id. BEHAVIOR CHANGE: it sits behind the same
+  `elevated_exec` destructive category and `confirm` semantics as the other
+  process-starting tools, because the task runs with the interactive user's
+  highest run level.
+- **Electron/Chromium UI Automation (#129):** the `adapter: "electron"`
+  request now has guest-side behavior instead of being a permission gate. The
+  helper is asked to enable the renderer accessibility tree BEFORE a selector
+  resolves; adjacent single-glyph text nodes on one line are merged into word
+  runs (on the electron path only, behind the module-level
+  `uia.GLYPH_MERGE_DEFAULT`, on by default); and a tree that stays
+  unavailable is reported as `accessibility_unavailable` rather than an empty
+  match list. The helper now advertises the `adapter:electron` capability it
+  implements, and the front door performs an adapter-neutral bootstrap so a
+  fresh process's first electron request can be approved at all. Starting the
+  application with `--force-renderer-accessibility` through
+  `hyperv_guest_start_interactive` remains the deterministic route.
+- **Built-in GUI testing playbook (#134):** the server registers one MCP
+  prompt, `gui-testing-playbook`, ordering the interaction paths BY SURFACE
+  (DevTools for web content, UI Automation for native windows, console tools
+  before logon) and covering verify-after-every-action, the commit-guarded
+  click discipline, transient-versus-absent errors, and evidence capture. The
+  console click, type and screenshot tool descriptions now point at their
+  element-level alternatives (`hyperv_ui_find` / `hyperv_ui_invoke`), so the
+  most capable path is discoverable among the 85 tools.
+- Version bump: 0.19.0 -> 0.20.0.
 
 ## 0.19.0 changes
 
@@ -1536,6 +1576,7 @@ These tools refuse to run unless their category is enabled **and** (when
 | `hyperv_checkpoint_remove` (esp. subtree) | `checkpoint_remove` |
 | `hyperv_configure_kdnet` / `hyperv_configure_kdcom` | `kd_reboot` |
 | `hyperv_guest_run(_ps)` with `elevated=true` | `elevated_exec` |
+| `hyperv_guest_start_interactive` | `elevated_exec` |
 | `hyperv_guest_put` (guest write) | `guest_write` |
 | `hyperv_console_type_text` / `press_key` / `key_combo` / `type_scancodes` / `mouse_move` / `click` / `button` / `scroll` | `console_input` (no confirm — non-destructive interactive input) |
 | `hyperv_vm_media_attach` / `media_detach` / `network_set` | `media` (reversible, no confirm) |
@@ -1726,7 +1767,7 @@ become a published credential):
 
 ---
 
-## Available Tools (80 total)
+## Available Tools (85 total)
 
 Every registered tool in the tables below returns failures the same way:
 the one-envelope contract (`ok/error/error_class/retryable/retry_after_ms`,
@@ -1842,6 +1883,8 @@ Direct with separately-quoted arguments. Both tools are gated by the
 cases and requires the VM Off/Saved for the `Set-VMComPort` step.
 
 ### Guest Execution (PowerShell Direct — no WinRM required)
+| `hyperv_guest_start_interactive` | `vm_name` or `vm_id`, `command`, `args[]`, `cwd`, `timeout_ms` (default 60000), `confirm` | `{ok, pid, session_id, vm_name, unregistered}` (+ `cleanup_error`) |
+
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|

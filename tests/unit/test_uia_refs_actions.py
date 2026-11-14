@@ -1141,7 +1141,7 @@ def test_snapshot_and_act_are_registered(tmp_path, fresh_server):
     missing = sorted(expected - set(schemas))
     assert missing == [], (
         f"the ui tool family must be complete; missing: {missing}")
-    assert len(schemas) == 84, (
+    assert len(schemas) == 85, (
         "the registered tool count must be 84 (82 at base plus "
         f"hyperv_ui_snapshot and hyperv_ui_act); got {len(schemas)}")
 
@@ -1162,7 +1162,7 @@ def test_snapshot_and_act_are_registered(tmp_path, fresh_server):
         props = cred_schemas[name].get("properties", {})
         assert "username" in props, name
         assert "password" in props, name
-    assert len(cred_schemas) == 84, (
+    assert len(cred_schemas) == 85, (
         "the registered tool count must be 84 in inline-credential mode "
         "too (both credential modes register the same tools); got "
         f"{len(cred_schemas)}")
