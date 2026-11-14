@@ -1288,7 +1288,16 @@ function Invoke-Request([hashtable]$req) {
                 # applied to unmerged glyphs matches nothing. Collect the
                 # scope WITHOUT the name condition, merge the runs, then
                 # match the name/name_contains predicates against the JOINED
-                # names.
+                # names. The host's module switch rides on the request, so
+                # turning it off leaves the per-glyph nodes untouched here
+                # too (not only on the host side).
+                $mergeRuns = $true
+                if ($req.ContainsKey('args') -and $null -ne $req['args'] -and $req['args'] -is [hashtable] -and $req['args'].ContainsKey('merge_glyph_runs')) {
+                    $mergeRuns = [bool]$req['args']['merge_glyph_runs']
+                }
+                if (-not $mergeRuns) {
+                    $elements = @(Resolve-Target $selector $cache)
+                } else {
                 $collector = @{}
                 foreach ($k in @($selector.Keys)) {
                     if ($k -ne 'name' -and $k -ne 'name_contains') { $collector[$k] = $selector[$k] }
@@ -1307,6 +1316,7 @@ function Invoke-Request([hashtable]$req) {
                     $matched += $el
                 }
                 $elements = $matched
+                }
             } else {
                 $elements = @(Resolve-Target $selector $cache)
             }

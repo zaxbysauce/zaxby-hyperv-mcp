@@ -1800,7 +1800,6 @@ omission is rejected rather than defaulting to a disable.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_guest_start_interactive` | `vm_name` or `vm_id`, `command`, `args[]`, `cwd`, `timeout_ms` (default 60000), `confirm` | `{ok, pid, session_id, vm_name, unregistered}` (+ `cleanup_error`) |
 | `hyperv_list_vms` | — | `[{id, name, state, status, memory_mb, cpu_count, uptime_seconds}]` |
 | `hyperv_get_vm_info` | `vm_name` or `vm_id` | `{id, name, state, generation, memory_mb, cpu_count, checkpoint_count, checkpoint_type, com_ports, network_adapters, hard_drives, ...}` |
 | `hyperv_start_vm` | `vm_name` or `vm_id` | `{status: started\|already_running, vm_name, state}` — waits for Running |
@@ -1903,6 +1902,7 @@ newest.
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
+| `hyperv_guest_start_interactive` | `vm_name` or `vm_id`, `command`, `args[]`, `cwd`, `timeout_ms` (default 60000), `confirm` | `{ok, pid, session_id, vm_name, unregistered}` (+ `cleanup_error`) |
 | `hyperv_guest_run` | `vm_name` or `vm_id`, `command`, `args[]`, `cwd?`, `timeout_ms` (default 60000), `elevated`, `confirm` | `{ok, exit_code, stdout, stderr, timed_out, truncated}` |
 | `hyperv_guest_run_ps` | `vm_name` or `vm_id`, `script`, `timeout_ms` (default 60000), `elevated`, `confirm` | same envelope |
 | `hyperv_guest_put` | `vm_name` or `vm_id`, `local_path`, `remote_path`, `confirm`, `verify?` | `{ok, bytes_copied, sha256_local?, sha256_remote?}` |
@@ -2308,8 +2308,10 @@ approved at all.
 **Reprovisioning.** An already-running helper keeps serving the build it was
 provisioned with: the host integrity-checks every frame against the packaged
 helper bytes, so a helper that predates this change will not gain the enable
-arm or the capability, and an electron request against it is refused
-`adapter_unapproved`. Re-run `hyperv_ui_helper_provision` to pick up a new
+arm or the capability, and an electron request against it is refused —
+`helper_integrity_mismatch` on a fresh host process (the packaged bytes no
+longer match), or `adapter_unapproved` where a registration from the old
+build is still seeded. Re-run `hyperv_ui_helper_provision` to pick up a new
 build.
 
 ### In-session UI Automation helper (0.7.0, issue #29)

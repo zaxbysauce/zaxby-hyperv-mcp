@@ -1600,6 +1600,11 @@ def _verb_request(cfg, ref, cred: CredentialSet, verb: str, args: dict,
     the whole wait.
     """
     request = build_request(verb, args=args)
+    if adapter == "electron":
+        # Issue #129: the per-glyph merge switch must reach the GUEST as well
+        # as the host, or turning it off leaves the helper merging anyway.
+        request.setdefault("args", {})
+        request["args"]["merge_glyph_runs"] = bool(GLYPH_MERGE_DEFAULT)
     if selector is not None:
         request["selector"] = validate_selector(selector)
     if element_id is not None:

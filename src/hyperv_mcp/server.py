@@ -589,7 +589,7 @@ cannot.
 
 | Surface | First choice | Then |
 |---|---|---|
-| Web content of an Electron, WebView2, CEF or Chromium window | the DevTools protocol over the byte-stream relay (`hyperv_relay_start`, issue #135) | UI Automation with the application started with `--force-renderer-accessibility` (`hyperv_ui_find`, `hyperv_ui_invoke`), then console input |
+| Web content of an Electron, WebView2, CEF or Chromium window | the DevTools protocol (needs the byte-stream relay of #135 or the CDP tools of #127, neither shipped yet; today's `hyperv_relay_start` is HTTP-only and reaches just the `/json/*` endpoints) | UI Automation with the application started with `--force-renderer-accessibility` (`hyperv_ui_find`, `hyperv_ui_invoke`), then console input |
 | Native windows and controls, including native dialogs raised by an Electron application | UI Automation tools (`hyperv_ui_find`, `hyperv_ui_invoke`, `hyperv_ui_snapshot`, `hyperv_ui_act`) | console input |
 | Anything before logon, on the secure desktop, or in WinPE | console tools | visual grounding |
 

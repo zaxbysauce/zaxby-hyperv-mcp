@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 
 from . import credentials, policy, psdsessions, pswindows, timing, vmident, vmlocks
 from .config import Config
@@ -801,11 +802,19 @@ _TASK_PREFIX = "hyperv-mcp-interactive-"
 #: interactive session id as ``-Command`` positional arguments, so no literal
 #: in the launch script ever repeats the task name.
 _INTERACTIVE_OBSERVER = """$ErrorActionPreference = 'SilentlyContinue'
-$StatusPath = $args[0]
-$Exe = $args[1]
-$SessionId = [int]$args[2]
-$LaunchedAt = [DateTime]$args[3]
-$Deadline = [DateTime]::UtcNow.AddSeconds(120)
+# The inputs ride as ONE base64 token: Start-Process -ArgumentList joins its
+# elements with spaces and does not quote, so four separate arguments would
+# split on any space in a path or a timestamp -- and even a single-quoted JSON
+# token loses its quotes twice on the way through PowerShell's own -File
+# argument parser (verified live: the inner double quotes arrived stripped).
+$cfg = ([Text.Encoding]::UTF8.GetString(
+    [Convert]::FromBase64String([string]$args[0]))) | ConvertFrom-Json
+$StatusPath = [string]$cfg.status
+$Exe = [string]$cfg.exe
+$SessionId = [int]$cfg.session
+$LaunchedAt = [DateTime]$cfg.launched
+$TimeoutSec = [int]$cfg.timeout_s
+$Deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
 $Found = $null
 while ($null -eq $Found -and [DateTime]::UtcNow -lt $Deadline) {
     $Found = Get-CimInstance Win32_Process -Filter ("Name='" + $Exe + "'") |
@@ -856,9 +865,16 @@ def _interactive_launch_script(task_name: str, command: str,
     # The -Argument parameter is OMITTED when there are no arguments, because
     # PowerShell 5.1 rejects an empty string for it ("Cannot validate argument
     # on parameter 'Argument'. The argument is null or empty.").
+    # ONE CreateProcess command line, delivered as ONE quoted PowerShell
+    # string. `New-ScheduledTaskAction -Argument` is System.String: passing
+    # several quoted tokens makes PowerShell treat the later ones as extra
+    # POSITIONAL arguments ("A positional parameter cannot be found that
+    # accepts argument 'arg2'") or, without a cwd, silently bind the second
+    # one as the working directory. Verified live in PowerShell 5.1.
     arg_clause = ""
     if args:
-        arg_clause = " -Argument " + " ".join(pswindows.ps_quote(a) for a in args)
+        arg_clause = " -Argument " + pswindows.ps_quote(
+            subprocess.list2cmdline(args))
     work = (" -WorkingDirectory " + pswindows.ps_quote(cwd)) if cwd else ""
     text = (LAUNCH_TEMPLATE
             .replace("__TASKNAME__", task_name)
@@ -874,18 +890,35 @@ def _interactive_launch_script(task_name: str, command: str,
     # multi-line script and its arguments reach the child intact. Verified
     # live in PowerShell 5.1: -ArgumentList mangles a multi-line payload and
     # -EncodedCommand followed by positional args is refused outright.
-    text = text.replace(
-        "$Observer = @'",
+    # The observer runs from a temp .ps1 and takes its inputs as ONE
+    # single-quoted JSON token. Start-Process -ArgumentList joins its elements
+    # with spaces WITHOUT quoting, so a path or a timestamp containing a space
+    # splits into two $args slots (verified live: "$LaunchedAt" arrived as
+    # "11/13/2026" and "22:36:16", and [DateTime] of the first evaluated to
+    # midnight, which made the "created since the launch" filter return a
+    # PRE-EXISTING same-named process). A regex is used because __EXE__ has
+    # already been substituted by the time this runs.
+    text, n = re.subn(
+        r"\$observer = Start-Process.*\)",
         "$ObserverPath = Join-Path $env:TEMP ($TaskName + '-observer.ps1')" + chr(10) +
-        "Set-Content -LiteralPath $ObserverPath -Value @'")
-    text = text.replace(
-        "'@" + chr(10) + "$observer = Start-Process -FilePath 'powershell.exe' -PassThru "
+        "Set-Content -LiteralPath $ObserverPath -Value @'" + chr(10) +
+        "__OBSERVER__" + chr(10) +
+        "'@ -Encoding UTF8" + chr(10) +
+        "$observerArgs = @{ status = $StatusPath; exe = __EXE__;" + chr(10) +
+        "    session = $InteractiveSession; launched = $LaunchedAt.ToString('o');" + chr(10) +
+        "    timeout_s = $TimeoutSec } | ConvertTo-Json -Compress" + chr(10) +
+        "$observerArgs = [Convert]::ToBase64String(" + chr(10) +
+        "    [Text.Encoding]::UTF8.GetBytes($observerArgs))" + chr(10) +
+        "$observer = Start-Process -FilePath 'powershell.exe' -PassThru "
         "-WindowStyle Hidden -ArgumentList @('-NoProfile', '-NonInteractive', "
-        "'-EncodedCommand', $Observer, $StatusPath,",
-        "'@ -Encoding UTF8" + chr(10) + "$observer = Start-Process -FilePath "
-        "'powershell.exe' -PassThru -WindowStyle Hidden -ArgumentList "
-        "@('-NoProfile', '-NonInteractive', '-File', $ObserverPath, "
-        "$StatusPath,")
+        "'-File', $ObserverPath, $observerArgs)",
+        text, count=1)
+    assert n == 1, "the launch template must carry one observer invocation"
+    # the replacement re-introduces the __EXE__ placeholder, so substitute it
+    # here (after the caller-supplied argument clause is already in place).
+    text = text.replace("__EXE__", pswindows.ps_quote(exe))
+    assert "-EncodedCommand" not in text, (
+        "the observer must not be invoked through -EncodedCommand")
     return text.replace("__ARGCLAUSE__", arg_clause)
 
 
