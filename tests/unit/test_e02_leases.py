@@ -58,7 +58,6 @@ _SRC = Path(__file__).resolve().parents[2] / "src"
 # scope, lease-gated, no confirm) makes it 43.
 LEASED_TOOLS = [
     "hyperv_guest_start_interactive",
-    "hyperv_guest_start_interactive",
     # lifecycle (17)
     "hyperv_start_vm",
     "hyperv_stop_vm",
@@ -112,7 +111,6 @@ LEASED_TOOLS = [
 # (AC14, PRESERVING — pinned at base c1da890 as 16; issue #29's
 # hyperv_ui_helper_provision is the 17th; issues #31's clone/remove are 18-19).
 CONFIRM_TOOLS = [
-    "hyperv_guest_start_interactive",
     "hyperv_guest_start_interactive",
     "hyperv_stop_vm",
     "hyperv_reset_vm",

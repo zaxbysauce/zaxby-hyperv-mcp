@@ -590,14 +590,15 @@ cannot.
 | Surface | First choice | Then |
 |---|---|---|
 | Web content of an Electron, WebView2, CEF or Chromium window | the DevTools protocol (needs the byte-stream relay of #135 or the CDP tools of #127, neither shipped yet; today's `hyperv_relay_start` is HTTP-only and reaches just the `/json/*` endpoints) | UI Automation with the application started with `--force-renderer-accessibility` (`hyperv_ui_find`, `hyperv_ui_invoke`), then console input |
-| Native windows and controls, including native dialogs raised by an Electron application | UI Automation tools (`hyperv_ui_find`, `hyperv_ui_invoke`, `hyperv_ui_snapshot`, `hyperv_ui_act`) | console input |
+| Native windows and controls, including native dialogs raised by an Electron application | UI Automation tools (`hyperv_ui_find`, `hyperv_ui_inspect`, `hyperv_ui_snapshot`, `hyperv_ui_act` -- the element state, snapshots and actions of #136 and #137) | console input |
 | Anything before logon, on the secure desktop, or in WinPE | console tools | visual grounding |
 
 To tell which surface a window is, read the foreground process from
 `hyperv_ui_session_state` and check whether a DevTools target exists for it.
 Keep the guest display at the size screenshots are taken at
-(`hyperv_vm_set_resolution`), so no scaling sits between a screenshot and a
-click. Start a GUI application into the interactive session with
+(`hyperv_vm_set_resolution`, issue #125), so no scaling sits between a screenshot and a
+click. Where a guest image can lock, sleep or hide a UAC prompt, pick the
+test-image profile of #138 before driving it. Start a GUI application into the interactive session with
 `hyperv_guest_start_interactive`; a process started through the ordinary
 guest-execution tools runs in the PowerShell Direct remoting session and never
 appears on the desktop.
@@ -1227,7 +1228,6 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_guest_start_interactive", vm_name, "exec",
                 guestexec.start_interactive, _cfg(), vm_name, command, args, cwd,
                 timeout_ms=timeout_ms, confirm=confirm, vm_id=vm_id,
-                lease_id=lease_id, fencing_token=fencing_token,
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
             )
 
@@ -1745,7 +1745,6 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_guest_start_interactive", vm_name, "exec",
                 guestexec.start_interactive, _cfg(), vm_name, command, args, cwd,
                 timeout_ms=timeout_ms, confirm=confirm, vm_id=vm_id,
-                lease_id=lease_id, fencing_token=fencing_token,
                 cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
             )
 

@@ -268,19 +268,39 @@ class BrokerPipe:
 
 
 class LegRecorder:
-    """uia._run_uia_leg stand-in that must stay UNTOUCHED on a refusal:
-    records every leg; serving is irrelevant because the pin is emptiness."""
+    """uia._run_uia_leg stand-in for the unapproved-adapter pin.
+
+    It records every leg AND serves a frame that CORRELATES with the
+    request id it was handed, decoding it out of the framed stdin. The
+    frame advertises no electron capability, so the adapter-neutral
+    bootstrap the #129 fix adds can complete without approving the
+    adapter -- which is what makes the pin stronger than "no leg ran":
+    it proves the bootstrap ran and that a helper advertising nothing is
+    STILL refused adapter_unapproved.
+    """
 
     def __init__(self):
         self.scripts: list[str] = []
         self.stdin_b64: list[str | None] = []
+        self.request_ids: list[str | None] = []
 
     def __call__(self, cfg, script, *, stdin_b64=None, timeout_s=None,
                  **kwargs):
         self.scripts.append(script)
         self.stdin_b64.append(stdin_b64)
+        rid = None
+        if stdin_b64:
+            try:
+                # stdin is two lines: the credential password (b64) then the
+                # framed request payload (b64).
+                payload_b64 = stdin_b64.split(chr(10))[-1]
+                inner = json.loads(base64.b64decode(payload_b64).decode("utf-8"))
+                rid = inner.get("id")
+            except Exception:
+                rid = None
+        self.request_ids.append(rid)
         return pswindows.PSResult(
-            stdout=json.dumps({"ok": True, "id": "unused", "result": {},
+            stdout=json.dumps({"ok": True, "id": rid, "result": {},
                                "session": dict(HELPER_SESSION)}),
             returncode=0)
 
@@ -814,6 +834,22 @@ def _run_helper_dispatch(cases_ps: str, tmp_path) -> list[dict]:
     return out
 
 
+def test_enable_accessibility_is_not_a_mutating_verb():
+    """RC-24: the ledger-polarity pin stubbed ``uia._pipe_request`` with
+    ``FrontDoorPipe``, which replaced exactly the code containing the
+    ``MUTATING_VERBS`` ledger bump (``_pipe_forward``), so its "zero ledger
+    bumps" assertion could never see that seam -- adding
+    ``enable_accessibility`` to ``MUTATING_VERBS`` shipped green. This node
+    pins the set directly. Mutant: add the verb -- this node fails."""
+    from hyperv_mcp import uia
+
+    assert uia._ENABLE_ACCESSIBILITY not in uia.MUTATING_VERBS, (
+        "the renderer-accessibility enable is a READ-ONLY side-channel "
+        "verb: it must not bump the console-input ledger, or every "
+        "electron find would invalidate a prior #126/#140 commit-guard "
+        "verification")
+
+
 def test_helper_merges_glyph_runs_before_matching(tmp_path):
     """AC2b (wave-3 S4 rewrite -- behavior and wiring, NOT naming): the
     helper's REAL request path (Invoke-Request, the production dispatch --
@@ -898,6 +934,12 @@ def test_helper_merges_glyph_runs_before_matching(tmp_path):
         #    tree (the F05 idiom: later definitions win)
         "function Resolve-Target { param($selector, $cache)"
         " @($gW,$gO,$gR,$gD) }",
+        # RC-05: the electron arm collects through Resolve-Subtree, not
+        # Resolve-Target -- a name-only selector leaves the collector
+        # empty, and Resolve-Target answers that shape with the scope
+        # window itself.
+        "function Resolve-Subtree { param($selector, $cache, $cap)"
+        " @($gW,$gO,$gR,$gD) }",
         f"$target = @{{ vm_guid = '{guid}'; user_sid = '{SID}';"
         " session_id = 2 }",
         # case 1: ELECTRON find naming the JOINED word -> the merged,
@@ -908,7 +950,8 @@ def test_helper_merges_glyph_runs_before_matching(tmp_path):
         "$e1 = @($r1.result.elements)[0]",
         "@{ case = 'joined'; ok = $r1.ok; count = @($r1.result.elements).Count;"
         " name = [string]$e1.name; control_type = [string]$e1.control_type;"
-        " element_id = [string]$e1.element_id; rect = [string]$e1.rect }"
+        " element_id = [string]$e1.element_id;"
+        " enabled = [string]$e1.enabled; rect = [string]$e1.rect }"
         " | ConvertTo-Json -Compress -Depth 6",
         # case 2: ELECTRON find naming a single UNMERGED glyph -> nothing
         "$r2 = Invoke-Request @{ id = 'req-2'; verb = 'find';"
@@ -947,6 +990,12 @@ def test_helper_merges_glyph_runs_before_matching(tmp_path):
         f"the merged element must carry the run's FIRST identity "
         f"(element_id 42:31, the RuntimeId a later invoke/act resolves -- "
         f"an ACTIONABLE element): {joined!r}")
+    # RC-22: the merged node must report IsEnabled. Get-ElementResult
+    # reads $c.Cached.IsEnabled as a PROPERTY, so a merged node that never
+    # sets it answers enabled=false and an Electron wait_for with
+    # {"enabled": true} would never match merged text.
+    assert joined.get("enabled") == "True", (
+        f"the merged node must report enabled=true; got {joined}")
     assert joined["rect"] == _rect(0, 10, 32, 16), (
         f"the merged element must carry a rect SPANNING the run "
         f"(0,10,32,16): {joined!r}")
@@ -1135,7 +1184,14 @@ def test_enable_leg_receipt_and_ledger_polarity(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# AC4 (preserving): no capability -> adapter_unapproved, zero transport
+# AC4 (preserving): no capability -> adapter_unapproved
+#
+# AMENDED (swarm-pr-review RC-27): the original wording pinned that the
+# gate fires "without a single _run_uia_leg". That is no longer true on a
+# FRESH process, because the #129 adapter-neutral bootstrap (an
+# adapter-free session_state probe) runs BEFORE the gate so a registration
+# can be seeded at all. The pin now asserts the refusal plus that no FIND
+# frame is issued.
 # ---------------------------------------------------------------------------
 
 def test_unapproved_adapter_still_refused(monkeypatch):
@@ -1160,9 +1216,17 @@ def test_unapproved_adapter_still_refused(monkeypatch):
     assert out.get("error_class") == "adapter_unapproved", (
         f"the electron adapter without the registered capability must be "
         f"refused as adapter_unapproved, got {out.get('error_class')!r}")
-    assert legs.scripts == [], (
-        f"the gate must fire BEFORE any transport leg; {len(legs.scripts)} "
-        "helper leg(s) ran")
+    # The adapter-neutral bootstrap DOES run: the seeded row lacks the
+    # electron capability, so _front_door asks the helper (through an
+    # adapter-free session_state probe) whether it has it. The probe is
+    # ONE leg and carries no adapter, and the frame it serves advertises
+    # no electron capability -- so the gate still refuses, and NO find
+    # frame is ever issued. What must NOT happen is a find leg.
+    assert len(legs.scripts) == 1, (
+        f"exactly the adapter-neutral bootstrap leg may run; "
+        f"{len(legs.scripts)} helper leg(s) ran")
+    assert legs.request_ids and legs.request_ids[0], (
+        "the bootstrap leg must serve a correlating frame")
 
     # -- broker level (the frozen AC21 mirror): the pipe seam records
     #    nothing for the refused electron request

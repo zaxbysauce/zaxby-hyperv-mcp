@@ -94,6 +94,10 @@ BASE_CAPABILITIES = {"uia", "msaa"}
 ELECTRON_CAPABILITY = "adapter:electron"
 _CAPABILITIES = BASE_CAPABILITIES | {ELECTRON_CAPABILITY}
 
+#: The capability each adapter name maps to. A request naming an adapter
+#: with no entry here is never gated and never bootstrapped.
+_ADAPTER_CAPABILITIES = {"electron": ELECTRON_CAPABILITY}
+
 #: Issue #129: the electron adapter merges Chromium's per-glyph text nodes
 #: into word runs. The merge ships ON for the adapter and is governed by this
 #: module-level switch, read at CALL time so a caller (or a test) can turn it
@@ -1204,6 +1208,11 @@ def _front_door(cfg, vm, cred: CredentialSet, request: dict) -> dict:
     except UiAError as exc:
         return {"ok": False, "error_class": "ambiguous_session",
                 "error": str(exc), "session": _fallback_block(cfg, ref, cred)}
+    # The session id must be on the request BEFORE any frame is forwarded.
+    # The helper checks the session dimension for EVERY verb, so a probe
+    # carrying a null id is refused ``session_unverified`` -- which is what
+    # made the adapter bootstrap below unusable on a fresh process.
+    request["target"]["session_id"] = session_id
     registration = ensure_registration(
         cfg, ref, cred, session_id=session_id, target_guid=target_guid)
     if (registration is not None and current_sid
@@ -1213,7 +1222,18 @@ def _front_door(cfg, vm, cred: CredentialSet, request: dict) -> dict:
         # DIFFERENT recorded SID is a genuine mismatch and stays one.
         with _REGISTRY_LOCK:
             registration["user_sid"] = current_sid
-    if registration is None and request.get("adapter"):
+    # Adapter bootstrap (issue #129). A request carrying NO adapter is never
+    # gated, so it can reach the helper and seed the registration from the
+    # response's session block. It runs BOTH when no row exists (a fresh
+    # process) AND when a row exists but lacks the adapter the request asks
+    # for: ``_front_door`` calls ``ensure_registration(frame=...)`` only when
+    # the lookup returns None, so without this second branch a row seeded
+    # {'uia'} stays unapprovable for electron for the life of the host
+    # process -- exactly what the capability upgrade exists to prevent.
+    adapter_cap = _ADAPTER_CAPABILITIES.get(str(request.get("adapter") or ""))
+    if adapter_cap and (
+            registration is None
+            or adapter_cap not in (registration.get("capabilities") or ())):
         # Adapter-neutral bootstrap (issue #129). A request carrying NO
         # adapter is never gated, so it can reach the helper and seed the
         # registration from the response's session block. Without it a FRESH
@@ -1238,7 +1258,6 @@ def _front_door(cfg, vm, cred: CredentialSet, request: dict) -> dict:
         if isinstance(boot.get("session"), dict):
             registration = ensure_registration(
                 cfg, ref, cred, frame=boot, target_guid=target_guid)
-    request["target"]["session_id"] = session_id
     refusal = _adapter_gate(registration, request)
     if refusal is not None:
         return refusal
@@ -1307,9 +1326,19 @@ def _spanning_rect(rects: list[str]) -> str:
     parsed = []
     for raw in rects:
         try:
-            parsed.append(tuple(int(p) for p in str(raw).split(",")))
+            parts = tuple(int(p) for p in str(raw).split(","))
         except (TypeError, ValueError):
             return str(rects[0]) if rects else ""
+        # A rect that parses as numbers but carries fewer than the four
+        # fields the frozen "x,y,w,h" convention requires degrades to the
+        # run's first rect rather than raising: the helper's own emitters
+        # always produce four ints or the empty string, so a short rect can
+        # only arrive from a frame the host does not trust, and an
+        # IndexError here would surface as a generic tool error instead of
+        # a usable element list.
+        if len(parts) != 4:
+            return str(rects[0]) if rects else ""
+        parsed.append(parts)
     if not parsed:
         return ""
     x = min(r[0] for r in parsed)
@@ -1530,7 +1559,15 @@ def _read_console_exclusion(ref, mode: str) -> Iterator[None]:
 
 #: The read verbs the electron adapter's enable request precedes. A mutating
 #: verb never triggers it: the enable is housekeeping for a selector read.
-_ADAPTER_READ_VERBS = frozenset({"find", "inspect", "snapshot", "wait_for"})
+#: The read verbs an electron request enables the renderer tree for. Every
+#: member must EXPOSE an ``adapter`` parameter on its public verb function
+#: -- a member that does not is unreachable dead code, because nothing can
+#: put an adapter on its request. ``uia.wait_for`` has no ``adapter``
+#: parameter and ``hyperv_ui_wait_for`` does not expose one, so it cannot
+#: be a member. ``test_adapter_read_verbs_all_expose_an_adapter`` derives
+#: the set from the live signatures so the two sides of that seam can never
+#: drift apart again.
+_ADAPTER_READ_VERBS = frozenset({"find", "inspect", "snapshot"})
 
 
 def _enable_renderer_accessibility(cfg, ref, cred: CredentialSet,
@@ -1553,6 +1590,18 @@ def _enable_renderer_accessibility(cfg, ref, cred: CredentialSet,
     """
     enable = build_request(_ENABLE_ACCESSIBILITY, args={})
     enable["adapter"] = request.get("adapter") or "electron"
+    # Carry the WINDOW SCOPE the verb is about to use, so the helper judges
+    # the window the caller actually named instead of whatever happens to be
+    # foreground. The selector's element conditions are NOT carried: this
+    # leg only asks whether a renderer tree exists.
+    scope_keys = ("hwnd", "window_title", "window_title_contains",
+                  "process_name", "scope")
+    selector = request.get("selector")
+    if isinstance(selector, dict):
+        carried = {k: selector[k] for k in scope_keys
+                   if selector.get(k) not in (None, "")}
+        if carried:
+            enable["args"] = carried
     with vm_lock(ref.id, mode="read"), _read_console_exclusion(ref, "read"):
         try:
             frame = _pipe_request(cfg, ref, cred, enable)

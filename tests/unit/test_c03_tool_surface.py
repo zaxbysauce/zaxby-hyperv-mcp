@@ -265,7 +265,7 @@ def test_ac12_tool_inventory_per_credential_mode(tmp_path, fresh_server):
         f"missing={sorted(TOOL_NAMES - set(base_schemas))}"
     )
     assert len(base_schemas) == len(TOOL_NAMES) == 85, (
-        f"AC12: tool count {len(base_schemas)} != 84 "
+        f"AC12: tool count {len(base_schemas)} != 85 "
         f"(66 through issue #24; 67 with issue #27's settle wait; "
         f"76 with issue #29's eight hyperv_ui_* tools; 80 with PR #112's "
         f"four Workstream G tools; 82 with issue #130's "

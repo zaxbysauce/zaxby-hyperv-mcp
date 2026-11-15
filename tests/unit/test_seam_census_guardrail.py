@@ -263,8 +263,13 @@ def test_observer_payload_is_base64_and_carries_iso_timestamp():
         "the observer payload must be base64 so no space can split it")
     assert "ToString('o')" in script, (
         "the launch timestamp must be ISO-8601 (no space) on the wire")
-    assert "-File', $ObserverPath, $observerArgs)" in script, (
-        "the observer must take its inputs as ONE token, not four")
+    assert "-File', ('\"' + $ObserverPath + '\"'), $observerArgs)" in script, (
+        "the observer must take its inputs as ONE token, not four, and the "
+        "-File path must be pre-quoted because -ArgumentList joins its "
+        "elements with spaces without quoting")
+    # the payload token is the LAST element, so nothing can be appended to it
+    assert "$observerArgs)" in script.rsplit("-ArgumentList @(", 1)[-1], (
+        "the base64 token must close the -ArgumentList array")
     assert "-EncodedCommand" not in script, (
         "PowerShell 5.1 refuses -EncodedCommand followed by positional args")
     # the observer decodes it

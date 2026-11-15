@@ -72,6 +72,13 @@ $PipeInstanceCount = 4
 $MaxDepth = 32
 $MaxElements = 500
 $MaxMatches = 200
+# Issue #129: the electron path collects a window's whole subtree so the
+# per-glyph runs can be merged and matched by their JOINED name. The
+# $MaxMatches cap cannot bound that COLLECTION, because a name whose
+# glyphs sit past element 200 in tree order would then be invisible -- so
+# the collection gets its own, larger bound and $MaxMatches is applied to
+# the merged, name-filtered RESULT.
+$ElectronCollectCap = 4000
 $MaxValueChars = 65536
 $MaxRequestBytes = 262144
 $RequestTimeoutMs = 30000
@@ -490,6 +497,46 @@ function New-WalkCache {
         $cache.Add($pat)
     }
     return $cache
+}
+
+function Resolve-Subtree([hashtable]$selector, $cache, [int]$cap) {
+    # Every element in the scope windows' subtrees, bounded by $cap.
+    # Unlike Resolve-Target this NEVER treats "no conditions" as "the
+    # scope window is itself the match": an electron find collects the
+    # subtree so the per-glyph runs can be merged and matched by their
+    # JOINED name, and returning the window would both miss every control
+    # and let a name that happens to equal the window title match the
+    # window itself -- so a later invoke would hit the wrong element.
+    $list = @()
+    if ($null -eq $selector) { $selector = @{} }
+    $scopeSet = Get-WindowScopeSet $selector
+    if ($scopeSet.Count -eq 0) { return $list }
+    $condResult = ConvertTo-Condition $selector
+    if ($null -ne $condResult -and -not $condResult.resolvable) { return $list }
+    $conditions = @()
+    if ($null -ne $condResult) { $conditions = @($condResult.conditions) }
+    $cond = [System.Windows.Automation.Condition]::TrueCondition
+    if ($conditions.Count -eq 1) {
+        $cond = $conditions[0]
+    } elseif ($conditions.Count -gt 1) {
+        $cond = New-Object System.Windows.Automation.AndCondition($conditions)
+    }
+    foreach ($scope in $scopeSet) {
+        $found = $null
+        $pushed = $cache.Activate()
+        try {
+            $found = $scope.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+        } finally {
+            if ($null -ne $pushed) { $pushed.Dispose() }
+        }
+        if ($null -eq $found) { continue }
+        foreach ($el in $found) {
+            if ($list.Count -ge $cap) { break }
+            $list += $el
+        }
+        if ($list.Count -ge $cap) { break }
+    }
+    return $list
 }
 
 function Resolve-Target([hashtable]$selector, $cache) {
@@ -1146,20 +1193,59 @@ function Invoke-Request([hashtable]$req) {
         if (-not $available) {
             return @{ ok = $true; result = @{ available = $false } }
         }
-        # The renderer tree is reachable only when the foreground window's
-        # subtree yields element nodes; an application that never turned its
-        # renderer accessibility on answers available:false rather than an
-        # empty match list.
+        # The renderer tree is reachable only when the target window's
+        # subtree yields CONTENT nodes. Probing for "any ControlView child"
+        # is not a signal: a Chromium top-level window always exposes its
+        # own frame, so that check answers true whether or not the renderer
+        # ever built a tree -- and an application that never turned its
+        # renderer accessibility on would then answer available:true and the
+        # caller would get an empty match list, exactly the ambiguity this
+        # refusal exists to prevent.
+        #
+        # The window scope the VERB is about to use rides on the request, so
+        # a background window is judged on its own subtree instead of on
+        # whatever happens to be foreground.
         $found = 0
         try {
-            $fg = Get-ForegroundWindow
-            if ($null -ne $fg) {
-                $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
-                $node = $walker.GetFirstChild($fg)
-                while ($null -ne $node -and $found -lt 1) {
-                    $found++
-                    $node = $walker.GetNextSibling($node)
+            $scopeSel = @{}
+            if ($null -ne $req['args'] -and $req['args'] -is [hashtable]) {
+                foreach ($k in @('hwnd', 'window_title', 'window_title_contains', 'process_name', 'scope')) {
+                    if ($null -ne $req['args'][$k]) { $scopeSel[$k] = $req['args'][$k] }
                 }
+            }
+            $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+            $contentTypes = @('Document', 'Text', 'Edit', 'Button', 'CheckBox',
+                              'RadioButton', 'ComboBox', 'List', 'Hyperlink',
+                              'Tree', 'Table', 'MenuItem', 'Slider', 'Spinner',
+                              'Tab', 'TreeItem', 'ListItem', 'DataItem')
+            foreach ($win in (Get-WindowScopeSet $scopeSel)) {
+                if ($null -eq $win) { continue }
+                $node = $walker.GetFirstChild($win)
+                $budget = 400
+                while ($null -ne $node -and $budget -gt 0) {
+                    $budget--
+                    $short = ''
+                    try {
+                        $pn = $node.Current.ControlType.ProgrammaticName
+                        if ($pn) { $short = $pn.Split('.')[-1] }
+                    } catch { }
+                    if ($short -and ($contentTypes -contains $short)) {
+                        $found++
+                        break
+                    }
+                    $child = $walker.GetFirstChild($node)
+                    if ($null -ne $child) {
+                        $node = $child
+                    } else {
+                        $node = $walker.GetNextSibling($node)
+                        while ($null -eq $node) {
+                            $parent = $walker.GetParent($node)
+                            if ($null -eq $parent) { break }
+                            $node = $walker.GetNextSibling($parent)
+                        }
+                    }
+                }
+                if ($found -gt 0) { break }
             }
         } catch { $found = 0 }
         return @{ ok = $true; result = @{ available = ($found -gt 0) } }
@@ -1298,17 +1384,25 @@ function Invoke-Request([hashtable]$req) {
                 if (-not $mergeRuns) {
                     $elements = @(Resolve-Target $selector $cache)
                 } else {
+                # Collect the scope WITHOUT the name condition, merge the
+                # runs, then match the name/name_contains predicates against
+                # the JOINED names. Resolve-Subtree (never Resolve-Target) is
+                # what collects: a name-only selector leaves the collector
+                # empty, and Resolve-Target answers that shape with the scope
+                # window itself -- so the merge would have nothing to merge
+                # and a title equal to the wanted name would match the window.
                 $collector = @{}
                 foreach ($k in @($selector.Keys)) {
                     if ($k -ne 'name' -and $k -ne 'name_contains') { $collector[$k] = $selector[$k] }
                 }
-                $elements = @(Merge-GlyphRuns (Resolve-Target $collector $cache))
+                $elements = @(Merge-GlyphRuns (Resolve-Subtree $collector $cache $ElectronCollectCap))
                 $wantName = $null
                 if ($selector.ContainsKey('name') -and $null -ne $selector['name']) { $wantName = [string]$selector['name'] }
                 $needle = $null
                 if ($selector.ContainsKey('name_contains') -and $null -ne $selector['name_contains']) { $needle = [string]$selector['name_contains'] }
                 $matched = @()
                 foreach ($el in $elements) {
+                    if ($matched.Count -ge $MaxMatches) { break }
                     $nm = Get-ElementName $el
                     if ($null -eq $nm) { continue }
                     if ($null -ne $wantName -and $nm -ne $wantName) { continue }
@@ -1878,7 +1972,8 @@ $functionNames = @(
     'Read-HelperFile', 'Get-OwnIdentity', 'Get-LiveUuid', 'Test-OwnsInputDesktop',
     'Get-LockState', 'Get-ForegroundWindow', 'New-PipeSecurity', 'New-SecurityAttributes',
     'Free-SecurityAttributes', 'New-PipeInstance', 'ConvertTo-HashtableDeep',
-    'Get-ElementProcessName', 'ConvertTo-Condition', 'Resolve-Target',
+    'Get-ElementProcessName', 'ConvertTo-Condition', 'Resolve-Subtree',
+    'Resolve-Target',
     'Get-WindowScopeSet', 'New-WalkCache', 'Get-ElementIdScopeSelector',
     'Enter-Snapshot', 'Resolve-Ref', 'Get-HelperCapabilities',
     'Select-One', 'Get-ElementResult', 'Walk-Tree', 'Invoke-Pattern', 'Invoke-Request',
@@ -1913,6 +2008,7 @@ $sessionVariables = @{
     MaxDepth = $MaxDepth
     MaxElements = $MaxElements
     MaxMatches = $MaxMatches
+    ElectronCollectCap = $ElectronCollectCap
     MaxValueChars = $MaxValueChars
     MaxRequestBytes = $MaxRequestBytes
     RequestTimeoutMs = $RequestTimeoutMs

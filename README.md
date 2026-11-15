@@ -1920,7 +1920,7 @@ newest.
   retryable, retry_after_ms}` where `error_class` is one of `timeout | transport |
   policy | credential | busy | invalid | parse | integrity | not_found |
   guest | lease_conflict | lease_required | lease_unknown | lease_expired |
-  fenced | lease_not_owned`. `lease_conflict` is retryable with
+  fenced | lease_not_owned`. (the enumeration is not exhaustive: module-level diagnostics carry their own `error_class`, documented in each tool's section) `lease_conflict` is retryable with
   `retry_after_ms` = milliseconds to the holder's expiry; the other lease
   classes are not retryable. Every registered tool returns this envelope on failure (0.4.0
   documented breaking change: host-side tools no longer raise through the
@@ -1975,7 +1975,7 @@ What the pool does and does not touch:
 
 | | |
 |---|---|
-| **Pooled** | `hyperv_guest_run`, `hyperv_guest_run_ps`, `hyperv_victim_run`, `hyperv_victim_run_ps`, `hyperv_guest_read_file`, `hyperv_guest_list_dir`, the diagnose/repair/evidence guest legs, and every guest-job leg including `hyperv_guest_job_start` (they share `diagnostics.run_guest_inner`) |
+| **Pooled** | `hyperv_guest_run`, `hyperv_guest_run_ps`, `hyperv_victim_run`, `hyperv_victim_run_ps`, `hyperv_guest_read_file`, `hyperv_guest_list_dir`, the diagnose/repair/evidence guest legs, every guest-job leg including `hyperv_guest_job_start`, and `hyperv_guest_start_interactive` (they share `diagnostics.run_guest_inner`; the interactive launch consumes TWO pooled legs per call, its launch leg and its cleanup leg) |
 | **Not pooled (yet)** | `hyperv_guest_put` and `hyperv_guest_get`. A transfer rides `Copy-Item -ToSession`, which needs the session object in the guest scriptblock's own scope; routing that through a pooled worker needs a second worker mode this change does not add. They keep the per-call path. |
 | **Not pooled, by design** | `hyperv_wait_guest_recovery` (it exists to detect a guest coming back, so it must open fresh sessions and observe a real failure) and the relay's per-request legs (they deliberately skip `vm_lock`) |
 | **Never pooled** | remote Hyper-V host mode (`hyperv.host`, issue #43) — a pooled worker would have to be spawned on the remote host through a second transport this does not add. Remote mode takes the per-call path unchanged |
