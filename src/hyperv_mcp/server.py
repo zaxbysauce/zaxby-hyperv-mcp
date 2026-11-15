@@ -5513,8 +5513,20 @@ def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]
                     row_vm = guestjobs.peek_vm_id(
                         arguments.get("job_id") or "", cfg, owner=agent)
                 else:
-                    row_vm = relay.peek_vm_id(
-                        arguments.get("relay_id") or "", cfg, owner=agent)
+                    # The relay's VM, resolved with the SAME rule the CDP body
+                    # uses (`relay.lookup_entry`, which applies no ownership
+                    # filter) rather than the owner-filtered `peek_vm_id`. The
+                    # filtered read returns "" for a relay owned by another
+                    # principal, and `matches_hint` treats an empty hint as
+                    # "any VM" — so a lease on VM-A would authorize a call into
+                    # VM-B whenever the caller is unattributed. Using the
+                    # body's rule makes the gate agree with what the body will
+                    # actually address; a relay the body would refuse yields
+                    # no hint and the body refuses it anyway.
+                    entry = relay.lookup_entry(
+                        arguments.get("relay_id") or "")
+                    row_vm = (str(entry.get("vm_id") or "")
+                              if entry is not None else "")
                 vm_hint = row_vm or ""
             leases.authorize(cfg, lease_id, token, agent, scope,
                              vm_hint=vm_hint, vm_name_hint=vm_name_hint)

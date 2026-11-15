@@ -572,17 +572,20 @@ _TEST_PROFILE_RECORD_PATH = _TEST_PROFILE_DIR + "\\" + _TEST_PROFILE_RECORD
 TEST_PROFILE_SETTINGS: dict[str, dict[str, str]] = {
     "no_display_timeout": {
         "kind": "powercfg", "sub": "SUB_VIDEO", "alias": "VIDEOIDLE",
+        "after": "[PSCustomObject]@{ ac = '0'; dc = '0' }",
         "change": ("powercfg /change monitor-timeout-ac 0" + _NL
                    + "powercfg /change monitor-timeout-dc 0"),
     },
     "no_sleep": {
         "kind": "powercfg", "sub": "SUB_SLEEP", "alias": "STANDBYIDLE",
+        "after": "[PSCustomObject]@{ ac = '0'; dc = '0'; hibernate = 'off' }",
         "change": ("powercfg /change standby-timeout-ac 0" + _NL
                    + "powercfg /change standby-timeout-dc 0" + _NL
                    + "powercfg /h off"),
     },
     "no_lock_on_resume": {
         "kind": "powercfg", "sub": "SUB_NONE", "alias": "CONSOLELOCK",
+        "after": "[PSCustomObject]@{ ac = '0'; dc = '0' }",
         "change": ("powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE "
                    "CONSOLELOCK 0" + _NL
                    + "powercfg /setdcvalueindex SCHEME_CURRENT SUB_NONE "
@@ -592,6 +595,7 @@ TEST_PROFILE_SETTINGS: dict[str, dict[str, str]] = {
         "kind": "registry",
         "path": (r"HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"),
         "name": "NoAutoUpdate",
+        "after": "1",
         "type": "DWord",
         "change": (
             "if (-not (Test-Path -LiteralPath $auPath)) {    New-Item -Path $auPath -Force | Out-Null}Set-ItemProperty -Path $auPath -Name NoAutoUpdate -Value 1 "
@@ -601,6 +605,7 @@ TEST_PROFILE_SETTINGS: dict[str, dict[str, str]] = {
         "kind": "registry",
         "path": (r"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"),
         "name": "InactivityTimeoutSecs",
+        "after": "0",
         "type": "DWord",
         "change": (
             "Set-ItemProperty -Path $lockPath -Name InactivityTimeoutSecs "
@@ -610,6 +615,7 @@ TEST_PROFILE_SETTINGS: dict[str, dict[str, str]] = {
         "kind": "registry",
         "path": r"HKCU:\Control Panel\Desktop",
         "name": "ScreenSaveActive",
+        "after": "'0'",
         "type": "String",
         "change": (
             "Set-ItemProperty -Path $ssPath -Name ScreenSaveActive -Value '0' "
@@ -619,6 +625,7 @@ TEST_PROFILE_SETTINGS: dict[str, dict[str, str]] = {
         "kind": "registry",
         "path": (r"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"),
         "name": "PromptOnSecureDesktop",
+        "after": "0",
         "type": "DWord",
         "change": (
             "Set-ItemProperty -Path $uacPath -Name PromptOnSecureDesktop "
@@ -744,8 +751,12 @@ def _test_profile_setting_script(setting: str) -> str:
         "    Save-HypervMcpRestoreRecord $recordPath $rec",
         "}",
         spec["change"],
+        # before/after are the issue's claim 4.4: the result must carry, per
+        # setting, what the guest held, what the profile set, and whether it
+        # landed. The leg is the only honest source for both.
         "[PSCustomObject]@{ ok = $true; setting = "
-        + pswindows.ps_quote(setting) + " } | ConvertTo-Json -Compress",
+        + pswindows.ps_quote(setting) + "; before = $before; after = "
+        + spec["after"] + " } | ConvertTo-Json -Compress",
     ])
 
 
@@ -758,9 +769,13 @@ def _profile_read_block(setting: str) -> str:
         # the reader block-parses for. Passing the alias in the subgroup slot
         # (the earlier shape) made powercfg reject the command or return the
         # wrong block, so all three powercfg settings were unusable.
+        # TWO arguments, matching the reader's two parameters: the subgroup
+        # and the setting's alias. Passing the scheme as a third argument
+        # (an earlier shape of this line) left the reader bound to
+        # $subGuid='SCHEME_CURRENT' and $alias='<subgroup>', so it queried
+        # SCHEME_CURRENT as a subgroup and never matched the setting at all.
         read_cmd = (
             "$pair = Get-HypervMcpPowerIndices "
-            + pswindows.ps_quote("SCHEME_CURRENT") + " "
             + pswindows.ps_quote(spec["sub"]) + " "
             + pswindows.ps_quote(spec["alias"])
         )
@@ -768,6 +783,9 @@ def _profile_read_block(setting: str) -> str:
             read_cmd,
             "$entry = [PSCustomObject]@{ kind = 'powercfg'; ac = $pair[0]; "
             "dc = $pair[1] }",
+            # $before is what the leg reports back to the host (issue #138
+            # claim 4.4: the result carries before/after/applied per setting).
+            "$before = [PSCustomObject]@{ ac = $pair[0]; dc = $pair[1] }",
         ]
         if setting == "no_sleep":
             # The profile disables hibernation, so the prior state has to be
@@ -776,6 +794,8 @@ def _profile_read_block(setting: str) -> str:
                 "$hibOn = [bool](@(powercfg /a 2>$null) | "
                 "Where-Object { $_ -match 'Hibernate' })",
                 "$entry | Add-Member -NotePropertyName hibernate -NotePropertyValue "
+                "$(if ($hibOn) { 'on' } else { 'off' }) -Force",
+                "$before | Add-Member -NotePropertyName hibernate -NotePropertyValue "
                 "$(if ($hibOn) { 'on' } else { 'off' }) -Force",
             ]
         return _NL.join(lines)
@@ -791,6 +811,7 @@ def _profile_read_block(setting: str) -> str:
         + " -Name " + name + " -ErrorAction SilentlyContinue)." + name,
         "}",
         "$entry = [PSCustomObject]@{ kind = 'registry'; value = $prev }",
+        "$before = $prev",
     ])
 
 
@@ -2774,7 +2795,12 @@ def provision_helper(cfg, vm_name="", cred: CredentialSet | None = None,
             # profile. A setting that fails leaves the guest half-configured,
             # so the call reports ok:false with the per-setting detail rather
             # than pretending the profile landed.
-            applied: list[str] = []
+            # Issue #138 claim 4.4: the result carries, per setting, `before`,
+            # `after` and `applied`, plus `reboot_required`. The leg is the
+            # only honest source for `before`/`after` (it read the original
+            # and set the new value), so the host records what the leg
+            # reported rather than reconstructing it.
+            applied: dict[str, dict] = {}
             failed: list[str] = []
             for setting in settings:
                 try:
@@ -2792,10 +2818,22 @@ def provision_helper(cfg, vm_name="", cred: CredentialSet | None = None,
                     results["test_profile_error"] = str(exc)[:300]
                     continue
                 if frame.get("ok"):
-                    applied.append(setting)
+                    applied[setting] = {
+                        "before": frame.get("before"),
+                        "after": frame.get("after"),
+                        "applied": True,
+                    }
                 else:
                     failed.append(setting)
+                    applied[setting] = {"before": frame.get("before"),
+                                        "after": None, "applied": False}
             results["test_profile"] = applied
+            if applied:
+                # The profile's settings are read at logon (the screen saver,
+                # UAC's secure desktop and the lock timeouts), so the guest
+                # must be rebooted — or at least logged off and back on —
+                # before the new state is what a session actually sees.
+                results["reboot_required"] = True
             if failed:
                 return {**results, "ok": False,
                         "error_class": "test_profile_failed",

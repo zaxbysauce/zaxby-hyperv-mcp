@@ -173,17 +173,20 @@ def _ws_send(sock: Any, obj: Any) -> None:
     sock.sendall(header + mask + masked)
 
 
-def _frame_header(opcode: int, payload: bytes) -> bytes:
-    """An UNMASKED server-to-client frame header (RFC 6455 section 5)."""
+def _masked_frame(opcode: int, payload: bytes) -> bytes:
+    """One MASKED client-to-server frame (RFC 6455 section 5: a client MUST
+    mask). Used for the pong reply, which this code sends as a client."""
+    mask = os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
     n = len(payload)
     head = bytes([0x80 | opcode])
     if n < 126:
-        head += bytes([n])
+        head += bytes([0x80 | n])
     elif n < 65536:
-        head += bytes([126]) + n.to_bytes(2, "big")
+        head += bytes([0x80 | 126]) + n.to_bytes(2, "big")
     else:
-        head += bytes([127]) + n.to_bytes(8, "big")
-    return head
+        head += bytes([0x80 | 127]) + n.to_bytes(8, "big")
+    return head + mask + masked
 
 
 def _ws_recv(reader: _SockReader, sock: Any, want_id: Any,
@@ -192,12 +195,18 @@ def _ws_recv(reader: _SockReader, sock: Any, want_id: Any,
 
     A close frame, an over-long frame or the deadline raises: a CDP session
     that cannot answer is a transport failure, never an empty result.
-    Continuation frames are accumulated (RFC 6455 permits fragmentation) and
-    control frames are answered through the same length encoder the request
-    path uses, so an oversized ping cannot desync the stream.
+    A fragmented message is reassembled on the FIN bit (RFC 6455 section 5.4)
+    rather than on "did the JSON parse", so a reply split across frames is not
+    discarded. The pong reply is MASKED, because this code is the WebSocket
+    client. Control frames are capped at 125 bytes, so an oversized ping cannot
+    desync the stream.
     """
     deadline = time.monotonic() + timeout
-    fragments: list[bytes] = []
+    # A message may arrive as several frames (RFC 6455 section 5.4): the FIN
+    # bit marks the last one. Accumulating on "did the JSON parse" instead
+    # discarded the first fragment of every fragmented reply, because
+    # incomplete JSON never parses -- so the awaited answer never arrived.
+    message: list[bytes] = []
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -207,6 +216,7 @@ def _ws_recv(reader: _SockReader, sock: Any, want_id: Any,
         if hdr is None:
             raise ConnectionError("the DevTools endpoint closed mid-frame")
         opcode = hdr[0] & 0x0F
+        fin = bool(hdr[0] & 0x80)
         masked = bool(hdr[1] & 0x80)
         length = hdr[1] & 0x7F
         if length == 126:
@@ -237,21 +247,30 @@ def _ws_recv(reader: _SockReader, sock: Any, want_id: Any,
                 # that sends more is misbehaving, and echoing it with the
                 # single-byte length form would corrupt the stream.
                 if len(payload) <= 125:
-                    sock.sendall(_frame_header(0xA, payload) + payload)
+                    sock.sendall(_masked_frame(0xA, payload))
             except Exception:
                 pass
             continue
         if opcode == 0x0:
-            fragments.append(payload)
-            continue
-        if opcode not in (0x1, 0x2):
+            message.append(payload)
+            if fin:
+                payload = b"".join(message)
+                message = []
+            else:
+                continue
+        elif opcode in (0x1, 0x2):
+            if fin:
+                payload = b"".join(message + [payload])
+                message = []
+            else:
+                message.append(payload)
+                continue
+        else:
             continue
         try:
-            msg = json.loads(b"".join(fragments + [payload]).decode("utf-8"))
+            msg = json.loads(payload.decode("utf-8"))
         except ValueError:
-            fragments = []
             continue
-        fragments = []
         if isinstance(msg, dict) and msg.get("id") == want_id:
             return msg
         # A response to another id (or a notification) is dropped: the client

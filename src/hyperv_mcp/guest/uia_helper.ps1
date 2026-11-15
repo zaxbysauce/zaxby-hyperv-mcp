@@ -1856,14 +1856,19 @@ $StreamServeOne = {
     $guest = $null
     try {
         $stream = New-Object System.Net.Sockets.NetworkStream($client, $true)
-        # A host that dials the socket and then dies before writing its header
-        # must not park this connection forever: bound both the header's length
-        # (the host caps its own line reads at 4096) and the wait for it.
+        # A host that dials the socket and then stalls must not park this
+        # connection forever: bound the header's length (the host caps its own
+        # line reads at 4096) AND the TOTAL time the header may take. A
+        # per-read ReceiveTimeout alone bounds each read, not the header — a
+        # peer sending one byte just under every timeout could hold the
+        # runspace for hours.
         $client.ReceiveTimeout = 30000
+        $headerDeadline = [DateTime]::UtcNow.AddSeconds(30)
         # 1) the relay's one-line header, read byte by byte: it is short, and
         #    unbounded framing would risk reading into the client's payload
         $ms = New-Object System.IO.MemoryStream
         while ($ms.Length -lt 4096) {
+            if ([DateTime]::UtcNow -gt $headerDeadline) { return }
             $b = $stream.ReadByte()
             if ($b -lt 0) { return }
             if ($b -eq 10) { break }

@@ -469,3 +469,41 @@ def test_record_write_is_atomic_and_reapply_keeps_the_original(legs):
     assert "failed.count" in teardown, (
         "AC43: the record must be retained (and the failure reported) when "
         "any restore failed")
+
+
+# ---------------------------------------------------------------------------
+# AC49 — the result carries before/after/applied per setting
+# ---------------------------------------------------------------------------
+
+
+def test_profile_result_carries_before_after_applied(legs):
+    """AC49 (review round): issue #138 claim 4.4 requires the result to carry,
+    for each selected setting, `before`, `after` and `applied`, plus
+    `reboot_required`. The leg is the only honest source for before/after, so
+    the host must record what the leg reported — a names-only list loses the
+    evidence the live-host leg is required to hold.
+
+    The LegRecorder serves a frame whose before/after the check asserts on, so
+    a payload that drops either key turns this red.
+    """
+    rec, _ps = legs
+    cfg = Config(unrestricted=True)
+    out = uia.provision_helper(cfg, "p138-vm", CRED, autologon=True,
+                               confirm=True, test_profile=["no_sleep"])
+    assert out.get("ok") is True, f"AC49: {json.dumps(out, default=str)[:300]}"
+    profile = out.get("test_profile")
+    assert isinstance(profile, dict), (
+        f"AC49: test_profile must map each setting to its evidence; got "
+        f"{profile!r}")
+    entry = profile.get("no_sleep")
+    assert isinstance(entry, dict), (
+        f"AC49: every selected setting must carry an entry; got {profile!r}")
+    assert entry.get("applied") is True, (
+        f"AC49: the applied setting must report applied; got {entry!r}")
+    assert "before" in entry, (
+        f"AC49: the entry must carry the guest's original value; got {entry!r}")
+    assert "after" in entry, (
+        f"AC49: the entry must carry the value the profile set; got {entry!r}")
+    assert out.get("reboot_required") is True, (
+        "AC49: an applied profile must report that the guest needs a reboot "
+        "before the new state is what a session sees")
