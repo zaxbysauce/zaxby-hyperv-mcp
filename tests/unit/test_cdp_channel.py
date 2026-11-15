@@ -409,6 +409,35 @@ def _http_response(status: int, reason: str, body: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 
 
+class _ServingPS:
+    """Serves the by-name and by-id resolution legs; every other leg is
+    answered benignly. The lease-gate check needs no PowerShell in its path."""
+
+    def __call__(self, script, **kwargs):
+        if ("Msvm_ComputerSystem" in script
+                and script.rstrip().endswith("$vmTarget")):
+            return pswindows.PSResult(stdout="test-vm", returncode=0)
+        if "Get-VM -Id $vmTarget" in script and script.rstrip().endswith(
+                "$vm.Name"):
+            return pswindows.PSResult(stdout="test-vm", returncode=0)
+        return pswindows.PSResult(stdout="", returncode=0)
+
+
+
+# A stable GUID for "some other VM" the lease is taken on.
+_OTHER_GUID = "11111111-2222-3333-4444-555555555555"
+
+
+def _relay_cfg_required() -> Config:
+    """A config whose lease axis is required, for the lease-gate checks."""
+    return Config.from_dict({
+        "allowed_vm_patterns": ["test-*"],
+        "destructive": {"relay": True},
+        "leases": {"required": True},
+    })
+
+
+
 CDP_CONFIG = {
     "allowed_vm_patterns": ["test-*"],
     "destructive": {"relay": True},
@@ -900,3 +929,62 @@ def test_eval_cap_counts_utf8_bytes(cdp_stack):
         f"{len(returned.encode('utf-8'))} bytes")
     assert 0 < len(returned) < 600 * 1024, (
         "AC38: the over-cap value must come back shortened")
+
+
+# ---------------------------------------------------------------------------
+# AC46 — the lease gate binds a presented lease to the relay's VM
+# ---------------------------------------------------------------------------
+
+
+def test_lease_gate_binds_the_presented_lease_to_the_relay_vm(
+        cdp_stack, monkeypatch, tmp_path):
+    """AC46 (review round): a presented lease is authorized against the VM the
+    relay addresses, not against any VM.
+
+    `hyperv_cdp_eval` / `hyperv_cdp_input` carry no vm_name/vm_id argument, so
+    the gate's hints would otherwise be empty and `matches_hint` would accept a
+    lease on ANY VM — the mutual exclusion issue #23 exists to provide would
+    not cover the two tools that run guest code and dispatch real input.
+    """
+    import importlib
+
+    import hyperv_mcp.server as server_module
+    from hyperv_mcp import leases
+
+    # a lease on a DIFFERENT VM must be refused by the CDP gate
+    # agent=None on BOTH sides: the lease is taken by the same unattributed
+    # principal the gate will see, so the ONLY difference is the VM. Taking it
+    # under a named agent made the check pass on the agent mismatch and never
+    # exercised the VM binding it exists to pin.
+    other_vm = leases.acquire(_relay_cfg_required(), _OTHER_GUID,
+                              ["guest_exec"], None)
+    other = {"lease_id": other_vm[0].lease_id,
+             "fencing_token": other_vm[0].fencing_token}
+    try:
+        cfg_path = tmp_path / "lease.json"
+        cfg_path.write_text(json.dumps({
+            "allowed_vm_patterns": ["test-*"],
+            "destructive": {"relay": True},
+            "leases": {"required": True},
+        }), encoding="utf-8")
+        mod = importlib.reload(server_module)
+        mod.bootstrap({"HYPERV_MCP_CONFIG": str(cfg_path)})
+        monkeypatch.setattr(pswindows, "run_ps", _ServingPS())
+        env = _refuse_tool(mod, "hyperv_cdp_eval",
+                           {"relay_id": cdp_stack.out["relay_id"],
+                            "target_id": "page-1", "expression": "1",
+                            "lease_id": other["lease_id"],
+                            "fencing_token": other["fencing_token"]})
+        assert env.get("ok") is False, (
+            f"AC46: a lease on another VM must not authorize a CDP call; got "
+            f"{json.dumps(env)[:200]}")
+        text = json.dumps(env).lower()
+        assert "lease" in text, (
+            f"AC46: the refusal must name the lease; got {text[:200]}")
+    finally:
+        try:
+            leases.release(_relay_cfg_required(), other["lease_id"],
+                           other["fencing_token"], None)
+        except Exception:
+            pass
+        importlib.reload(server_module)

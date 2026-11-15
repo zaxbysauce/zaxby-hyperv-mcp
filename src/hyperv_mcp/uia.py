@@ -571,18 +571,18 @@ _TEST_PROFILE_RECORD_PATH = _TEST_PROFILE_DIR + "\\" + _TEST_PROFILE_RECORD
 #: value the guest never held).
 TEST_PROFILE_SETTINGS: dict[str, dict[str, str]] = {
     "no_display_timeout": {
-        "kind": "powercfg", "alias": "VIDEOIDLE",
+        "kind": "powercfg", "sub": "SUB_VIDEO", "alias": "VIDEOIDLE",
         "change": ("powercfg /change monitor-timeout-ac 0" + _NL
                    + "powercfg /change monitor-timeout-dc 0"),
     },
     "no_sleep": {
-        "kind": "powercfg", "alias": "STANDBYIDLE",
+        "kind": "powercfg", "sub": "SUB_SLEEP", "alias": "STANDBYIDLE",
         "change": ("powercfg /change standby-timeout-ac 0" + _NL
                    + "powercfg /change standby-timeout-dc 0" + _NL
                    + "powercfg /h off"),
     },
     "no_lock_on_resume": {
-        "kind": "powercfg", "alias": "CONSOLELOCK",
+        "kind": "powercfg", "sub": "SUB_NONE", "alias": "CONSOLELOCK",
         "change": ("powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE "
                    "CONSOLELOCK 0" + _NL
                    + "powercfg /setdcvalueindex SCHEME_CURRENT SUB_NONE "
@@ -754,9 +754,18 @@ def _profile_read_block(setting: str) -> str:
     `$entry`, and THROWS when the current value cannot be determined."""
     spec = TEST_PROFILE_SETTINGS[setting]
     if spec["kind"] == "powercfg":
+        # /query's second argument is the SUBGROUP; the setting's alias is what
+        # the reader block-parses for. Passing the alias in the subgroup slot
+        # (the earlier shape) made powercfg reject the command or return the
+        # wrong block, so all three powercfg settings were unusable.
+        read_cmd = (
+            "$pair = Get-HypervMcpPowerIndices "
+            + pswindows.ps_quote("SCHEME_CURRENT") + " "
+            + pswindows.ps_quote(spec["sub"]) + " "
+            + pswindows.ps_quote(spec["alias"])
+        )
         lines = [
-            "$pair = Get-HypervMcpPowerIndices " + pswindows.ps_quote(
-                "SCHEME_CURRENT") + " " + pswindows.ps_quote(spec["alias"]),
+            read_cmd,
             "$entry = [PSCustomObject]@{ kind = 'powercfg'; ac = $pair[0]; "
             "dc = $pair[1] }",
         ]
@@ -2559,10 +2568,22 @@ def _teardown_helper(cfg, ref, cred: CredentialSet) -> dict:
         # FAILED is reported: the helper itself is gone, but the guest is still
         # carrying a profile setting, and the caller must be able to see that
         # (the record is retained for a retry).
-        leg = _frame_leg(cfg, ref, cred, _TEST_PROFILE_RESTORE_INNER,
-                         pswindows.utf8_b64("profile-restore"),
-                         timeout_ms=60000)
-        frame = _provision_leg_frame(leg)
+        try:
+            leg = _frame_leg(cfg, ref, cred, _TEST_PROFILE_RESTORE_INNER,
+                             pswindows.utf8_b64("profile-restore"),
+                             timeout_ms=60000)
+            frame = _provision_leg_frame(leg)
+        except Exception as exc:
+            # A leg that RAISES after the task is unregistered and the LSA
+            # secret deleted is still a restore that did not complete: the
+            # caller must see it as one, with the record retained, rather than
+            # a raw transport error that says nothing about the profile.
+            out["profile_restored"] = False
+            out["unrestored_settings"] = []
+            return {"ok": False, "error_class": "profile_restore_failed",
+                    "error": (f"the profile-restore leg failed: {str(exc)[:300]} "
+                              "(the restore record was retained for a retry)"),
+                    **{k: v for k, v in out.items() if k != "ok"}}
         # `profile_restored` is ABSENT only on a leg that never ran the
         # generated script (a stubbed transport); the script itself always
         # emits it, so an absent key is read as "no failure reported" while a
@@ -2756,10 +2777,20 @@ def provision_helper(cfg, vm_name="", cred: CredentialSet | None = None,
             applied: list[str] = []
             failed: list[str] = []
             for setting in settings:
-                leg = _frame_leg(
-                    cfg, ref, cred, _test_profile_setting_script(setting),
-                    pswindows.utf8_b64("profile"), timeout_ms=60000)
-                frame = _provision_leg_frame(leg)
+                try:
+                    leg = _frame_leg(
+                        cfg, ref, cred, _test_profile_setting_script(setting),
+                        pswindows.utf8_b64("profile"), timeout_ms=60000)
+                    frame = _provision_leg_frame(leg)
+                except Exception as exc:
+                    # A leg that RAISES (transport failure, PS pool busy) is a
+                    # failed setting like any other: letting it escape abandons
+                    # the remaining settings AND the applied/failed accounting,
+                    # so the caller sees a raw transport envelope with no record
+                    # of which settings landed.
+                    failed.append(setting)
+                    results["test_profile_error"] = str(exc)[:300]
+                    continue
                 if frame.get("ok"):
                     applied.append(setting)
                 else:

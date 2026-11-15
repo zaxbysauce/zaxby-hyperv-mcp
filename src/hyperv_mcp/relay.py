@@ -251,6 +251,13 @@ def _restored_entry(cfg: Config, row: statestore.RelayRow,
         "guest_port": row.guest_port,
         "bind": row.bind,
         "host_port": row.host_port,
+        # Issue #135: the store row carries no `kind` (the RelayRow schema is
+        # unchanged, so a 0.20.0 server still reads a 0.21.0 row), so a
+        # restored relay is reported as the only kind that existed before this
+        # issue. The consequence is fail-closed and disclosed: the CDP tools
+        # refuse a restored tcp relay rather than dial a kind they cannot
+        # confirm, and `relay_start` must be re-run after a restart.
+        "kind": "http",
         "server": None,
         "thread": _DeadThread(),
         "context": context,
@@ -880,10 +887,14 @@ class _TcpBridge:
     # -- lifecycle ---------------------------------------------------------------
 
     def start(self) -> None:
+        # Registered BEFORE the thread starts: `_run` can fail and reach its
+        # finally before the append lands, and close()'s self-removal would
+        # then have already run — leaving a dead bridge in the list that no
+        # later close() (all early-return on `_closed`) ever removes.
+        self._entry["bridges"].append(self)
         thread = threading.Thread(target=self._run, daemon=True,
                                   name=f"hyperv-tcp-bridge-{id(self):x}")
         thread.start()
-        self._entry["bridges"].append(self)
 
     def close(self) -> None:
         """Close both ends. Idempotent; never raises.
@@ -937,6 +948,14 @@ class _TcpBridge:
                 # close the client and forward nothing.
                 return
             established = True
+            # Back to BLOCKING for the pump. `_read_line` leaves the guest
+            # socket at whatever sub-second timeout its byte-at-a-time loop
+            # last set, and `_pump`'s recv would inherit it — so any half-second
+            # of guest-side silence (an idle DevTools WebSocket between user
+            # interactions) tore the bridge down, contradicting this kind's
+            # documented "no idle timeout". The bridge is closed by relay_stop
+            # or by either peer, not by a read deadline.
+            self._guest.settimeout(None)
             self._pump()
         except Exception:
             # No fallback transport inside a tcp relay (#135 Design 7): when
@@ -1023,16 +1042,31 @@ class _TcpRelayServer:
             except TimeoutError:
                 continue
             except OSError:
-                break
+                # A closed listener is the only fatal case. A TRANSIENT error
+                # (temporary handle exhaustion under a connection flood) must
+                # not retire the accept thread while the relay stays `active`
+                # in the registry — clients would then queue in the backlog
+                # forever, detectable only by inspecting thread_alive.
+                if self._stop.is_set() or self._sock.fileno() < 0:
+                    break
+                time.sleep(0.05)
+                continue
             self._accepts += 1
             ctx = self._entry.get("context")
             if ctx is not None:
                 with ctx["counter_lock"]:
                     ctx["counters"]["requests"] += 1
-            bridge = _TcpBridge(
-                self._entry["context"]["cfg"], self._entry["vm_id"],
-                self._entry["guest_port"], conn, self._entry)
-            bridge.start()
+            try:
+                bridge = _TcpBridge(
+                    self._entry["context"]["cfg"], self._entry["vm_id"],
+                    self._entry["guest_port"], conn, self._entry)
+                bridge.start()
+            except BaseException:
+                # The accepted socket belongs to nobody if the bridge never
+                # took it: close it rather than leaking one fd per failed
+                # start.
+                _drain_and_close(conn)
+                raise
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -1059,10 +1093,17 @@ def _require_stream_capability(cfg: Config, vm_name: str, vm_id: str,
 
     A helper installed before issue #135 has no forwarder, so the caller must
     learn what to do rather than see a connect timeout.
+
+    `vm_name` is accepted for the caller's message and deliberately NOT
+    forwarded: `uia.helper_capabilities` refuses a call carrying both a name
+    and an id, and `relay_start` has already resolved the VM, so forwarding
+    both made every production tcp start die on that guard while every unit
+    check (which monkeypatches the seam) stayed green. The id alone resolves
+    the same VM.
     """
     from . import uia
 
-    caps = uia.helper_capabilities(cfg, vm_name, cred=cred, vm_id=vm_id)
+    caps = uia.helper_capabilities(cfg, cred=cred, vm_id=vm_id)
     if _STREAM_CAPABILITY not in set(caps or ()):
         # StreamUnavailable subclasses ValueError, so the module-level callers
         # (and the frozen AC9 check) keep catching ValueError — while the tool

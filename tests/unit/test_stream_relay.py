@@ -73,6 +73,18 @@ from hyperv_mcp.policy import PolicyDenied
 
 CRED = CredentialSet("Administrator", "placeholder-pass")
 
+
+_GUID = "e953c649-1234-5678-9abc-def012345678"
+
+
+def _relay_cfg_required():
+    """A config whose lease axis is required, for the lease-gate checks."""
+    return Config.from_dict({
+        "allowed_vm_patterns": ["test-*"],
+        "destructive": {"relay": True},
+        "leases": {"required": True},
+    })
+
 VM_GUID_HEX = "e953c649-1234-5678-9abc-def012345678"
 SVC_GUID_HEX = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
 
@@ -86,6 +98,17 @@ _NAME_RE = re.compile(r"ElementName -eq '([^']*)'")
 def _is_resolution_leg(script: str) -> bool:
     """A standalone by-name resolution leg emits $vmTarget as its last line."""
     return "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget")
+
+
+def _is_by_id_leg(script: str) -> bool:
+    """The by-id counterpart: `Get-VM -Id $vmTarget` emitting the VM name.
+
+    `relay_start(kind="tcp")` consults the capability seam with the resolved
+    id alone, and that seam re-resolves by id — so the by-id leg must be
+    served too, or every tcp start dies on "resolved to an empty name".
+    """
+    return "Get-VM -Id $vmTarget" in script and script.rstrip().endswith(
+        "$vm.Name")
 
 
 def _resolved_guid(script: str) -> str:
@@ -108,6 +131,8 @@ class FakePS:
         self.scripts.append(script)
         if _is_resolution_leg(script):
             return pswindows.PSResult(stdout=_resolved_guid(script), returncode=0)
+        if _is_by_id_leg(script):
+            return pswindows.PSResult(stdout="test-vm", returncode=0)
         if self._r:
             item = self._r.pop(0)
             if isinstance(item, Exception):
@@ -1184,3 +1209,89 @@ def test_completed_bridge_is_not_an_error(monkeypatch):
             relay.relay_stop(_relay_cfg(), out["relay_id"])
     finally:
         guest.close()
+
+
+# ---------------------------------------------------------------------------
+# AC44 — a tcp start reaches the capability seam with ONE identity
+# ---------------------------------------------------------------------------
+
+
+def test_tcp_start_reaches_the_capability_seam_with_one_identity(monkeypatch):
+    """AC44 (review round): `relay_start(kind="tcp")` must consult the
+    capability seam with an identity `uia.helper_capabilities` accepts.
+
+    The shipped bug this pins: the start forwarded BOTH the resolved name and
+    the resolved id, and `helper_capabilities` refuses a call carrying both —
+    so every production tcp start died on that guard while every unit check
+    stayed green, because each of them monkeypatches the seam itself. The
+    probe therefore patches the DISCOVERY leg (`uia._install_facts`), not the
+    capability function, and lets the real path run.
+    """
+    from hyperv_mcp import hvsock, relay, uia  # RED at base
+
+    seen: dict = {}
+
+    def fake_facts(cfg, ref, cred):
+        seen["vm_name"] = ref.name
+        seen["vm_id"] = ref.id
+        return {"dir": "C:\\ProgramData\\hyperv-mcp\\uia-helper-x",
+                "uuid": "", "nonce": "", "version": "1",
+                "capabilities": ["uia", "msaa", "stream"]}
+
+    monkeypatch.setattr(uia, "_install_facts", fake_facts)
+    monkeypatch.setattr(hvsock, "connect",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("AC44: a guest stream opened")))
+    monkeypatch.setattr(pswindows, "run_ps", FakePS())
+    out = relay.relay_start(_relay_cfg(), "test-vm", 9222, kind="tcp",
+                            cred=CRED)
+    try:
+        assert out.get("ok") is True, (
+            f"AC44: the tcp start must reach the listener with a resolvable "
+            f"identity; got {out}")
+        assert seen.get("vm_id"), "AC44: the discovery leg never ran"
+    finally:
+        relay.relay_stop(_relay_cfg(), out["relay_id"])
+
+
+# ---------------------------------------------------------------------------
+# AC45 — the discovery leg's capability record reaches the host
+# ---------------------------------------------------------------------------
+
+
+def test_discovery_carries_capabilities_to_the_host(monkeypatch):
+    """AC45 (review round): the capability set the guest records reaches
+    `helper_capabilities`, and a record WITHOUT capabilities reads as the
+    baseline — which is why a pre-#135 helper must still be refused a tcp
+    relay. Probes the real function (only `_install_facts` is faked), so the
+    plumbing the mocked seam hid is exercised."""
+    from hyperv_mcp import relay, uia  # RED at base
+
+    def with_caps(caps):
+        def fake_facts(cfg, ref, cred):
+            return {"dir": "C:\\ProgramData\\hyperv-mcp\\uia-helper-x",
+                    "uuid": "", "nonce": "", "version": "1",
+                    "capabilities": caps}
+        return fake_facts
+
+    monkeypatch.setattr(pswindows, "run_ps", FakePS())
+    monkeypatch.setattr(uia, "_install_facts",
+                        with_caps(["uia", "msaa", "stream"]))
+    caps = uia.helper_capabilities(_relay_cfg(), cred=CRED, vm_id=_GUID)
+    assert "stream" in caps, (
+        f"AC45: the guest's recorded capability must reach the host; got "
+        f"{sorted(caps)}")
+    assert caps <= (uia.BASE_CAPABILITIES | {uia.ELECTRON_CAPABILITY,
+                                             uia.STREAM_CAPABILITY}), (
+        f"AC45: the host must intersect with its closed capability set; got "
+        f"{sorted(caps)}")
+
+    # a helper with no capabilities.txt (provisioned before #135) reads as the
+    # baseline, so the tcp start is refused rather than attempted
+    monkeypatch.setattr(uia, "_install_facts", with_caps([]))
+    baseline = uia.helper_capabilities(_relay_cfg(), cred=CRED, vm_id=_GUID)
+    assert "stream" not in baseline, (
+        f"AC45: a helper with no recorded capabilities must not advertise "
+        f"stream; got {sorted(baseline)}")
+    with pytest.raises(ValueError, match="stream_unavailable"):
+        relay.relay_start(_relay_cfg(), "test-vm", 9223, kind="tcp", cred=CRED)

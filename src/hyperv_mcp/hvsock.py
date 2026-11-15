@@ -32,6 +32,7 @@ from __future__ import annotations
 import ctypes
 import select
 import socket
+import time
 import uuid
 
 # Address family for Hyper-V sockets. Present as `socket.AF_HYPERV` from
@@ -62,11 +63,6 @@ _SOL_SOCKET = 0xFFFF           # SOL_SOCKET on Windows
 _SO_ERROR = 0x1007             # getsockopt option: the pending error
 _WSAEWOULDBLOCK = 10035
 _WSAEISCONN = 10056
-#: How often the non-blocking connect is re-checked. Coarse enough to cost
-#: nothing, fine enough that a refused guest is reported promptly.
-_CONNECT_POLL_S = 0.02
-
-
 def _guid_bytes(value: str) -> bytes:
     """`bytes_le` for a GUID string, rejecting anything that is not a GUID."""
     try:
@@ -168,19 +164,29 @@ def _await_connect(ws2_32, handle: int, timeout_s: float) -> None:
     `SO_ERROR`, which stays 0 until the attempt either fails (non-zero) or
     succeeds (0 and the peer is now reachable) — so a 0 is confirmed with
     `select` reporting the socket writable rather than assumed.
+
+    The deadline is a MONOTONIC INSTANT, not a `waited` accumulator: each
+    `select` may block for the whole remaining budget, so an accumulator that
+    advances by a fixed poll step per iteration under-counts the real elapsed
+    time by roughly timeout^2 / (2 * step) — about 6 hours at the 30 s default,
+    which is precisely the hang this wait exists to prevent.
     """
-    deadline = timeout_s
-    waited = 0.0
+    deadline = time.monotonic() + timeout_s
     while True:
         err = _connect_error(ws2_32, handle)
         if err == _WSAEISCONN:
             return
         if err not in (0, _WSAEWOULDBLOCK):
             raise OSError(f"Ws2_32.connect failed: winsock error {err}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"the Hyper-V socket to the guest did not connect within "
+                f"{timeout_s:g}s")
         proxy = _HandleProxy(handle)
         try:
-            readable, writable, _errored = select.select(
-                [], [proxy], [], max(0.0, deadline - waited))
+            _readable, writable, _errored = select.select(
+                [], [proxy], [], remaining)
         except OSError:
             # A handle `select` cannot watch (already closed) is a failure,
             # not a reason to spin until the deadline.
@@ -190,11 +196,6 @@ def _await_connect(ws2_32, handle: int, timeout_s: float) -> None:
             if err in (0, _WSAEISCONN):
                 return
             raise OSError(f"Ws2_32.connect failed: winsock error {err}")
-        waited += _CONNECT_POLL_S
-        if waited >= deadline:
-            raise TimeoutError(
-                f"the Hyper-V socket to the guest did not connect within "
-                f"{timeout_s:g}s")
 
 
 class _HandleProxy:

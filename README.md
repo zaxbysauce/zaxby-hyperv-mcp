@@ -324,7 +324,7 @@ the task-spawned controller reads it from the environment.
   click discipline, transient-versus-absent errors, and evidence capture. The
   console click, type and screenshot tool descriptions now point at their
   element-level alternatives (`hyperv_ui_find` / `hyperv_ui_invoke`), so the
-  most capable path is discoverable among the 89 tools.
+  most capable path is discoverable among the 85 tools.
 - Version bump: 0.19.0 -> 0.20.0.
 
 ## 0.19.0 changes
@@ -2244,9 +2244,10 @@ forwarding each HTTP request through PowerShell Direct to
 `http://127.0.0.1:<guest_port><path>` INSIDE the guest — reach guest-local
 web endpoints and DevTools HTTP APIs (`/json/version`, ...) with zero
 dependence on the guest's external addresses and no guest-side component.
-Gated by the `relay` category (`hyperv_relay_start` only — status/stop
-address the host-side registry and carry no category gate, as do the four
-`hyperv_cdp_*` tools). Limits (the `http` kind): request bodies <= 1 MiB with
+Gated by the `relay` category: `hyperv_relay_start` and all four
+`hyperv_cdp_*` tools. `hyperv_relay_status` / `hyperv_relay_stop` address
+the host-side registry and carry no category gate. Limits (the `http` kind):
+request bodies <= 1 MiB with
 Content-Length (chunked bodies are rejected with 411; a negative
 Content-Length is rejected with 400), responses <= 4 MiB; only path-absolute
 request targets are forwarded (authority/absolute-form targets are rejected
@@ -2310,9 +2311,11 @@ refused when a remote Hyper-V host is configured (a Hyper-V socket is local
 to the host) and when the VM's helper does not advertise the `stream`
 capability — a helper provisioned before 0.21.0 has no forwarder, so the
 caller is told rather than left watching a connect timeout. `socket.AF_HYPERV`
-is absent on the supported Pythons (3.10-3.12), so the transport is built on
-a ctypes `ws2_32` binding with the stdlib `socket` path used where the
-constant exists (gh-92658). `http_entry` gains
+was ADDED in CPython 3.12, so 3.10/3.11 take a ctypes `ws2_32` binding
+(gh-92658) while 3.12 uses the stdlib path — and the two are NOT
+interchangeable: the stdlib's address form is the `(vm_id, service_id)` tuple
+of UUID strings, while the packed 36-byte sockaddr is only what the raw
+Winsock `connect` consumes. `http_entry` gains
 `--register-hvsocket-service` / `--unregister-hvsocket-service` /
 `--check-hvsocket-service`, which create, remove and report the
 `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\<GUID>` entry the

@@ -4957,8 +4957,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             expression: The expression to evaluate
             lease_id: Optional lease citation - the lease gate runs before the body
             fencing_token: The lease's fencing token, with lease_id
-        Returns: {ok, value, truncated}. A value over the 1 MiB documented
-        cap comes back shortened with truncated=true.
+        Returns: {ok, relay_id, target_id, value, truncated}. A value over
+        the 1 MiB documented cap comes back shortened with truncated=true.
         """
         return _run_guest_tool(
             "hyperv_cdp_eval", "", "relay",
@@ -4994,7 +4994,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             ref: Snapshot node ref (ref click; x/y are ignored)
             lease_id: Optional lease citation - the lease gate runs before the body
             fencing_token: The lease's fencing token, with lease_id
-        Returns: {ok, x, y} (the coordinates the click landed on).
+        Returns: {ok, relay_id, target_id, x, y} — the coordinates the
+        click landed on, plus `ref` on a ref click.
         """
         return _run_guest_tool(
             "hyperv_cdp_input", "", "relay",
@@ -5496,6 +5497,25 @@ def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]
                 return {"ok": False, "error": str(exc), "error_class": "invalid"}, None
             policy.vm_allowed(cfg, vm_name)
         if lease_id:
+            # A relay_id-addressed tool carries no vm_name/vm_id argument, so
+            # the hints built from the arguments are empty. Authorizing with
+            # empty hints makes `matches_hint` accept a lease on ANY VM — the
+            # mutual exclusion issue #23 exists to provide would not cover
+            # these tools at all. Resolve the relay's VM BEFORE authorizing so
+            # the presented lease is bound to the VM the call actually touches.
+            # The read is an indexed registry lookup (a store fallback only on
+            # a local miss), never a spawn.
+            if not vm_hint and not vm_name_hint and name in (
+                "hyperv_guest_job_stop", "hyperv_relay_stop",
+                "hyperv_cdp_eval", "hyperv_cdp_input",
+            ):
+                if name == "hyperv_guest_job_stop":
+                    row_vm = guestjobs.peek_vm_id(
+                        arguments.get("job_id") or "", cfg, owner=agent)
+                else:
+                    row_vm = relay.peek_vm_id(
+                        arguments.get("relay_id") or "", cfg, owner=agent)
+                vm_hint = row_vm or ""
             leases.authorize(cfg, lease_id, token, agent, scope,
                              vm_hint=vm_hint, vm_name_hint=vm_name_hint)
             # Issue #23 (review critical 2): present the lease to THIS call's

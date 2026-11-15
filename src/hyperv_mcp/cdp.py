@@ -78,6 +78,11 @@ class _SockReader:
         self.buf = b""
 
     def _fill(self, timeout: float) -> str:
+        # The timeout is scoped to THIS read and restored afterwards: leaving
+        # the socket at the read's sub-second value would make the write legs
+        # that follow (`_ws_send`'s sendall, the pong reply) fail far sooner
+        # than the documented per-connection deadline.
+        previous = self.conn.gettimeout()
         self.conn.settimeout(max(0.01, timeout))
         try:
             chunk = self.conn.recv(65536)
@@ -85,6 +90,11 @@ class _SockReader:
             return "timeout"
         except OSError:
             return "closed"
+        finally:
+            try:
+                self.conn.settimeout(previous)
+            except OSError:
+                pass
         if not chunk:
             return "closed"
         self.buf += chunk
@@ -163,14 +173,31 @@ def _ws_send(sock: Any, obj: Any) -> None:
     sock.sendall(header + mask + masked)
 
 
+def _frame_header(opcode: int, payload: bytes) -> bytes:
+    """An UNMASKED server-to-client frame header (RFC 6455 section 5)."""
+    n = len(payload)
+    head = bytes([0x80 | opcode])
+    if n < 126:
+        head += bytes([n])
+    elif n < 65536:
+        head += bytes([126]) + n.to_bytes(2, "big")
+    else:
+        head += bytes([127]) + n.to_bytes(8, "big")
+    return head
+
+
 def _ws_recv(reader: _SockReader, sock: Any, want_id: Any,
              timeout: float = _TIMEOUT_S) -> dict:
     """The reply whose ``id`` is ``want_id``; pings are answered inline.
 
     A close frame, an over-long frame or the deadline raises: a CDP session
     that cannot answer is a transport failure, never an empty result.
+    Continuation frames are accumulated (RFC 6455 permits fragmentation) and
+    control frames are answered through the same length encoder the request
+    path uses, so an oversized ping cannot desync the stream.
     """
     deadline = time.monotonic() + timeout
+    fragments: list[bytes] = []
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -206,17 +233,25 @@ def _ws_recv(reader: _SockReader, sock: Any, want_id: Any,
             raise ConnectionError("the DevTools endpoint closed the session")
         if opcode == 0x9:
             try:
-                pong = bytes([0x8A, len(payload)]) + payload
-                sock.sendall(pong)
+                # Control frames are capped at 125 bytes by RFC 6455; a peer
+                # that sends more is misbehaving, and echoing it with the
+                # single-byte length form would corrupt the stream.
+                if len(payload) <= 125:
+                    sock.sendall(_frame_header(0xA, payload) + payload)
             except Exception:
                 pass
+            continue
+        if opcode == 0x0:
+            fragments.append(payload)
             continue
         if opcode not in (0x1, 0x2):
             continue
         try:
-            msg = json.loads(payload.decode("utf-8"))
+            msg = json.loads(b"".join(fragments + [payload]).decode("utf-8"))
         except ValueError:
+            fragments = []
             continue
+        fragments = []
         if isinstance(msg, dict) and msg.get("id") == want_id:
             return msg
         # A response to another id (or a notification) is dropped: the client
@@ -232,11 +267,19 @@ class _CdpSession:
     """
 
     def __init__(self, entry: dict[str, Any], path: str) -> None:
-        self._sock = socket.create_connection(
+        sock = socket.create_connection(
             (str(entry["bind"]), int(entry["host_port"])), timeout=_TIMEOUT_S)
-        self._reader = _SockReader(self._sock)
-        self._next_id = 1
-        self._handshake(entry, path)
+        try:
+            self._sock = sock
+            self._reader = _SockReader(sock)
+            self._next_id = 1
+            self._handshake(entry, path)
+        except BaseException:
+            # A constructor that fails must not leak the socket (and the relay
+            # bridge behind it): `with` never binds the object, so __exit__
+            # never runs and closure would otherwise depend on refcount GC.
+            _close(sock)
+            raise
 
     def _handshake(self, entry: dict[str, Any], path: str) -> None:
         host = f"{entry['bind']}:{entry['host_port']}"

@@ -1856,10 +1856,14 @@ $StreamServeOne = {
     $guest = $null
     try {
         $stream = New-Object System.Net.Sockets.NetworkStream($client, $true)
+        # A host that dials the socket and then dies before writing its header
+        # must not park this connection forever: bound both the header's length
+        # (the host caps its own line reads at 4096) and the wait for it.
+        $client.ReceiveTimeout = 30000
         # 1) the relay's one-line header, read byte by byte: it is short, and
         #    unbounded framing would risk reading into the client's payload
         $ms = New-Object System.IO.MemoryStream
-        while ($true) {
+        while ($ms.Length -lt 4096) {
             $b = $stream.ReadByte()
             if ($b -lt 0) { return }
             if ($b -eq 10) { break }
@@ -1883,8 +1887,13 @@ $StreamServeOne = {
         $up = $stream.CopyToAsync($gstream)
         $down = $gstream.CopyToAsync($stream)
         [void][System.Threading.Tasks.Task]::WaitAny($up, $down)
-        try { $up.Dispose() } catch { }
-        try { $down.Dispose() } catch { }
+        # Dispose only the task that COMPLETED: disposing a still-running Task
+        # throws InvalidOperationException, and swallowing that made the
+        # disposal a structural no-op for exactly one task per connection.
+        # Closing the streams in the finally is what actually stops the other
+        # copy, and its unobserved exception is benign by .NET 4.5 defaults.
+        try { if ($up.IsCompleted) { $up.Dispose() } } catch { }
+        try { if ($down.IsCompleted) { $down.Dispose() } } catch { }
     } catch { }
     finally {
         if ($null -ne $guest) { try { $guest.Close() } catch { } }
@@ -1892,13 +1901,31 @@ $StreamServeOne = {
     }
 }
 
-# The accept loop.
+# The accept loop. Each accepted connection is served on its OWN runspace:
+# serving it inline here would occupy the single accept loop for the
+# connection's whole lifetime, so one long-lived DevTools WebSocket would
+# queue every other bridge behind the listen backlog, and a connection that
+# never sends its header would wedge the forwarder permanently.
+#
+# Deliberately self-contained (.NET only, no helper function): this loop runs
+# in a DEFAULT InitialSessionState runspace, where none of the helper's own
+# functions exist.
 $StreamAccept = {
     param($listener, $serveOne)
     while ($true) {
         $client = $null
         try { $client = $listener.Accept() } catch { break }
-        & $serveOne $client $serveOne
+        try {
+            $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+            $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($iss)
+            $rs.Open()
+            $sh = [System.Management.Automation.PowerShell]::Create()
+            $sh.Runspace = $rs
+            [void]$sh.AddScript('param($s, $c) & $s $c $s').AddArgument($serveOne).AddArgument($client)
+            [void]$sh.BeginInvoke()
+        } catch {
+            try { $client.Close() } catch { }
+        }
     }
 }
 
