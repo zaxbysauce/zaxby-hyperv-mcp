@@ -88,17 +88,17 @@ wave's bookkeeping and is never a gate failure.
 
 ### 23-leases-with-fencing-tokens (exit 1)
 
-- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 f8a6aa407cf6fd091a1cb2aab2959dfd7d5dd8b7 (C1)`
-- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 f8a6aa407cf6fd091a1cb2aab2959dfd7d5dd8b7 (C2)`
-- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 f8a6aa407cf6fd091a1cb2aab2959dfd7d5dd8b7 (C3)`
-- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 f8a6aa407cf6fd091a1cb2aab2959dfd7d5dd8b7 (C12)`
-- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 f8a6aa407cf6fd091a1cb2aab2959dfd7d5dd8b7 (C13)`
-- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 f8a6aa407cf6fd091a1cb2aab2959dfd7d5dd8b7 (C14)`
+- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 9d48ef849fd75233607cb1984615229ee14ce9ff (C1)`
+- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 9d48ef849fd75233607cb1984615229ee14ce9ff (C2)`
+- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 9d48ef849fd75233607cb1984615229ee14ce9ff (C3)`
+- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 9d48ef849fd75233607cb1984615229ee14ce9ff (C12)`
+- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 9d48ef849fd75233607cb1984615229ee14ce9ff (C13)`
+- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 9d48ef849fd75233607cb1984615229ee14ce9ff (C14)`
 
 ### 24-durable-operation-handles (exit 1)
 
 - `CHANGED tests/unit/test_server.py 902223243a1b4c3a04794d7e1ff849c8f8d36e95 78030b2e91c8bc838a2edd5a7a97881eb4b5f6df (C4)`
-- `CHANGED tests/unit/test_c03_tool_surface.py bbdc239578fc7ddfc56931232803ac6abd91ad18 3537579f00743c7b881eccb777c89dbdb1d85fc0 (C4)`
+- `CHANGED tests/unit/test_c03_tool_surface.py bbdc239578fc7ddfc56931232803ac6abd91ad18 afa091ee968a4eb4985473f366f74f6d37c87fb3 (C4)`
 
 ### 26-checkpoint-type-standard (exit 1)
 
@@ -130,37 +130,37 @@ wave's bookkeeping and is never a gate failure.
 
 ### 31-32-33-94-workstream-g-deployment (exit 1)
 
-- `CHANGED tests/unit/test_g02_clone_remove.py 6f938fb7fdaf8a6aa1efed5c0c292f51c0be8fc4 9653d38e6f08d812f361b724f258634a776338c6 (C1)`
-- `CHANGED tests/unit/test_g02_clone_remove.py 6f938fb7fdaf8a6aa1efed5c0c292f51c0be8fc4 9653d38e6f08d812f361b724f258634a776338c6 (C2)`
-- `CHANGED tests/unit/test_g02_clone_remove.py 6f938fb7fdaf8a6aa1efed5c0c292f51c0be8fc4 9653d38e6f08d812f361b724f258634a776338c6 (C4)`
-- `CHANGED tests/unit/test_g02_clone_remove.py 6f938fb7fdaf8a6aa1efed5c0c292f51c0be8fc4 9653d38e6f08d812f361b724f258634a776338c6 (C5)`
+- `CHANGED tests/unit/test_g02_clone_remove.py 6f938fb7fdaf8a6aa1efed5c0c292f51c0be8fc4 4d9cb55544eb98a61a521efbfac253eb09a096dd (C1)`
+- `CHANGED tests/unit/test_g02_clone_remove.py 6f938fb7fdaf8a6aa1efed5c0c292f51c0be8fc4 4d9cb55544eb98a61a521efbfac253eb09a096dd (C2)`
+- `CHANGED tests/unit/test_g02_clone_remove.py 6f938fb7fdaf8a6aa1efed5c0c292f51c0be8fc4 4d9cb55544eb98a61a521efbfac253eb09a096dd (C4)`
+- `CHANGED tests/unit/test_g02_clone_remove.py 6f938fb7fdaf8a6aa1efed5c0c292f51c0be8fc4 4d9cb55544eb98a61a521efbfac253eb09a096dd (C5)`
 
 ### 44-vm-display-resolution (exit 1)
 
-- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 86d536f8e8b7d55dbc84854517de569635acfd7b (C1)`
-- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 86d536f8e8b7d55dbc84854517de569635acfd7b (C2)`
-- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 86d536f8e8b7d55dbc84854517de569635acfd7b (C3)`
-- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 86d536f8e8b7d55dbc84854517de569635acfd7b (C4)`
-- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 86d536f8e8b7d55dbc84854517de569635acfd7b (C5)`
-- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 86d536f8e8b7d55dbc84854517de569635acfd7b (C6)`
-- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 86d536f8e8b7d55dbc84854517de569635acfd7b (C7)`
-- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 86d536f8e8b7d55dbc84854517de569635acfd7b (C8)`
+- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 92d057c1c3e6633ccc2128f7737ebd5b503d5cbe (C1)`
+- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 92d057c1c3e6633ccc2128f7737ebd5b503d5cbe (C2)`
+- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 92d057c1c3e6633ccc2128f7737ebd5b503d5cbe (C3)`
+- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 92d057c1c3e6633ccc2128f7737ebd5b503d5cbe (C4)`
+- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 92d057c1c3e6633ccc2128f7737ebd5b503d5cbe (C5)`
+- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 92d057c1c3e6633ccc2128f7737ebd5b503d5cbe (C6)`
+- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 92d057c1c3e6633ccc2128f7737ebd5b503d5cbe (C7)`
+- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 92d057c1c3e6633ccc2128f7737ebd5b503d5cbe (C8)`
 
 ### 5-ps51-sanitized-env (exit 1)
 
-- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af fddbf4209f71799a167821138f7e4f7f7699b60a (C1)`
-- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af fddbf4209f71799a167821138f7e4f7f7699b60a (C2)`
-- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af fddbf4209f71799a167821138f7e4f7f7699b60a (C3)`
-- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af fddbf4209f71799a167821138f7e4f7f7699b60a (C4)`
-- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af fddbf4209f71799a167821138f7e4f7f7699b60a (C6)`
-- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af fddbf4209f71799a167821138f7e4f7f7699b60a (C7)`
-- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af fddbf4209f71799a167821138f7e4f7f7699b60a (C8)`
-- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af fddbf4209f71799a167821138f7e4f7f7699b60a (C9)`
+- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af 9fdda0ef2cb66cf1aaadc20c1706dcf85606332e (C1)`
+- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af 9fdda0ef2cb66cf1aaadc20c1706dcf85606332e (C2)`
+- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af 9fdda0ef2cb66cf1aaadc20c1706dcf85606332e (C3)`
+- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af 9fdda0ef2cb66cf1aaadc20c1706dcf85606332e (C4)`
+- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af 9fdda0ef2cb66cf1aaadc20c1706dcf85606332e (C6)`
+- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af 9fdda0ef2cb66cf1aaadc20c1706dcf85606332e (C7)`
+- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af 9fdda0ef2cb66cf1aaadc20c1706dcf85606332e (C8)`
+- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af 9fdda0ef2cb66cf1aaadc20c1706dcf85606332e (C9)`
 
 ### 74-72-88-cost-latency-accounting (exit 1)
 
-- `CHANGED README.md 1960d4c6f808c0ee2b2f2b4de64c877d73bc1682 2dfeaf3bed540804a6144a0290ee37926f48e231 (C10)`
-- `CHANGED src/hyperv_mcp/server.py 47b2c188ae2c1cb8ede580229e8ca3b50823c941 2b1ea5781a26356b6b1457433633fadde270e95e (C10)`
+- `CHANGED README.md 1960d4c6f808c0ee2b2f2b4de64c877d73bc1682 4b8a085ffe617cbd5066d51ef3eec77c2b159825 (C10)`
+- `CHANGED src/hyperv_mcp/server.py 47b2c188ae2c1cb8ede580229e8ca3b50823c941 a1019d721c792147c75fb2f2d473b208ec49395d (C10)`
 
 <!-- regenerated-state-end -->
 
