@@ -48,6 +48,7 @@ from . import __version__ as _pkg_version
 from . import (
     admission,
     auditlog,
+    cdp,
     console,
     credentials,
     diagnostics,
@@ -589,7 +590,7 @@ cannot.
 
 | Surface | First choice | Then |
 |---|---|---|
-| Web content of an Electron, WebView2, CEF or Chromium window | the DevTools protocol (needs the byte-stream relay of #135 or the CDP tools of #127, neither shipped yet; today's `hyperv_relay_start` is HTTP-only and reaches just the `/json/*` endpoints) | UI Automation with the application started with `--force-renderer-accessibility` (`hyperv_ui_find`, `hyperv_ui_invoke`), then console input |
+| Web content of an Electron, WebView2, CEF or Chromium window | the DevTools protocol — start a relay with `kind="tcp"` (issue #135) and drive the page through `hyperv_cdp_targets` / `hyperv_cdp_eval` / `hyperv_cdp_input` / `hyperv_cdp_snapshot` (issue #127); the `http` kind still reaches just the `/json/*` endpoints | UI Automation with the application started with `--force-renderer-accessibility` (`hyperv_ui_find`, `hyperv_ui_invoke`), then console input |
 | Native windows and controls, including native dialogs raised by an Electron application | UI Automation tools (`hyperv_ui_find`, `hyperv_ui_inspect`, `hyperv_ui_snapshot`, `hyperv_ui_act` -- the element state, snapshots and actions of #136 and #137) | console input |
 | Anything before logon, on the secure desktop, or in WinPE | console tools | visual grounding |
 
@@ -3521,6 +3522,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         def hyperv_ui_helper_provision(
             vm_name: str = "", autologon: bool = True, confirm: bool = False,
             teardown: bool = False,
+            test_profile: list[str] | None = None,
             lease_id: str = "", fencing_token: int = 0,
             username: str = "", password: str = "", vm_id: str = "",
         ) -> dict:
@@ -3534,7 +3536,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             starts the helper at logon. Re-provisioning is idempotent (the
             running helper and every previous helper directory are removed
             first); teardown stops the task, removes the helper directories,
-            deletes the LSA secret and restores the Winlogon values.
+            deletes the LSA secret, restores the Winlogon values and restores
+            every setting a test-image profile changed.
             Disposable test images only: provisioning configures automatic
             logon with the guest credential.
 
@@ -3544,6 +3547,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                     (default true; ignored by teardown)
                 confirm: Must be true (destructive.require_confirm)
                 teardown: true removes the helper instead of installing it
+                test_profile: optional test-image settings for a disposable
+                    guest (issue #138) — ["default"] selects all seven:
+                    no_display_timeout, no_sleep, no_lock_on_resume,
+                    no_inactivity_lock, no_screen_saver, no_auto_update,
+                    uac_on_desktop. Each setting's previous value is recorded
+                    before it changes and restored at teardown
                 lease_id: optional lease citation (issue #23) — the lease
                     gate runs before the body
                 fencing_token: the lease's fencing token, with lease_id
@@ -3556,9 +3565,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             Returns: {ok, autologon_configured, task_registered,
             helper_version, helper_running, reboot_required, guest_uuid_read,
-            helper_dir} — or, with teardown=true, {ok, torn_down,
+            helper_dir, test_profile} — or, with teardown=true, {ok, torn_down,
             task_unregistered, helper_directories_removed,
-            lsa_secret_deleted, autologon_restored} — or
+            lsa_secret_deleted, autologon_restored, profile_restored} — or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             gate = _uia_prevalidate_result("hyperv_ui_helper_provision", {})
@@ -3570,6 +3579,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 _cfg(), vm_name,
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 autologon=autologon, confirm=confirm, teardown=teardown,
+                test_profile=test_profile,
                 vm_id=vm_id)
 
         @mcp.tool()
@@ -4095,6 +4105,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         def hyperv_ui_helper_provision(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", autologon: bool = True, confirm: bool = False,
             teardown: bool = False,
+            test_profile: list[str] | None = None,
             lease_id: str = "", fencing_token: int = 0,
             vm_id: str = "",
         ) -> dict:
@@ -4108,7 +4119,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             starts the helper at logon. Re-provisioning is idempotent (the
             running helper and every previous helper directory are removed
             first); teardown stops the task, removes the helper directories,
-            deletes the LSA secret and restores the Winlogon values.
+            deletes the LSA secret, restores the Winlogon values and restores
+            every setting a test-image profile changed.
             Disposable test images only: provisioning configures automatic
             logon with the guest credential.
 
@@ -4118,6 +4130,12 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                     (default true; ignored by teardown)
                 confirm: Must be true (destructive.require_confirm)
                 teardown: true removes the helper instead of installing it
+                test_profile: optional test-image settings for a disposable
+                    guest (issue #138) — ["default"] selects all seven:
+                    no_display_timeout, no_sleep, no_lock_on_resume,
+                    no_inactivity_lock, no_screen_saver, no_auto_update,
+                    uac_on_desktop. Each setting's previous value is recorded
+                    before it changes and restored at teardown
                 lease_id: optional lease citation (issue #23) — the lease
                     gate runs before the body
                 fencing_token: the lease's fencing token, with lease_id
@@ -4126,9 +4144,9 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
 
             Returns: {ok, autologon_configured, task_registered,
             helper_version, helper_running, reboot_required, guest_uuid_read,
-            helper_dir} — or, with teardown=true, {ok, torn_down,
+            helper_dir, test_profile} — or, with teardown=true, {ok, torn_down,
             task_unregistered, helper_directories_removed,
-            lsa_secret_deleted, autologon_restored} — or
+            lsa_secret_deleted, autologon_restored, profile_restored} — or
             {ok: false, error, error_class, retryable, retry_after_ms} (+ holder on busy).
             """
             gate = _uia_prevalidate_result("hyperv_ui_helper_provision", {})
@@ -4140,6 +4158,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 _cfg(), vm_name,
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id)),
                 autologon=autologon, confirm=confirm, teardown=teardown,
+                test_profile=test_profile,
                 vm_id=vm_id)
 
         @mcp.tool()
@@ -4409,19 +4428,32 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_name: str = "", guest_port: int = 0, host_port: int = 0,
             username: str = "", password: str = "",
             vm_id: str = "",
+            kind: str = "http",
             lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
-            """Start a loopback-only host HTTP listener forwarding requests
-            through PowerShell Direct to the guest's 127.0.0.1:guest_port —
-            reach guest-local web endpoints and DevTools HTTP APIs with no
-            dependence on guest network addresses. Policy: relay category.
-            HTTP only (no WebSocket proxying).
+            """Start a loopback-only host listener forwarding to the guest's
+            127.0.0.1:guest_port — reach guest-local web endpoints and
+            DevTools HTTP APIs with no dependence on guest network addresses.
+            Policy: relay category.
+
+            kind="http" (the default) forwards HTTP requests through a
+            per-request PowerShell Direct leg and carries the per-relay secret
+            as a URL path prefix. kind="tcp" (issue #135) carries raw bytes in
+            both directions over a Hyper-V socket with no PowerShell process
+            in the data path: no secret, no idle timeout, TCP keepalive on.
+            A tcp relay is refused when a remote Hyper-V host is configured
+            and when the VM's helper does not advertise the `stream`
+            capability (run hyperv_ui_helper_provision on one that does).
 
             Args:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
                 guest_port: Guest-local port to relay to (loopback)
                 host_port: Host-side loopback listener port
+                kind: Relay kind - "http" (the default) forwards HTTP requests
+                      through a per-request PowerShell Direct leg; "tcp" carries
+                      raw bytes in both directions over a Hyper-V socket with no
+                      PowerShell process in the data path
                 username: Inline guest username (requires allow_inline_credentials=true)
                 password: Inline guest password (requires allow_inline_credentials=true)
                 lease_id: Optional lease citation - the lease gate runs before the body
@@ -4434,7 +4466,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_guest_tool(
                 "hyperv_relay_start", vm_name, "relay",
                 relay.relay_start, _cfg(), vm_name, guest_port,
-                host_port=host_port, vm_id=vm_id,
+                host_port=host_port, vm_id=vm_id, kind=kind,
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
                 owner=auditlog.current_agent_id(),
             )
@@ -4645,14 +4677,22 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         def hyperv_relay_start(  # type: ignore[misc]  # dual registration — see _register_tools
             vm_name: str = "", guest_port: int = 0, host_port: int = 0,
             vm_id: str = "",
+            kind: str = "http",
             lease_id: str = "", fencing_token: int = 0,
         ) -> dict:
-            """Start a loopback-only host HTTP listener forwarding requests
-            through PowerShell Direct to the guest's 127.0.0.1:guest_port —
-            reach guest-local web endpoints and DevTools HTTP APIs with no
-            dependence on guest network addresses. Policy: relay category.
-            HTTP only (no WebSocket proxying). Credentials from environment
-            only.
+            """Start a loopback-only host listener forwarding to the guest's
+            127.0.0.1:guest_port — reach guest-local web endpoints and
+            DevTools HTTP APIs with no dependence on guest network addresses.
+            Policy: relay category. Credentials from environment only.
+
+            kind="http" (the default) forwards HTTP requests through a
+            per-request PowerShell Direct leg and carries the per-relay secret
+            as a URL path prefix. kind="tcp" (issue #135) carries raw bytes in
+            both directions over a Hyper-V socket with no PowerShell process
+            in the data path: no secret, no idle timeout, TCP keepalive on.
+            A tcp relay is refused when a remote Hyper-V host is configured
+            and when the VM's helper does not advertise the `stream`
+            capability (run hyperv_ui_helper_provision on one that does).
 
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
 
@@ -4661,6 +4701,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 vm_name: Name of the VM (must match allowed_vm_patterns)
                 guest_port: Guest-local port to relay to (loopback)
                 host_port: Host-side loopback listener port
+                kind: Relay kind - "http" (the default) forwards HTTP requests
+                      through a per-request PowerShell Direct leg; "tcp" carries
+                      raw bytes in both directions over a Hyper-V socket with no
+                      PowerShell process in the data path
                 vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
                 lease_id: Optional lease citation - the lease gate runs before the body
                 fencing_token: The lease's fencing token, with lease_id
@@ -4671,7 +4715,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return _run_guest_tool(
                 "hyperv_relay_start", vm_name, "relay",
                 relay.relay_start, _cfg(), vm_name, guest_port,
-                host_port=host_port, vm_id=vm_id,
+                host_port=host_port, vm_id=vm_id, kind=kind,
                 cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
                 owner=auditlog.current_agent_id(),
             )
@@ -4862,6 +4906,120 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         return _run_guest_tool(
             "hyperv_relay_stop", "", "relay",
             relay.relay_stop, _cfg(), relay_id,
+            owner=auditlog.current_agent_id(),
+            audit_relay_id=relay_id,
+            audit_vm_name=lambda: relay.peek_vm_name(
+                relay_id, _cfg(), owner=auditlog.current_agent_id()),
+        )
+
+    # ---- issue #127: the CDP channel over a tcp relay --------------------
+    #
+    # All four address a relay by the id relay_start returned, take no guest
+    # credential (the byte-stream relay carries none) and are gated by the
+    # `relay` category — the same gate hyperv_relay_start runs under. They
+    # ride the relay's loopback listener, so there is no PowerShell process
+    # anywhere in the data path.
+
+    @mcp.tool()
+    def hyperv_cdp_targets(relay_id: str) -> dict:
+        """List the DevTools targets of the application behind a tcp relay.
+
+        Discovery only: the tools never create a target and never close one
+        (`Target.createTarget` is unsupported in Electron, `Browser.close`
+        would quit the attached application).
+
+        Args:
+            relay_id: Relay id returned by relay_start (kind="tcp")
+        Returns: {ok, relay_id, targets: [{id, type, title, url,
+        webSocketDebuggerUrl}]}. The webSocketDebuggerUrl is rewritten to the
+        relay's own loopback listener, so it is dialable from the host.
+        """
+        return _run_guest_tool(
+            "hyperv_cdp_targets", "", "relay",
+            cdp.targets, _cfg(), relay_id,
+            owner=auditlog.current_agent_id(),
+            audit_relay_id=relay_id,
+            audit_vm_name=lambda: relay.peek_vm_name(
+                relay_id, _cfg(), owner=auditlog.current_agent_id()),
+        )
+
+    @mcp.tool()
+    def hyperv_cdp_eval(relay_id: str, target_id: str, expression: str,
+                        lease_id: str = "", fencing_token: int = 0) -> dict:
+        """Evaluate one JavaScript expression in a DevTools target.
+
+        Lease-gated (guest_exec scope): this runs application code inside the
+        guest, the same class of operation as hyperv_guest_run_ps.
+
+        Args:
+            relay_id: Relay id returned by relay_start (kind="tcp")
+            target_id: Target id from hyperv_cdp_targets
+            expression: The expression to evaluate
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
+        Returns: {ok, value, truncated}. A value over the 1 MiB documented
+        cap comes back shortened with truncated=true.
+        """
+        return _run_guest_tool(
+            "hyperv_cdp_eval", "", "relay",
+            cdp.evaluate, _cfg(), relay_id, target_id, expression,
+            owner=auditlog.current_agent_id(),
+            audit_relay_id=relay_id,
+            audit_vm_name=lambda: relay.peek_vm_name(
+                relay_id, _cfg(), owner=auditlog.current_agent_id()),
+        )
+
+    @mcp.tool()
+    def hyperv_cdp_input(relay_id: str, target_id: str,
+                         x: float | None = None, y: float | None = None,
+                         ref: str = "",
+                         lease_id: str = "", fencing_token: int = 0) -> dict:
+        """Dispatch a trusted click in a DevTools target.
+
+        Lease-gated (console scope): this dispatches real mouse events into
+        the guest, the same class of operation as hyperv_ui_act.
+
+        Either CSS-pixel coordinates, or the `ref` of a node from
+        hyperv_cdp_snapshot — a ref click scrolls the node into view, reads
+        its content box and clicks the centre, so the caller supplies no
+        coordinates. A ref that does not resolve in the target's LIVE
+        accessibility tree is refused with error_class "stale_ref" and
+        dispatches nothing.
+
+        Args:
+            relay_id: Relay id returned by relay_start (kind="tcp")
+            target_id: Target id from hyperv_cdp_targets
+            x: Click X in CSS pixels (coordinate click)
+            y: Click Y in CSS pixels (coordinate click)
+            ref: Snapshot node ref (ref click; x/y are ignored)
+            lease_id: Optional lease citation - the lease gate runs before the body
+            fencing_token: The lease's fencing token, with lease_id
+        Returns: {ok, x, y} (the coordinates the click landed on).
+        """
+        return _run_guest_tool(
+            "hyperv_cdp_input", "", "relay",
+            cdp.input_event, _cfg(), relay_id, target_id, x, y, ref,
+            owner=auditlog.current_agent_id(),
+            audit_relay_id=relay_id,
+            audit_vm_name=lambda: relay.peek_vm_name(
+                relay_id, _cfg(), owner=auditlog.current_agent_id()),
+        )
+
+    @mcp.tool()
+    def hyperv_cdp_snapshot(relay_id: str, target_id: str) -> dict:
+        """One accessibility snapshot of a DevTools target.
+
+        Args:
+            relay_id: Relay id returned by relay_start (kind="tcp")
+            target_id: Target id from hyperv_cdp_targets
+        Returns: {ok, nodes: [{ref, role, name, backendDOMNodeId,
+        properties}], lines: [str]} — one compact text line per node carrying
+        its role, name and state. The refs are the addresses
+        hyperv_cdp_input(ref=...) accepts until the next snapshot.
+        """
+        return _run_guest_tool(
+            "hyperv_cdp_snapshot", "", "relay",
+            cdp.snapshot, _cfg(), relay_id, target_id,
             owner=auditlog.current_agent_id(),
             audit_relay_id=relay_id,
             audit_vm_name=lambda: relay.peek_vm_name(
@@ -5151,6 +5309,13 @@ TOOL_SCOPES: dict[str, str] = {
     "hyperv_guest_job_start": "guest_exec", "hyperv_guest_job_stop": "guest_exec",
     "hyperv_relay_start": "guest_exec", "hyperv_relay_stop": "guest_exec",
     "hyperv_repair_guest_access": "guest_exec",
+    # issue #127: the two MUTATING CDP tools are lease-gated like the other
+    # guest-input family. `eval` runs application code (guest_exec, the
+    # hyperv_guest_run_ps scope) and `input` dispatches real mouse events
+    # (console, the hyperv_ui_act scope). `targets`/`snapshot` are reads and
+    # stay unleased, exactly like hyperv_relay_status.
+    "hyperv_cdp_eval": "guest_exec",
+    "hyperv_cdp_input": "console",
     # transfer
     "hyperv_guest_put": "transfer", "hyperv_guest_get": "transfer",
     # console
@@ -5354,9 +5519,13 @@ def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]
             return errors.enrich_failure(env), None
         # Unleased path. For id-addressed tools the store row supplies the VM
         # (round-3 MAJOR-6); resolution is deferred until candidates exist, so
-        # a quiet system pays one indexed query and no spawn.
+        # a quiet system pays one indexed query and no spawn. The relay_id
+        # family (relay stop, issue #127's two mutating CDP tools) reads the VM
+        # back through the relay registry: the relay_id is the caller's handle,
+        # and the lease gate still has to know which VM it addresses.
         if not vm_hint and not vm_name_hint and name in (
             "hyperv_guest_job_stop", "hyperv_relay_stop",
+            "hyperv_cdp_eval", "hyperv_cdp_input",
         ):
             if name == "hyperv_guest_job_stop":
                 row_vm = guestjobs.peek_vm_id(arguments.get("job_id") or "", cfg,

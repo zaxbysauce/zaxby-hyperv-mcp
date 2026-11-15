@@ -108,6 +108,9 @@ TOOL_NAMES = {
     "hyperv_ui_session_state", "hyperv_ui_helper_provision",
     # issue #137: the element-contract pair
     "hyperv_ui_snapshot", "hyperv_ui_act",
+    # issue #127: the CDP channel over a tcp relay (no guest credential)
+    "hyperv_cdp_targets", "hyperv_cdp_eval",
+    "hyperv_cdp_input", "hyperv_cdp_snapshot",
 }
 CRED_TOOLS = {
     "hyperv_guest_start_interactive",
@@ -264,8 +267,8 @@ def test_ac12_tool_inventory_per_credential_mode(tmp_path, fresh_server):
         f"extra={sorted(set(base_schemas) - TOOL_NAMES)}, "
         f"missing={sorted(TOOL_NAMES - set(base_schemas))}"
     )
-    assert len(base_schemas) == len(TOOL_NAMES) == 85, (
-        f"AC12: tool count {len(base_schemas)} != 85 "
+    assert len(base_schemas) == len(TOOL_NAMES) == 89, (
+        f"AC12: tool count {len(base_schemas)} != 89 "
         f"(66 through issue #24; 67 with issue #27's settle wait; "
         f"76 with issue #29's eight hyperv_ui_* tools; 80 with PR #112's "
         f"four Workstream G tools; 82 with issue #130's "

@@ -1787,11 +1787,201 @@ try {
 $legacyPattern = $null
 try { $legacyPattern = [System.Windows.Automation.LegacyIAccessiblePattern]::Pattern } catch { $legacyPattern = $null }
 
+# ---------------------------------------------------------------------------
+# issue #135: the Hyper-V socket stream forwarder
+# ---------------------------------------------------------------------------
+
+# The byte-stream relay's guest half. The host dials
+# (vm_guid, SERVICE_GUID) over a Hyper-V socket; this listener accepts it,
+# reads the relay's one-line header, answers it, and carries raw bytes in both
+# directions between the host connection and 127.0.0.1:<header port> INSIDE the
+# guest. No PowerShell runs in that path -- the pump is .NET only, so a raw
+# thread needs no session state.
+
+# -TypeDefinition (not -MemberDefinition): this is the one block in the helper
+# that must DECLARE A CLASS, and -MemberDefinition wraps its source in a
+# generated class of the same name as -Name, which makes the compiler reject it
+# twice over -- a `using` line lands inside the generated class, and a class
+# declaration collides with it. -TypeDefinition takes the source verbatim.
+Add-Type -TypeDefinition @'
+using System;
+using System.Net;
+using System.Net.Sockets;
+
+namespace HypervMcp.Stream {
+    // The 36-byte AF_HYPERV sockaddr: family (LE), two reserved zero bytes,
+    // then the VM GUID and the service GUID. Guid.ToByteArray() is the Windows
+    // in-memory GUID order, which is exactly what the wire layout wants (the
+    // same bytes Python's uuid.UUID.bytes_le produces on the host side).
+    public class HvSocketEndPoint : EndPoint {
+        private readonly SocketAddress _address;
+        public HvSocketEndPoint(Guid vmId, Guid serviceId) {
+            _address = new SocketAddress((AddressFamily)34, 36);
+            byte[] vm = vmId.ToByteArray();
+            for (int i = 0; i < 16; i++) { _address[4 + i] = vm[i]; }
+            byte[] svc = serviceId.ToByteArray();
+            for (int i = 0; i < 16; i++) { _address[20 + i] = svc[i]; }
+        }
+        public override EndPoint Create(SocketAddress socketAddress) {
+            return new HvSocketEndPoint(Guid.Empty, Guid.Empty);
+        }
+        public override SocketAddress Serialize() { return _address; }
+    }
+}
+'@
+
+#: The service GUID this build's host dials. Overridable through the
+#: environment so a deployment can move it without rebuilding the helper.
+$StreamServiceGuid = '0b48efab-5086-42b0-94f6-7ddb08383dd6'
+if ($env:HYPERVMCP_STREAM_SERVICE_GUID) { $StreamServiceGuid = $env:HYPERVMCP_STREAM_SERVICE_GUID }
+
+#: True once the listener has bound. `stream` is advertised ONLY on this
+#: evidence: a helper whose listener failed to start must not claim a
+#: forwarder it does not have (that is what keeps the host's capability gate
+#: meaningful). Injected into the per-request worker runspaces below, so the
+#: UNQUALIFIED name resolves in both scopes.
+$StreamListenerBound = $false
+
+# One accepted host connection: header in, ack out, then the guest endpoint,
+# pumped with CopyToAsync. NO PowerShell thread runs any of it -- the pump is
+# two .NET async copies waited on together, so nothing races the process exit
+# (a scriptblock on a raw .NET thread does: PowerShell tears its runspace down
+# at exit and the resulting unhandled exception on that background thread
+# overrides the script's own exit code).
+#
+# Every scriptblock below takes PLAIN parameters (never a Tuple), so it can be
+# invoked with the call operator inside a runspace script.
+$StreamServeOne = {
+    param($client, $pump)
+    $guest = $null
+    try {
+        $stream = New-Object System.Net.Sockets.NetworkStream($client, $true)
+        # 1) the relay's one-line header, read byte by byte: it is short, and
+        #    unbounded framing would risk reading into the client's payload
+        $ms = New-Object System.IO.MemoryStream
+        while ($true) {
+            $b = $stream.ReadByte()
+            if ($b -lt 0) { return }
+            if ($b -eq 10) { break }
+            [void]$ms.WriteByte([byte]$b)
+        }
+        $header = [System.Text.Encoding]::ASCII.GetString($ms.ToArray())
+        $port = 0
+        try { $port = [int]((ConvertFrom-Json $header).port) } catch { $port = 0 }
+        if ($port -lt 1 -or $port -gt 65535) { return }
+        # 2) the ack, before any client byte is carried
+        $ack = [System.Text.Encoding]::ASCII.GetBytes('{"ok":true}' + [char]10)
+        $stream.Write($ack, 0, $ack.Length)
+        $stream.Flush()
+        # 3) the guest endpoint the header named
+        $guest = New-Object System.Net.Sockets.TcpClient
+        $guest.Connect([System.Net.IPAddress]::Loopback, $port)
+        $gstream = $guest.GetStream()
+        # 4) full duplex. Either direction ending ends the bridge: WhenAny
+        #    returns as soon as one copy completes, and closing the streams
+        #    fails the other one.
+        $up = $stream.CopyToAsync($gstream)
+        $down = $gstream.CopyToAsync($stream)
+        [void][System.Threading.Tasks.Task]::WaitAny($up, $down)
+        try { $up.Dispose() } catch { }
+        try { $down.Dispose() } catch { }
+    } catch { }
+    finally {
+        if ($null -ne $guest) { try { $guest.Close() } catch { } }
+        try { $client.Close() } catch { }
+    }
+}
+
+# The accept loop.
+$StreamAccept = {
+    param($listener, $serveOne)
+    while ($true) {
+        $client = $null
+        try { $client = $listener.Accept() } catch { break }
+        & $serveOne $client $serveOne
+    }
+}
+
+# Run one scriptblock on its own runspace, the same idiom the pipe workers use
+# (RunspaceFactory + BeginInvoke). PowerShell tracks the async result, so an
+# `exit` disposes it instead of racing it.
+function Start-HypervMcpStreamRunspace {
+    param($Script, $Arg1, $Arg2)
+    try {
+        # InitialSessionState.CreateDefault (NOT RunspaceFactory.CreateDefault,
+        # which does not exist in .NET Framework): the forwarder needs no
+        # helper variable, so a default session state is enough.
+        $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+        $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($iss)
+        $rs.Open()
+        $shell = [System.Management.Automation.PowerShell]::Create()
+        $shell.Runspace = $rs
+        [void]$shell.AddScript('param($s, $a, $b) & $s $a $b').AddArgument($Script).AddArgument($Arg1).AddArgument($Arg2)
+        [void]$shell.BeginInvoke()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Start-HypervMcpStreamForwarder {
+    param([string]$ServiceGuid, $ServeOne, $Accept)
+    try {
+        $listener = New-Object System.Net.Sockets.Socket(
+            [System.Net.Sockets.AddressFamily]34,
+            [System.Net.Sockets.SocketType]::Stream, 1)
+        # The guest binds the service GUID with the VM GUID zeroed: the guest
+        # does not reliably know the host's GUID for itself, and the kernel
+        # routes by service id.
+        $listener.Bind((New-Object HypervMcp.Stream.HvSocketEndPoint(
+            [Guid]::Parse('00000000-0000-0000-0000-000000000000'),
+            [Guid]::Parse($ServiceGuid))))
+        $listener.Listen(8)
+    } catch {
+        return $false
+    }
+    if (-not (Start-HypervMcpStreamRunspace $Accept $listener $ServeOne)) {
+        return $false
+    }
+    return $true
+}
+
+# Started once at startup; a failure is NOT fatal for the pipe verbs -- the
+# helper keeps serving UIA and simply does not advertise the forwarder.
+try {
+    $StreamListenerBound = Start-HypervMcpStreamForwarder $StreamServiceGuid $StreamServeOne $StreamAccept
+} catch {
+    $StreamListenerBound = $false
+}
+
 # Issue #136: advertise msaa ONLY when the bridge pattern type resolved -
 # never a hardcoded capability list the client cannot trust.
+# Issue #135: the host's capability discovery reads capabilities.txt rather
+# than opening a pipe leg, so the forwarder's availability is recorded where a
+# cold host process can see it. The helper is the ONLY honest source: it writes
+# what it actually resolved (msaa only when the bridge type exists, stream only
+# when the listener bound).
+#
+# Deliberately its own function, placed AFTER Get-SessionBlock: the seam census
+# in tests/unit/test_seam_census_guardrail.py extracts every single-quoted
+# lowercase token from Get-HelperCapabilities' body, and a file name written
+# there would read as a capability the host never declared.
+function Save-HypervMcpCapabilityRecord {
+    param([string[]]$Caps)
+    try {
+        $capsPath = Join-Path $HelperDir ('capabilities' + '.' + 'txt')
+        [IO.File]::WriteAllText($capsPath, ($Caps -join ','))
+    } catch { }
+}
+
 function Get-HelperCapabilities {
     $caps = @('uia')
     if ($null -ne $legacyPattern) { $caps += 'msaa' }
+    # Issue #135: advertise the byte-stream forwarder ONLY when its listener
+    # actually bound. A helper whose listener failed must not claim it. The
+    # UNQUALIFIED name resolves to the script-scope value here and to the
+    # injected session variable inside a per-request worker runspace.
+    if ($StreamListenerBound) { $caps += 'stream' }
     # Issue #129: the helper implements the electron adapter's behaviour (the
     # renderer-accessibility enable and the per-glyph run merge), so it
     # reports the capability the host's _adapter_gate requires. A helper that
@@ -1801,6 +1991,8 @@ function Get-HelperCapabilities {
     return $caps
 }
 $capabilities = Get-HelperCapabilities
+Save-HypervMcpCapabilityRecord $capabilities
+
 
 # Issue #136: per-monitor DPI awareness so the helper's click points are
 # PHYSICAL pixels. PROCESS-level declaration FIRST (the request dispatch
@@ -2001,6 +2193,7 @@ $sessionVariables = @{
     ownNonce = $ownNonce
     recordedUuid = $recordedUuid
     capabilities = $capabilities
+    StreamListenerBound = $StreamListenerBound
     ownSha256 = $ownSha256
     identity = $identity
     PipeName = $PipeName

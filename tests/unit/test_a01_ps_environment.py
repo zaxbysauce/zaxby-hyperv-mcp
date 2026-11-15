@@ -201,11 +201,12 @@ def test_server_info_tool_registered():
             f"hyperv_server_info is not registered; tool inventory has "
             f"{len(names)} tools, expected 85 including hyperv_server_info"
         )
-        assert len(names) == 85, (
-            f"tool inventory is {len(names)} tools; expected exactly 85 "
+        assert len(names) == 89, (
+            f"tool inventory is {len(names)} tools; expected exactly 89 "
             "(76 through issue #29's eight hyperv_ui_* tools, plus issue #112's "
             "four Workstream G tools, plus issue #130's lock_state + unlock, "
-            "plus issue #137's hyperv_ui_snapshot + hyperv_ui_act)"
+            "plus issue #137's hyperv_ui_snapshot + hyperv_ui_act, plus issue "
+            "#127's four hyperv_cdp_* tools)"
         )
     finally:
         importlib.reload(server_module)

@@ -31,7 +31,7 @@ from typing import Any
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.transport_security import TransportSecuritySettings
 
-from . import logemit, pswindows
+from . import hvsock, logemit, pswindows
 from .config import Config, ConfigError
 from .server import VERSION, bootstrap, configure_http_auth, get_mcp
 
@@ -333,6 +333,102 @@ def _token_env_names(cfg: Config) -> list[str]:
     return names
 
 
+def _hvsocket_key() -> str:
+    r"""The host registry key the project's Hyper-V socket service lives at.
+
+    Microsoft's "Make your own integration services" documents
+    ``GuestCommunicationServices\<ServiceGUID>`` with an ``ElementName``
+    value; registration is once per host, from an elevated shell.
+    """
+    return (
+        "HKLM:" + chr(92) + "SOFTWARE" + chr(92) + "Microsoft" + chr(92)
+        + "Windows NT" + chr(92) + "CurrentVersion" + chr(92)
+        + "Virtualization" + chr(92) + "GuestCommunicationServices" + chr(92)
+        + str(hvsock.SERVICE_GUID)
+    )
+
+
+def _hvsocket_register_script() -> str:
+    """Create the service key (idempotent) and name it. No secrets."""
+    key = _hvsocket_key()
+    return (
+        "$ErrorActionPreference = 'Stop'" + chr(10) +
+        "$key = '" + _ps_quote(key) + "'" + chr(10) +
+        "if (-not (Test-Path $key)) {" + chr(10) +
+        "    New-Item -Path $key -Force | Out-Null" + chr(10) +
+        "}" + chr(10) +
+        "New-ItemProperty -Path $key -Name 'ElementName' "
+        "-Value 'hyperv-mcp stream forwarder' -PropertyType String -Force | Out-Null" + chr(10) +
+        "Write-Output 'REGISTERED'" + chr(10)
+    )
+
+
+def _hvsocket_unregister_script() -> str:
+    """Remove the service key if it is present. No secrets."""
+    key = _hvsocket_key()
+    return (
+        "$ErrorActionPreference = 'Stop'" + chr(10) +
+        "$key = '" + _ps_quote(key) + "'" + chr(10) +
+        "if (Test-Path $key) {" + chr(10) +
+        "    Remove-Item -Path $key -Recurse -Force" + chr(10) +
+        "}" + chr(10) +
+        "Write-Output 'NOT-REGISTERED'" + chr(10)
+    )
+
+
+def _hvsocket_check_script() -> str:
+    """Report whether the service key is present. No secrets."""
+    key = _hvsocket_key()
+    return (
+        "$ErrorActionPreference = 'Stop'" + chr(10) +
+        "$key = '" + _ps_quote(key) + "'" + chr(10) +
+        "if (Test-Path $key) { Write-Output 'PRESENT' } else { Write-Output 'ABSENT' }" + chr(10)
+    )
+
+
+def _handle_hvsocket_service(install: bool, uninstall: bool, check: bool) -> int:
+    """Register, remove or probe the project's Hyper-V socket service.
+
+    bootstrap() must run first, exactly as for the logon task: run_ps raises
+    PowerShellTransportError unless pswindows.init() has executed, and a
+    mocked run_ps cannot catch a missing init — a real operator registration
+    would crash while every test passed.
+    """
+    try:
+        bootstrap()
+    except ConfigError as exc:
+        controller_log(f"CONFIG ERROR: {exc}")
+        return 2
+    if install:
+        script = _hvsocket_register_script()
+    elif uninstall:
+        script = _hvsocket_unregister_script()
+    else:
+        script = _hvsocket_check_script()
+    try:
+        result = pswindows.run_ps(script, timeout_s=60)
+    except pswindows.PowerShellTransportError as exc:
+        controller_log(
+            f"ERROR: PowerShell transport failed: {pswindows.redact(str(exc))}")
+        return 1
+    except pswindows.PowerShellBusy as exc:
+        controller_log(
+            f"ERROR: host PowerShell pool busy: {pswindows.redact(str(exc))}")
+        return 1
+    if not result.ok():
+        stderr = pswindows.redact(
+            result.stderr.strip() or result.stdout.strip() or "unknown error")
+        controller_log(
+            f"ERROR: Hyper-V socket service registration failed: {stderr}")
+        return 1
+    out = result.stdout.strip()
+    if check:
+        controller_log(f"hvsocket service: {out or 'ABSENT'} ({_hvsocket_key()})")
+        return 0 if out == "PRESENT" else 1
+    controller_log(out or ("REGISTERED" if install else "NOT-REGISTERED"))
+    return 0
+
+
 def _handle_logon_task(
     cfg: Config, install: bool, host: str = "", port: str = "", allow_anonymous: bool = False
 ) -> int:
@@ -466,6 +562,21 @@ def main(argv: list[str] | None = None) -> int:
         "--uninstall-logon-task", action="store_true",
         help="remove the hyperv-mcp-http logon scheduled task, then exit",
     )
+    parser.add_argument(
+        "--register-hvsocket-service", action="store_true",
+        help="register the project's Hyper-V socket service "
+             "(GuestCommunicationServices) on this host, from an elevated "
+             "shell, once — a tcp relay needs it — then exit",
+    )
+    parser.add_argument(
+        "--unregister-hvsocket-service", action="store_true",
+        help="remove the Hyper-V socket service key from this host, then exit",
+    )
+    parser.add_argument(
+        "--check-hvsocket-service", action="store_true",
+        help="report whether the Hyper-V socket service key is present, "
+             "then exit",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     ns = parser.parse_args(argv)
 
@@ -496,6 +607,13 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         controller_log(f"CONFIG ERROR: {exc}")
         return 2
+    if (ns.register_hvsocket_service or ns.unregister_hvsocket_service
+            or ns.check_hvsocket_service):
+        return _handle_hvsocket_service(
+            install=ns.register_hvsocket_service,
+            uninstall=ns.unregister_hvsocket_service,
+            check=ns.check_hvsocket_service,
+        )
     if ns.install_logon_task or ns.uninstall_logon_task:
         # Issue #70 PRR-044: the logon-task INSTALL embeds an explicit port
         # in the task action, so an explicitly supplied port is validated

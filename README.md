@@ -1,7 +1,7 @@
 # hyperv-mcp (hardened fork)
 
 An MCP (Model Context Protocol) server for Hyper-V VM management and guest
-execution. Exposes 85 tools for VM lifecycle, checkpoint management, kernel
+execution. Exposes 89 tools for VM lifecycle, checkpoint management, kernel
 debug setup (KDNET/KDCOM), and guest file transfer/command execution via
 PowerShell Direct (no WinRM required).
 
@@ -184,7 +184,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.20.0 today) instead of
+  package's version (0.21.0 today) instead of
   the SDK's (the release contract, the complete bump-site
   enumeration, and how to read `version`/`git_revision` live in
   [docs/versioning-policy.md](docs/versioning-policy.md)).
@@ -234,6 +234,59 @@ definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
 
+## 0.21.0 changes
+
+- **Byte-stream relay (`kind="tcp"`, #135):** `hyperv_relay_start` takes a
+  `kind` parameter. `kind="http"` (the default) is unchanged — HTTP requests
+  forwarded through a per-request PowerShell Direct leg under the per-relay
+  secret. `kind="tcp"` carries raw bytes in both directions over a Hyper-V
+  socket (`AF_HYPERV`; a ctypes fallback covers the Pythons that lack the
+  constant, gh-92658), with NO PowerShell process anywhere in the data path:
+  no secret (the loopback listener itself is the access boundary — the same
+  loopback-only bind `#135 AC6` pins), no idle timeout, TCP keepalive on.
+  Each client connection gets its own guest stream, so a short discovery
+  request and a long-lived DevTools socket stay independent by construction.
+  A tcp relay is refused when a remote Hyper-V host is configured (a Hyper-V
+  socket is local to the host) and when the VM's helper does not advertise
+  the new `stream` capability — a helper provisioned before this change has
+  no forwarder, so the caller is told rather than left watching a connect
+  timeout. `http_entry` gains `--register-hvsocket-service` /
+  `--unregister-hvsocket-service` / `--check-hvsocket-service`, which create
+  the `GuestCommunicationServices` registry entry the guest-side forwarder
+  needs under service GUID `0b48efab-5086-42b0-94f6-7ddb08383dd6`.
+- **The CDP channel (#127):** four tools replace the hand-written PowerShell
+  `ClientWebSocket` client the Electron/WebView2 campaign carried — 5,036
+  `hyperv_guest_run_ps` calls in one month, mostly for that client.
+  `hyperv_cdp_targets` lists the attached application's targets (discovery
+  only: the tools never create a target and never close one),
+  `hyperv_cdp_eval` runs `Runtime.evaluate` and returns the value truncated
+  at the documented 1 MiB cap with `truncated=true`, `hyperv_cdp_input`
+  dispatches `Input.dispatchMouseEvent` at a coordinate or at the centre of a
+  snapshot ref's content box (`DOM.scrollIntoViewIfNeeded` then
+  `DOM.getContentQuads`, so the caller supplies no coordinates), and
+  `hyperv_cdp_snapshot` renders `Accessibility.getFullAXTree` with one ref
+  and one text line per node. A ref that no longer resolves in the live tree
+  is refused with `error_class "stale_ref"` and dispatches nothing — the
+  `hyperv_ui_act` discipline. `Browser.close` and `Target.createTarget` are
+  never sent: the first quits the attached application, the second is
+  unsupported there. All four ride a `kind="tcp"` relay and are gated by the
+  `relay` category.
+- **Test-image profile (#138):** `hyperv_ui_helper_provision` takes
+  `test_profile`. `["default"]` selects all seven settings — no display
+  timeout, no sleep, no lock on resume, no inactivity lock, no screen saver,
+  no automatic updates, UAC on the ordinary desktop — and any subset may be
+  named instead. Each setting's previous value is READ, the restore record
+  (`C:\ProgramData\hyperv-mcp\test-profile\restore.json`) is WRITTEN, and
+  only then is the change applied, so a crash mid-leg cannot lose the
+  original; the record write is guarded on the setting not already being
+  recorded, so re-applying the profile cannot overwrite the true original
+  with the profile's own value. `teardown=true` restores every recorded
+  setting (a recorded `$null` registry value is DELETED rather than written
+  back) and then removes the record; a teardown on an install that never had
+  a profile is a no-op. An unknown setting name is refused before any
+  PowerShell runs.
+- Version bump: 0.20.0 -> 0.21.0.
+
 ## 0.20.0 changes
 
 - **GUI application drivability (#128/#129/#134):** an agent can now start and
@@ -271,7 +324,7 @@ the task-spawned controller reads it from the environment.
   click discipline, transient-versus-absent errors, and evidence capture. The
   console click, type and screenshot tool descriptions now point at their
   element-level alternatives (`hyperv_ui_find` / `hyperv_ui_invoke`), so the
-  most capable path is discoverable among the 85 tools.
+  most capable path is discoverable among the 89 tools.
 - Version bump: 0.19.0 -> 0.20.0.
 
 ## 0.19.0 changes
@@ -1767,7 +1820,7 @@ become a published credential):
 
 ---
 
-## Available Tools (85 total)
+## Available Tools (89 total)
 
 Every registered tool in the tables below returns failures the same way:
 the one-envelope contract (`ok/error/error_class/retryable/retry_after_ms`,
@@ -2174,13 +2227,17 @@ each named process exists. `failures` lists exactly what did not return
 (`ps_direct`, `service:<name>`, `process:<name>`). Empty lists = wait for PS
 Direct only.
 
-### Host-to-Guest HTTP Relay (0.3.0)
+### Host-to-Guest Relay (0.3.0; byte-stream kind and CDP tools in this change)
 
 | Tool | Parameters | Returns |
 |------|-----------|---------|
-| `hyperv_relay_start` | `vm_name` or `vm_id`, `guest_port`, `host_port=0` (ephemeral) | `{ok, relay_id, url, host_port, ...}` |
+| `hyperv_relay_start` | `vm_name` or `vm_id`, `guest_port`, `host_port=0` (ephemeral), `kind="http"` | `{ok, relay_id, kind, url, host_port, ...}` |
 | `hyperv_relay_status` | `relay_id?` | `{ok, relays[{relay_id, url, counters, latency, stopped, ...}]}` |
 | `hyperv_relay_stop` | `relay_id` | `{ok, relay_id, host_port, stopped}` |
+| `hyperv_cdp_targets` | `relay_id` | `{ok, relay_id, targets[{id, type, title, url, webSocketDebuggerUrl}]}` |
+| `hyperv_cdp_eval` | `relay_id`, `target_id`, `expression` | `{ok, relay_id, target_id, value, truncated}` |
+| `hyperv_cdp_input` | `relay_id`, `target_id`, `x?`, `y?`, `ref=""` | `{ok, relay_id, target_id, x, y}` (or `ref`) |
+| `hyperv_cdp_snapshot` | `relay_id`, `target_id` | `{ok, relay_id, target_id, nodes[{ref, role, name, backendDOMNodeId, properties}], lines[]}` |
 
 A loopback-only host listener (127.0.0.1; non-loopback binds are refused)
 forwarding each HTTP request through PowerShell Direct to
@@ -2188,8 +2245,8 @@ forwarding each HTTP request through PowerShell Direct to
 web endpoints and DevTools HTTP APIs (`/json/version`, ...) with zero
 dependence on the guest's external addresses and no guest-side component.
 Gated by the `relay` category (`hyperv_relay_start` only — status/stop
-address the host-side registry and carry no category gate). Limits: HTTP
-only (no WebSocket/CDP socket proxying); request bodies <= 1 MiB with
+address the host-side registry and carry no category gate, as do the four
+`hyperv_cdp_*` tools). Limits (the `http` kind): request bodies <= 1 MiB with
 Content-Length (chunked bodies are rejected with 411; a negative
 Content-Length is rejected with 400), responses <= 4 MiB; only path-absolute
 request targets are forwarded (authority/absolute-form targets are rejected
@@ -2236,6 +2293,59 @@ exit. Relay ids carry 128 bits of randomness and job ids 122 (a v4 UUID's
 transcript or audit row cannot be guessed either. Guest-side HTTP error statuses pass through to the caller (a
 guest 404 arrives as 404 with the relay error envelope); a request racing
 `hyperv_relay_stop` receives a clean 503 relay-stopped envelope.
+
+**The `tcp` kind (issue #135).** `kind="tcp"` carries raw bytes in both
+directions over a Hyper-V socket instead: no secret, no idle timeout, TCP
+keepalive on, and NO PowerShell process anywhere in the data path — the
+loopback listener itself is the access boundary (the same loopback-only bind
+the http kind enforces, which is why this kind needs no capability URL). The
+host side is a raw TCP listener rather than an `HTTPServer`, because the HTTP
+request parser would corrupt the bytes it is meant to carry. Each accepted
+client gets its OWN guest stream, so a short discovery request and a
+long-lived WebSocket socket stay independent by construction; the relay writes
+a one-line header (`{"v":1,"port":<guest_port>}`) before any client byte and
+expects an answering `{"ok":true}` line, and a refusal or a half-open stream
+closes the client WITHOUT forwarding a single client byte. A tcp relay is
+refused when a remote Hyper-V host is configured (a Hyper-V socket is local
+to the host) and when the VM's helper does not advertise the `stream`
+capability — a helper provisioned before 0.21.0 has no forwarder, so the
+caller is told rather than left watching a connect timeout. `socket.AF_HYPERV`
+is absent on the supported Pythons (3.10-3.12), so the transport is built on
+a ctypes `ws2_32` binding with the stdlib `socket` path used where the
+constant exists (gh-92658). `http_entry` gains
+`--register-hvsocket-service` / `--unregister-hvsocket-service` /
+`--check-hvsocket-service`, which create, remove and report the
+`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\<GUID>` entry the
+guest-side forwarder needs, under service GUID
+`0b48efab-5086-42b0-94f6-7ddb08383dd6`.
+
+**Driving it with a stock DevTools client.** `hyperv_cdp_targets` rewrites
+each `webSocketDebuggerUrl` to the relay's own loopback listener, so a
+stock client (Playwright's `connect_over_cdp`, the Chrome DevTools
+Frontend, `chrome-remote-interface`) connects to the returned URL
+directly. The `http` kind reaches only the `/json/*` endpoints; the
+WebSocket itself needs `kind="tcp"`.
+
+**What the test-image profile weakens.** `test_profile` deliberately
+disables the display and sleep timeouts, the resume and inactivity
+locks, the screen saver and automatic updates, and moves UAC prompts
+off the secure desktop — every one of them a security or availability
+control on a normal image. It exists for DISPOSABLE TEST GUESTS, which
+is why `hyperv_ui_helper_provision` already gates it behind
+`ui_provision` + `confirm`, and why teardown restores every recorded
+setting before removing the record. A teardown interrupted before the
+restore leg completes leaves the record in place, so a re-run of
+teardown retries the restore rather than losing it; a teardown that
+ran with NO record restores nothing and reports
+`profile_restored: true`.
+
+**Checkpoint-restore warning.** A guest whose test-image profile was
+applied and was then reverted to a checkpoint taken BEFORE the
+profile ran still carries the profile's changes (the checkpoint
+predates them), and its restore record — which lives in the guest's
+filesystem, not in the checkpoint — describes values the reverted
+image never held. Re-provision or re-apply the profile after a
+checkpoint revert; do not run teardown against a reverted image.
 
 **Per-request latency.** Each successful request's guest-leg elapsed time is
 recorded in a per-relay ring of the last 1024 samples, and `relay_status`
@@ -2339,7 +2449,7 @@ no window scope searches the FOREGROUND window; the closed `scope` key
 | `hyperv_ui_invoke` | `ui_input` | Invoke/Toggle/SelectionItem/ExpandCollapse on an element |
 | `hyperv_ui_set_value` `secret_ref?` (0.18.0: `env:NAME` allowlisted by `secret_env_names`, or policy-allowlisted `file:PATH`; mutually exclusive with `value`; the resolved value is set, only the length is reported) | `ui_input` | set a Value-pattern property (result reports the length, never the value) |
 | `hyperv_ui_focus` | `ui_input` | focus an element (locked sessions refuse: `no_interactive_desktop` — as do invoke and set_value) |
-| `hyperv_ui_helper_provision` | `ui_provision` + confirm | install + start the helper (`teardown=true` removes it); optional autologon |
+| `hyperv_ui_helper_provision` | `ui_provision` + confirm | install + start the helper (`teardown=true` removes it); optional autologon; optional `test_profile` (a test-image profile, restored at teardown) |
 
 Provisioning (`hyperv_ui_helper_provision(autologon=true, confirm=true)`)
 configures automatic logon for the test account: the password is stored ONLY
@@ -2347,8 +2457,26 @@ as the LSA secret `DefaultPassword` (never a plain-text registry value) and a
 per-user AtLogOn scheduled task (Interactive, RunLevel Highest, restart 3x/1m)
 starts the helper at logon. This is for DISPOSABLE TEST IMAGES; the server is
 a lab tool. `teardown=true` is provisioning's inverse: it stops the task,
-removes every helper directory, deletes the LSA secret and restores the
-Winlogon values.
+removes every helper directory, deletes the LSA secret, restores the
+Winlogon values and restores every setting a test-image profile changed.
+
+Test-image profile (`test_profile=["default"]`, issue #138): one leg per
+selected setting, in the order READ the current value, WRITE the restore record
+(`C:\ProgramData\hyperv-mcp\test-profile\restore.json`), CHANGE the
+setting — so a crash mid-leg cannot lose the original value. The record write
+is guarded on the setting not already being recorded, so re-applying the
+profile cannot overwrite the true original with the profile's own value. The
+closed set is `no_display_timeout` (powercfg `monitor-timeout-ac`/`-dc` = 0),
+`no_sleep` (powercfg `standby-timeout-ac`/`-dc` = 0 plus `/h off`),
+`no_lock_on_resume` (powercfg `CONSOLELOCK` = 0),
+`no_inactivity_lock` (`InactivityTimeoutSecs` = 0), `no_screen_saver`
+(`ScreenSaveActive` = '0'), `no_auto_update` (`NoAutoUpdate` = 1 under
+`...\Windows\WindowsUpdate\AU`) and `uac_on_desktop`
+(`PromptOnSecureDesktop` = 0). Teardown restores every recorded setting — a
+recorded `$null` registry value is DELETED rather than written back, because
+the image never carried it — and then removes the record. A teardown on an
+install that never had a profile is a no-op. An unknown setting name is
+refused before any PowerShell runs.
 
 Session honesty: every request carries its target VM identity (the guest
 SMBIOS UUID recorded at provision time), user SID, and interactive session;
@@ -2774,7 +2902,7 @@ commit-guarded click discipline, transient-versus-absent errors, and evidence
 capture. List it with your client's prompt listing and fetch it before a GUI
 session; the console click/type/screenshot tool descriptions also point at
 their element-level alternatives so the most capable path is discoverable
-among the 85 tools.
+among the 89 tools.
 
 ### MDT Deployment Playbook (agent-driven)
 

@@ -72,7 +72,10 @@ def test_host_capabilities_match_helper_report():
     caps = set(re.findall(r"'([a-z:_.]+)'",
                           _ps_function_body(_helper_text(),
                                             "Get-HelperCapabilities")))
-    host = uia.BASE_CAPABILITIES | {uia.ELECTRON_CAPABILITY}
+    # issue #135 adds the byte-stream forwarder capability; the seam
+    # guard must know about it exactly as it learned about electron.
+    host = uia.BASE_CAPABILITIES | {uia.ELECTRON_CAPABILITY,
+                                    uia.STREAM_CAPABILITY}
     assert caps == host, (
         "one-sided capability seam: the helper's reported capability set "
         f"{sorted(caps)} != the host's declared set {sorted(host)}; every "

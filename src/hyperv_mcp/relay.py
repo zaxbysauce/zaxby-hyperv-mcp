@@ -1,11 +1,15 @@
-"""Host-to-guest HTTP relay over PowerShell Direct (AC12, plan D2a).
+"""Host-to-guest relay over PowerShell Direct (AC12, plan D2a).
 
 A loopback-only host listener forwards each HTTP request through one PS
 Direct Invoke-WebRequest to http://127.0.0.1:<guest_port><path> INSIDE the
 guest — reaching guest-local endpoints (DevTools HTTP APIs, test web
 servers) with zero dependence on the guest's external addresses and with no
-guest-side component. HTTP only: WebSocket / raw TCP proxying is out of
-scope (disclosed in the README).
+guest-side component. That is the `http` kind. Issue #135 adds a `tcp` kind
+that carries raw bytes in both directions over a Hyper-V socket with no
+PowerShell process in the data path (no secret, no idle timeout, TCP
+keepalive on), which is what the WebSocket/CDP channel of issue #127 rides;
+the `http` kind's documented limits (no WebSocket/CDP socket proxying) are
+scoped to it, disclosed in the README.
 
 Lock policy: the relay lifecycle tools are audited tool calls, but the
 per-request PS Direct legs deliberately SKIP vm_lock (pinned in the plan) —
@@ -49,7 +53,9 @@ from __future__ import annotations
 import base64
 import json
 import secrets
+import socket
 import threading
+import time
 from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -59,6 +65,7 @@ from . import consolebench, guestjobs, policy, pswindows, statestore, vmident
 from .config import Config
 from .credentials import CredentialError, CredentialSet
 from .diagnostics import build_guest_script
+from .errors import StreamUnavailable
 
 _LOOPBACK_BINDS = {"127.0.0.1", "localhost", "::1"}
 _MAX_BODY_BYTES = 1024 * 1024
@@ -309,6 +316,21 @@ def clear_registry_for_tests() -> None:
         _store_wrote.clear()
     for entry in entries:
         _shutdown_server(entry)
+
+
+def lookup_entry(relay_id: str) -> dict[str, Any] | None:
+    """The live registry entry for relay_id, or None (no ownership filter).
+
+    Issue #127: the CDP tools address a relay by the id relay_start returned
+    and need the listener's bind/host_port to dial it. They never need the
+    entry's credential (a tcp relay nulls it at start, issue #135) and they
+    apply no ownership filter — the relay_id is itself the capability, and
+    the loopback listener is the access boundary. Returns the LIVE dict, so
+    a caller must treat it as read-mostly shared state (the entry's counters
+    and bridges are mutated the same way by the relay's own threads).
+    """
+    with _relays_lock:
+        return _relays.get(relay_id or "")
 
 
 def peek_vm_id(relay_id: str, cfg: Config | None = None,
@@ -735,7 +757,322 @@ class _RelayServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
+# -- the tcp kind (issue #135) ---------------------------------------------------
+#
+# A tcp relay carries raw bytes, in both directions, between a host loopback
+# port and a loopback port inside the guest — over a Hyper-V socket, with no
+# PowerShell process anywhere in the data path. Wire protocol (#135 Design 3):
+# after connecting, the host writes one line `{"v":1,"port":<guest_port>}` and
+# reads one line back, `{"ok":true}` or `{"ok":false,"error_class":"..."}`.
+# Everything after that is raw bytes until either side closes.
+#
+# No secret and no idle timeout on this kind: stock DevTools clients cannot
+# keep a path prefix (they read the socket URL from `/json/version`, which
+# Chromium builds from the Host header), and the listener is loopback-only.
+# TCP keepalive is on so a long-lived CDP session is not cut by a NAT.
+
+_STREAM_CAPABILITY = "stream"
+_RELAY_KINDS = ("http", "tcp")
+# A Hyper-V socket is local to the host, so a tcp relay is refused outright
+# when a remote Hyper-V host is configured.
+_REMOTE_HOST_REFUSAL = (
+    "refusing a tcp relay while a remote Hyper-V host is configured: "
+    "a Hyper-V socket is local to the host, so a tcp relay requires local mode"
+)
+_STREAM_HEADER_VERSION = 1
+_STREAM_ACK_TIMEOUT_S = 30.0
+
+
+def _stream_header(guest_port: int) -> bytes:
+    """The one-line header the host writes before any client byte."""
+    return (
+        json.dumps({"v": _STREAM_HEADER_VERSION, "port": int(guest_port)},
+                   separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _read_line(sock: Any, limit: int = 4096,
+               timeout_s: float | None = None) -> bytes:
+    """Read through the first newline, bounded. Empty bytes = peer closed.
+
+    The deadline is monotonic and absolute, so a guest that accepts the socket
+    and then never answers cannot pin a bridge thread forever: the read raises
+    `TimeoutError` and the bridge is torn down. An empty return is the distinct
+    "the peer closed without answering" outcome.
+
+    `timeout_s=None` resolves to the module global AT CALL TIME. A default
+    ARGUMENT would bind the value once at import, which freezes the deadline
+    against every later change (and makes it untestable).
+    """
+    if timeout_s is None:
+        timeout_s = _STREAM_ACK_TIMEOUT_S
+    buf = b""
+    deadline = time.monotonic() + timeout_s
+    while len(buf) < limit:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"the guest stream did not answer within {timeout_s:g}s")
+        sock.settimeout(max(0.01, min(remaining, 0.5)))
+        try:
+            chunk = sock.recv(1)
+        except TimeoutError:
+            continue
+        if not chunk:
+            return b""
+        buf += chunk
+        if chunk == b"\n":
+            return buf
+    return b""
+
+
+def _drain_and_close(sock: Any, drain_s: float = 1.0) -> None:
+    """Close a socket so the peer sees a clean EOF, never a reset.
+
+    `close()` on a socket that still holds UNREAD received data makes Windows
+    send RST rather than FIN, and the peer's `recv` then raises ECONNRESET
+    instead of returning b"" — a refusal the client cannot tell from a crash.
+    Half-closing first sends the FIN, and draining the receive queue (the
+    bytes this side deliberately did not forward) keeps the reset from
+    replacing it. Idempotent; never raises.
+    """
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_WR)
+    except Exception:
+        pass
+    try:
+        sock.settimeout(0.1)
+        deadline = time.monotonic() + drain_s
+        while time.monotonic() < deadline:
+            if not sock.recv(65536):
+                break
+    except Exception:
+        pass
+    try:
+        sock.close()
+    except Exception:
+        pass
+
+
+class _TcpBridge:
+    """One client connection carried on its own guest stream.
+
+    The guest stream is dialled per client connection (never shared), so two
+    clients are independent by construction — a DevTools client opens short
+    discovery requests beside its long-lived socket. When the guest forwarder
+    answers the header with a refusal or closes without answering, the client
+    connection is closed and NO client byte is forwarded.
+    """
+
+    def __init__(self, cfg: Config, vm_id: str, guest_port: int, conn: Any,
+                 entry: dict[str, Any]) -> None:
+        self._cfg = cfg
+        self._vm_id = vm_id
+        self._guest_port = int(guest_port)
+        self._conn = conn
+        self._entry = entry
+        self._guest: Any = None
+        self._closed = threading.Event()
+        self._pumps: list[threading.Thread] = []
+
+    # -- lifecycle ---------------------------------------------------------------
+
+    def start(self) -> None:
+        thread = threading.Thread(target=self._run, daemon=True,
+                                  name=f"hyperv-tcp-bridge-{id(self):x}")
+        thread.start()
+        self._entry["bridges"].append(self)
+
+    def close(self) -> None:
+        """Close both ends. Idempotent; never raises.
+
+        The client end is drained before it is closed: a refusal must reach
+        the client as a clean EOF, not as a reset it cannot distinguish from a
+        crash (issue #135 AC3).
+        """
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        _drain_and_close(self._conn)
+        _drain_and_close(self._guest)
+        if self in self._entry["bridges"]:
+            self._entry["bridges"].remove(self)
+
+    # -- internals ---------------------------------------------------------------
+
+    def _run(self) -> None:
+        # Whether the bridge ever reached the pump. A bridge that pumped and
+        # then saw EOF is a COMPLETED connection, not an error: counting it as
+        # one made every ordinary short request (a /json listing) look like a
+        # failure in relay_status.
+        established = False
+        try:
+            self._conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            try:
+                self._conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except Exception:
+                pass
+            # The single transport seam: hvsock.connect. The unit checks
+            # monkeypatch it to dial a local fake; production uses
+            # socket.AF_HYPERV where present and the ctypes path otherwise.
+            from . import hvsock
+
+            self._guest = hvsock.connect(
+                self._vm_id, hvsock.SERVICE_GUID, timeout_s=_STREAM_ACK_TIMEOUT_S)
+            self._guest.settimeout(_STREAM_ACK_TIMEOUT_S)
+            self._guest.sendall(_stream_header(self._guest_port))
+            ack = _read_line(self._guest)
+            if not ack:
+                # The forwarder closed without answering: a half-open bridge
+                # must never be left talking to a client.
+                return
+            try:
+                answer = json.loads(ack.decode("utf-8", "replace"))
+            except ValueError:
+                return
+            if not answer.get("ok"):
+                # A refusal is a protocol answer, not a transport failure:
+                # close the client and forward nothing.
+                return
+            established = True
+            self._pump()
+        except Exception:
+            # No fallback transport inside a tcp relay (#135 Design 7): when
+            # the guest stream cannot be opened the client connection is
+            # closed and the failure counted; nothing is retried over
+            # PowerShell Direct.
+            pass
+        finally:
+            ctx = self._entry.get("context")
+            if ctx is not None and not established:
+                with ctx["counter_lock"]:
+                    ctx["counters"]["errors"] += 1
+            self.close()
+
+    def _pump(self) -> None:
+        """Full-duplex pump: one thread per direction, both bounded by close."""
+        def _copy(src: Any, dst: Any, key: str) -> None:
+            try:
+                while not self._closed.is_set():
+                    chunk = src.recv(65536)
+                    if not chunk:
+                        break
+                    dst.sendall(chunk)
+                    ctx = self._entry.get("context")
+                    if ctx is not None:
+                        with ctx["counter_lock"]:
+                            ctx["counters"][key] += len(chunk)
+            except Exception:
+                pass
+            finally:
+                # Either direction ending ends the bridge: a half-closed
+                # stream would otherwise pin the other side open forever.
+                self.close()
+
+        for src, dst, key in (
+            (self._conn, self._guest, "bytes_in"),
+            (self._guest, self._conn, "bytes_out"),
+        ):
+            t = threading.Thread(target=_copy, args=(src, dst, key), daemon=True,
+                                 name=f"hyperv-tcp-pump-{id(self):x}")
+            t.start()
+            self._pumps.append(t)
+        for t in self._pumps:
+            t.join()
+
+
+class _TcpRelayServer:
+    """A loopback TCP listener that bridges every accepted client.
+
+    Deliberately NOT an `HTTPServer`: the tcp kind carries raw bytes, so the
+    HTTP request parser would corrupt them. The shape mirrors `_RelayServer`
+    (a `server`/`thread` pair on the registry entry) so `relay_status` and
+    `relay_stop` need no kind-specific branch.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, address: tuple[str, int], entry: dict[str, Any]) -> None:
+        self._entry = entry
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(address)
+        self._sock.listen(16)
+        self._sock.settimeout(0.2)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True,
+                                        name=f"hyperv-tcp-{entry['relay_id']}")
+        self._accepts = 0
+
+    # -- the server_address contract relay_start reads ---------------------------
+
+    @property
+    def server_address(self) -> tuple[str, int]:
+        return self._sock.getsockname()  # type: ignore[return-value]
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, _addr = self._sock.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            self._accepts += 1
+            ctx = self._entry.get("context")
+            if ctx is not None:
+                with ctx["counter_lock"]:
+                    ctx["counters"]["requests"] += 1
+            bridge = _TcpBridge(
+                self._entry["context"]["cfg"], self._entry["vm_id"],
+                self._entry["guest_port"], conn, self._entry)
+            bridge.start()
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=5)
+
+    def server_close(self) -> None:
+        # Every bridged connection dies with the listener: a stopped relay
+        # must leave no thread or socket behind.
+        for bridge in list(self._entry["bridges"]):
+            bridge.close()
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
 # -- public API ------------------------------------------------------------------
+
+
+def _require_stream_capability(cfg: Config, vm_name: str, vm_id: str,
+                               cred: CredentialSet | None) -> None:
+    """Refuse a tcp relay unless the VM's helper advertises `stream`.
+
+    A helper installed before issue #135 has no forwarder, so the caller must
+    learn what to do rather than see a connect timeout.
+    """
+    from . import uia
+
+    caps = uia.helper_capabilities(cfg, vm_name, cred=cred, vm_id=vm_id)
+    if _STREAM_CAPABILITY not in set(caps or ()):
+        # StreamUnavailable subclasses ValueError, so the module-level callers
+        # (and the frozen AC9 check) keep catching ValueError — while the tool
+        # envelope now carries its own error_class instead of "invalid".
+        raise StreamUnavailable(
+            f"the helper on '{vm_name or vm_id}' does not advertise the "
+            f"{_STREAM_CAPABILITY!r} capability, so no guest stream forwarder "
+            "is installed; run hyperv_ui_helper_provision on a helper that "
+            "advertises it (stream_unavailable)"
+        )
 
 
 def relay_start(
@@ -746,10 +1083,18 @@ def relay_start(
     *,
     host_port: int = 0,
     bind: str = "127.0.0.1",
+    kind: str = "http",
     cred: CredentialSet | None = None,
     owner: str | None = None,
 ) -> dict:
-    """Start a loopback HTTP relay to the guest's 127.0.0.1:guest_port.
+    """Start a loopback relay to the guest's 127.0.0.1:guest_port.
+
+    `kind="http"` (the default, unchanged) forwards HTTP requests through a
+    per-request PowerShell Direct leg and carries the per-relay secret as a
+    path prefix. `kind="tcp"` (issue #135) carries raw bytes in both
+    directions over a Hyper-V socket, with no PowerShell process in the data
+    path: no secret, no idle timeout, TCP keepalive on. Both kinds share the
+    registry, the ownership rule, the cap, status and stop.
 
     The VM may be addressed by `vm_name` or `vm_id` (exactly one required;
     vmident.resolve enforces identity and policy). The stored GUID addresses
@@ -773,10 +1118,25 @@ def relay_start(
         raise ValueError("host_port must be 0..65535 (0 = ephemeral)")
     if bind.lower() not in _LOOPBACK_BINDS:
         raise ValueError(f"refusing non-loopback bind {bind!r}: the relay is loopback-only")
-    policy.require_category(cfg, "relay", f"relay HTTP requests into guest '{vm_name or vm_id}'")
+    if kind not in _RELAY_KINDS:
+        raise ValueError(
+            f"unknown relay kind {kind!r}; expected one of {list(_RELAY_KINDS)}")
+    policy.require_category(
+        cfg, "relay",
+        f"relay {kind} bytes into guest '{vm_name or vm_id}'")
+    if kind == "tcp" and pswindows.hyperv_host(cfg):
+        # A Hyper-V socket is local to the host, so a tcp relay cannot cross
+        # to another one. Refused BEFORE the VM is resolved: a remote config
+        # often cannot resolve locally, and the caller must hear the real
+        # reason rather than an empty-Id resolution failure.
+        raise ValueError(_REMOTE_HOST_REFUSAL)
     # Resolve once (VM policy runs inside vmident.resolve on the governing
     # name — caller-supplied or resolved from the GUID).
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    if kind == "tcp":
+        # The helper must advertise the forwarder; a helper installed before
+        # this issue has none.
+        _require_stream_capability(cfg, ref.name, ref.id, cred)
 
     relay_id = f"relay-{guest_port}-{secrets.token_hex(16)}"
     secret = secrets.token_urlsafe(16)
@@ -820,12 +1180,15 @@ def relay_start(
                 rows = {row.relay_id: row for row in store.relay_rows()}
                 known = set(_relays) | set(rows)
                 for key in known:
-                    entry = _relays.get(key)
-                    if entry is not None:
+                    # Named local_entry (not entry): the registry entry this
+                    # start binds further down is also called `entry`, and a
+                    # `dict | None` binding here would poison its inferred type.
+                    local_entry = _relays.get(key)
+                    if local_entry is not None:
                         live_target = (
-                            not entry.get("stopped")
-                            and entry["vm_id"] == ref.id
-                            and entry["guest_port"] == guest_port
+                            not local_entry.get("stopped")
+                            and local_entry["vm_id"] == ref.id
+                            and local_entry["guest_port"] == guest_port
                         )
                     else:
                         live_target = False  # store-only: interrupted by construction
@@ -965,10 +1328,42 @@ def relay_start(
         }
         handler = type("BoundRelayHandler", (_RelayHandler,), {"context": context})
         context["relay_id"] = relay_id
-        server = _RelayServer((bind, int(host_port)), handler)
-        thread = threading.Thread(
-            target=server.serve_forever, name=f"hyperv-relay-{relay_id}", daemon=True,
-        )
+        # The registry entry is built BEFORE the listener so a tcp bridge can
+        # reach it (it counts into the entry's counters and registers itself
+        # for stop). Every later mutation lands on this same dict.
+        entry: dict[str, Any] = {
+            "relay_id": relay_id,
+            "vm_name": ref.name,
+            "vm_id": ref.id,
+            "guest_port": int(guest_port),
+            "bind": bind,
+            "kind": kind,
+            # Live tcp bridges, closed by relay_stop (issue #135 AC10).
+            "bridges": [],
+            "owner": owner,
+            "started_at": _utc_now_iso(),
+            "stopped": False,
+            # Issue #30: the credential identity rides the entry so the row
+            # persists it (never the secret) and restore binds on it.
+            "cred_profile": guestjobs._cred_profile_label(cred),
+            "cred_username": str(getattr(cred, "username", "") or ""),
+        }
+        entry["context"] = context
+        if kind == "tcp":
+            # Raw bytes, so no HTTP request parser and no per-relay secret:
+            # the loopback listener itself is the access boundary (#135
+            # Design, "Why no secret on this kind").
+            server: Any = _TcpRelayServer((bind, int(host_port)), entry)
+            thread = server._thread
+        else:
+            server = _RelayServer((bind, int(host_port)), handler)
+            thread = threading.Thread(
+                target=server.serve_forever, name=f"hyperv-relay-{relay_id}",
+                daemon=True,
+            )
+        entry["server"] = server
+        entry["thread"] = thread
+        entry["host_port"] = server.server_address[1]
     except OSError as exc:
         _release()
         raise RuntimeError(f"could not bind {bind}:{host_port or 0}: {exc}") from None
@@ -983,26 +1378,13 @@ def relay_start(
         raise
     try:
         thread.start()
-        entry = {
-            "relay_id": relay_id,
-            "vm_name": ref.name,
-            "vm_id": ref.id,
-            "guest_port": int(guest_port),
-            "bind": bind,
-            "host_port": server.server_address[1],
-            "server": server,
-            "thread": thread,
-            "context": context,
-            "owner": owner,
-            "started_at": _utc_now_iso(),
-            "stopped": False,
-            # Issue #30: the credential identity rides the entry so the row
-            # persists it (never the secret) and restore binds on it.
-            "cred_profile": guestjobs._cred_profile_label(cred),
-            "cred_username": str(getattr(cred, "username", "") or ""),
-        }
         with _relays_lock:
             _relays[relay_id] = entry
+        if kind == "tcp":
+            # A tcp relay keeps no guest credential after start: the Hyper-V
+            # socket is addressed by GUID, so no credential is needed to dial
+            # it, and retaining one would only widen its lifetime.
+            entry["context"]["cred"] = None
         # Registry lock released first: store-lock is the outer order.
         store.relay_upsert(_row(entry, statestore.RELAY_ACTIVE))
         # Issue #24: the (re-)registration transition's event (best-effort).
@@ -1035,16 +1417,24 @@ def relay_start(
             pass
         raise
     host_port_actual = entry["host_port"]
+    if kind == "tcp":
+        # No secret on this kind, so the URL is the bare loopback listener.
+        # A stock DevTools client reads its socket URL from /json/version,
+        # which Chromium builds from the Host header with no path prefix.
+        url = f"http://{bind}:{host_port_actual}"
+    else:
+        # Capability URL (issue #11): the per-relay secret rides as the
+        # first path segment; requests without it get 401 at the listener.
+        url = f"http://{bind}:{host_port_actual}/{secret}/"
     return {
         "ok": True,
         "relay_id": relay_id,
+        "kind": kind,
         "vm_name": ref.name,
         "guest_port": int(guest_port),
         "bind": bind,
         "host_port": host_port_actual,
-        # Capability URL (issue #11): the per-relay secret rides as the
-        # first path segment; requests without it get 401 at the listener.
-        "url": f"http://{bind}:{host_port_actual}/{secret}/",
+        "url": url,
         "started_at": entry["started_at"],
     }
 
