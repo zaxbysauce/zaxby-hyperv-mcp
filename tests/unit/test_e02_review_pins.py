@@ -312,6 +312,7 @@ def test_tool_scopes_map_is_pinned():
         "hyperv_vm_tpm_set": "lifecycle", "hyperv_vm_secureboot_set": "lifecycle",
         "hyperv_vm_set_resolution": "lifecycle",
         # guest_exec
+        "hyperv_guest_start_interactive": "guest_exec",
         "hyperv_guest_run_ps": "guest_exec", "hyperv_guest_run": "guest_exec",
         "hyperv_victim_run": "guest_exec", "hyperv_victim_run_ps": "guest_exec",
         "hyperv_guest_job_start": "guest_exec", "hyperv_guest_job_stop": "guest_exec",

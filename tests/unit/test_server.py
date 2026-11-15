@@ -14,6 +14,7 @@ import pytest
 import hyperv_mcp.server as server_module
 
 CRED_TOOLS = {
+    "hyperv_guest_start_interactive",
     "hyperv_configure_kdnet", "hyperv_configure_kdcom",
     "hyperv_guest_run", "hyperv_guest_run_ps",
     "hyperv_guest_put", "hyperv_guest_get",
@@ -29,6 +30,7 @@ CRED_TOOLS = {
     "hyperv_ui_snapshot", "hyperv_ui_act",
 }
 TOOL_NAMES = {
+    "hyperv_guest_start_interactive",
     "hyperv_list_vms", "hyperv_get_vm_info", "hyperv_start_vm", "hyperv_stop_vm",
     "hyperv_reset_vm", "hyperv_checkpoint_create", "hyperv_checkpoint_list",
     "hyperv_checkpoint_restore", "hyperv_checkpoint_remove",
@@ -79,6 +81,7 @@ TOOL_NAMES = {
     "hyperv_ui_snapshot", "hyperv_ui_act",
 }
 CONFIRM_TOOLS = {
+    "hyperv_guest_start_interactive",
     "hyperv_stop_vm", "hyperv_reset_vm", "hyperv_checkpoint_restore",
     "hyperv_checkpoint_remove", "hyperv_configure_kdnet",
     "hyperv_configure_kdcom", "hyperv_guest_run_ps", "hyperv_guest_run",
@@ -122,7 +125,7 @@ def test_tool_inventory_registered(fresh_server):
     # 76 with issue #29's eight hyperv_ui_* tools; 80 with PR #112's four
     # Workstream G tools (vm_clone, vm_remove, deployment_status, harvest);
     # 84 with issue #137's hyperv_ui_snapshot + hyperv_ui_act.
-    assert len(schemas) == 84
+    assert len(schemas) == 85
 
 
 def test_every_vm_tool_schema_has_vm_id(fresh_server):

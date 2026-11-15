@@ -451,24 +451,27 @@ def test_password_field_value_is_never_returned(lab_cfg, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_msaa_is_advertised_only_with_a_live_bridge():
-    """C5: the helper ships Get-HelperCapabilities, returning @('uia')
-    plus 'msaa' ONLY when the LegacyIAccessible pattern probe resolved
-    ($legacyPattern -ne $null). The function body is extracted from the
-    shipped script text and executed under Windows PowerShell 5.1 with
-    $legacyPattern forced on each side. Skipped when powershell.exe is
-    absent (non-Windows).
+    """C5: the helper ships Get-HelperCapabilities, returning @('uia'),
+    'adapter:electron' (issue #129: the helper implements the electron
+    adapter's behaviour, so it reports the capability the host's
+    _adapter_gate requires) plus 'msaa' ONLY when the LegacyIAccessible
+    pattern probe resolved ($legacyPattern -ne $null). The function body is
+    extracted from the shipped script text and executed under Windows
+    PowerShell 5.1 with $legacyPattern forced on each side. Skipped when
+    powershell.exe is absent (non-Windows).
     RED at base (the function does not exist), GREEN after the fix."""
     if shutil.which("powershell.exe") is None:
         pytest.skip("powershell.exe is absent (non-Windows)")
     body = _extract_ps_function(_helper_text(), "Get-HelperCapabilities")
 
     dead = _caps_under_powershell(body, None)
-    assert dead == {"uia"}, (
+    assert dead == {"uia", "adapter:electron"}, (
         "with the LegacyIAccessible probe unresolved ($legacyPattern is "
-        f"$null) the capabilities must be exactly {{'uia'}}, got {dead}")
+        f"$null) the capabilities must be exactly {{'uia', 'adapter:electron'}} "
+        f"(issue #129), got {dead}")
 
     live = _caps_under_powershell(body, "legacy-live")
-    assert live == {"uia", "msaa"}, (
+    assert live == {"uia", "msaa", "adapter:electron"}, (
         "with the LegacyIAccessible probe resolved ($legacyPattern "
-        f"non-null) the capabilities must be exactly {{'uia', 'msaa'}}, "
-        f"got {live}")
+        f"non-null) the capabilities must be exactly "
+        f"{{'uia', 'msaa', 'adapter:electron'}} (issue #129), got {live}")
