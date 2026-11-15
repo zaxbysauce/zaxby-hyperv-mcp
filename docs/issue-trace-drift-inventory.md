@@ -10,34 +10,35 @@ reported below (issue #143).
 
 | trace | pairs | OK | CHANGED | verify-checkpoint |
 |---|---:|---:|---:|---|
-| 10-agent-identity-audit-correlation | 12 | 11 | 1 | exit 1 |
+| 10-agent-identity-audit-correlation | 12 | 12 | 0 | clean |
 | 11-job-relay-ownership | 12 | 12 | 0 | clean |
 | 115-86-71-60-collated | 9 | 9 | 0 | clean |
 | 12-remote-hyperv-host | 7 | 7 | 0 | clean |
 | 125-126-console-accuracy-commit-guard | 11 | 11 | 0 | clean |
 | 128-129-134-gui-drivability | 20 | 20 | 0 | clean |
-| 13-stdio-proxy | 10 | 8 | 2 | exit 1 |
+| 13-stdio-proxy | 10 | 10 | 0 | clean |
 | 136-137-uia-element-contract | 27 | 27 | 0 | clean |
 | 140-126-uia-state-receipt | 44 | 44 | 0 | clean |
 | 143-130-collated | 12 | 12 | 0 | clean |
-| 17-rgb565-native-decode | 12 | 11 | 1 | exit 1 |
+| 147-trace-drift-repair | 4 | 4 | 0 | clean |
+| 17-rgb565-native-decode | 12 | 12 | 0 | clean |
 | 18-console-one-ps-process-per-call | 17 | 17 | 0 | clean |
-| 19-screenshot-output-options | 23 | 22 | 1 | exit 1 |
+| 19-screenshot-output-options | 23 | 23 | 0 | clean |
 | 20-per-call-timing-soak-benchmark | 17 | 17 | 0 | clean |
 | 21-psdirect-session-reuse | 31 | 31 | 0 | clean |
 | 22-durable-state-store | 15 | 15 | 0 | clean |
-| 23-leases-with-fencing-tokens | 16 | 10 | 6 | exit 1 |
-| 24-durable-operation-handles | 19 | 17 | 2 | exit 1 |
+| 23-leases-with-fencing-tokens | 16 | 16 | 0 | clean |
+| 24-durable-operation-handles | 19 | 19 | 0 | clean |
 | 25-f1-console-keyboard-click-origin | 11 | 11 | 0 | clean |
-| 26-checkpoint-type-standard | 11 | 10 | 1 | exit 1 |
+| 26-checkpoint-type-standard | 11 | 11 | 0 | clean |
 | 27-frame-stable-wait | 14 | 14 | 0 | clean |
-| 29-uia-helper-element-desktop | 19 | 2 | 17 | exit 1 |
-| 30-per-vm-credential-profiles | 30 | 29 | 1 | exit 1 |
-| 31-32-33-94-workstream-g-deployment | 18 | 14 | 4 | exit 1 |
+| 29-uia-helper-element-desktop | 19 | 19 | 0 | clean |
+| 30-per-vm-credential-profiles | 30 | 30 | 0 | clean |
+| 31-32-33-94-workstream-g-deployment | 18 | 18 | 0 | clean |
 | 31-79-live-host-confirmation | 7 | 7 | 0 | clean |
-| 44-vm-display-resolution | 8 | 0 | 8 | exit 1 |
+| 44-vm-display-resolution | 8 | 8 | 0 | clean |
 | 45-console-direct-wmi | 8 | 8 | 0 | clean |
-| 5-ps51-sanitized-env | 8 | 0 | 8 | exit 1 |
+| 5-ps51-sanitized-env | 8 | 8 | 0 | clean |
 | 55-108-31-32-33-collated | 14 | 14 | 0 | clean |
 | 59-64-68-70-hardening-wave | 15 | 15 | 0 | clean |
 | 6-guest-put-get-policy | 13 | 13 | 0 | clean |
@@ -45,7 +46,7 @@ reported below (issue #143).
 | 64-68-collated | 11 | 11 | 0 | clean |
 | 67-118-release-vendor-provenance | 10 | 10 | 0 | clean |
 | 7-guest-jobs-truthful-reporting | 13 | 13 | 0 | clean |
-| 74-72-88-cost-latency-accounting | 17 | 15 | 2 | exit 1 |
+| 74-72-88-cost-latency-accounting | 17 | 17 | 0 | clean |
 | 75-76-78-81-83-84-collated | 26 | 26 | 0 | clean |
 | 77-28-console-actor-batched-sequences | 18 | 18 | 0 | clean |
 | 8-vm-guid-identity | 11 | 11 | 0 | clean |
@@ -69,99 +70,7 @@ wave's bookkeeping and is never a gate failure.
 
 ## Drift detail (CHANGED pairs)
 
-### 10-agent-identity-audit-correlation (exit 1)
-
-- `CHANGED tests/unit/test_server.py 902223243a1b4c3a04794d7e1ff849c8f8d36e95 78030b2e91c8bc838a2edd5a7a97881eb4b5f6df (C12)`
-
-### 13-stdio-proxy (exit 1)
-
-- `CHANGED tests/unit/test_server.py 902223243a1b4c3a04794d7e1ff849c8f8d36e95 78030b2e91c8bc838a2edd5a7a97881eb4b5f6df (C11)`
-- `CHANGED tests/unit/test_server.py 902223243a1b4c3a04794d7e1ff849c8f8d36e95 78030b2e91c8bc838a2edd5a7a97881eb4b5f6df (C12)`
-
-### 17-rgb565-native-decode (exit 1)
-
-- `CHANGED tests/unit/test_evidence.py dcc0814bb59788dcdc8a2a7df3d29cbd3fcf3042 c72b1d2b761eb5a16ae0775a2d331910e2d5a2f7 (C12)`
-
-### 19-screenshot-output-options (exit 1)
-
-- `CHANGED tests/unit/test_server.py 902223243a1b4c3a04794d7e1ff849c8f8d36e95 78030b2e91c8bc838a2edd5a7a97881eb4b5f6df (C15)`
-
-### 23-leases-with-fencing-tokens (exit 1)
-
-- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 9d48ef849fd75233607cb1984615229ee14ce9ff (C1)`
-- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 9d48ef849fd75233607cb1984615229ee14ce9ff (C2)`
-- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 9d48ef849fd75233607cb1984615229ee14ce9ff (C3)`
-- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 9d48ef849fd75233607cb1984615229ee14ce9ff (C12)`
-- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 9d48ef849fd75233607cb1984615229ee14ce9ff (C13)`
-- `CHANGED tests/unit/test_e02_leases.py 9511191f4fce2560446f9c44ec49a6168417ab12 9d48ef849fd75233607cb1984615229ee14ce9ff (C14)`
-
-### 24-durable-operation-handles (exit 1)
-
-- `CHANGED tests/unit/test_server.py 902223243a1b4c3a04794d7e1ff849c8f8d36e95 78030b2e91c8bc838a2edd5a7a97881eb4b5f6df (C4)`
-- `CHANGED tests/unit/test_c03_tool_surface.py bbdc239578fc7ddfc56931232803ac6abd91ad18 afa091ee968a4eb4985473f366f74f6d37c87fb3 (C4)`
-
-### 26-checkpoint-type-standard (exit 1)
-
-- `CHANGED tests/unit/test_server.py 902223243a1b4c3a04794d7e1ff849c8f8d36e95 78030b2e91c8bc838a2edd5a7a97881eb4b5f6df (C9)`
-
-### 29-uia-helper-element-desktop (exit 1)
-
-- `CHANGED tests/unit/test_evidence.py dcc0814bb59788dcdc8a2a7df3d29cbd3fcf3042 c72b1d2b761eb5a16ae0775a2d331910e2d5a2f7 (C14)`
-- `CHANGED tests/unit/test_f05_interactive_helper.py 8e0ade2869f87fa8c433b5f69a24cb5e162a5893 39138145da4016aad727547a997563a54cc35aa1 (C19)`
-- `CHANGED tests/unit/test_f05_interactive_helper.py 8e0ade2869f87fa8c433b5f69a24cb5e162a5893 39138145da4016aad727547a997563a54cc35aa1 (C20)`
-- `CHANGED tests/unit/test_f05_interactive_helper.py 8e0ade2869f87fa8c433b5f69a24cb5e162a5893 39138145da4016aad727547a997563a54cc35aa1 (C21)`
-- `CHANGED tests/unit/test_f05_uia_helper.py 7f6160979c112278ef48386379424590bf7ce7ba 02116878d19f90ed0e4bba89d11dabb8e6e0e5b6 (C1)`
-- `CHANGED tests/unit/test_f05_uia_helper.py 7f6160979c112278ef48386379424590bf7ce7ba 02116878d19f90ed0e4bba89d11dabb8e6e0e5b6 (C10)`
-- `CHANGED tests/unit/test_f05_uia_helper.py 7f6160979c112278ef48386379424590bf7ce7ba 02116878d19f90ed0e4bba89d11dabb8e6e0e5b6 (C11)`
-- `CHANGED tests/unit/test_f05_uia_helper.py 7f6160979c112278ef48386379424590bf7ce7ba 02116878d19f90ed0e4bba89d11dabb8e6e0e5b6 (C12)`
-- `CHANGED tests/unit/test_f05_uia_helper.py 7f6160979c112278ef48386379424590bf7ce7ba 02116878d19f90ed0e4bba89d11dabb8e6e0e5b6 (C2)`
-- `CHANGED tests/unit/test_f05_uia_helper.py 7f6160979c112278ef48386379424590bf7ce7ba 02116878d19f90ed0e4bba89d11dabb8e6e0e5b6 (C3)`
-- `CHANGED tests/unit/test_f05_uia_helper.py 7f6160979c112278ef48386379424590bf7ce7ba 02116878d19f90ed0e4bba89d11dabb8e6e0e5b6 (C4)`
-- `CHANGED tests/unit/test_f05_uia_helper.py 7f6160979c112278ef48386379424590bf7ce7ba 02116878d19f90ed0e4bba89d11dabb8e6e0e5b6 (C5)`
-- `CHANGED tests/unit/test_f05_uia_helper.py 7f6160979c112278ef48386379424590bf7ce7ba 02116878d19f90ed0e4bba89d11dabb8e6e0e5b6 (C6)`
-- `CHANGED tests/unit/test_f05_uia_helper.py 7f6160979c112278ef48386379424590bf7ce7ba 02116878d19f90ed0e4bba89d11dabb8e6e0e5b6 (C7)`
-- `CHANGED tests/unit/test_f05_uia_helper.py 7f6160979c112278ef48386379424590bf7ce7ba 02116878d19f90ed0e4bba89d11dabb8e6e0e5b6 (C8)`
-- `CHANGED tests/unit/test_f05_uia_helper.py 7f6160979c112278ef48386379424590bf7ce7ba 02116878d19f90ed0e4bba89d11dabb8e6e0e5b6 (C9)`
-- `CHANGED tests/unit/test_server.py 902223243a1b4c3a04794d7e1ff849c8f8d36e95 78030b2e91c8bc838a2edd5a7a97881eb4b5f6df (C15)`
-
-### 30-per-vm-credential-profiles (exit 1)
-
-- `CHANGED tests/unit/test_server.py 902223243a1b4c3a04794d7e1ff849c8f8d36e95 78030b2e91c8bc838a2edd5a7a97881eb4b5f6df (C13)`
-
-### 31-32-33-94-workstream-g-deployment (exit 1)
-
-- `CHANGED tests/unit/test_g02_clone_remove.py 6f938fb7fdaf8a6aa1efed5c0c292f51c0be8fc4 4d9cb55544eb98a61a521efbfac253eb09a096dd (C1)`
-- `CHANGED tests/unit/test_g02_clone_remove.py 6f938fb7fdaf8a6aa1efed5c0c292f51c0be8fc4 4d9cb55544eb98a61a521efbfac253eb09a096dd (C2)`
-- `CHANGED tests/unit/test_g02_clone_remove.py 6f938fb7fdaf8a6aa1efed5c0c292f51c0be8fc4 4d9cb55544eb98a61a521efbfac253eb09a096dd (C4)`
-- `CHANGED tests/unit/test_g02_clone_remove.py 6f938fb7fdaf8a6aa1efed5c0c292f51c0be8fc4 4d9cb55544eb98a61a521efbfac253eb09a096dd (C5)`
-
-### 44-vm-display-resolution (exit 1)
-
-- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 92d057c1c3e6633ccc2128f7737ebd5b503d5cbe (C1)`
-- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 92d057c1c3e6633ccc2128f7737ebd5b503d5cbe (C2)`
-- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 92d057c1c3e6633ccc2128f7737ebd5b503d5cbe (C3)`
-- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 92d057c1c3e6633ccc2128f7737ebd5b503d5cbe (C4)`
-- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 92d057c1c3e6633ccc2128f7737ebd5b503d5cbe (C5)`
-- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 92d057c1c3e6633ccc2128f7737ebd5b503d5cbe (C6)`
-- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 92d057c1c3e6633ccc2128f7737ebd5b503d5cbe (C7)`
-- `CHANGED tests/unit/test_vm_video.py 8e4d4340ee63dc01314b9d7751ba7d05d0723fb9 92d057c1c3e6633ccc2128f7737ebd5b503d5cbe (C8)`
-
-### 5-ps51-sanitized-env (exit 1)
-
-- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af 9fdda0ef2cb66cf1aaadc20c1706dcf85606332e (C1)`
-- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af 9fdda0ef2cb66cf1aaadc20c1706dcf85606332e (C2)`
-- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af 9fdda0ef2cb66cf1aaadc20c1706dcf85606332e (C3)`
-- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af 9fdda0ef2cb66cf1aaadc20c1706dcf85606332e (C4)`
-- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af 9fdda0ef2cb66cf1aaadc20c1706dcf85606332e (C6)`
-- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af 9fdda0ef2cb66cf1aaadc20c1706dcf85606332e (C7)`
-- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af 9fdda0ef2cb66cf1aaadc20c1706dcf85606332e (C8)`
-- `CHANGED tests/unit/test_a01_ps_environment.py 4ad553260755217455bf7678988388f70db000af 9fdda0ef2cb66cf1aaadc20c1706dcf85606332e (C9)`
-
-### 74-72-88-cost-latency-accounting (exit 1)
-
-- `CHANGED README.md 1960d4c6f808c0ee2b2f2b4de64c877d73bc1682 4b8a085ffe617cbd5066d51ef3eec77c2b159825 (C10)`
-- `CHANGED src/hyperv_mcp/server.py 47b2c188ae2c1cb8ede580229e8ca3b50823c941 a1019d721c792147c75fb2f2d473b208ec49395d (C10)`
-
+None — every gate-relevant frozen pair verifies OK at the current tree.
 <!-- regenerated-state-end -->
 
 ## Discovery snapshot (recorded 2026-11-05, base 8bc60cb7196ae128231c25a15881cded26b0afda)
