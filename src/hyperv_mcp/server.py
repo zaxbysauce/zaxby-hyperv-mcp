@@ -5563,8 +5563,15 @@ def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]
                 row_vm = guestjobs.peek_vm_id(arguments.get("job_id") or "", cfg,
                                               owner=agent)
             else:
-                row_vm = relay.peek_vm_id(arguments.get("relay_id") or "", cfg,
-                                          owner=agent)
+                # The relay's VM, read with the SAME rule the leased path above
+                # and the CDP body use (`relay.lookup_entry`, no ownership
+                # filter). `relay.peek_vm_id` is owner-filtered and returns ""
+                # for a relay owned by another principal; an empty hint reads
+                # as "any VM", so the unleased conflict test would silently
+                # skip the VM the call actually addresses.
+                entry = relay.lookup_entry(arguments.get("relay_id") or "")
+                row_vm = (str(entry.get("vm_id") or "")
+                          if entry is not None else "")
             vm_hint = row_vm or ""
         # The conflict comparison is GUID-keyed, so the caller's name is
         # resolved to its GUID BEFORE any conflict test (round-6 note). A

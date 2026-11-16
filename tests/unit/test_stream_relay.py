@@ -52,12 +52,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ctypes
 import importlib
 import importlib.resources
 import json
 import os
 import re
 import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -842,9 +844,164 @@ def test_ctypes_path_selected_without_af_hyperv(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# AC14 — the service registration command's generated script
+# AC50 — the REAL Ws2_32 prototypes accept a real handle
 # ---------------------------------------------------------------------------
 
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="the real Ws2_32 prototypes are Windows-only")
+def test_real_winsock_prototypes_accept_a_real_handle():
+    """AC50: `_load_ws2_32()`'s declarations must be usable against the real
+    DLL and a REAL socket handle, not only against the recording fake. The
+    shipped defect was a prototype/call mismatch the fake could not see:
+    `getsockopt`'s `optval` was declared `c_char_p` while `_connect_error`
+    passes `ctypes.byref(c_int)`, so ctypes raised `ArgumentError: argument
+    4: TypeError: wrong type` on every ctypes-path connect (Python 3.10/3.11).
+    `relay.py` swallows the resulting error, so the caller only ever saw a
+    closed connection.
+
+    Both legs are asserted, because a `_connect_error` that ignores
+    `getsockopt` and returns `WSAGetLastError()` (0 here) would satisfy the
+    first leg alone: the value must be READ OUT of the socket, so a socket in
+    a known error state must come back non-zero."""
+    from hyperv_mcp import hvsock
+
+    ws = hvsock._load_ws2_32()
+
+    # Leg 1 — a healthy connected socket reports no pending error.
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    healthy = socket.socket()
+    try:
+        healthy.connect(srv.getsockname())
+        err = hvsock._connect_error(ws, healthy.fileno())
+        assert err == 0, (
+            f"AC50: a healthy connected socket must report SO_ERROR 0; got "
+            f"{err}")
+
+        # Leg 2 — a non-blocking connect that was REFUSED reports the pending
+        # error. This is the branch `_await_connect` polls, and it is the leg
+        # that proves the value is really read out of the socket: a
+        # `_connect_error` that ignored `getsockopt` and returned
+        # `WSAGetLastError()` would answer 0 here.
+        #
+        # The thread's last error is cleared first, with one SUCCESSFUL
+        # winsock call on the same handle, because the refusal itself leaves
+        # nothing there — without that step the two sources agree by accident
+        # and the stub survives.
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        closed_port = probe.getsockname()[1]
+        probe.close()
+        dialing = socket.socket()
+        try:
+            dialing.setblocking(False)
+            try:
+                dialing.connect(("127.0.0.1", closed_port))
+            except BlockingIOError:
+                pass
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if hvsock._connect_error(ws, dialing.fileno()) != 0:
+                    break
+                time.sleep(0.05)
+            assert hvsock._connect_error(ws, dialing.fileno()) != 0, (
+                "AC50: the refused connect never reported a pending error")
+            clearing = ctypes.c_int(0)
+            clearing_size = ctypes.c_int(ctypes.sizeof(clearing))
+            assert ws.getsockopt(dialing.fileno(), hvsock._SOL_SOCKET, 0x1008,
+                                 ctypes.byref(clearing),
+                                 ctypes.byref(clearing_size)) == 0, (
+                "AC50: the clearing getsockopt(SO_TYPE) call failed")
+            assert ws.WSAGetLastError() == 0, (
+                "AC50: a successful winsock call must clear the thread error")
+            err = hvsock._connect_error(ws, dialing.fileno())
+            assert err != 0, (
+                "AC50: after the refusal the socket must still report a "
+                "non-zero SO_ERROR; the prototypes are declared but the value "
+                "is not being read")
+        finally:
+            dialing.close()
+    finally:
+        healthy.close()
+        srv.close()
+
+
+# ---------------------------------------------------------------------------
+# AC54 — the connect deadline is a monotonic instant, not an accumulator
+# ---------------------------------------------------------------------------
+
+
+class _FullBlockSelect:
+    """`select` that honours the timeout it is handed and reports nothing
+    writable. That is precisely the shape an accumulator bug needs to
+    survive: the wait consumes the whole budget it was asked for, while a
+    `waited += step` counter only advances by the step."""
+
+    def __init__(self):
+        self.budgets: list[float] = []
+
+    def select(self, _r, _w, _x, timeout):
+        self.budgets.append(timeout)
+        if timeout and timeout > 0:
+            time.sleep(timeout)
+        return ([], [], [])
+
+
+class _InFlightWinsock:
+    """A winsock whose connect never settles: SO_ERROR stays 0 forever."""
+
+    def getsockopt(self, *_args):
+        return 0
+
+    def WSAGetLastError(self):
+        return 0
+
+
+def test_await_connect_deadline_is_a_monotonic_instant(monkeypatch):
+    """AC54: `_await_connect` gives up after `timeout_s` of REAL time.
+
+    The defect this pins: the wait advanced a `waited` accumulator by a fixed
+    poll step while handing `select` the whole remaining budget, so the
+    elapsed time it under-counted by roughly timeout^2 / (2 * step) — about
+    six hours at the 30 s default, which is exactly the hang the wait exists
+    to prevent. Asserted on both axes: the wall clock and the number of
+    budgets handed to `select`, because a mutant that merely caps the
+    iteration count still passes the clock check at a small timeout.
+    """
+    from types import SimpleNamespace
+
+    from hyperv_mcp import hvsock  # RED at base
+
+    fake = _FullBlockSelect()
+    monkeypatch.setattr(hvsock, "select",
+                        SimpleNamespace(select=fake.select))
+    handle_sock = socket.socket()
+    try:
+        started = time.monotonic()
+        try:
+            hvsock._await_connect(_InFlightWinsock(), handle_sock.fileno(), 1.0)
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError(
+                "AC54: a connect that never settles must raise TimeoutError")
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.5, (
+            f"AC54: the wait must give up after ~1s of real time; it took "
+            f"{elapsed:.1f}s")
+        assert len(fake.budgets) <= 2, (  # count before detail
+            f"AC54: a 1s budget must be handed to select at most twice; it "
+            f"was handed {len(fake.budgets)} times ({fake.budgets!r}) — the "
+            f"deadline is being counted in poll steps, not real time")
+    finally:
+        handle_sock.close()
+
+
+# ---------------------------------------------------------------------------
+# AC14 — the service registration command's generated script
+# ---------------------------------------------------------------------------
 
 def test_register_service_script_contract(monkeypatch, capsys):
     """AC14: `hyperv-mcp-http --register-hvsocket-service` generates a
@@ -1207,6 +1364,137 @@ def test_completed_bridge_is_not_an_error(monkeypatch):
                 f"AC41: the echo must have been counted; got {counters}")
         finally:
             relay.relay_stop(_relay_cfg(), out["relay_id"])
+    finally:
+        guest.close()
+
+
+# ---------------------------------------------------------------------------
+# AC52 — the pump runs on a BLOCKING guest socket
+# ---------------------------------------------------------------------------
+
+
+class _TimeoutRecordingSock:
+    """A guest socket proxy that records every `settimeout` the bridge makes.
+
+    `_read_line`'s byte-at-a-time loop leaves the socket at whatever
+    sub-second timeout its last iteration set; the bridge must clear that
+    before the pump, because `_pump`'s recv inherits it.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.settimeout_calls: list = []
+
+    def settimeout(self, value):
+        self.settimeout_calls.append(value)
+        return self._inner.settimeout(value)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_pump_runs_on_a_blocking_guest_socket(monkeypatch):
+    """AC52: after the ack the guest socket goes back to BLOCKING before the
+    pump starts, so the tcp kind's documented "no idle timeout" holds.
+
+    The defect this pins: `_read_line` leaves the guest socket at a sub-second
+    timeout, and the pump's `recv` inherits it — so any half-second of
+    guest-side silence (an idle DevTools WebSocket between user interactions)
+    raised `socket.timeout`, whose handler closes the bridge. The client then
+    saw a clean EOF in the middle of an idle connection.
+
+    Asserted behaviourally AND structurally: the client must still be
+    connected well past the longest sub-second timeout `_read_line` can leave
+    behind (the guest answers only after 1.5s of silence), and the bridge must
+    have called `settimeout(None)` on the guest socket at all.
+    """
+    from hyperv_mcp import hvsock, relay  # RED at base
+
+    class SilentGuest:
+        """Answers the header, stays quiet past every sub-second timeout
+        `_read_line` can leave behind, then echoes."""
+
+        def __init__(self):
+            self._sock = socket.socket()
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind(("127.0.0.1", 0))
+            self._sock.listen(4)
+            self.port = self._sock.getsockname()[1]
+            self._stop = threading.Event()
+            self._conns: list = []
+            threading.Thread(target=self._serve, daemon=True).start()
+
+        def close(self):
+            self._stop.set()
+            for sock in [self._sock] + list(self._conns):
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+        def _serve(self):
+            self._sock.settimeout(0.2)
+            while not self._stop.is_set():
+                try:
+                    conn, _ = self._sock.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                self._conns.append(conn)
+                threading.Thread(target=self._one, args=(conn,),
+                                 daemon=True).start()
+
+        def _one(self, conn):
+            try:
+                buf = b""
+                while b"\n" not in buf:
+                    chunk = conn.recv(1)
+                    if not chunk:
+                        return
+                    buf += chunk
+                conn.sendall(b'{"ok":true}\n')
+                # Long past the 0.5s ceiling of `_read_line`'s sub-second
+                # loop: a bridge still carrying that timeout dies here.
+                time.sleep(1.5)
+                while not self._stop.is_set():
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    conn.sendall(chunk)
+            except Exception:
+                pass
+
+    holder: dict = {}
+
+    def _connect(*_a, **_k):
+        inner = socket.create_connection(("127.0.0.1", guest.port), timeout=15)
+        proxy = _TimeoutRecordingSock(inner)
+        holder["guest"] = proxy
+        return proxy
+
+    guest = SilentGuest()
+    try:
+        monkeypatch.setattr(hvsock, "connect", _connect)
+        _patch_caps(monkeypatch, ("uia", "msaa", "stream"))
+        monkeypatch.setattr(pswindows, "run_ps", FakePS())
+        out = relay.relay_start(_relay_cfg(), "test-vm", 9222, kind="tcp",
+                                cred=CRED)
+        try:
+            with socket.create_connection(("127.0.0.1", out["host_port"]),
+                                          timeout=15) as client:
+                client.settimeout(10)
+                client.sendall(b"ping")
+                data = client.recv(4096)
+                assert data == b"ping", (
+                    f"AC52: the bridge tore itself down during guest silence; "
+                    f"the client saw {data!r} instead of the late echo")
+        finally:
+            relay.relay_stop(_relay_cfg(), out["relay_id"])
+        calls = holder["guest"].settimeout_calls
+        assert None in calls, (
+            f"AC52: the bridge must clear the guest socket's timeout before "
+            f"the pump; it never called settimeout(None) (sequence {calls!r})")
     finally:
         guest.close()
 

@@ -127,9 +127,15 @@ def _load_ws2_32():
     ws2_32.connect.argtypes = [sock_p, ctypes.c_char_p, ctypes.c_int]
     ws2_32.closesocket.restype = ctypes.c_int
     ws2_32.closesocket.argtypes = [sock_p]
+    # `optval` is `char *` but the caller passes a byref'd int, so it is
+    # declared c_void_p: declaring it c_char_p makes ctypes REJECT the
+    # byref object ("argument 4: TypeError: wrong type"), which meant every
+    # non-blocking connect on the ctypes path (Python 3.10/3.11) raised
+    # ArgumentError before the socket was ever usable. The unit checks' fake
+    # winsock never exercised the real prototypes, so nothing caught it.
     ws2_32.getsockopt.restype = ctypes.c_int
     ws2_32.getsockopt.argtypes = [sock_p, ctypes.c_int, ctypes.c_int,
-                                  ctypes.c_char_p, ctypes.POINTER(ctypes.c_int)]
+                                  ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
     ws2_32.ioctlsocket.restype = ctypes.c_int
     ws2_32.ioctlsocket.argtypes = [sock_p, ctypes.c_long,
                                    ctypes.POINTER(ctypes.c_ulong)]

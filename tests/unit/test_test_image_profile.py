@@ -36,6 +36,7 @@ touched.
 from __future__ import annotations
 
 import json
+import os
 import re
 
 import pytest
@@ -49,12 +50,17 @@ CRED = CredentialSet("Administrator", "placeholder-pass")
 
 VM_GUID = "e953c649-1234-5678-9abc-def012345678"
 
-# The documented set: setting name -> tokens the generated change must carry
-# (compared case-insensitively; powercfg aliases and registry value names
-# from the claim-4 table).
+# The documented set: setting name -> the tokens a generated leg for that
+# setting must carry (compared case-insensitively). A powercfg setting is
+# identified by its GUID ALIAS, because that is what both the forward change
+# and the restore address it by ('powercfg /setacvalueindex SCHEME_CURRENT
+# <sub> <alias> <index>'). The issue's claim-4 table names the friendly
+# setting names (monitor-timeout-ac, ...); AC51 pins the alias contract
+# directly, including that the restore writes the recorded index through the
+# RAW-INDEX command rather than '/change', which reads its value as MINUTES.
 SETTINGS = {
-    "no_display_timeout": ("monitor-timeout-ac", "monitor-timeout-dc"),
-    "no_sleep": ("standby-timeout-ac", "standby-timeout-dc", "/h off"),
+    "no_display_timeout": ("videoidle",),
+    "no_sleep": ("standbyidle", "/h off"),
     "no_auto_update": ("windowsupdate\\au", "noautoupdate"),
     "no_lock_on_resume": ("consolelock",),
     "no_inactivity_lock": ("inactivitytimeoutsecs",),
@@ -120,9 +126,26 @@ class LegRecorder:
         result: dict = {}
         if RESTORE_RECORD in script and _reads(script):
             result = {"text": RECORD_JSON}
+        frame: dict = {"ok": True, "result": result}
+        # A profile leg reports before/after itself: the host records what
+        # the leg said, so the recorder must SAY something. Serving a frame
+        # with neither key made AC49's "the key is present" assertion pass
+        # with None values -- a payload that drops either key entirely and
+        # one that carries it faithfully were indistinguishable.
+        named = re.search(r"setting = '([^']*)'", script)
+        if named:
+            if "Get-HypervMcpPowerIndices" in script:
+                frame["before"] = {"ac": "300", "dc": "300"}
+                frame["after"] = {"ac": "0", "dc": "0"}
+                if named.group(1) == "no_sleep":
+                    frame["before"]["hibernate"] = "on"
+                    frame["after"]["hibernate"] = "off"
+            else:
+                frame["before"] = "1"
+                frame["after"] = "0"
         return pswindows.PSResult(
             stdout=json.dumps({
-                "ok": True, "result": result,
+                **frame,
                 "session": {"session_id": 2, "interactive_user": "tester",
                             "locked": False},
             }),
@@ -138,6 +161,75 @@ def legs(monkeypatch):
     monkeypatch.setattr(uia, "_run_uia_leg", rec)
     monkeypatch.setattr(pswindows, "run_ps", ps)
     return rec, ps
+
+
+_REAL_RUN_PS = pswindows.run_ps  # saved before any monkeypatching
+
+_PS_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+
+
+@pytest.fixture()
+def _ps_available():
+    if not os.path.isfile(_PS_EXE):
+        pytest.skip("Windows PowerShell not available")
+
+
+# `powercfg /query SCHEME_CURRENT SUB_VIDEO` as the tool really prints it
+# (Microsoft's own sample shape): ONE subgroup holding SEVERAL settings, each
+# closing with its own "Current AC/DC Power Setting Index" pair, and the
+# target setting (VIDEOIDLE) deliberately NOT last. A reader that collects to
+# the end of the subgroup returns the LAST setting's indices (0|0) instead of
+# the target's (900|0), which is the defect this check pins.
+_SYNTHETIC_SUBGROUP = "\n".join([
+    "Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)",
+    "  GUID Alias: SCHEME_MIN",
+    "  Subgroup GUID: 7516b95f-f776-4464-8c53-06167f40cc99  (Display)",
+    "    GUID Alias: SUB_VIDEO",
+    "    Power Setting GUID: 3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e  (Turn off display after)",
+    "      GUID Alias: VIDEOIDLE",
+    "      Minimum Possible Setting: 0x00000000",
+    "      Maximum Possible Setting: 0xffffffff",
+    "      Possible Settings increment: 0x00000001",
+    "      Possible Settings units: Seconds",
+    "    Current AC Power Setting Index: 0x00000384",
+    "    Current DC Power Setting Index: 0x00000000",
+    "",
+    "    Power Setting GUID: f1fbfde2-a960-4165-9f88-50667911ce96  (Dimmed display brightness)",
+    "      Minimum Possible Setting: 0x00000000",
+    "      Maximum Possible Setting: 0x00000064",
+    "      Possible Settings increment: 0x00000001",
+    "      Possible Settings units: %",
+    "    Current AC Power Setting Index: 0x00000032",
+    "    Current DC Power Setting Index: 0x00000032",
+    "",
+    "    Power Setting GUID: fbd9aa66-9553-4097-ba44-ed6e9d65eab8  (Enable adaptive brightness)",
+    "      GUID Alias: ADAPTBRIGHT",
+    "      Possible Setting Index: 000",
+    "      Possible Setting Friendly Name: Off",
+    "      Possible Setting Index: 001",
+    "      Possible Setting Friendly Name: On",
+    "    Current AC Power Setting Index: 0x00000000",
+    "    Current DC Power Setting Index: 0x00000000",
+])
+
+
+def _run_ps_script(script: str) -> str:
+    """Execute a script under the real PS 5.1 and return its stdout.
+
+    The script rides stdin as base64 (the repo's single-token transport):
+    it never appears in a process command line, so nothing in it can be
+    split on a space or stripped of quotes on the way in.
+    """
+    b64 = pswindows.utf8_b64(script)
+    runner = (
+        "$text = [System.Text.Encoding]::UTF8.GetString("
+        "[Convert]::FromBase64String([Console]::In.ReadLine()))\n"
+        "& ([ScriptBlock]::Create($text))\n"
+    )
+    result = _REAL_RUN_PS(runner, timeout_s=90, stdin_b64=b64)
+    assert result.returncode == 0, (
+        f"the harness script failed: {result.stdout}{result.stderr}")
+    return result.stdout
 
 
 def _blob(rec: LegRecorder) -> str:
@@ -425,12 +517,114 @@ def test_record_carries_ac_dc_and_hibernation(legs):
         "must be recorded for the restore")
     # the teardown must restore both indices and re-enable hibernation
     teardown = uia._TEST_PROFILE_RESTORE_INNER.lower()
-    assert teardown.count("standby-timeout-ac") >= 2, (
+    assert teardown.count("standbyidle") >= 2, (
         "AC42: teardown must restore the AC standby index")
-    assert teardown.count("standby-timeout-dc") >= 2, (
-        "AC42: teardown must restore the DC standby index")
+    assert "setacvalueindex scheme_current sub_sleep standbyidle $e.ac" in teardown, (
+        "AC42: teardown must write the recorded AC index back")
+    assert "setdcvalueindex scheme_current sub_sleep standbyidle $e.dc" in teardown, (
+        "AC42: teardown must write the recorded DC index back")
     assert "/h on" in teardown, (
         "AC42: teardown must re-enable hibernation when it was on")
+
+
+# ---------------------------------------------------------------------------
+# AC51 — the powercfg reader, restore unit and hibernation source
+# ---------------------------------------------------------------------------
+
+
+def test_powercfg_reader_and_restore_contract(_ps_available):
+    """AC51: three invariants the mocked checks could not see, each of them
+    confirmed against Microsoft's own documentation and sample output.
+
+    (a) BLOCK BOUNDARY. `powercfg /query SCHEME_CURRENT <subgroup>` holds
+        SEVERAL settings, each closing with its own AC/DC index pair. The
+        reader must stop at the end of the TARGET setting's block, or it
+        returns the LAST setting's indices. Executed here for real, against
+        the synthetic subgroup above, with VIDEOIDLE deliberately not last:
+        the correct answer is 900|0 and the unbounded reader answers 0|0.
+    (b) UNIT. `powercfg /change <timeout> <value>` reads its value in
+        MINUTES ("*value* Specifies the new value, in minutes.") while
+        /query reports the index in SECONDS ("Possible Settings units:
+        Seconds"), so the restore must write the recorded index through the
+        raw-index command (/setacvalueindex) rather than /change -- feeding
+        it seconds restores 60x the original timeout.
+    (c) ARITY + HIBERNATION. The reader takes exactly two arguments (a
+        three-argument call bound $subGuid='SCHEME_CURRENT' and never
+        matched), and the prior hibernation state must come from
+        HibernateEnabled, which is what `powercfg /h` itself writes --
+        `powercfg /a` lists Hibernate under "not available on this system"
+        when it is merely disabled, so a token match read a disabled
+        hibernation as enabled.
+    """
+    pswindows.init(Config(unrestricted=True))
+
+    # --- (a) the reader, executed against the synthetic subgroup ----------
+    harness = "\n".join([
+        "function Assert-HypervMcpNative($what) {",
+        "    if ($LASTEXITCODE -ne 0) { throw \"$what failed\" }",
+        "}",
+        "$LASTEXITCODE = 0",
+        "$script:queryLines = @'",
+        _SYNTHETIC_SUBGROUP,
+        "'@ -split \"\\r?\\n\"",
+        "function powercfg { $script:queryLines }",
+        uia._POWERCFG_READER,
+        "$pair = Get-HypervMcpPowerIndices 'SUB_VIDEO' 'VIDEOIDLE'",
+        "Write-Output ($pair[0] + '|' + $pair[1])",
+    ])
+    out = _run_ps_script(harness).strip()
+    assert out == "900|0", (
+        f"AC51(a): the reader must return the TARGET setting's indices "
+        f"(AC 900 = 0x384, DC 0); got {out!r}. A reader that walks to the "
+        f"end of the subgroup returns the LAST setting's indices instead.")
+
+    # --- (c) the reader's arity, and the call's arity ---------------------
+    declared = re.search(
+        r"function\s+Get-HypervMcpPowerIndices\s*\(([^)]*)\)",
+        uia._POWERCFG_READER)
+    assert declared, "AC51(c): the reader function declaration is missing"
+    params = [p for p in declared.group(1).split(",") if p.strip()]
+    assert len(params) == 2, (
+        f"AC51(c): the reader must declare exactly two parameters (subgroup, "
+        f"alias); it declares {len(params)}: {params}")
+    call = re.search(r"Get-HypervMcpPowerIndices([^\n]*)",
+                     uia._profile_read_block("no_display_timeout"))
+    assert call, "AC51(c): the generated read never calls the reader"
+    passed = re.findall(r"'[^']*'", call.group(1))
+    assert len(passed) == 2, (
+        f"AC51(c): the read must pass exactly two arguments; it passes "
+        f"{len(passed)}: {passed}. A third argument left the reader bound to "
+        f"$subGuid='SCHEME_CURRENT', so it never matched the setting.")
+
+    # --- (c) the hibernation prior state ---------------------------------
+    sleep_read = uia._profile_read_block("no_sleep")
+    assert "HibernateEnabled" in sleep_read, (
+        "AC51(c): the prior hibernation state must be read from "
+        "HibernateEnabled, which is what 'powercfg /h' itself writes")
+    assert "powercfg /a" not in sleep_read, (
+        "AC51(c): 'powercfg /a' cannot answer whether hibernation is ON -- "
+        "it lists Hibernate under 'not available on this system' when it is "
+        "merely disabled, so a token match reads disabled as enabled")
+
+    # --- (b) the restore's unit ------------------------------------------
+    restore = uia._TEST_PROFILE_RESTORE_INNER
+    for setting, sub, alias in (("no_display_timeout", "SUB_VIDEO", "VIDEOIDLE"),
+                                ("no_sleep", "SUB_SLEEP", "STANDBYIDLE")):
+        assert (f"powercfg /setacvalueindex SCHEME_CURRENT {sub} {alias} "
+                f"$e.ac" in restore), (
+            f"AC51(b): the {setting} restore must write the recorded AC "
+            f"index through /setacvalueindex, which takes the RAW index "
+            f"/query reported")
+        assert (f"powercfg /setdcvalueindex SCHEME_CURRENT {sub} {alias} "
+                f"$e.dc" in restore), (
+            f"AC51(b): the {setting} restore must write the recorded DC "
+            f"index through /setdcvalueindex")
+    for stale in ("/change monitor-timeout-ac", "/change monitor-timeout-dc",
+                  "/change standby-timeout-ac", "/change standby-timeout-dc"):
+        assert stale not in restore, (
+            f"AC51(b): the restore must not use '{stale}' -- /change reads "
+            f"its value in MINUTES while the recorded index is in SECONDS, "
+            f"so it would restore 60x the original timeout")
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +698,23 @@ def test_profile_result_carries_before_after_applied(legs):
         f"AC49: the entry must carry the guest's original value; got {entry!r}")
     assert "after" in entry, (
         f"AC49: the entry must carry the value the profile set; got {entry!r}")
+    # The VALUES, not just the keys: a key present with None is what a leg
+    # that stopped reporting it looks like, and it is indistinguishable from
+    # a faithful one unless the assertion names what was served.
+    assert entry.get("before") == {"ac": "300", "dc": "300", "hibernate": "on"}, (
+        f"AC49: the host must record the leg's reported original; got "
+        f"{entry.get('before')!r}")
+    assert entry.get("after") == {"ac": "0", "dc": "0", "hibernate": "off"}, (
+        f"AC49: the host must record the leg's reported new value; got "
+        f"{entry.get('after')!r}")
+    # ...and the leg must EMIT it: the spec's `after` expression is what the
+    # generated script reports, so a leg that stops naming it loses the value
+    # even though the host still forwards the key.
+    script = _profile_script(rec, "no_sleep")
+    expected_after = "after = " + uia.TEST_PROFILE_SETTINGS["no_sleep"]["after"]
+    assert expected_after in script, (
+        f"AC49: the leg must emit its after value ({expected_after!r}); the "
+        f"generated script does not name it")
     assert out.get("reboot_required") is True, (
         "AC49: an applied profile must report that the guest needs a reboot "
         "before the new state is what a session sees")

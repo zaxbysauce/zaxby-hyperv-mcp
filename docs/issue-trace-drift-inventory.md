@@ -17,7 +17,7 @@ reported below (issue #143).
 | 125-126-console-accuracy-commit-guard | 11 | 11 | 0 | clean |
 | 128-129-134-gui-drivability | 20 | 20 | 0 | clean |
 | 13-stdio-proxy | 10 | 10 | 0 | clean |
-| 135-127-138-gui-electron-drivability | 47 | 47 | 0 | clean |
+| 135-127-138-gui-electron-drivability | 53 | 53 | 0 | clean |
 | 136-137-uia-element-contract | 27 | 27 | 0 | clean |
 | 140-126-uia-state-receipt | 44 | 44 | 0 | clean |
 | 143-130-collated | 12 | 12 | 0 | clean |

@@ -188,6 +188,19 @@ def write_ws_frame(sock, opcode: int, payload: bytes) -> None:
     sock.sendall(header + payload)
 
 
+def write_ws_fragment(sock, opcode: int, payload: bytes, fin: bool) -> None:
+    """One frame with an explicit FIN bit, so a message can be split."""
+    header = bytes([(0x80 if fin else 0x00) | opcode])
+    n = len(payload)
+    if n < 126:
+        header += bytes([n])
+    elif n < 65536:
+        header += bytes([126]) + n.to_bytes(2, "big")
+    else:
+        header += bytes([127]) + n.to_bytes(8, "big")
+    sock.sendall(header + payload)
+
+
 def client_send_frame(sock, payload: bytes) -> None:
     """A client-to-server frame: masked, text opcode."""
     mask = os.urandom(4)
@@ -246,6 +259,9 @@ class FakeDevTools:
         self.commands: list[tuple[str, dict]] = []
         self.headers: list[bytes] = []
         self.eval_value = "cdp-eval-value"
+        # When set, the next reply is sent as TWO frames (the first without
+        # FIN), so the reassembler's FIN handling is exercised for real.
+        self.fragment_next_reply = False
         # quad for DOM.getContentQuads: a 10,20 -> 110,70 box (centre 60,45)
         self.quad = [10, 20, 110, 20, 110, 70, 10, 70]
         self.ax_tree = ax_tree(with_ok=True)
@@ -372,7 +388,16 @@ class FakeDevTools:
                     "id": msg.get("id"),
                     "result": self._result_for(method, params),
                 }).encode()
-                write_ws_frame(conn, 0x1, reply)
+                if self.fragment_next_reply:
+                    # Split at a point where NEITHER half parses as JSON, so
+                    # an accumulator keyed on "did the JSON parse" discards
+                    # the first fragment and the answer never arrives.
+                    self.fragment_next_reply = False
+                    cut = max(1, len(reply) // 2)
+                    write_ws_fragment(conn, 0x1, reply[:cut], False)
+                    write_ws_fragment(conn, 0x0, reply[cut:], True)
+                else:
+                    write_ws_frame(conn, 0x1, reply)
             except Exception:
                 return
 
@@ -630,6 +655,89 @@ def test_cdp_eval_returns_value_with_size_cap(cdp_stack):
     assert len(evaluates) == 2, (  # count before detail
         f"AC3: expected 2 Runtime.evaluate commands; saw "
         f"{[c[0] for c in cdp_stack.fake.commands]}")
+
+
+# ---------------------------------------------------------------------------
+# AC53 — a reply split across WebSocket frames is reassembled on the FIN bit
+# ---------------------------------------------------------------------------
+
+
+def test_fragmented_reply_is_reassembled_on_the_fin_bit(cdp_stack):
+    """AC53: a CDP reply that arrives as SEVERAL frames is reassembled and
+    answered.
+
+    The defect this pins: the reassembler accumulated on "did the JSON
+    parse" instead of the FIN bit, so the first fragment of every fragmented
+    reply was discarded — incomplete JSON never parses, and the awaited
+    answer never arrived. The fake endpoint splits the reply at its midpoint,
+    where NEITHER half is valid JSON, so an accumulator keyed on the parse
+    cannot pass by accident.
+    """
+    cdp_stack.fake.fragment_next_reply = True
+    cdp_stack.fake.eval_value = "fragmented-value"
+    env = _call_tool(cdp_stack.mod, "hyperv_cdp_eval",
+                     {"relay_id": cdp_stack.out["relay_id"],
+                      "target_id": "page-1", "expression": "'x'"})
+    assert env.get("ok") is True, (
+        f"AC53: a reply split across frames must still be answered; got "
+        f"{json.dumps(env)[:300]}")
+    assert env.get("value") == "fragmented-value", (
+        f"AC53: the reassembled reply must carry the value; got "
+        f"{env.get('value')!r}")
+
+
+# ---------------------------------------------------------------------------
+# AC55 — the UNLEASED lease path resolves the relay's VM unfiltered
+# ---------------------------------------------------------------------------
+
+
+def test_unleased_path_resolves_the_relay_vm_unfiltered(cdp_stack, monkeypatch):
+    """AC55: on the UNLEASED path the relay's VM is read with the same
+    unfiltered rule the leased path and the tool body use.
+
+    The defect this pins: the unleased path read it through
+    `relay.peek_vm_id(..., owner=agent)`, which returns "" for a relay owned
+    by another principal. `assert_unleased` returns IMMEDIATELY when both
+    hints are empty, so a relay addressed by a principal other than its owner
+    had no lease-conflict gate at all — issue #23's mutual exclusion silently
+    did not cover the relay_id family. Captured by observing the hints the
+    gate hands to `assert_unleased`.
+    """
+    from hyperv_mcp import leases, relay
+
+    cfg = cdp_stack.cfg
+    # A relay owned by a DIFFERENT principal than the caller: the caller is
+    # the unattributed local principal (None), which is what a direct module
+    # or stdio path resolves to.
+    owned = relay.relay_start(cfg, "test-vm", 9223, kind="tcp", cred=CRED,
+                              owner="relay-owner")
+    try:
+        entry = relay.lookup_entry(owned["relay_id"])
+        assert entry is not None and entry.get("vm_id"), (
+            "AC55: the relay must record the VM it addresses")
+        seen: dict = {}
+
+        def _capture(*_args, **kwargs):
+            seen["vm_hint"] = kwargs.get("vm_hint") or ""
+            seen["vm_name_hint"] = kwargs.get("vm_name_hint") or ""
+            return None
+
+        monkeypatch.setattr(leases, "assert_unleased", _capture)
+        env, _token = cdp_stack.mod._lease_gate(
+            "hyperv_cdp_input", {"relay_id": owned["relay_id"]})
+        assert env is None, (
+            f"AC55: the unleased gate must not refuse outright; got {env!r}")
+        assert seen.get("vm_hint") == str(entry["vm_id"]), (
+            f"AC55: the unleased path must resolve the relay's VM through the "
+            f"unfiltered lookup; it handed assert_unleased "
+            f"vm_hint={seen.get('vm_hint')!r} for a relay on "
+            f"{entry['vm_id']!r}. An empty hint makes assert_unleased return "
+            f"without checking anything.")
+    finally:
+        try:
+            relay.relay_stop(cfg, owned["relay_id"])
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

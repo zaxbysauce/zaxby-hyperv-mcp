@@ -573,14 +573,25 @@ TEST_PROFILE_SETTINGS: dict[str, dict[str, str]] = {
     "no_display_timeout": {
         "kind": "powercfg", "sub": "SUB_VIDEO", "alias": "VIDEOIDLE",
         "after": "[PSCustomObject]@{ ac = '0'; dc = '0' }",
-        "change": ("powercfg /change monitor-timeout-ac 0" + _NL
-                   + "powercfg /change monitor-timeout-dc 0"),
+        # The change addresses the setting by ALIAS through
+        # /setacvalueindex, which takes the RAW index /query reported.
+        # 'powercfg /change monitor-timeout-ac 0' would disable it just as
+        # well (0 is 0 in either unit), but the RESTORE has to write the
+        # recorded index back and /change interprets its value in MINUTES
+        # while /query reports SECONDS -- so keeping one command shape for
+        # both directions removes the unit conversion entirely.
+        "change": ("powercfg /setacvalueindex SCHEME_CURRENT SUB_VIDEO "
+                   "VIDEOIDLE 0" + _NL
+                   + "powercfg /setdcvalueindex SCHEME_CURRENT SUB_VIDEO "
+                   "VIDEOIDLE 0"),
     },
     "no_sleep": {
         "kind": "powercfg", "sub": "SUB_SLEEP", "alias": "STANDBYIDLE",
         "after": "[PSCustomObject]@{ ac = '0'; dc = '0'; hibernate = 'off' }",
-        "change": ("powercfg /change standby-timeout-ac 0" + _NL
-                   + "powercfg /change standby-timeout-dc 0" + _NL
+        "change": ("powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP "
+                   "STANDBYIDLE 0" + _NL
+                   + "powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP "
+                   "STANDBYIDLE 0" + _NL
                    + "powercfg /h off"),
     },
     "no_lock_on_resume": {
@@ -675,6 +686,14 @@ _POWERCFG_READER = """function Get-HypervMcpPowerIndices($subGuid, $alias) {
     # locale-independent way to tell them apart.
     $lines = @(powercfg /query SCHEME_CURRENT $subGuid 2>$null)
     Assert-HypervMcpNative "powercfg /query SCHEME_CURRENT $subGuid"
+    # A subgroup holds SEVERAL settings, each closing with its own AC/DC index
+    # pair, so the collection has to stop at the end of THIS setting's block.
+    # The block ends where the next dashed GUID appears ("Power Setting GUID:",
+    # "Subgroup GUID:", "Power Scheme GUID:") -- a dashed GUID is the one
+    # structural marker that survives a localized UI, and no line inside a
+    # setting block carries one. Without this bound the reader walks to the
+    # end of the subgroup and returns the LAST setting's indices.
+    $guid = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
     $seen = $false
     $indices = New-Object System.Collections.Generic.List[string]
     foreach ($ln in $lines) {
@@ -682,6 +701,7 @@ _POWERCFG_READER = """function Get-HypervMcpPowerIndices($subGuid, $alias) {
             if ($ln -match [regex]::Escape($alias)) { $seen = $true }
             continue
         }
+        if ($ln -match $guid) { break }
         if ($ln -match '0x([0-9a-fA-F]{8})') { $indices.Add($Matches[1]) }
     }
     if ((-not $seen) -or ($indices.Count -lt 2)) {
@@ -791,8 +811,16 @@ def _profile_read_block(setting: str) -> str:
             # The profile disables hibernation, so the prior state has to be
             # recorded too or teardown cannot put it back.
             lines += [
-                "$hibOn = [bool](@(powercfg /a 2>$null) | "
-                "Where-Object { $_ -match 'Hibernate' })",
+                # 'powercfg /a' cannot answer this: it lists Hibernate
+                # under "not available on this system" WITH a reason line
+                # when hibernation is merely disabled, so matching the token
+                # read a disabled hibernation as enabled and teardown turned
+                # it back on. HibernateEnabled is what 'powercfg /h' itself
+                # writes, so it is the exact prior state.
+                r"$hibKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Power'",
+                "$hibOn = [bool]((Get-ItemProperty -Path $hibKey "
+                "-Name HibernateEnabled -ErrorAction SilentlyContinue)"
+                ".HibernateEnabled)",
                 "$entry | Add-Member -NotePropertyName hibernate -NotePropertyValue "
                 "$(if ($hibOn) { 'on' } else { 'off' }) -Force",
                 "$before | Add-Member -NotePropertyName hibernate -NotePropertyValue "
@@ -843,27 +871,34 @@ $failed = New-Object System.Collections.Generic.List[string]
 if (Test-Path -LiteralPath $recordPath) {
     $obj = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
     $props = $obj.PSObject.Properties
-    # no_display_timeout (powercfg): the profile ran 'powercfg /change
-    # monitor-timeout-ac 0' and 'powercfg /change monitor-timeout-dc 0'.
+    # no_display_timeout (powercfg): the profile ran 'powercfg
+    # /setacvalueindex SCHEME_CURRENT SUB_VIDEO VIDEOIDLE 0' and the matching
+    # /setdcvalueindex. The restore writes the recorded index back through the
+    # SAME command, because it takes the raw index /query reported (SECONDS
+    # for a timeout). The other spelling of the same restore, the one that
+    # names the friendly setting instead of the alias, would read that number
+    # as MINUTES and restore 60x the original timeout.
     if ($props['no_display_timeout']) {
         $e = $obj.no_display_timeout
         try {
-            powercfg /change monitor-timeout-ac $e.ac
-            Assert-HypervMcpNative "restoring monitor-timeout-ac"
-            powercfg /change monitor-timeout-dc $e.dc
-            Assert-HypervMcpNative "restoring monitor-timeout-dc"
+            powercfg /setacvalueindex SCHEME_CURRENT SUB_VIDEO VIDEOIDLE $e.ac
+            Assert-HypervMcpNative "restoring VIDEOIDLE AC"
+            powercfg /setdcvalueindex SCHEME_CURRENT SUB_VIDEO VIDEOIDLE $e.dc
+            Assert-HypervMcpNative "restoring VIDEOIDLE DC"
         } catch { $failed.Add('no_display_timeout') }
     }
-    # no_sleep (powercfg): the profile ran 'powercfg /change
-    # standby-timeout-ac 0', 'powercfg /change standby-timeout-dc 0' and
-    # 'powercfg /h off'.
+    # no_sleep (powercfg): the profile ran 'powercfg /setacvalueindex
+    # SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0', the matching /setdcvalueindex
+    # and 'powercfg /h off'. The restore writes the recorded index back
+    # through the SAME command (raw index, SECONDS); the friendly-setting
+    # spelling would read it as MINUTES.
     if ($props['no_sleep']) {
         $e = $obj.no_sleep
         try {
-            powercfg /change standby-timeout-ac $e.ac
-            Assert-HypervMcpNative "restoring standby-timeout-ac"
-            powercfg /change standby-timeout-dc $e.dc
-            Assert-HypervMcpNative "restoring standby-timeout-dc"
+            powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE $e.ac
+            Assert-HypervMcpNative "restoring STANDBYIDLE AC"
+            powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE $e.dc
+            Assert-HypervMcpNative "restoring STANDBYIDLE DC"
             if ($e.hibernate -eq 'on') { powercfg /h on }
         } catch { $failed.Add('no_sleep') }
     }

@@ -1852,7 +1852,7 @@ $StreamListenerBound = $false
 # Every scriptblock below takes PLAIN parameters (never a Tuple), so it can be
 # invoked with the call operator inside a runspace script.
 $StreamServeOne = {
-    param($client, $pump)
+    param($client)
     $guest = $null
     try {
         $stream = New-Object System.Net.Sockets.NetworkStream($client, $true)
@@ -1926,7 +1926,14 @@ $StreamAccept = {
             $rs.Open()
             $sh = [System.Management.Automation.PowerShell]::Create()
             $sh.Runspace = $rs
-            [void]$sh.AddScript('param($s, $c) & $s $c $s').AddArgument($serveOne).AddArgument($client)
+            # The serve-one scriptblock is RE-CREATED in this runspace rather
+            # than invoked as-is: a scriptblock carries its DEFINING runspace's
+            # session state, so invoking it across threads shared that state
+            # between every connection. [scriptblock]::Create on the
+            # scriptblock's own text yields one bound to the runspace it runs
+            # in. This is the helper's OWN code, never request data, so it
+            # does not touch the "caller text is never evaluated" constraint.
+            [void]$sh.AddScript('param($s, $c) & ([scriptblock]::Create($s.ToString())) $c').AddArgument($serveOne).AddArgument($client)
             [void]$sh.BeginInvoke()
         } catch {
             try { $client.Close() } catch { }
@@ -1948,7 +1955,10 @@ function Start-HypervMcpStreamRunspace {
         $rs.Open()
         $shell = [System.Management.Automation.PowerShell]::Create()
         $shell.Runspace = $rs
-        [void]$shell.AddScript('param($s, $a, $b) & $s $a $b').AddArgument($Script).AddArgument($Arg1).AddArgument($Arg2)
+        # Same isolation as the accept loop: the scriptblock is re-created in
+        # the runspace that runs it, so it cannot reach back into the
+        # forwarder's session state from another thread.
+        [void]$shell.AddScript('param($s, $a, $b) & ([scriptblock]::Create($s.ToString())) $a $b').AddArgument($Script).AddArgument($Arg1).AddArgument($Arg2)
         [void]$shell.BeginInvoke()
         return $true
     } catch {
