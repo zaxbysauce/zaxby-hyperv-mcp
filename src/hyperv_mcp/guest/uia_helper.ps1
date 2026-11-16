@@ -1914,12 +1914,30 @@ $StreamServeOne = {
 #
 # Deliberately self-contained (.NET only, no helper function): this loop runs
 # in a DEFAULT InitialSessionState runspace, where none of the helper's own
-# functions exist.
+# functions exist. `$stop` is a .NET event object rather than a PowerShell
+# variable because a variable does not cross a runspace boundary -- this loop
+# must be able to end when its host process is finished with it, and a
+# blocking Accept() on an AF_HYPERV socket does not return when the listener
+# is closed, so the wait has to be polled for the loop to observe anything.
+#
+# The wait is `Socket.Poll(microSeconds, SelectRead)`, NOT
+# `BeginAccept` + `AsyncWaitHandle.WaitOne(timeout)`: on a listening socket a
+# timed-out WaitOne abandons the overlapped accept and the socket then refuses
+# new connections, so a poll loop built that way accepts exactly one
+# connection and then stops. Poll waits on the socket itself, costs nothing
+# when it times out, and does not throw on family 34. On a listening socket,
+# SelectRead readability means a connection is pending, so the Accept() that
+# follows returns immediately.
 $StreamAccept = {
-    param($listener, $serveOne)
+    param($listener, $serveOne, $stop)
     while ($true) {
+        if ($stop.WaitOne(0)) { return }
+        if (-not $listener.Poll(200000,
+                                [System.Net.Sockets.SelectMode]::SelectRead)) {
+            continue
+        }
         $client = $null
-        try { $client = $listener.Accept() } catch { break }
+        try { $client = $listener.Accept() } catch { continue }
         try {
             $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
             $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($iss)
@@ -1945,7 +1963,7 @@ $StreamAccept = {
 # (RunspaceFactory + BeginInvoke). PowerShell tracks the async result, so an
 # `exit` disposes it instead of racing it.
 function Start-HypervMcpStreamRunspace {
-    param($Script, $Arg1, $Arg2)
+    param($Script, $Arg1, $Arg2, $Arg3)
     try {
         # InitialSessionState.CreateDefault (NOT RunspaceFactory.CreateDefault,
         # which does not exist in .NET Framework): the forwarder needs no
@@ -1958,7 +1976,7 @@ function Start-HypervMcpStreamRunspace {
         # Same isolation as the accept loop: the scriptblock is re-created in
         # the runspace that runs it, so it cannot reach back into the
         # forwarder's session state from another thread.
-        [void]$shell.AddScript('param($s, $a, $b) & ([scriptblock]::Create($s.ToString())) $a $b').AddArgument($Script).AddArgument($Arg1).AddArgument($Arg2)
+        [void]$shell.AddScript('param($s, $a, $b, $c) & ([scriptblock]::Create($s.ToString())) $a $b $c').AddArgument($Script).AddArgument($Arg1).AddArgument($Arg2).AddArgument($Arg3)
         [void]$shell.BeginInvoke()
         return $true
     } catch {
@@ -1982,7 +2000,14 @@ function Start-HypervMcpStreamForwarder {
     } catch {
         return $false
     }
-    if (-not (Start-HypervMcpStreamRunspace $Accept $listener $ServeOne)) {
+    # Exposed at SCRIPT scope, not left local: the accept loop blocks in its
+    # own runspace and holds the only reference to this socket, so the
+    # shutdown path below has no other way to reach it.
+    $script:StreamListener = $listener
+    # The stop signal travels as a .NET object because a PowerShell variable
+    # does not cross the runspace boundary the accept loop runs behind.
+    $script:StreamStop = New-Object System.Threading.ManualResetEvent $false
+    if (-not (Start-HypervMcpStreamRunspace $Accept $listener $ServeOne $script:StreamStop)) {
         return $false
     }
     return $true
@@ -1994,6 +2019,31 @@ try {
     $StreamListenerBound = Start-HypervMcpStreamForwarder $StreamServiceGuid $StreamServeOne $StreamAccept
 } catch {
     $StreamListenerBound = $false
+}
+# The forwarder's accept loop runs on its own runspace and, by design, never
+# ends on its own -- the helper the AtLogOn task starts is a long-lived service
+# whose main script ends in `while ($true) { Start-Sleep }`. That is correct in
+# production, but it also means nothing inside the helper can end the loop, so
+# any host whose main work IS finished (the f05 production-path harness runs
+# this real startup slice in a short-lived powershell.exe) would hang forever
+# on the runspace's foreground thread. Signalling the loop from the engine-exit
+# event lets it return, its pipeline complete, and the process exit. The event
+# only fires at real shutdown, so production is unaffected -- and closing the
+# listener there is the right thing to do anyway.
+#
+# The objects are captured by closure rather than read through $script: from
+# inside the action: the action scriptblock runs in the event subscription's
+# own scope, and relying on $script: there is exactly the cross-scope mistake
+# this comment exists to prevent.
+if ($StreamListenerBound) {
+    $stopEvent = $script:StreamStop
+    $listenerObj = $script:StreamListener
+    try {
+        Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+            try { $stopEvent.Set() } catch { }
+            try { $listenerObj.Close() } catch { }
+        } | Out-Null
+    } catch { }
 }
 
 # Issue #136: advertise msaa ONLY when the bridge pattern type resolved -
