@@ -624,6 +624,16 @@ TEST_PROFILE_SETTINGS: dict[str, dict[str, str]] = {
                    "CONSOLELOCK 0" + _NL
                    + "Assert-HypervMcpNative \"applying CONSOLELOCK DC\""),
     },
+    # The four registry legs share one shape: create the key if the guest
+    # never had it, then create the value with an explicit PropertyType or
+    # update it in place. NOTE for reviewers: `Set-ItemProperty` ALSO accepts
+    # `-Type` and it is validated (`-Type NotARealType` is a
+    # ParameterBindingException) and it does control the stored kind, but it
+    # appears in neither `Get-Command -Syntax` nor `.Parameters` under
+    # Windows PowerShell 5.1.26100.9818 -- so a leg that leans on it looks
+    # broken to anyone reading the metadata. The teardown restore legs do use
+    # it; both forms were executed under the 5.1 host this module pins
+    # (`_DEFAULT_PS`) and both write the recorded kind, so neither is a bug.
     "no_auto_update": {
         "kind": "registry",
         "path": (r"HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"),
