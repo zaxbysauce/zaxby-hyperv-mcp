@@ -10,6 +10,7 @@ side effects.
 
 import base64
 import json
+import re
 
 import pytest
 
@@ -921,3 +922,144 @@ def test_parse_readiness_wait_and_status(monkeypatch, parsed_ps):
     assert actions, "deployment_status produced no action script"
     for script in rec2.scripts:
         assert _parse_errors(script) == []
+
+
+# --- issue #138: the test-image profile's generated guest scripts ----------
+
+
+# Setting tokens from #138 claim 4's table (lowercased; matched against the
+# generated script text case-insensitively).
+_PROFILE_TOKENS = (
+    "monitor-timeout-ac", "monitor-timeout-dc",
+    "standby-timeout-ac", "standby-timeout-dc", "/h off",
+    "windowsupdate\\au", "noautoupdate",
+    "consolelock", "inactivitytimeoutsecs",
+    "screensaveactive", "promptonsecuredesktop",
+    # The powercfg GUID aliases. Selecting on the change tokens alone stopped
+    # matching the display-timeout leg once that leg moved to the alias
+    # spelling, so the leg was never parse-checked at all.
+    "videoidle", "standbyidle",
+)
+
+# The marker every generated profile leg emits, and the teardown restore's
+# own verdict marker. Selecting on these cannot silently drop a leg.
+_PROFILE_LEG_RE = re.compile(r"setting = '[a-z_]+'")
+_PROFILE_RESTORE_MARKER = "profile_restored"
+
+_PROFILE_SETTING_COUNT = 7
+
+_PROFILE_ENC_RE = re.compile(r"\$enc = '([A-Za-z0-9+/=]+)'")
+
+
+def _decoded_enc(script: str) -> list[str]:
+    """The inner scripts embedded as $enc payloads in a wrapper."""
+    out = []
+    for m in _PROFILE_ENC_RE.finditer(script):
+        try:
+            out.append(base64.b64decode(m.group(1)).decode("utf-8", "replace"))
+        except Exception:
+            pass
+    return out
+
+
+def test_parse_test_profile_scripts(monkeypatch, parsed_ps):
+    """Issue #138 AC10: every guest script the default test profile
+    generates parses under the real Windows PowerShell 5.1 parser.
+
+    RED at base: uia.provision_helper has no test_profile argument, so the
+    call raises TypeError naming it (re-raised so the base leg's error
+    names the absent surface, the test_parse_console_sequence idiom).
+    GREEN after the fix. Post-capture validation failures still don't
+    matter — the generated scripts were already captured.
+
+    Lives here rather than in a new test_script_parse_new.py (intake
+    finding 1): the repo's parse lane is this file.
+    """
+    from hyperv_mcp import uia
+
+    inner: list[str] = []
+    outer: list[str] = []
+
+    def leg_rec(cfg, script, *, stdin_b64=None, timeout_s=None, **kwargs):
+        inner.append(script)
+        return pswindows.PSResult(
+            stdout=json.dumps({
+                "ok": True, "result": {},
+                "session": {"session_id": 2, "interactive_user": "tester",
+                            "locked": False},
+            }),
+            returncode=0,
+        )
+
+    def ps_rec(script, **kwargs):
+        outer.append(script)
+        if _is_resolution_leg(script):
+            return pswindows.PSResult(stdout=VM_GUID, returncode=0)
+        return pswindows.PSResult(stdout="", returncode=0)
+
+    monkeypatch.setattr(uia, "_run_uia_leg", leg_rec)
+    monkeypatch.setattr(pswindows, "run_ps", ps_rec)
+    try:
+        uia.provision_helper(
+            UNRESTRICTED, "vm1", cred=CRED, autologon=True, confirm=True,
+            test_profile=["default"],
+        )
+    except TypeError:
+        raise  # base tree: the test_profile surface itself is absent
+    except Exception:
+        pass  # post-capture validation failures don't matter (script captured)
+
+    # A teardown as well: the restore script is a guest script too, and it is
+    # the one that puts the guest's original values back. Without this leg the
+    # restore was never generated, so it was never parse-checked.
+    try:
+        uia.provision_helper(
+            UNRESTRICTED, "vm1", cred=CRED, autologon=True, confirm=True,
+            teardown=True,
+        )
+    except TypeError:
+        raise
+    except Exception:
+        pass
+
+    candidates = list(inner)
+    for script in outer:
+        candidates.append(script)
+        candidates.extend(_decoded_enc(script))
+    profile_scripts = [
+        s for s in candidates
+        if _PROFILE_LEG_RE.search(s)
+        or any(token in s.lower() for token in _PROFILE_TOKENS)
+    ]
+    # The teardown restore script is a guest script too, and it is the one
+    # that puts the guest's original values back -- so a syntax error in it
+    # breaks every teardown while nothing else notices.
+    restore_scripts = [
+        s for s in candidates if _PROFILE_RESTORE_MARKER in s]
+    assert profile_scripts, (
+        "#138 AC10: the default test profile generated no guest scripts"
+    )
+    # Exactly one leg per setting, so a leg that stops being selected cannot
+    # disappear silently.
+    legs_seen = {
+        m.group(0).split("'")[1]
+        for s in profile_scripts
+        for m in [_PROFILE_LEG_RE.search(s)] if m
+    }
+    assert len(legs_seen) == _PROFILE_SETTING_COUNT, (
+        f"#138 AC10/TF-001: expected {_PROFILE_SETTING_COUNT} profile legs "
+        f"to be parse-checked; saw {len(legs_seen)}: {sorted(legs_seen)}")
+    for script in profile_scripts:
+        assert _parse_errors(script) == [], (
+            "#138 AC10: a test-profile script does not parse under "
+            "Windows PowerShell 5.1"
+        )
+    assert restore_scripts, (
+        "#138 AC10/TF-002: the teardown restore script was never generated, "
+        "so it is never parse-checked either"
+    )
+    for script in restore_scripts:
+        assert _parse_errors(script) == [], (
+            "#138 AC10: the teardown restore script does not parse under "
+            "Windows PowerShell 5.1"
+        )

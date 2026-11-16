@@ -92,7 +92,12 @@ def suppress_receipt_mints() -> Iterator[None]:
         _MINT_SUPPRESSED.reset(token)
 BASE_CAPABILITIES = {"uia", "msaa"}
 ELECTRON_CAPABILITY = "adapter:electron"
-_CAPABILITIES = BASE_CAPABILITIES | {ELECTRON_CAPABILITY}
+#: Issue #135: the in-session helper's byte-stream forwarder. A helper that
+#: advertises it can carry a tcp relay's guest leg; one installed before this
+#: issue cannot, which is why `relay_start(kind="tcp")` consults
+#: `helper_capabilities` and refuses with `stream_unavailable`.
+STREAM_CAPABILITY = "stream"
+_CAPABILITIES = BASE_CAPABILITIES | {ELECTRON_CAPABILITY, STREAM_CAPABILITY}
 
 #: The capability each adapter name maps to. A request naming an adapter
 #: with no entry here is never gated and never bootstrapped.
@@ -414,6 +419,21 @@ if (Test-Path $dir) {
     Remove-Item -Recurse -Force $dir
 }
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
+# The restore record lives under this directory, and the profile's AC7 guard
+# trusts whatever record it finds -- so an unprivileged guest user must not be
+# able to create one first. The stock ProgramData child ACL grants Users
+# CI/WD/AD/WEA/WA and CREATOR OWNER full control; strip the inheritance and
+# leave only SYSTEM and Administrators (by SID, so a localized group name
+# cannot change the answer).
+$dacl = Get-Acl -Path $dir
+$dacl.SetAccessRuleProtection($true, $false)
+foreach ($sid in 'S-1-5-18', 'S-1-5-32-544') {
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        (New-Object System.Security.Principal.SecurityIdentifier $sid),
+        'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+    [void]$dacl.AddAccessRule($rule)
+}
+Set-Acl -Path $dir -AclObject $dacl
 $helperPath = Join-Path $dir 'uia_helper.ps1'
 [IO.File]::WriteAllBytes($helperPath, [Convert]::FromBase64String($reqEnc))
 $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($helperPath))
@@ -544,6 +564,487 @@ try {
 _UUID_READ_CMD = ("(Get-CimInstance -ClassName Win32_ComputerSystemProduct "
                   "-ErrorAction Stop).UUID")
 
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# issue #138: the test-image profile
+# ---------------------------------------------------------------------------
+
+#: Where the profile's restore record lives. One JSON object mapping each
+#: applied setting name to what the guest held BEFORE the profile changed it.
+#: Teardown reads it, restores every recorded setting, and removes the file
+#: only when EVERY restore succeeded.
+_TEST_PROFILE_DIR = r"C:\ProgramData\hyperv-mcp\test-profile"
+_TEST_PROFILE_RECORD = "restore.json"
+_NL = chr(10)  # a literal newline; keeps the generated scripts readable
+_TEST_PROFILE_RECORD_PATH = _TEST_PROFILE_DIR + "\\" + _TEST_PROFILE_RECORD
+
+#: The closed setting set (issue #138 claim 4's table). Each entry names the
+#: setting, what its recorded previous value IS, and the guest script that
+#: applies the change. `alias` is the powercfg GUID alias the read
+#: block-parses; `power` settings are recorded as BOTH the AC and the DC index
+#: (the profile changes both, so recording one would restore the other to a
+#: value the guest never held).
+TEST_PROFILE_SETTINGS: dict[str, dict[str, str]] = {
+    "no_display_timeout": {
+        "kind": "powercfg", "sub": "SUB_VIDEO", "alias": "VIDEOIDLE",
+        "after": "[PSCustomObject]@{ ac = '0'; dc = '0' }",
+        # The change addresses the setting by ALIAS through
+        # /setacvalueindex, which takes the RAW index /query reported.
+        # 'powercfg /change monitor-timeout-ac 0' would disable it just as
+        # well (0 is 0 in either unit), but the RESTORE has to write the
+        # recorded index back and /change interprets its value in MINUTES
+        # while /query reports SECONDS -- so keeping one command shape for
+        # both directions removes the unit conversion entirely.
+        "change": ("powercfg /setacvalueindex SCHEME_CURRENT SUB_VIDEO "
+                   "VIDEOIDLE 0" + _NL
+                   + "Assert-HypervMcpNative \"applying VIDEOIDLE AC\"" + _NL
+                   + "powercfg /setdcvalueindex SCHEME_CURRENT SUB_VIDEO "
+                   "VIDEOIDLE 0" + _NL
+                   + "Assert-HypervMcpNative \"applying VIDEOIDLE DC\""),
+    },
+    "no_sleep": {
+        "kind": "powercfg", "sub": "SUB_SLEEP", "alias": "STANDBYIDLE",
+        "after": "[PSCustomObject]@{ ac = '0'; dc = '0'; hibernate = 'off' }",
+        "change": ("powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP "
+                   "STANDBYIDLE 0" + _NL
+                   + "Assert-HypervMcpNative \"applying STANDBYIDLE AC\"" + _NL
+                   + "powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP "
+                   "STANDBYIDLE 0" + _NL
+                   + "Assert-HypervMcpNative \"applying STANDBYIDLE DC\""
+                   + "powercfg /h off" + _NL
+                   + "Assert-HypervMcpNative \"disabling hibernation\""),
+    },
+    "no_lock_on_resume": {
+        "kind": "powercfg", "sub": "SUB_NONE", "alias": "CONSOLELOCK",
+        "after": "[PSCustomObject]@{ ac = '0'; dc = '0' }",
+        "change": ("powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE "
+                   "CONSOLELOCK 0" + _NL
+                   + "Assert-HypervMcpNative \"applying CONSOLELOCK AC\"" + _NL
+                   + "powercfg /setdcvalueindex SCHEME_CURRENT SUB_NONE "
+                   "CONSOLELOCK 0" + _NL
+                   + "Assert-HypervMcpNative \"applying CONSOLELOCK DC\""),
+    },
+    # The four registry legs share one shape: create the key if the guest
+    # never had it, then create the value with an explicit PropertyType or
+    # update it in place. NOTE for reviewers: `Set-ItemProperty` ALSO accepts
+    # `-Type` and it is validated (`-Type NotARealType` is a
+    # ParameterBindingException) and it does control the stored kind, but it
+    # appears in neither `Get-Command -Syntax` nor `.Parameters` under
+    # Windows PowerShell 5.1.26100.9818 -- so a leg that leans on it looks
+    # broken to anyone reading the metadata. The teardown restore legs do use
+    # it; both forms were executed under the 5.1 host this module pins
+    # (`_DEFAULT_PS`) and both write the recorded kind, so neither is a bug.
+    "no_auto_update": {
+        "kind": "registry",
+        "path": (r"HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"),
+        "name": "NoAutoUpdate",
+        "after": "1",
+        "type": "DWord",
+        "change": (
+                   "if (-not (Test-Path -LiteralPath $auPath)) {" + _NL
+                   + "    New-Item -Path $auPath -Force | Out-Null" + _NL
+                   + "}" + _NL
+                   + "if ($null -eq (Get-ItemProperty -Path $auPath -Name NoAutoUpdate -ErrorAction SilentlyContinue)) {" + _NL
+                   + "    New-ItemProperty -Path $auPath -Name NoAutoUpdate -Value 1 -PropertyType DWord | Out-Null" + _NL
+                   + "} else {" + _NL
+                   + "    Set-ItemProperty -Path $auPath -Name NoAutoUpdate -Value 1" + _NL
+                   + "}"),
+    },
+    "no_inactivity_lock": {
+        "kind": "registry",
+        "path": (r"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"),
+        "name": "InactivityTimeoutSecs",
+        "after": "0",
+        "type": "DWord",
+        "change": (
+                   "if (-not (Test-Path -LiteralPath $lockPath)) {" + _NL
+                   + "    New-Item -Path $lockPath -Force | Out-Null" + _NL
+                   + "}" + _NL
+                   + "if ($null -eq (Get-ItemProperty -Path $lockPath -Name InactivityTimeoutSecs -ErrorAction SilentlyContinue)) {" + _NL
+                   + "    New-ItemProperty -Path $lockPath -Name InactivityTimeoutSecs -Value 0 -PropertyType DWord | Out-Null" + _NL
+                   + "} else {" + _NL
+                   + "    Set-ItemProperty -Path $lockPath -Name InactivityTimeoutSecs -Value 0" + _NL
+                   + "}"),
+    },
+    "no_screen_saver": {
+        "kind": "registry",
+        "path": r"HKCU:\Control Panel\Desktop",
+        "name": "ScreenSaveActive",
+        "after": "'0'",
+        "type": "String",
+        "change": (
+                   "if (-not (Test-Path -LiteralPath $ssPath)) {" + _NL
+                   + "    New-Item -Path $ssPath -Force | Out-Null" + _NL
+                   + "}" + _NL
+                   + "if ($null -eq (Get-ItemProperty -Path $ssPath -Name ScreenSaveActive -ErrorAction SilentlyContinue)) {" + _NL
+                   + "    New-ItemProperty -Path $ssPath -Name ScreenSaveActive -Value '0' -PropertyType String | Out-Null" + _NL
+                   + "} else {" + _NL
+                   + "    Set-ItemProperty -Path $ssPath -Name ScreenSaveActive -Value '0'" + _NL
+                   + "}"),
+    },
+    "uac_on_desktop": {
+        "kind": "registry",
+        "path": (r"HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"),
+        "name": "PromptOnSecureDesktop",
+        "after": "0",
+        "type": "DWord",
+        "change": (
+                   "if (-not (Test-Path -LiteralPath $uacPath)) {" + _NL
+                   + "    New-Item -Path $uacPath -Force | Out-Null" + _NL
+                   + "}" + _NL
+                   + "if ($null -eq (Get-ItemProperty -Path $uacPath -Name PromptOnSecureDesktop -ErrorAction SilentlyContinue)) {" + _NL
+                   + "    New-ItemProperty -Path $uacPath -Name PromptOnSecureDesktop -Value 0 -PropertyType DWord | Out-Null" + _NL
+                   + "} else {" + _NL
+                   + "    Set-ItemProperty -Path $uacPath -Name PromptOnSecureDesktop -Value 0" + _NL
+                   + "}"),
+    },
+}
+
+#: Shared PowerShell prelude for one profile leg. Every piece of it exists to
+#: keep the ORIGINAL value recoverable:
+#:
+#: * `Assert-HypervMcpNative` checks `$LASTEXITCODE` after every native call,
+#:   so a native failure aborts the leg BEFORE the record is written.
+#: * `Save-HypervMcpRestoreRecord` writes a temp file and renames it, so a
+#:   crash mid-write cannot truncate the record and destroy every prior entry.
+_PROFILE_PRELUDE = """$ErrorActionPreference = 'Stop'
+function Assert-HypervMcpNative($what) {
+    if ($LASTEXITCODE -ne 0) {
+        throw ("$what failed: the native command exited $LASTEXITCODE")
+    }
+}
+function Save-HypervMcpRestoreRecord($recordPath, $record) {
+    $dir = Split-Path -Parent $recordPath
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        # Same rule as the install directory: the record is the only copy of
+        # the guest's original state, and the guard trusts whatever it finds.
+        $dacl = Get-Acl -Path $dir
+        $dacl.SetAccessRuleProtection($true, $false)
+        foreach ($sid in 'S-1-5-18', 'S-1-5-32-544') {
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier $sid),
+                'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+            [void]$dacl.AddAccessRule($rule)
+        }
+        Set-Acl -Path $dir -AclObject $dacl
+    }
+    # Temp file + rename: the record is the ONLY copy of the guest's original
+    # state, so a partially written file must never become the record.
+    $tmp = [IO.Path]::GetTempFileName()
+    try {
+        [IO.File]::WriteAllText($tmp, ($record | ConvertTo-Json -Compress))
+        Move-Item -LiteralPath $tmp -Destination $recordPath -Force
+    } catch {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}"""
+
+#: The powercfg reader, carried only by powercfg legs (a registry leg names
+#: only its own setting, issue #138 AC5). It reads BOTH the AC and the DC
+#: index and THROWS when it cannot find them: a read failure must never be
+#: recorded as a fabricated original.
+_POWERCFG_READER = """function Get-HypervMcpPowerIndices($subGuid, $alias) {
+    # The block is identified by the setting's GUID alias (an ASCII token that
+    # appears in powercfg's output whatever the UI language), and the two hex
+    # indices at the END of that block are the AC and the DC value -- the
+    # "Possible Setting" lines come first, so taking the last two is the
+    # locale-independent way to tell them apart.
+    $lines = @(powercfg /query SCHEME_CURRENT $subGuid 2>$null)
+    Assert-HypervMcpNative "powercfg /query SCHEME_CURRENT $subGuid"
+    # A subgroup holds SEVERAL settings, each closing with its own AC/DC index
+    # pair, so the collection has to stop at the end of THIS setting's block.
+    # The block ends where the next dashed GUID appears ("Power Setting GUID:",
+    # "Subgroup GUID:", "Power Scheme GUID:") -- a dashed GUID is the one
+    # structural marker that survives a localized UI, and no line inside a
+    # setting block carries one. Without this bound the reader walks to the
+    # end of the subgroup and returns the LAST setting's indices.
+    $guid = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+    $seen = $false
+    $indices = New-Object System.Collections.Generic.List[string]
+    foreach ($ln in $lines) {
+        if (-not $seen) {
+            if ($ln -match [regex]::Escape($alias)) { $seen = $true }
+            continue
+        }
+        if ($ln -match $guid) { break }
+        if ($ln -match '0x([0-9a-fA-F]{8})') { $indices.Add($Matches[1]) }
+    }
+    if ((-not $seen) -or ($indices.Count -lt 2)) {
+        throw ("could not read the current $alias power indices from " +
+               "powercfg /query; the original value is unknown, so the " +
+               "profile cannot be applied safely")
+    }
+    return @([Convert]::ToInt32($indices[$indices.Count - 2], 16).ToString(),
+             [Convert]::ToInt32($indices[$indices.Count - 1], 16).ToString())
+}"""
+
+
+def resolve_test_profile(requested) -> list[str]:
+    """The closed setting names a `test_profile` request selects.
+
+    `["default"]` (or any list containing it) selects every setting; a name
+    outside the documented set is refused BY NAME before anything runs, so a
+    typo costs no PowerShell leg and the caller learns the exact spelling.
+    """
+    if not requested:
+        return []
+    names = [str(name or "").strip() for name in requested]
+    unknown = sorted({n for n in names
+                      if n and n != "default" and n not in TEST_PROFILE_SETTINGS})
+    if unknown:
+        raise ValueError(
+            "unknown test-image setting(s): " + ", ".join(unknown)
+            + '; expected "default" or one of '
+            + ", ".join(sorted(TEST_PROFILE_SETTINGS)))
+    if "default" in names:
+        return sorted(TEST_PROFILE_SETTINGS)
+    return sorted({n for n in names if n})
+
+
+def _test_profile_setting_script(setting: str) -> str:
+    """One leg per setting: READ the current value, RECORD it (guarded), CHANGE.
+
+    The order inside the script is load-bearing (issue #138 AC6): the current
+    value is read first, the restore record is written second, and the change
+    is applied last — so a crash mid-leg cannot lose the original value. The
+    record write is guarded on the setting not already being recorded (AC7):
+    re-applying the profile must not overwrite the true original with the
+    profile's own value.
+    """
+    spec = TEST_PROFILE_SETTINGS[setting]
+    read = _profile_read_block(setting)
+    parts = [_PROFILE_PRELUDE]
+    if spec["kind"] == "powercfg":
+        # Only a powercfg leg carries the reader: a registry leg names only
+        # its own setting, so it must not mention another setting's alias.
+        parts.append(_POWERCFG_READER)
+    parts.append(read)
+    return _NL.join(parts + [
+        "$recordDir = " + pswindows.ps_quote(_TEST_PROFILE_DIR),
+        "$recordPath = Join-Path $recordDir "
+        + pswindows.ps_quote(_TEST_PROFILE_RECORD),
+        "$rec = @{}",
+        "if (Test-Path -LiteralPath $recordPath) {",
+        "    $obj = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json",
+        "    foreach ($p in $obj.PSObject.Properties) { $rec[$p.Name] = $p.Value }",
+        "}",
+        # AC7's guard: only a setting that is NOT yet recorded is written, so
+        # a re-apply cannot overwrite the true original with the profile's own
+        # value.
+        "if (-not $rec.ContainsKey(" + pswindows.ps_quote(setting) + ")) {",
+        "    $rec[" + pswindows.ps_quote(setting) + "] = $entry",
+        "    Save-HypervMcpRestoreRecord $recordPath $rec",
+        "}",
+        spec["change"],
+        # before/after are the issue's claim 4.4: the result must carry, per
+        # setting, what the guest held, what the profile set, and whether it
+        # landed. The leg is the only honest source for both.
+        "[PSCustomObject]@{ ok = $true; setting = "
+        + pswindows.ps_quote(setting) + "; before = $before; after = "
+        + spec["after"] + " } | ConvertTo-Json -Compress",
+    ])
+
+
+def _profile_read_block(setting: str) -> str:
+    """The read fragment for one setting: it leaves the record entry in
+    `$entry`, and THROWS when the current value cannot be determined."""
+    spec = TEST_PROFILE_SETTINGS[setting]
+    if spec["kind"] == "powercfg":
+        # /query's second argument is the SUBGROUP; the setting's alias is what
+        # the reader block-parses for. Passing the alias in the subgroup slot
+        # (the earlier shape) made powercfg reject the command or return the
+        # wrong block, so all three powercfg settings were unusable.
+        # TWO arguments, matching the reader's two parameters: the subgroup
+        # and the setting's alias. Passing the scheme as a third argument
+        # (an earlier shape of this line) left the reader bound to
+        # $subGuid='SCHEME_CURRENT' and $alias='<subgroup>', so it queried
+        # SCHEME_CURRENT as a subgroup and never matched the setting at all.
+        read_cmd = (
+            "$pair = Get-HypervMcpPowerIndices "
+            + pswindows.ps_quote(spec["sub"]) + " "
+            + pswindows.ps_quote(spec["alias"])
+        )
+        lines = [
+            read_cmd,
+            "$entry = [PSCustomObject]@{ kind = 'powercfg'; ac = $pair[0]; "
+            "dc = $pair[1] }",
+            # $before is what the leg reports back to the host (issue #138
+            # claim 4.4: the result carries before/after/applied per setting).
+            "$before = [PSCustomObject]@{ ac = $pair[0]; dc = $pair[1] }",
+        ]
+        if setting == "no_sleep":
+            # The profile disables hibernation, so the prior state has to be
+            # recorded too or teardown cannot put it back.
+            lines += [
+                # 'powercfg /a' cannot answer this: it lists Hibernate
+                # under "not available on this system" WITH a reason line
+                # when hibernation is merely disabled, so matching the token
+                # read a disabled hibernation as enabled and teardown turned
+                # it back on. HibernateEnabled is what 'powercfg /h' itself
+                # writes, so it is the exact prior state.
+                r"$hibKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Power'",
+                "$hibOn = [bool]((Get-ItemProperty -Path $hibKey "
+                "-Name HibernateEnabled -ErrorAction SilentlyContinue)"
+                ".HibernateEnabled)",
+                "$entry | Add-Member -NotePropertyName hibernate -NotePropertyValue "
+                "$(if ($hibOn) { 'on' } else { 'off' }) -Force",
+                "$before | Add-Member -NotePropertyName hibernate -NotePropertyValue "
+                "$(if ($hibOn) { 'on' } else { 'off' }) -Force",
+            ]
+        return _NL.join(lines)
+    path = pswindows.ps_quote(spec["path"])
+    name = spec["name"]
+    # A registry value that does not exist is $null -- a legitimate original
+    # state, recorded as null and restored by DELETING the value.
+    return _NL.join([
+        "$" + _REGISTRY_VAR[setting] + " = " + path,
+        "$prev = $null",
+        "if (Test-Path -LiteralPath $" + _REGISTRY_VAR[setting] + ") {",
+        "    $prev = (Get-ItemProperty -Path $" + _REGISTRY_VAR[setting]
+        + " -Name " + name + " -ErrorAction SilentlyContinue)." + name,
+        "}",
+        "$entry = [PSCustomObject]@{ kind = 'registry'; value = $prev }",
+        "$before = $prev",
+    ])
+
+
+#: The variable each registry setting's read block binds its path to. One per
+#: setting so a leg never names another setting's registry path (AC5: an
+#: unselected setting's tokens must not appear in the leg at all).
+_REGISTRY_VAR = {
+    "no_auto_update": "auPath",
+    "no_inactivity_lock": "lockPath",
+    "no_screen_saver": "ssPath",
+    "uac_on_desktop": "uacPath",
+}
+
+
+#: Teardown's inverse of the whole profile: restore every recorded setting,
+#: then remove the record — but only when EVERY restore succeeded. A no-op
+#: when no profile was ever applied, so a teardown on a plain install costs
+#: one leg and changes nothing. Each block carries a comment naming the exact
+#: commands the profile ran, so the generated script is self-describing about
+#: what it is undoing.
+_TEST_PROFILE_RESTORE_INNER = """$ErrorActionPreference = 'Stop'
+function Assert-HypervMcpNative($what) {
+    if ($LASTEXITCODE -ne 0) {
+        throw ("$what failed: the native command exited $LASTEXITCODE")
+    }
+}
+$recordPath = """ + pswindows.ps_quote(_TEST_PROFILE_RECORD_PATH) + """
+$failed = New-Object System.Collections.Generic.List[string]
+if (Test-Path -LiteralPath $recordPath) {
+    $obj = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+    $props = $obj.PSObject.Properties
+    # no_display_timeout (powercfg): the profile ran 'powercfg
+    # /setacvalueindex SCHEME_CURRENT SUB_VIDEO VIDEOIDLE 0' and the matching
+    # /setdcvalueindex. The restore writes the recorded index back through the
+    # SAME command, because it takes the raw index /query reported (SECONDS
+    # for a timeout). The other spelling of the same restore, the one that
+    # names the friendly setting instead of the alias, would read that number
+    # as MINUTES and restore 60x the original timeout.
+    if ($props['no_display_timeout']) {
+        $e = $obj.no_display_timeout
+        try {
+            powercfg /setacvalueindex SCHEME_CURRENT SUB_VIDEO VIDEOIDLE $e.ac
+            Assert-HypervMcpNative "restoring VIDEOIDLE AC"
+            powercfg /setdcvalueindex SCHEME_CURRENT SUB_VIDEO VIDEOIDLE $e.dc
+            Assert-HypervMcpNative "restoring VIDEOIDLE DC"
+        } catch { $failed.Add('no_display_timeout') }
+    }
+    # no_sleep (powercfg): the profile ran 'powercfg /setacvalueindex
+    # SCHEME_CURRENT SUB_SLEEP STANDBYIDLE 0', the matching /setdcvalueindex
+    # and 'powercfg /h off'. The restore writes the recorded index back
+    # through the SAME command (raw index, SECONDS); the friendly-setting
+    # spelling would read it as MINUTES.
+    if ($props['no_sleep']) {
+        $e = $obj.no_sleep
+        try {
+            powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE $e.ac
+            Assert-HypervMcpNative "restoring STANDBYIDLE AC"
+            powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE $e.dc
+            Assert-HypervMcpNative "restoring STANDBYIDLE DC"
+            if ($e.hibernate -eq 'on') {
+                powercfg /h on
+                Assert-HypervMcpNative "restoring hibernation"
+            }
+        } catch { $failed.Add('no_sleep') }
+    }
+    # no_lock_on_resume (powercfg): the profile ran 'powercfg
+    # /setacvalueindex SCHEME_CURRENT SUB_NONE CONSOLELOCK 0' and the matching
+    # /setdcvalueindex.
+    if ($props['no_lock_on_resume']) {
+        $e = $obj.no_lock_on_resume
+        try {
+            powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE CONSOLELOCK $e.ac
+            Assert-HypervMcpNative "restoring CONSOLELOCK AC"
+            powercfg /setdcvalueindex SCHEME_CURRENT SUB_NONE CONSOLELOCK $e.dc
+            Assert-HypervMcpNative "restoring CONSOLELOCK DC"
+        } catch { $failed.Add('no_lock_on_resume') }
+    }
+    # no_auto_update (registry): the profile set NoAutoUpdate=1 under
+    # HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU. A
+    # recorded $null means the guest never had the value, so the restore
+    # DELETES it rather than writing a value the image did not carry.
+    if ($props['no_auto_update']) {
+        $e = $obj.no_auto_update
+        try {
+            $auPath = 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU'
+            if ($null -eq $e.value) {
+                Remove-ItemProperty -Path $auPath -Name NoAutoUpdate -ErrorAction SilentlyContinue
+            } else {
+                Set-ItemProperty -Path $auPath -Name NoAutoUpdate -Value $e.value -Type DWord
+            }
+        } catch { $failed.Add('no_auto_update') }
+    }
+    # no_inactivity_lock (registry): the profile set InactivityTimeoutSecs=0.
+    if ($props['no_inactivity_lock']) {
+        $e = $obj.no_inactivity_lock
+        try {
+            $p = 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System'
+            if ($null -eq $e.value) {
+                Remove-ItemProperty -Path $p -Name InactivityTimeoutSecs -ErrorAction SilentlyContinue
+            } else {
+                Set-ItemProperty -Path $p -Name InactivityTimeoutSecs -Value $e.value -Type DWord
+            }
+        } catch { $failed.Add('no_inactivity_lock') }
+    }
+    # no_screen_saver (registry): the profile set ScreenSaveActive='0'.
+    if ($props['no_screen_saver']) {
+        $e = $obj.no_screen_saver
+        try {
+            $p = 'HKCU:\\Control Panel\\Desktop'
+            if ($null -eq $e.value) {
+                Remove-ItemProperty -Path $p -Name ScreenSaveActive -ErrorAction SilentlyContinue
+            } else {
+                Set-ItemProperty -Path $p -Name ScreenSaveActive -Value $e.value -Type String
+            }
+        } catch { $failed.Add('no_screen_saver') }
+    }
+    # uac_on_desktop (registry): the profile set PromptOnSecureDesktop=0.
+    if ($props['uac_on_desktop']) {
+        $e = $obj.uac_on_desktop
+        try {
+            $p = 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System'
+            if ($null -eq $e.value) {
+                Remove-ItemProperty -Path $p -Name PromptOnSecureDesktop -ErrorAction SilentlyContinue
+            } else {
+                Set-ItemProperty -Path $p -Name PromptOnSecureDesktop -Value $e.value -Type DWord
+            }
+        } catch { $failed.Add('uac_on_desktop') }
+    }
+    # The record is the ONLY copy of the original state, so it is removed only
+    # once every restore has succeeded; a partial restore keeps it for a retry.
+    if ($failed.Count -eq 0) {
+        Remove-Item -LiteralPath '""" + _TEST_PROFILE_RECORD_PATH + """' -Force
+    }
+}
+[PSCustomObject]@{ ok = ($failed.Count -eq 0); profile_restored = ($failed.Count -eq 0); unrestored = @($failed) } | ConvertTo-Json -Compress"""
+
+
+
 #: The verb-path discovery of a recorded install: the newest per-provision
 #: helper directory and the uuid/nonce/version files inside it (F3/F10c).
 _UUID_DISCOVERY_CMD = (
@@ -551,11 +1052,19 @@ _UUID_DISCOVERY_CMD = (
     "-Directory -Filter 'uia-helper-*' -ErrorAction SilentlyContinue | "
     "Sort-Object LastWriteTime -Descending | Select-Object -First 1); "
     "if ($d) { "
-    "$f = @{ dir = $d.FullName; uuid = ''; nonce = ''; version = '' }; "
+    "$f = @{ dir = $d.FullName; uuid = ''; nonce = ''; version = ''; "
+    "capabilities = @() }; "
     "foreach ($k in @('uuid','nonce','version')) { "
     "$p = Join-Path $d.FullName ($k + '.txt'); "
     "if (Test-Path -LiteralPath $p) { "
     "$f[$k] = ([IO.File]::ReadAllText($p)).Trim() } }; "
+    # Issue #135: capabilities.txt is the helper's OWN record of what it
+    # resolved (the only honest source), read as a list so an empty file
+    # is an empty set rather than a blank capability name.
+    "$cp = Join-Path $d.FullName 'capabilities.txt'; "
+    "if (Test-Path -LiteralPath $cp) { "
+    "$f.capabilities = @((([IO.File]::ReadAllText($cp)).Trim() -split ',') | "
+    "Where-Object { $_ -ne '' }) }; "
     "$f | ConvertTo-Json -Compress }"
 )
 
@@ -783,11 +1292,20 @@ def _install_facts(cfg, ref, cred: CredentialSet) -> dict | None:
         return None
     if not isinstance(facts, dict) or not facts.get("dir"):
         return None
+    caps = facts.get("capabilities")
+    if isinstance(caps, str):
+        caps = [c.strip() for c in caps.split(",") if c.strip()]
     record = {
         "dir": str(facts.get("dir")),
         "uuid": str(facts.get("uuid") or ""),
         "nonce": str(facts.get("nonce") or ""),
         "version": str(facts.get("version") or ""),
+        # Issue #135: the capability set the INSTALLED helper advertises.
+        # A helper provisioned before this issue has no capabilities.txt,
+        # so the list is empty and helper_capabilities falls back to the
+        # baseline -- which is exactly why such a helper must be refused a
+        # tcp relay.
+        "capabilities": [str(c) for c in (caps or [])],
     }
     with _REGISTRY_LOCK:
         _INSTALLS[ref.id] = record
@@ -2170,12 +2688,111 @@ def _teardown_helper(cfg, ref, cred: CredentialSet) -> dict:
                         k: v for k, v in out.items() if k != "ok"}}
         out["lsa_secret_deleted"] = bool(frame.get("lsa_secret_deleted"))
         out["autologon_restored"] = bool(frame.get("autologon_restored"))
+        # Issue #138: the profile's inverse. Runs on EVERY teardown and is a
+        # no-op when no profile was ever applied (the record file is absent),
+        # so a plain install costs one leg and changes nothing. A restore that
+        # FAILED is reported: the helper itself is gone, but the guest is still
+        # carrying a profile setting, and the caller must be able to see that
+        # (the record is retained for a retry).
+        try:
+            leg = _frame_leg(cfg, ref, cred, _TEST_PROFILE_RESTORE_INNER,
+                             pswindows.utf8_b64("profile-restore"),
+                             timeout_ms=60000)
+            frame = _provision_leg_frame(leg)
+        except Exception as exc:
+            # A leg that RAISES after the task is unregistered and the LSA
+            # secret deleted is still a restore that did not complete: the
+            # caller must see it as one, with the record retained, rather than
+            # a raw transport error that says nothing about the profile.
+            out["profile_restored"] = False
+            out["unrestored_settings"] = []
+            return {"ok": False, "error_class": "profile_restore_failed",
+                    "error": (f"the profile-restore leg failed: {str(exc)[:300]} "
+                              "(the restore record was retained for a retry)"),
+                    **{k: v for k, v in out.items() if k != "ok"}}
+        # A leg whose stdout is not exactly one JSON document (any crash of
+        # the restore script, any native output ahead of the frame) parses to
+        # {}, and _provision_leg_frame turns that into {}. Reading an absent
+        # key as "restored" therefore reported every such failure as a clean
+        # restore while the guest kept the profile's values. The leg's own ok
+        # is now required, so a degraded frame is a FAILED restore.
+        out["profile_restored"] = bool(
+            frame.get("ok") is True and frame.get("profile_restored") is True)
+        out["unrestored_settings"] = [
+            str(s) for s in (frame.get("unrestored") or [])]
+    if out.get("profile_restored") is False:
+        return {"ok": False, "error_class": "profile_restore_failed",
+                "error": ("test-image settings not restored: "
+                          + ", ".join(out.get("unrestored_settings") or ["unknown"])
+                          + " (the restore record was retained for a retry)"),
+                **{k: v for k, v in out.items() if k != "ok"}}
     return out
+
+
+def helper_capabilities(cfg, vm_name="", cred: CredentialSet | None = None, *,
+                        vm_id: str = "") -> set[str]:
+    """The capability set the VM's installed helper advertises (issue #135).
+
+    Returns the EMPTY set when no helper is installed, the install facts are
+    unreadable, or the discovery leg fails — a caller must treat that as "no
+    forwarder", never as "unknown, assume present". A helper provisioned
+    before issue #135 advertises the baseline `uia` and nothing else, so it
+    has no stream forwarder and a tcp relay must be refused.
+
+    Read-only: it never installs, never provisions and never mutates the
+    registry. The checks for a tcp relay monkeypatch this function, which is
+    why it is the single seam `relay_start(kind="tcp")` consults.
+    """
+    if vm_name and vm_id:
+        raise ValueError("give vm_name or vm_id, not both")
+    ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    if cred is None:
+        # The install facts are read through a guest leg, so no credential
+        # means no facts — an EMPTY capability set, never an assumed one.
+        return set()
+    try:
+        facts = _install_facts(cfg, ref, cred)
+    except Exception:
+        return set()
+    if not isinstance(facts, dict):
+        return set()
+    caps = facts.get("capabilities")
+    if isinstance(caps, (list, tuple, set)):
+        known = {str(c) for c in caps}
+    elif "capabilities" in facts:
+        # Present but not a list: a corrupt record. That is UNKNOWN, never an
+        # assumed baseline.
+        return set()
+    else:
+        # The key is ABSENT, which is what provision_helper's cache holds: it
+        # records the install facts before the helper has ever written
+        # capabilities.txt, so the set is unknown rather than the baseline.
+        # Reducing it to the baseline here made the normal
+        # provision-then-relay_start(kind="tcp") workflow fail for the life of
+        # the process. Drop the incomplete record and read the guest's own.
+        _drop_install_facts(ref.id)
+        try:
+            facts = _install_facts(cfg, ref, cred)
+        except Exception:
+            return set()
+        if not isinstance(facts, dict):
+            return set()
+        caps = facts.get("capabilities")
+        if isinstance(caps, (list, tuple, set)):
+            known = {str(c) for c in caps}
+        elif "capabilities" in facts:
+            return set()
+        else:
+            # Still nothing: a helper provisioned before issue #135, or one
+            # whose discovery leg failed. Both are "no forwarder".
+            known = set(BASE_CAPABILITIES)
+    return known & _CAPABILITIES
 
 
 def provision_helper(cfg, vm_name="", cred: CredentialSet | None = None,
                      autologon: bool = True, confirm: bool = False, *,
-                     vm_id: str = "", teardown: bool = False):
+                     vm_id: str = "", teardown: bool = False,
+                     test_profile=None):
     """Install + start the in-session UIA helper (ui_provision + confirm),
     or — with ``teardown=True`` — remove everything it persisted.
 
@@ -2184,6 +2801,15 @@ def provision_helper(cfg, vm_name="", cred: CredentialSet | None = None,
     PolicyDenied naming ui_provision, and confirm=False raises
     PolicyDenied naming confirm. Secrets (the autologon password, the
     helper bytes) ride the framed stdin payload, never script text.
+
+    ``test_profile`` (issue #138) additionally applies a test-image profile
+    to a disposable guest: ``["default"]`` selects every setting in the
+    closed set (no display timeout, no sleep, no lock on resume, no
+    inactivity lock, no screen saver, no automatic updates, UAC on the
+    ordinary desktop). Each setting's previous value is read, recorded and
+    only then changed, and ``teardown=True`` restores every recorded setting
+    before removing the record. An unknown setting name is refused before
+    any PowerShell runs.
 
     The install is idempotent (F14a): the running helper's task instance
     and process are stopped and every previous per-provision directory is
@@ -2202,6 +2828,9 @@ def provision_helper(cfg, vm_name="", cred: CredentialSet | None = None,
 
         raise CredentialError(
             "guest credentials are required for provisioning")
+    # Issue #138: the setting names are validated BEFORE the VM is resolved,
+    # so a typo costs no PowerShell leg (the resolution leg runs one).
+    settings = resolve_test_profile(test_profile)
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     if teardown:
         return _teardown_helper(cfg, ref, cred)
@@ -2218,7 +2847,11 @@ def provision_helper(cfg, vm_name="", cred: CredentialSet | None = None,
                      "task_registered": False,
                      "helper_version": HELPER_VERSION,
                      "helper_running": False, "reboot_required": False,
-                     "guest_uuid_read": False, "helper_dir": ""}
+                     "guest_uuid_read": False, "helper_dir": "",
+                     # Issue #138: the test-image profile. Additive — a call
+                     # without test_profile carries the same empty list it
+                     # always did.
+                     "test_profile": []}
     with vm_lock(ref.id, mode="write"):
         # F14(a): stop the running helper and clear the previous
         # directories first — re-provisioning must not leave the old
@@ -2289,6 +2922,57 @@ def provision_helper(cfg, vm_name="", cred: CredentialSet | None = None,
                          pswindows.utf8_b64("task"), timeout_ms=60000)
         frame = _provision_leg_frame(leg)
         results["task_registered"] = bool(frame.get("task_registered"))
+        if settings:
+            # Issue #138: one leg per setting, INSIDE the same write lock, so
+            # a concurrent re-provision cannot interleave with a half-applied
+            # profile. A setting that fails leaves the guest half-configured,
+            # so the call reports ok:false with the per-setting detail rather
+            # than pretending the profile landed.
+            # Issue #138 claim 4.4: the result carries, per setting, `before`,
+            # `after` and `applied`, plus `reboot_required`. The leg is the
+            # only honest source for `before`/`after` (it read the original
+            # and set the new value), so the host records what the leg
+            # reported rather than reconstructing it.
+            applied: dict[str, dict] = {}
+            failed: list[str] = []
+            for setting in settings:
+                try:
+                    leg = _frame_leg(
+                        cfg, ref, cred, _test_profile_setting_script(setting),
+                        pswindows.utf8_b64("profile"), timeout_ms=60000)
+                    frame = _provision_leg_frame(leg)
+                except Exception as exc:
+                    # A leg that RAISES (transport failure, PS pool busy) is a
+                    # failed setting like any other: letting it escape abandons
+                    # the remaining settings AND the applied/failed accounting,
+                    # so the caller sees a raw transport envelope with no record
+                    # of which settings landed.
+                    failed.append(setting)
+                    results["test_profile_error"] = str(exc)[:300]
+                    continue
+                if frame.get("ok"):
+                    applied[setting] = {
+                        "before": frame.get("before"),
+                        "after": frame.get("after"),
+                        "applied": True,
+                    }
+                else:
+                    failed.append(setting)
+                    applied[setting] = {"before": frame.get("before"),
+                                        "after": None, "applied": False}
+            results["test_profile"] = applied
+            if applied:
+                # The profile's settings are read at logon (the screen saver,
+                # UAC's secure desktop and the lock timeouts), so the guest
+                # must be rebooted — or at least logged off and back on —
+                # before the new state is what a session actually sees.
+                results["reboot_required"] = True
+            if failed:
+                return {**results, "ok": False,
+                        "error_class": "test_profile_failed",
+                        "error": (
+                            "test-image settings that did not apply: "
+                            + ", ".join(failed))}
     try:
         state = session_state(cfg, ref, cred=cred)
         helper = (state or {}).get("helper") or {}

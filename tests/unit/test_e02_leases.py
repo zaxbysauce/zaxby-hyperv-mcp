@@ -55,7 +55,9 @@ _SRC = Path(__file__).resolve().parents[2] / "src"
 # below IS the contract. Issue #29 added the four lease-gated console-scope
 # UI tools (invoke/set_value/focus/helper_provision), bringing the surface
 # to 80 tools and this list to 42; issue #137's hyperv_ui_act (console
-# scope, lease-gated, no confirm) makes it 43.
+# scope, lease-gated, no confirm) makes it 43; issue #127's two
+# mutating CDP tools make it 45, and the four hyperv_cdp_* tools are not
+# lease-gated, so this list holds 47 entries.
 LEASED_TOOLS = [
     "hyperv_guest_start_interactive",
     # lifecycle (17)
@@ -86,6 +88,10 @@ LEASED_TOOLS = [
     "hyperv_relay_start",
     "hyperv_relay_stop",
     "hyperv_repair_guest_access",
+    # issue #127: the two mutating CDP tools (eval runs application code,
+    # input dispatches real mouse events); targets/snapshot are reads
+    "hyperv_cdp_eval",
+    "hyperv_cdp_input",
     # transfer (2)
     "hyperv_guest_put",
     "hyperv_guest_get",

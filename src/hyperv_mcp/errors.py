@@ -25,8 +25,21 @@ from .credentials import CredentialError
 from .media import MediaError
 from .vmlocks import VMBusy
 
+
+class StreamUnavailable(ValueError):
+    """Issue #135: the VM's helper advertises no `stream` forwarder.
+
+    Subclasses `ValueError` so the module-level API keeps raising the same
+    family its callers (and the frozen acceptance checks) already catch, while
+    `classify` can report its OWN class instead of collapsing it into
+    "invalid" — a caller must be able to branch on `stream_unavailable` and
+    hear the remedy (`hyperv_ui_helper_provision`) without string-matching.
+    """
+
+
 __all__ = [
     "BUSY_RETRY_MS",
+    "StreamUnavailable",
     "classify",
     "enrich_failure",
     "envelope",
@@ -53,6 +66,10 @@ def classify(exc: BaseException) -> str:
     """
     if isinstance(exc, policy.PolicyDenied):
         return "policy"
+    if isinstance(exc, StreamUnavailable):
+        # Issue #135: a helper without the `stream` forwarder is its own
+        # class, so the tool envelope names it instead of "invalid".
+        return "stream_unavailable"
     if isinstance(exc, CredentialError):
         return "credential"
     if isinstance(exc, VMBusy):

@@ -44,6 +44,10 @@ RUN_PS_ALLOWLIST = {
     # deliberate: the logon-task launcher registers a scheduled task (a
     # service-management script), not Hyper-V addressing (issue #13)
     ("http_entry.py", "_handle_logon_task"),
+    # issue #135: the GuestCommunicationServices registration leg — the same
+    # service-management class as the logon task (a registry key plus an
+    # ElementName value), never Hyper-V addressing
+    ("http_entry.py", "_handle_hvsocket_service"),
     ("server.py", "main"),                    # deliberate: --check-env reachability probe
 }
 

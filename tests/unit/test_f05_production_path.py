@@ -733,6 +733,13 @@ class ProvisionLegRecorder:
         if "Unregister-ScheduledTask" in script:     # _RESET_INNER
             return self._ps({"ok": True, "task_unregistered": True,
                              "directories_removed": 2})
+        # _TEST_PROFILE_RESTORE_INNER: the leg emits its own verdict, so the
+        # recorder has to serve one. Falling through to the session_state
+        # frame here left the key absent, and the host used to read an absent
+        # key as "restored" -- exactly the default RP-004 removed.
+        if "profile_restored" in script:
+            return self._ps({"ok": True, "profile_restored": True,
+                             "unrestored": []})
         if "LsaStorePrivateData" in script:          # _AUTOLOGON_INNER
             return self._ps({"ok": True, "autologon": True})
         if "Register-ScheduledTask" in script:       # _TASK_INNER

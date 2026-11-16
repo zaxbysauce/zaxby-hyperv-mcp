@@ -66,6 +66,9 @@ TOOL_NAMES = {
     "hyperv_guest_job_output", "hyperv_guest_job_stop",
     "hyperv_wait_guest_recovery",
     "hyperv_relay_start", "hyperv_relay_status", "hyperv_relay_stop",
+    # issue #127: the CDP channel over a tcp relay (no guest credential)
+    "hyperv_cdp_targets", "hyperv_cdp_eval",
+    "hyperv_cdp_input", "hyperv_cdp_snapshot",
     "hyperv_capture_evidence",
     # issue #23: the lease surface
     "hyperv_lease_acquire", "hyperv_lease_renew",
@@ -124,8 +127,9 @@ def test_tool_inventory_registered(fresh_server):
     # tests/unit/test_f04_sequences.py::test_sequence_tool_schema_and_boot_epoch_reporting);
     # 76 with issue #29's eight hyperv_ui_* tools; 80 with PR #112's four
     # Workstream G tools (vm_clone, vm_remove, deployment_status, harvest);
-    # 84 with issue #137's hyperv_ui_snapshot + hyperv_ui_act.
-    assert len(schemas) == 85
+    # 84 with issue #137's hyperv_ui_snapshot + hyperv_ui_act; 89 with issue
+    # #127's four hyperv_cdp_* tools.
+    assert len(schemas) == 89
 
 
 def test_every_vm_tool_schema_has_vm_id(fresh_server):

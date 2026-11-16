@@ -318,6 +318,10 @@ def test_tool_scopes_map_is_pinned():
         "hyperv_guest_job_start": "guest_exec", "hyperv_guest_job_stop": "guest_exec",
         "hyperv_relay_start": "guest_exec", "hyperv_relay_stop": "guest_exec",
         "hyperv_repair_guest_access": "guest_exec",
+        # issue #127: the two mutating CDP tools are lease-gated; the read
+        # pair (targets/snapshot) is not, exactly like hyperv_relay_status
+        "hyperv_cdp_eval": "guest_exec",
+        "hyperv_cdp_input": "console",
         # transfer
         "hyperv_guest_put": "transfer", "hyperv_guest_get": "transfer",
         # console
