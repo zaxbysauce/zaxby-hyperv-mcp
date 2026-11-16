@@ -1,7 +1,7 @@
 """
 hyperv_mcp.server -- MCP server for Hyper-V VM management (hardened fork).
 
-Exposes 85 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
+Exposes 89 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
 guest execution and file transfer via PowerShell Direct, guest access
 diagnostics/repair and managed guest jobs, reboot recovery verification,
 host-to-guest HTTP relay, console observation and input (WMI), evidence
@@ -5503,8 +5503,8 @@ def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]
             # mutual exclusion issue #23 exists to provide would not cover
             # these tools at all. Resolve the relay's VM BEFORE authorizing so
             # the presented lease is bound to the VM the call actually touches.
-            # The read is an indexed registry lookup (a store fallback only on
-            # a local miss), never a spawn.
+            # The read is an indexed registry lookup (plus a store fallback for
+            # the tool whose body also reads the store), never a spawn.
             if not vm_hint and not vm_name_hint and name in (
                 "hyperv_guest_job_stop", "hyperv_relay_stop",
                 "hyperv_cdp_eval", "hyperv_cdp_input",
@@ -5512,17 +5512,23 @@ def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]
                 if name == "hyperv_guest_job_stop":
                     row_vm = guestjobs.peek_vm_id(
                         arguments.get("job_id") or "", cfg, owner=agent)
+                elif name == "hyperv_relay_stop":
+                    # relay_stop's body restores a relay the registry no longer
+                    # holds (`_restore_relay`, which reads the durable store),
+                    # so the gate must resolve the VM the same way or a lease on
+                    # one VM authorizes stopping a persisted row for another.
+                    # The owner-filtered read is correct HERE because the body's
+                    # restore path uses strict owner equality: a relay another
+                    # principal owns yields no hint and the body refuses it.
+                    row_vm = relay.peek_vm_id(
+                        arguments.get("relay_id") or "", cfg, owner=agent)
                 else:
-                    # The relay's VM, resolved with the SAME rule the CDP body
-                    # uses (`relay.lookup_entry`, which applies no ownership
-                    # filter) rather than the owner-filtered `peek_vm_id`. The
-                    # filtered read returns "" for a relay owned by another
-                    # principal, and `matches_hint` treats an empty hint as
-                    # "any VM" — so a lease on VM-A would authorize a call into
-                    # VM-B whenever the caller is unattributed. Using the
-                    # body's rule makes the gate agree with what the body will
-                    # actually address; a relay the body would refuse yields
-                    # no hint and the body refuses it anyway.
+                    # The two CDP tools read the LIVE registry only, so the
+                    # gate uses the same rule -- an owner-filtered read would
+                    # return "" for a relay owned by another principal, and
+                    # `matches_hint` treats an empty hint as "any VM", so a
+                    # lease on VM-A would authorize a call into VM-B whenever
+                    # the caller is unattributed.
                     entry = relay.lookup_entry(
                         arguments.get("relay_id") or "")
                     row_vm = (str(entry.get("vm_id") or "")
@@ -5563,15 +5569,20 @@ def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]
                 row_vm = guestjobs.peek_vm_id(arguments.get("job_id") or "", cfg,
                                               owner=agent)
             else:
-                # The relay's VM, read with the SAME rule the leased path above
-                # and the CDP body use (`relay.lookup_entry`, no ownership
-                # filter). `relay.peek_vm_id` is owner-filtered and returns ""
-                # for a relay owned by another principal; an empty hint reads
-                # as "any VM", so the unleased conflict test would silently
-                # skip the VM the call actually addresses.
-                entry = relay.lookup_entry(arguments.get("relay_id") or "")
-                row_vm = (str(entry.get("vm_id") or "")
-                          if entry is not None else "")
+                # The relay's VM, read with the rule that matches each tool's
+                # body: the two CDP tools read the live registry only, so an
+                # owner-filtered read would return "" for a relay owned by
+                # another principal and an empty hint would read as "any VM";
+                # relay_stop's body also reads the durable store, so it takes
+                # the store-aware read instead.
+                if name == "hyperv_relay_stop":
+                    row_vm = relay.peek_vm_id(
+                        arguments.get("relay_id") or "", cfg, owner=agent)
+                else:
+                    entry = relay.lookup_entry(
+                        arguments.get("relay_id") or "")
+                    row_vm = (str(entry.get("vm_id") or "")
+                              if entry is not None else "")
             vm_hint = row_vm or ""
         # The conflict comparison is GUID-keyed, so the caller's name is
         # resolved to its GUID BEFORE any conflict test (round-6 note). A

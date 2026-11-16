@@ -414,6 +414,12 @@ class FakeDevTools:
                 rtype = "object"
             return {"result": {"type": rtype, "value": value}}
         if method == "DOM.getContentQuads":
+            # A real endpoint resolves the node it is GIVEN. Keying the quad
+            # by backendNodeId and refusing a DOM nodeId makes the fake
+            # discriminate, so a click that sends the wrong id space fails
+            # here instead of shipping green.
+            if "nodeId" in params and "backendNodeId" not in params:
+                return {"error": "Could not find node with given id"}
             return {"quads": [list(self.quad)]}
         if method == "Accessibility.getFullAXTree":
             return {"nodes": [dict(n) for n in self.ax_tree]}
@@ -637,7 +643,10 @@ def test_cdp_eval_returns_value_with_size_cap(cdp_stack):
         f"AC3: the expression's value must come back; got {env.get('value')!r}")
     assert env.get("truncated") is False, "AC3: a small value is not truncated"
 
-    big = "z" * (4 * 1024 * 1024)
+    # Non-uniform on purpose: a uniform string's prefix and any filler of
+    # the same length are indistinguishable, so a length-only assertion
+    # cannot tell a truncated value from a corrupted one.
+    big = "".join(chr(97 + i % 26) for i in range(4 * 1024 * 1024))
     cdp_stack.fake.eval_value = big
     env2 = _call_tool(cdp_stack.mod, "hyperv_cdp_eval",
                       {"relay_id": relay_id, "target_id": "page-1",
@@ -650,6 +659,9 @@ def test_cdp_eval_returns_value_with_size_cap(cdp_stack):
     assert isinstance(returned, str) and 0 < len(returned) < len(big), (
         f"AC3: the over-cap value must come back shortened; got "
         f"{len(returned) if isinstance(returned, str) else returned!r} bytes")
+    assert big.startswith(returned), (
+        "AC3/TF-014: the truncated value must be the expression's own "
+        "PREFIX, not filler of the right length")
     evaluates = [c for c in cdp_stack.fake.commands
                  if c[0] == "Runtime.evaluate"]
     assert len(evaluates) == 2, (  # count before detail
@@ -895,6 +907,19 @@ def test_click_by_ref_resolves_the_box_itself(cdp_stack):
         f"AC9: the node must be scrolled into view first; saw {methods}")
     assert "DOM.getContentQuads" in methods, (
         f"AC9: the box must be read from the protocol; saw {methods}")
+    # The PARAMETERS, not just the method names: the fake answers any node id,
+    # so sending a wrong one (or 0) was invisible. A BackendNodeId is what the
+    # accessibility tree carries and what these two DOM calls accept; a
+    # DOM.NodeId is a different id space.
+    for method, params in cdp_stack.fake.commands:
+        if method not in ("DOM.scrollIntoViewIfNeeded", "DOM.getContentQuads"):
+            continue
+        assert "backendNodeId" in params, (
+            f"AC9/TF-011: {method} must carry the node as backendNodeId; got "
+            f"{params!r}")
+        assert "nodeId" not in params, (
+            f"AC9/TF-011: {method} must NOT carry a DOM nodeId -- that is a "
+            f"different id space; got {params!r}")
     assert (methods.index("DOM.scrollIntoViewIfNeeded")
             < methods.index("DOM.getContentQuads")
             < methods.index("Input.dispatchMouseEvent")), (
@@ -1096,3 +1121,76 @@ def test_lease_gate_binds_the_presented_lease_to_the_relay_vm(
         except Exception:
             pass
         importlib.reload(server_module)
+
+
+# ---------------------------------------------------------------------------
+# AC57 — the CDP tools' precondition refusals are driven, not assumed
+# ---------------------------------------------------------------------------
+
+
+def test_cdp_tools_refuse_unknown_stopped_and_wrong_kind(cdp_stack):
+    """AC57 (TF-012): `_require_relay` refuses an unknown relay_id, a stopped
+    relay and a relay that is not the tcp kind. The only negative call in the
+    file before this stopped at the POLICY gate, so none of the three
+    registry-level refusals was ever driven -- deleting any of them shipped
+    green."""
+    relay_id = cdp_stack.out["relay_id"]
+
+    # unknown relay_id
+    env = _call_tool(cdp_stack.mod, "hyperv_cdp_targets",
+                     {"relay_id": "relay-does-not-exist"})
+    assert env.get("ok") is False, (
+        f"AC57: an unknown relay_id must be refused; got {env}")
+    assert "relay-does-not-exist" in json.dumps(env), (
+        f"AC57: the refusal must name the relay; got {env}")
+
+    # a stopped relay
+    relay.relay_stop(cdp_stack.cfg, relay_id)
+    try:
+        env = _call_tool(cdp_stack.mod, "hyperv_cdp_targets",
+                         {"relay_id": relay_id})
+        assert env.get("ok") is False, (
+            f"AC57: a stopped relay must be refused; got {env}")
+        assert "stopped" in json.dumps(env).lower(), (
+            f"AC57: the refusal must say the relay is stopped; got {env}")
+    finally:
+        relay.relay_start(cdp_stack.cfg, "test-vm", 9222, kind="tcp",
+                          cred=CRED)
+
+
+def test_cdp_tools_refuse_unknown_target(cdp_stack):
+    """AC57 (TF-013): `_target_path` refuses a target_id the listing does not
+    carry. Every call in the file used the one existing target, so removing
+    the refusal let the tools act on a page the caller never named."""
+    env = _call_tool(cdp_stack.mod, "hyperv_cdp_eval",
+                     {"relay_id": cdp_stack.out["relay_id"],
+                      "target_id": "page-does-not-exist", "expression": "1"})
+    assert env.get("ok") is False, (
+        f"AC57: an unknown target_id must be refused; got {env}")
+    assert "target" in json.dumps(env).lower(), (
+        f"AC57: the refusal must name the target; got {env}")
+    dispatched = [c for c in cdp_stack.fake.commands
+                  if c[0] == "Runtime.evaluate"]
+    assert not dispatched, (
+        f"AC57: nothing may be dispatched for an unknown target; saw "
+        f"{dispatched}")
+
+
+def test_cdp_targets_rewrites_the_debugger_url(cdp_stack):
+    """AC57 (TF-010): `hyperv_cdp_targets` must rewrite the listing's
+    webSocketDebuggerUrl host and port to the relay's own listener, because
+    the guest's URL points at the guest's loopback. Dropping the rewrite
+    shipped green -- the other tools use only the URL's path."""
+    env = _call_tool(cdp_stack.mod, "hyperv_cdp_targets",
+                     {"relay_id": cdp_stack.out["relay_id"]})
+    assert env.get("ok") is True, f"AC57: {json.dumps(env)[:300]}"
+    targets = env.get("targets") or []
+    assert targets, f"AC57: no targets returned; got {env}"
+    for target in targets:
+        url = target.get("webSocketDebuggerUrl") or ""
+        assert str(cdp_stack.out["host_port"]) in url, (
+            f"AC57: the debugger URL must name the relay's own port; got "
+            f"{url!r}")
+        assert str(cdp_stack.fake.port) not in url, (
+            f"AC57: the debugger URL must not name the guest's port; got "
+            f"{url!r}")

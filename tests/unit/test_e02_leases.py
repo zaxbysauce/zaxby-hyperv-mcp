@@ -56,7 +56,8 @@ _SRC = Path(__file__).resolve().parents[2] / "src"
 # UI tools (invoke/set_value/focus/helper_provision), bringing the surface
 # to 80 tools and this list to 42; issue #137's hyperv_ui_act (console
 # scope, lease-gated, no confirm) makes it 43; issue #127's two
-# mutating CDP tools make it 45.
+# mutating CDP tools make it 45, and the four hyperv_cdp_* tools are not
+# lease-gated, so this list holds 47 entries.
 LEASED_TOOLS = [
     "hyperv_guest_start_interactive",
     # lifecycle (17)

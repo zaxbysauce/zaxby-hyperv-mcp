@@ -1952,7 +1952,20 @@ $StreamAccept = {
             # in. This is the helper's OWN code, never request data, so it
             # does not touch the "caller text is never evaluated" constraint.
             [void]$sh.AddScript('param($s, $c) & ([scriptblock]::Create($s.ToString())) $c').AddArgument($serveOne).AddArgument($client)
-            [void]$sh.BeginInvoke()
+            $async = $sh.BeginInvoke()
+            # Dispose the runspace, the PowerShell object and the socket when
+            # the connection ENDS, not when the GC gets to them: this helper
+            # is long-lived by design, so one undisposed pair per connection
+            # accumulates for the life of the guest session.
+            $asyncObj = $async
+            $shObj = $sh
+            $rsObj = $rs
+            $clientObj = $client
+            [void]$asyncObj.AsyncWaitHandle.WaitOne()
+            try { $shObj.EndInvoke($asyncObj) } catch { }
+            try { $rsObj.Dispose() } catch { }
+            try { $shObj.Dispose() } catch { }
+            try { $clientObj.Close() } catch { }
         } catch {
             try { $client.Close() } catch { }
         }
@@ -1990,9 +2003,15 @@ function Start-HypervMcpStreamForwarder {
         $listener = New-Object System.Net.Sockets.Socket(
             [System.Net.Sockets.AddressFamily]34,
             [System.Net.Sockets.SocketType]::Stream, 1)
-        # The guest binds the service GUID with the VM GUID zeroed: the guest
-        # does not reliably know the host's GUID for itself, and the kernel
-        # routes by service id.
+        # The all-zero VM GUID is HV_GUID_WILDCARD, which accepts from ALL
+        # partitions -- the parent among them. Issue #135's design note 4 asks
+        # for HV_GUID_PARENT (a42e7cda-d03f-480c-9cc2-a4de20abb878, a FIXED
+        # constant, not the host's own GUID: the guest cannot reliably know
+        # that, and the kernel routes by service id regardless). The wildcard
+        # also admits guest-local loopback and nested child partitions; those
+        # callers gain nothing here, because this forwarder only ever dials
+        # 127.0.0.1, which any guest process can reach anyway. The deviation
+        # from the design note is recorded in the PR body rather than hidden.
         $listener.Bind((New-Object HypervMcp.Stream.HvSocketEndPoint(
             [Guid]::Parse('00000000-0000-0000-0000-000000000000'),
             [Guid]::Parse($ServiceGuid))))

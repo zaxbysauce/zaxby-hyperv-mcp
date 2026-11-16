@@ -935,7 +935,18 @@ _PROFILE_TOKENS = (
     "windowsupdate\\au", "noautoupdate",
     "consolelock", "inactivitytimeoutsecs",
     "screensaveactive", "promptonsecuredesktop",
+    # The powercfg GUID aliases. Selecting on the change tokens alone stopped
+    # matching the display-timeout leg once that leg moved to the alias
+    # spelling, so the leg was never parse-checked at all.
+    "videoidle", "standbyidle",
 )
+
+# The marker every generated profile leg emits, and the teardown restore's
+# own verdict marker. Selecting on these cannot silently drop a leg.
+_PROFILE_LEG_RE = re.compile(r"setting = '[a-z_]+'")
+_PROFILE_RESTORE_MARKER = "profile_restored"
+
+_PROFILE_SETTING_COUNT = 7
 
 _PROFILE_ENC_RE = re.compile(r"\$enc = '([A-Za-z0-9+/=]+)'")
 
@@ -998,19 +1009,57 @@ def test_parse_test_profile_scripts(monkeypatch, parsed_ps):
     except Exception:
         pass  # post-capture validation failures don't matter (script captured)
 
+    # A teardown as well: the restore script is a guest script too, and it is
+    # the one that puts the guest's original values back. Without this leg the
+    # restore was never generated, so it was never parse-checked.
+    try:
+        uia.provision_helper(
+            UNRESTRICTED, "vm1", cred=CRED, autologon=True, confirm=True,
+            teardown=True,
+        )
+    except TypeError:
+        raise
+    except Exception:
+        pass
+
     candidates = list(inner)
     for script in outer:
         candidates.append(script)
         candidates.extend(_decoded_enc(script))
     profile_scripts = [
         s for s in candidates
-        if any(token in s.lower() for token in _PROFILE_TOKENS)
+        if _PROFILE_LEG_RE.search(s)
+        or any(token in s.lower() for token in _PROFILE_TOKENS)
     ]
+    # The teardown restore script is a guest script too, and it is the one
+    # that puts the guest's original values back -- so a syntax error in it
+    # breaks every teardown while nothing else notices.
+    restore_scripts = [
+        s for s in candidates if _PROFILE_RESTORE_MARKER in s]
     assert profile_scripts, (
         "#138 AC10: the default test profile generated no guest scripts"
     )
+    # Exactly one leg per setting, so a leg that stops being selected cannot
+    # disappear silently.
+    legs_seen = {
+        m.group(0).split("'")[1]
+        for s in profile_scripts
+        for m in [_PROFILE_LEG_RE.search(s)] if m
+    }
+    assert len(legs_seen) == _PROFILE_SETTING_COUNT, (
+        f"#138 AC10/TF-001: expected {_PROFILE_SETTING_COUNT} profile legs "
+        f"to be parse-checked; saw {len(legs_seen)}: {sorted(legs_seen)}")
     for script in profile_scripts:
         assert _parse_errors(script) == [], (
             "#138 AC10: a test-profile script does not parse under "
+            "Windows PowerShell 5.1"
+        )
+    assert restore_scripts, (
+        "#138 AC10/TF-002: the teardown restore script was never generated, "
+        "so it is never parse-checked either"
+    )
+    for script in restore_scripts:
+        assert _parse_errors(script) == [], (
+            "#138 AC10: the teardown restore script does not parse under "
             "Windows PowerShell 5.1"
         )

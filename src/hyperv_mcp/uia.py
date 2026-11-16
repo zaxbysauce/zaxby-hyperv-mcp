@@ -419,6 +419,21 @@ if (Test-Path $dir) {
     Remove-Item -Recurse -Force $dir
 }
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
+# The restore record lives under this directory, and the profile's AC7 guard
+# trusts whatever record it finds -- so an unprivileged guest user must not be
+# able to create one first. The stock ProgramData child ACL grants Users
+# CI/WD/AD/WEA/WA and CREATOR OWNER full control; strip the inheritance and
+# leave only SYSTEM and Administrators (by SID, so a localized group name
+# cannot change the answer).
+$dacl = Get-Acl -Path $dir
+$dacl.SetAccessRuleProtection($true, $false)
+foreach ($sid in 'S-1-5-18', 'S-1-5-32-544') {
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        (New-Object System.Security.Principal.SecurityIdentifier $sid),
+        'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+    [void]$dacl.AddAccessRule($rule)
+}
+Set-Acl -Path $dir -AclObject $dacl
 $helperPath = Join-Path $dir 'uia_helper.ps1'
 [IO.File]::WriteAllBytes($helperPath, [Convert]::FromBase64String($reqEnc))
 $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes($helperPath))
@@ -582,25 +597,32 @@ TEST_PROFILE_SETTINGS: dict[str, dict[str, str]] = {
         # both directions removes the unit conversion entirely.
         "change": ("powercfg /setacvalueindex SCHEME_CURRENT SUB_VIDEO "
                    "VIDEOIDLE 0" + _NL
+                   + "Assert-HypervMcpNative \"applying VIDEOIDLE AC\"" + _NL
                    + "powercfg /setdcvalueindex SCHEME_CURRENT SUB_VIDEO "
-                   "VIDEOIDLE 0"),
+                   "VIDEOIDLE 0" + _NL
+                   + "Assert-HypervMcpNative \"applying VIDEOIDLE DC\""),
     },
     "no_sleep": {
         "kind": "powercfg", "sub": "SUB_SLEEP", "alias": "STANDBYIDLE",
         "after": "[PSCustomObject]@{ ac = '0'; dc = '0'; hibernate = 'off' }",
         "change": ("powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP "
                    "STANDBYIDLE 0" + _NL
+                   + "Assert-HypervMcpNative \"applying STANDBYIDLE AC\"" + _NL
                    + "powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP "
                    "STANDBYIDLE 0" + _NL
-                   + "powercfg /h off"),
+                   + "Assert-HypervMcpNative \"applying STANDBYIDLE DC\""
+                   + "powercfg /h off" + _NL
+                   + "Assert-HypervMcpNative \"disabling hibernation\""),
     },
     "no_lock_on_resume": {
         "kind": "powercfg", "sub": "SUB_NONE", "alias": "CONSOLELOCK",
         "after": "[PSCustomObject]@{ ac = '0'; dc = '0' }",
         "change": ("powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE "
                    "CONSOLELOCK 0" + _NL
+                   + "Assert-HypervMcpNative \"applying CONSOLELOCK AC\"" + _NL
                    + "powercfg /setdcvalueindex SCHEME_CURRENT SUB_NONE "
-                   "CONSOLELOCK 0"),
+                   "CONSOLELOCK 0" + _NL
+                   + "Assert-HypervMcpNative \"applying CONSOLELOCK DC\""),
     },
     "no_auto_update": {
         "kind": "registry",
@@ -609,8 +631,14 @@ TEST_PROFILE_SETTINGS: dict[str, dict[str, str]] = {
         "after": "1",
         "type": "DWord",
         "change": (
-            "if (-not (Test-Path -LiteralPath $auPath)) {    New-Item -Path $auPath -Force | Out-Null}Set-ItemProperty -Path $auPath -Name NoAutoUpdate -Value 1 "
-            "-Type DWord"),
+                   "if (-not (Test-Path -LiteralPath $auPath)) {" + _NL
+                   + "    New-Item -Path $auPath -Force | Out-Null" + _NL
+                   + "}" + _NL
+                   + "if ($null -eq (Get-ItemProperty -Path $auPath -Name NoAutoUpdate -ErrorAction SilentlyContinue)) {" + _NL
+                   + "    New-ItemProperty -Path $auPath -Name NoAutoUpdate -Value 1 -PropertyType DWord | Out-Null" + _NL
+                   + "} else {" + _NL
+                   + "    Set-ItemProperty -Path $auPath -Name NoAutoUpdate -Value 1" + _NL
+                   + "}"),
     },
     "no_inactivity_lock": {
         "kind": "registry",
@@ -619,8 +647,14 @@ TEST_PROFILE_SETTINGS: dict[str, dict[str, str]] = {
         "after": "0",
         "type": "DWord",
         "change": (
-            "Set-ItemProperty -Path $lockPath -Name InactivityTimeoutSecs "
-            "-Value 0 -Type DWord"),
+                   "if (-not (Test-Path -LiteralPath $lockPath)) {" + _NL
+                   + "    New-Item -Path $lockPath -Force | Out-Null" + _NL
+                   + "}" + _NL
+                   + "if ($null -eq (Get-ItemProperty -Path $lockPath -Name InactivityTimeoutSecs -ErrorAction SilentlyContinue)) {" + _NL
+                   + "    New-ItemProperty -Path $lockPath -Name InactivityTimeoutSecs -Value 0 -PropertyType DWord | Out-Null" + _NL
+                   + "} else {" + _NL
+                   + "    Set-ItemProperty -Path $lockPath -Name InactivityTimeoutSecs -Value 0" + _NL
+                   + "}"),
     },
     "no_screen_saver": {
         "kind": "registry",
@@ -629,8 +663,14 @@ TEST_PROFILE_SETTINGS: dict[str, dict[str, str]] = {
         "after": "'0'",
         "type": "String",
         "change": (
-            "Set-ItemProperty -Path $ssPath -Name ScreenSaveActive -Value '0' "
-            "-Type String"),
+                   "if (-not (Test-Path -LiteralPath $ssPath)) {" + _NL
+                   + "    New-Item -Path $ssPath -Force | Out-Null" + _NL
+                   + "}" + _NL
+                   + "if ($null -eq (Get-ItemProperty -Path $ssPath -Name ScreenSaveActive -ErrorAction SilentlyContinue)) {" + _NL
+                   + "    New-ItemProperty -Path $ssPath -Name ScreenSaveActive -Value '0' -PropertyType String | Out-Null" + _NL
+                   + "} else {" + _NL
+                   + "    Set-ItemProperty -Path $ssPath -Name ScreenSaveActive -Value '0'" + _NL
+                   + "}"),
     },
     "uac_on_desktop": {
         "kind": "registry",
@@ -639,8 +679,14 @@ TEST_PROFILE_SETTINGS: dict[str, dict[str, str]] = {
         "after": "0",
         "type": "DWord",
         "change": (
-            "Set-ItemProperty -Path $uacPath -Name PromptOnSecureDesktop "
-            "-Value 0 -Type DWord"),
+                   "if (-not (Test-Path -LiteralPath $uacPath)) {" + _NL
+                   + "    New-Item -Path $uacPath -Force | Out-Null" + _NL
+                   + "}" + _NL
+                   + "if ($null -eq (Get-ItemProperty -Path $uacPath -Name PromptOnSecureDesktop -ErrorAction SilentlyContinue)) {" + _NL
+                   + "    New-ItemProperty -Path $uacPath -Name PromptOnSecureDesktop -Value 0 -PropertyType DWord | Out-Null" + _NL
+                   + "} else {" + _NL
+                   + "    Set-ItemProperty -Path $uacPath -Name PromptOnSecureDesktop -Value 0" + _NL
+                   + "}"),
     },
 }
 
@@ -661,6 +707,17 @@ function Save-HypervMcpRestoreRecord($recordPath, $record) {
     $dir = Split-Path -Parent $recordPath
     if (-not (Test-Path -LiteralPath $dir)) {
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        # Same rule as the install directory: the record is the only copy of
+        # the guest's original state, and the guard trusts whatever it finds.
+        $dacl = Get-Acl -Path $dir
+        $dacl.SetAccessRuleProtection($true, $false)
+        foreach ($sid in 'S-1-5-18', 'S-1-5-32-544') {
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier $sid),
+                'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+            [void]$dacl.AddAccessRule($rule)
+        }
+        Set-Acl -Path $dir -AclObject $dacl
     }
     # Temp file + rename: the record is the ONLY copy of the guest's original
     # state, so a partially written file must never become the record.
@@ -899,7 +956,10 @@ if (Test-Path -LiteralPath $recordPath) {
             Assert-HypervMcpNative "restoring STANDBYIDLE AC"
             powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP STANDBYIDLE $e.dc
             Assert-HypervMcpNative "restoring STANDBYIDLE DC"
-            if ($e.hibernate -eq 'on') { powercfg /h on }
+            if ($e.hibernate -eq 'on') {
+                powercfg /h on
+                Assert-HypervMcpNative "restoring hibernation"
+            }
         } catch { $failed.Add('no_sleep') }
     }
     # no_lock_on_resume (powercfg): the profile ran 'powercfg
@@ -2640,11 +2700,14 @@ def _teardown_helper(cfg, ref, cred: CredentialSet) -> dict:
                     "error": (f"the profile-restore leg failed: {str(exc)[:300]} "
                               "(the restore record was retained for a retry)"),
                     **{k: v for k, v in out.items() if k != "ok"}}
-        # `profile_restored` is ABSENT only on a leg that never ran the
-        # generated script (a stubbed transport); the script itself always
-        # emits it, so an absent key is read as "no failure reported" while a
-        # present False is a real partial restore. C43 pins the generator.
-        out["profile_restored"] = bool(frame.get("profile_restored", True))
+        # A leg whose stdout is not exactly one JSON document (any crash of
+        # the restore script, any native output ahead of the frame) parses to
+        # {}, and _provision_leg_frame turns that into {}. Reading an absent
+        # key as "restored" therefore reported every such failure as a clean
+        # restore while the guest kept the profile's values. The leg's own ok
+        # is now required, so a degraded frame is a FAILED restore.
+        out["profile_restored"] = bool(
+            frame.get("ok") is True and frame.get("profile_restored") is True)
         out["unrestored_settings"] = [
             str(s) for s in (frame.get("unrestored") or [])]
     if out.get("profile_restored") is False:
@@ -2686,8 +2749,33 @@ def helper_capabilities(cfg, vm_name="", cred: CredentialSet | None = None, *,
     caps = facts.get("capabilities")
     if isinstance(caps, (list, tuple, set)):
         known = {str(c) for c in caps}
+    elif "capabilities" in facts:
+        # Present but not a list: a corrupt record. That is UNKNOWN, never an
+        # assumed baseline.
+        return set()
     else:
-        known = set(BASE_CAPABILITIES)
+        # The key is ABSENT, which is what provision_helper's cache holds: it
+        # records the install facts before the helper has ever written
+        # capabilities.txt, so the set is unknown rather than the baseline.
+        # Reducing it to the baseline here made the normal
+        # provision-then-relay_start(kind="tcp") workflow fail for the life of
+        # the process. Drop the incomplete record and read the guest's own.
+        _drop_install_facts(ref.id)
+        try:
+            facts = _install_facts(cfg, ref, cred)
+        except Exception:
+            return set()
+        if not isinstance(facts, dict):
+            return set()
+        caps = facts.get("capabilities")
+        if isinstance(caps, (list, tuple, set)):
+            known = {str(c) for c in caps}
+        elif "capabilities" in facts:
+            return set()
+        else:
+            # Still nothing: a helper provisioned before issue #135, or one
+            # whose discovery leg failed. Both are "no forwarder".
+            known = set(BASE_CAPABILITIES)
     return known & _CAPABILITIES
 
 

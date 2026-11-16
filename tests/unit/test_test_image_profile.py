@@ -67,6 +67,18 @@ SETTINGS = {
     "no_screen_saver": ("screensaveactive",),
     "uac_on_desktop": ("promptonsecuredesktop",),
 }
+# The RESTORE tokens, which are not the change tokens: no_sleep's change
+# disables hibernation (/h off) while its restore re-enables it (/h on).
+RESTORE_TOKENS = {
+    "no_display_timeout": ("videoidle",),
+    "no_sleep": ("standbyidle", "/h on"),
+    "no_auto_update": ("noautoupdate",),
+    "no_lock_on_resume": ("consolelock",),
+    "no_inactivity_lock": ("inactivitytimeoutsecs",),
+    "no_screen_saver": ("screensaveactive",),
+    "uac_on_desktop": ("promptonsecuredesktop",),
+}
+
 ALL_TOKENS = tuple(
     token for tokens in SETTINGS.values() for token in tokens)
 
@@ -127,6 +139,11 @@ class LegRecorder:
         if RESTORE_RECORD in script and _reads(script):
             result = {"text": RECORD_JSON}
         frame: dict = {"ok": True, "result": result}
+        # _TEST_PROFILE_RESTORE_INNER emits its own verdict. Falling through
+        # to the generic frame left the key absent, and the host used to read
+        # an absent key as "restored" -- the default RP-004 removed.
+        if "profile_restored" in script:
+            frame = {"ok": True, "profile_restored": True, "unrestored": []}
         # A profile leg reports before/after itself: the host records what
         # the leg said, so the recorder must SAY something. Serving a frame
         # with neither key made AC49's "the key is present" assertion pass
@@ -373,20 +390,23 @@ def test_previous_value_is_recorded_before_the_change(legs):
     read_at = _first_pos(script, [
         r"get-itempropertyvalue", r"get-itemproperty", r"getvalue\(",
     ])
-    record_at = script.lower().find(RESTORE_RECORD)
+    # The save CALL, not the first mention of the record path: the path is
+    # assigned before anything else, so anchoring on it let a leg with no save
+    # at all satisfy the order check.
+    save_at = _first_pos(script, [r"save-hypervmcprestorerecord\s+\$recordpath"])
     change_at = _first_pos(script, [
         r"set-itemproperty", r"new-itemproperty", r"setvalue\(",
     ])
     assert read_at is not None, (
         "AC6: the leg never reads the setting's current value; the original "
         "would be lost")
-    assert record_at != -1, (
-        "AC6: the leg never mentions the restore record "
-        f"({RESTORE_RECORD}); the original value is not persisted")
+    assert save_at is not None, (
+        "AC6: the leg never CALLS Save-HypervMcpRestoreRecord; the original "
+        "value is not persisted")
     assert change_at is not None, (
         "AC6: the leg never applies the setting's change")
-    assert read_at < record_at < change_at, (
-        f"AC6: order must be read ({read_at}) < record ({record_at}) < "
+    assert read_at < save_at < change_at, (
+        f"AC6: order must be read ({read_at}) < save ({save_at}) < "
         f"change ({change_at}) — the change must be applied only after the "
         "original value is recorded")
 
@@ -414,17 +434,26 @@ def test_reapply_keeps_the_original_record(legs):
     uia.provision_helper(cfg, "p138-vm", CRED, autologon=True, confirm=True,
                          test_profile=["no_inactivity_lock"])
     script = _profile_script(rec, "no_inactivity_lock")
-    guards = re.findall(
-        r"if\s*\([^)\n]{0,200}(?:no_inactivity_lock|inactivitytimeoutsecs)"
-        r"[^)\n]{0,200}\)",
+    # The EXACT guard, not "some conditional that mentions the setting": an
+    # inverted guard matches the loose regex, and an inverted guard writes the
+    # record only when the setting is already recorded -- so a first apply
+    # persists nothing and a re-apply overwrites the true original.
+    guard = re.search(
+        r"if\s*\(\s*-not\s+\$rec\.ContainsKey\(\s*'no_inactivity_lock'\s*\)\s*\)\s*\{",
         script,
-        re.IGNORECASE,
     )
-    assert guards, (  # count before detail
-        "AC7: no conditional in the leg tests whether the setting is "
-        "already recorded — a re-apply would overwrite the original value")
-    record_at = script.lower().find(RESTORE_RECORD)
-    assert record_at != -1, "AC7: the leg never writes the restore record"
+    assert guard, (
+        "AC7: the leg has no 'if (-not $rec.ContainsKey(...))' guard on the "
+        "setting — a re-apply would overwrite the original value")
+    # ...and the save call must be INSIDE that block, or the guard is decor.
+    block = script[guard.end():]
+    nxt = re.search(r"^\s*\}", block, re.M)
+    block = block[:nxt.start()] if nxt else block
+    assert re.search(r"Save-HypervMcpRestoreRecord\s+\$recordPath", block,
+                     re.IGNORECASE), (
+        "AC7: the guarded block does not call Save-HypervMcpRestoreRecord — "
+        "the guard protects no write")
+    assert RESTORE_RECORD in script, "AC7: the leg never names the restore record"
 
 
 # ---------------------------------------------------------------------------
@@ -432,25 +461,53 @@ def test_reapply_keeps_the_original_record(legs):
 # ---------------------------------------------------------------------------
 
 
+def _strip_ps_comments(script: str) -> str:
+    """The script with its PowerShell comments removed.
+
+    A token search over the raw text is satisfied by the documentation alone:
+    the restore script names each setting's command in the comment that
+    explains it, so deleting the command itself leaves every token in place.
+    """
+    out_lines = []
+    for line in script.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+
 def test_teardown_restores_every_recorded_setting(legs):
     """AC8: with a full restore record in the guest, teardown generates a
     restore for EVERY recorded setting and then removes the record."""
     rec, _ps = legs
     cfg = Config(unrestricted=True)
-    uia.provision_helper(cfg, "p138-vm", CRED, teardown=True, confirm=True)
+    out = uia.provision_helper(cfg, "p138-vm", CRED, teardown=True, confirm=True)
     blob = _blob(rec)
     lowered = blob.lower()
     assert RESTORE_RECORD in lowered, (
         "AC8: teardown never touched the restore record")
+    # Comments stripped: the restore script documents each restore in a
+    # comment naming the very command it replaces, so a token search over the
+    # raw text is satisfied by the documentation alone. The restore must be
+    # EXECUTABLE.
+    bare = _strip_ps_comments(uia._TEST_PROFILE_RESTORE_INNER).lower()
     missing = [
         f"{setting}:{token}"
-        for setting, tokens in SETTINGS.items()
+        for setting, tokens in RESTORE_TOKENS.items()
         for token in tokens
-        if token not in lowered
+        if token not in bare
     ]
     assert not missing, (  # count before enumeration
-        f"AC8: {len(missing)} recorded settings have no restore generated: "
-        f"{missing}")
+        f"AC8: {len(missing)} recorded settings have no executable restore "
+        f"generated: {missing}")
+    # And the host must surface the restore's own verdict rather than
+    # discarding it (TF-008).
+    assert out.get("ok") is True, (
+        f"AC8: a teardown whose restore leg reported success must report ok; "
+        f"got {out}")
+    assert out.get("profile_restored") is True, (
+        f"AC8: the teardown result must carry the restore verdict; got {out}")
     removal = re.search(
         r"remove-item[\s\S]{0,200}" + RESTORE_RECORD
         + r"|" + RESTORE_RECORD + r"[\s\S]{0,200}remove-item",
@@ -503,9 +560,15 @@ def test_record_carries_ac_dc_and_hibernation(legs):
                          test_profile=["no_sleep"])
     script = _profile_script(rec, "no_sleep")
     lowered = script.lower()
-    # the read must produce both indices
-    assert "ac" in lowered and "dc" in lowered, (
-        "AC42: the powercfg read must produce BOTH the AC and the DC index; "
+    # The read must produce both indices -- pinned as the exact recorded
+    # shape, not as the bare substrings "ac"/"dc" that unrelated text
+    # ($ErrorActionPreference, /setdcvalueindex) already satisfies.
+    assert ("$entry = [pscustomobject]@{ kind = 'powercfg'; ac = $pair[0]; "
+            "dc = $pair[1] }") in lowered, (
+        "AC42: the powercfg read must record BOTH the AC and the DC index; "
+        f"got {script[-400:]!r}")
+    assert "$before = [pscustomobject]@{ ac = $pair[0]; dc = $pair[1] }" in lowered, (
+        "AC42: the leg's reported original must carry both indices; "
         f"got {script[-400:]!r}")
     # the reader must fail closed rather than fabricate an original
     assert "throw" in lowered, (
@@ -646,17 +709,25 @@ def test_record_write_is_atomic_and_reapply_keeps_the_original(legs):
     lowered = script.lower()
     assert "gettempfilename" in lowered and "move-item" in lowered, (
         "AC43: the record must be written to a temp file and renamed")
-    guards = re.findall(
-        r"if\s*\([^)\n]{0,200}(?:no_inactivity_lock|inactivitytimeoutsecs)"
-        r"[^)\n]{0,200}\)",
+    # The CALL, not merely the prelude's function definition: gettempfilename
+    # and move-item both appear in Save-HypervMcpRestoreRecord's body, which
+    # every leg carries whether or not it is ever invoked.
+    assert re.search(r"save-hypervmcprestorerecord\s+\$recordpath", lowered), (
+        "AC43: the leg must CALL Save-HypervMcpRestoreRecord; the prelude's "
+        "definition alone persists nothing")
+    guard = re.search(
+        r"if\s*\(\s*-not\s+\$rec\.ContainsKey\(\s*'no_inactivity_lock'\s*\)\s*\)\s*\{",
         script,
-        re.IGNORECASE,
     )
-    assert guards, (  # count before detail
+    assert guard, (
         "AC43: the record write must be guarded on the setting not already "
         "being recorded")
-    record_at = lowered.find("restore.json")
-    assert record_at != -1, "AC43: the leg must write the restore record"
+    block = script[guard.end():]
+    nxt = re.search(r"^\s*\}", block, re.M)
+    block = block[:nxt.start()] if nxt else block
+    assert re.search(r"Save-HypervMcpRestoreRecord\s+\$recordPath", block,
+                     re.IGNORECASE), (
+        "AC43: the guarded block must contain the record write")
     teardown = uia._TEST_PROFILE_RESTORE_INNER.lower()
     assert "remove-item" in teardown, (
         "AC43: teardown must remove the record once every restore succeeded")
@@ -718,3 +789,73 @@ def test_profile_result_carries_before_after_applied(legs):
     assert out.get("reboot_required") is True, (
         "AC49: an applied profile must report that the guest needs a reboot "
         "before the new state is what a session sees")
+
+
+# ---------------------------------------------------------------------------
+# AC56 — a restore leg that reports a failure is surfaced, not swallowed
+# ---------------------------------------------------------------------------
+
+
+def test_failed_profile_restore_is_reported(monkeypatch):
+    """AC56 (TF-008): a restore leg that reports a partial failure must come
+    back as ok:false with error_class profile_restore_failed and the
+    unrestored settings named.
+
+    The host used to read an ABSENT profile_restored as True, so a degraded
+    frame -- which is what _provision_leg_frame returns for any stdout that is
+    not exactly one JSON document, i.e. any crash of the restore script --
+    was reported as a clean restore while the guest kept the profile's values.
+    """
+    rec = LegRecorder()
+    monkeypatch.setattr(uia, "_run_uia_leg", rec)
+    monkeypatch.setattr(pswindows, "run_ps", PSRecorder())
+
+    def failing_restore(cfg, script, *, stdin_b64=None, timeout_s=None,
+                        **kwargs):
+        rec.scripts.append(script)
+        if "profile_restored" in script:
+            return pswindows.PSResult(
+                stdout=json.dumps({"ok": True, "profile_restored": False,
+                                   "unrestored": ["no_sleep"]}),
+                returncode=0)
+        return rec(cfg, script, stdin_b64=stdin_b64, timeout_s=timeout_s,
+                   **kwargs)
+
+    monkeypatch.setattr(uia, "_run_uia_leg", failing_restore)
+    out = uia.provision_helper(Config(unrestricted=True), "p138-vm", CRED,
+                               teardown=True, confirm=True)
+    assert out.get("ok") is False, (
+        f"AC56: a failed restore must not report ok; got {out}")
+    assert out.get("error_class") == "profile_restore_failed", (
+        f"AC56: the error_class must name the profile restore; got "
+        f"{out.get('error_class')!r}")
+    assert out.get("unrestored_settings") == ["no_sleep"], (
+        f"AC56: the unrestored settings must be named; got "
+        f"{out.get('unrestored_settings')!r}")
+    assert out.get("torn_down") is True, (
+        "AC56: the rest of the teardown still ran; the failure is the "
+        f"profile's, not the teardown's; got {out}")
+
+
+def test_degraded_restore_frame_is_a_failure(monkeypatch):
+    """AC56 (TF-008, the degraded-frame half): a restore leg whose stdout is
+    not exactly one JSON document parses to {}, and a {} frame must be a
+    FAILED restore -- never the default the host used to apply."""
+    base = LegRecorder()
+
+    def degraded_restore(cfg, script, *, stdin_b64=None, timeout_s=None,
+                         **kwargs):
+        if "profile_restored" in script:
+            return pswindows.PSResult(stdout="", returncode=0)
+        return base(cfg, script, stdin_b64=stdin_b64, timeout_s=timeout_s,
+                    **kwargs)
+
+    monkeypatch.setattr(uia, "_run_uia_leg", degraded_restore)
+    monkeypatch.setattr(pswindows, "run_ps", PSRecorder())
+    out = uia.provision_helper(Config(unrestricted=True), "p138-vm", CRED,
+                               teardown=True, confirm=True)
+    assert out.get("ok") is False, (
+        f"AC56: an empty restore frame must not report ok; got {out}")
+    assert out.get("error_class") == "profile_restore_failed", (
+        f"AC56: a degraded frame is a failed restore; got "
+        f"{out.get('error_class')!r}")

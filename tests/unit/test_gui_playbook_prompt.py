@@ -98,7 +98,7 @@ file IS the spec the fix implements against):
   negated guidance injected into the REAL prompt must FAIL).
 
   THE INVENTORY (AC4, preserving): the DEFAULT registration publishes
-  exactly 85 tools -- the 84 frozen below plus
+  exactly 89 tools -- the 84 frozen below plus
   ``hyperv_guest_start_interactive`` (#128) -- and every PRE-EXISTING tool
   keeps its FULL ``inputSchema`` object DEEP-EQUAL to the frozen literal
   below (types, defaults, descriptions, titles, required lists,
@@ -1006,7 +1006,7 @@ def test_tool_schemas_unchanged(fresh_server, tmp_path):
         for t in asyncio.run(inline.list_tools())
     }
     assert set(inline_schemas) == expected_names, (
-        f"the inline-credentials variant registers the same 85 tools: "
+        f"the inline-credentials variant registers the same 89 tools: "
         f"missing={sorted(expected_names - set(inline_schemas))} "
         f"unexpected={sorted(set(inline_schemas) - expected_names)}")
     drift_inline = _schema_drift(inline_schemas, FROZEN_SCHEMAS_INLINE_JSON)

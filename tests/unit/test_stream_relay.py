@@ -1583,3 +1583,41 @@ def test_discovery_carries_capabilities_to_the_host(monkeypatch):
         f"stream; got {sorted(baseline)}")
     with pytest.raises(ValueError, match="stream_unavailable"):
         relay.relay_start(_relay_cfg(), "test-vm", 9223, kind="tcp", cred=CRED)
+
+
+# ---------------------------------------------------------------------------
+# AC58 — the tcp kind's documented keepalive is really requested
+# ---------------------------------------------------------------------------
+
+
+def test_tcp_bridge_sets_tcp_keepalive(monkeypatch):
+    """AC58 (TF-015): the tcp kind's documented TCP keepalive is really
+    requested on the accepted client connection. The call sits inside a bare
+    `except`, so nothing failed while it was absent, and no check asserted it.
+
+    Driven through the real relay path with a spying `setsockopt`, so the
+    assertion is about the shipped code rather than about a stub."""
+    recorded: list[tuple] = []
+    real_setsockopt = socket.socket.setsockopt
+
+    def spy(self, level, optname, value):
+        recorded.append((level, optname, value))
+        return real_setsockopt(self, level, optname, value)
+
+    monkeypatch.setattr(socket.socket, "setsockopt", spy)
+    out, _fake, _calls, _ps = _start_tcp_relay(monkeypatch)
+    try:
+        with socket.create_connection(("127.0.0.1", out["host_port"]),
+                                      timeout=15) as client:
+            client.settimeout(15)
+            client.sendall(b"ping")
+            assert client.recv(4096) == b"ping", (
+                "AC58: the echo must arrive for the keepalive check to mean "
+                "anything")
+    finally:
+        relay.relay_stop(_relay_cfg(), out["relay_id"])
+
+    seen = {(lvl, opt) for lvl, opt, _v in recorded}
+    assert (socket.SOL_SOCKET, socket.SO_KEEPALIVE) in seen, (
+        f"AC58: the tcp kind must request SO_KEEPALIVE on the client "
+        f"connection; recorded {sorted(seen)}")

@@ -788,6 +788,9 @@ _REMOTE_HOST_REFUSAL = (
 )
 _STREAM_HEADER_VERSION = 1
 _STREAM_ACK_TIMEOUT_S = 30.0
+# How long close() waits for a pump thread to finish before it drains
+# the socket: a drain is a second reader, so it must never race one.
+_DRAIN_TIMEOUT_S = 1.0
 
 
 def _stream_header(guest_port: int) -> bytes:
@@ -906,6 +909,16 @@ class _TcpBridge:
         if self._closed.is_set():
             return
         self._closed.set()
+        # Join the pumps BEFORE draining: a drain is a second reader on the
+        # same socket, and whichever thread the kernel woke first took the
+        # bytes -- so a client that half-closed while the guest's reply was in
+        # flight lost it. Only one reader may exist at a time.
+        for pump in list(self._pumps):
+            try:
+                pump.join(timeout=_DRAIN_TIMEOUT_S)
+            except Exception:
+                pass
+        self._pumps.clear()
         _drain_and_close(self._conn)
         _drain_and_close(self._guest)
         if self in self._entry["bridges"]:
@@ -965,9 +978,17 @@ class _TcpBridge:
             pass
         finally:
             ctx = self._entry.get("context")
-            if ctx is not None and not established:
+            if ctx is not None:
                 with ctx["counter_lock"]:
-                    ctx["counters"]["errors"] += 1
+                    if not established:
+                        ctx["counters"]["errors"] += 1
+                    elif not getattr(self, "_pump_failed", False):
+                        # An established bridge that ended without a pump
+                        # error is a completed connection. Without this the
+                        # tcp kind reported ok=0 for its whole life, so
+                        # relay_status could not tell a working relay from a
+                        # failing one.
+                        ctx["counters"]["ok"] += 1
             self.close()
 
     def _pump(self) -> None:
@@ -984,7 +1005,11 @@ class _TcpBridge:
                         with ctx["counter_lock"]:
                             ctx["counters"][key] += len(chunk)
             except Exception:
-                pass
+                # `_pump` swallows this to keep the other direction's
+                # teardown simple, so the outcome is recorded here instead:
+                # an established bridge whose pump raised is a FAILED leg,
+                # not a completed one.
+                self._pump_failed = True
             finally:
                 # Either direction ending ends the bridge: a half-closed
                 # stream would otherwise pin the other side open forever.
@@ -1061,12 +1086,25 @@ class _TcpRelayServer:
                     self._entry["context"]["cfg"], self._entry["vm_id"],
                     self._entry["guest_port"], conn, self._entry)
                 bridge.start()
-            except BaseException:
+            except (KeyboardInterrupt, SystemExit):
                 # The accepted socket belongs to nobody if the bridge never
                 # took it: close it rather than leaking one fd per failed
                 # start.
                 _drain_and_close(conn)
                 raise
+            except Exception:
+                # A bridge that fails to START (a thread the process cannot
+                # allocate, which is what a connection flood produces) must
+                # not retire the accept thread while the relay stays
+                # registered active -- clients would then queue in the
+                # backlog forever, detectable only through thread_alive. This
+                # is the policy the sibling OSError branch already states.
+                _drain_and_close(conn)
+                ctx = self._entry.get("context")
+                if ctx is not None:
+                    with ctx["counter_lock"]:
+                        ctx["counters"]["errors"] += 1
+                continue
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -1558,7 +1596,12 @@ def relay_status(cfg: Config, relay_id: str = "", *, owner: str | None = None) -
             "guest_port": entry["guest_port"],
             "bind": entry["bind"],
             "host_port": entry["host_port"],
-            "url": f"http://{entry['bind']}:{entry['host_port']}/",
+            # The kind decides whether the CDP tools will use this relay, so
+            # it is part of the row; and the url is only an http:// url for
+            # the kind that actually speaks HTTP.
+            "kind": entry.get("kind", "http"),
+            "url": (f"http://{entry['bind']}:{entry['host_port']}/"
+                    if entry.get("kind", "http") == "http" else ""),
             "started_at": entry["started_at"],
             "stopped": bool(entry["stopped"]),
             "thread_alive": False if restored else bool(entry["thread"].is_alive()),

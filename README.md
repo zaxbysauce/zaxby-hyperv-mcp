@@ -1642,6 +1642,7 @@ These tools refuse to run unless their category is enabled **and** (when
 | `hyperv_ui_helper_provision` | `ui_provision` + `confirm` (installs the in-session helper and configures autologon; `teardown=true` runs the same gate) |
 | `hyperv_repair_guest_access` with `apply=true` | `guest_repair` + `confirm` (dry run is read-only) |
 | `hyperv_relay_start` | `relay` (standing loopback listener, no confirm) |
+| `hyperv_cdp_targets` / `_eval` / `_input` / `_snapshot` | `relay` (byte-stream and CDP traffic into the guest, no confirm) |
 | `hyperv_repair_guest_access` (dry run) | none (read-only) |
 
 Denials return a structured `policy` error (no secrets, no speculative paths).
@@ -2310,7 +2311,11 @@ closes the client WITHOUT forwarding a single client byte. A tcp relay is
 refused when a remote Hyper-V host is configured (a Hyper-V socket is local
 to the host) and when the VM's helper does not advertise the `stream`
 capability — a helper provisioned before 0.21.0 has no forwarder, so the
-caller is told rather than left watching a connect timeout. `socket.AF_HYPERV`
+caller is told rather than left watching a connect timeout. That refusal
+carries `error_class "stream_unavailable"`: the guest's helper is
+installed but predates the stream forwarder, and the remedy is to re-run
+`hyperv_ui_helper_provision` (optionally with `test_profile`), not to
+retry the same relay start. `socket.AF_HYPERV`
 was ADDED in CPython 3.12, so 3.10/3.11 take a ctypes `ws2_32` binding
 (gh-92658) while 3.12 uses the stdlib path — and the two are NOT
 interchangeable: the stdlib's address form is the `(vm_id, service_id)` tuple

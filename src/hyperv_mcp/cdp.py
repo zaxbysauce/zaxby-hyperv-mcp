@@ -97,6 +97,16 @@ class _SockReader:
                 pass
         if not chunk:
             return "closed"
+        # One bound for every read path: the frame reassembler, read_until's
+        # marker hunt, read_exact's declared length and read_to_eof all grow
+        # this buffer, and the per-frame cap does not bound any of them. A
+        # guest endpoint that keeps streaming would otherwise exhaust host
+        # memory inside one tool call -- and this process is the MCP server,
+        # so every attached session dies with it.
+        if len(self.buf) + len(chunk) > _MAX_FRAME_BYTES:
+            raise ValueError(
+                f"the guest endpoint sent more than {_MAX_FRAME_BYTES} bytes "
+                "without a complete message")
         self.buf += chunk
         return "data"
 
@@ -252,6 +262,14 @@ def _ws_recv(reader: _SockReader, sock: Any, want_id: Any,
                 pass
             continue
         if opcode == 0x0:
+            # The per-frame cap above bounds ONE frame; a fragmented message
+            # is the sum of all of them, so the sum is bounded too -- a guest
+            # endpoint that streams sub-limit fragments forever would
+            # otherwise grow host memory until the read deadline.
+            if sum(len(part) for part in message) + len(payload) > _MAX_FRAME_BYTES:
+                raise ValueError(
+                    f"WebSocket message exceeds the {_MAX_FRAME_BYTES}-byte "
+                    "sanity bound")
             message.append(payload)
             if fin:
                 payload = b"".join(message)
@@ -378,7 +396,10 @@ def _require_relay(cfg, relay_id: str, owner: str | None = None) -> dict[str, An
     entry = relay.lookup_entry(relay_id)
     if entry is None or entry.get("in_flight"):
         raise ValueError(f"unknown relay_id {relay_id!r}")
-    if owner is not None and entry.get("owner") != owner:
+    # Strict, like relay._restored_entry and relay.peek_vm_id: an
+    # unattributed caller must not address an authenticated agent's relay, and
+    # an authenticated caller must not address an unattributed one.
+    if (entry.get("owner") or None) != (owner or None):
         raise ValueError(f"unknown relay_id {relay_id!r}")
     if entry.get("stopped"):
         raise ValueError(f"relay {relay_id!r} is stopped")
@@ -418,7 +439,14 @@ def _http_get(entry: dict[str, Any], path: str) -> tuple[int, bytes]:
                 headers[k.strip().lower()] = v.strip()
         length = headers.get("content-length", "")
         if length.isdigit():
-            body = reader.read_exact(int(length), timeout=_TIMEOUT_S) or b""
+            # The length is the guest's claim about itself, so it is checked
+            # against the same bound before a single byte is read.
+            declared = int(length)
+            if declared > _MAX_FRAME_BYTES:
+                raise ValueError(
+                    f"the guest endpoint declared {declared} bytes, above the "
+                    f"{_MAX_FRAME_BYTES}-byte sanity bound")
+            body = reader.read_exact(declared, timeout=_TIMEOUT_S) or b""
         else:
             body = reader.read_to_eof(timeout=_TIMEOUT_S)
         return status, body
@@ -548,10 +576,15 @@ def input_event(cfg, relay_id: str, target_id: str, x: float | None = None,
             node = live.get(str(node_id or ""))
             if node is None:
                 return _stale_ref(relay_id, target_id, ref)
-            session.call("DOM.scrollIntoViewIfNeeded",
-                         {"nodeId": node.get("backendDOMNodeId")})
-            quads = (session.call("DOM.getContentQuads",
-                                  {"nodeId": node.get("backendDOMNodeId")})
+            # A BackendNodeId is NOT a NodeId: DOM.scrollIntoViewIfNeeded
+            # and DOM.getContentQuads take a DOM.NodeId, and a backend id only
+            # becomes usable as one after DOM.pushNodesByBackendIdsToFrontend.
+            # Sending it under "nodeId" made every ref click fail (or address
+            # the wrong node) against a real endpoint, while the fake answered
+            # any id and the checks stayed green.
+            node_ref = {"backendNodeId": node.get("backendDOMNodeId")}
+            session.call("DOM.scrollIntoViewIfNeeded", node_ref)
+            quads = (session.call("DOM.getContentQuads", node_ref)
                      .get("result") or {}).get("quads") or []
             if not quads:
                 raise ValueError(
