@@ -5820,24 +5820,33 @@ def heartbeat_disable(cfg: Config, *, vm_name: str = "",
     """Stop this VM's heartbeat. Owner check (final-critic C6): a caller
     may only stop a heartbeat bound to a lease it owns; an unmatched
     lease_id or holder refuses without touching the timer."""
-    if lease_id:
-        try:
-            leases.authorize(cfg, lease_id, 0, agent, "console",
-                             vm_hint=vm_id, vm_name_hint=vm_name)
-        except Exception as exc:
-            raise ValueError(
-                "heartbeat disable requires the owning live lease"
-            ) from exc
     key_id = _ledger_key(vm_name, vm_id)
     with _HB_LOCK:
         hb = _HEARTBEATS.get(key_id) if key_id else None
-        if hb is not None and ((lease_id and hb.lease_id == lease_id)
-                               or (not lease_id and hb.agent == agent)):
-            _HEARTBEATS.pop(key_id, None)
-        else:
-            hb = None
-    if hb is not None:
-        hb.stop()
+    if hb is None:
+        return {"ok": True, "vm_name": vm_name, "enabled": False}
+    # Authorize with the heartbeat's OWN bound token (not 0 — the
+    # fencing counter is >= 1 after an explicit lease), and require the
+    # cited lease to be the one this heartbeat is bound to (final-critic
+    # R2-C1). A mismatch is an explicit refusal, never a silent ok:true.
+    if lease_id and lease_id != hb.lease_id:
+        return {"ok": False, "error": "heartbeat belongs to another lease",
+                "error_class": "invalid"}
+    if (lease_id or hb.lease_id) and hb.agent != agent:
+        return {"ok": False, "error": "heartbeat belongs to another agent",
+                "error_class": "invalid"}
+    if lease_id or hb.lease_id:
+        try:
+            leases.authorize(cfg, hb.lease_id, hb.fencing_token, hb.agent,
+                             "console", vm_hint=hb.vm_id,
+                             vm_name_hint=hb.vm_name)
+        except Exception:
+            return {"ok": False,
+                    "error": "heartbeat disable requires the owning live lease",
+                    "error_class": "invalid"}
+    with _HB_LOCK:
+        _HEARTBEATS.pop(key_id, None)
+    hb.stop()
     return {"ok": True, "vm_name": vm_name, "enabled": False}
 
 

@@ -34,6 +34,10 @@ class _AsymPS:
 
     def __init__(self) -> None:
         self.scripts: list[str] = []
+        # Keyed by (vm, step-kind): call ORDER changes when the barrier is
+        # removed, so positional timestamps cannot detect it (R2-C2).
+        self.starts: dict[tuple[str, str], float] = {}
+        self.ends: dict[tuple[str, str], float] = {}
 
     def __call__(self, script: str, **kwargs) -> pswindows.PSResult:
         self.scripts.append(script)
@@ -43,8 +47,12 @@ class _AsymPS:
             guid = GUID_A if name == "guard-vm-a" else GUID_B
             return pswindows.PSResult(stdout=guid, returncode=0)
         if "MethodName TypeScancodes" in script:
-            if name == "guard-vm-b" and "(30,158)" in script:
+            kind = "pre" if "(30,158)" in script else "post"
+            key = (name, kind)
+            self.starts[key] = time.monotonic()
+            if name == "guard-vm-b" and kind == "pre":
                 time.sleep(0.4)
+            self.ends[key] = time.monotonic()
             return pswindows.PSResult(
                 stdout=f"VMID={GUID_A if name == 'guard-vm-a' else GUID_B}\n"
                        "EPOCH=7\nSTEP=0 OK=1\n", returncode=0)
@@ -55,6 +63,7 @@ class _AsymPS:
 
 def test_reg1_barrier_holds_with_asymmetric_vm_timing(monkeypatch, tmp_path):
     import importlib
+
     import hyperv_mcp.server as server
 
     cfg_file = tmp_path / "cfg.json"
@@ -90,6 +99,14 @@ def test_reg1_barrier_holds_with_asymmetric_vm_timing(monkeypatch, tmp_path):
     assert max(pre_idx) < min(post_idx), (
         "REG-1: a post-barrier step dispatched before BOTH VMs' pre steps "
         f"(barrier rendezvous removed?) indices={pre_idx}/{post_idx}")
+    # B's slow pre step is the last of the two arrivals; its completion
+    # timestamp must precede the first post step's dispatch time.
+    b_pre_end = stub.ends[("guard-vm-b", "pre")]
+    for vm in ("guard-vm-a", "guard-vm-b"):
+        post_start = stub.starts[(vm, "post")]
+        assert post_start >= b_pre_end, (
+            f"REG-1: {vm}'s post step began before the slow VM's pre step "
+            f"COMPLETED (post={post_start:.3f}, b_pre_end={b_pre_end:.3f})")
 
 
 def test_reg2_stop_manifest_waits_for_bound_token(tmp_path):
@@ -122,3 +139,39 @@ def test_reg2_stop_manifest_waits_for_bound_token(tmp_path):
         (tmp_path / "reg2" / "journal.jsonl").read_bytes()).hexdigest()
     assert manifest["entries"].get("journal.jsonl") == digest, (
         "REG-2: manifest digest does not cover the token's journal line")
+
+
+def test_reg3_heartbeat_disable_owner_only(monkeypatch, tmp_path):
+    """The owner can stop its own heartbeat; a foreign caller cannot
+    (final-critic R2-C1). The disable path uses the heartbeat's bound
+    fencing token, not 0."""
+    import importlib
+
+    from hyperv_mcp import console, leases
+
+    cfg_file = tmp_path / "cfg.json"
+    cfg_file.write_text(json.dumps({"unrestricted": True}), encoding="utf-8")
+    mod = importlib.reload(importlib.import_module("hyperv_mcp.server"))
+    mod.bootstrap({"HYPERV_MCP_CONFIG": str(cfg_file)})
+    cfg = mod._cfg()
+    console.reset_input_ledger()
+    leases.clear_registry_for_tests() if hasattr(leases, "clear_registry_for_tests") else None
+    rows = leases.acquire(cfg, "guard-hb-vm", ["console"], "owner-agent",
+                          vm_name="guard-hb-vm")
+    lease = next(r for r in rows if r.scope == "console")
+    hb = console.heartbeat_enable(
+        cfg, vm_name="guard-hb-vm", vm_id=lease.vm_id, key="shift",
+        interval_s=5.0, lease_id=lease.lease_id,
+        fencing_token=lease.fencing_token, agent="owner-agent")
+    assert hb.get("ok") is True, hb
+    foreign = console.heartbeat_disable(
+        cfg, vm_name="guard-hb-vm", vm_id=lease.vm_id, agent="other-agent",
+        lease_id=lease.lease_id)
+    assert foreign.get("ok") is False, foreign
+    assert console.heartbeat_status(cfg, vm_name="guard-hb-vm")["enabled"] is True
+    owner = console.heartbeat_disable(
+        cfg, vm_name="guard-hb-vm", vm_id=lease.vm_id, agent="owner-agent",
+        lease_id=lease.lease_id)
+    assert owner.get("ok") is True, owner
+    assert console.heartbeat_status(cfg, vm_name="guard-hb-vm")["enabled"] is False
+    console.reset_input_ledger()

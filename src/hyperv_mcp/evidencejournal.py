@@ -496,8 +496,12 @@ def _maybe_video(run: _Run) -> dict | None:
     if n == 1:
         argv += ["-map", "0:v"]
     else:
-        chain = "".join(f"[{i}:v]" for i in range(n)) + f"concat=n={n}:v=1:a=0[outv]"
-        argv += ["-filter_complex", chain, "-map", "[outv]"]
+        # setpts paces the concatenated frames at 2 fps; without it the
+        # concat output has microsecond timestamps and is ~40 ms long
+        # regardless of frame count (final-critic R2-C4).
+        chain = ("".join(f"[{i}:v]" for i in range(n))
+                 + f"concat=n={n}:v=1:a=0,setpts=N/(2*TB)[outv]")
+        argv += ["-r", "2", "-filter_complex", chain, "-map", "[outv]"]
     argv += ["-metadata", f"comment=action-markers:{marker_doc}", str(out)]
     try:
         from . import pswindows
