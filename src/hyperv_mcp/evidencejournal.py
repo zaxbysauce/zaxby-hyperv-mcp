@@ -52,7 +52,7 @@ _SENSITIVE_KEYS = frozenset({
     "text", "value", "script", "command", "expression", "scancodes", "value_b64",
 })
 # Keys that carry credentials: never serialized at all (value -> length only).
-_NEVER_KEYS = frozenset({"password", "secret_ref", "secret", "cred"})
+_NEVER_KEYS = frozenset({"password", "username", "secret_ref", "secret", "cred"})
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _MAX_ARG_STR = 2000  # cap on non-sensitive string fields kept verbatim
@@ -238,7 +238,7 @@ def _capture_frame(run: _Run, token: "JournalToken", role: str) -> None:
                 token.post_frame_path = sp
             if sp:
                 with run.lock:
-                    run.frames.append((seq, role, Path(sp)))
+                    run.frames.append((seq, role, token.tool, Path(sp)))
     except Exception:  # noqa: BLE001 — a capture hiccup must never fail the call
         return
 
@@ -299,8 +299,9 @@ class JournalToken:
             self.result = _normalize_result(result)
         if self.dispatched:
             _capture_frame(run, self, "post")
-            with run.lock:
-                run.inflight -= 1
+        # Decrement inflight ONLY after the journal append (below): the stop
+        # drain waits for this counter, so decrementing early lets stop
+        # manifest a run before its final journal line exists (review F2).
         ts_mono = time.monotonic() - run.started_at
         line = {
             "seq": self._seq_stamp(run),
@@ -322,8 +323,16 @@ class JournalToken:
         }
         try:
             with run.lock:
-                with open(run.journal_path, "a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(line, ensure_ascii=False, default=str) + "\n")
+                try:
+                    with open(run.journal_path, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(line, ensure_ascii=False, default=str) + "\n")
+                finally:
+                    # The counter is released ONLY after the append is done
+                    # (or has definitively failed), under the same lock the
+                    # stop drain reads — no manifest before the final line
+                    # (review F2).
+                    if self.dispatched:
+                        run.inflight -= 1
         except OSError:
             pass
 
@@ -361,16 +370,27 @@ def has_any_open_run() -> bool:
 
 def finish(token: "JournalToken | None", result: Any = None, *,
            outcome: str = "body") -> None:
-    """Guard-side convenience: resolve a token once (no-op for None or an
-    already-resolved/handed-off token)."""
+    """Resolve a token exactly once (no-op for None or an already-resolved
+    token). The runner OWNS a handed-off token and calls this with its real
+    result; the guard uses finish_if_unowned so a detached call is never
+    journalled twice (review F1)."""
+    if token is None or token.finished:
+        return
+    token.finish(result, outcome=outcome)
+
+
+def finish_if_unowned(token: "JournalToken | None", result: Any = None, *,
+                      outcome: str = "body") -> None:
+    """Guard-side finalizer: a handed-off token belongs to the runner."""
     if token is None or token.finished or token.handed_off:
         return
     token.finish(result, outcome=outcome)
 
 
 def arm(token: "JournalToken | None") -> None:
-    """Mark the call as dispatching input and capture the pre-frame."""
-    if token is None or token.finished or token.handed_off:
+    """Mark the call as dispatching input and capture the pre-frame. A
+    handed-off token is legitimately armed by its runner (review F1)."""
+    if token is None or token.finished:
         return
     token.arm_pre()
 
@@ -424,7 +444,7 @@ def _digest(path: Path) -> str:
 def _maybe_video(run: _Run) -> dict | None:
     if not run.video:
         return None
-    frames = sorted({p for _s, _r, p in run.frames if p.is_file()})
+    frames = sorted({p for _s, _r, _t, p in run.frames if p.is_file()})
     if not frames:
         return None
     import shutil
@@ -442,10 +462,16 @@ def _maybe_video(run: _Run) -> dict | None:
     else:
         chain = "".join(f"[{i}:v]" for i in range(n)) + f"concat=n={n}:v=1:a=0[outv]"
         argv += ["-filter_complex", chain, "-map", "[outv]", str(out)]
-    # per-step action markers sidecar (honors #131 "action marker per step")
-    markers = [{"seq": s, "role": r, "file": p.name} for s, r, p in sorted(run.frames)]
-    (run.run_dir / "markers.json").write_text(
+    # per-step action markers sidecar (honors #131 "action marker per step").
+    # The ffmpeg argv carries the sidecar as a metadata input so the markers
+    # are actually available to the assembled video, not merely dropped next
+    # to it (implementation-review F4). Fixed argv entries, no shell.
+    markers = [{"seq": s, "role": r, "tool": t, "file": p.name}
+               for s, r, t, p in sorted(run.frames)]
+    marker_path = run.run_dir / "markers.json"
+    marker_path.write_text(
         json.dumps({"markers": markers}, ensure_ascii=False), encoding="utf-8")
+    argv += ["-metadata", f"comment=action-markers:{marker_path}"]
     try:
         from . import pswindows
 
@@ -469,18 +495,22 @@ def stop_run(run_id: str, *, agent: str | None = None) -> dict:
     if run.agent != ag:
         return {"ok": False, "error": f"unknown run_id {run_id!r}",
                 "error_class": "invalid"}
-    # drain in-flight calls (bounded) so a call that already dispatched
-    # journals before the manifest is computed.
-    deadline = time.monotonic() + 2.0
+    # Close ADMISSION atomically first (review F2): no new call may bind a
+    # token after stop begins, and begin() refuses non-open runs under the
+    # same _RUNS_LOCK. Then drain the calls that already bound one; their
+    # finish() decrements inflight only AFTER appending its journal line.
+    with _RUNS_LOCK:
+        run.state = "closing"
+    deadline = time.monotonic() + 5.0
     while True:
         with run.lock:
             if run.inflight <= 0:
                 break
         if time.monotonic() >= deadline:
+            # Disclose an un-drained call instead of silently manifesting a
+            # run whose journal may still change (bounded wait elapsed).
             break
         time.sleep(0.01)
-    with run.lock:
-        run.state = "closing"
     video = _maybe_video(run)
     # manifest: SHA-256 of every file in the run dir (including the mp4).
     entries: dict[str, str] = {}

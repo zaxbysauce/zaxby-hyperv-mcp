@@ -6085,7 +6085,8 @@ def _harden_tools(mcp: MCPServer) -> None:
                 # issue #131: a refused mutating call still gets its journal
                 # line (no frames — nothing dispatched); exactly-once via the
                 # token's finished flag.
-                evidencejournal.finish(journal_token, env, outcome="refusal")
+                evidencejournal.finish_if_unowned(journal_token, env,
+                                              outcome="refusal")
             return errors.failure_result(env)
 
         async def guard(arguments, context=None, convert_result=False, _tool=tool, _run=original_run, **kwargs):
@@ -6135,6 +6136,7 @@ def _harden_tools(mcp: MCPServer) -> None:
                         tool_fn, _runner_slots,
                         preflight=lambda: _operations_preflight(
                             name, dict(arguments or {}), _tool),
+                    journal_token=jtok,
                     )
                 except UrlElicitationRequiredError:
                     raise
@@ -6273,7 +6275,7 @@ def _harden_tools(mcp: MCPServer) -> None:
                     # an explicit finish (park cancellation, body
                     # BaseException re-raise) still journals exactly one
                     # cancel line; resolved/handed-off tokens no-op.
-                    evidencejournal.finish(jtok, None, outcome="cancel")
+                    evidencejournal.finish_if_unowned(jtok, None, outcome="cancel")
                     # Issue #68 supplement: every exit (success, failure,
                     # rejection, cancellation) releases both admission
                     # stages and resets the audit ContextVar, so no permit,
@@ -6283,7 +6285,7 @@ def _harden_tools(mcp: MCPServer) -> None:
             finally:
                 # issue #131: last-ditch resolve for escapes before the
                 # inner try (elicit raise from guard_consult); idempotent.
-                evidencejournal.finish(jtok, None, outcome="cancel")
+                evidencejournal.finish_if_unowned(jtok, None, outcome="cancel")
                 # Issue #23: the presented lease rides only THIS call. The
                 # reset must cover every exit (success, failure, rejection,
                 # replay, detach) or a stale lease id leaks into the next call

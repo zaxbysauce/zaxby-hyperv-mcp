@@ -5967,6 +5967,12 @@ def run_sequence_multi(
             # worker's vm_lock call rows attributed to the plan's lease)
             "lease_id": str(plan.get("lease_id") or ""),
             "fencing_token": int(plan.get("fencing_token") or 0),
+            # issue #132 initial preconditions: apply ONLY to this plan's
+            # FIRST atomic engine call (review F3). Later steps change the
+            # frame, so re-checking the initial hash would refuse a valid
+            # plan. Validated by run_sequence itself on that first call.
+            "expect_frame_hash": str(plan.get("expect_frame_hash") or ""),
+            "expect_boot_epoch": plan.get("expect_boot_epoch"),
         })
 
     stop = threading.Event()
@@ -6014,10 +6020,15 @@ def run_sequence_multi(
                 start_mono, start_wall = _stamps()
                 lease_token = (leases.set_presented_lease(plan["lease_id"])
                                if plan["lease_id"] else None)
+                first = item["index"] == 0
                 try:
                     res = run_sequence(
                         cfg, vm_name=plan["vm_name"], steps=[item["raw"]],
                         vm_id=plan["vm_id"],
+                        # apply the plan's initial preconditions once, on
+                        # the first atomic call only (review F3)
+                        expect_frame_hash=(plan["expect_frame_hash"] if first else ""),
+                        expect_boot_epoch=(plan["expect_boot_epoch"] if first else None),
                         timeout_s=max(1, int(remaining)),
                         width=width, height=height,
                     )
