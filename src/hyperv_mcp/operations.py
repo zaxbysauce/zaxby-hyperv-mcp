@@ -60,7 +60,8 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from . import admission, auditlog, errors, leases, pswindows, statestore
+from . import (admission, auditlog, errors, evidencejournal, leases,
+               pswindows, statestore)
 from .config import Config
 
 #: The detachable set: every tool whose body can run for minutes. The two
@@ -247,6 +248,7 @@ def guard_consult(
     tool_fn: Callable[..., Any],
     runner_slots: Callable[[], threading.BoundedSemaphore],
     preflight: Callable[[], None] | None = None,
+    journal_token: Any = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Idempotency + detach interception for one dispatchable call.
 
@@ -324,7 +326,8 @@ def guard_consult(
             )
             store.op_insert(row)
             emit(cfg, "op.created", row.op_id, "", agent, {"tool": name, "detached": True})
-            _start_runner(cfg, row, dict(arguments), tool_fn, slots)
+            _start_runner(cfg, row, dict(arguments), tool_fn, slots,
+                          journal_token=journal_token)
             return _handle_payload(row), None
         if idem_key:
             row = statestore.OpRow(
@@ -537,6 +540,7 @@ def _start_runner(
     tool_fn: Callable[..., Any],
     runner_slots: threading.BoundedSemaphore,
     store: statestore.Store | None = None,
+    journal_token: Any = None,
 ) -> None:
     """Start one daemon runner thread for a detached op. The caller's context
     is COPIED now (the guard resets the presented-lease ContextVar in its
@@ -544,6 +548,10 @@ def _start_runner(
     synchronous call would; the body still enters auditlog.operation, so
     vm_lock's scope resolver and call-row adoption behave identically."""
     captured = contextvars.copy_context()
+    # issue #131: the runner owns this call's journal token (guard's
+    # finally must not resolve it); the body resolves it at completion.
+    if journal_token is not None:
+        journal_token.handed_off = True
     body_args = {k: v for k, v in arguments.items() if k not in ("detach", "idempotency_key")}
     presented = ""
     agent = row.agent
@@ -555,7 +563,7 @@ def _start_runner(
         target=_run_detached,
         args=(captured, cfg, store if store is not None else store_for(cfg),
               row.op_id, row.tool, tool_fn, body_args, agent, presented,
-              runner_slots),
+              runner_slots, journal_token),
         name=f"hyperv-op-{row.op_id[:8]}",
         daemon=True,
     )
@@ -575,6 +583,7 @@ def _run_detached(
     agent: str,
     presented_lease: str,
     runner_slots: threading.BoundedSemaphore,
+    journal_token: Any = None,
 ) -> None:
     # `store` is BOUND AT DETACH TIME on purpose: a runner that outlives its
     # caller (its test's seam rebinds, its process restarts against the same
@@ -604,7 +613,7 @@ def _run_detached(
     try:
         captured.run(
             _execute_body, cfg, op_id, tool_name, tool_fn, body_args, agent,
-            store, stop,
+            store, stop, journal_token,
         )
     finally:
         stop.set()
@@ -647,6 +656,7 @@ def _execute_body(
     agent: str,
     store: statestore.Store,
     stop: threading.Event,
+    journal_token: Any = None,
 ) -> None:
     """Runs inside the copied context: sets the cancel-hook ContextVars,
     admits the call through the classed-admission core (issue #68
@@ -728,9 +738,11 @@ def _execute_body(
                              "op.cancelled")
             return
         try:
+            evidencejournal.arm(journal_token)
             result = tool_fn(**body_args)
         finally:
             admission.release_sync(ticket)
+        evidencejournal.finish(journal_token, result, outcome="body")
         text = _result_text(result)
         # A tool-level failure leaves as a NORMAL return carrying the one
         # envelope ({ok: false, error, error_class}) - recording that as
@@ -766,6 +778,11 @@ def _execute_body(
             result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
         )
     finally:
+        # issue #131 (PC4-1): every runner terminal outcome that skipped
+        # an explicit finish (admission refusal, cancelled pre-check,
+        # OperationCancelled, BaseException) still resolves exactly one
+        # journal line here; body-finished/handed-off tokens no-op.
+        evidencejournal.finish(journal_token, None, outcome="terminal")
         # The BACKSTOP pop (review r3/r5): idempotent safety net for the
         # exits that never reach the park-window pop above — the cancelled
         # pre-check raising before the park (and any future early return).
@@ -1112,9 +1129,16 @@ def tasks_extension(
             if not self._capable(ctx):
                 return await call_next(ctx)
             arguments = dict(params.arguments or {})
+            # issue #131 (PC4-1): the tasks route bypasses guard entirely —
+            # bind its own journal token at entry so gate/preflight/slot
+            # refusals, reattach, and accepted-start all resolve exactly
+            # one line (begin no-ops with no runs open).
+            jtok = (evidencejournal.begin(params.name, arguments)
+                    if evidencejournal.has_any_open_run() else None)
             env, reset = gate_fn(params.name, arguments)
             if env is not None:
                 # Gate refusal is an ordinary tool-envelope answer, never -32021.
+                evidencejournal.finish(jtok, env, outcome="refusal")
                 return errors.failure_result(env)
             if preflight_fn is not None:
                 try:
@@ -1122,12 +1146,16 @@ def tasks_extension(
                 except Exception as exc:
                     # Synchronous body-gate refusal BEFORE any op row
                     # (implementation-review R2/R13) - an ordinary envelope.
-                    return errors.failure_result(errors.envelope(exc))
+                    _penv = errors.envelope(exc)
+                    evidencejournal.finish(jtok, _penv, outcome="refusal")
+                    return errors.failure_result(_penv)
             # Runner admission (R4): symmetric with the guard path - excess
             # detached calls are refused retryable-busy, never queued.
             slots = runner_slots()
             if not slots.acquire(blocking=False):
-                return errors.failure_result(_busy_envelope(params.name))
+                _benv = _busy_envelope(params.name)
+                evidencejournal.finish(jtok, _benv, outcome="busy")
+                return errors.failure_result(_benv)
             released = False
             try:
                 agent = auditlog.current_agent_id() or ""
@@ -1160,10 +1188,18 @@ def tasks_extension(
                             # permit erodes BOTH routes forever (review F1).
                             slots.release()
                             released = True
-                            return errors.failure_result(
-                                _conflict_envelope(params.name, idem_key))
+                            _cenv = _conflict_envelope(params.name, idem_key)
+                            evidencejournal.finish(jtok, _cenv,
+                                                   outcome="conflict")
+                            return errors.failure_result(_cenv)
                         slots.release()
                         released = True
+                        evidencejournal.finish(
+                            jtok,
+                            {"task_id": existing.op_id,
+                             "status": existing.status,
+                             "replayed": True},
+                            outcome="reattach")
                         return TaskHandleResult(
                             task_id=existing.op_id,
                             status=existing.status,
@@ -1189,7 +1225,8 @@ def tasks_extension(
                     store.op_insert(row)
                 emit(cfg, "op.created", row.op_id, "", agent,
                      {"tool": params.name, "detached": True, "tasks": True})
-                _start_runner(cfg, row, arguments, tool_fn_resolver(params.name), slots)
+                _start_runner(cfg, row, arguments, tool_fn_resolver(params.name),
+                              slots, journal_token=jtok)
                 return TaskHandleResult(
                     task_id=row.op_id,
                     status=statestore.OP_WORKING,

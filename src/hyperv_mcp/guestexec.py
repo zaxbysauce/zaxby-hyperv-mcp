@@ -23,9 +23,11 @@ removed in finally blocks; a host timeout can leak them in the guest %TEMP%
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import subprocess
+import time
 
 from . import credentials, policy, psdsessions, pswindows, timing, vmident, vmlocks
 from .config import Config
@@ -727,12 +729,30 @@ def guest_run_ps(
     cred: CredentialSet | None = None,
     vm_id: str = "",
     session_role: str = "guest",
+    on_timeout: str = "",
 ) -> dict:
     if (not vm_name and not vm_id) or not script:
         raise ValueError("vm_name (or vm_id) and script are required")
     if cred is None:
         raise ValueError("guest credentials are required")
+    if on_timeout not in ("", "job"):
+        return {"ok": False,
+                "error": 'on_timeout must be "" (default) or "job"',
+                "error_class": "invalid"}
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    if on_timeout == "job":
+        # issue #133 AC4 (CF-3/PC5/PC9): the script runs EXACTLY ONCE,
+        # directly through the managed-job lane — never a synchronous
+        # attempt-then-adopt (that double-executes the guest work). This
+        # branch sits BEFORE the caller's vm_lock: job_start/run_guest_inner
+        # take their own single read lock and vm_lock is non-reentrant.
+        if elevated:
+            return {"ok": False,
+                    "error": ('elevated=True cannot be combined with '
+                              'on_timeout="job" (managed jobs do not '
+                              'support elevated starts)'),
+                    "error_class": "invalid"}
+        return _run_ps_job_lane(cfg, ref, script, cred, timeout_ms)
     if elevated:
         policy.require_destructive(cfg, "elevated_exec", confirm, f"run an elevated script on '{ref.name}'")
     with vmlocks.vm_lock(ref.id, mode="read"):
@@ -741,6 +761,88 @@ def guest_run_ps(
             cfg, ref.id, inner, cred, timeout_ms, elevated,
             vm_name=ref.name, session_role=session_role,
         )
+
+
+def _run_ps_job_lane(
+    cfg: Config, ref: vmident.VMRef, script: str, cred: CredentialSet,
+    timeout_ms: int,
+) -> dict:
+    """on_timeout="job" lane (issue #133): one managed-job execution of the
+    inline script (powershell -EncodedCommand, so the wrapper .ps1 carries no
+    quoting hazard), waited in-call up to timeout_ms.
+
+    If the job finishes inside the window the caller gets the normal
+    success-shaped envelope (exit_code/stdout/stderr, timed_out False) plus
+    the job fields; if it is still running at the deadline the caller gets
+    ok:true with the hyperv_guest_job_start-shaped handle (promoted:true) —
+    the work keeps running and job_status/job_output/job_stop address it by
+    job_id. Owner attribution follows the current agent, exactly like
+    hyperv_guest_job_start (issue #11 rule)."""
+    from dataclasses import replace
+
+    from . import auditlog, guestjobs  # late: module-graph flat, cycle-free
+
+    # Managed-job legs must NOT pin a pooled PS Direct worker for the whole
+    # in-call wait: the job outlives this call (that's the point of the
+    # promotion), and doing `replace(cfg, psdirect_session_reuse=False)` keeps
+    # every other config field (store path, roots, timeouts) unchanged while
+    # forcing the per-call leg path for job_start/status/output. A fresh
+    # session per short leg also avoids inheriting a worker whose session the
+    # caller may invalidate between the start and the follow-up.
+    cfg = replace(cfg, psdirect_session_reuse=False)
+
+    if not script.strip():
+        return {"ok": False, "error": "script is required",
+                "error_class": "invalid"}
+    b64 = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    owner = auditlog.current_agent_id()
+    # Address by NAME only: job_start re-resolves internally, and the by-id
+    # resolve leg (psdirect_vm_target_id, no trailing "$vmTarget") is a
+    # DIFFERENT script shape than the by-name resolution — fake transports
+    # (and any host that only serves named resolution) cannot answer it.
+    # ref.name is already the resolved canonical name (host-derived), so the
+    # re-resolve is consistent and adds no caller-input surface.
+    started = guestjobs.job_start(
+        cfg, vm_name=ref.name, command="powershell.exe",
+        args=["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+              "-EncodedCommand", b64],
+        cred=cred, timeout_ms=min(int(timeout_ms), 60000),
+        owner=owner,
+    )
+    if not started.get("ok"):
+        return started
+    handle_fields = {k: started.get(k) for k in
+                     ("job_id", "pid", "job_dir", "out_path", "err_path",
+                      "exit_path", "started_at", "start_time_ticks")}
+    deadline = time.monotonic() + max(0.0, timeout_ms / 1000.0)
+    while True:
+        st = guestjobs.job_status(cfg, started["job_id"], owner=owner)
+        status = str(st.get("status") or "")
+        if st.get("ok") and status in ("exited", "stopped"):
+            out = guestjobs.job_output(cfg, started["job_id"], owner=owner)
+            return {
+                "ok": True,
+                "exit_code": st.get("exit_code"),
+                "stdout": out.get("stdout") or "",
+                "stderr": out.get("stderr") or "",
+                "timed_out": False,
+                "truncated": bool(out.get("stdout_truncated")
+                                  or out.get("stderr_truncated")),
+                "vm_name": ref.name,
+                "promoted": True,
+                **handle_fields,
+            }
+        if time.monotonic() >= deadline:
+            return {
+                "ok": True, "timed_out": False, "promoted": True,
+                "vm_name": ref.name,
+                **handle_fields,
+                "note": ("guest script still running at the deadline; the "
+                         "call was promoted to a managed job — poll "
+                         "hyperv_guest_job_status / job_output / job_stop "
+                         "with this job_id"),
+            }
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
 
 
 def guest_run(

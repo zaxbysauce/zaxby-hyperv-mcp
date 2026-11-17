@@ -48,6 +48,8 @@ TOOL_NAMES = {
     "hyperv_console_button", "hyperv_console_scroll",
     "hyperv_console_wait_frame_change", "hyperv_console_wait_frame_stable",
     "hyperv_console_capture_sequence", "hyperv_console_sequence",
+    "hyperv_console_sequence_multi", "hyperv_console_heartbeat",
+    "hyperv_evidence_run_start", "hyperv_evidence_run_stop",
     # VM / media preparation
     "hyperv_vm_create", "hyperv_vm_clone", "hyperv_vm_remove",
     "hyperv_harvest_offline_logs", "hyperv_deployment_status",
@@ -129,7 +131,7 @@ def test_tool_inventory_registered(fresh_server):
     # Workstream G tools (vm_clone, vm_remove, deployment_status, harvest);
     # 84 with issue #137's hyperv_ui_snapshot + hyperv_ui_act; 89 with issue
     # #127's four hyperv_cdp_* tools.
-    assert len(schemas) == 89
+    assert len(schemas) == 93
 
 
 def test_every_vm_tool_schema_has_vm_id(fresh_server):

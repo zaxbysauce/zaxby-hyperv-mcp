@@ -332,6 +332,8 @@ def test_tool_scopes_map_is_pinned():
         "hyperv_console_mouse_move": "console", "hyperv_console_click": "console",
         "hyperv_console_button": "console", "hyperv_console_scroll": "console",
         "hyperv_console_sequence": "console",
+        "hyperv_console_sequence_multi": "console",
+        "hyperv_console_heartbeat": "console",
         "hyperv_ui_invoke": "console",
         "hyperv_ui_set_value": "console",
         "hyperv_ui_focus": "console",

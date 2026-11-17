@@ -69,6 +69,8 @@ TOOL_NAMES = {
     "hyperv_console_wait_frame_stable",
     "hyperv_console_capture_sequence",
     "hyperv_console_sequence",
+    "hyperv_console_sequence_multi", "hyperv_console_heartbeat",
+    "hyperv_evidence_run_start", "hyperv_evidence_run_stop",
     "hyperv_vm_create", "hyperv_vm_clone", "hyperv_vm_remove",
     "hyperv_deployment_status", "hyperv_harvest_offline_logs",
     "hyperv_vm_disk_add",
@@ -267,7 +269,7 @@ def test_ac12_tool_inventory_per_credential_mode(tmp_path, fresh_server):
         f"extra={sorted(set(base_schemas) - TOOL_NAMES)}, "
         f"missing={sorted(TOOL_NAMES - set(base_schemas))}"
     )
-    assert len(base_schemas) == len(TOOL_NAMES) == 89, (
+    assert len(base_schemas) == len(TOOL_NAMES) == 93, (
         f"AC12: tool count {len(base_schemas)} != 89 "
         f"(66 through issue #24; 67 with issue #27's settle wait; "
         f"76 with issue #29's eight hyperv_ui_* tools; 80 with PR #112's "
