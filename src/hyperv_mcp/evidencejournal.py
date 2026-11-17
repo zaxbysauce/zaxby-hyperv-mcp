@@ -10,6 +10,15 @@ was not edited after the fact; where ffmpeg is available and video was
 requested at start, the frames are additionally assembled into an MP4 with a
 per-step action marker.
 
+Manifest scope edge (review ASK-152-1, swarm-critic adjudicated 2026-11-18):
+the manifest records the bytes present when ``stop_run`` executed. If the
+stop result carried a ``"tree kill FAILED"`` video note (ffmpeg termination
+could not be established — never observed in practice), a LATER digest
+mismatch on ``evidence.mp4`` is the expected result of that edge, not
+evidence of tampering; the file was already flagged untrusted via
+``video: None`` plus the note. Reusing a ``run_dir`` for a second run is
+not supported.
+
 Design commitments (from the frozen spec + plan-critic rounds):
 
 * The record stores typed text as its LENGTH, never the text (AC2) — the
