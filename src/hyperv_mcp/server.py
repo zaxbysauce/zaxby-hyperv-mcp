@@ -1,7 +1,7 @@
 """
 hyperv_mcp.server -- MCP server for Hyper-V VM management (hardened fork).
 
-Exposes 89 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
+Exposes 93 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
 guest execution and file transfer via PowerShell Direct, guest access
 diagnostics/repair and managed guest jobs, reboot recovery verification,
 host-to-guest HTTP relay, console observation and input (WMI), evidence
@@ -35,7 +35,7 @@ import sys
 import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, cast
 
 import anyio
 from mcp.server.auth.settings import AuthSettings
@@ -829,7 +829,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                         # #9 review PRR-003/PRR-004).
                         enriched = errors.enrich_failure(result)
                         op.error_class = enriched["error_class"]
-                        return errors.failure_result(enriched)
+                        return cast(dict, errors.failure_result(enriched))
                     op.error_class = str(result.get("error_class") or "")
                 return result
         except UrlElicitationRequiredError:
@@ -1861,7 +1861,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                         # with the audit class derived from them.
                         enriched = errors.enrich_failure(result)
                         op.error_class = enriched["error_class"]
-                        return errors.failure_result(enriched)
+                        return cast(dict, errors.failure_result(enriched))
                     # issue #133 AC1: a successful VM-addressing console
                     # result reports the seconds since this process' last
                     # console input to that VM (all-identity lookup in
@@ -1995,7 +1995,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         vm_name: str = "", key: str = "shift", interval_s: float = 5.0,
         enable: bool = True, vm_id: str = "",
         lease_id: str = "", fencing_token: int = 0,
-    ) -> Any:
+    ) -> dict:
         """Enable or disable the per-VM benign-key heartbeat (issue #133).
 
         WHILE enabled and the bound console lease is live, the configured
@@ -2043,14 +2043,14 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             except Exception:  # noqa: BLE001 — discovery failure is "no lease"
                 rows = []
             if len(rows) != 1:
-                return errors.failure_result(errors.enrich_failure({
+                return cast(dict, errors.failure_result(errors.enrich_failure({
                     "ok": False,
                     "error": (
                         "heartbeat requires exactly one live console lease on "
                         f"the VM (found {len(rows)}); acquire one with "
                         "hyperv_lease_acquire or cite it via lease_id + "
                         "fencing_token"),
-                    "error_class": "invalid"}))
+                    "error_class": "invalid"})))
             bound_id = rows[0].lease_id
             bound_token = int(rows[0].fencing_token)
         if not enable:
@@ -2083,7 +2083,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     @mcp.tool()
     def hyperv_evidence_run_start(
         run_dir: str = "", vms: list[str] | None = None, video: bool = False,
-    ) -> Any:
+    ) -> dict:
         """Open an evidence run (issue #131).
 
         While a run is open, EVERY mutating tool call (the lease-scoped tools
@@ -2115,11 +2115,11 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             if not op.ok:
                 enriched = errors.enrich_failure(result)
                 op.error_class = enriched["error_class"]
-                return errors.failure_result(enriched)
+                return cast(dict, errors.failure_result(enriched))
             return result
 
     @mcp.tool()
-    def hyperv_evidence_run_stop(run_id: str = "") -> Any:
+    def hyperv_evidence_run_stop(run_id: str = "") -> dict:
         """Close an evidence run (issue #131).
 
         Drains in-flight journaled calls (bounded), optionally assembles the
@@ -2140,7 +2140,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             if not op.ok:
                 enriched = errors.enrich_failure(result)
                 op.error_class = enriched["error_class"]
-                return errors.failure_result(enriched)
+                return cast(dict, errors.failure_result(enriched))
             return result
 
     @mcp.tool()

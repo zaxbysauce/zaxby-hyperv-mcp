@@ -549,8 +549,9 @@ def _start_runner(
     captured = contextvars.copy_context()
     # issue #131: the runner owns this call's journal token (guard's
     # finally must not resolve it); the body resolves it at completion.
-    if journal_token is not None:
-        journal_token.handed_off = True
+    # handed_off is set ONLY immediately before thread.start() (review
+    # F-003 round-2): every setup failure before that point leaves the
+    # token unmarked so the caller's finish_if_unowned resolves it.
     body_args = {k: v for k, v in arguments.items() if k not in ("detach", "idempotency_key")}
     presented = ""
     agent = row.agent
@@ -568,7 +569,19 @@ def _start_runner(
     )
     with _runners_lock:
         _runners[row.op_id] = thread
-    thread.start()
+    try:
+        if journal_token is not None:
+            journal_token.handed_off = True
+        thread.start()
+    except BaseException:
+        # issue #152 review F-003 (round-2 residual): a failed start leaves
+        # no runner to own the token; un-mark it and let the caller's
+        # cleanup (finish_if_unowned in the tasks except path) resolve it.
+        if journal_token is not None:
+            journal_token.handed_off = False
+        with _runners_lock:
+            _runners.pop(row.op_id, None)
+        raise
 
 
 def _run_detached(
@@ -1134,7 +1147,14 @@ def tasks_extension(
             # one line (begin no-ops with no runs open).
             jtok = (evidencejournal.begin(params.name, arguments)
                     if evidencejournal.has_any_open_run() else None)
-            env, reset = gate_fn(params.name, arguments)
+            try:
+                env, reset = gate_fn(params.name, arguments)
+            except Exception:
+                # issue #152 review F-003 (round-2 residual): a gate raise
+                # before the main try must resolve the token or stop_run
+                # wedges on journal_drain_timeout forever.
+                evidencejournal.finish_if_unowned(jtok, None, outcome="error")
+                raise
             if env is not None:
                 # Gate refusal is an ordinary tool-envelope answer, never -32021.
                 evidencejournal.finish(jtok, env, outcome="refusal")
@@ -1150,11 +1170,18 @@ def tasks_extension(
                     return errors.failure_result(_penv)
             # Runner admission (R4): symmetric with the guard path - excess
             # detached calls are refused retryable-busy, never queued.
-            slots = runner_slots()
-            if not slots.acquire(blocking=False):
-                _benv = _busy_envelope(params.name)
-                evidencejournal.finish(jtok, _benv, outcome="busy")
-                return errors.failure_result(_benv)
+            try:
+                slots = runner_slots()
+                if not slots.acquire(blocking=False):
+                    _benv = _busy_envelope(params.name)
+                    evidencejournal.finish(jtok, _benv, outcome="busy")
+                    return errors.failure_result(_benv)
+            except Exception:
+                # issue #152 review F-003 (round-3/4): a raise from the slot
+                # factory OR the acquire itself is still a pre-handoff
+                # failure; resolve the token like the gate path does.
+                evidencejournal.finish_if_unowned(jtok, None, outcome="error")
+                raise
             released = False
             try:
                 agent = auditlog.current_agent_id() or ""
@@ -1238,6 +1265,10 @@ def tasks_extension(
                         slots.release()
                     except ValueError:
                         pass
+                # issue #152 review F-003: a pre-handoff failure must resolve
+                # the journal token or stop_run wedges on journal_drain_timeout
+                # forever (the runner never owned it, nothing else finalizes).
+                evidencejournal.finish_if_unowned(jtok, None, outcome="error")
                 raise
             finally:
                 if reset is not None:

@@ -815,6 +815,7 @@ def _run_ps_job_lane(
                      ("job_id", "pid", "job_dir", "out_path", "err_path",
                       "exit_path", "started_at", "start_time_ticks")}
     deadline = time.monotonic() + max(0.0, timeout_ms / 1000.0)
+    poll_s = 0.5
     while True:
         st = guestjobs.job_status(cfg, started["job_id"], owner=owner)
         status = str(st.get("status") or "")
@@ -842,7 +843,11 @@ def _run_ps_job_lane(
                          "hyperv_guest_job_status / job_output / job_stop "
                          "with this job_id"),
             }
-        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        # Back off between status legs (each is a fresh PowerShell Direct
+        # process on this lane): 0.5s doubling to 5s caps the spawn cost for
+        # long in-call waits (issue #152 review F-012).
+        time.sleep(min(poll_s, max(0.0, deadline - time.monotonic())))
+        poll_s = min(5.0, poll_s * 2)
 
 
 def guest_run(

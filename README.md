@@ -1821,7 +1821,7 @@ become a published credential):
 
 ---
 
-## Available Tools (89 total)
+## Available Tools (93 total)
 
 Every registered tool in the tables below returns failures the same way:
 the one-envelope contract (`ok/error/error_class/retryable/retry_after_ms`,

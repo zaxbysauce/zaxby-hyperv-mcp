@@ -50,9 +50,18 @@ from typing import Any
 # for result-scrubbing (PC10). Matched case-insensitively on the leaf key.
 _SENSITIVE_KEYS = frozenset({
     "text", "value", "script", "command", "expression", "scancodes", "value_b64",
+    # issue #152 review F-007: per-keystroke input slots are content too —
+    # a caller can spell arbitrary text one press_key at a time.
+    "key", "keys", "modifiers",
 })
 # Keys that carry credentials: never serialized at all (value -> length only).
 _NEVER_KEYS = frozenset({"password", "username", "secret_ref", "secret", "cred"})
+# prefix marking a scrub token that must match only its quoted repr form
+# (sensitive-list elements; review F-007) — never the bare substring.
+_QUOTED_MARK = "\x00quoted:"
+# key-name slots whose values are echoed only through {x!r} validation
+# errors: scrubbed repr-form-only (F-007 round-4), not exact-replaced.
+_ECHO_ONLY_KEYS = frozenset({"key", "keys", "modifiers"})
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 _MAX_ARG_STR = 2000  # cap on non-sensitive string fields kept verbatim
@@ -113,11 +122,31 @@ class _Run:
             return False
         if not self.vms:
             return True
-        return bool(self.vms & vm_ids)
+        # Expand BOTH sides through the hint map so a run stored under a name
+        # matches calls carrying that VM's GUID and vice versa (review F-004).
+        try:
+            from . import console as _console
+
+            expanded = set(self.vms)
+            for v in self.vms:
+                hint = _console._NAME_GUID_HINTS.get(v)
+                if hint:
+                    expanded.add(hint)
+            called = set(vm_ids)
+            for v in vm_ids:
+                hint = _console._NAME_GUID_HINTS.get(v)
+                if hint:
+                    called.add(hint)
+            return bool(expanded & called)
+        except Exception:  # noqa: BLE001 — fall back to literal intersection
+            return bool(self.vms & vm_ids)
 
 
 _RUNS: dict[str, _Run] = {}
 _RUNS_LOCK = threading.Lock()
+# review F-011: an agent that never stops its runs would grow the registry
+# (and on-disk run dirs) without bound; refuse a new start past the open cap.
+_MAX_OPEN_RUNS = 16
 
 
 def reset_for_tests() -> None:
@@ -127,11 +156,18 @@ def reset_for_tests() -> None:
 
 
 def _vm_ids_from_arguments(arguments: dict) -> set[str]:
+    """Every identity spelling a call may address its VM under: the literal
+    casefolded name/id values plus the hint-resolved GUID for each name
+    (issue #152 review F-004 — a run scoped by name must cover by-GUID calls
+    for the same VM and vice versa)."""
     ids: set[str] = set()
+    raw_names: list[str] = []
     for key in ("vm_name", "vm_id"):
         v = arguments.get(key)
         if isinstance(v, str) and v.strip():
             ids.add(v.strip().casefold())
+            if key == "vm_name":
+                raw_names.append(v.strip())
     # multi-VM plans carry per-plan vm identities
     plans = arguments.get("plans")
     if isinstance(plans, list):
@@ -141,6 +177,20 @@ def _vm_ids_from_arguments(arguments: dict) -> set[str]:
                     v = plan.get(key)
                     if isinstance(v, str) and v.strip():
                         ids.add(v.strip().casefold())
+                        if key == "vm_name":
+                            raw_names.append(v.strip())
+    # Expand each caller-supplied name with its hint-resolved GUID (the
+    # console ledger's identity map); a GUID learned later still matches the
+    # run's stored name spelling through _Run.covers' own expansion below.
+    try:
+        from . import console as _console
+
+        for name in raw_names:
+            hint = _console._NAME_GUID_HINTS.get(name.casefold())
+            if hint:
+                ids.add(hint)
+    except Exception:  # noqa: BLE001 — identity hints are best-effort; the
+        pass           # literal spellings still apply
     return ids
 
 
@@ -165,14 +215,43 @@ def _sanitize_args(obj: Any, secrets: list[str]) -> Any:
         out: dict[str, Any] = {}
         for k, v in obj.items():
             kl = str(k).lower()
-            if kl in _SENSITIVE_KEYS and isinstance(v, str):
+            if kl in _ECHO_ONLY_KEYS and isinstance(v, str):
+                # key name slots (review F-007): content is echoed only via
+                # {x!r} in validation errors, so the token is collected for
+                # repr-form-only scrubbing; exact replacement of a short key
+                # name (e.g. "a") would rewrite every occurrence in
+                # unrelated result metadata.
+                if v:
+                    secrets.append(_QUOTED_MARK + v)
+                out[k] = len(v)
+            elif kl in _ECHO_ONLY_KEYS and isinstance(v, list):
+                for item in v:
+                    if isinstance(item, str) and item:
+                        secrets.append(_QUOTED_MARK + item)
+                out[k] = len(v)
+            elif kl in _SENSITIVE_KEYS and isinstance(v, str):
                 if v:
                     secrets.append(v)
                 out[k] = len(v)
             elif kl in _SENSITIVE_KEYS and isinstance(v, list):
-                # scancodes / keys lists: record count, not contents
+                # scancodes / keys lists: record count, not contents. The
+                # elements are collected for QUOTED-FORM-ONLY scrubbing
+                # (review F-007 round-2): a validation error echoes an
+                # invalid element via repr ("unknown key 'x'"), so scrubbing
+                # the quoted 'x' form closes that leak without the global
+                # exact-replace corrupting unrelated result metadata (a
+                # bare "a" in the scrub set would rewrite every 'a' in
+                # hashes, ids and error text).
+                for item in v:
+                    if isinstance(item, str) and item:
+                        secrets.append(_QUOTED_MARK + item)
                 out[k] = len(v)
             elif kl in _NEVER_KEYS:
+                # length-only AND collected for result scrubbing (review
+                # F-007): an echoed credential value must not survive in the
+                # serialized result.
+                if isinstance(v, str) and v:
+                    secrets.append(v)
                 out[k] = len(v) if isinstance(v, str) else 0
             else:
                 out[k] = _sanitize_args(v, secrets)
@@ -186,9 +265,49 @@ def _sanitize_args(obj: Any, secrets: list[str]) -> Any:
 
 def _scrub_text(text: str, secrets: list[str]) -> str:
     for s in secrets:
-        if s:
+        if s.startswith(_QUOTED_MARK):
+            # echo-only token (sensitive key/keys/modifiers values and
+            # sensitive list elements, review F-007): scrub the repr form
+            # the validation errors actually emit ({x!r}) — repr() covers
+            # escaping (backslash/newline) and both quote styles — never
+            # the bare substring (would corrupt unrelated metadata such as
+            # hashes and identifiers).
+            t = s[len(_QUOTED_MARK):]
+            text = text.replace(repr(t), f"<{len(t)} chars>")
+        elif s:
             text = text.replace(s, f"<{len(s)} chars>")
     return text
+
+
+def _sanitize_result_keys(obj: Any, *, top: bool = True) -> Any:
+    """Result-side echo-slot redaction (review F-007 round-5, scoped rounds
+    7-8): ONLY the TOP-LEVEL echo-only key slots (key/keys/modifiers) of the
+    normalized result collapse — the only place a tool legitimately echoes
+    back an input slot (e.g. the heartbeat result's "key"). Two deliberate
+    narrowings from review: (1) content-sensitive keys (text/value/script/
+    ...) are NEVER key-guessed on the result side — result fields under
+    those names carry legitimate COMPUTED data (hyperv_cdp_eval returns its
+    evaluation result as "value"; round-6's collapse-to-0 falsified real
+    journal data), and the ARGUMENT side already enforces the typed-text
+    content contract; (2) the redaction is NOT recursive — a nested dict is
+    computed data (a CDP evaluation can legitimately return {"key": "abc"}),
+    so key-name redaction inside it would corrupt results (round-8)."""
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if top and kl in _ECHO_ONLY_KEYS:
+                # str/list echoes collapse (input slots); any other type is
+                # passed through unchanged — a fabricated 0 would falsify
+                # computed result data (review F-007 round-6 finding).
+                out[k] = (len(v) if isinstance(v, str) else
+                          (len(v) if isinstance(v, list) else v))
+            else:
+                out[k] = _sanitize_result_keys(v, top=False)
+        return out
+    if isinstance(obj, list):
+        return [_sanitize_result_keys(v, top=False) for v in obj]
+    return obj
 
 
 def _scrub_result(obj: Any, secrets: list[str]) -> Any:
@@ -326,7 +445,8 @@ class JournalToken:
             "dispatched": self.dispatched,
             "outcome": outcome,
             "arguments": self.arguments,
-            "result": _scrub_result(self.result, self.secrets)
+            "result": _scrub_result(
+                _sanitize_result_keys(self.result), self.secrets)
             if self.result is not None else None,
             "pre_frame_hash": self.pre_frame_hash,
             "pre_frame_path": self.pre_frame_path,
@@ -337,7 +457,14 @@ class JournalToken:
             with run.lock:
                 try:
                     with open(run.journal_path, "a", encoding="utf-8") as fh:
-                        fh.write(json.dumps(line, ensure_ascii=False, default=str) + "\n")
+                        try:
+                            payload = json.dumps(line, ensure_ascii=False,
+                                                 default=str, allow_nan=False)
+                        except ValueError:
+                            payload = json.dumps(_json_safe(line),
+                                                 ensure_ascii=False,
+                                                 default=str, allow_nan=False)
+                        fh.write(payload + "\n")
                 finally:
                     # The counter is released ONLY after the append is done
                     # (or has definitively failed), under the same lock the
@@ -444,23 +571,65 @@ def start_run(run_dir: str, vms: list[str] | None, *, agent: str | None = None,
     except Exception as exc:  # noqa: BLE001 — classify, don't crash
         return {"ok": False, "error": f"run_dir refused: {exc}",
                 "error_class": "invalid"}
+    ag = agent if agent is not None else current_agent()
+    # Cap check + registry insert in ONE lock hold, BEFORE any filesystem
+    # creation (review F-011 round-5): a refused start creates nothing on
+    # disk. A mkdir failure after admission rolls the registry entry back.
+    with _RUNS_LOCK:
+        open_count = sum(
+            1 for r in _RUNS.values()
+            if r.state in ("open", "closing", "initializing")
+            and (r.agent == ag))
+        if open_count >= _MAX_OPEN_RUNS:
+            return {
+                "ok": False,
+                "error": (
+                    f"too many open evidence runs ({open_count} >= "
+                    f"{_MAX_OPEN_RUNS} for a single agent); stop one with "
+                    "hyperv_evidence_run_stop before starting another"),
+                "error_class": "invalid",
+            }
+        run_id = uuid.uuid4().hex
+        run = _Run(run_id, root, ag, list(vms or []), bool(video))
+        # "initializing" while the directories are created: begin() binds
+        # only runs whose state is "open", so a concurrent mutating call in
+        # this window cannot bind a run whose journal path does not exist
+        # yet (review F-003-adjacent round-6: no journal loss on mkdir).
+        run.state = "initializing"
+        _RUNS[run_id] = run
+        # (no closed-run prune needed: stop_run removes the entry when the
+        # run closes, so _RUNS retains only open/closing/initializing runs,
+        # which the per-agent cap above bounds)
     try:
         root.mkdir(parents=True, exist_ok=True)
         (root / "frames").mkdir(parents=True, exist_ok=True)
     except OSError as exc:
+        with _RUNS_LOCK:
+            _RUNS.pop(run_id, None)
         return {"ok": False, "error": f"cannot create run dir: {exc}",
                 "error_class": "invalid"}
-    run_id = uuid.uuid4().hex
-    ag = agent if agent is not None else current_agent()
-    run = _Run(run_id, root, ag, list(vms or []), bool(video))
     with _RUNS_LOCK:
-        _RUNS[run_id] = run
+        if _RUNS.get(run_id) is run:
+            run.state = "open"
     return {"ok": True, "run_id": run_id, "run_dir": str(root),
             "video": bool(video)}
 
 
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _json_safe(obj: Any) -> Any:
+    """Replace non-finite floats (NaN/Inf) with None so json.dumps with
+    allow_nan=False never emits invalid bare tokens (review F-010)."""
+    if isinstance(obj, float):
+        return obj if (obj == obj and obj not in
+                       (float("inf"), float("-inf"))) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
 
 
 def _maybe_video(run: _Run) -> dict | None:
@@ -503,17 +672,59 @@ def _maybe_video(run: _Run) -> dict | None:
                  + f"concat=n={n}:v=1:a=0,setpts=N/(2*TB)[outv]")
         argv += ["-r", "2", "-filter_complex", chain, "-map", "[outv]"]
     argv += ["-metadata", f"comment=action-markers:{marker_doc}", str(out)]
+    # Fixed argv, no shell, sanitized child env (the spawn-site census
+    # requires the literal `env=pswindows.child_env()` call at the site —
+    # a local Name or an IfExp reads as uncompliant), bounded timeout.
+    # Popen + explicit tree kill on timeout (review F-008): subprocess.run's
+    # timeout kills only the direct ffmpeg child; filter chains can leave
+    # grandchildren writing the output file, so taskkill /T takes the tree.
     try:
         from . import pswindows
 
-        # Fixed argv, no shell, sanitized child env (the spawn-site census
-        # requires the literal `env=pswindows.child_env()` call at the site —
-        # a local Name or an IfExp reads as uncompliant), bounded timeout.
-        proc = subprocess.run(argv, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL,
-                              timeout=120, check=False, env=pswindows.child_env())
-    except (OSError, subprocess.SubprocessError):
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                env=pswindows.child_env())
+    except OSError:
         return {"video": None, "note": "ffmpeg invocation failed"}
+    try:
+        proc.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        # taskkill /T /F returning 0 reports the whole tree terminated; the
+        # bounded re-wait confirms the direct child exited. Every note states
+        # only what was ESTABLISHED (review F-008 round-6).
+        tree_dead = False
+        try:
+            tk = subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                check=False, timeout=10, env=pswindows.child_env())
+        except (OSError, subprocess.SubprocessError):
+            tk = None
+        if tk is not None and tk.returncode == 0:
+            try:
+                proc.wait(timeout=10)
+                tree_dead = True
+            except subprocess.TimeoutExpired:
+                tree_dead = False
+        child_dead = False
+        if not tree_dead:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+                child_dead = True
+            except (OSError, subprocess.SubprocessError):
+                child_dead = False
+        if tree_dead:
+            note = "ffmpeg timed out after 120s; tree killed"
+        else:
+            note = ("ffmpeg timed out after 120s; tree kill FAILED"
+                    + ("; direct child killed" if child_dead else
+                       "; direct child kill UNVERIFIED"))
+        # The out path rides the failure result for diagnostics; stop_run
+        # certifies the whole run dir and discloses the untrusted video via
+        # this note (review round-10: narrowing the manifest contract to a
+        # partial certification is an owner decision, recorded ASK).
+        return {"video": None, "note": note, "out": str(out)}
     if proc.returncode != 0:
         return {"video": None, "note": f"ffmpeg exited {proc.returncode}"}
     if not out.is_file():
@@ -561,6 +772,13 @@ def stop_run(run_id: str, *, agent: str | None = None) -> dict:
         time.sleep(0.01)
     video = _maybe_video(run)
     # manifest: SHA-256 of every file in the run dir (including the mp4).
+    # Known residual (review round-10, ASK-recorded): if ffmpeg's tree kill
+    # FAILED (taskkill unsuccessful — never demonstrated on this host) a
+    # surviving writer could mutate evidence.mp4 after this digest; the stop
+    # result carries the honest "tree kill FAILED" note in that edge so the
+    # caller knows the video lane is untrusted. Narrowing the manifest
+    # contract (partial certification) needs a product decision and was NOT
+    # taken unilaterally.
     entries: dict[str, str] = {}
     for p in sorted(run.run_dir.rglob("*")):
         if p.is_file():

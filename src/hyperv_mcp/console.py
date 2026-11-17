@@ -218,6 +218,17 @@ def note_name_guid_hint(vm_name: str, guid: str) -> None:
                     prior_ts = _LAST_INPUT_TS.pop(key)
                     if prior_ts > _LAST_INPUT_TS.get(guid, 0.0):
                         _LAST_INPUT_TS[guid] = prior_ts
+                # Issue #152 review F-002: the heartbeat registry is keyed by
+                # the same volatile ledger key; a name learned mid-flight must
+                # migrate the live chain or disable/status orphan it. Lock
+                # order is hint lock BEFORE HB lock (same as the ledger chain).
+                with _HB_LOCK:
+                    hb = _HEARTBEATS.pop(key, None)
+                    if hb is not None:
+                        prior_hb = _HEARTBEATS.get(guid)
+                        if prior_hb is not None:
+                            prior_hb.stop()
+                        _HEARTBEATS[guid] = hb
 
 
 # ---------------------------------------------------------------------------
@@ -5797,14 +5808,20 @@ def heartbeat_enable(
     # immediately). Agent match is enforced by authorize (PC3-6 owner rules).
     leases.authorize(cfg, lease_id, int(fencing_token), agent, "console",
                      vm_hint=vm_id, vm_name_hint=vm_name)
-    key_id = _ledger_key(vm_name, vm_id)
-    if not key_id:
-        raise ValueError("heartbeat needs a vm_name or vm_id")
     hb = _Heartbeat(cfg, vm_name, vm_id, resolved_key, interval,
                     lease_id, int(fencing_token), agent)
-    with _HB_LOCK:
-        prior = _HEARTBEATS.pop(key_id, None)
-        _HEARTBEATS[key_id] = hb
+    # issue #152 review F-002 (round-2 residual): resolve the key and insert
+    # the chain as ONE atomic hint->HB chain (PRR-005 mutator pattern) so a
+    # concurrent hint learn either migrates the pre-existing chain or waits;
+    # it can never migrate nothing and leave this insertion under a stale
+    # name key. Lock order hint -> HB, same as the migration above.
+    with _HINT_LOCK:
+        key_id = _ledger_key_unlocked(vm_name, vm_id)
+        if not key_id:
+            raise ValueError("heartbeat needs a vm_name or vm_id")
+        with _HB_LOCK:
+            prior = _HEARTBEATS.pop(key_id, None)
+            _HEARTBEATS[key_id] = hb
     if prior is not None:
         prior.stop()
     hb.start()
@@ -5820,9 +5837,15 @@ def heartbeat_disable(cfg: Config, *, vm_name: str = "",
     """Stop this VM's heartbeat. Owner check (final-critic C6): a caller
     may only stop a heartbeat bound to a lease it owns; an unmatched
     lease_id or holder refuses without touching the timer."""
-    key_id = _ledger_key(vm_name, vm_id)
-    with _HB_LOCK:
-        hb = _HEARTBEATS.get(key_id) if key_id else None
+    # Resolve the identity and look up the chain as ONE atomic hint->HB
+    # chain (review round-9: a hint learn migrating name->GUID between the
+    # split resolve and lookup made disable report ok/enabled=False while
+    # the live timer moved to the GUID key). Lock order hint -> HB, same as
+    # the migration block and the enable insertion.
+    with _HINT_LOCK:
+        key_id = _ledger_key_unlocked(vm_name, vm_id)
+        with _HB_LOCK:
+            hb = _HEARTBEATS.get(key_id) if key_id else None
     if hb is None:
         return {"ok": True, "vm_name": vm_name, "enabled": False}
     # Authorize with the heartbeat's OWN bound token (not 0 — the
@@ -5844,21 +5867,33 @@ def heartbeat_disable(cfg: Config, *, vm_name: str = "",
             return {"ok": False,
                     "error": "heartbeat disable requires the owning live lease",
                     "error_class": "invalid"}
-    with _HB_LOCK:
-        # Only pop the heartbeat we validated: if the same owner re-enabled
-        # a fresh one between the lookup and here, popping by key would
-        # orphan the NEW timer (final-critic round-3 note).
-        if _HEARTBEATS.get(key_id) is hb:
-            _HEARTBEATS.pop(key_id, None)
+    with _HINT_LOCK:
+        with _HB_LOCK:
+            # Remove the VALIDATED object by identity, wherever it now
+            # lives: re-enabling by the same owner replaces the dict entry
+            # with a NEW object (popping by identity then finds nothing and
+            # leaves the fresh timer alone — final-critic round-3 note), and
+            # a concurrent hint migration re-keys the object to the GUID
+            # (round-9: the identity search follows it there, so a disable
+            # can never return ok while its timer survives under another
+            # key).
+            live_key = next((k for k, v in _HEARTBEATS.items()
+                             if v is hb), None)
+            if live_key is not None:
+                _HEARTBEATS.pop(live_key, None)
     hb.stop()
     return {"ok": True, "vm_name": vm_name, "enabled": False}
 
 
 def heartbeat_status(cfg: Config, *, vm_name: str = "",
                      vm_id: str = "") -> dict:
-    key_id = _ledger_key(vm_name, vm_id)
-    with _HB_LOCK:
-        hb = _HEARTBEATS.get(key_id) if key_id else None
+    # Same atomic hint->HB resolution as disable (review round-9): status
+    # must not report a chain disabled/absent because a hint learn migrated
+    # it between the split resolve and the lookup.
+    with _HINT_LOCK:
+        key_id = _ledger_key_unlocked(vm_name, vm_id)
+        with _HB_LOCK:
+            hb = _HEARTBEATS.get(key_id) if key_id else None
     return {
         "ok": True, "vm_name": vm_name,
         "enabled": hb is not None and not hb.stop_event.is_set(),
@@ -6041,6 +6076,7 @@ def run_sequence_multi(
             for item in items:
                 if stop.is_set():
                     rows.append(_skipped_row(item["index"], item["action"]))
+                    plan_ok = False
                     continue
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
