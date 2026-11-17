@@ -256,6 +256,10 @@ class JournalToken:
         self.call_id = uuid.uuid4().hex[:8]
         self.dispatched = False
         self.finished = False
+        # Review R2-F2: the inflight slot is reserved at BIND time (atomically
+        # with run selection), not at arm time — otherwise stop can drain and
+        # manifest during the bind->arm window while this token still writes.
+        self.counted = False
         # True once the detached runner (or the tasks route) owns the token's
         # resolution: the inline guard's finally must NOT resolve it, or a
         # detached call would journal twice (once the divert handle, once the
@@ -277,14 +281,14 @@ class JournalToken:
         self.t_start = time.monotonic()
 
     def arm_pre(self) -> None:
-        """Called immediately before the body dispatches input: bump the
-        in-flight counter and capture the pre-frame."""
+        """Called immediately before the body dispatches input: capture the
+        pre-frame. The inflight slot was already reserved at bind() time
+        (R2-F2); never increment here or the counter double-counts."""
         if self.dispatched or self.finished:
             return
         with self.run.lock:
             if self.run.state != "open":
                 return
-            self.run.inflight += 1
             self.dispatched = True
         _capture_frame(self.run, self, "pre")
 
@@ -331,8 +335,9 @@ class JournalToken:
                     # (or has definitively failed), under the same lock the
                     # stop drain reads — no manifest before the final line
                     # (review F2).
-                    if self.dispatched:
+                    if self.counted:
                         run.inflight -= 1
+                        self.counted = False
         except OSError:
             pass
 
@@ -358,9 +363,18 @@ def begin(tool: str, arguments: dict, *, agent: str | None = None) -> JournalTok
     with _RUNS_LOCK:
         run = next((r for r in _RUNS.values()
                     if r.state == "open" and r.covers(ag, vm_ids)), None)
-    if run is None:
-        return None
-    return JournalToken(run, tool, arguments or {}, ag)
+        if run is None:
+            return None
+        token = JournalToken(run, tool, arguments or {}, ag)
+        # Reserve the inflight slot AT BIND time, under the same global lock
+        # stop uses to close admission (R2-F2). Stop can no longer observe
+        # inflight==0 while a bound token has yet to append its line.
+        with run.lock:
+            if run.state != "open":
+                return None
+            run.inflight += 1
+            token.counted = True
+    return token
 
 
 def has_any_open_run() -> bool:
@@ -453,7 +467,17 @@ def _maybe_video(run: _Run) -> dict | None:
     if shutil.which("ffmpeg") is None:
         return {"video": None, "note": "ffmpeg not available"}
     out = run.run_dir / "evidence.mp4"
-    argv = ["ffmpeg", "-y", "-framerate", "2"]
+    # Per-step action markers (issue #131): the sidecar is written AND its
+    # CONTENT is passed as ffmpeg output metadata BEFORE the output filename,
+    # so the assembled video actually carries the markers (review R2-F4).
+    # Fixed argv entries, no shell, no pathname-as-comment placeholder.
+    markers = [{"seq": s, "role": r, "tool": t, "file": p.name}
+               for s, r, t, p in sorted(run.frames)]
+    marker_doc = json.dumps({"markers": markers}, ensure_ascii=False)
+    marker_path = run.run_dir / "markers.json"
+    marker_path.write_text(marker_doc, encoding="utf-8")
+    argv = ["ffmpeg", "-y", "-framerate", "2",
+            "-metadata", f"comment=action-markers:{marker_doc}"]
     for p in frames:
         argv += ["-i", str(p)]
     n = len(frames)
@@ -462,16 +486,6 @@ def _maybe_video(run: _Run) -> dict | None:
     else:
         chain = "".join(f"[{i}:v]" for i in range(n)) + f"concat=n={n}:v=1:a=0[outv]"
         argv += ["-filter_complex", chain, "-map", "[outv]", str(out)]
-    # per-step action markers sidecar (honors #131 "action marker per step").
-    # The ffmpeg argv carries the sidecar as a metadata input so the markers
-    # are actually available to the assembled video, not merely dropped next
-    # to it (implementation-review F4). Fixed argv entries, no shell.
-    markers = [{"seq": s, "role": r, "tool": t, "file": p.name}
-               for s, r, t, p in sorted(run.frames)]
-    marker_path = run.run_dir / "markers.json"
-    marker_path.write_text(
-        json.dumps({"markers": markers}, ensure_ascii=False), encoding="utf-8")
-    argv += ["-metadata", f"comment=action-markers:{marker_path}"]
     try:
         from . import pswindows
 
@@ -502,14 +516,26 @@ def stop_run(run_id: str, *, agent: str | None = None) -> dict:
     with _RUNS_LOCK:
         run.state = "closing"
     deadline = time.monotonic() + 5.0
+    outstanding = 1
     while True:
         with run.lock:
-            if run.inflight <= 0:
+            outstanding = run.inflight
+            if outstanding <= 0:
                 break
         if time.monotonic() >= deadline:
-            # Disclose an un-drained call instead of silently manifesting a
-            # run whose journal may still change (bounded wait elapsed).
-            break
+            # Never certify a final manifest while writers are outstanding:
+            # a late journal line would invalidate every digest (review R2-F2
+            # second finding). Leave the run open so callers can retry stop;
+            # disclose the exact outstanding count.
+            with _RUNS_LOCK:
+                run.state = "open"  # re-arm admission; stop was not completed
+            return {"ok": False,
+                    "error": (f"journal drain timed out with {outstanding} "
+                              "call(s) still open; retry run_stop after they "
+                              "finish"),
+                    "error_class": "journal_drain_timeout",
+                    "retryable": True, "retry_after_ms": 1000,
+                    "outstanding": outstanding}
         time.sleep(0.01)
     video = _maybe_video(run)
     # manifest: SHA-256 of every file in the run dir (including the mp4).
