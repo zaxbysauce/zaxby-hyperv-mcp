@@ -5845,7 +5845,11 @@ def heartbeat_disable(cfg: Config, *, vm_name: str = "",
                     "error": "heartbeat disable requires the owning live lease",
                     "error_class": "invalid"}
     with _HB_LOCK:
-        _HEARTBEATS.pop(key_id, None)
+        # Only pop the heartbeat we validated: if the same owner re-enabled
+        # a fresh one between the lookup and here, popping by key would
+        # orphan the NEW timer (final-critic round-3 note).
+        if _HEARTBEATS.get(key_id) is hb:
+            _HEARTBEATS.pop(key_id, None)
     hb.stop()
     return {"ok": True, "vm_name": vm_name, "enabled": False}
 
