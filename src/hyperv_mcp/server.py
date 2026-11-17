@@ -1,7 +1,7 @@
 """
 hyperv_mcp.server -- MCP server for Hyper-V VM management (hardened fork).
 
-Exposes 89 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
+Exposes 93 tools: VM lifecycle, checkpoints, kernel debug setup (KDNET/KDCOM),
 guest execution and file transfer via PowerShell Direct, guest access
 diagnostics/repair and managed guest jobs, reboot recovery verification,
 host-to-guest HTTP relay, console observation and input (WMI), evidence
@@ -35,7 +35,7 @@ import sys
 import threading
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, cast
 
 import anyio
 from mcp.server.auth.settings import AuthSettings
@@ -54,6 +54,7 @@ from . import (
     diagnostics,
     errors,
     evidence,
+    evidencejournal,
     filetransfer,
     guestexec,
     guestjobs,
@@ -325,6 +326,14 @@ def bootstrap(
     # flag is off, and the session cap is derived from the host PowerShell cap
     # so pooled workers cannot starve the per-call legs of slots.
     psdsessions.install_default_pool(cfg)
+    # issue #131: wire the evidence-journal seams (late injection breaks
+    # the import cycle; mutating = lease-scoped, the authoritative map).
+    evidencejournal.reset_for_tests()
+    evidencejournal.install(
+        get_config=_cfg,
+        is_mutating=lambda name: name in TOOL_SCOPES,
+        screenshot=_journal_screenshot,
+    )
     auth = None
     if _http_token_verifier is not None:
         # MCPServer requires AuthSettings when a token_verifier is installed.
@@ -820,7 +829,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                         # #9 review PRR-003/PRR-004).
                         enriched = errors.enrich_failure(result)
                         op.error_class = enriched["error_class"]
-                        return errors.failure_result(enriched)
+                        return cast(dict, errors.failure_result(enriched))
                     op.error_class = str(result.get("error_class") or "")
                 return result
         except UrlElicitationRequiredError:
@@ -1314,6 +1323,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_id: str = "",
             lease_id: str = "", fencing_token: int = 0,
         detach: bool = False, idempotency_key: str = "",
+        on_timeout: str = "",
         ) -> dict:
             """Run a PowerShell script inside a guest via PowerShell Direct.
             stdout/stderr are SEPARATE (0.2.0 change); exit codes are real.
@@ -1324,6 +1334,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 vm_name: Name of the VM
                 vm_id:   Optional VM GUID; exactly one of vm_name/vm_id must be given
                 script: PowerShell script text to run in the guest
+                on_timeout: "" (default) or "job" — on host timeout while
+                    the guest process is still running, promote the call to a
+                    managed job (the script runs EXACTLY ONCE through the job
+                    lane) and return its handle instead of a timeout error
                 timeout_ms: Per-call timeout in milliseconds
                 elevated: Run elevated in the guest (destructive.elevated_exec + confirm)
                 confirm: Must be true (the tool's destructive category + require_confirm)
@@ -1341,7 +1355,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_guest_run_ps", vm_name, "exec",
                 guestexec.guest_run_ps, _cfg(), vm_name, script,
                 timeout_ms=timeout_ms, elevated=elevated, confirm=confirm,
-                vm_id=vm_id, cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
+                vm_id=vm_id, on_timeout=on_timeout,
+                cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
             )
 
         @mcp.tool()
@@ -1514,6 +1529,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             elevated: bool = False, confirm: bool = False, vm_id: str = "",
             lease_id: str = "", fencing_token: int = 0,
         detach: bool = False, idempotency_key: str = "",
+        on_timeout: str = "",
         ) -> dict:
             """Run a PowerShell script inside a guest via PowerShell Direct.
             stdout/stderr are SEPARATE (0.2.0 change); exit codes are real.
@@ -1527,6 +1543,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             Args:
                 vm_name: Name of the VM (must match allowed_vm_patterns)
                 script: PowerShell script text to run in the guest
+                on_timeout: "" (default) or "job" — on host timeout while
+                    the guest process is still running, promote the call to a
+                    managed job (the script runs EXACTLY ONCE through the job
+                    lane) and return its handle instead of a timeout error
                 timeout_ms: Per-call timeout in milliseconds
                 elevated: Run elevated in the guest (destructive.elevated_exec + confirm)
                 confirm: Must be true (the tool's destructive category + require_confirm)
@@ -1542,7 +1562,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_guest_run_ps", vm_name, "exec",
                 guestexec.guest_run_ps, _cfg(), vm_name, script,
                 timeout_ms=timeout_ms, elevated=elevated, confirm=confirm,
-                vm_id=vm_id, cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
+                vm_id=vm_id, on_timeout=on_timeout,
+                cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
             )
 
         @mcp.tool()
@@ -1840,12 +1861,287 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                         # with the audit class derived from them.
                         enriched = errors.enrich_failure(result)
                         op.error_class = enriched["error_class"]
-                        return errors.failure_result(enriched)
+                        return cast(dict, errors.failure_result(enriched))
+                    # issue #133 AC1: a successful VM-addressing console
+                    # result reports the seconds since this process' last
+                    # console input to that VM (all-identity lookup in
+                    # console.input_idle_s; omitted before any input ever).
+                    idle = console.input_idle_s(
+                        vm or str(result.get("vm_name") or ""),
+                        str(kwargs.get("vm_id") or ""))
+                    if idle is not None:
+                        result = dict(result)
+                        result["input_idle_s"] = idle
                 return result
         except UrlElicitationRequiredError:
             raise
         except Exception as exc:
             return errors.failure_result(errors.envelope(exc))
+
+    def _multi_lease_gate(plans: list) -> dict | None:
+        """issue #132 AC4: per-plan lease gate for hyperv_console_sequence_multi.
+
+        Mirrors _lease_gate's arms once per plan (presented lease ->
+        authorize; absent + leases.required -> lease_required; otherwise ->
+        assert_unleased against that plan's resolved VM). ANY refusal returns
+        the envelope BEFORE a single thread starts — a partial plan on one VM
+        is unwanted guest state. The tools are _SELF_GATED_TOOLS precisely so
+        this per-plan decision replaces the generic single-hint gate (which
+        cannot express one lease per VM)."""
+        cfg = _cfg()
+        agent = auditlog.current_agent_id()
+        required = bool(getattr(cfg.leases, "required", False))
+        for i, plan in enumerate(plans or []):
+            if not isinstance(plan, dict):
+                return {"ok": False, "error": f"plan {i}: object required",
+                        "error_class": "invalid"}
+            vm_name = str(plan.get("vm_name") or "")
+            vm_id = str(plan.get("vm_id") or "")
+            lease_id = str(plan.get("lease_id") or "")
+            raw_token = plan.get("fencing_token") or 0
+            try:
+                token = int(raw_token)
+            except (TypeError, ValueError):
+                return {"ok": False,
+                        "error": "fencing_token must be an integer",
+                        "error_class": "invalid"}
+            if lease_id:
+                try:
+                    leases.authorize(cfg, lease_id, token, agent, "console",
+                                     vm_hint=vm_id, vm_name_hint=vm_name)
+                except (leases.LeaseError, policy.PolicyDenied) as exc:
+                    return errors.envelope(exc)
+                continue
+            if required:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"plan {i} needs a lease on this shared controller: "
+                        "acquire one with hyperv_lease_acquire and pass "
+                        "lease_id and fencing_token per plan"),
+                    "error_class": "lease_required",
+                }
+            try:
+                if vm_name and not vm_id:
+                    if not leases.candidates_exist_by_name(cfg, vm_name, agent):
+                        continue
+                    try:
+                        ref = vmident.resolve(cfg, vm_name=vm_name)
+                        vm_id = ref.id
+                    except Exception:
+                        leases.assert_unleased(cfg, agent, "console",
+                                               vm_name_hint=vm_name)
+                        continue
+                if vm_id or vm_name:
+                    leases.assert_unleased(cfg, agent, "console",
+                                           vm_hint=vm_id,
+                                           vm_name_hint=vm_name)
+            except (leases.LeaseError, policy.PolicyDenied) as exc:
+                return errors.envelope(exc)
+        return None
+
+    @mcp.tool()
+    def hyperv_console_sequence_multi(
+        plans: list[dict] | None = None, barriers: list[str] | None = None,
+        timeout_s: int = 60, width: int = 640, height: int = 480,
+    ) -> dict:
+        """Run coordinated console steps on two or more VMs with named
+        barriers and host-clock timestamps (issue #132).
+
+        plans is a list of 1..8 per-VM plan objects, each
+        {vm_name?, vm_id?, steps, lease_id?, fencing_token?}: exactly one of
+        vm_name/vm_id must be given, steps uses the hyperv_console_sequence
+        grammar (same step kinds, same 50-step bound, same wait budgets), and
+        a plan may carry a `{"action": "barrier", "name": ...}` marker step
+        whose name must come from the top-level `barriers` list. barriers is
+        a list of unique names; every plan must reference every barrier
+        exactly once in the same order (full rendezvous — partial or
+        reordered participation is refused before any dispatch).
+
+        Semantics: no step after a barrier starts on any VM until every plan
+        has reached it; every step result carries host monotonic_ns +
+        wall_utc timestamps stamped at its real start/finish; a step failure
+        on any VM stops all VMs at their next step (remaining steps report
+        skipped: true, never dispatched); all per-plan lease checks run
+        BEFORE any input (a lease failure refuses the whole plan). request_key
+        is deliberately absent (cross-VM UNKNOWN replay semantics under one
+        key are unsound — deferral documented in issue #132). Policy:
+        console_input. Non-detachable; audit: one row per plan call.
+
+        Args:
+            plans: List of 1..8 per-VM plan objects (vm identity, steps,
+                optional per-plan lease citation)
+            barriers: Ordered list of unique barrier names every plan joins
+            timeout_s: Overall coordinator deadline in seconds
+            width: Requested snapshot width for per-step engine legs
+            height: Requested snapshot height for per-step engine legs
+        Returns: {ok, results: [{vm_name, ok, steps: [{index, action, ok,
+            monotonic_ns, wall_utc, ...}]}], barriers} or
+            {ok: false, error, error_class, ...} (whole-plan refusal)
+        """
+        def _body():
+            gate = _multi_lease_gate(plans or [])
+            if gate is not None:
+                return gate
+            return console.run_sequence_multi(
+                _cfg(), plans or [], barriers or [],
+                timeout_s=timeout_s, width=width, height=height)
+
+        return _run_console_tool(
+            "hyperv_console_sequence_multi", "", "console_input", _body)
+
+    @mcp.tool()
+    def hyperv_console_heartbeat(
+        vm_name: str = "", key: str = "shift", interval_s: float = 5.0,
+        enable: bool = True, vm_id: str = "",
+        lease_id: str = "", fencing_token: int = 0,
+    ) -> dict:
+        """Enable or disable the per-VM benign-key heartbeat (issue #133).
+
+        WHILE enabled and the bound console lease is live, the configured
+        single benign key is sent at the configured interval; every beat
+        revalidates the lease and dispatches with it presented, and the
+        heartbeat stops the moment the lease ends (release or expiry) — never
+        an orphaned typing stream. When lease_id is omitted the caller's
+        UNIQUE live console lease on the VM is discovered and bound (0 or
+        more-than-1 matches refuse as invalid); an explicit lease_id +
+        fencing_token is reauthorized at enable. Raw scancode payloads are
+        refused: only single key names the press_key table recognizes.
+        Self-gated (_SELF_GATED_TOOLS): the body performs the full lease
+        decision while the tool keeps its console TOOL_SCOPES entry for
+        vm_lock call-row scoping. Policy: console_input.
+
+        Args:
+            vm_name: Name of the VM (must match allowed_vm_patterns)
+            vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
+            key: Single benign key name from the press_key table (default shift)
+            interval_s: Seconds between beats (0.05..3600; default 5)
+            enable: True to (re)arm the heartbeat, False to stop it
+            lease_id: Optional lease citation - the body authorizes/discovery-binds
+            fencing_token: The lease's fencing token, with lease_id
+        Returns: {ok, vm_name, enabled, key?, interval_s?, lease_id?, sent?}
+        """
+        cfg = _cfg()
+        agent = auditlog.current_agent_id()
+        bound_id = str(lease_id or "")
+        bound_token = int(fencing_token or 0)
+        if enable and not bound_id:
+            # discovery-bind the caller's single live console lease (PC2-2);
+            # list_leases is owner-UNFILTERED by design (leases.py:452-470),
+            # so the holder_agent comparison here IS the owner check (PC3-6).
+            try:
+                rows = [
+                    r for r in leases.list_leases(cfg, vm_id=str(vm_id or ""))
+                    if r.scope == "console" and r.holder_agent == agent
+                    and (
+                        (vm_id and str(r.vm_id or "").strip().casefold()
+                         == vm_id.strip().casefold())
+                        or (vm_name and str(r.vm_name or "").strip().lower()
+                            == vm_name.strip().lower())
+                    )
+                ]
+            except Exception:  # noqa: BLE001 — discovery failure is "no lease"
+                rows = []
+            if len(rows) != 1:
+                return cast(dict, errors.failure_result(errors.enrich_failure({
+                    "ok": False,
+                    "error": (
+                        "heartbeat requires exactly one live console lease on "
+                        f"the VM (found {len(rows)}); acquire one with "
+                        "hyperv_lease_acquire or cite it via lease_id + "
+                        "fencing_token"),
+                    "error_class": "invalid"})))
+            bound_id = rows[0].lease_id
+            bound_token = int(rows[0].fencing_token)
+        if not enable:
+            # Require the caller's owning lease on disable too (self-gated
+            # tools skip the generic lease gate on every path).
+            dis_id = str(lease_id or "")
+            if not dis_id:
+                own = [
+                    r for r in leases.list_leases(cfg, vm_id=str(vm_id or ""))
+                    if r.scope == "console" and r.holder_agent == agent
+                    and (
+                        (vm_id and str(r.vm_id or "").strip().casefold()
+                         == vm_id.strip().casefold())
+                        or (vm_name and str(r.vm_name or "").strip().lower()
+                            == vm_name.strip().lower())
+                    )
+                ]
+                if len(own) == 1:
+                    dis_id = own[0].lease_id
+            return _run_console_tool(
+                "hyperv_console_heartbeat", vm_name, "console_input",
+                console.heartbeat_disable, cfg, vm_name=vm_name, vm_id=vm_id,
+                agent=agent, lease_id=dis_id)
+        return _run_console_tool(
+            "hyperv_console_heartbeat", vm_name, "console_input",
+            console.heartbeat_enable, cfg, vm_name=vm_name, vm_id=vm_id,
+            key=key, interval_s=interval_s, lease_id=bound_id,
+            fencing_token=bound_token, agent=agent)
+
+    @mcp.tool()
+    def hyperv_evidence_run_start(
+        run_dir: str = "", vms: list[str] | None = None, video: bool = False,
+    ) -> dict:
+        """Open an evidence run (issue #131).
+
+        While a run is open, EVERY mutating tool call (the lease-scoped tools
+        in TOOL_SCOPES — the authoritative mutating map) on a VM covered by
+        `vms` appends one JSONL journal line under run_dir: the call, its
+        sanitized arguments (typed text recorded as its LENGTH, never the
+        text; credentials never serialized), its raw result (secrets scrubbed),
+        the frames captured immediately before and after it (saved under
+        run_dir/frames with their pixel-only frame hashes), and timestamps.
+        hyperv_evidence_run_stop writes a SHA-256 manifest over every file in
+        the directory (and, with video=true and ffmpeg available, assembles
+        the frames into an MP4 with per-step action markers first, so the
+        manifest covers the video too). With no open run the whole journal
+        surface is a no-op: tool behavior is byte-identical to before.
+
+        run_dir is gated by host_write policy; the journal only ever writes
+        inside it.
+
+        Args:
+            run_dir: Host directory for the run (must be under host_write_roots)
+            vms: VM names/guids this run covers; empty covers every VM
+            video: Assemble an MP4 from the frames at stop when ffmpeg exists
+        Returns: {ok, run_id, run_dir, video} or {ok: false, error, error_class}
+        """
+        with _audit("hyperv_evidence_run_start", "", "evidence") as op:
+            result = evidencejournal.start_run(run_dir, list(vms or []),
+                                               video=video)
+            op.ok = bool(result.get("ok", False))
+            if not op.ok:
+                enriched = errors.enrich_failure(result)
+                op.error_class = enriched["error_class"]
+                return cast(dict, errors.failure_result(enriched))
+            return result
+
+    @mcp.tool()
+    def hyperv_evidence_run_stop(run_id: str = "") -> dict:
+        """Close an evidence run (issue #131).
+
+        Drains in-flight journaled calls (bounded), optionally assembles the
+        MP4, then writes manifest.json whose SHA-256 entries match every file
+        in the run directory — reviewers can prove a cited receipt was not
+        edited after the run. The run_id belongs to the agent that opened it
+        (a foreign run_id answers unknown, mirroring the job/relay ownership
+        rule).
+
+        Args:
+            run_id: The id returned by hyperv_evidence_run_start
+        Returns: {ok, run_id, manifest, files, video?} or
+            {ok: false, error, error_class}
+        """
+        with _audit("hyperv_evidence_run_stop", "", "evidence") as op:
+            result = evidencejournal.stop_run(run_id)
+            op.ok = bool(result.get("ok", False))
+            if not op.ok:
+                enriched = errors.enrich_failure(result)
+                op.error_class = enriched["error_class"]
+                return cast(dict, errors.failure_result(enriched))
+            return result
 
     @mcp.tool()
     def hyperv_console_screenshot(
@@ -1909,6 +2205,15 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 # PRR-004: by-id adoption from the console module's metadata.
                 if not vm_name and meta.get("vm_name"):
                     op.vm_name = str(meta["vm_name"])
+                # issue #133 AC1 (PC3-5): the metadata text block of this
+                # image-returning console result carries input_idle_s too —
+                # the key joins the JSON meta, never the image bytes.
+                idle = console.input_idle_s(
+                    vm_name or str(meta.get("vm_name") or ""),
+                    str(meta.get("vm_id") or vm_id or ""))
+                if idle is not None:
+                    meta = dict(meta)
+                    meta["input_idle_s"] = idle
                 # ImageContent is a pydantic model; the raw SDK Image
                 # wrapper is not and breaks serialization across the mcp
                 # versions in the CI matrix. The frame's single encoding
@@ -5326,6 +5631,8 @@ TOOL_SCOPES: dict[str, str] = {
     "hyperv_console_button": "console", "hyperv_console_scroll": "console",
     "hyperv_console_sequence": "console",
     "hyperv_console_unlock": "console",
+    "hyperv_console_sequence_multi": "console",
+    "hyperv_console_heartbeat": "console",
     "hyperv_ui_invoke": "console",
     "hyperv_ui_set_value": "console",
     "hyperv_ui_focus": "console",
@@ -5436,6 +5743,17 @@ def _row_vm_allowed(cfg: Config, row) -> bool:
         return False
 
 
+#: issue #132/#133: tools that gate leases THEMSELVES (the multi-VM
+#: coordinator authorizes every per-plan lease; the heartbeat authorizes
+#: its bound lease). They keep their TOOL_SCOPES "console" entries so
+#: vm_lock call rows stay console-scoped (PC3-1); _lease_gate bypasses
+#: ONLY the generic single-hint lease decision for these names.
+_SELF_GATED_TOOLS = frozenset({
+    "hyperv_console_sequence_multi",
+    "hyperv_console_heartbeat",
+})
+
+
 def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]:
     """The pre-body lease check for a mutating tool (issue #23).
 
@@ -5450,6 +5768,11 @@ def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]
     """
     scope = TOOL_SCOPES.get(name)
     if scope is None:
+        return None, None
+    if name in _SELF_GATED_TOOLS:
+        # self-gated: the body/coordinator runs the full lease decision
+        # (authorize / required / assert_unleased) per plan; here we
+        # bypass only the single-hint logic, NOT the scope entry above.
         return None, None
     cfg = _cfg()
     agent = auditlog.current_agent_id()
@@ -5634,6 +5957,18 @@ def _lease_gate(name: str, arguments: dict) -> tuple[dict | None, object | None]
 _ADMISSION_CLASS_UNSET = object()
 
 
+def _journal_screenshot(cfg, *, vm_name: str, vm_id: str, save_path: str,
+                        width: int, height: int) -> dict:
+    """Screenshot seam injected into evidencejournal (issue #131): folded
+    capture to a save_path, returning its metadata (frame_hash/saved_path).
+    Failures propagate to the journal hook, which records null frames."""
+    _img, meta = console.screenshot(
+        cfg, vm_name=vm_name or "", width=width or 640, height=height or 480,
+        save_path=save_path, vm_id=vm_id or "",
+    )
+    return dict(meta)
+
+
 def _harden_tools(mcp: MCPServer) -> None:
     """Stamp additionalProperties:false and reject bad calls at Tool.run.
 
@@ -5688,6 +6023,7 @@ def _harden_tools(mcp: MCPServer) -> None:
             *,
             admission_class: object = _ADMISSION_CLASS_UNSET,
             retry_after_ms: float | None = None,
+            journal_token: Any = None,
         ) -> CallToolResult:
             args = arguments or {}
             # str()-coerce before redaction (credentials.redact raises on
@@ -5763,12 +6099,24 @@ def _harden_tools(mcp: MCPServer) -> None:
                     f"[hyperv-mcp] WARNING: audit write failed for a "
                     f"rejected call on {name}: {audit_exc}"
                 )
+            if journal_token is not None:
+                # issue #131: a refused mutating call still gets its journal
+                # line (no frames — nothing dispatched); exactly-once via the
+                # token's finished flag.
+                evidencejournal.finish_if_unowned(journal_token, env,
+                                              outcome="refusal")
             return errors.failure_result(env)
 
         async def guard(arguments, context=None, convert_result=False, _tool=tool, _run=original_run, **kwargs):
             declared = set((getattr(_tool, "parameters", None) or {}).get("properties", {}))
             unknown = sorted(k for k in (arguments or {}) if k not in declared)
             name = str(getattr(_tool, "name", "unknown-tool"))
+            # issue #131: bind the journal token at the single every-call
+            # dispatch point (before admission), so EVERY terminal outcome of
+            # a mutating call — body, refusal, replay, cancel — resolves
+            # exactly one journal line. No-op (None) when no run is open.
+            jtok = (evidencejournal.begin(name, arguments or {})
+                    if evidencejournal.has_any_open_run() else None)
             if unknown:
                 shown = ", ".join(unknown[:8]) + (", ..." if len(unknown) > 8 else "")
                 message = (
@@ -5782,7 +6130,7 @@ def _harden_tools(mcp: MCPServer) -> None:
                     "error_class": "invalid",
                     "retryable": retryable,
                     "retry_after_ms": retry_after_ms,
-                })
+                }, journal_token=jtok)
             # Issue #23: the lease gate. It returns an ENVELOPE (never raises)
             # and is audited exactly like the unknown-argument rejection,
             # because it fires before any tool body's audit region. MINOR-13:
@@ -5790,7 +6138,8 @@ def _harden_tools(mcp: MCPServer) -> None:
             # fail the deny-all census's raised == [] assertion.
             lease_env, lease_reset = _lease_gate(name, arguments or {})
             if lease_env is not None:
-                return _audited_rejection(name, arguments, lease_env)
+                return _audited_rejection(name, arguments, lease_env,
+                                          journal_token=jtok)
             # Issue #24: durable-operation interception - idempotency replay
             # or conflict refusal, or the detach divert. Gates have already
             # run, so a denied call never reaches here and never mints an op
@@ -5805,6 +6154,7 @@ def _harden_tools(mcp: MCPServer) -> None:
                         tool_fn, _runner_slots,
                         preflight=lambda: _operations_preflight(
                             name, dict(arguments or {}), _tool),
+                    journal_token=jtok,
                     )
                 except UrlElicitationRequiredError:
                     raise
@@ -5818,10 +6168,21 @@ def _harden_tools(mcp: MCPServer) -> None:
                     # gates answer, they do not raise.)
                     env = errors.envelope(
                         preflight_exc.__cause__ or preflight_exc)
-                    return _audited_rejection(name, arguments, env)
+                    return _audited_rejection(name, arguments, env,
+                                              journal_token=jtok)
                 if ops_response is not None:
                     if ops_response.get("ok") is False:
-                        return _audited_rejection(name, arguments, ops_response)
+                        return _audited_rejection(name, arguments, ops_response,
+                                                  journal_token=jtok)
+                    if ops_response.get("replayed"):
+                        # replay/reattach: this call's outcome is the
+                        # replayed payload — journal it now (PC4-1).
+                        evidencejournal.finish(jtok, ops_response,
+                                               outcome="replay")
+                    else:
+                        # fresh detach: hand the token to the runner so the
+                        # divert handle is never journalled as the result.
+                        evidencejournal.hand_off(jtok)
                     return errors.success_result([
                         TextContent(text=json.dumps(
                             ops_response, separators=(",", ":"), default=str,
@@ -5866,6 +6227,7 @@ def _harden_tools(mcp: MCPServer) -> None:
                         name, arguments, busy_env,
                         admission_class=str(admission.classify_tool(name)),
                         retry_after_ms=busy.retry_after_ms,
+                        journal_token=jtok,
                     )
                 except BaseException as exc:
                     # rb-1 parity for the PARK window (review round 1,
@@ -5882,9 +6244,11 @@ def _harden_tools(mcp: MCPServer) -> None:
                     raise
                 try:
                     try:
+                        evidencejournal.arm(jtok)
                         result = await _run(arguments, context, convert_result=convert_result, **kwargs)
                         if ops_ctx is not None:
                             operations.complete_inline(ops_ctx, result)
+                        evidencejournal.finish(jtok, result, outcome="body")
                         return result
                     except UrlElicitationRequiredError as exc:
                         if ops_ctx is not None:
@@ -5912,7 +6276,8 @@ def _harden_tools(mcp: MCPServer) -> None:
                         env = errors.envelope(cause if cause is not None else exc)
                         if ops_ctx is not None:
                             operations.fail_inline(ops_ctx, cause if cause is not None else exc)
-                        return _audited_rejection(name, arguments, env)
+                        return _audited_rejection(name, arguments, env,
+                                                  journal_token=jtok)
                     except BaseException as exc:
                         # Review rb-1: CancelledError (client disconnect / server
                         # shutdown) is a BaseException - without this arm a sync
@@ -5924,6 +6289,11 @@ def _harden_tools(mcp: MCPServer) -> None:
                             operations.fail_inline(ops_ctx, exc)
                         raise
                 finally:
+                    # issue #131 (PC4-1): a terminal outcome that skipped
+                    # an explicit finish (park cancellation, body
+                    # BaseException re-raise) still journals exactly one
+                    # cancel line; resolved/handed-off tokens no-op.
+                    evidencejournal.finish_if_unowned(jtok, None, outcome="cancel")
                     # Issue #68 supplement: every exit (success, failure,
                     # rejection, cancellation) releases both admission
                     # stages and resets the audit ContextVar, so no permit,
@@ -5931,6 +6301,9 @@ def _harden_tools(mcp: MCPServer) -> None:
                     # the next call on this request context.
                     await admission.release(ticket)
             finally:
+                # issue #131: last-ditch resolve for escapes before the
+                # inner try (elicit raise from guard_consult); idempotent.
+                evidencejournal.finish_if_unowned(jtok, None, outcome="cancel")
                 # Issue #23: the presented lease rides only THIS call. The
                 # reset must cover every exit (success, failure, rejection,
                 # replay, detach) or a stale lease id leaks into the next call

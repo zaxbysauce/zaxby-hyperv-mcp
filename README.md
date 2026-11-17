@@ -1,7 +1,7 @@
 # hyperv-mcp (hardened fork)
 
 An MCP (Model Context Protocol) server for Hyper-V VM management and guest
-execution. Exposes 89 tools for VM lifecycle, checkpoint management, kernel
+execution. Exposes 93 tools for VM lifecycle, checkpoint management, kernel
 debug setup (KDNET/KDCOM), and guest file transfer/command execution via
 PowerShell Direct (no WinRM required).
 
@@ -1821,7 +1821,7 @@ become a published credential):
 
 ---
 
-## Available Tools (89 total)
+## Available Tools (93 total)
 
 Every registered tool in the tables below returns failures the same way:
 the one-envelope contract (`ok/error/error_class/retryable/retry_after_ms`,
@@ -2910,7 +2910,7 @@ commit-guarded click discipline, transient-versus-absent errors, and evidence
 capture. List it with your client's prompt listing and fetch it before a GUI
 session; the console click/type/screenshot tool descriptions also point at
 their element-level alternatives so the most capable path is discoverable
-among the 89 tools.
+among the 93 tools.
 
 ### MDT Deployment Playbook (agent-driven)
 

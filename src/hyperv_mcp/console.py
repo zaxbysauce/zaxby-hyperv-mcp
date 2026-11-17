@@ -104,7 +104,7 @@ from typing import Any
 from PIL import Image as PILImage
 from PIL import features as _PILFeatures
 
-from . import auditlog, guestexec, policy, pswindows, vmident, vmlocks, wmiconsole
+from . import auditlog, guestexec, leases, policy, pswindows, vmident, vmlocks, wmiconsole
 from . import timing as timing_mod
 from .config import Config
 
@@ -214,6 +214,21 @@ def note_name_guid_hint(vm_name: str, guid: str) -> None:
                     prior = _LAST_INPUT_SEQ.pop(key)
                     if prior > _LAST_INPUT_SEQ.get(guid, 0):
                         _LAST_INPUT_SEQ[guid] = prior
+                if key in _LAST_INPUT_TS:
+                    prior_ts = _LAST_INPUT_TS.pop(key)
+                    if prior_ts > _LAST_INPUT_TS.get(guid, 0.0):
+                        _LAST_INPUT_TS[guid] = prior_ts
+                # Issue #152 review F-002: the heartbeat registry is keyed by
+                # the same volatile ledger key; a name learned mid-flight must
+                # migrate the live chain or disable/status orphan it. Lock
+                # order is hint lock BEFORE HB lock (same as the ledger chain).
+                with _HB_LOCK:
+                    hb = _HEARTBEATS.pop(key, None)
+                    if hb is not None:
+                        prior_hb = _HEARTBEATS.get(guid)
+                        if prior_hb is not None:
+                            prior_hb.stop()
+                        _HEARTBEATS[guid] = hb
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +293,12 @@ _LAST_INPUT_SEQ: dict[str, int] = {}
 #: the receipt channel takes NO live-frame re-check leg: its freshness leg
 #: is ledger-ordering only, per-server-process (#126 ASK-1 final).
 _STATE_RECEIPT_REGISTRY: dict[tuple[str, str], dict] = {}
+#: vm key -> console-module time.monotonic() at the LAST input dispatch
+#: (issue #133, the input_idle_s measure). Stamped at the SAME points as
+#: _LAST_INPUT_SEQ inside record_console_input, so "the ledger bumped" and
+#: "idle reset" never diverge; a refused/never-dispatched input neither.
+#: reset_input_ledger MUST clear it (the #140 per-VM-registry class rule).
+_LAST_INPUT_TS: dict[str, float] = {}
 
 
 def _ledger_key_unlocked(vm_name: str, vm_id: str) -> str:
@@ -368,9 +389,13 @@ def record_console_input(vm_name: str = "", vm_id: str = "") -> None:
         if not key:
             return
         seq = next(_LEDGER_SEQ)
+        mono = time.monotonic()
         with _LEDGER_LOCK:
             if seq > _LAST_INPUT_SEQ.get(key, 0):
                 _LAST_INPUT_SEQ[key] = seq
+            # issue #133: the idle clock bumps with the ledger seq, at every
+            # input-dispatch point (heartbeat beats included).
+            _LAST_INPUT_TS[key] = mono
 
 
 def record_state_read(vm_name: str = "", vm_id: str = "") -> str:
@@ -411,10 +436,15 @@ def reset_input_ledger() -> None:
     nothing to order. Every per-VM citation registry the guard family owns
     MUST be cleared here (the #140 class: a new registry omitted from this
     reset leaks citations across tests — and across VMs — fail-OPENLY)."""
+    # Issue #133: heartbeats are per-VM registry state too — stop every
+    # timer BEFORE clearing (a leaked timer typing into a VM nobody owns is
+    # the exact orphan the AC forbids), then clear the ledger maps.
+    stop_all_heartbeats()
     with _LEDGER_LOCK:
         _CAPTURE_REGISTRY.clear()
         _LAST_INPUT_SEQ.clear()
         _STATE_RECEIPT_REGISTRY.clear()
+        _LAST_INPUT_TS.clear()
 
 
 def _lookup_capture(frame_hash: str, vm_key: str) -> dict | None:
@@ -5617,4 +5647,533 @@ def run_sequence(
         "steps": steps_out,
         "elapsed_ms": int((time.monotonic() - started) * 1000),
         "timings": _ps_timings(timing),
+    }
+
+
+# ---------------------------------------------------------------------------
+# issue #133 — input-idle reporting and the lease-bound per-VM heartbeat
+# ---------------------------------------------------------------------------
+
+
+def _idle_identity_keys(vm_name: str, vm_id: str) -> set[str]:
+    """Every ledger key spelling under which an input to this VM could have
+    been recorded — casefolded caller name, explicit id, and hint-resolved
+    GUID (mirrors _input_seq_any_identity, issue #140: an identity-split
+    lookup would under-report the idle time and fabricate freshness)."""
+    keys: set[str] = set()
+    if vm_name and vm_name.strip():
+        keys.add(vm_name.strip().casefold())
+    if vm_id and vm_id.strip():
+        keys.add(vm_id.strip().casefold())
+    with _HINT_LOCK:
+        if vm_name and vm_name.strip():
+            hint = _NAME_GUID_HINTS.get(vm_name.strip().casefold())
+            if hint:
+                keys.add(hint)
+    return keys
+
+
+def input_idle_s(vm_name: str = "", vm_id: str = "") -> float | None:
+    """Seconds since the last console input was dispatched to that VM through
+    THIS server process (issue #133 AC1); None when this process has never
+    sent one — absence is honest; 0.0 would fabricate a fresh input.
+
+    The NEWEST timestamp wins across every identity spelling (all-identity
+    lookup, plan-critic PC6): a cold by-name input stamped under the name key
+    must still be found once the hint map knows the GUID."""
+    keys = _idle_identity_keys(vm_name, vm_id)
+    newest: float | None = None
+    with _LEDGER_LOCK:
+        for k in keys:
+            ts = _LAST_INPUT_TS.get(k)
+            if ts is not None and (newest is None or ts > newest):
+                newest = ts
+    if newest is None:
+        return None
+    return max(0.0, time.monotonic() - newest)
+
+
+_HEARTBEAT_MIN_INTERVAL_S = 0.05
+_HEARTBEAT_MAX_INTERVAL_S = 3600.0
+_HB_LOCK = threading.Lock()
+_HEARTBEATS: dict[str, _Heartbeat] = {}
+
+
+class _Heartbeat:
+    """A lease-bound benign-key heartbeat (issue #133 AC2/AC3).
+
+    One heartbeat per VM. Every beat REVALIDATES the bound lease before it
+    dispatches and dispatches with that lease PRESENTED (set_presented_lease)
+    so the per-call vm_lock row adopts the lease instead of colliding with
+    it (issue #23 presented-lease discipline; PC2-2). A released or expired
+    lease stops the typing — never an orphan keypress stream into a VM nobody
+    owns. Timer-chain pattern: operations.py's detached beat (daemon, stop
+    Event checked first)."""
+
+    def __init__(
+        self, cfg: Config, vm_name: str, vm_id: str, key: str,
+        interval_s: float, lease_id: str, fencing_token: int,
+        agent: str | None,
+    ) -> None:
+        self.cfg = cfg
+        self.vm_name = vm_name
+        self.vm_id = vm_id
+        self.key = key
+        self.interval_s = interval_s
+        self.lease_id = lease_id
+        self.fencing_token = fencing_token
+        self.agent = agent
+        self.stop_event = threading.Event()
+        self.timer: threading.Timer | None = None
+        self.sent = 0
+
+    def start(self) -> None:
+        self._schedule()
+
+    def _schedule(self) -> None:
+        if self.stop_event.is_set():
+            return
+        self.timer = threading.Timer(self.interval_s, self._fire)
+        self.timer.daemon = True
+        self.timer.start()
+
+    def _lease_alive(self) -> bool:
+        try:
+            leases.authorize(
+                self.cfg, self.lease_id, self.fencing_token, self.agent,
+                "console", vm_hint=self.vm_id, vm_name_hint=self.vm_name,
+            )
+        except Exception:  # any lease failure (unknown/expired/fenced/
+            return False   # conflict/not-owned) forfeits the right to type
+        return True
+
+    def _fire(self) -> None:
+        if self.stop_event.is_set():
+            return
+        if not self._lease_alive():
+            self.stop()
+            return
+        token = leases.set_presented_lease(self.lease_id)
+        try:
+            press_key(self.cfg, vm_name=self.vm_name, key=self.key,
+                      vm_id=self.vm_id)
+            self.sent += 1
+        except Exception:  # noqa: BLE001 — a failed beat neither kills the
+            pass           # chain nor leaks; liveness re-checks next beat
+        finally:
+            leases.reset_presented_lease(token)
+        if not self.stop_event.is_set():
+            self._schedule()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        timer = self.timer
+        if timer is not None:
+            timer.cancel()
+
+
+def heartbeat_enable(
+    cfg: Config, *, vm_name: str = "", vm_id: str = "", key: str = "shift",
+    interval_s: float = 5.0, lease_id: str = "", fencing_token: int = 0,
+    agent: str | None = None,
+) -> dict:
+    """Enable (or replace) the per-VM heartbeat. A live console lease is
+    REQUIRED and re-authorized here; every beat revalidates it. A single
+    benign KEY NAME only, resolved through the same table as press_key —
+    raw scancode payloads are refused (the heartbeat must not become an
+    input oracle)."""
+    policy.require_category(
+        cfg, "console_input", f"heartbeat {key!r} on '{vm_name}' console")
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("heartbeat key must be a single benign key name")
+    resolved_key = key.strip().lower()
+    try:
+        _scancodes_for_key(resolved_key)
+    except ValueError as exc:
+        raise ValueError(
+            f"heartbeat key {key!r} is not a recognized single key name"
+        ) from exc
+    try:
+        interval = float(interval_s)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("interval_s must be a number") from exc
+    if not (_HEARTBEAT_MIN_INTERVAL_S <= interval <= _HEARTBEAT_MAX_INTERVAL_S):
+        raise ValueError(
+            f"interval_s must be within {_HEARTBEAT_MIN_INTERVAL_S}.."
+            f"{_HEARTBEAT_MAX_INTERVAL_S} seconds")
+    if not lease_id:
+        raise ValueError("heartbeat requires a live console lease")
+    # Bind the lease up front: an unknown/expired/fenced citation must fail
+    # at enable, not on the first beat (fail-closed, and the caller learns
+    # immediately). Agent match is enforced by authorize (PC3-6 owner rules).
+    leases.authorize(cfg, lease_id, int(fencing_token), agent, "console",
+                     vm_hint=vm_id, vm_name_hint=vm_name)
+    hb = _Heartbeat(cfg, vm_name, vm_id, resolved_key, interval,
+                    lease_id, int(fencing_token), agent)
+    # issue #152 review F-002 (round-2 residual): resolve the key and insert
+    # the chain as ONE atomic hint->HB chain (PRR-005 mutator pattern) so a
+    # concurrent hint learn either migrates the pre-existing chain or waits;
+    # it can never migrate nothing and leave this insertion under a stale
+    # name key. Lock order hint -> HB, same as the migration above.
+    with _HINT_LOCK:
+        key_id = _ledger_key_unlocked(vm_name, vm_id)
+        if not key_id:
+            raise ValueError("heartbeat needs a vm_name or vm_id")
+        with _HB_LOCK:
+            prior = _HEARTBEATS.pop(key_id, None)
+            _HEARTBEATS[key_id] = hb
+    if prior is not None:
+        prior.stop()
+    hb.start()
+    return {
+        "ok": True, "vm_name": vm_name, "key": resolved_key,
+        "interval_s": interval, "lease_id": lease_id, "enabled": True,
+    }
+
+
+def heartbeat_disable(cfg: Config, *, vm_name: str = "",
+                      vm_id: str = "", agent: str | None = None,
+                      lease_id: str = "") -> dict:
+    """Stop this VM's heartbeat. Owner check (final-critic C6): a caller
+    may only stop a heartbeat bound to a lease it owns; an unmatched
+    lease_id or holder refuses without touching the timer."""
+    # Resolve the identity and look up the chain as ONE atomic hint->HB
+    # chain (review round-9: a hint learn migrating name->GUID between the
+    # split resolve and lookup made disable report ok/enabled=False while
+    # the live timer moved to the GUID key). Lock order hint -> HB, same as
+    # the migration block and the enable insertion.
+    with _HINT_LOCK:
+        key_id = _ledger_key_unlocked(vm_name, vm_id)
+        with _HB_LOCK:
+            hb = _HEARTBEATS.get(key_id) if key_id else None
+    if hb is None:
+        return {"ok": True, "vm_name": vm_name, "enabled": False}
+    # Authorize with the heartbeat's OWN bound token (not 0 — the
+    # fencing counter is >= 1 after an explicit lease), and require the
+    # cited lease to be the one this heartbeat is bound to (final-critic
+    # R2-C1). A mismatch is an explicit refusal, never a silent ok:true.
+    if lease_id and lease_id != hb.lease_id:
+        return {"ok": False, "error": "heartbeat belongs to another lease",
+                "error_class": "invalid"}
+    if (lease_id or hb.lease_id) and hb.agent != agent:
+        return {"ok": False, "error": "heartbeat belongs to another agent",
+                "error_class": "invalid"}
+    if lease_id or hb.lease_id:
+        try:
+            leases.authorize(cfg, hb.lease_id, hb.fencing_token, hb.agent,
+                             "console", vm_hint=hb.vm_id,
+                             vm_name_hint=hb.vm_name)
+        except Exception:
+            return {"ok": False,
+                    "error": "heartbeat disable requires the owning live lease",
+                    "error_class": "invalid"}
+    with _HINT_LOCK:
+        with _HB_LOCK:
+            # Remove the VALIDATED object by identity, wherever it now
+            # lives: re-enabling by the same owner replaces the dict entry
+            # with a NEW object (popping by identity then finds nothing and
+            # leaves the fresh timer alone — final-critic round-3 note), and
+            # a concurrent hint migration re-keys the object to the GUID
+            # (round-9: the identity search follows it there, so a disable
+            # can never return ok while its timer survives under another
+            # key).
+            live_key = next((k for k, v in _HEARTBEATS.items()
+                             if v is hb), None)
+            if live_key is not None:
+                _HEARTBEATS.pop(live_key, None)
+    hb.stop()
+    return {"ok": True, "vm_name": vm_name, "enabled": False}
+
+
+def heartbeat_status(cfg: Config, *, vm_name: str = "",
+                     vm_id: str = "") -> dict:
+    # Same atomic hint->HB resolution as disable (review round-9): status
+    # must not report a chain disabled/absent because a hint learn migrated
+    # it between the split resolve and the lookup.
+    with _HINT_LOCK:
+        key_id = _ledger_key_unlocked(vm_name, vm_id)
+        with _HB_LOCK:
+            hb = _HEARTBEATS.get(key_id) if key_id else None
+    return {
+        "ok": True, "vm_name": vm_name,
+        "enabled": hb is not None and not hb.stop_event.is_set(),
+        "key": hb.key if hb else None,
+        "interval_s": hb.interval_s if hb else None,
+        "lease_id": hb.lease_id if hb else None,
+        "sent": hb.sent if hb else 0,
+    }
+
+
+def stop_all_heartbeats() -> None:
+    """Shutdown/test-isolation hook: stop and forget every heartbeat timer
+    (a leaked timer is worse than a leaked dict; reset_input_ledger calls
+    this so per-VM isolation covers the registry AND its threads)."""
+    with _HB_LOCK:
+        items = list(_HEARTBEATS.values())
+        _HEARTBEATS.clear()
+    for hb in items:
+        hb.stop()
+
+
+# ---------------------------------------------------------------------------
+# issue #132 — coordinated multi-VM console sequences with barriers
+# ---------------------------------------------------------------------------
+
+_MULTI_MAX_PLANS = 8
+
+
+def _split_plan_at_barriers(
+    steps: list, barrier_names: list[str], plan_i: int,
+) -> list[tuple[list[dict], str | None]]:
+    """Validate one plan's barrier participation and split its step list into
+    (raw_steps, following_barrier_name) pairs. The barrier markers observed in
+    the plan must form the declared `barriers` sequence EXACTLY — every plan
+    participates in every barrier, once, in order (full rendezvous, PC2-8);
+    partial, duplicated, missing, or reordered participation is refused before
+    any dispatch."""
+    segments: list[tuple[list[dict], str | None]] = []
+    observed: list[str] = []
+    current: list[dict] = []
+    for j, step in enumerate(steps):
+        if not isinstance(step, dict):
+            raise _step_fail(j, "step must be an object")
+        if step.get("action") == "barrier":
+            name = step.get("name")
+            if not isinstance(name, str) or name.strip() not in barrier_names:
+                raise _step_fail(j, f"unknown barrier name {name!r}")
+            observed.append(name.strip())
+            segments.append((current, name.strip()))
+            current = []
+        else:
+            current.append(step)
+    segments.append((current, None))
+    if observed != barrier_names:
+        raise ValueError(
+            f"plan {plan_i}: barrier participation {observed!r} must equal "
+            f"the declared barriers {barrier_names!r} exactly (every VM "
+            "reaches every barrier, in order)")
+    return segments
+
+
+def run_sequence_multi(
+    cfg: Config, plans: list, barriers: list | None = None,
+    timeout_s: int = 60, width: int = 640, height: int = 480,
+) -> dict:
+    """Coordinate per-VM step lists with named barriers and host-clock
+    timestamps (issue #132).
+
+    Composition rules (frozen spec + plan-critic dispositions):
+    * every step is dispatched as its OWN single-step engine call, so the
+      host observes a genuine step boundary: a peer stops at its NEXT step
+      when any VM fails (AC3/PC2-4) and every executed step carries REAL
+      start/finish host timestamps (AC2 — never post-hoc labels).
+    * barriers are coordinator-side rendezvous (one Condition per name): no
+      step after a barrier starts until every plan's thread has arrived
+      (AC1). Any failure ABORTS every pending barrier wait immediately
+      (stop Event + notify_all — never a timeout-park, PC3-7) and every
+      unexecuted remaining step reports ``skipped: true`` with synthesized
+      stamps.
+    * a coordinator-wide monotonic deadline bounds every barrier wait; on
+      expiry all waits abort and tails report skipped (PC2-8: no plan can
+      park forever on a peer that will never arrive).
+    * per-VM locks never nest: each atomic engine call owns its own lock and
+      releases it at the barrier, so there is no cross-VM lock ordering.
+    * the lease/policy gate for every plan is the CALLER's responsibility and
+      must have completed before this function runs (the AC4 refusal shape
+      comes from the server-level gate, never from here).
+    * the public single-VM hyperv_console_sequence tool is untouched.
+    """
+    if not isinstance(plans, list) or not (1 <= len(plans) <= _MULTI_MAX_PLANS):
+        raise ValueError(
+            f"plans must be a list of 1..{_MULTI_MAX_PLANS} per-VM plans")
+    names = [str(b).strip() for b in (barriers or []) if str(b).strip()]
+    if len(set(names)) != len(names):
+        raise ValueError("barrier names must be unique")
+
+    # Host-side validation of EVERY plan before any thread spawns (the #28
+    # discipline): shape, barrier topology, per-segment step grammar.
+    parsed: list[dict] = []
+    for i, plan in enumerate(plans):
+        if not isinstance(plan, dict):
+            raise ValueError(f"plan {i}: object required")
+        vm_name = str(plan.get("vm_name") or "")
+        vm_id = str(plan.get("vm_id") or "")
+        if not vm_name and not vm_id:
+            raise ValueError(f"plan {i}: vm_name or vm_id is required")
+        raw_steps = plan.get("steps")
+        if not isinstance(raw_steps, list) or not raw_steps:
+            raise ValueError(f"plan {i}: steps must be a non-empty list")
+        segs = _split_plan_at_barriers(raw_steps, names, i)
+        validated: list[tuple[list[dict], str | None]] = []
+        index = 0
+        for seg_raw, barrier in segs:
+            items: list[dict] = []
+            if seg_raw:
+                norm = _validate_sequence_steps(seg_raw, timeout_s)
+                if len(norm) != len(seg_raw):
+                    raise ValueError(
+                        f"plan {i}: validator row/step drift "
+                        f"({len(norm)} rows vs {len(seg_raw)} steps)")
+                for nrow, raw in zip(norm, seg_raw, strict=True):
+                    items.append({
+                        "index": index,
+                        # report the CALLER's action name (press_key), not
+                        # the engine's normalized kind (codes): the envelope
+                        # mirrors what the plan said.
+                        "action": str(raw.get("action")),
+                        "nrow": nrow, "raw": raw,
+                    })
+                    index += 1
+            validated.append((items, barrier))
+        parsed.append({
+            "vm_name": vm_name, "vm_id": vm_id,
+            "segments": validated, "total_steps": index,
+            # per-plan lease citation (the server gate validated/authorized
+            # it BEFORE any thread started; presenting it here keeps each
+            # worker's vm_lock call rows attributed to the plan's lease)
+            "lease_id": str(plan.get("lease_id") or ""),
+            "fencing_token": int(plan.get("fencing_token") or 0),
+            # issue #132 initial preconditions: apply ONLY to this plan's
+            # FIRST atomic engine call (review F3). Later steps change the
+            # frame, so re-checking the initial hash would refuse a valid
+            # plan. Validated by run_sequence itself on that first call.
+            "expect_frame_hash": str(plan.get("expect_frame_hash") or ""),
+            "expect_boot_epoch": plan.get("expect_boot_epoch"),
+        })
+
+    stop = threading.Event()
+    plan_n = len(parsed)
+    conds = {name: threading.Condition() for name in names}
+    arrived = {name: 0 for name in names}
+    deadline = time.monotonic() + max(1, timeout_s)
+    results: list[dict | None] = [None] * plan_n
+
+    def _abort_barriers() -> None:
+        stop.set()
+        for cond in conds.values():
+            with cond:
+                cond.notify_all()
+
+    def _stamps() -> tuple[int, str]:
+        return time.monotonic_ns(), datetime.now(timezone.utc).isoformat()
+
+    def _skipped_row(index: int, action: str, name: str | None = None) -> dict:
+        mono, wall = _stamps()
+        row = {
+            "index": index, "action": action, "ok": False,
+            "skipped": True, "status": "skipped",
+            "monotonic_ns": mono, "wall_utc": wall,
+            "monotonic_end_ns": mono, "wall_end_utc": wall,
+        }
+        if name is not None:
+            row["name"] = name
+        return row
+
+    def _worker(i: int, plan: dict) -> None:
+        rows: list[dict] = []
+        plan_ok = True
+        for items, barrier in plan["segments"]:
+            for item in items:
+                if stop.is_set():
+                    rows.append(_skipped_row(item["index"], item["action"]))
+                    plan_ok = False
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _abort_barriers()
+                    rows.append(_skipped_row(item["index"], item["action"]))
+                    plan_ok = False
+                    continue
+                start_mono, start_wall = _stamps()
+                lease_token = (leases.set_presented_lease(plan["lease_id"])
+                               if plan["lease_id"] else None)
+                first = item["index"] == 0
+                try:
+                    res = run_sequence(
+                        cfg, vm_name=plan["vm_name"], steps=[item["raw"]],
+                        vm_id=plan["vm_id"],
+                        # apply the plan's initial preconditions once, on
+                        # the first atomic call only (review F3)
+                        expect_frame_hash=(plan["expect_frame_hash"] if first else ""),
+                        expect_boot_epoch=(plan["expect_boot_epoch"] if first else None),
+                        timeout_s=max(1, int(remaining)),
+                        width=width, height=height,
+                    )
+                except Exception as exc:  # noqa: BLE001 — a raised step (bad
+                    res = {"ok": False, "steps": [],  # vm identity etc.) is
+                           "error": str(exc)[:300],   # a failure row, never
+                           "error_class": "transport"}  # an escaping crash
+                finally:
+                    if lease_token is not None:
+                        leases.reset_presented_lease(lease_token)
+                end_mono, end_wall = _stamps()
+                engine_rows = res.get("steps") or []
+                erow = dict(engine_rows[0]) if engine_rows else {}
+                erow["index"] = item["index"]
+                erow.setdefault("action", item["action"])
+                erow["monotonic_ns"] = start_mono
+                erow["wall_utc"] = start_wall
+                erow["monotonic_end_ns"] = end_mono
+                erow["wall_end_utc"] = end_wall
+                step_failed = (res.get("ok") is False) or (
+                    erow.get("ok") is False)
+                if step_failed:
+                    erow["ok"] = False
+                    if "error" not in erow and res.get("error"):
+                        erow["error"] = res["error"]
+                    if "error_class" not in erow and res.get("error_class"):
+                        erow["error_class"] = res["error_class"]
+                    plan_ok = False
+                    _abort_barriers()
+                rows.append(erow)
+            if barrier is not None:
+                if stop.is_set():
+                    rows.append(_skipped_row(-1, "barrier", barrier))
+                    plan_ok = False
+                    continue
+                cond = conds[barrier]
+                with cond:
+                    arrived[barrier] += 1
+                    cond.notify_all()
+                    while arrived[barrier] < plan_n and not stop.is_set():
+                        rem = deadline - time.monotonic()
+                        if rem <= 0:
+                            break
+                        cond.wait(min(0.05, rem))
+                    reached = (arrived[barrier] >= plan_n
+                               and not stop.is_set())
+                if reached:
+                    mono, wall = _stamps()
+                    rows.append({
+                        "index": -1, "action": "barrier", "name": barrier,
+                        "ok": True, "skipped": False, "status": "arrived",
+                        "monotonic_ns": mono, "wall_utc": wall,
+                        "monotonic_end_ns": mono, "wall_end_utc": wall,
+                    })
+                else:
+                    # never all-arrived (deadline expiry): abort everything so
+                    # no plan parks, and report the barrier as skipped.
+                    _abort_barriers()
+                    rows.append(_skipped_row(-1, "barrier", barrier))
+                    plan_ok = False
+        results[i] = {"vm_name": plan["vm_name"], "ok": plan_ok, "steps": rows}
+
+    threads = [
+        threading.Thread(target=_worker, args=(i, plan), daemon=True,
+                         name=f"hyperv-seq-multi-{i}")
+        for i, plan in enumerate(parsed)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(max(1.0, deadline - time.monotonic()) + 30.0)
+    for i, plan in enumerate(parsed):
+        if results[i] is None:  # a thread that never published (join timeout)
+            results[i] = {"vm_name": plan["vm_name"], "ok": False,
+                          "steps": [], "error": "worker did not report"}
+    overall_ok = all(bool((r or {}).get("ok")) for r in results)
+    return {
+        "ok": overall_ok,
+        "results": results,
+        "barriers": names,
     }

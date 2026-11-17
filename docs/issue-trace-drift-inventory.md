@@ -10,53 +10,7 @@ reported below (issue #143).
 
 | trace | pairs | OK | CHANGED | verify-checkpoint |
 |---|---:|---:|---:|---|
-| 10-agent-identity-audit-correlation | 12 | 12 | 0 | clean |
-| 11-job-relay-ownership | 12 | 12 | 0 | clean |
-| 115-86-71-60-collated | 9 | 9 | 0 | clean |
-| 12-remote-hyperv-host | 7 | 7 | 0 | clean |
-| 125-126-console-accuracy-commit-guard | 11 | 11 | 0 | clean |
-| 128-129-134-gui-drivability | 20 | 20 | 0 | clean |
-| 13-stdio-proxy | 10 | 10 | 0 | clean |
-| 135-127-138-gui-electron-drivability | 53 | 53 | 0 | clean |
-| 136-137-uia-element-contract | 27 | 27 | 0 | clean |
-| 140-126-uia-state-receipt | 44 | 44 | 0 | clean |
-| 143-130-collated | 12 | 12 | 0 | clean |
-| 147-trace-drift-repair | 4 | 4 | 0 | clean |
-| 17-rgb565-native-decode | 12 | 12 | 0 | clean |
-| 18-console-one-ps-process-per-call | 17 | 17 | 0 | clean |
-| 19-screenshot-output-options | 23 | 23 | 0 | clean |
-| 20-per-call-timing-soak-benchmark | 17 | 17 | 0 | clean |
-| 21-psdirect-session-reuse | 31 | 31 | 0 | clean |
-| 22-durable-state-store | 15 | 15 | 0 | clean |
-| 23-leases-with-fencing-tokens | 16 | 16 | 0 | clean |
-| 24-durable-operation-handles | 19 | 19 | 0 | clean |
-| 25-f1-console-keyboard-click-origin | 11 | 11 | 0 | clean |
-| 26-checkpoint-type-standard | 11 | 11 | 0 | clean |
-| 27-frame-stable-wait | 14 | 14 | 0 | clean |
-| 29-uia-helper-element-desktop | 19 | 19 | 0 | clean |
-| 30-per-vm-credential-profiles | 30 | 30 | 0 | clean |
-| 31-32-33-94-workstream-g-deployment | 18 | 18 | 0 | clean |
-| 31-79-live-host-confirmation | 7 | 7 | 0 | clean |
-| 44-vm-display-resolution | 8 | 8 | 0 | clean |
-| 45-console-direct-wmi | 8 | 8 | 0 | clean |
-| 5-ps51-sanitized-env | 8 | 8 | 0 | clean |
-| 55-108-31-32-33-collated | 14 | 14 | 0 | clean |
-| 59-64-68-70-hardening-wave | 15 | 15 | 0 | clean |
-| 6-guest-put-get-policy | 13 | 13 | 0 | clean |
-| 63-66-119-collated | 12 | 12 | 0 | clean |
-| 64-68-collated | 11 | 11 | 0 | clean |
-| 67-118-release-vendor-provenance | 10 | 10 | 0 | clean |
-| 7-guest-jobs-truthful-reporting | 13 | 13 | 0 | clean |
-| 74-72-88-cost-latency-accounting | 17 | 17 | 0 | clean |
-| 75-76-78-81-83-84-collated | 26 | 26 | 0 | clean |
-| 77-28-console-actor-batched-sequences | 18 | 18 | 0 | clean |
-| 8-vm-guid-identity | 11 | 11 | 0 | clean |
-| 9-error-envelope | 13 | 13 | 0 | clean |
-| 95-69-37-57-56-110-collated | 20 | 20 | 0 | clean |
-| gpt6sol-guest-access-tools | 22 | 22 | 0 | clean |
-| issue-14-vm-rw-locks | 11 | 11 | 0 | clean |
-| issue-15-ps-cap-cancel | 9 | 9 | 0 | clean |
-| issue-16-tool-concurrency | 13 | 13 | 0 | clean |
+| 131-132-133-agent-ergonomics-triad | 15 | 15 | 0 | clean |
 
 ## Self-referential pairs (excluded from the gate, issue #143)
 
@@ -67,7 +21,7 @@ quine (final-critic finding 4, twice over). The frozen blob lives
 in the trace's manifest; re-anchoring is the next re-baseline
 wave's bookkeeping and is never a gate failure.
 
-- `63-66-119-collated` C8 (informational; excluded from the gate)
+None — no trace pins the inventory document itself.
 
 ## Drift detail (CHANGED pairs)
 
