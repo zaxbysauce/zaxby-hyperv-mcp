@@ -138,8 +138,8 @@ class PromotePS:
         wraps the guest-job inner script as `$enc = '<base64>'` before the
         host hop, so the job markers live in the DECODED payload, not in the
         raw script text this fake used to classify. Decode it (the same way
-        test_a03_guest_jobs.py::\_inner does) before marker matching; keep the
-        raw text too for legs that carry their markers literally."""
+        the _inner helper in test_a03_guest_jobs.py does) before marker
+        matching; keep the raw text too for legs carrying literal markers."""
         m = re.search(r"\$enc = '([A-Za-z0-9+/=]+)'", script)
         if not m:
             return script

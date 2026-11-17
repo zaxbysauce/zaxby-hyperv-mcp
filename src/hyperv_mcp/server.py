@@ -1995,7 +1995,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
         vm_name: str = "", key: str = "shift", interval_s: float = 5.0,
         enable: bool = True, vm_id: str = "",
         lease_id: str = "", fencing_token: int = 0,
-    ) -> dict:
+    ) -> Any:
         """Enable or disable the per-VM benign-key heartbeat (issue #133).
 
         WHILE enabled and the bound console lease is live, the configured
@@ -2034,7 +2034,8 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                     r for r in leases.list_leases(cfg, vm_id=str(vm_id or ""))
                     if r.scope == "console" and r.holder_agent == agent
                     and (
-                        (vm_id and str(r.vm_key or "") == vm_id.strip().casefold())
+                        (vm_id and str(r.vm_id or "").strip().casefold()
+                         == vm_id.strip().casefold())
                         or (vm_name and str(r.vm_name or "").strip().lower()
                             == vm_name.strip().lower())
                     )
@@ -2053,9 +2054,26 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             bound_id = rows[0].lease_id
             bound_token = int(rows[0].fencing_token)
         if not enable:
+            # Require the caller's owning lease on disable too (self-gated
+            # tools skip the generic lease gate on every path).
+            dis_id = str(lease_id or "")
+            if not dis_id:
+                own = [
+                    r for r in leases.list_leases(cfg, vm_id=str(vm_id or ""))
+                    if r.scope == "console" and r.holder_agent == agent
+                    and (
+                        (vm_id and str(r.vm_id or "").strip().casefold()
+                         == vm_id.strip().casefold())
+                        or (vm_name and str(r.vm_name or "").strip().lower()
+                            == vm_name.strip().lower())
+                    )
+                ]
+                if len(own) == 1:
+                    dis_id = own[0].lease_id
             return _run_console_tool(
                 "hyperv_console_heartbeat", vm_name, "console_input",
-                console.heartbeat_disable, cfg, vm_name=vm_name, vm_id=vm_id)
+                console.heartbeat_disable, cfg, vm_name=vm_name, vm_id=vm_id,
+                agent=agent, lease_id=dis_id)
         return _run_console_tool(
             "hyperv_console_heartbeat", vm_name, "console_input",
             console.heartbeat_enable, cfg, vm_name=vm_name, vm_id=vm_id,
@@ -2065,7 +2083,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
     @mcp.tool()
     def hyperv_evidence_run_start(
         run_dir: str = "", vms: list[str] | None = None, video: bool = False,
-    ) -> dict:
+    ) -> Any:
         """Open an evidence run (issue #131).
 
         While a run is open, EVERY mutating tool call (the lease-scoped tools
@@ -2101,7 +2119,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             return result
 
     @mcp.tool()
-    def hyperv_evidence_run_stop(run_id: str = "") -> dict:
+    def hyperv_evidence_run_stop(run_id: str = "") -> Any:
         """Close an evidence run (issue #131).
 
         Drains in-flight journaled calls (bounded), optionally assembles the

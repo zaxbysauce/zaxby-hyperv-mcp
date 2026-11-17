@@ -60,8 +60,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from . import (admission, auditlog, errors, evidencejournal, leases,
-               pswindows, statestore)
+from . import admission, auditlog, errors, evidencejournal, leases, pswindows, statestore
 from .config import Config
 
 #: The detachable set: every tool whose body can run for minutes. The two

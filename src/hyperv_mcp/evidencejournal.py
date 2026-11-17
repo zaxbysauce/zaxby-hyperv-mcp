@@ -36,14 +36,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 # Argument keys whose string values are typed text / executable content: these
 # are recorded by LENGTH, never verbatim (AC2), and their values are collected
@@ -59,8 +59,16 @@ _MAX_ARG_STR = 2000  # cap on non-sensitive string fields kept verbatim
 
 # ---- injected seams (set by server.install) --------------------------------
 
-_get_config: Callable[[], Any] = lambda: None
-_is_mutating: Callable[[str], bool] = lambda name: False
+def _no_config() -> Any:
+    return None
+
+
+def _not_mutating(name: str) -> bool:
+    return False
+
+
+_get_config: Callable[[], Any] = _no_config
+_is_mutating: Callable[[str], bool] = _not_mutating
 _screenshot: Callable[..., dict] | None = None
 
 
@@ -97,7 +105,7 @@ class _Run:
         self.inflight = 0
         self.seq = 0
         self.lock = threading.Lock()
-        self.frames: list[tuple[int, str, Path]] = []  # (seq, role, path)
+        self.frames: list[tuple[int, str, str, Path]] = []  # (seq, role, tool, path)
         self.started_at = time.monotonic()
 
     def covers(self, agent: str | None, vm_ids: set[str]) -> bool:
@@ -214,7 +222,7 @@ def _normalize_result(result: Any) -> dict | None:
 
 # ---- capture seam ----------------------------------------------------------
 
-def _capture_frame(run: _Run, token: "JournalToken", role: str) -> None:
+def _capture_frame(run: _Run, token: JournalToken, role: str) -> None:
     if _screenshot is None:
         return
     with run.lock:
@@ -382,7 +390,7 @@ def has_any_open_run() -> bool:
         return any(r.state == "open" for r in _RUNS.values())
 
 
-def finish(token: "JournalToken | None", result: Any = None, *,
+def finish(token: JournalToken | None, result: Any = None, *,
            outcome: str = "body") -> None:
     """Resolve a token exactly once (no-op for None or an already-resolved
     token). The runner OWNS a handed-off token and calls this with its real
@@ -393,7 +401,7 @@ def finish(token: "JournalToken | None", result: Any = None, *,
     token.finish(result, outcome=outcome)
 
 
-def finish_if_unowned(token: "JournalToken | None", result: Any = None, *,
+def finish_if_unowned(token: JournalToken | None, result: Any = None, *,
                       outcome: str = "body") -> None:
     """Guard-side finalizer: a handed-off token belongs to the runner."""
     if token is None or token.finished or token.handed_off:
@@ -401,7 +409,7 @@ def finish_if_unowned(token: "JournalToken | None", result: Any = None, *,
     token.finish(result, outcome=outcome)
 
 
-def arm(token: "JournalToken | None") -> None:
+def arm(token: JournalToken | None) -> None:
     """Mark the call as dispatching input and capture the pre-frame. A
     handed-off token is legitimately armed by its runner (review F1)."""
     if token is None or token.finished:
@@ -409,7 +417,7 @@ def arm(token: "JournalToken | None") -> None:
     token.arm_pre()
 
 
-def hand_off(token: "JournalToken | None") -> None:
+def hand_off(token: JournalToken | None) -> None:
     """Give the token to a detached runner (guard's finally must not resolve)."""
     if token is not None:
         token.handed_off = True
@@ -476,27 +484,37 @@ def _maybe_video(run: _Run) -> dict | None:
     marker_doc = json.dumps({"markers": markers}, ensure_ascii=False)
     marker_path = run.run_dir / "markers.json"
     marker_path.write_text(marker_doc, encoding="utf-8")
-    argv = ["ffmpeg", "-y", "-framerate", "2",
-            "-metadata", f"comment=action-markers:{marker_doc}"]
+    # ffmpeg OPTION ORDER (final-critic C1): -metadata is an OUTPUT option and
+    # MUST come AFTER every -i input and the filter, immediately before the
+    # output filename. Placing it before the first -i makes real ffmpeg
+    # refuse to open the inputs ("Option metadata cannot be applied to input
+    # url") — the mocked C4 could not see that.
+    argv = ["ffmpeg", "-y", "-framerate", "2"]
     for p in frames:
         argv += ["-i", str(p)]
     n = len(frames)
     if n == 1:
-        argv += ["-map", "0:v", str(out)]
+        argv += ["-map", "0:v"]
     else:
         chain = "".join(f"[{i}:v]" for i in range(n)) + f"concat=n={n}:v=1:a=0[outv]"
-        argv += ["-filter_complex", chain, "-map", "[outv]", str(out)]
+        argv += ["-filter_complex", chain, "-map", "[outv]"]
+    argv += ["-metadata", f"comment=action-markers:{marker_doc}", str(out)]
     try:
         from . import pswindows
 
         # Fixed argv, no shell, sanitized child env (the spawn-site census
         # requires the literal `env=pswindows.child_env()` call at the site —
         # a local Name or an IfExp reads as uncompliant), bounded timeout.
-        subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=120, check=False, env=pswindows.child_env())
+        proc = subprocess.run(argv, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL,
+                              timeout=120, check=False, env=pswindows.child_env())
     except (OSError, subprocess.SubprocessError):
         return {"video": None, "note": "ffmpeg invocation failed"}
-    return {"video": str(out) if out.is_file() else None}
+    if proc.returncode != 0:
+        return {"video": None, "note": f"ffmpeg exited {proc.returncode}"}
+    if not out.is_file():
+        return {"video": None, "note": "ffmpeg produced no output file"}
+    return {"video": str(out)}
 
 
 def stop_run(run_id: str, *, agent: str | None = None) -> dict:

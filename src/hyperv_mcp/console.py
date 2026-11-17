@@ -5685,7 +5685,7 @@ def input_idle_s(vm_name: str = "", vm_id: str = "") -> float | None:
 _HEARTBEAT_MIN_INTERVAL_S = 0.05
 _HEARTBEAT_MAX_INTERVAL_S = 3600.0
 _HB_LOCK = threading.Lock()
-_HEARTBEATS: dict[str, "_Heartbeat"] = {}
+_HEARTBEATS: dict[str, _Heartbeat] = {}
 
 
 class _Heartbeat:
@@ -5778,13 +5778,14 @@ def heartbeat_enable(
     resolved_key = key.strip().lower()
     try:
         _scancodes_for_key(resolved_key)
-    except ValueError:
+    except ValueError as exc:
         raise ValueError(
-            f"heartbeat key {key!r} is not a recognized single key name")
+            f"heartbeat key {key!r} is not a recognized single key name"
+        ) from exc
     try:
         interval = float(interval_s)
-    except (TypeError, ValueError):
-        raise ValueError("interval_s must be a number")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("interval_s must be a number") from exc
     if not (_HEARTBEAT_MIN_INTERVAL_S <= interval <= _HEARTBEAT_MAX_INTERVAL_S):
         raise ValueError(
             f"interval_s must be within {_HEARTBEAT_MIN_INTERVAL_S}.."
@@ -5814,10 +5815,27 @@ def heartbeat_enable(
 
 
 def heartbeat_disable(cfg: Config, *, vm_name: str = "",
-                      vm_id: str = "") -> dict:
+                      vm_id: str = "", agent: str | None = None,
+                      lease_id: str = "") -> dict:
+    """Stop this VM's heartbeat. Owner check (final-critic C6): a caller
+    may only stop a heartbeat bound to a lease it owns; an unmatched
+    lease_id or holder refuses without touching the timer."""
+    if lease_id:
+        try:
+            leases.authorize(cfg, lease_id, 0, agent, "console",
+                             vm_hint=vm_id, vm_name_hint=vm_name)
+        except Exception as exc:
+            raise ValueError(
+                "heartbeat disable requires the owning live lease"
+            ) from exc
     key_id = _ledger_key(vm_name, vm_id)
     with _HB_LOCK:
-        hb = _HEARTBEATS.pop(key_id, None) if key_id else None
+        hb = _HEARTBEATS.get(key_id) if key_id else None
+        if hb is not None and ((lease_id and hb.lease_id == lease_id)
+                               or (not lease_id and hb.agent == agent)):
+            _HEARTBEATS.pop(key_id, None)
+        else:
+            hb = None
     if hb is not None:
         hb.stop()
     return {"ok": True, "vm_name": vm_name, "enabled": False}
@@ -5948,7 +5966,7 @@ def run_sequence_multi(
                     raise ValueError(
                         f"plan {i}: validator row/step drift "
                         f"({len(norm)} rows vs {len(seg_raw)} steps)")
-                for nrow, raw in zip(norm, seg_raw):
+                for nrow, raw in zip(norm, seg_raw, strict=True):
                     items.append({
                         "index": index,
                         # report the CALLER's action name (press_key), not
@@ -6104,7 +6122,7 @@ def run_sequence_multi(
         if results[i] is None:  # a thread that never published (join timeout)
             results[i] = {"vm_name": plan["vm_name"], "ok": False,
                           "steps": [], "error": "worker did not report"}
-    overall_ok = all(bool(r["ok"]) for r in results)
+    overall_ok = all(bool((r or {}).get("ok")) for r in results)
     return {
         "ok": overall_ok,
         "results": results,
