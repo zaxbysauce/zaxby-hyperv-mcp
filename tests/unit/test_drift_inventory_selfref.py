@@ -369,3 +369,25 @@ def test_missing_trace_is_disclosed_and_check_fails(tmp_path):
     assert restored.returncode == 0, restored.stderr
     assert _doc() == doc2  # the regeneration rebuilt the exact census bytes
     assert _gen("--check").returncode == 0
+
+
+def test_verifier_selection_prefers_user_level(tmp_path, monkeypatch):
+    """Issue #148 (final-critic round 2): the drift gate's _verifier()
+    selection must prefer the user-level v1+v2-capable repro-check.sh and
+    fall back to the vendored path. Pins both arms against the real
+    generator module."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "gendi", "scripts/gen_trace_drift_inventory.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(mod.Path, "home", classmethod(lambda cls: fake_home))
+    assert mod._verifier() == mod.REPRO, (
+        "without a user-level verifier the vendored path must be the fallback")
+    user_scripts = fake_home / ".zcode" / "skills" / "issue-tracer" / "scripts"
+    user_scripts.mkdir(parents=True)
+    (user_scripts / "repro-check.sh").write_text("#!/bin/sh" + chr(10), encoding="utf-8")
+    got = mod._verifier()
+    assert Path(got) == user_scripts / "repro-check.sh", (
+        f"the user-level verifier must be preferred, got {got}")
