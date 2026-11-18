@@ -255,7 +255,7 @@ def test_committed_baseline_unwrap_pin(tmp_path):
     manifest = repo_root / slug / "repro" / "checkpoint.manifest"
     manifest.parent.mkdir(parents=True)
     manifest.write_text(
-        f"# issue-tracer checkpoint manifest v1 rows=2\n"
+        "# issue-tracer checkpoint manifest v1 rows=2\n"
         + "\n".join([
             _row(1, "CHECKPOINT", _ARGV),
             _row(2, "AMEND", _ARGV_RETYPED),

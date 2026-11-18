@@ -105,7 +105,7 @@ def test_schema_v5_migration_adds_the_kind_column(tmp_path):
     so the precondition fails before any fixture work runs.
     """
     if statestore.SCHEMA_VERSION != 5 or 4 not in statestore._MIGRATIONS:
-        assert False, (
+        raise AssertionError(
             "the migration to version 5 does not exist (SCHEMA_VERSION is "
             f"{statestore.SCHEMA_VERSION} and _MIGRATIONS has no 4 to 5 "
             "entry)")
