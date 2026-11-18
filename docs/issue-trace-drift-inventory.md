@@ -15,22 +15,22 @@ reported below (issue #143).
 | 115-86-71-60-collated | 9 | 9 | 0 | clean |
 | 12-remote-hyperv-host | 7 | 7 | 0 | clean |
 | 125-126-console-accuracy-commit-guard | 11 | 11 | 0 | clean |
-| 128-129-134-gui-drivability | 0 | 0 | 0 | exit 2 |
+| 128-129-134-gui-drivability | 20 | 13 | 7 | exit 1 |
 | 13-stdio-proxy | 10 | 8 | 2 | exit 1 |
 | 135-127-138-gui-electron-drivability | 53 | 53 | 0 | clean |
 | 136-137-uia-element-contract | 27 | 14 | 13 | exit 1 |
 | 140-126-uia-state-receipt | 44 | 44 | 0 | clean |
-| 143-130-collated | 0 | 0 | 0 | exit 2 |
-| 147-trace-drift-repair | 0 | 0 | 0 | exit 2 |
-| 148-151-153-followup-hygiene-triad | 0 | 0 | 0 | exit 2 |
+| 143-130-collated | 12 | 12 | 0 | clean |
+| 147-trace-drift-repair | 4 | 4 | 0 | clean |
+| 148-151-153-followup-hygiene-triad | 26 | 26 | 0 | clean |
 | 17-rgb565-native-decode | 12 | 12 | 0 | clean |
 | 18-console-one-ps-process-per-call | 17 | 17 | 0 | clean |
 | 19-screenshot-output-options | 23 | 22 | 1 | exit 1 |
 | 20-per-call-timing-soak-benchmark | 17 | 17 | 0 | clean |
 | 21-psdirect-session-reuse | 31 | 31 | 0 | clean |
 | 22-durable-state-store | 15 | 15 | 0 | clean |
-| 23-leases-with-fencing-tokens | 0 | 0 | 0 | exit 2 |
-| 24-durable-operation-handles | 0 | 0 | 0 | exit 2 |
+| 23-leases-with-fencing-tokens | 16 | 16 | 0 | clean |
+| 24-durable-operation-handles | 19 | 19 | 0 | clean |
 | 25-f1-console-keyboard-click-origin | 11 | 11 | 0 | clean |
 | 26-checkpoint-type-standard | 11 | 10 | 1 | exit 1 |
 | 27-frame-stable-wait | 14 | 14 | 0 | clean |
@@ -44,11 +44,11 @@ reported below (issue #143).
 | 55-108-31-32-33-collated | 14 | 14 | 0 | clean |
 | 59-64-68-70-hardening-wave | 15 | 15 | 0 | clean |
 | 6-guest-put-get-policy | 13 | 13 | 0 | clean |
-| 63-66-119-collated | 0 | 0 | 0 | exit 2 |
+| 63-66-119-collated | 12 | 12 | 0 | clean |
 | 64-68-collated | 11 | 11 | 0 | clean |
 | 67-118-release-vendor-provenance | 10 | 10 | 0 | clean |
 | 7-guest-jobs-truthful-reporting | 13 | 13 | 0 | clean |
-| 74-72-88-cost-latency-accounting | 17 | 10 | 7 | exit 1 |
+| 74-72-88-cost-latency-accounting | 17 | 13 | 4 | exit 1 |
 | 75-76-78-81-83-84-collated | 26 | 26 | 0 | clean |
 | 77-28-console-actor-batched-sequences | 18 | 18 | 0 | clean |
 | 8-vm-guid-identity | 11 | 11 | 0 | clean |
@@ -57,7 +57,7 @@ reported below (issue #143).
 | gpt6sol-guest-access-tools | 22 | 22 | 0 | clean |
 | issue-14-vm-rw-locks | 11 | 11 | 0 | clean |
 | issue-15-ps-cap-cancel | 9 | 9 | 0 | clean |
-| issue-16-tool-concurrency | 0 | 0 | 0 | exit 2 |
+| issue-16-tool-concurrency | 13 | 13 | 0 | clean |
 
 ## Self-referential pairs (excluded from the gate, issue #143)
 
@@ -75,6 +75,16 @@ wave's bookkeeping and is never a gate failure.
 ### 10-agent-identity-audit-correlation (exit 1)
 
 - `CHANGED tests/unit/test_server.py 179763e841c93718bd8fe7d70e35b635f7e59a65 4c5832afd2c574028595d48b531ffc79d13f0f23 (C12)`
+
+### 128-129-134-gui-drivability (exit 1)
+
+- `CHANGED tests/unit/test_gui_playbook_prompt.py 8abe86e3f576610642b56e067971d25f792617bf 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 (C09)`
+- `CHANGED tests/unit/test_gui_playbook_prompt.py 8abe86e3f576610642b56e067971d25f792617bf 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 (C10)`
+- `CHANGED tests/unit/test_gui_playbook_prompt.py 8abe86e3f576610642b56e067971d25f792617bf 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 (C11)`
+- `CHANGED tests/unit/test_gui_playbook_prompt.py 8abe86e3f576610642b56e067971d25f792617bf 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 (C12)`
+- `CHANGED tests/unit/test_gui_playbook_prompt.py 8abe86e3f576610642b56e067971d25f792617bf 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 (C13)`
+- `CHANGED tests/unit/test_gui_playbook_prompt.py 8abe86e3f576610642b56e067971d25f792617bf 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 (C17)`
+- `CHANGED tests/unit/test_gui_playbook_prompt.py 8abe86e3f576610642b56e067971d25f792617bf 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 (C21)`
 
 ### 13-stdio-proxy (exit 1)
 
@@ -148,9 +158,6 @@ wave's bookkeeping and is never a gate failure.
 - `CHANGED src/hyperv_mcp/console.py 55a15f2c35ca4cdb12ab0d463b22d7b8ec7abcdf 52bff5eea3f8ba3b1a629d784f7d023b22a05367 (C5)`
 - `CHANGED README.md 40504438e40c2f29ef6409983b7bcdac83e26f1c 2434fa79bb22b9bf018266fade77fddbe6458167 (C10)`
 - `CHANGED src/hyperv_mcp/server.py 549d8b6d9e2c51103d8788e0b88dd6225c19c33a c26d7ea1d88746e7cb2c01728765758a78ce7611 (C10)`
-- `CHANGED src/hyperv_mcp/relay.py e9e79d6e587419cb03355a40dd5b8c72003698e6 391c9a81c1242abf7487814e9c7fb13b5724092c (C6)`
-- `CHANGED src/hyperv_mcp/relay.py e9e79d6e587419cb03355a40dd5b8c72003698e6 391c9a81c1242abf7487814e9c7fb13b5724092c (C7)`
-- `CHANGED src/hyperv_mcp/relay.py e9e79d6e587419cb03355a40dd5b8c72003698e6 391c9a81c1242abf7487814e9c7fb13b5724092c (C9)`
 
 <!-- regenerated-state-end -->
 
