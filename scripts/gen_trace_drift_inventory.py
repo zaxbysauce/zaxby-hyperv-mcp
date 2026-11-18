@@ -36,6 +36,18 @@ census text is therefore
 regeneration-stable by construction and two consecutive `--check` runs
 agree. The pair stays visible (issue #143 AC3); re-anchoring is the next
 re-baseline wave's bookkeeping, never a gate failure.
+
+Amend guard + trace ledger (issue #148, plan F4/F7): when
+docs/amend-guard-baseline.json exists (the guard's activation switch),
+_collect() also runs scripts/verify_amend_verbatim.py per manifest —
+guard exit 1 (post-watermark argv corruption) fails --check and
+regeneration; exit 2 (semantic amendments) is disclosed on stderr only.
+docs/issue-trace-ledger.md registers every slug ever rendered: a
+regeneration appends new slugs (first-rendered commit, status active),
+and an active ledger slug no longer rendered is reported as
+`MISSING <slug>` on stderr and fails --check. Guard and ledger results
+are exit-code/stderr-only and are never rendered into the document
+(quine safety), so consecutive regenerations stay byte-stable.
 """
 
 from __future__ import annotations
@@ -56,6 +68,27 @@ BEGIN = "<!-- regenerated-state-begin -->"
 END = "<!-- regenerated-state-end -->"
 DISCOVERY_HEADING = "## Discovery snapshot"
 SELF_PATH = "docs/issue-trace-drift-inventory.md"
+LEDGER_BEGIN = "<!-- ledger-rows-begin -->"
+LEDGER_END = "<!-- ledger-rows-end -->"
+
+_LEDGER_SKELETON = (
+    "# Issue-trace ledger\n"
+    "\n"
+    "Append-only register of every trace slug ever rendered into\n"
+    "docs/issue-trace-drift-inventory.md (issue #148, plan F7). Machine rows\n"
+    "live between the markers, one per slug:\n"
+    "\n"
+    "- <slug> | <active|retired> | <first-rendered commit> | <retirement date+reason or ->\n"
+    "\n"
+    "Regeneration (python scripts/gen_trace_drift_inventory.py) appends newly\n"
+    "rendered slugs automatically; retiring a trace — flip its row to\n"
+    "`retired` with a date and reason — is the only manual edit. The ledger\n"
+    "carries no inventory-derived value (no blobs, counts, or verdicts), so\n"
+    "it adds no self-referential hash surface to the inventory document.\n"
+    "\n"
+    f"{LEDGER_BEGIN}\n"
+    f"{LEDGER_END}\n"
+)
 
 
 def _verify(slug: str) -> tuple[int, str]:
@@ -64,6 +97,78 @@ def _verify(slug: str) -> tuple[int, str]:
         cwd=REPO, capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     return proc.returncode, proc.stdout + proc.stderr
+
+
+def _tail(text: str, limit: int = 400) -> str:
+    """Bounded single-line tail of a guard transcript for the stderr /
+    exit-code disclosure lines."""
+    flat = " ".join((text or "").split())
+    return flat[-limit:] if len(flat) > limit else flat
+
+
+def _guard(manifest: Path) -> tuple[str | None, str | None]:
+    """Run the amend-verbatim guard on one manifest (issue #148, plan F4).
+    Returns (fail_tail, warn_tail); at most one is set. Exit 3 (usage/shape
+    error) would be a real bug in the wiring — it is surfaced as a failure,
+    never silently skipped."""
+    try:
+        proc = subprocess.run(
+            [sys.executable,
+             str(REPO / "scripts" / "verify_amend_verbatim.py"),
+             str(manifest), "--repo-root", str(REPO)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError as exc:
+        return f"guard did not run: {exc}", None
+    if proc.returncode == 0:
+        return None, None
+    transcript = _tail((proc.stdout or "") + (proc.stderr or ""))
+    if proc.returncode == 2:
+        return None, transcript or "guard warned with no output"
+    # 1 = post-watermark argv corruption; anything else (including the
+    # usage-error 3) means the guard invocation itself is broken: both
+    # fail the inventory run.
+    return transcript or f"guard exited {proc.returncode}", None
+
+
+def _ledger_file() -> Path:
+    # Resolved from REPO at call time: tests repoint REPO at a sandbox.
+    return REPO / "docs" / "issue-trace-ledger.md"
+
+
+def _ledger_rows(text: str) -> list[list[str]]:
+    """Parsed machine rows between the ledger markers: columns are
+    [slug, status, first-rendered commit, retirement]. Non-machine lines
+    inside the markers are ignored (and preserved untouched by appends)."""
+    try:
+        section = text.split(LEDGER_BEGIN, 1)[1].split(LEDGER_END, 1)[0]
+    except IndexError:
+        return []
+    rows = []
+    for line in section.splitlines():
+        if not line.startswith("- "):
+            continue
+        cols = [c.strip() for c in line[2:].split("|")]
+        if len(cols) >= 2:
+            rows.append(cols)
+    return rows
+
+
+def _doc_slugs(text: str) -> set[str]:
+    """Slugs rendered in the census table of a document (between the
+    regenerated-state markers)."""
+    try:
+        section = text.split(BEGIN, 1)[1].split(END, 1)[0]
+    except IndexError:
+        return set()
+    slugs = set()
+    for line in section.splitlines():
+        if not line.startswith("| ") or line.startswith("|---"):
+            continue
+        cols = [c.strip() for c in line.split("|")]
+        if len(cols) >= 2 and cols[1] and cols[1] != "trace":
+            slugs.add(cols[1])
+    return slugs
 
 
 def _manifest_self_pairs(manifest: Path) -> list[dict]:
@@ -97,6 +202,12 @@ def _collect() -> list[dict]:
             file=sys.stderr,
         )
         raise SystemExit(2)
+    # The amend-verbatim guard activates only when the committed baseline
+    # watermark exists (plan F4 ordering: the activation commit lands
+    # docs/amend-guard-baseline.json and switches the generator on in the
+    # same wave). Without it the legacy pre-guard AMEND rows would be
+    # evaluated strict from row 1 and the gate could never go green.
+    guard_active = (REPO / "docs" / "amend-guard-baseline.json").exists()
     for manifest in manifests:
         slug = manifest.parent.parent.name
         code, out = _verify(slug)
@@ -119,7 +230,7 @@ def _collect() -> list[dict]:
             1 for line in lines
             if line.startswith("OK ") and SELF_PATH not in line
         )
-        rows.append({
+        row = {
             "slug": slug, "code": code,
             "pairs": gate_ok + len(gate_changed),
             "ok": gate_ok, "changed": len(gate_changed),
@@ -127,7 +238,10 @@ def _collect() -> list[dict]:
             "self_changed": self_changed,
             "gate_changed": gate_changed,
             "changed_lines": changed_lines,
-        })
+        }
+        if guard_active:
+            row["guard_fail"], row["guard_warn"] = _guard(manifest)
+        rows.append(row)
     return rows
 
 
@@ -240,6 +354,20 @@ def main() -> int:
         if not DOCS.exists():
             print(f"FAIL: {DOCS.relative_to(REPO)} missing — run --snapshot to record the inventory", file=sys.stderr)
             return 1
+        # Guard failures fail the gate (plan F4 wiring): post-watermark argv
+        # corruption in any walked manifest is disclosed per trace and fails
+        # --check even when the document itself is current. Warnings (the
+        # sanctioned semantic-amendment tier) are stderr-disclosed only.
+        for row in rows:
+            if row.get("guard_warn"):
+                print(f"GUARD WARN {row['slug']}: {row['guard_warn']}", file=sys.stderr)
+        guard_failed = [row for row in rows if row.get("guard_fail")]
+        if guard_failed:
+            for row in guard_failed:
+                print(f"GUARD FAIL {row['slug']}: {row['guard_fail']}")
+            print("FAIL: amend-guard corruption — repair the manifest with the "
+                  "per-pair AMEND procedure in docs/rebaseline-runbook.md")
+            return 1
         # Real drift anywhere in the census is a gate failure on its own
         # (issue #143 AC2): the docs copy matching the regeneration must not
         # launder a CHANGED sibling into an OK verdict.
@@ -266,7 +394,23 @@ def main() -> int:
                       "trace's local checkpoint setup")
             print("FAIL: inventory drift — regenerate with python scripts/gen_trace_drift_inventory.py")
             return 1
+        # Deletion laundering guard (plan F7): a ledger-active slug that is
+        # no longer rendered in the census is a deleted trace — after the
+        # deletion both the store and the document lack the slug, so the
+        # census alone cannot see it; only the committed ledger can. Stderr
+        # + exit code only, never rendered into the document (quine safety).
         existing = DOCS.read_text(encoding="utf-8")
+        ledger = _ledger_file()
+        ledger_text = ledger.read_text(encoding="utf-8") if ledger.exists() else ""
+        active = {r[0] for r in _ledger_rows(ledger_text) if r[1] == "active"}
+        missing = sorted(active - _doc_slugs(existing))
+        for slug in missing:
+            print(f"MISSING {slug}", file=sys.stderr)
+        if missing:
+            print("FAIL: ledger-active traces missing from the rendered inventory — "
+                  "restore the trace store or retire the ledger row in "
+                  "docs/issue-trace-ledger.md")
+            return 1
         s = existing.find(BEGIN)
         e = existing.find(END)
         if s == -1 or e == -1:
@@ -304,7 +448,49 @@ def main() -> int:
     else:
         print(f"FAIL: {DOCS.relative_to(REPO)} missing — run --snapshot first")
         return 1
-    return 0
+    # Ledger maintenance + guard/MISSING disclosure (issue #148, plan F7):
+    # stderr and exit-code only — the rendered document is never touched by
+    # any of it, so consecutive regenerations stay byte-stable (the ledger
+    # is committed state, not regenerated content: appends touch only the
+    # ledger file, MISSING rows are never rendered into the document).
+    status = 0
+    for row in rows:
+        if row.get("guard_warn"):
+            print(f"GUARD WARN {row['slug']}: {row['guard_warn']}", file=sys.stderr)
+        if row.get("guard_fail"):
+            print(f"GUARD FAIL {row['slug']}: {row['guard_fail']}", file=sys.stderr)
+            status = 1
+    rendered = [row["slug"] for row in rows]
+    ledger = _ledger_file()
+    ledger_text = (ledger.read_text(encoding="utf-8")
+                   if ledger.exists() else _LEDGER_SKELETON)
+    if LEDGER_BEGIN not in ledger_text or LEDGER_END not in ledger_text:
+        print(f"FAIL: {ledger.relative_to(REPO)} is malformed (no ledger-rows "
+              "markers) — restore it from git history", file=sys.stderr)
+        return 1
+    known = {r[0] for r in _ledger_rows(ledger_text)}
+    fresh = [slug for slug in rendered if slug not in known]
+    if fresh:
+        rev = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO,
+                             capture_output=True, text=True,
+                             encoding="utf-8")
+        commit = (rev.stdout.strip()
+                  if rev.returncode == 0 and rev.stdout.strip() else "-")
+        addition = "".join(f"- {slug} | active | {commit} | -\n"
+                           for slug in fresh)
+        idx = ledger_text.index(LEDGER_END)
+        ledger.write_text(ledger_text[:idx] + addition + ledger_text[idx:],
+                          encoding="utf-8", newline="\n")
+    active = {r[0] for r in _ledger_rows(ledger_text) if r[1] == "active"}
+    missing = sorted(active - set(rendered))
+    for slug in missing:
+        print(f"MISSING {slug}", file=sys.stderr)
+    if missing:
+        print("FAIL: ledger-active traces missing from the rendered inventory — "
+              "restore the trace store or retire the ledger row in "
+              "docs/issue-trace-ledger.md", file=sys.stderr)
+        status = 1
+    return status
 
 
 if __name__ == "__main__":

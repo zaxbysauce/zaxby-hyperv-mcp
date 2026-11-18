@@ -238,3 +238,134 @@ def test_table_cell_is_identical_whatever_the_self_pair_reads(tmp_path, monkeypa
     )
     assert "| 63-66-119-collated |" in ok_body
     assert "exit 1" not in ok_body.split("## Self-referential")[0].split("| 63-66-119-collated |")[1]
+
+
+def test_missing_trace_is_disclosed_and_check_fails(tmp_path):
+    """AC12 (issue #148, plan F7): a deleted trace can no longer be laundered
+    out of the census — after deletion both the store and the document lack
+    the slug, so only the committed ledger (docs/issue-trace-ledger.md) can
+    see it. Three arms in one sandbox:
+
+    1. delete — regeneration discloses `MISSING <slug>` on stderr and exits
+       nonzero; consecutive regenerations are byte-stable (document AND
+       ledger); --check fails naming the slug.
+    2. retire — flipping the ledger row to retired silences the MISSING and
+       --check goes clean, with byte-stable regenerations on either side.
+    3. store-present/document-absent — removing the rendered row by hand
+       fails --check via the same MISSING detection; regenerating restores
+       the document and --check passes.
+
+    Subprocess harness: the REAL generator, the REAL amend guard
+    (scripts/verify_amend_verbatim.py) and the vendored repro-check.sh are
+    copied into a throwaway git repo, so the census runs the real
+    verify-checkpoint legs rather than fakes. The guard itself never fires
+    in the sandbox: docs/amend-guard-baseline.json is absent there — the
+    guard's activation switch by design — so this test exercises the
+    ledger arm in isolation.
+    """
+    import hashlib
+    import shutil
+    import subprocess
+
+    repo_src = _SCRIPT.parents[1]
+    sandbox = tmp_path / "sandbox"
+    gen = sandbox / "scripts" / "gen_trace_drift_inventory.py"
+    guard = sandbox / "scripts" / "verify_amend_verbatim.py"
+    vendored = (repo_src / ".agents" / "skills" / "issue-tracer" /
+                "scripts" / "repro-check.sh")
+    for d in (
+        sandbox / "scripts",
+        sandbox / "docs",
+        sandbox / ".agents" / "skills" / "issue-tracer" / "scripts",
+        sandbox / ".agents" / "issue-traces" / "alpha-sandbox-trace" / "repro",
+        sandbox / ".agents" / "issue-traces" / "beta-sandbox-trace" / "repro",
+    ):
+        d.mkdir(parents=True)
+    shutil.copyfile(_SCRIPT, gen)
+    shutil.copyfile(repo_src / "scripts" / "verify_amend_verbatim.py", guard)
+    shutil.copyfile(vendored,
+                    sandbox / ".agents" / "skills" / "issue-tracer" /
+                    "scripts" / "repro-check.sh")
+    readme = sandbox / "README.md"
+    readme.write_text("# sandbox readme\n", encoding="utf-8", newline="\n")
+    data = readme.read_bytes()
+    blob = hashlib.sha1(b"blob %d\x00" % len(data) + data).hexdigest()
+    traces = sandbox / ".agents" / "issue-traces"
+    for slug in ("alpha-sandbox-trace", "beta-sandbox-trace"):
+        _write_manifest(traces / slug / "repro" / "checkpoint.manifest",
+                        [("CHECKPOINT", "README.md", blob, "C1")])
+
+    def _git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-c", "user.email=trace@example.invalid",
+             "-c", "user.name=trace sandbox", *args],
+            cwd=sandbox, capture_output=True, text=True, check=True)
+
+    _git("init", "-q")
+    _git("add", "-A")
+    _git("commit", "-q", "-m", "sandbox seed")
+
+    def _gen(*flags: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(gen), *flags],
+            cwd=sandbox, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=180)
+
+    def _doc() -> bytes:
+        return (sandbox / "docs" / "issue-trace-drift-inventory.md").read_bytes()
+
+    def _ledger() -> bytes:
+        return (sandbox / "docs" / "issue-trace-ledger.md").read_bytes()
+
+    assert _gen("--snapshot").returncode == 0  # seed the markers
+    seeded = _gen()  # first regen: appends BOTH slugs to the ledger
+    assert seeded.returncode == 0, seeded.stderr
+    ledger1 = _ledger().decode("utf-8")
+    assert "- alpha-sandbox-trace | active |" in ledger1
+    assert "- beta-sandbox-trace | active |" in ledger1
+
+    # Arm 1: delete a trace — the ledger discloses what the census can no
+    # longer see, both regenerations stay byte-stable, --check fails.
+    shutil.rmtree(traces / "alpha-sandbox-trace")
+    deleted = _gen()
+    assert deleted.returncode == 1
+    assert "MISSING alpha-sandbox-trace" in deleted.stderr
+    doc2, ledger2 = _doc(), _ledger()
+    again = _gen()
+    assert again.returncode == 1
+    assert "MISSING alpha-sandbox-trace" in again.stderr
+    assert _doc() == doc2  # byte-stable: MISSING is never rendered
+    assert _ledger() == ledger2  # the ledger is committed state, not regen content
+    checked = _gen("--check")
+    assert checked.returncode == 1
+    assert "MISSING alpha-sandbox-trace" in checked.stderr
+
+    # Arm 2: retire the deleted slug — the only manual ledger edit — and
+    # the census goes clean with byte-stable regenerations.
+    retired = ledger2.decode("utf-8").replace(
+        "- alpha-sandbox-trace | active |",
+        "- alpha-sandbox-trace | retired |", 1)
+    (sandbox / "docs" / "issue-trace-ledger.md").write_text(
+        retired, encoding="utf-8", newline="\n")
+    clean = _gen()
+    assert clean.returncode == 0, clean.stderr
+    assert "MISSING" not in clean.stderr
+    assert _doc() == doc2  # retirement changed no rendered byte
+    assert _gen().returncode == 0  # second regen: still byte-stable, still clean
+    assert _doc() == doc2
+    assert _gen("--check").returncode == 0
+
+    # Arm 3: store present, document row removed by hand — --check fails
+    # via the MISSING detection; regenerating restores the document.
+    doc_path = sandbox / "docs" / "issue-trace-drift-inventory.md"
+    surgically_reduced = "\n".join(
+        line for line in doc_path.read_text(encoding="utf-8").splitlines()
+        if not line.startswith("| beta-sandbox-trace |")) + "\n"
+    doc_path.write_text(surgically_reduced, encoding="utf-8", newline="\n")
+    tampered = _gen("--check")
+    assert tampered.returncode == 1
+    assert "MISSING beta-sandbox-trace" in tampered.stderr
+    restored = _gen()
+    assert restored.returncode == 0, restored.stderr
+    assert _doc() == doc2  # the regeneration rebuilt the exact census bytes
+    assert _gen("--check").returncode == 0

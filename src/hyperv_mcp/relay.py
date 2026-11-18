@@ -142,6 +142,9 @@ def _row(entry: dict[str, Any], state: str) -> statestore.RelayRow:
         cred_username=str(
             entry.get("cred_username") or getattr(cred, "username", "") or ""
         ),
+        # Issue #151: the relay kind, persisted so a restored entry reports
+        # the kind it was started with (issue #135 residual closed here).
+        kind=str(entry.get("kind") or "http"),
     )
 
 
@@ -251,13 +254,11 @@ def _restored_entry(cfg: Config, row: statestore.RelayRow,
         "guest_port": row.guest_port,
         "bind": row.bind,
         "host_port": row.host_port,
-        # Issue #135: the store row carries no `kind` (the RelayRow schema is
-        # unchanged, so a 0.20.0 server still reads a 0.21.0 row), so a
-        # restored relay is reported as the only kind that existed before this
-        # issue. The consequence is fail-closed and disclosed: the CDP tools
-        # refuse a restored tcp relay rather than dial a kind they cannot
-        # confirm, and `relay_start` must be re-run after a restart.
-        "kind": "http",
+        # Issue #151 (closing issue #135's residual): the store row carries
+        # the kind the relay was started with; pre-v5 rows migrated with the
+        # DEFAULT 'http' (http was the only kind that existed before #135),
+        # so the fallback only covers a defensively-empty value.
+        "kind": str(getattr(row, "kind", "") or "http"),
         "server": None,
         "thread": _DeadThread(),
         "context": context,
@@ -1330,6 +1331,10 @@ def relay_start(
                     "vm_id": ref.id,
                     "guest_port": int(guest_port),
                     "owner": owner,
+                    # Issue #151: the requested kind is bound from reservation
+                    # onward, so a TCP start that dies before registration
+                    # still restores as tcp.
+                    "kind": kind,
                     "in_flight": True,
                     "started_at": started_at,
                     "stopped": False,
@@ -1345,6 +1350,9 @@ def relay_start(
                     # the identity columns are only persisted with the
                     # registration row.
                     cred_ref="inline", owner=owner,
+                    # Issue #151: the reservation row carries the requested
+                    # kind (relay_start's own argument), never a default.
+                    kind=kind,
                 ))
                 _mark_store_wrote(relay_id)
         except BaseException:

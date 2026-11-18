@@ -184,7 +184,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.21.0 today) instead of
+  package's version (0.22.0 today) instead of
   the SDK's (the release contract, the complete bump-site
   enumeration, and how to read `version`/`git_revision` live in
   [docs/versioning-policy.md](docs/versioning-policy.md)).
@@ -233,6 +233,32 @@ restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.22.0 changes
+
+- **Relay kind persists across restarts (#151):** a `kind="tcp"` relay now
+  survives a controller restart with its kind intact. The state store
+  migrates forward (v4 -> v5, additive `relays.kind` column; every existing
+  row is preserved), `relay_start` persists the kind from the reservation
+  onward, and `relay_status` reports `tcp` for a relay started with
+  `kind="tcp"`. The CDP tools no longer require a `relay_start` re-run after
+  a restart; the restored entry carries the true kind. The fail-closed kind
+  refusal in the CDP tools is unchanged and now only fires on a genuinely
+  wrong kind.
+- **Evidence-run directory reuse refused (#153):** `hyperv_evidence_run_start`
+  refuses a `run_dir` that already contains a `manifest.json` or an
+  `evidence.mp4` from a previous run, naming each offending file in the
+  refusal. A reused directory previously interleaved two runs' evidence
+  under one manifest; the refusal fires before any registry entry, journal
+  file, or frames directory is created.
+- **Frozen-ledger hygiene (#148):** count-free stable-predicate expects on
+  the two enumeration-count frozen pairs, a repo-side verbatim-AMEND guard
+  (`scripts/verify_amend_verbatim.py`, enforced by the drift-inventory
+  generator with a per-manifest baseline watermark), the repair of the two
+  pre-existing `verify-semantics` failures, a pre-push exit-2 contract in
+  the runbook, and deletion-laundering protection for the drift inventory
+  via the new `docs/issue-trace-ledger.md` register.
+- Version bump: 0.21.0 -> 0.22.0.
 
 ## 0.21.0 changes
 

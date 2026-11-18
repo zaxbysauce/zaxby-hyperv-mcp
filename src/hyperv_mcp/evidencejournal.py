@@ -581,6 +581,18 @@ def start_run(run_dir: str, vms: list[str] | None, *, agent: str | None = None,
         return {"ok": False, "error": f"run_dir refused: {exc}",
                 "error_class": "invalid"}
     ag = agent if agent is not None else current_agent()
+    # Issue #153 reuse guard: refuse a run root that already carries run
+    # artifacts BEFORE the cap check, the registry insert, and any mkdir —
+    # a reused directory would let stop_run's manifest certify the PREVIOUS
+    # run's files as this run's evidence. Pure read probe on the canonical
+    # resolved root (the host-write gate already validated it above).
+    stale = [n for n in ("manifest.json", "evidence.mp4")
+             if (root / n).exists()]
+    if stale:
+        return {"ok": False,
+                "error": (f"run_dir refused: already contains run "
+                          f"artifacts: {', '.join(sorted(stale))}"),
+                "error_class": "invalid"}
     # Cap check + registry insert in ONE lock hold, BEFORE any filesystem
     # creation (review F-011 round-5): a refused start creates nothing on
     # disk. A mkdir failure after admission rolls the registry entry back.
