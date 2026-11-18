@@ -91,9 +91,27 @@ _LEDGER_SKELETON = (
 )
 
 
+def _verifier() -> str:
+    """Pick the repro-check.sh that can read every local manifest.
+
+    The checkpoint manifests carry v1 or v2 headers depending on the tool
+    generation that last appended to them; the vendored 3.0.0 verifier
+    rejects v2 outright, which would render every appended-since trace as a
+    blind "0 / 0 / exit 2" census row (issue #148 review: the AMEND waves
+    upgraded nine manifests to v2 and hid their drift from the gate). The
+    user-level 3.0.3 verifier reads both; the vendored path is the fallback
+    where no user-level copy exists (a CI-like checkout has no local
+    manifests to verify at all, so the fallback never decides anything).
+    """
+    user_level = Path.home() / ".zcode" / "skills" / "issue-tracer" / "scripts" / "repro-check.sh"
+    if user_level.exists():
+        return str(user_level)
+    return REPRO
+
+
 def _verify(slug: str) -> tuple[int, str]:
     proc = subprocess.run(
-        [r"C:\Program Files\Git\bin\bash.exe", REPRO, "verify-checkpoint", "--slug", slug],
+        [r"C:\Program Files\Git\bin\bash.exe", _verifier(), "verify-checkpoint", "--slug", slug],
         cwd=REPO, capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     return proc.returncode, proc.stdout + proc.stderr
