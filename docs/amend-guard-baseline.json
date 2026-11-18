@@ -5,31 +5,31 @@
    "watermark_seq": 26,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "11-job-relay-ownership": {
    "watermark_seq": 18,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "115-86-71-60-collated": {
    "watermark_seq": 27,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "12-remote-hyperv-host": {
    "watermark_seq": 9,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "125-126-console-accuracy-commit-guard": {
    "watermark_seq": 16,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "128-129-134-gui-drivability": {
    "watermark_seq": 102,
@@ -91,79 +91,79 @@
      "note": "F5 corruption repair (table-verbatim), receipt on trace 128-129-134"
     }
    ],
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "13-stdio-proxy": {
    "watermark_seq": 34,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "135-127-138-gui-electron-drivability": {
    "watermark_seq": 420,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 258,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "136-137-uia-element-contract": {
    "watermark_seq": 285,
    "legacy_argv_exceptions": 27,
    "legacy_semantic_warnings": 19,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "140-126-uia-state-receipt": {
    "watermark_seq": 44,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "143-130-collated": {
    "watermark_seq": 72,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "147-trace-drift-repair": {
    "watermark_seq": 6,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "17-rgb565-native-decode": {
    "watermark_seq": 31,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "18-console-one-ps-process-per-call": {
    "watermark_seq": 138,
    "legacy_argv_exceptions": 6,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "19-screenshot-output-options": {
    "watermark_seq": 44,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 1,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "20-per-call-timing-soak-benchmark": {
    "watermark_seq": 31,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "21-psdirect-session-reuse": {
    "watermark_seq": 228,
    "legacy_argv_exceptions": 37,
    "legacy_semantic_warnings": 2,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "22-durable-state-store": {
    "watermark_seq": 37,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "23-leases-with-fencing-tokens": {
    "watermark_seq": 47,
@@ -177,7 +177,7 @@
      "note": "#148 count-free stable-predicate repair"
     }
    ],
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "24-durable-operation-handles": {
    "watermark_seq": 48,
@@ -203,163 +203,163 @@
      "note": "#148 count-free stable-predicate repair"
     }
    ],
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "25-f1-console-keyboard-click-origin": {
    "watermark_seq": 33,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "26-checkpoint-type-standard": {
    "watermark_seq": 19,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "27-frame-stable-wait": {
    "watermark_seq": 32,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "29-uia-helper-element-desktop": {
    "watermark_seq": 64,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "30-per-vm-credential-profiles": {
    "watermark_seq": 37,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "31-32-33-94-workstream-g-deployment": {
    "watermark_seq": 38,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "31-79-live-host-confirmation": {
    "watermark_seq": 14,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 5,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "44-vm-display-resolution": {
    "watermark_seq": 56,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "45-console-direct-wmi": {
    "watermark_seq": 16,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "5-ps51-sanitized-env": {
    "watermark_seq": 75,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "55-108-31-32-33-collated": {
    "watermark_seq": 35,
    "legacy_argv_exceptions": 2,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "59-64-68-70-hardening-wave": {
    "watermark_seq": 91,
    "legacy_argv_exceptions": 1,
    "legacy_semantic_warnings": 1,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "6-guest-put-get-policy": {
    "watermark_seq": 39,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 1,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "63-66-119-collated": {
    "watermark_seq": 143,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 4,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "64-68-collated": {
    "watermark_seq": 21,
    "legacy_argv_exceptions": 1,
    "legacy_semantic_warnings": 2,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "67-118-release-vendor-provenance": {
    "watermark_seq": 19,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "7-guest-jobs-truthful-reporting": {
    "watermark_seq": 26,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "74-72-88-cost-latency-accounting": {
    "watermark_seq": 171,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 31,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "75-76-78-81-83-84-collated": {
    "watermark_seq": 73,
    "legacy_argv_exceptions": 2,
    "legacy_semantic_warnings": 4,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "77-28-console-actor-batched-sequences": {
    "watermark_seq": 21,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "8-vm-guid-identity": {
    "watermark_seq": 28,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 1,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "9-error-envelope": {
    "watermark_seq": 39,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "95-69-37-57-56-110-collated": {
    "watermark_seq": 149,
    "legacy_argv_exceptions": 6,
    "legacy_semantic_warnings": 17,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "gpt6sol-guest-access-tools": {
    "watermark_seq": 22,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "issue-14-vm-rw-locks": {
    "watermark_seq": 12,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "issue-15-ps-cap-cancel": {
    "watermark_seq": 26,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "issue-16-tool-concurrency": {
    "watermark_seq": 105,
@@ -403,14 +403,14 @@
      "note": "F5 repair (table-verbatim), receipt on issue-16"
     }
    ],
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   },
   "148-151-153-followup-hygiene-triad": {
    "watermark_seq": 34,
    "legacy_argv_exceptions": 0,
    "legacy_semantic_warnings": 0,
    "note": "born this PR; all appends carry the two-tier contract by construction",
-   "dispositioned_commit": "c3aacca (full sha in git log; R precedes activation commit B)"
+   "dispositioned_commit": "c3aaccae80fcc1ff115047ad5fd270936ff053c3 (repair commit R; a proper ancestor of the commit carrying this file, never the activation commit)"
   }
  }
 }

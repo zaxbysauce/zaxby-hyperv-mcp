@@ -108,6 +108,11 @@ def verify_manifest(manifest_path: Path, baseline: dict) -> tuple[int, list]:
                              "detail": "base-only change (versioning-policy "
                                        "amendment)"})
             worst = max(worst, 2)
+    # Failure dominates warnings regardless of row order: a WARN aggregated
+    # after a FAIL must never downgrade the exit (review finding R1 — exit
+    # codes are severity-ordered here, not numerically).
+    if any(f["verdict"] == "FAIL" for f in findings):
+        worst = 1
     return worst, findings
 
 

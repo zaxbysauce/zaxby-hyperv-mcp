@@ -189,3 +189,111 @@ def test_manifest_without_amend_rows_is_ok(tmp_path):
     proc = _guard(manifest, baseline)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "OK: all AMEND rows verbatim or baseline-covered" in proc.stdout
+
+
+def test_severity_fail_dominates_warn_regardless_of_order(tmp_path):
+    """Severity dominance: exit codes are severity-ordered (FAIL=1 worse
+    than WARN=2), not numeric — an argv-FAIL row and an expect-only WARN
+    row in the SAME manifest aggregate to exit 1 whichever row order they
+    appear in. Pins the aggregation fix at the end of verify_manifest:
+    without the post-loop FAIL recheck, a WARN aggregated after a FAIL
+    (worst = max(worst, 2)) would downgrade the exit from 1 to 2."""
+    other_path = "tests/unit/test_mirror.py"
+    fail_first = [
+        _row(1, "CHECKPOINT", _ARGV),
+        _row(2, "AMEND", _ARGV_RETYPED),
+        _row(3, "CHECKPOINT", _ARGV, path=other_path, check="C2",
+             expect="sig-old"),
+        _row(4, "AMEND", _ARGV, path=other_path, check="C2",
+             expect="AssertionError: AC3: stable-predicate"),
+    ]
+    manifest, baseline = _sandbox(
+        tmp_path, "failfirst", fail_first, entry={"watermark_seq": 0})
+    proc = _guard(manifest, baseline)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "FAIL" in proc.stdout
+    assert "WARN" in proc.stdout
+
+    warn_first = [
+        _row(1, "CHECKPOINT", _ARGV, path=other_path, check="C2",
+             expect="sig-old"),
+        _row(2, "AMEND", _ARGV, path=other_path, check="C2",
+             expect="AssertionError: AC3: stable-predicate"),
+        _row(3, "CHECKPOINT", _ARGV),
+        _row(4, "AMEND", _ARGV_RETYPED),
+    ]
+    manifest, baseline = _sandbox(
+        tmp_path, "warnfirst", warn_first, entry={"watermark_seq": 0})
+    proc = _guard(manifest, baseline)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "FAIL" in proc.stdout
+    assert "WARN" in proc.stdout
+
+
+def test_committed_baseline_unwrap_pin(tmp_path):
+    """load_baseline's committed-form unwrap pin. The committed baseline
+    (docs/amend-guard-baseline.json, reached via --repo-root) nests the
+    per-slug entries under a top-level "traces" key with contract metadata
+    alongside; load_baseline unwraps with doc.get("traces", doc) before
+    verify_manifest looks the slug up.
+
+    Decisive pair on the SAME retyped-argv manifest (which FAILs strictly):
+      (i)  NESTED baseline, watermark_seq covering every row -> exit 0: the
+           watermark was applied THROUGH the traces unwrap.
+      (ii) FLAT baseline (the same watermark numbers hoisted to the top
+           level, no "traces" wrapper and no slug key) -> exit 1: the slug
+           lookup finds nothing, the manifest is born-strict (watermark 0).
+
+    Removing load_baseline's .get("traces", doc) unwrap changes production
+    behavior and this arm detects it: without the unwrap the nested doc
+    ({"_contract": ..., "traces": {...}}) has no slug at the top level, so
+    arm (i) would read watermark 0 and FAIL exit 1, while arm (ii) stays
+    exit 1 either way — the pair discriminates the unwrap specifically (the
+    wrapper, not the watermark numbers, is what applies the watermark)."""
+    slug = "repounwrap-sandbox-trace"
+    repo_root = tmp_path / "repo"
+    manifest = repo_root / slug / "repro" / "checkpoint.manifest"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        f"# issue-tracer checkpoint manifest v1 rows=2\n"
+        + "\n".join([
+            _row(1, "CHECKPOINT", _ARGV),
+            _row(2, "AMEND", _ARGV_RETYPED),
+        ]) + "\n",
+        encoding="utf-8", newline="\n",
+    )
+    entry = {"watermark_seq": 5,
+             "dispositioned_commit": "c3a9f8d0241faeb4e3656e097e7855fb855f11aa",
+             "legacy_argv_exceptions": 0}
+    baseline_file = repo_root / "docs" / "amend-guard-baseline.json"
+    baseline_file.parent.mkdir(parents=True)
+
+    def _guard_repo() -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(_TOOL), str(manifest),
+             "--repo-root", str(repo_root)],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=60,
+        )
+
+    # (i) nested committed form: the unwrap applies the covering watermark.
+    baseline_file.write_text(json.dumps({
+        "_contract": "amend-guard-baseline v1 (nested committed form)",
+        "traces": {slug: entry},
+    }), encoding="utf-8", newline="\n")
+    nested = _guard_repo()
+    assert nested.returncode == 0, nested.stdout + nested.stderr
+    assert "FAIL" not in nested.stdout
+    assert "OK: all AMEND rows verbatim or baseline-covered" in nested.stdout
+
+    # (ii) flat form: same watermark numbers at the top level, no traces
+    # wrapper and no slug key — born-strict, the retyped row FAILs.
+    baseline_file.write_text(json.dumps({
+        "watermark_seq": entry["watermark_seq"],
+        "dispositioned_commit": entry["dispositioned_commit"],
+        "legacy_argv_exceptions": entry["legacy_argv_exceptions"],
+    }), encoding="utf-8", newline="\n")
+    flat = _guard_repo()
+    assert flat.returncode == 1, flat.stdout + flat.stderr
+    assert "FAIL" in flat.stdout
+    assert "argv" in flat.stdout
