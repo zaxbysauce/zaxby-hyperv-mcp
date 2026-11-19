@@ -10,7 +10,16 @@ Contract (two-tier, plan F4):
     repair rows are covered because the two repaired manifests' watermark
     seqs were set AFTER those repairs landed (activation commit B postdates
     repair commit R, and dispositioned_commit is always a proper ancestor
-    of the commit carrying the baseline file, never the activation commit).
+    of the commit carrying the baseline file, never the activation commit —
+    that ancestor invariant is documented here and in the runbook but not
+    yet enforced in code; it needs a full-history git checkout).
+  - The watermark is bounded: a watermark_seq that is not a non-negative
+    int, or that exceeds the manifest's max seq, is a usage/shape error
+    (exit 3) — an unbounded watermark would disposition every AMEND row
+    BASELINE and turn the guard off for that manifest. The committed
+    legacy_argv_exceptions count must also match the manifest's actual
+    at-watermark argv-diff rows (a mismatch means the baseline file
+    describes a different manifest).
 
 Exit codes: 0 clean (verbatim and baseline-covered rows only); 2 warnings
 (semantic amendments above the watermark); 1 failure (post-watermark argv
@@ -32,12 +41,12 @@ def parse_manifest(path: Path) -> list[dict]:
         if not line.strip() or line.startswith("#"):
             continue
         parts = line.split("\t")
-        if len(parts) < FIELDS - 1:
-            # Row 9 (reason) may be '-' on CHECKPOINT rows; tolerate 9 fields.
-            if len(parts) == FIELDS - 1:
-                parts.append("-")
-            else:
-                raise ValueError(f"{path}: malformed row ({len(parts)} fields)")
+        if len(parts) < FIELDS:
+            # The row grammar is exactly 10 fields (repro-check.sh hardcodes
+            # ten and its validator rejects any other count); a '-' reason is
+            # the VALUE of the 10th field, not a 9-field row. Anything
+            # shorter is malformed.
+            raise ValueError(f"{path}: malformed row ({len(parts)} fields)")
         rows.append({
             "seq": int(parts[0]),
             "type": parts[1],
@@ -70,12 +79,24 @@ def load_baseline(repo_root: Path) -> dict:
 
 
 def verify_manifest(manifest_path: Path, baseline: dict) -> tuple[int, list]:
-    """Return (worst_exit, findings). worst_exit: 0 ok, 2 warn, 1 fail."""
+    """Return (worst_exit, findings). worst_exit: 0 ok, 2 warn, 1 fail,
+    3 usage/shape error (unbounded watermark, count mismatch)."""
     slug = manifest_path.parent.parent.name
-    watermark = int(baseline.get(slug, {}).get("watermark_seq", 0))
+    entry = baseline.get(slug, {})
+    watermark = entry.get("watermark_seq", 0)
+    if (not isinstance(watermark, int) or isinstance(watermark, bool)
+            or watermark < 0):
+        print(f"verify_amend_verbatim: {slug}: watermark_seq must be a "
+              f"non-negative int (got {watermark!r})", file=sys.stderr)
+        return 3, []
     findings = []
     worst = 0
     rows = parse_manifest(manifest_path)
+    max_seq = max((row["seq"] for row in rows), default=0)
+    if watermark > max_seq:
+        print(f"verify_amend_verbatim: {slug}: watermark_seq {watermark} "
+              f"exceeds manifest max seq {max_seq}", file=sys.stderr)
+        return 3, findings
     predecessor: dict[tuple[str, str], dict] = {}
     for row in rows:
         key = (row["path"], row["check_id"])
@@ -86,7 +107,8 @@ def verify_manifest(manifest_path: Path, baseline: dict) -> tuple[int, list]:
         if row["seq"] <= watermark:
             findings.append({"row": row["seq"], "path": key[0],
                              "check_id": key[1], "verdict": "BASELINE",
-                             "field": None})
+                             "field": "argv" if row["argv"] != prev["argv"]
+                             else None})
             continue
         if row["argv"] != prev["argv"]:
             findings.append({"row": row["seq"], "path": key[0],
@@ -113,6 +135,19 @@ def verify_manifest(manifest_path: Path, baseline: dict) -> tuple[int, list]:
     # codes are severity-ordered here, not numerically).
     if any(f["verdict"] == "FAIL" for f in findings):
         worst = 1
+    # Baseline cross-check: the committed legacy_argv_exceptions count must
+    # equal the manifest's actual at-watermark argv-diff rows — a mismatch
+    # means the baseline file describes a different manifest than the one
+    # being verified (exit 3, usage/shape error).
+    declared = entry.get("legacy_argv_exceptions")
+    if declared is not None:
+        actual = sum(1 for f in findings
+                     if f["verdict"] == "BASELINE" and f["field"] == "argv")
+        if int(declared) != actual:
+            print(f"verify_amend_verbatim: {slug}: baseline declares "
+                  f"{declared} legacy argv exceptions, manifest shows "
+                  f"{actual}", file=sys.stderr)
+            return 3, findings
     return worst, findings
 
 
@@ -134,20 +169,33 @@ def main() -> int:
     baseline_file = Path(args.baseline) if args.baseline else None
     if baseline_file is not None:
         try:
-            baseline = json.loads(baseline_file.read_text(encoding="utf-8"))
+            doc = json.loads(baseline_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             print(f"verify_amend_verbatim: baseline unreadable: {exc}",
                   file=sys.stderr)
             return 3
+        # Same nested/flat acceptance as load_baseline: the committed
+        # baseline nests per-slug entries under a top-level "traces" key.
+        baseline = doc.get("traces", doc) if isinstance(doc, dict) else {}
     else:
         baseline = load_baseline(Path(args.repo_root))
-    worst, findings = verify_manifest(manifest_path, baseline)
+    try:
+        worst, findings = verify_manifest(manifest_path, baseline)
+    except ValueError as exc:
+        # Malformed manifest row: a shape error per the docstring contract
+        # (exit 3), not an uncaught traceback (exit 1).
+        print(f"verify_amend_verbatim: {exc}", file=sys.stderr)
+        return 3
     if args.as_json:
-        print(json.dumps({"ok": worst != 1, "exit": worst,
+        # ok is exactly the clean state (exit 0): a shape error (exit 3) is
+        # never "ok", and the watermark is serialized as-is — a forced int()
+        # here would raise outside the ValueError handler for a non-int
+        # watermark that verify_manifest already refused with exit 3.
+        print(json.dumps({"ok": worst == 0, "exit": worst,
                           "manifest": str(manifest_path),
-                          "watermark_seq": int(baseline.get(
+                          "watermark_seq": baseline.get(
                               manifest_path.parent.parent.name, {})
-                          .get("watermark_seq", 0)),
+                          .get("watermark_seq", 0),
                           "findings": findings}, indent=1))
     else:
         for f in findings:

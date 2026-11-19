@@ -140,11 +140,12 @@ _SCHEMA_STATEMENTS = (
         -- Issue #30: same identity binding as the jobs table.
         cred_profile TEXT NOT NULL DEFAULT '',
         cred_username TEXT NOT NULL DEFAULT '',
+        owner TEXT,
         -- Issue #151: the relay kind ('http' | 'tcp'). Persisted so a
         -- restored relay reports the kind it was started with; 'http' is the
         -- default for pre-v5 rows (http was the only kind that existed).
-        kind TEXT NOT NULL DEFAULT 'http',
-        owner TEXT
+        -- Declared last to match _RELAY_COLUMNS (kind @12).
+        kind TEXT NOT NULL DEFAULT 'http'
     )
     """,
     """

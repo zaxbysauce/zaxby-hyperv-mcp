@@ -110,10 +110,16 @@ def _verifier() -> str:
 
 
 def _verify(slug: str) -> tuple[int, str]:
-    proc = subprocess.run(
-        [r"C:\Program Files\Git\bin\bash.exe", _verifier(), "verify-checkpoint", "--slug", slug],
-        cwd=REPO, capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
+    try:
+        proc = subprocess.run(
+            [r"C:\Program Files\Git\bin\bash.exe", _verifier(), "verify-checkpoint", "--slug", slug],
+            cwd=REPO, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        # A hung verifier fails the gate closed (a nonzero exit with a
+        # diagnostic), never as a silent 0/0 row.
+        return 1, "verify-checkpoint timed out after 120s"
     return proc.returncode, proc.stdout + proc.stderr
 
 
@@ -135,7 +141,11 @@ def _guard(manifest: Path) -> tuple[str | None, str | None]:
              str(REPO / "scripts" / "verify_amend_verbatim.py"),
              str(manifest), "--repo-root", str(REPO)],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60,
         )
+    except subprocess.TimeoutExpired:
+        # A hung guard fails the gate closed (like a hang), never skipped.
+        return "guard timed out after 60s", None
     except OSError as exc:
         return f"guard did not run: {exc}", None
     if proc.returncode == 0:
@@ -152,6 +162,24 @@ def _guard(manifest: Path) -> tuple[str | None, str | None]:
 def _ledger_file() -> Path:
     # Resolved from REPO at call time: tests repoint REPO at a sandbox.
     return REPO / "docs" / "issue-trace-ledger.md"
+
+
+def _ledger_tracked() -> bool:
+    """True iff the ledger is committed in HEAD. A HEAD-present ledger that
+    is missing from the working tree — a staged `git rm` OR an unstaged
+    deletion — is a deletion to fail closed on, not a fresh sandbox: only a
+    ledger never committed (a fresh sandbox / non-git tmp root) bootstraps
+    from the skeleton. The check is HEAD-based (git cat-file -e), not
+    index-based (git ls-files), so a staged deletion is still 'tracked' and
+    refused — otherwise `git rm` the ledger, delete the trace store, and
+    regenerate would rebuild a skeleton ledger and launder the deletion."""
+    try:
+        rel = _ledger_file().relative_to(REPO).as_posix()
+        return subprocess.run(
+            ["git", "cat-file", "-e", f"HEAD:{rel}"],
+            cwd=REPO, capture_output=True, text=True, timeout=30).returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
 
 
 def _ledger_rows(text: str) -> list[list[str]]:
@@ -246,7 +274,7 @@ def _collect() -> list[dict]:
         gate_changed = [line for line in changed_lines if _line_path(line) != SELF_PATH]
         gate_ok = sum(
             1 for line in lines
-            if line.startswith("OK ") and SELF_PATH not in line
+            if line.startswith("OK ") and _line_path(line) != SELF_PATH
         )
         row = {
             "slug": slug, "code": code,
@@ -347,8 +375,17 @@ def main() -> int:
                   "replace the recorded audit trail. Use --force only to intentionally "
                   "re-record it.", file=sys.stderr)
             return 1
-        base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO,
-                              capture_output=True, text=True, encoding="utf-8").stdout.strip()
+        try:
+            base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO,
+                                  capture_output=True, text=True, encoding="utf-8",
+                                  timeout=30).stdout.strip()
+        except subprocess.TimeoutExpired:
+            # Fail closed: a hung git lookup must not record a snapshot with
+            # an empty base — the audit trail would carry an unresolvable
+            # identity and the failure would surface as silent drift later.
+            print("FAIL: git rev-parse HEAD timed out after 30s — "
+                  "the local git state is broken; restore it before --snapshot")
+            return 1
         parts = [
             "# Issue-trace checkpoint inventory",
             "",
@@ -370,7 +407,9 @@ def main() -> int:
 
     if args.check:
         if not DOCS.exists():
-            print(f"FAIL: {DOCS.relative_to(REPO)} missing — run --snapshot to record the inventory", file=sys.stderr)
+            # Blocking summaries ride stdout: the host pre-push hook discards
+            # stderr, so the operator-facing line must not live there.
+            print(f"FAIL: {DOCS.relative_to(REPO)} missing — run --snapshot to record the inventory")
             return 1
         # Guard failures fail the gate (plan F4 wiring): post-watermark argv
         # corruption in any walked manifest is disclosed per trace and fails
@@ -382,9 +421,40 @@ def main() -> int:
         guard_failed = [row for row in rows if row.get("guard_fail")]
         if guard_failed:
             for row in guard_failed:
-                print(f"GUARD FAIL {row['slug']}: {row['guard_fail']}")
+                print(f"GUARD FAIL {row['slug']}: {row['guard_fail']}", file=sys.stderr)
             print("FAIL: amend-guard corruption — repair the manifest with the "
                   "per-pair AMEND procedure in docs/rebaseline-runbook.md")
+            return 1
+        # Deletion-laundering guard (plan F7): a ledger-active slug that is
+        # no longer rendered in the census is a deleted trace — after the
+        # deletion both the store and the document lack the slug, so the
+        # census alone cannot see it; only the committed ledger can. This
+        # check runs BEFORE the drift/broken-leg returns so a deleted or
+        # marker-less ledger fails the gate even while the pre-existing
+        # cascade is pending (closeout critic: the check was unreachable
+        # behind the drift return). Stderr + exit code only, never rendered
+        # into the document (quine safety).
+        existing = DOCS.read_text(encoding="utf-8")
+        ledger = _ledger_file()
+        ledger_text = ledger.read_text(encoding="utf-8") if ledger.exists() else ""
+        # Fail closed: a ledger that is missing or marker-less is a DELETED
+        # ledger, not an empty one — with an empty one the deletion-laundering
+        # guard would see no active rows and let every ledger-active trace
+        # silently pass as rendered. The host pre-push hook discards stderr,
+        # so this disclosure rides stdout and --check exit 1 blocks the push.
+        if not ledger.exists() or LEDGER_BEGIN not in ledger_text \
+                or LEDGER_END not in ledger_text:
+            print("FAIL: docs/issue-trace-ledger.md missing or malformed "
+                  "(no ledger-rows markers) — restore it from git history")
+            return 1
+        active = {r[0] for r in _ledger_rows(ledger_text) if r[1] == "active"}
+        missing = sorted(active - _doc_slugs(existing))
+        for slug in missing:
+            print(f"MISSING {slug}", file=sys.stderr)
+        if missing:
+            print("FAIL: ledger-active traces missing from the rendered inventory — "
+                  "restore the trace store or retire the ledger row in "
+                  "docs/issue-trace-ledger.md")
             return 1
         # Real drift anywhere in the census is a gate failure on its own
         # (issue #143 AC2): the docs copy matching the regeneration must not
@@ -412,27 +482,10 @@ def main() -> int:
                       "trace's local checkpoint setup")
             print("FAIL: inventory drift — regenerate with python scripts/gen_trace_drift_inventory.py")
             return 1
-        # Deletion laundering guard (plan F7): a ledger-active slug that is
-        # no longer rendered in the census is a deleted trace — after the
-        # deletion both the store and the document lack the slug, so the
-        # census alone cannot see it; only the committed ledger can. Stderr
-        # + exit code only, never rendered into the document (quine safety).
-        existing = DOCS.read_text(encoding="utf-8")
-        ledger = _ledger_file()
-        ledger_text = ledger.read_text(encoding="utf-8") if ledger.exists() else ""
-        active = {r[0] for r in _ledger_rows(ledger_text) if r[1] == "active"}
-        missing = sorted(active - _doc_slugs(existing))
-        for slug in missing:
-            print(f"MISSING {slug}", file=sys.stderr)
-        if missing:
-            print("FAIL: ledger-active traces missing from the rendered inventory — "
-                  "restore the trace store or retire the ledger row in "
-                  "docs/issue-trace-ledger.md")
-            return 1
         s = existing.find(BEGIN)
         e = existing.find(END)
         if s == -1 or e == -1:
-            print("FAIL: docs copy has no regenerated-state markers — run --snapshot", file=sys.stderr)
+            print("FAIL: docs copy has no regenerated-state markers — run --snapshot")
             return 1
         current = existing[s:e + len(END)]
         if current == dynamic.rstrip("\n"):
@@ -461,16 +514,71 @@ def main() -> int:
         body = head + "\n\n" + dynamic.rstrip("\n") + "\n"
         if static:
             body += "\n" + static
+        # Ledger pre-flight + ordering (issue #148, plan F7): the ledger
+        # must AHEAD of the inventory in every partial-failure state. --check
+        # catches ledger-active slugs missing from the document (MISSING),
+        # but never rendered slugs missing from the ledger — so writing the
+        # inventory first would let a failed/interrupted ledger write leave a
+        # rendered trace unregistered, laundering its later deletion. The
+        # pre-flight fails closed before any write (a hung git lookup), the
+        # ledger append lands first, and the inventory write is last: a
+        # failure in between leaves the ledger ahead, which --check reports
+        # as MISSING (the append is idempotent — the slug is already known
+        # on the next regeneration, so no duplicate row).
+        rendered = [row["slug"] for row in rows]
+        ledger = _ledger_file()
+        if ledger.exists():
+            ledger_text = ledger.read_text(encoding="utf-8")
+        elif _ledger_tracked():
+            # Tracked but missing: a deletion, not a fresh sandbox. Refuse to
+            # rebuild it from the skeleton — that would drop every previously
+            # active slug whose trace was also deleted and let the laundering
+            # succeed (closeout critic finding FB-001b). Restore from history.
+            print(f"FAIL: {ledger.relative_to(REPO)} is tracked but missing — "
+                  f"restore it from git history (a deleted ledger is "
+                  f"deletion laundering)", file=sys.stderr)
+            return 1
+        else:
+            ledger_text = _LEDGER_SKELETON
+        if LEDGER_BEGIN not in ledger_text or LEDGER_END not in ledger_text:
+            print(f"FAIL: {ledger.relative_to(REPO)} is malformed (no "
+                  f"ledger-rows markers) — restore it from git history",
+                  file=sys.stderr)
+            return 1
+        known = {r[0] for r in _ledger_rows(ledger_text)}
+        fresh = [slug for slug in rendered if slug not in known]
+        if fresh:
+            try:
+                rev = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO,
+                                     capture_output=True, text=True,
+                                     encoding="utf-8", timeout=30)
+            except subprocess.TimeoutExpired:
+                # Fail closed: a hung git lookup must not leave the rendered
+                # inventory and the ledger inconsistent — the ledger is the
+                # audit trail, and an unresolvable identity recorded there
+                # (or a rendered trace missing from it) is silent drift.
+                print("FAIL: git rev-parse HEAD timed out after 30s — "
+                      "the local git state is broken; restore it before "
+                      "regenerating")
+                return 1
+            commit = (rev.stdout.strip()
+                      if rev.returncode == 0 and rev.stdout.strip()
+                      else "-")
+            addition = "".join(f"- {slug} | active | {commit} | -\n"
+                               for slug in fresh)
+            idx = ledger_text.index(LEDGER_END)
+            ledger.write_text(ledger_text[:idx] + addition + ledger_text[idx:],
+                              encoding="utf-8", newline="\n")
         DOCS.write_text(body, encoding="utf-8", newline="\n")
         print(f"regenerated {DOCS.relative_to(REPO)}")
     else:
         print(f"FAIL: {DOCS.relative_to(REPO)} missing — run --snapshot first")
         return 1
-    # Ledger maintenance + guard/MISSING disclosure (issue #148, plan F7):
-    # stderr and exit-code only — the rendered document is never touched by
-    # any of it, so consecutive regenerations stay byte-stable (the ledger
-    # is committed state, not regenerated content: appends touch only the
-    # ledger file, MISSING rows are never rendered into the document).
+    # Guard/MISSING disclosure (issue #148, plan F7): stderr and exit-code
+    # only — the rendered document is never touched by any of it, so
+    # consecutive regenerations stay byte-stable (the ledger is committed
+    # state, not regenerated content: appends touch only the ledger file,
+    # MISSING rows are never rendered into the document).
     status = 0
     for row in rows:
         if row.get("guard_warn"):
@@ -478,27 +586,6 @@ def main() -> int:
         if row.get("guard_fail"):
             print(f"GUARD FAIL {row['slug']}: {row['guard_fail']}", file=sys.stderr)
             status = 1
-    rendered = [row["slug"] for row in rows]
-    ledger = _ledger_file()
-    ledger_text = (ledger.read_text(encoding="utf-8")
-                   if ledger.exists() else _LEDGER_SKELETON)
-    if LEDGER_BEGIN not in ledger_text or LEDGER_END not in ledger_text:
-        print(f"FAIL: {ledger.relative_to(REPO)} is malformed (no ledger-rows "
-              "markers) — restore it from git history", file=sys.stderr)
-        return 1
-    known = {r[0] for r in _ledger_rows(ledger_text)}
-    fresh = [slug for slug in rendered if slug not in known]
-    if fresh:
-        rev = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO,
-                             capture_output=True, text=True,
-                             encoding="utf-8")
-        commit = (rev.stdout.strip()
-                  if rev.returncode == 0 and rev.stdout.strip() else "-")
-        addition = "".join(f"- {slug} | active | {commit} | -\n"
-                           for slug in fresh)
-        idx = ledger_text.index(LEDGER_END)
-        ledger.write_text(ledger_text[:idx] + addition + ledger_text[idx:],
-                          encoding="utf-8", newline="\n")
     active = {r[0] for r in _ledger_rows(ledger_text) if r[1] == "active"}
     missing = sorted(active - set(rendered))
     for slug in missing:

@@ -139,7 +139,7 @@ def test_baseline_watermark_covers_retyped_row(tmp_path):
     manifest, baseline = _sandbox(
         tmp_path, "covered",
         [_row(1, "CHECKPOINT", _ARGV), _row(2, "AMEND", _ARGV_RETYPED)],
-        entry={"watermark_seq": 5},
+        entry={"watermark_seq": 2},
     )
     proc = _guard(manifest, baseline)
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -168,7 +168,7 @@ def test_authorized_repair_row_passes_as_baseline(tmp_path):
     manifest, baseline = _sandbox(
         tmp_path, "authorized",
         [_row(1, "CHECKPOINT", _ARGV), _row(2, "AMEND", _ARGV_RETYPED)],
-        entry={"watermark_seq": 7,
+        entry={"watermark_seq": 2,
                "dispositioned_commit": "c3a9f8d0241faeb4e3656e097e7855fb855f11aa",
                "legacy_argv_exceptions": 1},
     )
@@ -262,9 +262,9 @@ def test_committed_baseline_unwrap_pin(tmp_path):
         ]) + "\n",
         encoding="utf-8", newline="\n",
     )
-    entry = {"watermark_seq": 5,
+    entry = {"watermark_seq": 2,
              "dispositioned_commit": "c3a9f8d0241faeb4e3656e097e7855fb855f11aa",
-             "legacy_argv_exceptions": 0}
+             "legacy_argv_exceptions": 1}
     baseline_file = repo_root / "docs" / "amend-guard-baseline.json"
     baseline_file.parent.mkdir(parents=True)
 
@@ -297,3 +297,86 @@ def test_committed_baseline_unwrap_pin(tmp_path):
     assert flat.returncode == 1, flat.stdout + flat.stderr
     assert "FAIL" in flat.stdout
     assert "argv" in flat.stdout
+
+
+def test_watermark_above_manifest_max_seq_is_a_shape_error(tmp_path):
+    """An unbounded watermark (watermark_seq above the manifest's max seq)
+    would disposition every AMEND row BASELINE and turn the guard off for
+    that manifest: a usage/shape error (exit 3), not a silent pass."""
+    manifest, baseline = _sandbox(
+        tmp_path, "unbounded",
+        [_row(1, "CHECKPOINT", _ARGV), _row(2, "AMEND", _ARGV_RETYPED)],
+        entry={"watermark_seq": 99},
+    )
+    proc = _guard(manifest, baseline)
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert "exceeds manifest max seq" in proc.stderr
+
+
+def test_non_int_watermark_is_a_shape_error(tmp_path):
+    """A watermark_seq that is not a non-negative int (a JSON string here)
+    is a usage/shape error (exit 3) — never a silent watermark 0."""
+    manifest, baseline = _sandbox(
+        tmp_path, "nonint",
+        [_row(1, "CHECKPOINT", _ARGV), _row(2, "AMEND", _ARGV_RETYPED)],
+        entry={"watermark_seq": "high"},
+    )
+    proc = _guard(manifest, baseline)
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert "non-negative int" in proc.stderr
+
+
+def test_malformed_manifest_row_is_a_shape_error(tmp_path):
+    """A manifest row with fewer than 10 tab-separated fields is malformed
+    (the row grammar is exactly 10; a '-' reason is the VALUE of the 10th
+    field, not a 9-field row): a shape error (exit 3), not an uncaught
+    traceback (exit 1)."""
+    slug = "malformed-sandbox-trace"
+    manifest = tmp_path / "malformed" / slug / "repro" / "checkpoint.manifest"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        "# issue-tracer checkpoint manifest v1 rows=1\n"
+        + "\t".join([
+            "1", "CHECKPOINT", _PATH, "f" * 40, "100644", "C1", _ARGV, "-",
+        ]) + "\n",
+        encoding="utf-8", newline="\n",
+    )
+    baseline_file = tmp_path / "malformed" / "baseline.json"
+    baseline_file.write_text(json.dumps({}), encoding="utf-8", newline="\n")
+    proc = _guard(manifest, baseline_file)
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert "malformed row" in proc.stderr
+
+
+def test_nested_baseline_via_explicit_baseline_flag(tmp_path):
+    """The committed nested form (per-slug entries under a top-level
+    'traces' key) must work through --baseline exactly as through
+    --repo-root: the explicit-file branch applies the same
+    doc.get('traces', doc) unwrap, so the covering watermark applies."""
+    manifest, baseline = _sandbox(
+        tmp_path, "nestedflag",
+        [_row(1, "CHECKPOINT", _ARGV), _row(2, "AMEND", _ARGV_RETYPED)],
+    )
+    slug = "nestedflag-sandbox-trace"
+    baseline.write_text(json.dumps({
+        "_contract": "amend-guard-baseline v1 (nested committed form)",
+        "traces": {slug: {"watermark_seq": 2}},
+    }), encoding="utf-8", newline="\n")
+    proc = _guard(manifest, baseline)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "OK: all AMEND rows verbatim or baseline-covered" in proc.stdout
+
+
+def test_legacy_count_mismatch_is_a_shape_error(tmp_path):
+    """The committed legacy_argv_exceptions count must equal the manifest's
+    actual at-watermark argv-diff rows: a mismatch means the baseline file
+    describes a different manifest (exit 3). Here the watermark covers the
+    retyped row (1 actual argv-diff row) but the entry declares 0."""
+    manifest, baseline = _sandbox(
+        tmp_path, "countmismatch",
+        [_row(1, "CHECKPOINT", _ARGV), _row(2, "AMEND", _ARGV_RETYPED)],
+        entry={"watermark_seq": 2, "legacy_argv_exceptions": 0},
+    )
+    proc = _guard(manifest, baseline)
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    assert "legacy argv exceptions" in proc.stderr

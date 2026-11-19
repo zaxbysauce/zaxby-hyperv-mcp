@@ -31,6 +31,9 @@ import pytest
 
 from hyperv_mcp import relay, statestore
 from hyperv_mcp.config import Config, DestructivePolicy
+from hyperv_mcp.credentials import CredentialSet
+
+CRED = CredentialSet("Administrator", "placeholder-pass")
 
 V4_RELAY_FIELDS = (
     "relay_id, vm_name, vm_id, guest_port, bind, host_port, started_at, "
@@ -153,12 +156,21 @@ def test_schema_v5_migration_adds_the_kind_column(tmp_path):
         after = con.execute(
             f"SELECT {V4_RELAY_FIELDS} FROM relays ORDER BY relay_id"
         ).fetchall()
+        kinds = [r[0] for r in con.execute(
+            "SELECT kind FROM relays ORDER BY relay_id")]
     finally:
         con.close()
     assert version == 5, f"a v4 store must migrate to 5, got {version}"
     assert "kind" in columns, (
         f"the v4 -> v5 migration must add the relays.kind column; columns: "
         f"{columns}")
+    # Pre-v5 rows predate the kind axis: http was the only kind that
+    # existed, so every migrated row must read back as 'http'. The
+    # migration supplies that value via ADD COLUMN ... DEFAULT 'http';
+    # a DEFAULT of anything else would invert the disclosed semantics on
+    # every legacy relay.
+    assert kinds == ["http", "http"], (
+        f"migrated pre-v5 relays must restore as kind 'http'; got {kinds}")
     # Issue #24's durable-operations recovery, not the migration, owns the
     # `state` field: an `active` row whose owning process is gone is
     # reclassified `interrupted` at open. The migration itself is
@@ -221,3 +233,50 @@ def test_a_v5_store_opens_without_remigrating(tmp_path, monkeypatch):
     assert reread is not None and reread.relay_id == canary.relay_id, (
         "reopening an up-to-date store must not disturb its rows")
     assert restamped == statestore.SCHEMA_VERSION, restamped
+
+
+def test_reservation_row_carries_the_requested_kind(monkeypatch):
+    """A relay that dies between reservation and registration must restore
+    with the kind it was started with: the RESERVATION row (written before
+    the listener exists) must carry kind=kind, never a default. KILLS:
+    dropping the kind= kind argument from the reservation upsert —
+    AC1's round-trip arm only sees the registration row, so a reservation
+    that lost its kind would pass AC1 and every row-level test alike."""
+    import uuid
+
+    from hyperv_mcp import pswindows, uia
+
+    cfg = _kind_cfg()
+    recorded: dict[str, object] = {}
+
+    def _fake_run_ps(script, **kwargs):
+        # Only the VM resolution leg runs a PowerShell script: the tcp
+        # stream-capability leg is stubbed below (uia seam), and the
+        # listener is stubbed before any per-request leg.
+        if "Msvm_ComputerSystem" in script:
+            return pswindows.PSResult(
+                stdout=str(uuid.uuid5(uuid.NAMESPACE_OID, "test-vm")),
+                returncode=0)
+        raise AssertionError(f"unexpected run_ps leg: {script[:80]}")
+
+    class StubTcpServer:
+        def __init__(self, addr, entry):
+            # The reservation transaction has committed by the time the
+            # listener is built, so the placeholder row is already durable:
+            # read it back through the same store handle relay_start used.
+            row = statestore.store_for(cfg).relay_get(entry["relay_id"])
+            recorded["kind"] = row.kind if row is not None else None
+            raise OSError("stubbed bind failure")
+
+    monkeypatch.setattr(pswindows, "run_ps", _fake_run_ps)
+    # The tcp-only stream-capability probe (relay.py _require_stream_capability)
+    # runs a second PS leg via uia; stub the seam so the only PS leg is the
+    # resolution leg above, and the helper advertises "stream" so the tcp
+    # start proceeds to the (stubbed) listener.
+    monkeypatch.setattr(uia, "helper_capabilities", lambda cfg, **kwargs: ["stream"])
+    monkeypatch.setattr(relay, "_TcpRelayServer", StubTcpServer)
+    with pytest.raises(RuntimeError, match="could not bind"):
+        relay.relay_start(cfg, "test-vm", 9222, kind="tcp", cred=CRED)
+    assert recorded["kind"] == "tcp", (
+        f"the reservation row must carry the requested kind 'tcp'; got "
+        f"{recorded['kind']!r}")

@@ -104,8 +104,11 @@ The watermark lives in the committed `docs/amend-guard-baseline.json`
 `seq <= watermark_seq` are BASELINE-dispositioned (counted, never FAIL) — the reviewed
 legacy repair rows predate the guard and are immutable, append-only history. The recorded
 `dispositioned_commit` is always a proper ancestor of the commit carrying the baseline file,
-never the activation commit itself (the two-commit repair-then-activate sequencing). A
-manifest with NO baseline entry is watermark 0: new traces are born strict from row 1. While
+never the activation commit itself (the two-commit repair-then-activate sequencing) — that
+ancestor invariant is documented here and in the guard's docstring but not yet enforced in
+code (enforcing it needs a full-history git checkout; the guard verifies watermarks and
+argv-exception counts only). A manifest with NO baseline entry is watermark 0: new traces
+are born strict from row 1. While
 the baseline file is absent the generator skips the guard entirely — its presence IS the
 activation switch.
 
