@@ -188,6 +188,11 @@ def test_broken_leg_fails_the_gate(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(mod, "_verify", _verify_with_broken)
     docs = _seed_docs(root)
     assert _main(monkeypatch, "--snapshot") == 0
+    # Seed a ledger first: the _sandbox is not a git repo, so regenerate
+    # bootstraps it from the skeleton. The ledger check now runs before the
+    # broken-leg check (closeout critic FB-001a), so --check needs a valid
+    # ledger to reach the broken-leg branch.
+    assert _main(monkeypatch) == 0
     body = docs.read_text(encoding="utf-8")
     # R8 render pin: the broken leg renders as its exit code, never "clean"
     assert "| sibling-wave | 0 | 0 | 0 | exit 2 |" in body
@@ -238,3 +243,314 @@ def test_table_cell_is_identical_whatever_the_self_pair_reads(tmp_path, monkeypa
     )
     assert "| 63-66-119-collated |" in ok_body
     assert "exit 1" not in ok_body.split("## Self-referential")[0].split("| 63-66-119-collated |")[1]
+
+
+def test_missing_trace_is_disclosed_and_check_fails(tmp_path):
+    """AC12 (issue #148, plan F7): a deleted trace can no longer be laundered
+    out of the census — after deletion both the store and the document lack
+    the slug, so only the committed ledger (docs/issue-trace-ledger.md) can
+    see it. Three arms in one sandbox:
+
+    1. delete — regeneration discloses `MISSING <slug>` on stderr and exits
+       nonzero; consecutive regenerations are byte-stable (document AND
+       ledger); --check fails naming the slug.
+    2. retire — flipping the ledger row to retired silences the MISSING and
+       --check goes clean, with byte-stable regenerations on either side.
+    3. store-present/document-absent — removing the rendered row by hand
+       fails --check via the same MISSING detection; regenerating restores
+       the document and --check passes.
+
+    Subprocess harness: the REAL generator, the REAL amend guard
+    (scripts/verify_amend_verbatim.py) and the vendored repro-check.sh are
+    copied into a throwaway git repo, so the census runs the real
+    verify-checkpoint legs rather than fakes. The guard itself never fires
+    in the sandbox: docs/amend-guard-baseline.json is absent there — the
+    guard's activation switch by design — so this test exercises the
+    ledger arm in isolation.
+    """
+    import hashlib
+    import shutil
+    import subprocess
+
+    repo_src = _SCRIPT.parents[1]
+    sandbox = tmp_path / "sandbox"
+    gen = sandbox / "scripts" / "gen_trace_drift_inventory.py"
+    guard = sandbox / "scripts" / "verify_amend_verbatim.py"
+    vendored = (repo_src / ".agents" / "skills" / "issue-tracer" /
+                "scripts" / "repro-check.sh")
+    for d in (
+        sandbox / "scripts",
+        sandbox / "docs",
+        sandbox / ".agents" / "skills" / "issue-tracer" / "scripts",
+        sandbox / ".agents" / "issue-traces" / "alpha-sandbox-trace" / "repro",
+        sandbox / ".agents" / "issue-traces" / "beta-sandbox-trace" / "repro",
+    ):
+        d.mkdir(parents=True)
+    shutil.copyfile(_SCRIPT, gen)
+    shutil.copyfile(repo_src / "scripts" / "verify_amend_verbatim.py", guard)
+    shutil.copyfile(vendored,
+                    sandbox / ".agents" / "skills" / "issue-tracer" /
+                    "scripts" / "repro-check.sh")
+    readme = sandbox / "README.md"
+    readme.write_text("# sandbox readme\n", encoding="utf-8", newline="\n")
+    data = readme.read_bytes()
+    blob = hashlib.sha1(b"blob %d\x00" % len(data) + data).hexdigest()
+    traces = sandbox / ".agents" / "issue-traces"
+    for slug in ("alpha-sandbox-trace", "beta-sandbox-trace"):
+        _write_manifest(traces / slug / "repro" / "checkpoint.manifest",
+                        [("CHECKPOINT", "README.md", blob, "C1")])
+
+    def _git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-c", "user.email=trace@example.invalid",
+             "-c", "user.name=trace sandbox", *args],
+            cwd=sandbox, capture_output=True, text=True, check=True)
+
+    _git("init", "-q")
+    _git("add", "-A")
+    _git("commit", "-q", "-m", "sandbox seed")
+
+    def _gen(*flags: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(gen), *flags],
+            cwd=sandbox, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=180)
+
+    def _doc() -> bytes:
+        return (sandbox / "docs" / "issue-trace-drift-inventory.md").read_bytes()
+
+    def _ledger() -> bytes:
+        return (sandbox / "docs" / "issue-trace-ledger.md").read_bytes()
+
+    assert _gen("--snapshot").returncode == 0  # seed the markers
+    seeded = _gen()  # first regen: appends BOTH slugs to the ledger
+    assert seeded.returncode == 0, seeded.stderr
+    ledger1 = _ledger().decode("utf-8")
+    assert "- alpha-sandbox-trace | active |" in ledger1
+    assert "- beta-sandbox-trace | active |" in ledger1
+
+    # Arm 1: delete a trace — the ledger discloses what the census can no
+    # longer see, both regenerations stay byte-stable, --check fails.
+    shutil.rmtree(traces / "alpha-sandbox-trace")
+    deleted = _gen()
+    assert deleted.returncode == 1
+    assert "MISSING alpha-sandbox-trace" in deleted.stderr
+    doc2, ledger2 = _doc(), _ledger()
+    again = _gen()
+    assert again.returncode == 1
+    assert "MISSING alpha-sandbox-trace" in again.stderr
+    assert _doc() == doc2  # byte-stable: MISSING is never rendered
+    assert _ledger() == ledger2  # the ledger is committed state, not regen content
+    checked = _gen("--check")
+    assert checked.returncode == 1
+    assert "MISSING alpha-sandbox-trace" in checked.stderr
+
+    # Arm 2: retire the deleted slug — the only manual ledger edit — and
+    # the census goes clean with byte-stable regenerations.
+    retired = ledger2.decode("utf-8").replace(
+        "- alpha-sandbox-trace | active |",
+        "- alpha-sandbox-trace | retired |", 1)
+    (sandbox / "docs" / "issue-trace-ledger.md").write_text(
+        retired, encoding="utf-8", newline="\n")
+    clean = _gen()
+    assert clean.returncode == 0, clean.stderr
+    assert "MISSING" not in clean.stderr
+    assert _doc() == doc2  # retirement changed no rendered byte
+    assert _gen().returncode == 0  # second regen: still byte-stable, still clean
+    assert _doc() == doc2
+    assert _gen("--check").returncode == 0
+
+    # Arm 3: store present, document row removed by hand — --check fails
+    # via the MISSING detection; regenerating restores the document.
+    doc_path = sandbox / "docs" / "issue-trace-drift-inventory.md"
+    surgically_reduced = "\n".join(
+        line for line in doc_path.read_text(encoding="utf-8").splitlines()
+        if not line.startswith("| beta-sandbox-trace |")) + "\n"
+    doc_path.write_text(surgically_reduced, encoding="utf-8", newline="\n")
+    tampered = _gen("--check")
+    assert tampered.returncode == 1
+    assert "MISSING beta-sandbox-trace" in tampered.stderr
+    restored = _gen()
+    assert restored.returncode == 0, restored.stderr
+    assert _doc() == doc2  # the regeneration rebuilt the exact census bytes
+    assert _gen("--check").returncode == 0
+
+
+def test_deleted_ledger_fails_check_closed(tmp_path, monkeypatch, capsys):
+    """FB-001 (issue #148 plan F7, reviewer round): a DELETED ledger is not
+    an empty one — with an empty one the deletion-laundering guard would
+    see no active rows and let every ledger-active trace silently pass as
+    rendered. --check must fail closed on a missing ledger (exit 1), with
+    the disclosure on stdout (the host pre-push hook discards stderr)."""
+    root = _sandbox(tmp_path, monkeypatch)
+    _fake_verify(monkeypatch, {
+        "63-66-119-collated": OK_SELF,
+        "sibling-wave": OK_SIBLING,
+    })
+    _seed_docs(root)
+    assert _main(monkeypatch, "--snapshot") == 0
+    assert _main(monkeypatch) == 0  # regenerate: bootstraps the ledger
+    ledger = root / "docs" / "issue-trace-ledger.md"
+    assert ledger.exists()
+    ledger.unlink()
+    rc = _main(monkeypatch, "--check")
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "missing or malformed" in captured.out
+
+
+def test_marker_less_ledger_fails_check_closed(tmp_path, monkeypatch, capsys):
+    """FB-001: a ledger whose ledger-rows markers are stripped is
+    malformed (its machine rows are unparseable) — --check fails closed
+    (exit 1) with the disclosure on stdout."""
+    root = _sandbox(tmp_path, monkeypatch)
+    _fake_verify(monkeypatch, {
+        "63-66-119-collated": OK_SELF,
+        "sibling-wave": OK_SIBLING,
+    })
+    _seed_docs(root)
+    assert _main(monkeypatch, "--snapshot") == 0
+    assert _main(monkeypatch) == 0  # regenerate: bootstraps the ledger
+    ledger = root / "docs" / "issue-trace-ledger.md"
+    ledger.write_text(
+        "# Issue-trace ledger\n\nno machine rows section here\n",
+        encoding="utf-8", newline="\n",
+    )
+    rc = _main(monkeypatch, "--check")
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "missing or malformed" in captured.out
+
+
+def test_tracked_but_missing_ledger_refuses_regen(tmp_path):
+    """FB-001b (closeout critic + re-review): a ledger committed in HEAD but
+    missing from the working tree is a DELETION, not a fresh sandbox —
+    regenerate must fail closed (exit 1) and must NOT rebuild it from the
+    skeleton (which would drop every previously active slug whose trace was
+    also deleted, laundering it). The check is HEAD-based (git cat-file -e),
+    so BOTH a staged `git rm` (arm A — the deliberate case) and an unstaged
+    `rm` (arm B — the careless case) are refused; only a ledger never
+    committed (a fresh sandbox / non-git tmp root) bootstraps. The untracked
+    bootstrap case is covered by the other self-ref tests (their _sandbox is
+    not a git repo)."""
+    import hashlib
+    import shutil
+    import subprocess
+
+    repo_src = _SCRIPT.parents[1]
+    sandbox = tmp_path / "sandbox"
+    gen = sandbox / "scripts" / "gen_trace_drift_inventory.py"
+    guard = sandbox / "scripts" / "verify_amend_verbatim.py"
+    vendored = (repo_src / ".agents" / "skills" / "issue-tracer" /
+                "scripts" / "repro-check.sh")
+    for d in (
+        sandbox / "scripts",
+        sandbox / "docs",
+        sandbox / ".agents" / "skills" / "issue-tracer" / "scripts",
+        sandbox / ".agents" / "issue-traces" / "alpha-sandbox-trace" / "repro",
+    ):
+        d.mkdir(parents=True)
+    shutil.copyfile(_SCRIPT, gen)
+    shutil.copyfile(repo_src / "scripts" / "verify_amend_verbatim.py", guard)
+    shutil.copyfile(vendored,
+                    sandbox / ".agents" / "skills" / "issue-tracer" /
+                    "scripts" / "repro-check.sh")
+    readme = sandbox / "README.md"
+    readme.write_text("# sandbox readme\n", encoding="utf-8", newline="\n")
+    data = readme.read_bytes()
+    blob = hashlib.sha1(b"blob %d\x00" % len(data) + data).hexdigest()
+    traces = sandbox / ".agents" / "issue-traces"
+    _write_manifest(traces / "alpha-sandbox-trace" / "repro" / "checkpoint.manifest",
+                    [("CHECKPOINT", "README.md", blob, "C1")])
+
+    def _git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-c", "user.email=trace@example.invalid",
+             "-c", "user.name=trace sandbox", *args],
+            cwd=sandbox, capture_output=True, text=True, check=True)
+
+    def _gen(*flags: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(gen), *flags],
+            cwd=sandbox, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=180)
+
+    def _ledger() -> Path:
+        return sandbox / "docs" / "issue-trace-ledger.md"
+
+    _git("init", "-q")
+    _git("add", "-A")
+    _git("commit", "-q", "-m", "sandbox seed")
+
+    assert _gen("--snapshot").returncode == 0
+    seeded = _gen()  # creates the ledger with alpha-sandbox-trace active
+    assert seeded.returncode == 0, seeded.stderr
+    assert "- alpha-sandbox-trace | active |" in _ledger().read_text(encoding="utf-8")
+    _git("add", "-A")
+    _git("commit", "-q", "-m", "seed ledger")  # make the ledger git-committed
+    assert _ledger().exists()
+
+    # Arm A: staged deletion (git rm) — the deliberate laundering path.
+    _git("rm", "-q", "docs/issue-trace-ledger.md")
+    refused = _gen()
+    assert refused.returncode == 1, refused.stderr
+    assert "tracked but missing" in refused.stderr
+    assert not _ledger().exists()  # the skeleton was NOT written
+    # Restore the ledger (working tree + index) for arm B.
+    _git("checkout", "-q", "HEAD", "--", "docs/issue-trace-ledger.md")
+    assert _ledger().exists()
+
+    # Arm B: unstaged deletion (rm) — the careless path.
+    _ledger().unlink()
+    refused2 = _gen()
+    assert refused2.returncode == 1, refused2.stderr
+    assert "tracked but missing" in refused2.stderr
+    assert not _ledger().exists()
+
+
+def test_ok_line_containing_the_self_path_is_not_excluded(tmp_path, monkeypatch):
+    """FB-009 (PR-144 RISK-02): an OK line whose PATH FIELD merely CONTAINS
+    the self path must be counted as a sibling OK, not silently excluded —
+    the old substring test (SELF_PATH not in line) excluded it. KILLS:
+    reverting gate_ok to the substring form drops the pair from the census
+    (pairs/OK render 0/0 instead of 1/1)."""
+    root = _sandbox(tmp_path, monkeypatch)
+    # Repoint the sibling manifest at a path that CONTAINS the self path
+    # (a field-level match keeps it a sibling; only exact equality is the
+    # self pair).
+    traces = root / ".agents" / "issue-traces"
+    _write_manifest(
+        traces / "sibling-wave" / "repro" / "checkpoint.manifest",
+        [("CHECKPOINT", mod.SELF_PATH + ".bak", "3" * 40, "C1")],
+    )
+    _fake_verify(monkeypatch, {
+        "63-66-119-collated": OK_SELF,
+        "sibling-wave": f"OK {mod.SELF_PATH}.bak\n",
+    })
+    _seed_docs(root)
+    assert _main(monkeypatch, "--snapshot") == 0
+    assert _main(monkeypatch) == 0  # regenerate in place
+    body = (root / "docs" / "issue-trace-drift-inventory.md").read_text(encoding="utf-8")
+    assert "| sibling-wave | 1 | 1 | 0 |" in body
+
+
+def test_verifier_selection_prefers_user_level(tmp_path, monkeypatch):
+    """Issue #148 (final-critic round 2): the drift gate's _verifier()
+    selection must prefer the user-level v1+v2-capable repro-check.sh and
+    fall back to the vendored path. Pins both arms against the real
+    generator module."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "gendi", "scripts/gen_trace_drift_inventory.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(mod.Path, "home", classmethod(lambda cls: fake_home))
+    assert mod._verifier() == mod.REPRO, (
+        "without a user-level verifier the vendored path must be the fallback")
+    user_scripts = fake_home / ".zcode" / "skills" / "issue-tracer" / "scripts"
+    user_scripts.mkdir(parents=True)
+    (user_scripts / "repro-check.sh").write_text("#!/bin/sh" + chr(10), encoding="utf-8")
+    got = mod._verifier()
+    assert Path(got) == user_scripts / "repro-check.sh", (
+        f"the user-level verifier must be preferred, got {got}")

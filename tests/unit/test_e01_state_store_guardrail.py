@@ -60,6 +60,8 @@ _REQUIRED_RELAY_COLUMNS = {
     "started_at", "state", "cred_ref", "owner",
     # Issue #30: same identity binding as the jobs table.
     "cred_profile", "cred_username",
+    # Issue #151: the persisted relay kind ('http' | 'tcp').
+    "kind",
 }
 # Issue #23. The fencing counter columns are named *_seq (NOT *_token)
 # deliberately: "token" is a forbidden fragment, and narrowing that list to

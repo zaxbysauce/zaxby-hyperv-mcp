@@ -47,7 +47,7 @@ from typing import Any
 
 from .config import Config, default_state_db_path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 BUSY_TIMEOUT_MS = 5000
 
 # Lease scopes (issue #23). `lifecycle` is exclusive against every other
@@ -140,7 +140,12 @@ _SCHEMA_STATEMENTS = (
         -- Issue #30: same identity binding as the jobs table.
         cred_profile TEXT NOT NULL DEFAULT '',
         cred_username TEXT NOT NULL DEFAULT '',
-        owner TEXT
+        owner TEXT,
+        -- Issue #151: the relay kind ('http' | 'tcp'). Persisted so a
+        -- restored relay reports the kind it was started with; 'http' is the
+        -- default for pre-v5 rows (http was the only kind that existed).
+        -- Declared last to match _RELAY_COLUMNS (kind @12).
+        kind TEXT NOT NULL DEFAULT 'http'
     )
     """,
     """
@@ -269,10 +274,19 @@ _V4_COLUMN_STATEMENTS = (
     "ALTER TABLE jobs ADD COLUMN cred_username TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE relays ADD COLUMN cred_username TEXT NOT NULL DEFAULT ''",
 )
+# -- v5 (issue #151): the relay kind column. The fresh-schema relays CREATE
+# already carries it; this migration is the additive ALTER for stores created
+# at v4 or earlier. Default 'http' preserves every pre-v5 row's disclosed
+# semantics (issue #135's _restored_entry residual: a restored relay was
+# always reported http because http was the only kind that existed).
+_V5_COLUMN_STATEMENTS = (
+    "ALTER TABLE relays ADD COLUMN kind TEXT NOT NULL DEFAULT 'http'",
+)
 _MIGRATIONS: dict[int, tuple[str, ...]] = {
     1: _V2_STATEMENTS,
     2: _V3_TABLE_STATEMENTS,
     3: _V4_COLUMN_STATEMENTS,
+    4: _V5_COLUMN_STATEMENTS,
 }
 
 
@@ -332,6 +346,11 @@ def _migrate_to(con: sqlite3.Connection, found: int) -> None:
             raise StateStoreError(
                 "state store migration pin broken: the v3->v4 migration must be "
                 "exactly the v4 statements (cred_profile/cred_username ALTERs)"
+            )
+        if _MIGRATIONS[4] != _V5_COLUMN_STATEMENTS or not _MIGRATIONS[4]:
+            raise StateStoreError(
+                "state store migration pin broken: the v4->v5 migration must be "
+                "exactly the v5 statement (the relays kind ALTER)"
             )
         # The migration is additive CREATE ... IF NOT EXISTS, so it must not
         # paper over a schema that is missing the versions BELOW it: a store
@@ -537,6 +556,9 @@ class RelayRow:
     # row or a reservation placeholder). Never the secret itself.
     cred_profile: str = ""
     cred_username: str = ""
+    # Issue #151: the relay kind ('http' | 'tcp'); 'http' = pre-v5 row
+    # default (http was the only kind that existed before issue #135).
+    kind: str = "http"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -552,6 +574,7 @@ class RelayRow:
             "owner": self.owner,
             "cred_profile": self.cred_profile,
             "cred_username": self.cred_username,
+            "kind": self.kind,
         }
 
 
@@ -589,6 +612,7 @@ def _row_to_relay(values: tuple) -> RelayRow:
         owner=None if values[9] is None else str(values[9]),
         cred_profile=str(values[10] or ""),
         cred_username=str(values[11] or ""),
+        kind=str(values[12] or "http"),
     )
 
 
@@ -599,7 +623,7 @@ _JOB_COLUMNS = (
 )
 _RELAY_COLUMNS = (
     "relay_id, vm_name, vm_id, guest_port, bind, host_port, started_at, "
-    "state, cred_ref, owner, cred_profile, cred_username"
+    "state, cred_ref, owner, cred_profile, cred_username, kind"
 )
 
 
@@ -842,19 +866,19 @@ class Store:
             try:
                 self._connect().execute(
                     "INSERT INTO relays (" + _RELAY_COLUMNS + ") "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(relay_id) DO UPDATE SET "
                     "vm_name=excluded.vm_name, vm_id=excluded.vm_id, "
                     "guest_port=excluded.guest_port, bind=excluded.bind, "
                     "host_port=excluded.host_port, started_at=excluded.started_at, "
                     "state=excluded.state, cred_ref=excluded.cred_ref, "
                     "owner=excluded.owner, cred_profile=excluded.cred_profile, "
-                    "cred_username=excluded.cred_username",
+                    "cred_username=excluded.cred_username, kind=excluded.kind",
                     (
                         row.relay_id, row.vm_name, row.vm_id, row.guest_port,
                         row.bind, row.host_port, row.started_at, row.state,
                         row.cred_ref, row.owner,
-                        row.cred_profile, row.cred_username,
+                        row.cred_profile, row.cred_username, row.kind,
                     ),
                 )
                 self._commit()
