@@ -89,7 +89,7 @@ def verify_manifest(manifest_path: Path, baseline: dict) -> tuple[int, list]:
         print(f"verify_amend_verbatim: {slug}: watermark_seq must be a "
               f"non-negative int (got {watermark!r})", file=sys.stderr)
         return 3, []
-    findings = []
+    findings: list[dict] = []
     worst = 0
     rows = parse_manifest(manifest_path)
     max_seq = max((row["seq"] for row in rows), default=0)
