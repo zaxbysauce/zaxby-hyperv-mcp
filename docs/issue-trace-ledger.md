@@ -61,4 +61,5 @@ it adds no self-referential hash surface to the inventory document.
 - issue-14-vm-rw-locks | active | c3a9f8d0241faeb4e3656e097e7855fb855f11aa | -
 - issue-15-ps-cap-cancel | active | c3a9f8d0241faeb4e3656e097e7855fb855f11aa | -
 - issue-16-tool-concurrency | active | c3a9f8d0241faeb4e3656e097e7855fb855f11aa | -
+- 163-156-followup-pair | active | f5b8e39b03ec503feca71154b537a45a8f2e6799 | -
 <!-- ledger-rows-end -->

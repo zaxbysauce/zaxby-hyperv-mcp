@@ -184,7 +184,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.22.0 today) instead of
+  package's version (0.23.0 today) instead of
   the SDK's (the release contract, the complete bump-site
   enumeration, and how to read `version`/`git_revision` live in
   [docs/versioning-policy.md](docs/versioning-policy.md)).
@@ -233,6 +233,31 @@ restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.23.0 changes
+
+- **Evidence-run root uniqueness (#163):** `hyperv_evidence_run_start` now refuses a
+  `run_dir` already claimed by a live run (open, closing, or initializing) with an
+  `invalid`-class error naming the owning run id prefix ("already in use by run <id>").
+  The refusal fires under the registry lock before any registry entry, directory
+  creation, or journal write. Previously the reuse guard only fired after a previous
+  run's stop artifacts existed, so a sequential second start or a concurrent same-root
+  race admitted two live runs on one root and their stop artifacts interleaved.
+- **Frozen-ledger wave (#156):** blob drift cleared on all 51 pre-existing drifted
+  frozen-check pairs across 12 traces (CHECK_WRONG AMENDs, preserved bases); 166
+  replayable pairs re-verified PASS with the census regenerated and committed at the
+  final head (the pre-push gate green with no bypass; the new trace's own census
+  self-pin pair is #143-excluded by construction). 36 pairs whose frozen bases
+  predate their frozen tests' surfaces (replay-visible base-drift, invisible to
+  the blob census) are re-pinned but their re-base is operator-gated and deferred
+  (six of them — 74-72-88 C1/C5/C10, 30-per-vm C13, 29-uia C15, 19-screenshot C15 —
+  carry FAIL/ERROR replay verdicts recorded in the wave matrix, no PASS fabricated);
+  the 63-66-119 C8 inventory self-pin remains the #143-excluded unreachable quine
+  (the census is settled at its rendered state); 74-72-88 anchored via the plain
+  anchor, 63-66-119 via the issue-tracer anchor-raw construction (a verified-receipt
+  fallback for traces whose only stale pair is the #143-excluded self-pin); issue
+  #156 stays open on its re-base acceptance criterion (the operator-gated re-base).
+- Version bump: 0.22.0 -> 0.23.0.
 
 ## 0.22.0 changes
 
