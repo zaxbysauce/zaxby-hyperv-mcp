@@ -23,7 +23,7 @@ reported below (issue #143).
 | 143-130-collated | 12 | 12 | 0 | clean |
 | 147-trace-drift-repair | 4 | 4 | 0 | clean |
 | 148-151-153-followup-hygiene-triad | 26 | 26 | 0 | clean |
-| 163-156-followup-pair | 11 | 11 | 0 | clean |
+| 163-156-followup-pair | 11 | 10 | 1 | exit 1 |
 | 17-rgb565-native-decode | 12 | 12 | 0 | clean |
 | 18-console-one-ps-process-per-call | 17 | 17 | 0 | clean |
 | 19-screenshot-output-options | 23 | 23 | 0 | clean |
@@ -45,11 +45,11 @@ reported below (issue #143).
 | 55-108-31-32-33-collated | 14 | 14 | 0 | clean |
 | 59-64-68-70-hardening-wave | 15 | 15 | 0 | clean |
 | 6-guest-put-get-policy | 13 | 13 | 0 | clean |
-| 63-66-119-collated | 12 | 12 | 0 | clean |
+| 63-66-119-collated | 12 | 10 | 2 | exit 1 |
 | 64-68-collated | 11 | 11 | 0 | clean |
 | 67-118-release-vendor-provenance | 10 | 10 | 0 | clean |
 | 7-guest-jobs-truthful-reporting | 13 | 13 | 0 | clean |
-| 74-72-88-cost-latency-accounting | 17 | 16 | 1 | exit 1 |
+| 74-72-88-cost-latency-accounting | 17 | 17 | 0 | clean |
 | 75-76-78-81-83-84-collated | 26 | 26 | 0 | clean |
 | 77-28-console-actor-batched-sequences | 18 | 18 | 0 | clean |
 | 8-vm-guid-identity | 11 | 11 | 0 | clean |
@@ -74,9 +74,14 @@ wave's bookkeeping and is never a gate failure.
 
 ## Drift detail (CHANGED pairs)
 
-### 74-72-88-cost-latency-accounting (exit 1)
+### 163-156-followup-pair (exit 1)
 
-- `CHANGED README.md db6f11bd92934bd083855c9e5f2ee6d6f6e58801 3164af1a0713db0426af20de8f66c73a7a60d5e1 (C10)`
+- `CHANGED .agents/issue-traces/74-72-88-cost-latency-accounting/repro/checkpoint.manifest 904c5ec87dc18013fb7fadfa8ce7f3d875764cda b3d6fb54fcef24927a0b345659f5446e443735fd (C5)`
+
+### 63-66-119-collated (exit 1)
+
+- `CHANGED .agents/issue-traces/74-72-88-cost-latency-accounting/repro/checkpoint.manifest 904c5ec87dc18013fb7fadfa8ce7f3d875764cda b3d6fb54fcef24927a0b345659f5446e443735fd (C9)`
+- `CHANGED .agents/issue-traces/74-72-88-cost-latency-accounting/repro/checkpoint.manifest 904c5ec87dc18013fb7fadfa8ce7f3d875764cda b3d6fb54fcef24927a0b345659f5446e443735fd (C10)`
 
 <!-- regenerated-state-end -->
 
