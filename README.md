@@ -246,13 +246,17 @@ the task-spawned controller reads it from the environment.
 - **Frozen-ledger wave (#156):** blob drift cleared on all 51 pre-existing drifted
   frozen-check pairs across 12 traces (CHECK_WRONG AMENDs, preserved bases); 166
   replayable pairs re-verified PASS with the census regenerated and committed at the
-  final head (the pre-push gate green with no bypass). 36 pairs whose frozen bases
-  predate their frozen tests' surfaces (replay-visible base-drift, invisible to the
-  blob census) are re-pinned but their re-base is operator-gated and deferred; the
-  63-66-119 C8 inventory self-pin remains the #143-excluded unreachable quine (the
-  census is settled at its rendered state); 74-72-88 anchored via the plain anchor,
-  63-66-119 via the documented anchor-raw fallback; issue #156 stays open on its AC3
-  (the operator-gated re-base).
+  final head (the pre-push gate green with no bypass; the new trace's own census
+  self-pin pair is #143-excluded by construction). 36 pairs whose frozen bases
+  predate their frozen tests' surfaces (replay-visible base-drift, invisible to
+  the blob census) are re-pinned but their re-base is operator-gated and deferred
+  (six of them — 74-72-88 C1/C5/C10, 30-per-vm C13, 29-uia C15, 19-screenshot C15 —
+  carry FAIL/ERROR replay verdicts recorded in the wave matrix, no PASS fabricated);
+  the 63-66-119 C8 inventory self-pin remains the #143-excluded unreachable quine
+  (the census is settled at its rendered state); 74-72-88 anchored via the plain
+  anchor, 63-66-119 via the issue-tracer anchor-raw construction (a verified-receipt
+  fallback for traces whose only stale pair is the #143-excluded self-pin); issue
+  #156 stays open on its re-base acceptance criterion (the operator-gated re-base).
 - Version bump: 0.22.0 -> 0.23.0.
 
 ## 0.22.0 changes
