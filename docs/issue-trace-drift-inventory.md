@@ -49,7 +49,7 @@ reported below (issue #143).
 | 64-68-collated | 11 | 11 | 0 | clean |
 | 67-118-release-vendor-provenance | 10 | 10 | 0 | clean |
 | 7-guest-jobs-truthful-reporting | 13 | 13 | 0 | clean |
-| 74-72-88-cost-latency-accounting | 17 | 17 | 0 | clean |
+| 74-72-88-cost-latency-accounting | 17 | 16 | 1 | exit 1 |
 | 75-76-78-81-83-84-collated | 26 | 26 | 0 | clean |
 | 77-28-console-actor-batched-sequences | 18 | 18 | 0 | clean |
 | 8-vm-guid-identity | 11 | 11 | 0 | clean |
@@ -74,7 +74,10 @@ wave's bookkeeping and is never a gate failure.
 
 ## Drift detail (CHANGED pairs)
 
-None — every gate-relevant frozen pair verifies OK at the current tree.
+### 74-72-88-cost-latency-accounting (exit 1)
+
+- `CHANGED README.md db6f11bd92934bd083855c9e5f2ee6d6f6e58801 3164af1a0713db0426af20de8f66c73a7a60d5e1 (C10)`
+
 <!-- regenerated-state-end -->
 
 ## Discovery snapshot (recorded 2026-11-05, base 8bc60cb7196ae128231c25a15881cded26b0afda)
