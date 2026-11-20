@@ -23,7 +23,7 @@ reported below (issue #143).
 | 143-130-collated | 12 | 12 | 0 | clean |
 | 147-trace-drift-repair | 4 | 4 | 0 | clean |
 | 148-151-153-followup-hygiene-triad | 26 | 26 | 0 | clean |
-| 163-156-followup-pair | 11 | 10 | 1 | exit 1 |
+| 163-156-followup-pair | 11 | 11 | 0 | clean |
 | 17-rgb565-native-decode | 12 | 12 | 0 | clean |
 | 18-console-one-ps-process-per-call | 17 | 17 | 0 | clean |
 | 19-screenshot-output-options | 23 | 23 | 0 | clean |
@@ -74,10 +74,7 @@ wave's bookkeeping and is never a gate failure.
 
 ## Drift detail (CHANGED pairs)
 
-### 163-156-followup-pair (exit 1)
-
-- `CHANGED .agents/issue-traces/63-66-119-collated/repro/checkpoint.manifest be4b6b77f78db02dee7520f37a037d6bae9b6c0d 88c606b674afc07a0d990a90d4d27ad1e200b944 (C4)`
-
+None — every gate-relevant frozen pair verifies OK at the current tree.
 <!-- regenerated-state-end -->
 
 ## Discovery snapshot (recorded 2026-11-05, base 8bc60cb7196ae128231c25a15881cded26b0afda)
