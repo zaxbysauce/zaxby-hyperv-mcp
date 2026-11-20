@@ -157,6 +157,12 @@ def test_sequential_second_start_on_claimed_root_refused(tmp_path):
         "a second start_run on a root already claimed by a LIVE run must "
         f"be refused; it accepted it: {second!r}")
     assert second.get("error_class") == "invalid", second
+    assert f"already in use by run {first['run_id'][:8]}" in second.get(
+        "error", ""), (
+        "the refusal must name the claiming run's OWN id prefix "
+        f"(error text contract: 'already in use by run <id-prefix>' with "
+        f"the admitted run's id {first['run_id'][:8]!r}); got: "
+        f"{second.get('error', '')!r}")
 
     # No second frames dir / nothing extra under the claimed root, and no
     # extra registry entry: exactly the admitted run's one entry remains.
@@ -170,6 +176,16 @@ def test_sequential_second_start_on_claimed_root_refused(tmp_path):
         assert len(ej._RUNS) == 1, (
             "a refused start must not leave a second registry entry; "
             f"registry size: {len(ej._RUNS)}")
+
+    # Negative control (review round: overreach): a DIFFERENT root must
+    # stay admissible while the first root is claimed — a refusal that is
+    # too broad would silently take the feature down. Runs after the
+    # registry-size assertion above (which pins the post-refusal state).
+    other = ej.start_run(str(tmp_path / "other-root"), ["test-vm"])
+    assert other.get("ok") is True, (
+        "a start on an UNclaimed root must stay admissible while another "
+        f"root is claimed (the refusal must not be over-broad); got: "
+        f"{other!r}")
 
 
 def _canonical_root(cfg: Config, root: Path) -> Path:
@@ -248,6 +264,32 @@ def test_same_root_refused_while_first_closing(tmp_path):
         assert len(ej._RUNS) == 1, (
             "the refused start must not add a registry entry; registry "
             f"size: {len(ej._RUNS)}")
+
+
+def test_cross_agent_root_uniqueness(tmp_path):
+    """Review round (swarm-pr-review): the uniqueness loop is deliberately
+    CROSS-agent (no `r.agent == ag` filter — unlike the per-agent cap check
+    above it), and that scope is the fix's core invariant. RED at base only
+    in the sense that any agent-filter regression would re-admit here: this
+    test pins the cross-agent refusal so a copy-paste `and r.agent == ag`
+    regression cannot pass the suite."""
+    cfg = _journal_cfg(tmp_path)
+    _install(cfg)
+
+    root = tmp_path / "cross-agent-root"
+    first = ej.start_run(str(root), ["test-vm"], agent="agent-a")
+    assert first.get("ok") is True, first
+
+    second = ej.start_run(str(root), ["test-vm"], agent="agent-b")
+    assert second.get("ok") is False, (
+        "a DIFFERENT agent's start_run on a root claimed by another "
+        "agent's live run must still be refused (uniqueness is "
+        f"cross-agent, not per-agent); it accepted it: {second!r}")
+    assert second.get("error_class") == "invalid", second
+    assert f"already in use by run {first['run_id'][:8]}" in second.get(
+        "error", ""), (
+        "the cross-agent refusal must name the owning run's id prefix; "
+        f"got: {second.get('error', '')!r}")
 
 
 def test_mkdir_failure_rollback_releases_root(tmp_path, monkeypatch):
