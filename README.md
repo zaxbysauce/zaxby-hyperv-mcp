@@ -243,11 +243,16 @@ the task-spawned controller reads it from the environment.
   creation, or journal write. Previously the reuse guard only fired after a previous
   run's stop artifacts existed, so a sequential second start or a concurrent same-root
   race admitted two live runs on one root and their stop artifacts interleaved.
-- **Frozen-ledger wave (#156):** all 51 pre-existing drifted frozen-check pairs across
-  12 traces repaired via CHECK_WRONG AMENDs with preserved bases and recorded
-  replays; the 63-66-119 C8 inventory self-pin driven to its documented fixed point;
-  anchor + verify-anchor enabled on 74-72-88-cost-latency-accounting and 63-66-119;
-  the census and ledger regenerated and committed at the final head.
+- **Frozen-ledger wave (#156):** blob drift cleared on all 51 pre-existing drifted
+  frozen-check pairs across 12 traces (CHECK_WRONG AMENDs, preserved bases); 166
+  replayable pairs re-verified PASS with the census regenerated and committed at the
+  final head (the pre-push gate green with no bypass). 36 pairs whose frozen bases
+  predate their frozen tests' surfaces (replay-visible base-drift, invisible to the
+  blob census) are re-pinned but their re-base is operator-gated and deferred; the
+  63-66-119 C8 inventory self-pin remains the #143-excluded unreachable quine (the
+  census is settled at its rendered state); 74-72-88 anchored via the plain anchor,
+  63-66-119 via the documented anchor-raw fallback; issue #156 stays open on its AC3
+  (the operator-gated re-base).
 - Version bump: 0.22.0 -> 0.23.0.
 
 ## 0.22.0 changes
