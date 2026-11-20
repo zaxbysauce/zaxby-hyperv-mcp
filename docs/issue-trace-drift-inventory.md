@@ -10,37 +10,38 @@ reported below (issue #143).
 
 | trace | pairs | OK | CHANGED | verify-checkpoint |
 |---|---:|---:|---:|---|
-| 10-agent-identity-audit-correlation | 12 | 11 | 1 | exit 1 |
+| 10-agent-identity-audit-correlation | 12 | 12 | 0 | clean |
 | 11-job-relay-ownership | 12 | 12 | 0 | clean |
 | 115-86-71-60-collated | 9 | 9 | 0 | clean |
 | 12-remote-hyperv-host | 7 | 7 | 0 | clean |
 | 125-126-console-accuracy-commit-guard | 11 | 11 | 0 | clean |
-| 128-129-134-gui-drivability | 20 | 13 | 7 | exit 1 |
-| 13-stdio-proxy | 10 | 8 | 2 | exit 1 |
+| 128-129-134-gui-drivability | 20 | 20 | 0 | clean |
+| 13-stdio-proxy | 10 | 10 | 0 | clean |
 | 135-127-138-gui-electron-drivability | 53 | 53 | 0 | clean |
-| 136-137-uia-element-contract | 27 | 14 | 13 | exit 1 |
+| 136-137-uia-element-contract | 27 | 27 | 0 | clean |
 | 140-126-uia-state-receipt | 44 | 44 | 0 | clean |
 | 143-130-collated | 12 | 12 | 0 | clean |
 | 147-trace-drift-repair | 4 | 4 | 0 | clean |
 | 148-151-153-followup-hygiene-triad | 26 | 26 | 0 | clean |
+| 163-156-followup-pair | 11 | 11 | 0 | clean |
 | 17-rgb565-native-decode | 12 | 12 | 0 | clean |
 | 18-console-one-ps-process-per-call | 17 | 17 | 0 | clean |
-| 19-screenshot-output-options | 23 | 22 | 1 | exit 1 |
+| 19-screenshot-output-options | 23 | 23 | 0 | clean |
 | 20-per-call-timing-soak-benchmark | 17 | 17 | 0 | clean |
 | 21-psdirect-session-reuse | 31 | 31 | 0 | clean |
 | 22-durable-state-store | 15 | 15 | 0 | clean |
 | 23-leases-with-fencing-tokens | 16 | 16 | 0 | clean |
 | 24-durable-operation-handles | 19 | 19 | 0 | clean |
 | 25-f1-console-keyboard-click-origin | 11 | 11 | 0 | clean |
-| 26-checkpoint-type-standard | 11 | 10 | 1 | exit 1 |
+| 26-checkpoint-type-standard | 11 | 11 | 0 | clean |
 | 27-frame-stable-wait | 14 | 14 | 0 | clean |
-| 29-uia-helper-element-desktop | 19 | 18 | 1 | exit 1 |
-| 30-per-vm-credential-profiles | 30 | 29 | 1 | exit 1 |
-| 31-32-33-94-workstream-g-deployment | 18 | 14 | 4 | exit 1 |
+| 29-uia-helper-element-desktop | 19 | 19 | 0 | clean |
+| 30-per-vm-credential-profiles | 30 | 30 | 0 | clean |
+| 31-32-33-94-workstream-g-deployment | 18 | 18 | 0 | clean |
 | 31-79-live-host-confirmation | 7 | 7 | 0 | clean |
-| 44-vm-display-resolution | 8 | 0 | 8 | exit 1 |
+| 44-vm-display-resolution | 8 | 8 | 0 | clean |
 | 45-console-direct-wmi | 8 | 8 | 0 | clean |
-| 5-ps51-sanitized-env | 8 | 0 | 8 | exit 1 |
+| 5-ps51-sanitized-env | 8 | 8 | 0 | clean |
 | 55-108-31-32-33-collated | 14 | 14 | 0 | clean |
 | 59-64-68-70-hardening-wave | 15 | 15 | 0 | clean |
 | 6-guest-put-get-policy | 13 | 13 | 0 | clean |
@@ -48,7 +49,7 @@ reported below (issue #143).
 | 64-68-collated | 11 | 11 | 0 | clean |
 | 67-118-release-vendor-provenance | 10 | 10 | 0 | clean |
 | 7-guest-jobs-truthful-reporting | 13 | 13 | 0 | clean |
-| 74-72-88-cost-latency-accounting | 17 | 13 | 4 | exit 1 |
+| 74-72-88-cost-latency-accounting | 17 | 17 | 0 | clean |
 | 75-76-78-81-83-84-collated | 26 | 26 | 0 | clean |
 | 77-28-console-actor-batched-sequences | 18 | 18 | 0 | clean |
 | 8-vm-guid-identity | 11 | 11 | 0 | clean |
@@ -68,97 +69,12 @@ quine (final-critic finding 4, twice over). The frozen blob lives
 in the trace's manifest; re-anchoring is the next re-baseline
 wave's bookkeeping and is never a gate failure.
 
+- `163-156-followup-pair` C2 (informational; excluded from the gate)
 - `63-66-119-collated` C8 (informational; excluded from the gate)
 
 ## Drift detail (CHANGED pairs)
 
-### 10-agent-identity-audit-correlation (exit 1)
-
-- `CHANGED tests/unit/test_server.py 179763e841c93718bd8fe7d70e35b635f7e59a65 4c5832afd2c574028595d48b531ffc79d13f0f23 (C12)`
-
-### 128-129-134-gui-drivability (exit 1)
-
-- `CHANGED tests/unit/test_gui_playbook_prompt.py 8abe86e3f576610642b56e067971d25f792617bf 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 (C09)`
-- `CHANGED tests/unit/test_gui_playbook_prompt.py 8abe86e3f576610642b56e067971d25f792617bf 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 (C10)`
-- `CHANGED tests/unit/test_gui_playbook_prompt.py 8abe86e3f576610642b56e067971d25f792617bf 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 (C11)`
-- `CHANGED tests/unit/test_gui_playbook_prompt.py 8abe86e3f576610642b56e067971d25f792617bf 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 (C12)`
-- `CHANGED tests/unit/test_gui_playbook_prompt.py 8abe86e3f576610642b56e067971d25f792617bf 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 (C13)`
-- `CHANGED tests/unit/test_gui_playbook_prompt.py 8abe86e3f576610642b56e067971d25f792617bf 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 (C17)`
-- `CHANGED tests/unit/test_gui_playbook_prompt.py 8abe86e3f576610642b56e067971d25f792617bf 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 (C21)`
-
-### 13-stdio-proxy (exit 1)
-
-- `CHANGED tests/unit/test_server.py 179763e841c93718bd8fe7d70e35b635f7e59a65 4c5832afd2c574028595d48b531ffc79d13f0f23 (C11)`
-- `CHANGED tests/unit/test_server.py 179763e841c93718bd8fe7d70e35b635f7e59a65 4c5832afd2c574028595d48b531ffc79d13f0f23 (C12)`
-
-### 136-137-uia-element-contract (exit 1)
-
-- `CHANGED tests/unit/test_uia_refs_actions.py e1c4495a4e86e9c0155bd45735be7eb359ccd187 87d8914607b9a0dfc217b535af5435676701bb10 (C10)`
-- `CHANGED tests/unit/test_uia_refs_actions.py e1c4495a4e86e9c0155bd45735be7eb359ccd187 87d8914607b9a0dfc217b535af5435676701bb10 (C11)`
-- `CHANGED tests/unit/test_uia_refs_actions.py e1c4495a4e86e9c0155bd45735be7eb359ccd187 87d8914607b9a0dfc217b535af5435676701bb10 (C12)`
-- `CHANGED tests/unit/test_uia_refs_actions.py e1c4495a4e86e9c0155bd45735be7eb359ccd187 87d8914607b9a0dfc217b535af5435676701bb10 (C13)`
-- `CHANGED tests/unit/test_uia_refs_actions.py e1c4495a4e86e9c0155bd45735be7eb359ccd187 87d8914607b9a0dfc217b535af5435676701bb10 (C14)`
-- `CHANGED tests/unit/test_uia_refs_actions.py e1c4495a4e86e9c0155bd45735be7eb359ccd187 87d8914607b9a0dfc217b535af5435676701bb10 (C15)`
-- `CHANGED tests/unit/test_uia_refs_actions.py e1c4495a4e86e9c0155bd45735be7eb359ccd187 87d8914607b9a0dfc217b535af5435676701bb10 (C16)`
-- `CHANGED tests/unit/test_uia_refs_actions.py e1c4495a4e86e9c0155bd45735be7eb359ccd187 87d8914607b9a0dfc217b535af5435676701bb10 (C17)`
-- `CHANGED tests/unit/test_uia_refs_actions.py e1c4495a4e86e9c0155bd45735be7eb359ccd187 87d8914607b9a0dfc217b535af5435676701bb10 (C18)`
-- `CHANGED tests/unit/test_uia_refs_actions.py e1c4495a4e86e9c0155bd45735be7eb359ccd187 87d8914607b9a0dfc217b535af5435676701bb10 (C19)`
-- `CHANGED tests/unit/test_uia_refs_actions.py e1c4495a4e86e9c0155bd45735be7eb359ccd187 87d8914607b9a0dfc217b535af5435676701bb10 (C20)`
-- `CHANGED tests/unit/test_uia_refs_actions.py e1c4495a4e86e9c0155bd45735be7eb359ccd187 87d8914607b9a0dfc217b535af5435676701bb10 (C21)`
-- `CHANGED tests/unit/test_uia_refs_actions.py e1c4495a4e86e9c0155bd45735be7eb359ccd187 87d8914607b9a0dfc217b535af5435676701bb10 (C22)`
-
-### 19-screenshot-output-options (exit 1)
-
-- `CHANGED tests/unit/test_server.py 179763e841c93718bd8fe7d70e35b635f7e59a65 4c5832afd2c574028595d48b531ffc79d13f0f23 (C15)`
-
-### 26-checkpoint-type-standard (exit 1)
-
-- `CHANGED tests/unit/test_server.py 179763e841c93718bd8fe7d70e35b635f7e59a65 4c5832afd2c574028595d48b531ffc79d13f0f23 (C9)`
-
-### 29-uia-helper-element-desktop (exit 1)
-
-- `CHANGED tests/unit/test_server.py 179763e841c93718bd8fe7d70e35b635f7e59a65 4c5832afd2c574028595d48b531ffc79d13f0f23 (C15)`
-
-### 30-per-vm-credential-profiles (exit 1)
-
-- `CHANGED tests/unit/test_server.py 179763e841c93718bd8fe7d70e35b635f7e59a65 4c5832afd2c574028595d48b531ffc79d13f0f23 (C13)`
-
-### 31-32-33-94-workstream-g-deployment (exit 1)
-
-- `CHANGED tests/unit/test_g02_clone_remove.py acb5f6c317a9a69dc4889dad93b09ed2ab76e406 58399519c6376cd549384073ce666013e8390097 (C1)`
-- `CHANGED tests/unit/test_g02_clone_remove.py acb5f6c317a9a69dc4889dad93b09ed2ab76e406 58399519c6376cd549384073ce666013e8390097 (C2)`
-- `CHANGED tests/unit/test_g02_clone_remove.py acb5f6c317a9a69dc4889dad93b09ed2ab76e406 58399519c6376cd549384073ce666013e8390097 (C4)`
-- `CHANGED tests/unit/test_g02_clone_remove.py acb5f6c317a9a69dc4889dad93b09ed2ab76e406 58399519c6376cd549384073ce666013e8390097 (C5)`
-
-### 44-vm-display-resolution (exit 1)
-
-- `CHANGED tests/unit/test_vm_video.py b4be413f8d7060183035cc3d90511d1e7d35b4f1 13b83bac515cc534604e00b637c716c0fffae2b0 (C1)`
-- `CHANGED tests/unit/test_vm_video.py b4be413f8d7060183035cc3d90511d1e7d35b4f1 13b83bac515cc534604e00b637c716c0fffae2b0 (C2)`
-- `CHANGED tests/unit/test_vm_video.py b4be413f8d7060183035cc3d90511d1e7d35b4f1 13b83bac515cc534604e00b637c716c0fffae2b0 (C3)`
-- `CHANGED tests/unit/test_vm_video.py b4be413f8d7060183035cc3d90511d1e7d35b4f1 13b83bac515cc534604e00b637c716c0fffae2b0 (C4)`
-- `CHANGED tests/unit/test_vm_video.py b4be413f8d7060183035cc3d90511d1e7d35b4f1 13b83bac515cc534604e00b637c716c0fffae2b0 (C5)`
-- `CHANGED tests/unit/test_vm_video.py b4be413f8d7060183035cc3d90511d1e7d35b4f1 13b83bac515cc534604e00b637c716c0fffae2b0 (C6)`
-- `CHANGED tests/unit/test_vm_video.py b4be413f8d7060183035cc3d90511d1e7d35b4f1 13b83bac515cc534604e00b637c716c0fffae2b0 (C7)`
-- `CHANGED tests/unit/test_vm_video.py b4be413f8d7060183035cc3d90511d1e7d35b4f1 13b83bac515cc534604e00b637c716c0fffae2b0 (C8)`
-
-### 5-ps51-sanitized-env (exit 1)
-
-- `CHANGED tests/unit/test_a01_ps_environment.py d7406519db64feb210ca05a0357eda34b9dd983e 6b0015da16415a2fd18c8e5169ed724535a32d5d (C1)`
-- `CHANGED tests/unit/test_a01_ps_environment.py d7406519db64feb210ca05a0357eda34b9dd983e 6b0015da16415a2fd18c8e5169ed724535a32d5d (C2)`
-- `CHANGED tests/unit/test_a01_ps_environment.py d7406519db64feb210ca05a0357eda34b9dd983e 6b0015da16415a2fd18c8e5169ed724535a32d5d (C3)`
-- `CHANGED tests/unit/test_a01_ps_environment.py d7406519db64feb210ca05a0357eda34b9dd983e 6b0015da16415a2fd18c8e5169ed724535a32d5d (C4)`
-- `CHANGED tests/unit/test_a01_ps_environment.py d7406519db64feb210ca05a0357eda34b9dd983e 6b0015da16415a2fd18c8e5169ed724535a32d5d (C6)`
-- `CHANGED tests/unit/test_a01_ps_environment.py d7406519db64feb210ca05a0357eda34b9dd983e 6b0015da16415a2fd18c8e5169ed724535a32d5d (C7)`
-- `CHANGED tests/unit/test_a01_ps_environment.py d7406519db64feb210ca05a0357eda34b9dd983e 6b0015da16415a2fd18c8e5169ed724535a32d5d (C8)`
-- `CHANGED tests/unit/test_a01_ps_environment.py d7406519db64feb210ca05a0357eda34b9dd983e 6b0015da16415a2fd18c8e5169ed724535a32d5d (C9)`
-
-### 74-72-88-cost-latency-accounting (exit 1)
-
-- `CHANGED src/hyperv_mcp/console.py 55a15f2c35ca4cdb12ab0d463b22d7b8ec7abcdf 52bff5eea3f8ba3b1a629d784f7d023b22a05367 (C1)`
-- `CHANGED src/hyperv_mcp/console.py 55a15f2c35ca4cdb12ab0d463b22d7b8ec7abcdf 52bff5eea3f8ba3b1a629d784f7d023b22a05367 (C5)`
-- `CHANGED README.md 40504438e40c2f29ef6409983b7bcdac83e26f1c 2434fa79bb22b9bf018266fade77fddbe6458167 (C10)`
-- `CHANGED src/hyperv_mcp/server.py 549d8b6d9e2c51103d8788e0b88dd6225c19c33a c26d7ea1d88746e7cb2c01728765758a78ce7611 (C10)`
-
+None — every gate-relevant frozen pair verifies OK at the current tree.
 <!-- regenerated-state-end -->
 
 ## Discovery snapshot (recorded 2026-11-05, base 8bc60cb7196ae128231c25a15881cded26b0afda)
