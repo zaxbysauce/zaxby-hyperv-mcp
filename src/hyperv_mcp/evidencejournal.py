@@ -610,6 +610,25 @@ def start_run(run_dir: str, vms: list[str] | None, *, agent: str | None = None,
                     "hyperv_evidence_run_stop before starting another"),
                 "error_class": "invalid",
             }
+        # Issue #163 root-uniqueness: exactly one live run per run root.
+        # The stale-artifact probe above only fires after a PREVIOUS run's
+        # stop wrote manifest.json/evidence.mp4, so without this check a
+        # second start on a claimed root (sequential or concurrent) is
+        # admitted and the two runs' stop artifacts interleave. Path
+        # equality only - no filesystem I/O under the lock; roots are
+        # already canonicalized by policy.check_host_write above. The
+        # refusal lands before any registry insert, directory creation, or
+        # journal write.
+        for r in _RUNS.values():
+            if (r.state in ("open", "closing", "initializing")
+                    and r.run_dir == root):
+                return {
+                    "ok": False,
+                    "error": (
+                        f"run_dir refused: already in use by run "
+                        f"{r.run_id[:8]}"),
+                    "error_class": "invalid",
+                }
         run_id = uuid.uuid4().hex
         run = _Run(run_id, root, ag, list(vms or []), bool(video))
         # "initializing" while the directories are created: begin() binds

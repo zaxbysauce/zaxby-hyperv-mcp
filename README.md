@@ -184,7 +184,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.22.0 today) instead of
+  package's version (0.23.0 today) instead of
   the SDK's (the release contract, the complete bump-site
   enumeration, and how to read `version`/`git_revision` live in
   [docs/versioning-policy.md](docs/versioning-policy.md)).
@@ -233,6 +233,22 @@ restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.23.0 changes
+
+- **Evidence-run root uniqueness (#163):** `hyperv_evidence_run_start` now refuses a
+  `run_dir` already claimed by a live run (open, closing, or initializing) with an
+  `invalid`-class error naming the owning run id prefix ("already in use by run <id>").
+  The refusal fires under the registry lock before any registry entry, directory
+  creation, or journal write. Previously the reuse guard only fired after a previous
+  run's stop artifacts existed, so a sequential second start or a concurrent same-root
+  race admitted two live runs on one root and their stop artifacts interleaved.
+- **Frozen-ledger wave (#156):** all 51 pre-existing drifted frozen-check pairs across
+  12 traces repaired via CHECK_WRONG AMENDs with preserved bases and recorded
+  replays; the 63-66-119 C8 inventory self-pin driven to its documented fixed point;
+  anchor + verify-anchor enabled on 74-72-88-cost-latency-accounting and 63-66-119;
+  the census and ledger regenerated and committed at the final head.
+- Version bump: 0.22.0 -> 0.23.0.
 
 ## 0.22.0 changes
 
