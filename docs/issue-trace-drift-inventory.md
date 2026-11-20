@@ -77,7 +77,7 @@ wave's bookkeeping and is never a gate failure.
 ### 163-156-followup-pair (exit 1)
 
 - `CHANGED .agents/issue-traces/74-72-88-cost-latency-accounting/repro/checkpoint.manifest b3d6fb54fcef24927a0b345659f5446e443735fd 91f0716e64acec7dd7ead8d8354e0473b4ee7fef (C5)`
-- `CHANGED .agents/issue-traces/63-66-119-collated/repro/checkpoint.manifest 1156cd1f24d01ad29bf1733440d55be8242478ee 4df73a4c44463173a021d5835aecf9597370ff7c (C4)`
+- `CHANGED .agents/issue-traces/63-66-119-collated/repro/checkpoint.manifest 1156cd1f24d01ad29bf1733440d55be8242478ee ee3dc878d14ae474fbe12a5d29cce8a9bf657846 (C4)`
 
 ### 63-66-119-collated (exit 1)
 
