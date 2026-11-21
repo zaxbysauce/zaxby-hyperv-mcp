@@ -457,6 +457,33 @@ def guard_consult(
                 existing = None
         if existing is not None:
             existing = _classify_stale(store, existing, cfg)
+            # R18-2 (closing review round 18): the fingerprint-conflict and
+            # legacy-identity protections run BEFORE any residue
+            # reconciliation — a lapsed unmarked sync- row can be LIVE (an
+            # admission park past the heartbeat TTL, S17c), so a
+            # different-argument retry must still receive the conflict
+            # envelope and a blank-fingerprint legacy row must still receive
+            # the protected reconciliation refusal (AC8: never authorizes a
+            # duplicate dispatch) — never silently reconciled and replaced.
+            if existing.params_hmac and existing.params_hmac != fingerprint:
+                return _conflict_envelope(name, idem_key), None
+            if not existing.params_hmac and fingerprint:
+                # Issue #157 (C8b): a legacy row with a BLANK fingerprint and
+                # different arguments is protected reconciliation — a disclosed
+                # refusal naming the original handle, never a silent reattach,
+                # never a re-dispatch.
+                return errors.enrich_failure({
+                    "ok": False,
+                    "error": (
+                        f"idempotency_key {idem_key!r} matches a legacy record "
+                        f"(handle {existing.op_id}) whose argument fingerprint "
+                        f"predates fingerprinting; reconciliation is required "
+                        f"before reuse — re-run with a new idempotency_key"
+                    ),
+                    "error_class": "idempotency_conflict",
+                    "reconciliation": True,
+                    "op_id": existing.op_id,
+                }), None
             if (
                 existing.status == statestore.OP_WORKING
                 and (existing.runner or "").startswith("sync-")
@@ -486,10 +513,35 @@ def guard_consult(
                 # moves the generation authority so the parked original's
                 # commit raises lost send authority. Same guard as the
                 # sibling TTL-expiry arm above.
+                # R18-1 (closing review round 18): the fence is FAIL-CLOSED —
+                # unless the authority move is CONFIRMED (op_fence returns
+                # the bumped generation), the identity is NOT retired, the
+                # idempotency slot is NOT freed, and NO replacement is
+                # authorized: the retry receives a disclosed retryable
+                # refusal naming the original handle. The row keeps its
+                # state (live → its request completes normally; dead → the
+                # R6 TTL retirement). A swallowed fence failure must never
+                # reopen the duplicate-dispatch race.
+                fenced_gen = None
                 try:
-                    store.op_fence(existing.op_id)
+                    fenced_gen = store.op_fence(existing.op_id)
                 except Exception:
-                    pass
+                    fenced_gen = None
+                if fenced_gen is None:
+                    return errors.enrich_failure({
+                        "ok": False,
+                        "error": (
+                            f"idempotency_key {idem_key!r} matches a working op "
+                            f"(handle {existing.op_id}) whose executor could not "
+                            f"be fenced for reconciliation; the identity is kept "
+                            f"and no replacement was authorized — retry after the "
+                            f"operation resolves"
+                        ),
+                        "error_class": "transport",
+                        "retryable": True,
+                        "retry_after_ms": errors.BUSY_RETRY_MS,
+                        "op_id": existing.op_id,
+                    }), None
                 text = json.dumps({
                     "ok": False,
                     "error": (
@@ -522,25 +574,6 @@ def guard_consult(
                      store=store)
                 existing = None
             if existing is not None:
-                if existing.params_hmac and existing.params_hmac != fingerprint:
-                    return _conflict_envelope(name, idem_key), None
-                if not existing.params_hmac and fingerprint:
-                    # Issue #157 (C8b): a legacy row with a BLANK fingerprint and
-                    # different arguments is protected reconciliation — a disclosed
-                    # refusal naming the original handle, never a silent reattach,
-                    # never a re-dispatch.
-                    return errors.enrich_failure({
-                        "ok": False,
-                        "error": (
-                            f"idempotency_key {idem_key!r} matches a legacy record "
-                            f"(handle {existing.op_id}) whose argument fingerprint "
-                            f"predates fingerprinting; reconciliation is required "
-                            f"before reuse — re-run with a new idempotency_key"
-                        ),
-                        "error_class": "idempotency_conflict",
-                        "reconciliation": True,
-                        "op_id": existing.op_id,
-                    }), None
                 if (
                     existing.status == statestore.OP_FAILED
                     and existing.error_class == statestore.OP_UNKNOWN

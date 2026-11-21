@@ -2394,3 +2394,136 @@ def test_residue_reconcile_fences_a_live_parked_request(ops_store, admission_env
         f"S17c: the fenced executor must NOT mark the send; got "
         f"{row_a2.as_dict()!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# S18 (impl-review round 18, R18-1/R18-2): the residue path's fail-closed
+# and protection orderings — (a) an unconfirmed fence authorizes NO
+# replacement; (b) a different-argument retry against a lapsed unmarked row
+# still receives the fingerprint conflict (the row can be LIVE); (c) a
+# blank-fingerprint legacy row still receives the AC8 reconciliation
+# refusal.
+# ---------------------------------------------------------------------------
+
+
+def test_residue_fence_failure_fails_closed(ops_store, admission_env, monkeypatch):
+    """S18a: when op_fence cannot confirm the authority move, the retry
+    receives a disclosed retryable refusal naming the original handle; the
+    row is untouched (working, key kept) and NO fresh dispatch happens."""
+    import hyperv_mcp.operations as _ops
+    from hyperv_mcp import statestore
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    now = store.now()
+    row = statestore.OpRow(
+        op_id="s18a-ghost", tool=OP_TOOL, agent="", vm_name="s18-vm",
+        status=statestore.OP_WORKING, created_at=now - 400.0,
+        updated_at=now - 400.0, runner="sync-deadbeef",
+        heartbeat_at=now - 400.0,
+        params_hmac=_ops.arguments_fingerprint(
+            cfg, store,
+            {"vm_name": "s18-vm", "checkpoint_name": "cp", "confirm": True,
+             "idempotency_key": "s18a", "detach": True}),
+        idem_key="s18a", generation=1,
+    )
+    store.op_insert(row)
+
+    real_fence = store.op_fence
+
+    def broken_fence(op_id):
+        raise RuntimeError("fence-only failure (simulated)")
+
+    monkeypatch.setattr(store, "op_fence", broken_fence)
+    try:
+        resp, ctx = _ops.guard_consult(
+            cfg, OP_TOOL,
+            {"vm_name": "s18-vm", "checkpoint_name": "cp", "confirm": True,
+             "idempotency_key": "s18a", "detach": True},
+            _CountingTool(), lambda: CountingSemaphore(2),
+        )
+    finally:
+        monkeypatch.setattr(store, "op_fence", real_fence)
+    assert ctx is None and isinstance(resp, dict), f"S18a: {resp!r}"
+    assert resp.get("retryable") is True and resp.get(
+        "op_id") == "s18a-ghost", (
+        f"S18a: the refusal must be retryable and name the original handle; "
+        f"got {resp!r}"
+    )
+    after = store.op_get("s18a-ghost")
+    assert after.status == "working" and after.idem_key == "s18a", (
+        f"S18a: the identity must be kept untouched (no retirement, no key "
+        f"release); got {after.as_dict()!r}"
+    )
+    assert getattr(after, "send_state", "") == ""
+
+
+def test_residue_lived_lapsed_mismatch_still_conflicts(ops_store, admission_env):
+    """S18b: a different-argument retry against a lapsed unmarked sync- row
+    (which may be LIVE — S17c) receives the fingerprint conflict envelope;
+    the row is not reconciled and no fresh dispatch happens."""
+    import hyperv_mcp.operations as _ops
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id="s18b-ghost", tool=OP_TOOL, agent="", vm_name="s18-vm",
+        status=statestore.OP_WORKING, created_at=now - 400.0,
+        updated_at=now - 400.0, runner="sync-deadbeef",
+        heartbeat_at=now - 400.0,
+        params_hmac=_ops.arguments_fingerprint(
+            cfg, store,
+            {"vm_name": "s18-vm", "checkpoint_name": "cp", "confirm": True,
+             "idempotency_key": "s18b", "detach": True}),
+        idem_key="s18b", generation=1,
+    ))
+    resp, ctx = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "s18-vm", "checkpoint_name": "OTHER", "confirm": True,
+         "idempotency_key": "s18b", "detach": True},
+        _CountingTool(), lambda: CountingSemaphore(2),
+    )
+    assert ctx is None and isinstance(resp, dict) and resp.get(
+        "error_class") == "idempotency_conflict", (
+        f"S18b: the different-args retry must conflict (never silently "
+        f"reconcile a possibly-live row); got {resp!r}"
+    )
+    row = store.op_get("s18b-ghost")
+    assert row.status == "working" and row.idem_key == "s18b", (
+        f"S18b: the row must be untouched; got {row.as_dict()!r}"
+    )
+
+
+def test_residue_blank_fingerprint_legacy_still_refused(ops_store, admission_env):
+    """S18c: a qualifying residue row with a BLANK fingerprint (the legacy
+    shape) receives the AC8 protected-reconciliation refusal — the residue
+    arm never bypasses it."""
+    import hyperv_mcp.operations as _ops
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id="s18c-legacy", tool=OP_TOOL, agent="", vm_name="s18-vm",
+        status=statestore.OP_WORKING, created_at=now - 400.0,
+        updated_at=now - 400.0, runner="sync-deadbeef",
+        heartbeat_at=now - 400.0,
+        params_hmac="",  # legacy blank fingerprint
+        idem_key="s18c", generation=1,
+    ))
+    resp, ctx = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "s18-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "s18c", "detach": True},
+        _CountingTool(), lambda: CountingSemaphore(2),
+    )
+    assert ctx is None and isinstance(resp, dict) and resp.get(
+        "reconciliation") is True, (
+        f"S18c: the blank-fingerprint legacy row must receive the AC8 "
+        f"reconciliation refusal (never a silent reattach); got {resp!r}"
+    )
+    row = store.op_get("s18c-legacy")
+    assert row.status == "working" and row.idem_key == "s18c", (
+        f"S18c: the legacy identity must be untouched; got {row.as_dict()!r}"
+    )
