@@ -766,11 +766,16 @@ def _reconcile_interrupted_commit_core(
 
 def reconcile_interrupted_commit(op_ctx: dict[str, Any], exc: BaseException) -> None:
     """Inline-route wrapper (op_ctx shape) around the shared reconciliation
-    core. Issue #157 (delta review R8-1)."""
-    _reconcile_interrupted_commit_core(
-        store_for(op_ctx["cfg"]), op_ctx["cfg"], op_ctx["op_id"],
-        str(op_ctx.get("agent") or ""),
-        int(op_ctx.get("generation") or 0) or None, exc)
+    core. Issue #157 (delta review R8-1). Best-effort end to end: the store
+    resolution itself sits inside the guard (round-15 regression fix) — a
+    store_for failure during the in-flight interruption must never mask it."""
+    try:
+        _reconcile_interrupted_commit_core(
+            store_for(op_ctx["cfg"]), op_ctx["cfg"], op_ctx["op_id"],
+            str(op_ctx.get("agent") or ""),
+            int(op_ctx.get("generation") or 0) or None, exc)
+    except Exception:
+        pass
 
 
 def fail_inline(op_ctx: dict[str, Any], exc: BaseException) -> None:

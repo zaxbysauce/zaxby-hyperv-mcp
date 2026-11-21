@@ -2139,3 +2139,92 @@ def test_detached_commit_baseexception_releases_ticket(
         f"S15 post-mark: the same-key retry must attach to the original "
         f"unknown identity; got {resp_s!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# S16 (impl-review round 15 regression fix): a store-resolution failure
+# during the commit-window BaseException must NOT mask the interruption —
+# the inline reconciliation is best-effort end to end.
+# ---------------------------------------------------------------------------
+
+
+def test_inline_reconciliation_store_failure_does_not_mask_interruption(tmp_path):
+    """S16: the commit raises a BaseException and the store resolution inside
+    the reconciliation ALSO fails; the original interruption must propagate
+    uncaught (never replaced by the store error), the gate must be free, the
+    admission ticket balanced, and the unmarked row stays the protected
+    working identity."""
+    import asyncio
+
+    import hyperv_mcp.operations as _ops
+    from hyperv_mcp import pswindows
+
+    mod = _boot_server(tmp_path)
+    mcp = mod.get_mcp()
+    saved = pswindows.run_ps
+    saved_commit = _ops.commit_send_intent
+    saved_store_for = _ops.store_for
+    fired = {"commit": 0, "store_broken": 0}
+
+    class _CommitBoom(BaseException):
+        pass
+
+    real_store_for = _ops.store_for
+
+    def boom_commit(cfg):
+        fired["commit"] += 1
+        fired["store_broken"] += 1  # the reconcile that follows must see the broken store
+        raise _CommitBoom("simulated host interruption at commit")
+
+    def broken_then_real(cfg, environ=None):
+        if fired["store_broken"]:
+            raise RuntimeError("store resolution failed during interruption")
+        return real_store_for(cfg, environ=environ)
+
+    def host_ok(script, **kwargs):
+        return pswindows.PSResult(stdout="", returncode=0)
+
+    pswindows.run_ps = host_ok
+    _ops.commit_send_intent = boom_commit
+    _ops.store_for = broken_then_real
+    try:
+        raised = None
+        try:
+            asyncio.run(mcp.call_tool(
+                "hyperv_checkpoint_restore",
+                {"vm_name": "test-vm", "checkpoint_name": "s16", "confirm": True,
+                 "idempotency_key": "s16-boom"},
+            ))
+        except BaseException as exc:
+            raised = exc
+        assert fired["commit"] == 1, f"S16: commit fired {fired['commit']} times"
+        assert isinstance(raised, _CommitBoom), (
+            f"S16: the ORIGINAL interruption must propagate unmasked (a store "
+            f"failure inside the reconciliation must never replace it); got "
+            f"{raised!r}"
+        )
+        # Gate free, admission balanced.
+        assert operations._send_gate_acquire({"vm_name": "test-vm"}) is True, (
+            "S16: the send gate must be released"
+        )
+        operations._send_gate_release({"vm_name": "test-vm"})
+        admission = __import__("hyperv_mcp.admission", fromlist=["x"])
+        assert admission.snapshot()["in_flight_general"] == 0, (
+            "S16: the admission ticket must be released"
+        )
+        # The unmarked row stays the protected working identity (reconciliation
+        # was best-effort and failed silently; no false terminal, no ghost
+        # classification).
+        store = real_store_for(mod.CFG)
+        rows = [r for r in store.op_rows_by_agent("", include_terminal=True)
+                if r.tool == "hyperv_checkpoint_restore"
+                and r.idem_key == "s16-boom"]
+        assert rows and rows[-1].status == "working" and rows[-1].send_state == "", (
+            f"S16: the unmarked row must stay the protected working identity "
+            f"when reconciliation could not run; got {rows[-1].as_dict()!r}"
+        )
+    finally:
+        pswindows.run_ps = saved
+        _ops.commit_send_intent = saved_commit
+        _ops.store_for = saved_store_for
+        _ops.drain_for_tests(timeout_s=5.0)
