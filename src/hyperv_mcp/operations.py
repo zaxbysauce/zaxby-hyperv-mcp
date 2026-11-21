@@ -476,6 +476,20 @@ def guard_consult(
                 # free the idempotency slot, and let the retry execute fresh
                 # (re-dispatch cannot duplicate a send). A FRESH heartbeat
                 # keeps the R6 live-attach contract untouched.
+                # R17-1 (freshness round at ef059d2): FENCE before the
+                # terminal write — a live inline request can still be parked
+                # in admission past heartbeat_ttl_s (reachable with any
+                # valid config where wait_s >= heartbeat_ttl_s), and
+                # op_mark_send is generation-only: without the fence its
+                # commit would succeed and BOTH it and the retry dispatch
+                # (a duplicate dispatch of a destructive tool). The fence
+                # moves the generation authority so the parked original's
+                # commit raises lost send authority. Same guard as the
+                # sibling TTL-expiry arm above.
+                try:
+                    store.op_fence(existing.op_id)
+                except Exception:
+                    pass
                 text = json.dumps({
                     "ok": False,
                     "error": (

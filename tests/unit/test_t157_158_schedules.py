@@ -2322,3 +2322,75 @@ def test_lapsed_unmarked_inline_residue_reconciles_at_retry(ops_store, admission
         f"S17b: a FRESH unmarked inline row must attach live (R6 untouched); "
         f"got resp={resp2!r} ctx={ctx2!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# S17c (freshness round at ef059d2, R17-1): the residue arm must FENCE before
+# terminalizing — a live inline request parked in admission past the
+# heartbeat TTL keeps its generation, and op_mark_send is generation-only:
+# without the fence its commit would succeed and BOTH it and the retry
+# dispatch (a duplicate dispatch of a destructive tool).
+# ---------------------------------------------------------------------------
+
+
+def test_residue_reconcile_fences_a_live_parked_request(ops_store, admission_env):
+    """S17c: a live keyed-inline ctx whose heartbeat lapsed (an admission
+    park past heartbeat_ttl_s) is reconciled by a same-key retry; the
+    ORIGINAL's later commit_send_intent must raise (lost send authority)
+    and its row must stay the unmarked interrupted residue."""
+    import hyperv_mcp.operations as _ops
+    from hyperv_mcp import statestore
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    now = store.now()
+
+    _, ctx_a = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "park-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "s17c"},
+        _CountingTool(), lambda: CountingSemaphore(2),
+    )
+    assert ctx_a is not None and ctx_a["generation"] >= 1, f"S17c: {ctx_a!r}"
+    op_a = ctx_a["op_id"]
+    # The admission park: the live request waits; its row's heartbeat ages
+    # past the TTL (rewound to stand in for the wait).
+    store._begin()
+    try:
+        store._connect().execute(
+            "UPDATE ops SET heartbeat_at = ? WHERE op_id = ?",
+            (now - 400.0, op_a),
+        )
+        store._commit()
+    except BaseException:
+        store._rollback()
+        raise
+    # The same-key retry: the residue arm fences + terminalizes A's row and
+    # proceeds fresh (a NEW inline ctx).
+    _, ctx_b = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "park-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "s17c"},
+        _CountingTool(), lambda: CountingSemaphore(2),
+    )
+    assert ctx_b is not None and ctx_b["op_id"] != op_a, (
+        f"S17c: the retry must proceed with a fresh handle; got {ctx_b!r}"
+    )
+    row_a = store.op_get(op_a)
+    assert row_a.status == "failed" and row_a.error_class == (
+        statestore.OP_INTERRUPTED) and row_a.send_state == "", (
+        f"S17c: A's row must be the reconciled residue; got {row_a.as_dict()!r}"
+    )
+    # The parked original reaches its commit window: the fence must deny it.
+    tokens = _bind_op_context(op_a, cfg, ctx_a["generation"])
+    try:
+        import pytest as _pytest
+        with _pytest.raises(RuntimeError, match="send authority"):
+            _ops.commit_send_intent(cfg)
+    finally:
+        _reset_op_context(tokens)
+    row_a2 = store.op_get(op_a)
+    assert row_a2.send_state == "", (
+        f"S17c: the fenced executor must NOT mark the send; got "
+        f"{row_a2.as_dict()!r}"
+    )
