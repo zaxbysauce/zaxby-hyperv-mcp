@@ -1627,11 +1627,9 @@ def test_inline_route_crash_after_effect_lapses_to_unknown(tmp_path):
     heartbeat lapsed the row reads failed/unknown at read time (final critic
     F1/PB) - never a fresh dispatch."""
     import asyncio
-    import json as _json
-    import importlib
 
     import hyperv_mcp.operations as _ops
-    from hyperv_mcp import pswindows, statestore
+    from hyperv_mcp import pswindows
 
     mod = _boot_server(tmp_path)
     mcp = mod.get_mcp()
@@ -1649,7 +1647,6 @@ def test_inline_route_crash_after_effect_lapses_to_unknown(tmp_path):
         raise RuntimeError("post-effect crash (simulated)")
 
     pswindows.run_ps = crash_after_restore
-    op_id = None
     try:
         try:
             asyncio.run(mcp.call_tool(
@@ -1668,7 +1665,6 @@ def test_inline_route_crash_after_effect_lapses_to_unknown(tmp_path):
             "S11b: the crash-after-effect attempt must persist with the mark"
         )
         row = rows[-1]
-        op_id = row.op_id
         assert calls["restore"] == 1, (
             f"S11b: exactly one provider submission; got {calls['restore']}"
         )
