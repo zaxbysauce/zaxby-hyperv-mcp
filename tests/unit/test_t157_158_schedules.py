@@ -2650,3 +2650,10 @@ def test_residue_terminal_failure_keeps_identity_and_recovers(
         f"S19b recovery: the residue must now be terminalized; got "
         f"{row2.as_dict()!r}"
     )
+    # Drain the recovery dispatch's detached runner (freshness round at
+    # 8b2b446): an undrained runner holds its admission ticket into the
+    # next file's admission reconfigure and fails the battery ~half the
+    # time by timing.
+    assert _ops.drain_for_tests(timeout_s=10.0) == 0, (
+        "S19b: the recovery runner must terminate before teardown"
+    )
