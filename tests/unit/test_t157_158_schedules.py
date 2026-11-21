@@ -2880,3 +2880,57 @@ def test_recovery_arm_fences_a_live_lapsed_runner(ops_store, admission_env):
         f"S22: the fenced runner must NOT mark the send; got {row2.as_dict()!r}"
     )
     assert _ops.drain_for_tests(timeout_s=10.0) == 0
+
+
+# ---------------------------------------------------------------------------
+# S23 (impl-review round 23, R22b): the generation guard covers EVERY
+# provenance-based replacement path — a lapsed generation-zero sync- row
+# (the migrated inline shape) stays HELD (live-attach/replay answer, key
+# kept), never residue-reconciled into a fresh dispatch.
+# ---------------------------------------------------------------------------
+
+
+def test_generation_zero_sync_residue_stays_held(ops_store, admission_env):
+    """S23: a past-heartbeat working sync- row with a VALID fingerprint but
+    generation 0 must not be residue-reconciled into a fresh dispatch — the
+    migration ALTER default makes its empty send_state unprovable, so the
+    identity is held (the retry attaches/replays the working handle) until
+    trusted reconciliation."""
+    import hyperv_mcp.operations as _ops
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id="s23-legacy", tool=OP_TOOL, agent="", vm_name="s23-vm",
+        status=statestore.OP_WORKING, created_at=now - 400.0,
+        updated_at=now - 400.0, runner="sync-deadbeef",
+        heartbeat_at=now - 400.0,
+        params_hmac=_ops.arguments_fingerprint(
+            cfg, store,
+            {"vm_name": "s23-vm", "checkpoint_name": "cp", "confirm": True,
+             "idempotency_key": "s23", "detach": True}),
+        idem_key="s23", generation=0,
+    ))
+    tool = _CountingTool()
+    resp, ctx = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "s23-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "s23", "detach": True},
+        tool, lambda: CountingSemaphore(2),
+    )
+    # The generation-less identity is HELD: no fresh dispatch (the tool
+    # would only run for a newly minted handle), the key stays attached.
+    row = store.op_get("s23-legacy")
+    assert row.status == "working" and row.idem_key == "s23", (
+        f"S23: the generation-less sync- identity must be held working with "
+        f"its key (trusted reconciliation); got {row.as_dict()!r}"
+    )
+    assert tool.calls == 0, (
+        f"S23: no dispatch may be authorized from unprovable provenance; got "
+        f"{tool.calls}"
+    )
+    assert ctx is None and isinstance(resp, dict), (
+        f"S23: the retry must be answered from the held identity; got "
+        f"resp={resp!r} ctx={ctx!r}"
+    )

@@ -507,6 +507,7 @@ def guard_consult(
                 and (existing.runner or "").startswith("sync-")
                 and (getattr(existing, "send_state", "") or "") != "possibly_sent"
                 and not heartbeat_fresh
+                and int(existing.generation or 0) > 0
             ):
                 # R16-1 (closing review round 16): the R6-exempt class has no
                 # runner thread — its serving request IS its heartbeat (the
@@ -521,6 +522,12 @@ def guard_consult(
                 # free the idempotency slot, and let the retry execute fresh
                 # (re-dispatch cannot duplicate a send). A FRESH heartbeat
                 # keeps the R6 live-attach contract untouched.
+                # R22b (impl-review round 23): the generation guard applies to
+                # EVERY provenance-based replacement path — a pre-v6 row's
+                # empty send_state proves nothing (the migration ALTER default
+                # is ''), so a generation-less sync- row stays held (falls
+                # through to the live-attach/replay answer) for trusted
+                # reconciliation, exactly like the recovery arm's guard.
                 # R17-1 (freshness round at ef059d2): FENCE before the
                 # terminal write — a live inline request can still be parked
                 # in admission past heartbeat_ttl_s (reachable with any
