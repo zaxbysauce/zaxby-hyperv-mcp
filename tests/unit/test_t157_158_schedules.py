@@ -1376,12 +1376,13 @@ def test_repair_intent_edit_and_directives(monkeypatch):
     planner = diagnostics.classify_bind_address
     assert planner("10.0.0.5", section) == "not_stale"
     assert planner("10.0.0.9", section) == "stale"
-    assert planner("fe80::1", section) == "not_stale"
-    # Issue #157 (final critic F3): link-local fe80::/10 is ALWAYS assigned -
-    # the production probe drops fe80* from the enumeration, so every fe80
-    # form classifies not_stale (never rewritten).
-    assert planner("fe80::5", section) == "not_stale"
-    assert planner("fe80::5", {"ipv4": [], "ipv6": None}) == "not_stale"
+    assert planner("fe80::1", section) == "unknown"
+    # Issue #157 (final critic F3 + delta review R7-2): link-local fe80::/10
+    # is NEVER in the production probe's enumeration, so its assignment can
+    # never be confirmed - it classifies UNKNOWN (never rewritten, never
+    # positively certified; the approved plan's observation rule).
+    assert planner("fe80::5", section) == "unknown"
+    assert planner("fe80::5", {"ipv4": [], "ipv6": None}) == "unknown"
     assert planner("10.0.0.9", {"ipv4": None, "ipv6": []}) == "unknown"
     assert planner("::1", section) == "not_stale"
     assert planner("host.example", section) == "not_stale"
@@ -1755,7 +1756,7 @@ def test_inline_route_baseexception_at_commit_releases_gate(tmp_path):
     import asyncio
 
     import hyperv_mcp.operations as _ops
-    from hyperv_mcp import pswindows
+    from hyperv_mcp import pswindows, statestore
 
     mod = _boot_server(tmp_path)
     mcp = mod.get_mcp()
@@ -1808,18 +1809,127 @@ def test_inline_route_baseexception_at_commit_releases_gate(tmp_path):
             "S12: the dispatch-bound op context must be unbound after the "
             "BaseException path"
         )
-        # The lost attempt leaves the protected interrupted identity: the
-        # boom fired at the commit's entry, so nothing was ever marked; the
-        # row stays working (protected from prune/consult-expiry) with no
-        # send mark - the durable-interrupted shape, reconcile at read time.
+        # R8-1 reconciliation: the boom fired at the commit's entry, so the
+        # possibly_sent mark never landed - nothing was dispatched, the
+        # definitive pre-send refusal. The row is terminal failed/interrupted
+        # (a same-key retry replays the envelope; no working ghost).
         store = _ops.store_for(mod.CFG)
         rows = [r for r in store.op_rows_by_agent("", include_terminal=True)
                 if r.tool == "hyperv_checkpoint_restore"
                 and r.idem_key == "s12-boom"]
-        assert rows and rows[-1].status == "working" and rows[-1].send_state == "", (
-            f"S12: the lost attempt must persist working with no send mark "
-            f"(the protected interrupted identity); "
+        assert rows and rows[-1].status == "failed" and rows[-1].send_state == "", (
+            f"S12: the pre-mark interruption must terminal-fail the row "
+            f"(definitive pre-send refusal; no working ghost); "
             f"got {rows[-1].as_dict() if rows else None}"
+        )
+        assert rows[-1].error_class == statestore.OP_INTERRUPTED, (
+            f"S12: the reconciled row must carry the interrupted class; "
+            f"got {rows[-1].error_class!r}"
+        )
+        # The same-key retry replays the interrupted envelope (no ghost
+        # attach, no re-dispatch).
+        resp, ctx = _ops.guard_consult(
+            mod.CFG, "hyperv_checkpoint_restore",
+            {"vm_name": "test-vm", "checkpoint_name": "s12", "confirm": True,
+             "idempotency_key": "s12-boom"},
+            lambda **kw: (_ for _ in ()).throw(AssertionError("re-dispatch")),
+            lambda: threading.BoundedSemaphore(2),
+        )
+        assert ctx is None and isinstance(resp, dict) and resp.get(
+            "replayed") is True, (
+            f"S12: the same-key retry must replay the interrupted envelope "
+            f"without re-dispatch; got resp={resp!r} ctx={ctx!r}"
+        )
+    finally:
+        pswindows.run_ps = saved
+        _ops.commit_send_intent = saved_commit
+        _ops.drain_for_tests(timeout_s=5.0)
+
+
+# ---------------------------------------------------------------------------
+# S13 (delta review R8-1, post-mark arm): a BaseException AFTER the send
+# commit landed keeps the protected unknown identity - the row stays
+# working/possibly_sent, the aged read reconciles it to failed/unknown, and
+# the same-key retry attaches to that identity without re-dispatch.
+# ---------------------------------------------------------------------------
+
+
+def test_inline_route_post_mark_interruption_keeps_unknown_identity(tmp_path):
+    """S13: dispatch a keyed-inline restore whose commit completes (the mark
+    lands) and THEN raises a BaseException; the row keeps
+    working/possibly_sent, a heartbeat-lapsed read reconciles it to
+    failed/unknown, and the same-key retry attaches to the unknown identity."""
+    import asyncio
+
+    import hyperv_mcp.operations as _ops
+    from hyperv_mcp import pswindows, statestore
+
+    mod = _boot_server(tmp_path)
+    mcp = mod.get_mcp()
+    saved = pswindows.run_ps
+    saved_commit = _ops.commit_send_intent
+
+    def host_ok(script, **kwargs):
+        return pswindows.PSResult(stdout="", returncode=0)
+
+    real_commit = _ops.commit_send_intent
+
+    def commit_then_boom(cfg):
+        real_commit(cfg)
+        raise _CommitBoom("simulated host interruption after the commit")
+
+    pswindows.run_ps = host_ok
+    _ops.commit_send_intent = commit_then_boom
+    try:
+        raised = None
+        try:
+            asyncio.run(mcp.call_tool(
+                "hyperv_checkpoint_restore",
+                {"vm_name": "test-vm", "checkpoint_name": "s13", "confirm": True,
+                 "idempotency_key": "s13-boom"},
+            ))
+        except BaseException as exc:
+            raised = exc
+        assert isinstance(raised, _CommitBoom), (
+            f"S13: the BaseException must propagate; got {raised!r}"
+        )
+        store = _ops.store_for(mod.CFG)
+        rows = [r for r in store.op_rows_by_agent("", include_terminal=True)
+                if r.tool == "hyperv_checkpoint_restore"
+                and r.idem_key == "s13-boom"]
+        assert rows and rows[-1].status == "working" and rows[
+            -1].send_state == "possibly_sent", (
+            f"S13: the post-mark interruption must keep the protected "
+            f"unknown identity (working/possibly_sent); "
+            f"got {rows[-1].as_dict() if rows else None}"
+        )
+        # The aged read reconciles the identity at read time.
+        store._begin()
+        try:
+            store._connect().execute(
+                "UPDATE ops SET heartbeat_at = ? WHERE op_id = ?",
+                (1.0, rows[-1].op_id),
+            )
+            store._commit()
+        except BaseException:
+            store._rollback()
+            raise
+        status = _ops.op_status(mod.CFG, rows[-1].op_id, "")
+        assert status.get("status") == "failed" and (
+            status.get("error_class") == statestore.OP_UNKNOWN
+        ), f"S13: the lapsed read must reconcile to failed/unknown; got {status!r}"
+        # The same-key retry attaches to the unknown identity (never fresh).
+        resp, ctx = _ops.guard_consult(
+            mod.CFG, "hyperv_checkpoint_restore",
+            {"vm_name": "test-vm", "checkpoint_name": "s13", "confirm": True,
+             "idempotency_key": "s13-boom"},
+            lambda **kw: (_ for _ in ()).throw(AssertionError("re-dispatch")),
+            lambda: threading.BoundedSemaphore(2),
+        )
+        assert ctx is None and isinstance(resp, dict) and resp.get(
+            "op_id") == rows[-1].op_id, (
+            f"S13: the same-key retry must attach to the original unknown "
+            f"identity; got resp={resp!r} ctx={ctx!r}"
         )
     finally:
         pswindows.run_ps = saved

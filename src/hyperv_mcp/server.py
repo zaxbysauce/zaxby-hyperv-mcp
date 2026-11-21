@@ -6313,6 +6313,17 @@ def _harden_tools(mcp: MCPServer) -> None:
                                     name, arguments, errors.envelope(mark_exc),
                                     journal_token=jtok,
                                 )
+                            except BaseException as boom:
+                                # R8-1 (delta review round 8): a BaseException
+                                # escaping the commit window reconciles the
+                                # attempt by its durable send provenance
+                                # before propagating - an unmarked row is the
+                                # definitive pre-send refusal (terminal
+                                # interrupted), a marked row keeps the
+                                # protected unknown identity.
+                                operations.reconcile_interrupted_commit(
+                                    ops_ctx, boom)
+                                raise
                             inline_beat_stop = operations.start_inline_heartbeat(ops_ctx)
                         finally:
                             operations._send_gate_release(arguments)

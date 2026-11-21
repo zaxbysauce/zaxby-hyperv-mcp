@@ -729,6 +729,42 @@ def complete_inline(op_ctx: dict[str, Any], result: Any) -> None:
         pass
 
 
+def reconcile_interrupted_commit(op_ctx: dict[str, Any], exc: BaseException) -> None:
+    """Issue #157 (delta review R8-1): a BaseException escaping the route's
+    pre-send commit window reconciles the attempt according to its durable
+    send provenance before the interruption propagates. The keyed commit is
+    the pre-send boundary: if the possibly_sent mark did NOT land, nothing
+    was dispatched — the definitive pre-send refusal (terminal failed,
+    interrupted). If the mark DID land (the crash came after the commit),
+    the row keeps the protected unknown identity and self-reconciles at
+    read time via the lapsed-heartbeat arm. Best-effort: a store failure
+    must never mask the in-flight interruption."""
+    try:
+        cfg: Config = op_ctx["cfg"]
+        store = store_for(cfg)
+        row = store.op_get(op_ctx["op_id"])
+        if row is None or row.status != statestore.OP_WORKING:
+            return
+        if (getattr(row, "send_state", "") or "") == "possibly_sent":
+            return
+        env = errors.envelope(exc)
+        env["note"] = "interrupted before the send commit; nothing was dispatched"
+        text = json.dumps(env, separators=(",", ":"))
+        store.op_transition(
+            op_ctx["op_id"], (statestore.OP_WORKING,), statestore.OP_FAILED,
+            error_class=statestore.OP_INTERRUPTED,
+            result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
+            updated_at=store.now(),
+            generation=int(op_ctx.get("generation") or 0) or None,
+            pre_body_terminal=True,
+        )
+        emit(cfg, "op.failed", op_ctx["op_id"], "",
+             str(op_ctx.get("agent") or ""),
+             {"error_class": statestore.OP_INTERRUPTED})
+    except Exception:
+        pass
+
+
 def fail_inline(op_ctx: dict[str, Any], exc: BaseException) -> None:
     """Issue #157: the failing arm's outcome carries its send-state
     provenance. A raise BEFORE the body started (send_state still empty) is

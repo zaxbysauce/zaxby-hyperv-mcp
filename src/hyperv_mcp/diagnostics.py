@@ -270,11 +270,17 @@ def classify_bind_address(raw: str, ip_section: dict | None) -> str:
     if ip.is_loopback:
         return "not_stale"
     if ip.version == 6 and ip.is_link_local:
-        # Issue #157 (final critic F3): link-local IPv6 (fe80::/10) is ALWAYS
-        # assigned to an interface, and the production probe legitimately
-        # drops fe80* from its enumeration - it can never be stale, and the
-        # unlisted-vs-unobserved distinction cannot apply to it.
-        return "not_stale"
+        # Issue #157 (final critic F3 + delta review R7-2/R8): link-local
+        # IPv6 (fe80::/10) is NEVER in the production probe's enumeration
+        # (the probe legitimately drops fe80*), so its assignment can never
+        # be confirmed from this data. It is therefore UNKNOWN, not
+        # not-stale: no rewrite is ever proposed from it (the F3
+        # no-false-flag requirement) and no positive postcondition is ever
+        # certified from a filtered enumeration (the approved plan's
+        # observation rule: the relevant family must be successfully
+        # observed before any staleness classification or positive
+        # verification).
+        return "unknown"
     section = ip_section or {}
     if section.get("error"):
         return "unknown"
