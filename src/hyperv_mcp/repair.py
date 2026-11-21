@@ -298,6 +298,7 @@ def _evaluate_change(
     detail: dict[str, Any] = {"finding_cleared": cleared}
     satisfied = cleared
     uncertified = False
+    stale_remaining = False
     action = item["action"]
     if action == "start_service":
         if item["target"] == "sshd":
@@ -346,6 +347,7 @@ def _evaluate_change(
         detail["config_listen"] = [str(a) for a in (ssh.get("config_listen") or [])]
         satisfied = cleared and not still_stale and not uncertain
         uncertified = bool(uncertain)
+        stale_remaining = bool(still_stale)
     elif action == "enable_existing_firewall_rules":
         fw = guest.get("firewall") or {}
         key = (
@@ -355,9 +357,18 @@ def _evaluate_change(
         detail[key] = fw.get(key)
         satisfied = cleared and fw.get(key) is True
     change["postcondition_detail"] = detail
-    change["postcondition"] = (
-        "satisfied" if satisfied else ("unknown" if uncertified else "unsatisfied")
-    )
+    # R10-1 (delta review round 10): precedence — definitive evidence wins.
+    # A positively observed stale binding means the postcondition is KNOWN
+    # unsatisfied even when another binding is uncertifiable; 'unknown' is
+    # only for the no-definite-failure-but-uncertifiable case.
+    if satisfied:
+        change["postcondition"] = "satisfied"
+    elif stale_remaining:
+        change["postcondition"] = "unsatisfied"
+    elif uncertified:
+        change["postcondition"] = "unknown"
+    else:
+        change["postcondition"] = "unsatisfied"
     change["verified"] = bool(change["applied"] and satisfied)
     if change.get("decision_required"):
         # C15: the not-attempted diagnostic (the operator-intent wording)

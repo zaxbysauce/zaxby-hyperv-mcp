@@ -2006,3 +2006,23 @@ def test_rewrite_verification_unknown_binding_blocks_certification(monkeypatch):
         f"S14 control: without the fe80 listener the rewrite certifies; "
         f"got {change2}"
     )
+
+    # R10-1: definitive negative evidence wins the precedence — a readback
+    # with BOTH a known-stale binding and an fe80 listener is KNOWN
+    # unsatisfied, never masked to unknown by the uncertifiable binding.
+    mixed_bad = _guest(listen="10.0.0.5")
+    mixed_bad["ip_addresses"]["ipv6"] = [{"interface": "E",
+                                          "address": "fe80::1", "prefix": 64}]
+    mixed_bad["ssh"]["listeners"] = [{"address": "10.9.9.9", "port": 22},
+                                     {"address": "fe80::1", "port": 22}]
+    out3 = fake_apply_verify(stale_diag, mixed_bad)
+    change3 = [c for c in out3["changes"]
+               if c["action"] == "rewrite_stale_ssh_bindings"][0]
+    assert change3["postcondition"] == "unsatisfied" and change3[
+        "verified"] is False, (
+        f"S14 R10-1: a known-stale remaining binding must read unsatisfied "
+        f"(never masked to unknown); got {change3}"
+    )
+    assert change3["postcondition_detail"]["stale_bindings_remaining"] == [
+        "10.9.9.9"]
+    assert "fe80::1" in change3["postcondition_detail"]["unverified_bindings"]
