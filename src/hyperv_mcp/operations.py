@@ -441,7 +441,15 @@ def guard_consult(
                 and not possibly_sent
                 and not heartbeat_fresh
                 and not protected_class
+                and bool(existing.params_hmac)
             ):
+                # R19-1 (closing review round 19): a BLANK-fingerprint row is
+                # AC8-protected — "a legacy row with no fingerprint/generation
+                # never authorizes a duplicate dispatch". Expiry deletion must
+                # never consume a protected legacy identity to authorize a
+                # fresh dispatch: such a row falls through to the
+                # reconciliation refusal below instead (it stays until
+                # trusted reconciliation).
                 existing = _classify_stale(store, existing, cfg)
                 if existing.status == statestore.OP_WORKING:
                     # Still working (a no-runner exempt row): fence it before
@@ -552,8 +560,16 @@ def guard_consult(
                     "note": "reconciled at retry time from the "
                             "lapsed-heartbeat residue",
                 }, separators=(",", ":"))
+                # R19-2 (closing review round 19): the terminal write is part
+                # of the identity retirement — CONFIRM it before freeing the
+                # idempotency slot or authorizing the replacement. A failed
+                # transition must NOT leave the old handle working with no
+                # recovery while a fresh dispatch runs: the identity is kept
+                # (the fence already denies the executor's send authority) and
+                # the retry receives the same disclosed retryable refusal; the
+                # next retry re-fences and re-reconciles (recoverable).
                 try:
-                    store.op_transition(
+                    moved = bool(store.op_transition(
                         existing.op_id, (statestore.OP_WORKING,),
                         statestore.OP_FAILED,
                         error_class=statestore.OP_INTERRUPTED,
@@ -561,9 +577,24 @@ def guard_consult(
                         result_size=len(text.encode("utf-8")),
                         updated_at=store.now(),
                         pre_body_terminal=True,
-                    )
+                    ))
                 except Exception:
-                    pass
+                    moved = False
+                if not moved:
+                    return errors.enrich_failure({
+                        "ok": False,
+                        "error": (
+                            f"idempotency_key {idem_key!r} matches a working op "
+                            f"(handle {existing.op_id}) whose residue could not "
+                            f"be terminalized; the identity is kept and no "
+                            f"replacement was authorized — retry after the "
+                            f"operation resolves"
+                        ),
+                        "error_class": "transport",
+                        "retryable": True,
+                        "retry_after_ms": errors.BUSY_RETRY_MS,
+                        "op_id": existing.op_id,
+                    }), None
                 try:
                     store.op_release_idem(existing.op_id)
                 except Exception:

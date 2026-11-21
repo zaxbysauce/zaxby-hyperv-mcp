@@ -2527,3 +2527,126 @@ def test_residue_blank_fingerprint_legacy_still_refused(ops_store, admission_env
     assert row.status == "working" and row.idem_key == "s18c", (
         f"S18c: the legacy identity must be untouched; got {row.as_dict()!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# S19 (impl-review round 19, R19-1/R19-2): (a) a past-TTL blank-fingerprint
+# working row is AC8-protected — the TTL expiry never deletes it to
+# authorize a fresh dispatch; (b) the residue terminalization is CONFIRMED
+# before the key release / replacement — a failed transition keeps the
+# identity and the retry recovers on the next attempt.
+# ---------------------------------------------------------------------------
+
+
+def test_past_ttl_blank_fingerprint_row_still_protected(ops_store, admission_env):
+    """S19a: a blank-fingerprint working row older than the idempotency TTL
+    must receive the AC8 reconciliation refusal (never silently deleted to
+    authorize a fresh dispatch)."""
+    import hyperv_mcp.operations as _ops
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id="s19a-legacy", tool=OP_TOOL, agent="", vm_name="s19-vm",
+        status=statestore.OP_WORKING, created_at=now - 100000.0,
+        updated_at=now - 100000.0, runner="sync-deadbeef",
+        heartbeat_at=now - 100000.0,
+        params_hmac="",  # legacy blank fingerprint
+        idem_key="s19a", generation=1,
+    ))
+    resp, ctx = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "s19-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "s19a", "detach": True},
+        _CountingTool(), lambda: CountingSemaphore(2),
+    )
+    assert ctx is None and isinstance(resp, dict) and resp.get(
+        "reconciliation") is True, (
+        f"S19a: the past-TTL blank-fingerprint row must receive the AC8 "
+        f"reconciliation refusal; got {resp!r}"
+    )
+    row = store.op_get("s19a-legacy")
+    assert row is not None and row.status == "working" and row.idem_key == "s19a", (
+        f"S19a: the protected legacy identity must be kept; got "
+        f"{row.as_dict() if row else None!r}"
+    )
+
+
+def test_residue_terminal_failure_keeps_identity_and_recovers(
+        ops_store, admission_env, monkeypatch):
+    """S19b: when the residue terminalization fails (transition returns
+    False), the retry receives the retryable refusal, the fenced row stays
+    working with its key kept, and NO fresh dispatch happens; a follow-up
+    retry with the fault removed reconciles the residue and executes fresh
+    (recoverable)."""
+    import hyperv_mcp.operations as _ops
+    from hyperv_mcp import statestore
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id="s19b-ghost", tool=OP_TOOL, agent="", vm_name="s19-vm",
+        status=statestore.OP_WORKING, created_at=now - 400.0,
+        updated_at=now - 400.0, runner="sync-deadbeef",
+        heartbeat_at=now - 400.0,
+        params_hmac=_ops.arguments_fingerprint(
+            cfg, store,
+            {"vm_name": "s19-vm", "checkpoint_name": "cp", "confirm": True,
+             "idempotency_key": "s19b", "detach": True}),
+        idem_key="s19b", generation=1,
+    ))
+    tool = _CountingTool()
+    real_transition = store.op_transition
+    failing = {"on": True}
+
+    def broken_transition(op_id, from_statuses, to_status, **kwargs):
+        if failing["on"]:
+            return False
+        return real_transition(op_id, from_statuses, to_status, **kwargs)
+
+    monkeypatch.setattr(store, "op_transition", broken_transition)
+    resp, ctx = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "s19-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "s19b", "detach": True},
+        tool, lambda: CountingSemaphore(2),
+    )
+    assert ctx is None and isinstance(resp, dict) and resp.get(
+        "retryable") is True and resp.get("op_id") == "s19b-ghost", (
+        f"S19b: the failed terminalization must answer the retryable "
+        f"refusal naming the handle; got {resp!r}"
+    )
+    row = store.op_get("s19b-ghost")
+    assert row.status == "working" and row.idem_key == "s19b", (
+        f"S19b: the fenced identity must be kept (no retirement, no key "
+        f"release); got {row.as_dict()!r}"
+    )
+    assert row.generation >= 2, (
+        f"S19b: the fence must have landed (generation moved); got "
+        f"{row.generation}"
+    )
+    assert tool.calls == 0, (
+        f"S19b: no fresh dispatch on the failed terminalization; got "
+        f"{tool.calls}"
+    )
+    # The follow-up retry with the fault removed recovers.
+    monkeypatch.setattr(store, "op_transition", real_transition)
+    resp2, ctx2 = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "s19-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "s19b", "detach": True},
+        tool, lambda: CountingSemaphore(2),
+    )
+    assert ctx2 is None and isinstance(resp2, dict) and resp2.get(
+        "op_id") and resp2.get("op_id") != "s19b-ghost", (
+        f"S19b recovery: the next retry must reconcile and dispatch fresh; "
+        f"got {resp2!r}"
+    )
+    row2 = store.op_get("s19b-ghost")
+    assert row2.status == "failed" and row2.error_class == (
+        statestore.OP_INTERRUPTED), (
+        f"S19b recovery: the residue must now be terminalized; got "
+        f"{row2.as_dict()!r}"
+    )
