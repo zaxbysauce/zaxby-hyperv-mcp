@@ -297,6 +297,7 @@ def _evaluate_change(
     cleared = finding not in remaining
     detail: dict[str, Any] = {"finding_cleared": cleared}
     satisfied = cleared
+    uncertified = False
     action = item["action"]
     if action == "start_service":
         if item["target"] == "sshd":
@@ -326,10 +327,25 @@ def _evaluate_change(
             str(listener.get("address", ""))
             for listener in (ssh.get("listeners") or [])
         ]
-        still_stale = [a for a in observed if _is_stale_address(a, report)]
+        still_stale = []
+        uncertain = []
+        ip_section = (report.get("guest") or {}).get("ip_addresses") or {}
+        for addr in observed:
+            cls = diagnostics.classify_bind_address(addr, ip_section)
+            if cls == "stale":
+                still_stale.append(addr)
+            elif cls == "unknown":
+                # R9-1 (delta review round 9): UNKNOWN is a third state, not
+                # "not stale" — the production probe never enumerates fe80*
+                # link-locals, so their presence in the readback can never
+                # be certified. An unknown relevant binding prevents
+                # positive certification entirely.
+                uncertain.append(addr)
         detail["stale_bindings_remaining"] = still_stale
+        detail["unverified_bindings"] = uncertain
         detail["config_listen"] = [str(a) for a in (ssh.get("config_listen") or [])]
-        satisfied = cleared and not still_stale
+        satisfied = cleared and not still_stale and not uncertain
+        uncertified = bool(uncertain)
     elif action == "enable_existing_firewall_rules":
         fw = guest.get("firewall") or {}
         key = (
@@ -339,7 +355,9 @@ def _evaluate_change(
         detail[key] = fw.get(key)
         satisfied = cleared and fw.get(key) is True
     change["postcondition_detail"] = detail
-    change["postcondition"] = "satisfied" if satisfied else "unsatisfied"
+    change["postcondition"] = (
+        "satisfied" if satisfied else ("unknown" if uncertified else "unsatisfied")
+    )
     change["verified"] = bool(change["applied"] and satisfied)
     if change.get("decision_required"):
         # C15: the not-attempted diagnostic (the operator-intent wording)

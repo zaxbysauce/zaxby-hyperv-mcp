@@ -1935,3 +1935,74 @@ def test_inline_route_post_mark_interruption_keeps_unknown_identity(tmp_path):
         pswindows.run_ps = saved
         _ops.commit_send_intent = saved_commit
         _ops.drain_for_tests(timeout_s=5.0)
+
+
+# ---------------------------------------------------------------------------
+# S14 (delta review R9-1 + final-critic freshness): the rewrite-verification
+# seam preserves the classifier's three states - an unknown (fe80*) binding
+# remaining in the readback prevents positive certification entirely.
+# ---------------------------------------------------------------------------
+
+
+def test_rewrite_verification_unknown_binding_blocks_certification(monkeypatch):
+    """S14: a fully observed report, an applied rewrite of a stale IPv4
+    binding, and a remaining fe80::1 listener in the readback must yield
+    postcondition unknown + verified False (the mixed-binding falsifier),
+    while the same flow without the fe80 listener certifies satisfied."""
+    cfg = Config(unrestricted=True)
+
+    # Mixed readback: the diagnostic found the stale IPv4 binding (the
+    # plan proposes rewriting it), the apply cleared it, but the readback
+    # carries a remaining fe80::1 link-local listener - uncertifiable.
+    stale_diag = _guest(listen="192.168.50.20")
+    mixed = _guest(listen="10.0.0.5")
+    mixed["ip_addresses"]["ipv6"] = [{"interface": "E", "address": "fe80::1",
+                                      "prefix": 64}]
+    mixed["ssh"]["listeners"] = [{"address": "10.0.0.5", "port": 22},
+                                 {"address": "fe80::1", "port": 22}]
+
+    def fake_apply_verify(diag_guest, readback_guest):
+        fake = FakePS([
+            _guid_result(),
+            _ok(_host()), _ok(diag_guest),
+            pswindows.PSResult(stdout="", returncode=0),
+            _ok(_host()), _ok(readback_guest),
+        ])
+        monkeypatch.setattr(pswindows, "run_ps", fake)
+        return repair.repair_guest_access(
+            cfg, "test-vm", apply=True, confirm=True, cred=CRED,
+            intended_bindings=["10.0.0.5"],
+        )
+
+    out = fake_apply_verify(stale_diag, mixed)
+    change = [c for c in out["changes"]
+              if c["action"] == "rewrite_stale_ssh_bindings"][0]
+    assert change["apply_outcome"] == "applied" and change["applied"] is True
+    assert change["observation"] == "positive"
+    assert change["postcondition"] == "unknown", (
+        f"S14: an unknown (fe80*) binding in the readback must prevent "
+        f"positive certification; got {change}"
+    )
+    assert change["verified"] is False
+    assert change["postcondition_detail"]["stale_bindings_remaining"] == []
+    assert "fe80::1" in change["postcondition_detail"]["unverified_bindings"]
+    # The planner proposed the rewrite for the stale IPv4 binding only
+    # (final-critic F3: no rewrite is ever proposed for fe80).
+    plan_rewrites = [p for p in out["plan"]
+                     if p["action"] == "rewrite_stale_ssh_bindings"]
+    assert plan_rewrites and plan_rewrites[0]["before"][
+        "stale_bindings"] == ["192.168.50.20"], (
+        f"S14: the planner must propose the rewrite for the stale IPv4 "
+        f"binding only; got {plan_rewrites}"
+    )
+
+    # Control: the same flow with a clean readback certifies.
+    clean = _guest(listen="10.0.0.5")
+    out2 = fake_apply_verify(stale_diag, clean)
+    change2 = [c for c in out2["changes"]
+               if c["action"] == "rewrite_stale_ssh_bindings"][0]
+    assert change2["postcondition"] == "satisfied" and change2[
+        "verified"] is True, (
+        f"S14 control: without the fe80 listener the rewrite certifies; "
+        f"got {change2}"
+    )
