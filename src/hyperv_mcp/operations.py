@@ -173,8 +173,9 @@ def commit_send_intent(cfg: Config, vm_key: str = "") -> None:
             )
     except RuntimeError:
         raise
-    except Exception:
-        pass
+    # Issue #157 fail-closed (impl-review F1): ANY inability to durably commit
+    # the mark or epoch propagates — a provider submission never follows an
+    # unrecorded send intent.
 
 
 class OperationCancelled(BaseException):
@@ -417,11 +418,15 @@ def guard_consult(
             possibly_sent = (
                 getattr(existing, "send_state", "") or ""
             ) == "possibly_sent"
+            protected_class = existing.error_class in (
+                statestore.OP_INTERRUPTED, statestore.OP_UNKNOWN
+            )
             if (
                 existing.created_at > 0
                 and existing.created_at < now - ttl
                 and not possibly_sent
                 and not heartbeat_fresh
+                and not protected_class
             ):
                 existing = _classify_stale(store, existing, cfg)
                 if existing.status == statestore.OP_WORKING:
@@ -473,22 +478,26 @@ def guard_consult(
             slots = runner_slots()
             if not slots.acquire(blocking=False):
                 return _busy_envelope(name), None
-            row = statestore.OpRow(
-                op_id=secrets.token_urlsafe(16),
-                tool=name,
-                agent=agent,
-                vm_name=str(arguments.get("vm_name") or ""),
-                status=statestore.OP_WORKING,
-                created_at=now,
-                updated_at=now,
-                runner=secrets.token_hex(8),
-                heartbeat_at=now,
-                params_hmac=fingerprint,
-                idem_key=idem_key,
-                poll_interval_ms=2000,
-                generation=store.op_next_generation(),
-            )
+            row = None
             try:
+                # Issue #157 (impl-review F6): everything after the acquire —
+                # INCLUDING generation minting — sits inside the protected
+                # region, so any failure releases the slot exactly once.
+                row = statestore.OpRow(
+                    op_id=secrets.token_urlsafe(16),
+                    tool=name,
+                    agent=agent,
+                    vm_name=str(arguments.get("vm_name") or ""),
+                    status=statestore.OP_WORKING,
+                    created_at=now,
+                    updated_at=now,
+                    runner=secrets.token_hex(8),
+                    heartbeat_at=now,
+                    params_hmac=fingerprint,
+                    idem_key=idem_key,
+                    poll_interval_ms=2000,
+                    generation=store.op_next_generation(),
+                )
                 store.op_insert(row)
                 emit(cfg, "op.created", row.op_id, "", agent,
                      {"tool": name, "detached": True})
@@ -502,10 +511,11 @@ def guard_consult(
                 # guard answers the classified refusal envelope instead of
                 # letting a raw store/transport exception escape.
                 slots.release()
-                try:
-                    store.op_delete(row.op_id)
-                except Exception:
-                    pass
+                if row is not None:
+                    try:
+                        store.op_delete(row.op_id)
+                    except Exception:
+                        pass
                 env = errors.enrich_failure({
                     "ok": False,
                     "error": (
@@ -659,13 +669,16 @@ def complete_inline(op_ctx: dict[str, Any], result: Any) -> None:
         except ValueError:
             parsed = None
         if error_class:
+            # Issue #157 (impl-review F8): a tool-level ok:false envelope is a
+            # BODY outcome — in-body provenance RETAINS the send mark (an
+            # envelope does not prove the provider never acted); the
+            # completed arm below is the definitive clear.
             store.op_transition(
                 op_ctx["op_id"], (statestore.OP_WORKING, statestore.OP_FAILED),
                 statestore.OP_FAILED,
                 error_class=error_class,
                 result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
                 updated_at=store.now(), generation=generation,
-                pre_body_terminal=True,
             )
             emit(cfg, "op.failed", op_ctx["op_id"], "", agent,
                  {"error_class": error_class, "mode": "inline"})
@@ -734,7 +747,10 @@ def release_busy_idem(op_ctx: dict[str, Any]) -> None:
     store failure degrades to the replayable refusal this closes, never
     into a raw exception on the response path."""
     try:
-        store_for(op_ctx["cfg"]).op_release_idem(op_ctx["op_id"])
+        store_for(op_ctx["cfg"]).op_release_idem(
+            op_ctx["op_id"],
+            generation=int(op_ctx.get("generation") or 0) or None,
+        )
     except Exception:
         pass
 
@@ -981,7 +997,8 @@ def _execute_body(
                 stop_event=stop,
             )
         except admission.AdmissionBusy as busy:
-            _admission_refusal(store, cfg, op_id, tool_name, agent, body_args, busy)
+            _admission_refusal(store, cfg, op_id, tool_name, agent, body_args, busy,
+                         generation=generation)
             return
         except admission.AdmissionStopped:
             # The stop valve fired mid-park (a cancel of the parked op, or
@@ -1046,6 +1063,7 @@ def _execute_body(
                     result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
                     pre_body_terminal=True,
                 )
+                admission.release_sync(ticket)
                 return
             try:
                 # Attempt-level pre-send commit: mark only. The dirty-epoch
@@ -1061,6 +1079,7 @@ def _execute_body(
                     result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
                     pre_body_terminal=True,
                 )
+                admission.release_sync(ticket)
                 return
         finally:
             if gate_held:
@@ -1084,14 +1103,14 @@ def _execute_body(
         except ValueError:
             parsed = None
         if error_class:
-            # A tool-level ok:false envelope is a DEFINITIVE outcome with its
-            # envelope in hand (issue #157): the failed move clears the send
-            # mark (pre_body_terminal — the result proves what happened).
+            # Issue #157 (impl-review F8): a tool-level ok:false envelope is a
+            # BODY outcome — in-body provenance RETAINS the send mark (an
+            # envelope does not prove the provider never acted).
             _safe_transition(
                 store, op_id, statestore.OP_FAILED, agent, cfg, "op.failed",
                 error_class=error_class,
                 result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
-                generation=generation or None, pre_body_terminal=True,
+                generation=generation or None,
             )
         else:
             _safe_transition(
@@ -1176,6 +1195,7 @@ def _admission_refusal(
     agent: str,
     body_args: dict[str, Any],
     busy: admission.AdmissionBusy,
+    generation: int = 0,
 ) -> None:
     """The runner-side pre-body admission refusal (issue #68 supplement):
     the op row transitions to failed carrying the busy envelope (whose
@@ -1193,6 +1213,7 @@ def _admission_refusal(
     text = json.dumps(env, separators=(",", ":"), default=str)
     _safe_transition(
         store, op_id, statestore.OP_FAILED, agent, cfg, "op.failed",
+        generation=int(generation or 0) or None,
         error_class="busy",
         result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
     )
@@ -1205,7 +1226,7 @@ def _admission_refusal(
     # AdmissionStopped arm) deliberately does NOT do this: a cancelled op
     # is terminal and its retry answers from the row (D9's pin).
     try:
-        store.op_release_idem(op_id)
+        store.op_release_idem(op_id, generation=int(generation or 0) or None)
     except Exception:
         pass  # best-effort: a store failure degrades to the replayable
         # refusal this closes, never into a runner-crash
@@ -1564,11 +1585,15 @@ def tasks_extension(
                         possibly_sent = (
                             getattr(existing, "send_state", "") or ""
                         ) == "possibly_sent"
+                        protected_class = existing.error_class in (
+                            statestore.OP_INTERRUPTED, statestore.OP_UNKNOWN
+                        )
                         if (
                             existing.created_at > 0
                             and existing.created_at < now - ttl
                             and not possibly_sent
                             and not heartbeat_fresh
+                            and not protected_class
                         ):
                             existing = _classify_stale(store, existing, cfg)
                             if existing.status == statestore.OP_WORKING:
@@ -1628,28 +1653,71 @@ def tasks_extension(
                     _benv = _busy_envelope(params.name)
                     evidencejournal.finish(jtok, _benv, outcome="busy")
                     return errors.failure_result(_benv)
-                row = statestore.OpRow(
-                    op_id=secrets.token_urlsafe(16),
-                    tool=params.name,
-                    agent=agent,
-                    vm_name=str(arguments.get("vm_name") or ""),
-                    status=statestore.OP_WORKING,
-                    created_at=now,
-                    updated_at=now,
-                    runner=secrets.token_hex(8),
-                    heartbeat_at=now,
-                    params_hmac=fingerprint,
-                    idem_key=idem_key,
-                    poll_interval_ms=2000,
-                    generation=store.op_next_generation(),
-                )
+                row = None
+                try:
+                    # Issue #157 (impl-review F6): minting sits inside the
+                    # protected region so a generation failure releases the slot.
+                    row = statestore.OpRow(
+                        op_id=secrets.token_urlsafe(16),
+                        tool=params.name,
+                        agent=agent,
+                        vm_name=str(arguments.get("vm_name") or ""),
+                        status=statestore.OP_WORKING,
+                        created_at=now,
+                        updated_at=now,
+                        runner=secrets.token_hex(8),
+                        heartbeat_at=now,
+                        params_hmac=fingerprint,
+                        idem_key=idem_key,
+                        poll_interval_ms=2000,
+                        generation=store.op_next_generation(),
+                    )
+                except Exception:
+                    # Issue #157 (impl-review F6): a generation-mint failure
+                    # releases the slot exactly once and answers the classified
+                    # refusal envelope.
+                    slots.release()
+                    evidencejournal.finish_if_unowned(jtok, None, outcome="error")
+                    env = errors.enrich_failure({
+                        "ok": False,
+                        "error": (
+                            f"{params.name}: the detached operation could not "
+                            f"be recorded; no dispatch authority was left "
+                            f"behind — retry after fixing the durable-state fault"
+                        ),
+                        "error_class": "transport",
+                    })
+                    env["retryable"] = True
+                    env["retry_after_ms"] = errors.BUSY_RETRY_MS
+                    return errors.failure_result(env)
                 # Durable creation BEFORE the response (SEP-2663: MUST NOT
                 # return CreateTaskResult until the task is durably created).
                 try:
                     store.op_insert(row)
                 except Exception:
-                    # Issue #157 (C1's tasks twin): a failed insert releases
-                    # the slot exactly once; the transaction rolled back.
+                    # Issue #157 (impl-review F3): a concurrent identical tasks
+                    # call may have won the insert race between this call's
+                    # consult and insert (the two are deliberately split so the
+                    # consult answers before capacity). RE-CONSULT: the winner
+                    # is answered as a reattach (the same handle the guard
+                    # route would return); a true durable-state failure still
+                    # releases the slot and answers the classified refusal.
+                    try:
+                        with store.transaction():
+                            winner = store.op_find_idem(agent, params.name, idem_key)
+                        if winner is not None and winner.op_id != row.op_id:
+                            slots.release()
+                            evidencejournal.finish(
+                                jtok, {"task_id": winner.op_id, "consulted": True},
+                                outcome="reattach")
+                            return TaskHandleResult(
+                                task_id=winner.op_id,
+                                status=winner.status,
+                                ttl_ms=int(cfg.operations.retention_s) * 1000,
+                                poll_interval_ms=winner.poll_interval_ms,
+                            )
+                    except Exception:
+                        pass
                     slots.release()
                     evidencejournal.finish_if_unowned(jtok, None, outcome="error")
                     env = errors.enrich_failure({
@@ -1730,10 +1798,26 @@ def tasks_extension(
                 ttl_ms=int(cfg.operations.retention_s) * 1000,
                 poll_interval_ms=row.poll_interval_ms,
             )
-            if row.status == statestore.OP_FAILED and row.error_class == statestore.OP_INTERRUPTED:
-                view.status_message = "interrupted: runner heartbeat lapsed; VM-side outcome is unknown"
+            # Issue #157: the tasks view carries the SAME outcome disclosures
+            # the guard route's _stale_view carries (impl-review F9).
+            stale = _stale_view(row)
+            if stale:
+                view.status_message = str(stale.get("note") or stale.get("vm_outcome"))
             elif row.error_class:
                 view.status_message = row.error_class
+            if (
+                embed_result
+                and row.status in statestore.OP_TERMINAL_STATES
+                and not row.result_json
+                and row.error_class != statestore.OP_UNKNOWN
+            ):
+                # A terminal tombstone (identity retained, payload pruned)
+                # discloses result-expired explicitly; unknown rows keep their
+                # own reconciliation disclosure above.
+                view.status_message = (
+                    "result expired: the payload was pruned within the replay "
+                    "window; the original handle stays addressable"
+                )
             if embed_result and row.result_json:
                 view.result = CallToolResult(
                     content=[TextContent(text=row.result_json)],

@@ -319,16 +319,25 @@ class SessionPool:
         guid = _norm_guid(key.vm_guid)
         try:
             epoch, state = reader(guid)
-        except Exception:
-            return None
+        except Exception as exc:
+            # Issue #157 fail-closed (impl-review F7): an unreadable epoch is
+            # UNCERTAIN — the borrow refuses (transient: the next borrow
+            # retries the consult) rather than proceeding as clean.
+            raise SessionEpochDirty(
+                f"vm {guid} epoch state is unreadable ({exc}); session reuse "
+                "stays blocked until the epoch is readable again"
+            ) from exc
         if state != "dirty":
             return None
         with self._recovery_lock(guid):
             # Re-read after a concurrent dance may have finished.
             try:
                 epoch, state = reader(guid)
-            except Exception:
-                return None
+            except Exception as exc:
+                raise SessionEpochDirty(
+                    f"vm {guid} epoch state is unreadable ({exc}); session "
+                    "reuse stays blocked until the epoch is readable again"
+                ) from exc
             if state != "dirty":
                 return None
             # Confirmed invalidation + drain (the pool's own discipline; a
@@ -668,7 +677,7 @@ class SessionPool:
                 try:
                     _epoch, state = self.epoch_reader(entry.key.vm_guid)
                 except Exception:
-                    state = "clean"
+                    state = "dirty"
                 if state == "dirty":
                     entry.doomed = True
                     victims = [entry]
@@ -986,7 +995,10 @@ def install_default_pool(cfg: Any) -> SessionPool | None:
         try:
             return _ops.store_for(cfg).epoch_snapshot(vm_key)
         except Exception:
-            return (0, "clean")
+            # Issue #157 fail-closed (impl-review F7): an unreadable epoch is
+            # uncertain — treated as dirty so borrows refuse instead of
+            # proceeding on an unverifiable barrier.
+            return (0, "dirty")
 
     def _epoch_clear(vm_key: str, expected_epoch: int) -> bool:
         from . import operations as _ops
