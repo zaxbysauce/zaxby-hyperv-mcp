@@ -6268,48 +6268,47 @@ def _harden_tools(mcp: MCPServer) -> None:
                     if ops_ctx is not None:
                         operations.fail_inline(ops_ctx, exc)
                     raise
-                # Issue #157 keyed-inline wiring (final critic F1, round-2
-                # corrections): the inline route performs the SAME durable
-                # pre-send sequence the runner route performs. ORDER MATTERS:
-                # the op context is bound FIRST (so the route-level commit
-                # takes the generation-validated keyed path), then the gate
-                # (NON-blocking: the async route answers a gate-specific
-                # retryable busy envelope and frees the idem key per PRR-001),
-                # then the attempt-level possibly_sent mark (no vm_key here —
-                # the dirty-epoch work stays at the in-body effect boundaries,
-                # GUID-keyed by lifecycle). Both early returns release the
-                # admission ticket explicitly (final critic round-2 blocker:
-                # the ticket's release finally starts at the body try).
+                # Issue #157 keyed-inline wiring (final critic F1, rounds 2-3):
+                # the inline route performs the SAME durable pre-send sequence
+                # the runner route performs. The WHOLE block lives inside the
+                # body try below so its finally owns the admission release AND
+                # the idempotent context unbind on EVERY path (round-3 blocker:
+                # early returns before the try leaked the bound context). ORDER:
+                # bind the op context first (the route-level commit then takes
+                # the generation-validated keyed path), the gate (NON-blocking:
+                # the async route answers a retryable busy envelope and frees
+                # the idem key per PRR-001), then the attempt-level possibly_sent
+                # mark (no vm_key here - the dirty-epoch work stays at the
+                # in-body effect boundaries, GUID-keyed by lifecycle), then the
+                # generation-fenced heartbeat timer for the body lifetime.
                 inline_beat_stop = None
                 op_ctx_tokens = None
-                if ops_ctx is not None:
-                    op_ctx_tokens = (
-                        operations._current_op_id.set(ops_ctx["op_id"]),
-                        operations._current_ops_cfg.set(ops_ctx["cfg"]),
-                        operations._current_op_generation.set(
-                            int(ops_ctx.get("generation") or 0)),
-                    )
-                    if not operations._send_gate_acquire(arguments):
-                        operations.busy_inline(ops_ctx, name)
-                        operations.release_busy_idem(ops_ctx)
-                        await admission.release(ticket)
-                        return _audited_rejection(
-                            name, arguments, operations._busy_envelope(name),
-                            journal_token=jtok,
-                        )
-                    try:
-                        operations.commit_send_intent(_cfg())
-                    except Exception as mark_exc:
-                        operations._send_gate_release(arguments)
-                        await admission.release(ticket)
-                        operations.fail_inline(ops_ctx, mark_exc)
-                        return _audited_rejection(
-                            name, arguments, errors.envelope(mark_exc),
-                            journal_token=jtok,
-                        )
-                    operations._send_gate_release(arguments)
-                    inline_beat_stop = operations.start_inline_heartbeat(ops_ctx)
                 try:
+                    if ops_ctx is not None:
+                        op_ctx_tokens = (
+                            operations._current_op_id.set(ops_ctx["op_id"]),
+                            operations._current_ops_cfg.set(ops_ctx["cfg"]),
+                            operations._current_op_generation.set(
+                                int(ops_ctx.get("generation") or 0)),
+                        )
+                        if not operations._send_gate_acquire(arguments):
+                            operations.busy_inline(ops_ctx, name)
+                            operations.release_busy_idem(ops_ctx)
+                            return _audited_rejection(
+                                name, arguments, operations._busy_envelope(name),
+                                journal_token=jtok,
+                            )
+                        try:
+                            operations.commit_send_intent(_cfg())
+                        except Exception as mark_exc:
+                            operations._send_gate_release(arguments)
+                            operations.fail_inline(ops_ctx, mark_exc)
+                            return _audited_rejection(
+                                name, arguments, errors.envelope(mark_exc),
+                                journal_token=jtok,
+                            )
+                        operations._send_gate_release(arguments)
+                        inline_beat_stop = operations.start_inline_heartbeat(ops_ctx)
                     try:
                         evidencejournal.arm(jtok)
                         result = await _run(arguments, context, convert_result=convert_result, **kwargs)
