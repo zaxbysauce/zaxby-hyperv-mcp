@@ -647,23 +647,45 @@ def guard_consult(
                 and existing.error_class == statestore.OP_INTERRUPTED
                 and (getattr(existing, "send_state", "") or "") == ""
                 and (existing.idem_key or "")
+                and int(existing.generation or 0) > 0
             ):
-                # R21-2 recovery: a terminal PRE-SEND refusal (unmarked =
-                # nothing was dispatched; interrupted = the definitive
-                # pre-send terminal) must not hold its idempotency slot
-                # forever — a failed release after the confirmed
-                # terminalization (or the R21-1 generation-less legacy shape
-                # after its provenance terminalization) would otherwise
-                # strand the key: the UNIQUE index blocks the replacement
-                # insert and the terminal row is excluded from TTL expiry.
-                # Free the slot and let the retry execute fresh (re-dispatch
-                # cannot duplicate a send). A release failure here keeps the
-                # replay answer — the slot frees on the next retry.
+                # R21-2 recovery: a terminal PRE-SEND refusal must not hold
+                # its idempotency slot forever — a failed release after the
+                # confirmed terminalization would otherwise strand the key:
+                # the UNIQUE index blocks the replacement insert and the
+                # terminal row is excluded from TTL expiry. Free the slot and
+                # let the retry execute fresh (re-dispatch cannot duplicate a
+                # send). A release failure here keeps the replay answer — the
+                # slot frees on the next retry.
+                # R22 (freshness round at b1e4bd7, probe-proven): the arm is
+                # GUARDED two ways. (a) generation > 0 — a pre-v6 row's empty
+                # send_state proves nothing (the migration ALTER default is
+                # ''), so a generation-less identity stays held for trusted
+                # reconciliation (AC8); its "unmarked" is unprovable. (b) a
+                # FAIL-CLOSED fence before the release — _classify_stale
+                # terminalizes on the heartbeat alone (a lapsed heartbeat may
+                # belong to a LIVE process: host sleep, a stalled heartbeat
+                # writer, a long admission park), and op_mark_send checks
+                # only the generation, so without the fence a live runner and
+                # the fresh retry could BOTH dispatch (the R17-1 race on the
+                # read-time path). The fence moves the generation authority;
+                # an unconfirmed fence keeps the replay answer. The rows this
+                # arm was written for (the reconcile core's pre-send refusals
+                # and the residue arm's fenced terminalizations) have
+                # executors that already raised or were already fenced.
+                fenced_gen = None
                 try:
-                    store.op_release_idem(existing.op_id)
-                    existing = None
+                    fenced_gen = store.op_fence(existing.op_id)
                 except Exception:
-                    pass
+                    fenced_gen = None
+                if fenced_gen is None:
+                    pass  # keep the replay answer (fail-closed)
+                else:
+                    try:
+                        store.op_release_idem(existing.op_id)
+                        existing = None
+                    except Exception:
+                        pass
             if existing is not None:
                 if (
                     existing.status == statestore.OP_FAILED

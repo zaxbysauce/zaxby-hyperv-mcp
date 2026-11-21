@@ -2690,8 +2690,10 @@ def test_residue_terminal_failure_keeps_identity_and_recovers(
 def test_generation_zero_legacy_row_reconciles_not_expires(ops_store, admission_env):
     """S21a: a past-TTL working row with a VALID fingerprint but generation 0
     (the migrated pre-v6 shape) must NOT be expiry-deleted to authorize a
-    fresh dispatch — it terminalizes by provenance (unmarked lapsed =
-    interrupted), the key frees, and the retry proceeds fresh."""
+    fresh dispatch AND must stay HELD for trusted reconciliation — the
+    migration ALTER default makes its empty send_state unprovable (R22:
+    'unmarked' is not evidence for a pre-v6 row), so the identity is kept
+    and the retry receives the protected reconciliation refusal."""
     import hyperv_mcp.operations as _ops
 
     cfg = Config(unrestricted=True)
@@ -2716,18 +2718,23 @@ def test_generation_zero_legacy_row_reconciles_not_expires(ops_store, admission_
          "idempotency_key": "s21a", "detach": True},
         tool, lambda: CountingSemaphore(2),
     )
+    # R22: the generation-less identity is HELD — the retry replays the
+    # terminal interrupted envelope (never a fresh dispatch from unprovable
+    # provenance; AC8).
     assert ctx is None and isinstance(resp, dict) and resp.get(
-        "op_id") and resp.get("op_id") != "s21a-legacy", (
-        f"S21a: the retry must proceed fresh after the provenance "
-        f"reconciliation (never a silent expiry-consume); got {resp!r}"
+        "replayed") is True, (
+        f"S21a: the generation-less legacy identity must stay held (replay, "
+        f"never a fresh dispatch from unprovable provenance); got {resp!r}"
     )
     row = store.op_get("s21a-legacy")
     assert row.status == "failed" and row.error_class == (
-        statestore.OP_INTERRUPTED) and row.idem_key == "", (
-        f"S21a: the legacy row must terminalize interrupted with its slot "
-        f"freed (reconciled, not consumed); got {row.as_dict()!r}"
+        statestore.OP_INTERRUPTED) and row.idem_key == "s21a", (
+        f"S21a: the legacy identity must keep its key for trusted "
+        f"reconciliation; got {row.as_dict()!r}"
     )
-    assert _ops.drain_for_tests(timeout_s=10.0) == 0
+    assert tool.calls == 0, (
+        f"S21a: no dispatch on a generation-less legacy row; got {tool.calls}"
+    )
 
 
 def test_residue_release_failure_keeps_identity_and_recovers(
@@ -2802,5 +2809,74 @@ def test_residue_release_failure_keeps_identity_and_recovers(
     assert row2.idem_key == "", (
         f"S21b recovery: the stranded slot must be freed; got "
         f"{row2.as_dict()!r}"
+    )
+    assert _ops.drain_for_tests(timeout_s=10.0) == 0
+
+
+# ---------------------------------------------------------------------------
+# S22 (freshness round at b1e4bd7, probe P2): the recovery arm FENCES before
+# freeing the key — a live detached runner whose heartbeat lapsed (host
+# sleep, a stalled heartbeat writer, a long admission park) keeps send
+# authority (op_mark_send is generation-only), so without the fence the
+# retry and the live runner would BOTH dispatch.
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_arm_fences_a_live_lapsed_runner(ops_store, admission_env):
+    """S22: a live v6 detached-runner row (generation 7, unmarked) whose
+    heartbeat lapsed is classified interrupted at read time; the recovery
+    arm must FENCE it before freeing the key, so the runner's later
+    commit_send_intent (bound to its captured generation) raises lost send
+    authority and the retry proceeds fresh — exactly one dispatch."""
+    import hyperv_mcp.operations as _ops
+    from hyperv_mcp import statestore
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id="s22-live", tool=OP_TOOL, agent="", vm_name="s22-vm",
+        status=statestore.OP_WORKING, created_at=now - 400.0,
+        updated_at=now - 400.0, runner="detachedrunner42",
+        heartbeat_at=now - 400.0,
+        params_hmac=_ops.arguments_fingerprint(
+            cfg, store,
+            {"vm_name": "s22-vm", "checkpoint_name": "cp", "confirm": True,
+             "idempotency_key": "s22", "detach": True}),
+        idem_key="s22", generation=7,
+    ))
+    tool = _CountingTool()
+    resp, ctx = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "s22-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "s22", "detach": True},
+        tool, lambda: CountingSemaphore(2),
+    )
+    assert ctx is None and isinstance(resp, dict) and resp.get(
+        "op_id") and resp.get("op_id") != "s22-live", (
+        f"S22: the retry must proceed fresh after the fenced recovery; got "
+        f"{resp!r}"
+    )
+    row = store.op_get("s22-live")
+    assert row.status == "failed" and row.error_class == (
+        statestore.OP_INTERRUPTED) and row.idem_key == "", (
+        f"S22: the classified residue must terminalize with its slot freed; "
+        f"got {row.as_dict()!r}"
+    )
+    assert row.generation >= 8, (
+        f"S22: the fence must have moved the generation authority; got "
+        f"{row.generation}"
+    )
+    # The live runner reaches its commit window: the fence must deny it.
+    tokens = _bind_op_context("s22-live", cfg, 7)
+    try:
+        import pytest as _pytest
+        with _pytest.raises(RuntimeError, match="send authority"):
+            _ops.commit_send_intent(cfg)
+    finally:
+        _reset_op_context(tokens)
+    row2 = store.op_get("s22-live")
+    assert row2.send_state == "", (
+        f"S22: the fenced runner must NOT mark the send; got {row2.as_dict()!r}"
     )
     assert _ops.drain_for_tests(timeout_s=10.0) == 0
