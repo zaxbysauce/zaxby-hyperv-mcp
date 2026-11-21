@@ -485,18 +485,38 @@ def guard_consult(
             # duplicate dispatch) — never silently reconciled and replaced.
             if existing.params_hmac and existing.params_hmac != fingerprint:
                 return _conflict_envelope(name, idem_key), None
-            if not existing.params_hmac and fingerprint:
-                # Issue #157 (C8b): a legacy row with a BLANK fingerprint and
-                # different arguments is protected reconciliation — a disclosed
-                # refusal naming the original handle, never a silent reattach,
-                # never a re-dispatch.
+            if (
+                (not existing.params_hmac and fingerprint)
+                or (
+                    int(existing.generation or 0) == 0
+                    and (getattr(existing, "send_state", "") or "")
+                    != "possibly_sent"
+                )
+            ):
+                # Issue #157 (C8b + R24, closing review round 24): a legacy
+                # row — a BLANK fingerprint predating fingerprinting, OR the
+                # v6 migration's generation=0 default (whose empty send_state
+                # proves nothing) — is protected reconciliation: a DISCLOSED
+                # refusal naming the original handle, never a silent reattach
+                # (an ordinary working attach would falsely represent an
+                # unknown legacy executor as a live one), never a re-dispatch.
+                # A MARKED row is exempt from the generation disjunct: the
+                # possibly_sent mark is durable proof the v6 machinery was
+                # active (a pre-v6 row could never carry it), so its
+                # provenance is provable regardless of generation — the C4
+                # frozen attach contract is untouched.
+                legacy_reason = (
+                    "whose argument fingerprint predates fingerprinting"
+                    if not existing.params_hmac
+                    else "which predates executor generationing (generation 0)"
+                )
                 return errors.enrich_failure({
                     "ok": False,
                     "error": (
                         f"idempotency_key {idem_key!r} matches a legacy record "
-                        f"(handle {existing.op_id}) whose argument fingerprint "
-                        f"predates fingerprinting; reconciliation is required "
-                        f"before reuse — re-run with a new idempotency_key"
+                        f"(handle {existing.op_id}) {legacy_reason}; "
+                        f"reconciliation is required before reuse — re-run "
+                        f"with a new idempotency_key"
                     ),
                     "error_class": "idempotency_conflict",
                     "reconciliation": True,

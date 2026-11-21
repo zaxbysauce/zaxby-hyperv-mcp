@@ -2718,13 +2718,13 @@ def test_generation_zero_legacy_row_reconciles_not_expires(ops_store, admission_
          "idempotency_key": "s21a", "detach": True},
         tool, lambda: CountingSemaphore(2),
     )
-    # R22: the generation-less identity is HELD — the retry replays the
-    # terminal interrupted envelope (never a fresh dispatch from unprovable
-    # provenance; AC8).
+    # R24: the generation-less identity gets the DISCLOSED reconciliation
+    # refusal naming the handle (never a fresh dispatch from unprovable
+    # provenance, never a silent reattach; AC8).
     assert ctx is None and isinstance(resp, dict) and resp.get(
-        "replayed") is True, (
-        f"S21a: the generation-less legacy identity must stay held (replay, "
-        f"never a fresh dispatch from unprovable provenance); got {resp!r}"
+        "reconciliation") is True and resp.get("op_id") == "s21a-legacy", (
+        f"S21a: the generation-less legacy identity must receive the "
+        f"disclosed reconciliation refusal naming the handle; got {resp!r}"
     )
     row = store.op_get("s21a-legacy")
     assert row.status == "failed" and row.error_class == (
@@ -2919,8 +2919,18 @@ def test_generation_zero_sync_residue_stays_held(ops_store, admission_env):
          "idempotency_key": "s23", "detach": True},
         tool, lambda: CountingSemaphore(2),
     )
-    # The generation-less identity is HELD: no fresh dispatch (the tool
-    # would only run for a newly minted handle), the key stays attached.
+    # R24: the generation-less identity receives the DISCLOSED
+    # reconciliation refusal (an ordinary working attach would falsely
+    # represent an unknown legacy executor as a live one; AC8).
+    assert ctx is None and isinstance(resp, dict) and (
+        resp.get("reconciliation") is True
+        and resp.get("op_id") == "s23-legacy"
+        and resp.get("error_class") == "idempotency_conflict"
+    ), (
+        f"S23: the generation-less legacy identity must receive the "
+        f"disclosed reconciliation refusal naming the handle; got "
+        f"{resp!r}"
+    )
     row = store.op_get("s23-legacy")
     assert row.status == "working" and row.idem_key == "s23", (
         f"S23: the generation-less sync- identity must be held working with "
@@ -2929,8 +2939,4 @@ def test_generation_zero_sync_residue_stays_held(ops_store, admission_env):
     assert tool.calls == 0, (
         f"S23: no dispatch may be authorized from unprovable provenance; got "
         f"{tool.calls}"
-    )
-    assert ctx is None and isinstance(resp, dict), (
-        f"S23: the retry must be answered from the held identity; got "
-        f"resp={resp!r} ctx={ctx!r}"
     )
