@@ -1704,22 +1704,56 @@ def tasks_extension(
                     # is answered as a reattach (the same handle the guard
                     # route would return); a true durable-state failure still
                     # releases the slot and answers the classified refusal.
-                    try:
-                        with store.transaction():
-                            winner = store.op_find_idem(agent, params.name, idem_key)
-                        if winner is not None and winner.op_id != row.op_id:
+                    with store.transaction():
+                        # Issue #157 (impl-review round 3): the re-consult
+                        # winner gets the SAME fingerprint/reconciliation/
+                        # protected-identity checks an ordinary consult
+                        # applies - the key identifies the slot, not the args.
+                        winner = store.op_find_idem(agent, params.name, idem_key)
+                    if winner is not None and winner.op_id != row.op_id:
+                        winner = _classify_stale(store, winner, cfg)
+                        if winner.params_hmac and winner.params_hmac != fingerprint:
                             slots.release()
                             evidencejournal.finish(
-                                jtok, {"task_id": winner.op_id, "consulted": True},
-                                outcome="reattach")
-                            return TaskHandleResult(
-                                task_id=winner.op_id,
-                                status=winner.status,
-                                ttl_ms=int(cfg.operations.retention_s) * 1000,
-                                poll_interval_ms=winner.poll_interval_ms,
-                            )
-                    except Exception:
-                        pass
+                                jtok, _conflict_envelope(params.name, idem_key),
+                                outcome="conflict")
+                            return errors.failure_result(
+                                _conflict_envelope(params.name, idem_key))
+                        if not winner.params_hmac and fingerprint:
+                            slots.release()
+                            _renv = errors.enrich_failure({
+                                "ok": False,
+                                "error": (
+                                    f"idempotency_key {idem_key!r} matches a "
+                                    f"legacy record (handle {winner.op_id}) "
+                                    f"whose argument fingerprint predates "
+                                    f"fingerprinting; reconciliation is "
+                                    f"required before reuse"
+                                ),
+                                "error_class": "idempotency_conflict",
+                                "reconciliation": True,
+                                "op_id": winner.op_id,
+                            })
+                            evidencejournal.finish(jtok, _renv, outcome="conflict")
+                            return errors.failure_result(_renv)
+                        if (
+                            winner.status == statestore.OP_FAILED
+                            and winner.error_class == statestore.OP_UNKNOWN
+                        ):
+                            try:
+                                store.op_fence(winner.op_id)
+                            except Exception:
+                                pass
+                        slots.release()
+                        evidencejournal.finish(
+                            jtok, {"task_id": winner.op_id, "consulted": True},
+                            outcome="reattach")
+                        return TaskHandleResult(
+                            task_id=winner.op_id,
+                            status=winner.status,
+                            ttl_ms=int(cfg.operations.retention_s) * 1000,
+                            poll_interval_ms=winner.poll_interval_ms,
+                        )
                     slots.release()
                     evidencejournal.finish_if_unowned(jtok, None, outcome="error")
                     env = errors.enrich_failure({

@@ -346,8 +346,15 @@ class SessionPool:
             # clear a NEWER dirty epoch).
             try:
                 self.invalidate_vm(key.vm_guid, "epoch_fresh_bind")
-            except Exception:
-                pass
+            except Exception as exc:
+                # Issue #157 fail-closed (impl-review round 3): an
+                # UNCONFIRMED invalidation leaves the epoch dirty and
+                # refuses the borrow - proceeding to create+clear on a
+                # failed invalidation could re-hand a stale worker.
+                raise SessionEpochDirty(
+                    f"vm {guid} invalidation failed during the fresh-bind "
+                    f"dance ({exc}); the epoch stays dirty"
+                ) from exc
             gate = self._gates.setdefault(key, threading.Lock())
             worker = None
             try:
