@@ -6268,12 +6268,63 @@ def _harden_tools(mcp: MCPServer) -> None:
                     if ops_ctx is not None:
                         operations.fail_inline(ops_ctx, exc)
                     raise
+                # Issue #157 keyed-inline wiring (final critic F1): the inline
+                # route performs the SAME durable pre-send sequence the runner
+                # route performs — the per-resource gate (NON-blocking: the
+                # async route answers the retryable busy envelope instead of
+                # blocking the event loop, and frees the idem key per PRR-001),
+                # the generation-validated possibly_sent commit (fail-closed),
+                # the op-context binding (op id + cfg + captured generation so
+                # the effect boundary validates authority and a body crash
+                # classifies unknown), and the generation-fenced heartbeat
+                # timer for the body lifetime (a LIVE inline body past the
+                # heartbeat TTL attaches; a crashed one lapses to unknown).
+                inline_beat_stop = None
+                if ops_ctx is not None:
+                    if not operations._send_gate_acquire(arguments):
+                        operations.busy_inline(ops_ctx, name)
+                        operations.release_busy_idem(ops_ctx)
+                        return _audited_rejection(
+                            name, arguments, operations._busy_envelope(name),
+                            journal_token=jtok,
+                        )
+                    try:
+                        operations.commit_send_intent(
+                            _cfg(), vm_key=operations._send_gate_key(arguments))
+                    except Exception as mark_exc:
+                        operations._send_gate_release(arguments)
+                        operations.fail_inline(ops_ctx, mark_exc)
+                        return _audited_rejection(
+                            name, arguments, errors.envelope(mark_exc),
+                            journal_token=jtok,
+                        )
+                    operations._send_gate_release(arguments)
+                    inline_beat_stop = operations.start_inline_heartbeat(ops_ctx)
                 try:
                     try:
-                        evidencejournal.arm(jtok)
-                        result = await _run(arguments, context, convert_result=convert_result, **kwargs)
+                        op_ctx_tokens = None
                         if ops_ctx is not None:
-                            operations.complete_inline(ops_ctx, result)
+                            # Bind the op context (immutable captured
+                            # generation) for the body: raise_if_cancelled and
+                            # the effect boundary now see this attempt.
+                            op_ctx_tokens = (
+                                operations._current_op_id.set(ops_ctx["op_id"]),
+                                operations._current_ops_cfg.set(ops_ctx["cfg"]),
+                                operations._current_op_generation.set(
+                                    int(ops_ctx.get("generation") or 0)),
+                            )
+                        try:
+                            evidencejournal.arm(jtok)
+                            result = await _run(arguments, context, convert_result=convert_result, **kwargs)
+                            if ops_ctx is not None:
+                                operations.complete_inline(ops_ctx, result)
+                        finally:
+                            # Issue #157 keyed-inline: unbind the op context on
+                            # EVERY body exit (scoped to this attempt only).
+                            if op_ctx_tokens is not None:
+                                operations._current_op_id.reset(op_ctx_tokens[0])
+                                operations._current_ops_cfg.reset(op_ctx_tokens[1])
+                                operations._current_op_generation.reset(op_ctx_tokens[2])
                         evidencejournal.finish(jtok, result, outcome="body")
                         return result
                     except UrlElicitationRequiredError as exc:
@@ -6315,6 +6366,13 @@ def _harden_tools(mcp: MCPServer) -> None:
                             operations.fail_inline(ops_ctx, exc)
                         raise
                 finally:
+                    # Issue #157 keyed-inline: the body-lifetime beat timer
+                    # stops on EVERY exit (a LIVE body kept its heartbeat
+                    # fresh; a crashed body lapses to unknown per contract).
+                    # (The op-context unbind rides the inner body try's own
+                    # finally, scoped exactly to the awaited call.)
+                    if inline_beat_stop is not None:
+                        inline_beat_stop()
                     # issue #131 (PC4-1): a terminal outcome that skipped
                     # an explicit finish (park cancellation, body
                     # BaseException re-raise) still journals exactly one

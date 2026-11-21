@@ -269,6 +269,12 @@ def classify_bind_address(raw: str, ip_section: dict | None) -> str:
         return "not_stale"
     if ip.is_loopback:
         return "not_stale"
+    if ip.version == 6 and ip.is_link_local:
+        # Issue #157 (final critic F3): link-local IPv6 (fe80::/10) is ALWAYS
+        # assigned to an interface, and the production probe legitimately
+        # drops fe80* from its enumeration - it can never be stale, and the
+        # unlisted-vs-unobserved distinction cannot apply to it.
+        return "not_stale"
     section = ip_section or {}
     if section.get("error"):
         return "unknown"

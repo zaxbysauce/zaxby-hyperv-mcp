@@ -318,6 +318,10 @@ if ($initial -ne 'Running') {{ Start-VM -VM $vm -ErrorAction Stop }}
 [PSCustomObject]@{{ initial_state=$initial }} | ConvertTo-Json -Compress
 """
     with vmlocks.vm_lock(ref.id):
+        # Issue #157 (final critic F6): a failed epoch write propagates - the
+        # provider submission never starts without its durable barrier.
+        from . import operations as _ops157
+        _ops157.commit_send_intent(cfg, vm_key=ref.id)
         result = _run(cfg, script, timeout_s=60)
         pswindows.check_result(result, f"hyperv_start_vm({vm_name or vm_id})")
         _invalidate_sessions(ref.id, "start")
@@ -359,6 +363,9 @@ if ($initial -notin ({", ".join(f"'{w}'" for w in wanted)})) {{
 [PSCustomObject]@{{ initial_state=$initial }} | ConvertTo-Json -Compress
 """
     with vmlocks.vm_lock(ref.id):
+        # Issue #157 (final critic F6): failed barrier write propagates.
+        from . import operations as _ops157
+        _ops157.commit_send_intent(cfg, vm_key=ref.id)
         result = _run(cfg, script, timeout_s=60)
         pswindows.check_result(result, f"hyperv_stop_vm({vm_name or vm_id}, {method})")
         _invalidate_sessions(ref.id, "stop")
@@ -383,6 +390,9 @@ Stop-VM -VM $vm -TurnOff -ErrorAction Stop
 Start-VM -VM $vm -ErrorAction Stop
 """
     with vmlocks.vm_lock(ref.id):
+        # Issue #157 (final critic F6): failed barrier write propagates.
+        from . import operations as _ops157
+        _ops157.commit_send_intent(cfg, vm_key=ref.id)
         result = _run(cfg, script, timeout_s=60)
         pswindows.check_result(result, f"hyperv_reset_vm({vm_name or vm_id})")
         _invalidate_sessions(ref.id, "reset")
@@ -420,6 +430,9 @@ def checkpoint_create(
     cn = pswindows.ps_name(checkpoint_name)
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
     with vmlocks.vm_lock(ref.id):
+        # Issue #157 (final critic F6): failed barrier write propagates.
+        from . import operations as _ops157
+        _ops157.commit_send_intent(cfg, vm_key=ref.id)
         if not checkpoint_type:
             script = f"""
 {guestexec.vm_target_preamble(ref.id)}

@@ -1115,13 +1115,18 @@ def test_send_gate_identity_schedules(ops_store, admission_env):
         )
         operations.drain_for_tests(timeout_s=5.0)
         row_held = ops_store.op_get(resp_held["op_id"])
-        assert row_held is not None and row_held.status == statestore.OP_FAILED and \
-            row_held.error_class == "busy", (
-                f"S7: the contended VM's runner must take the disclosed busy "
-                f"refusal; got {row_held.as_dict() if row_held else None}"
-            )
-        assert tool_held.calls == 0, (
-            "S7: a gate-contended attempt must not submit the provider leg"
+        # Issue #157 (final critic F2): a detached RUNNER acquires the gate
+        # BLOCKING - it waits its turn on the held VM (a queued wait beats
+        # a wedged idempotency key). Free the gate, then the runner proceeds.
+        operations._send_gate_release({"vm_name": "S7-Held-VM"})
+        operations.drain_for_tests(timeout_s=5.0)
+        row_held = ops_store.op_get(resp_held["op_id"])
+        assert row_held is not None and row_held.status == statestore.OP_COMPLETED, (
+            f"S7: the contended VM's runner must WAIT on the gate and proceed "
+            f"once it frees; got {row_held.as_dict() if row_held else None}"
+        )
+        assert tool_held.calls == 1, (
+            "S7: the held runner must submit after the gate frees"
         )
     finally:
         operations._send_gate_release({"vm_name": "S7-Held-VM"})
@@ -1372,23 +1377,29 @@ def test_repair_intent_edit_and_directives(monkeypatch):
     assert planner("10.0.0.5", section) == "not_stale"
     assert planner("10.0.0.9", section) == "stale"
     assert planner("fe80::1", section) == "not_stale"
-    assert planner("fe80::5", section) == "stale"
-    assert planner("fe80::5", {"ipv4": [], "ipv6": None}) == "unknown"
+    # Issue #157 (final critic F3): link-local fe80::/10 is ALWAYS assigned -
+    # the production probe drops fe80* from the enumeration, so every fe80
+    # form classifies not_stale (never rewritten).
+    assert planner("fe80::5", section) == "not_stale"
+    assert planner("fe80::5", {"ipv4": [], "ipv6": None}) == "not_stale"
     assert planner("10.0.0.9", {"ipv4": None, "ipv6": []}) == "unknown"
     assert planner("::1", section) == "not_stale"
     assert planner("host.example", section) == "not_stale"
 
-    # An IPv6 stale binding plans the rewrite for the IPv6 line (dry run).
-    stale6 = _guest(listen="fe80::5")
-    stale6["ip_addresses"]["ipv6"] = [{"interface": "E", "address": "fe80::1",
+    # An assigned-IPv6 (global, not link-local) stale binding plans the
+    # rewrite for the IPv6 line (dry run). fe80* link-local is never stale
+    # (final critic F3), so this scenario uses a global unassigned v6.
+    stale6 = _guest(listen="2001:db8::5")
+    stale6["ip_addresses"]["ipv6"] = [{"interface": "E", "address": "2001:db8::1",
                                        "prefix": 64}]
     fake6 = FakePS([_guid_result(), _ok(_host()), _ok(stale6)])
     monkeypatch.setattr(pswindows, "run_ps", fake6)
     out6 = repair.repair_guest_access(cfg, "test-vm", cred=CRED)
     rewrite6 = [p for p in out6["plan"]
                 if p["action"] == "rewrite_stale_ssh_bindings"]
-    assert rewrite6 and rewrite6[0]["before"]["stale_bindings"] == ["fe80::5"], (
-        f"S9: an unassigned IPv6 binding must plan its rewrite; got {out6['plan']}"
+    assert rewrite6 and rewrite6[0]["before"]["stale_bindings"] == ["2001:db8::5"], (
+        f"S9: an unassigned global IPv6 binding must plan its rewrite; got "
+        f"{out6['plan']}"
     )
 
 
@@ -1515,3 +1526,191 @@ def test_repair_tripartite_observation_arms(monkeypatch):
     assert sum("Copy-Item" in s for s in fake5.scripts) == 0, (
         "S10: an invalid intent must run no rewrite mutation script"
     )
+
+
+
+# ---------------------------------------------------------------------------
+# S11 (final critic F1): the KEYED-INLINE route driven through the REAL
+# mcp.call_tool dispatch - no hand-bound context. At the provider submission
+# the row must carry possibly_sent with the dispatch-bound op context; a
+# crash after the effect must lapse to the unknown reconciliation identity.
+# ---------------------------------------------------------------------------
+
+
+def _boot_server(tmp_path):
+    import importlib
+    import json as _json
+
+    import hyperv_mcp.server as server_module
+
+    doc = {"allowed_vm_patterns": ["test-*"], "unrestricted": True,
+           "state_db_path": str(tmp_path / "s11-state.db")}
+    cfg_path = tmp_path / "s11-boot.json"
+    cfg_path.write_text(_json.dumps(doc), encoding="utf-8")
+    mod = importlib.reload(server_module)
+    mod.bootstrap({"HYPERV_MCP_CONFIG": str(cfg_path)})
+    return mod
+
+
+def test_inline_route_marks_possibly_sent_at_submission(tmp_path):
+    """S11a: a keyed-inline checkpoint_restore observed AT the
+    Restore-VMSnapshot submission carries send_state='possibly_sent' and the
+    dispatch-bound op context - proving the route wiring itself, never a
+    hand-bound context (final critic F1/PA)."""
+    import asyncio
+    import json as _json
+    import threading as _th
+
+    import hyperv_mcp.operations as _ops
+    from hyperv_mcp import pswindows
+
+    mod = _boot_server(tmp_path)
+    mcp = mod.get_mcp()
+    reached = {"payload": None}
+    release = _th.Event()
+    saved = pswindows.run_ps
+
+    def dispatcher(script, **kwargs):
+        # Leg shapes mirror the e03 _FakePS: resolve -> bare GUID,
+        # restore -> empty stdout, state wait -> final_state JSON.
+        if "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget"):
+            return pswindows.PSResult(stdout=VM_GUID, returncode=0)
+        if "Restore-VMSnapshot" in script:
+            cfg = mod.CFG
+            store = _ops.store_for(cfg)
+            row = store.op_get(_ops._current_op_id.get(""))
+            reached["payload"] = {
+                "ctx_op_id": _ops._current_op_id.get(""),
+                "ctx_gen": _ops._current_op_generation.get(0),
+                "row_send": row.send_state if row else None,
+                "row_status": row.status if row else None,
+            }
+            release.set()
+            return pswindows.PSResult(stdout="", returncode=0)
+        if "final_state" in script:
+            return pswindows.PSResult(
+                stdout=_json.dumps({"final_state": "Off"}), returncode=0)
+        return pswindows.PSResult(stdout="{}", returncode=0)
+
+    pswindows.run_ps = dispatcher
+    try:
+        handle = asyncio.run(mcp.call_tool(
+            "hyperv_checkpoint_restore",
+            {"vm_name": "test-vm", "checkpoint_name": "s11a", "confirm": True,
+             "idempotency_key": "s11-inline-a"},
+        ))
+        release.wait(timeout=30.0)
+        payload = reached["payload"]
+        assert payload is not None and payload["row_send"] == "possibly_sent", (
+            f"S11a: the keyed-inline restore must carry possibly_sent AT the "
+            f"provider submission (route wiring); got {payload!r}"
+        )
+        handle_id = handle.get("op_id") if isinstance(handle, dict) else getattr(
+            handle, "op_id", None)
+        if handle_id:
+            assert payload["ctx_op_id"] == handle_id, (
+                f"S11a: the dispatch-bound op context must name the attempt; "
+                f"got {payload!r}"
+            )
+        assert payload["row_status"] == "working", (
+            f"S11a: the attempt is live mid-body; got {payload!r}"
+        )
+    finally:
+        release.set()
+        pswindows.run_ps = saved
+        _ops.drain_for_tests(timeout_s=5.0)
+
+
+def test_inline_route_crash_after_effect_lapses_to_unknown(tmp_path):
+    """S11b: an inline body that crashes AFTER the effect committed (the
+    restore leg succeeded, then the body raises) keeps the mark; once the
+    heartbeat lapsed the row reads failed/unknown at read time (final critic
+    F1/PB) - never a fresh dispatch."""
+    import asyncio
+    import json as _json
+    import importlib
+
+    import hyperv_mcp.operations as _ops
+    from hyperv_mcp import pswindows, statestore
+
+    mod = _boot_server(tmp_path)
+    mcp = mod.get_mcp()
+    saved = pswindows.run_ps
+    calls = {"restore": 0}
+
+    def crash_after_restore(script, **kwargs):
+        if "Msvm_ComputerSystem" in script and script.rstrip().endswith("$vmTarget"):
+            return pswindows.PSResult(stdout=VM_GUID, returncode=0)
+        if "Restore-VMSnapshot" in script:
+            calls["restore"] += 1
+            return pswindows.PSResult(stdout="", returncode=0)
+        # The state-wait leg runs AFTER the restore committed: raising here
+        # is the crash-after-effect schedule exactly.
+        raise RuntimeError("post-effect crash (simulated)")
+
+    pswindows.run_ps = crash_after_restore
+    op_id = None
+    try:
+        try:
+            asyncio.run(mcp.call_tool(
+                "hyperv_checkpoint_restore",
+                {"vm_name": "test-vm", "checkpoint_name": "s11b", "confirm": True,
+                 "idempotency_key": "s11-inline-b"},
+                ))
+        except Exception:
+            pass  # the post-effect crash surfaces as an audited rejection
+        cfg = mod.CFG
+        store = _ops.store_for(cfg)
+        rows = [r for r in store.op_rows_by_agent("", include_terminal=True)
+                if r.tool == "hyperv_checkpoint_restore"
+                and r.send_state == "possibly_sent"]
+        assert rows, (
+            "S11b: the crash-after-effect attempt must persist with the mark"
+        )
+        row = rows[-1]
+        op_id = row.op_id
+        assert calls["restore"] == 1, (
+            f"S11b: exactly one provider submission; got {calls['restore']}"
+        )
+        # Age the heartbeat deterministically (the beat timer stopped at
+        # dispatch exit) so the read-time classification runs its lapsed arm.
+        store._begin()
+        try:
+            store._connect().execute(
+                "UPDATE ops SET heartbeat_at = ? WHERE op_id = ?",
+                (1.0, row.op_id),
+            )
+            store._commit()
+        except BaseException:
+            store._rollback()
+            raise
+        status = _ops.op_status(cfg, row.op_id, "")
+        # Issue #157 (final critic F1/PB): the body-originated envelope
+        # retains the mark; the status view carries the vm_outcome unknown
+        # disclosure (the restore committed before the crash).
+        blob = json.dumps(status).lower()
+        assert status.get("status") == "failed", (
+            f"S11b: the crashed inline row reads failed; got {status!r}"
+        )
+        assert "unknown" in blob, (
+            f"S11b: the retained-mark row must disclose the unknown VM-side "
+            f"outcome in its status view; got {blob[:240]}"
+        )
+        # A same-key retry ATTACHES to the unknown identity (never fresh).
+        resp, ctx = _ops.guard_consult(
+            cfg, "hyperv_checkpoint_restore",
+            {"vm_name": "test-vm", "checkpoint_name": "s11b", "confirm": True,
+             "idempotency_key": "s11-inline-b"},
+            lambda **kw: (_ for _ in ()).throw(AssertionError("re-dispatch")),
+            lambda: __import__("threading").BoundedSemaphore(2),
+        )
+        # The retry REPLAYS the stored crash envelope (marked replayed, the
+        # unknown disclosure carried) and NEVER re-dispatches.
+        assert ctx is None and isinstance(resp, dict) and resp.get(
+            "replayed") is True and resp.get("vm_outcome") == "unknown", (
+            f"S11b: the same-key retry must replay the stored unknown envelope "
+            f"without re-dispatch; got resp={resp!r} ctx={ctx!r}"
+        )
+    finally:
+        pswindows.run_ps = saved
+        _ops.drain_for_tests(timeout_s=5.0)

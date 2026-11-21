@@ -123,15 +123,21 @@ def _send_gate_key(arguments: dict[str, Any]) -> str:
     return ""
 
 
-def _send_gate_acquire(arguments: dict[str, Any]) -> bool:
-    """True = acquired; False = contended (the async caller answers busy)."""
+def _send_gate_acquire(arguments: dict[str, Any], blocking: bool = False) -> bool:
+    """True = acquired; False = contended (non-blocking callers answer busy).
+
+    Runner threads pass blocking=True (the plan's canonical order holds the
+    gate until the pre-send commit completes; a same-VM runner waits its turn
+    instead of failing); the async keyed-inline caller passes blocking=False
+    and answers the retryable busy envelope on contention, never blocking the
+    event loop."""
     key = _send_gate_key(arguments)
     with _SEND_GATES_LOCK:
         lock = _SEND_GATES.get(key)
         if lock is None:
             lock = threading.Lock()
             _SEND_GATES[key] = lock
-    return lock.acquire(blocking=False)
+    return lock.acquire(blocking=blocking)
 
 
 def _send_gate_release(arguments: dict[str, Any]) -> None:
@@ -335,7 +341,13 @@ def _stale_view(row: statestore.OpRow) -> dict[str, Any]:
     (frozen AC5 asserts a literal 'unknown' marker)."""
     if row.status == statestore.OP_FAILED and row.error_class == statestore.OP_INTERRUPTED:
         return {"vm_outcome": "unknown", "note": "runner heartbeat lapsed; VM-side outcome is unknown"}
-    if row.status == statestore.OP_FAILED and row.error_class == statestore.OP_UNKNOWN:
+    if row.status == statestore.OP_FAILED and (
+        row.error_class == statestore.OP_UNKNOWN
+        or (getattr(row, "send_state", "") or "") == "possibly_sent"
+    ):
+        # Issue #157 (final critic F1/PB): ANY failed row still carrying the
+        # send mark is a post-send ambiguity - the provider may have committed
+        # before the failure - so the view discloses the unknown outcome.
         return {"vm_outcome": "unknown",
                 "note": ("send committed; reply lost; outcome unknown; the "
                          "identity stays protected until trusted reconciliation")}
@@ -574,7 +586,13 @@ def _replay_response(store: statestore.Store, row: statestore.OpRow) -> dict[str
     disclosure instead of a fresh dispatch."""
     if row.status == statestore.OP_WORKING:
         return {**_handle_payload(row), "replayed": True}
-    if row.error_class == statestore.OP_UNKNOWN:
+    if row.error_class == statestore.OP_UNKNOWN or (
+        row.status == statestore.OP_CANCELLED
+        and (getattr(row, "send_state", "") or "") == "possibly_sent"
+    ):
+        # Issue #157 (final critic F5): a cancelled possibly_sent row keeps
+        # its unknown disclosure on the replay view - never mislabeled as an
+        # ordinary payload expiry.
         payload = {
             **_handle_payload(row),
             "replayed": True,
@@ -671,10 +689,25 @@ def complete_inline(op_ctx: dict[str, Any], result: Any) -> None:
         except ValueError:
             parsed = None
         if error_class:
-            # Issue #157 (impl-review F8): a tool-level ok:false envelope is a
-            # BODY outcome — in-body provenance RETAINS the send mark (an
-            # envelope does not prove the provider never acted); the
-            # completed arm below is the definitive clear.
+            # Issue #157 (impl-review F8 + final critic F1/PB): a tool-level
+            # ok:false envelope is a BODY outcome — in-body provenance RETAINS
+            # the send mark (an envelope does not prove the provider never
+            # acted), and the stored envelope discloses the unknown VM-side
+            # outcome so retries/replays carry it.
+            row = store.op_get(op_ctx["op_id"])
+            if row is not None and (getattr(row, "send_state", "") or "") == "possibly_sent":
+                try:
+                    parsed_env = json.loads(text) if text.startswith("{") else None
+                    if isinstance(parsed_env, dict) and "vm_outcome" not in parsed_env:
+                        parsed_env["vm_outcome"] = "unknown"
+                        parsed_env["note"] = (
+                            "send committed before the failure; outcome unknown; "
+                            "the identity stays protected"
+                        )
+                        text = json.dumps(parsed_env, separators=(",", ":"),
+                                          default=str, ensure_ascii=False)
+                except ValueError:
+                    pass
             store.op_transition(
                 op_ctx["op_id"], (statestore.OP_WORKING, statestore.OP_FAILED),
                 statestore.OP_FAILED,
@@ -755,6 +788,68 @@ def release_busy_idem(op_ctx: dict[str, Any]) -> None:
         )
     except Exception:
         pass
+
+
+def busy_inline(op_ctx: dict[str, Any], name: str) -> None:
+    """The keyed-INLINE route's gate-contention twin of the runner's
+    admission-refusal epilogue (issue #157): the row closes failed/busy
+    (provably pre-body, so the send mark clears) and the caller frees the
+    idem_key (retryable per PRR-001) via release_busy_idem. Best-effort."""
+    try:
+        store = store_for(op_ctx["cfg"])
+        env = _busy_envelope(name)
+        text = json.dumps(env, separators=(",", ":"), default=str)
+        store.op_transition(
+            op_ctx["op_id"], (statestore.OP_WORKING,), statestore.OP_FAILED,
+            error_class="busy",
+            result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
+            updated_at=store.now(),
+            generation=int(op_ctx.get("generation") or 0) or None,
+            pre_body_terminal=True,
+        )
+        emit(op_ctx["cfg"], "op.failed", op_ctx["op_id"], "",
+             str(op_ctx.get("agent") or ""),
+             {"error_class": "busy", "mode": "inline"})
+    except Exception:
+        pass
+
+
+def start_inline_heartbeat(op_ctx: dict[str, Any]) -> Callable[[], None]:
+    """The keyed-inline body's generation-fenced beat timer (issue #157,
+    plan round-5 blocker 1): keeps the row's heartbeat fresh for the whole
+    inline body lifetime so a LIVE inline call past the heartbeat TTL is
+    never classified unknown, while a CRASHED inline body (timer dead with
+    the mark set) lapses into the unknown reconciliation identity. Returns
+    the stop callable; the dispatch's finally MUST call it."""
+    cfg: Config = op_ctx["cfg"]
+    op_id = str(op_ctx["op_id"])
+    generation = int(op_ctx.get("generation") or 0)
+    # The store is BOUND AT DISPATCH like the detached runner's: a body that
+    # outlives its caller writes to the row's own store, never re-resolves.
+    store = store_for(cfg)
+    stop = threading.Event()
+
+    def _beat() -> None:
+        try:
+            store.op_heartbeat(op_id, store.now(), generation=generation or None)
+        except Exception:
+            pass  # a missed beat is retried on the next interval
+        if not stop.is_set():
+            t = threading.Timer(
+                max(1.0, int(cfg.operations.heartbeat_ttl_s or 60) / 3.0), _beat)
+            t.daemon = True
+            t.start()
+
+    first = threading.Timer(
+        max(1.0, int(cfg.operations.heartbeat_ttl_s or 60) / 3.0), _beat)
+    first.daemon = True
+    first.start()
+
+    def _stop() -> None:
+        stop.set()
+        first.cancel()
+
+    return _stop
 
 
 def _result_text(result: Any) -> str:
@@ -1054,7 +1149,7 @@ def _execute_body(
         # disclosed deviation from the plan's whole-body hold that preserves
         # every gate property the plan required). A runner thread acquires
         # blocking; the async inline route acquires non-blocking (server.py).
-        gate_held = _send_gate_acquire(body_args)
+        gate_held = _send_gate_acquire(body_args, blocking=True)
         try:
             if not gate_held:
                 env = _busy_envelope(tool_name)
@@ -1065,6 +1160,14 @@ def _execute_body(
                     result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
                     pre_body_terminal=True,
                 )
+                # Issue #157 (final critic F2): the busy refusal is RETRYABLE
+                # (PRR-001) — free the (agent, tool, idem_key) slot so a
+                # same-key retry mints a fresh dispatch instead of replaying
+                # this busy envelope for the whole idempotency TTL.
+                try:
+                    store.op_release_idem(op_id, generation=generation or None)
+                except Exception:
+                    pass
                 admission.release_sync(ticket)
                 return
             try:
