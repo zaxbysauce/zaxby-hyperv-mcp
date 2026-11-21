@@ -2026,3 +2026,116 @@ def test_rewrite_verification_unknown_binding_blocks_certification(monkeypatch):
     assert change3["postcondition_detail"]["stale_bindings_remaining"] == [
         "10.9.9.9"]
     assert "fe80::1" in change3["postcondition_detail"]["unverified_bindings"]
+
+
+# ---------------------------------------------------------------------------
+# S15 (closing impl-review round 14, R14-1): a BaseException escaping the
+# DETACHED runner's pre-send commit window must NOT strand the admission
+# permit — the arm reconciles by provenance, releases the ticket exactly
+# once, and re-raises to the outer classifier. Both interruption arms pinned.
+# ---------------------------------------------------------------------------
+
+
+def test_detached_commit_baseexception_releases_ticket(
+        tmp_path, monkeypatch, ops_store, admission_env):
+    """S15: drive the real detached route with a commit that raises a
+    BaseException — pre-mark (raises at entry) and post-mark (marks first,
+    then raises). Both arms must return the admission budget to zero; the
+    pre-mark row terminalizes failed/interrupted (the definitive pre-send
+    refusal, same-key retry replays), the post-mark row classifies
+    failed/unknown with the mark retained (same-key retry attaches)."""
+    import hyperv_mcp.operations as _ops
+    from hyperv_mcp import admission
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    sem = CountingSemaphore(2)
+    saved_commit = _ops.commit_send_intent
+
+    class _CommitBoom(BaseException):
+        pass
+
+    def _dispatch(key: str):
+        tool = _NoDispatchTool()
+        return _ops.guard_consult(
+            cfg, OP_TOOL,
+            {"vm_name": "boom-vm", "checkpoint_name": "cp", "confirm": True,
+             "idempotency_key": key, "detach": True},
+            tool, lambda: sem,
+        )
+
+    # -- pre-mark arm: the boom fires before anything is marked -------------
+    def boom_early(cfg):
+        raise _CommitBoom("pre-mark interruption")
+
+    monkeypatch.setattr(_ops, "commit_send_intent", boom_early)
+    resp_a, ctx_a = _dispatch("s15-pre")
+    assert ctx_a is None and resp_a.get("op_id"), f"S15 pre: {resp_a!r}"
+    op_a = resp_a["op_id"]
+    assert _ops.drain_for_tests(timeout_s=10.0) == 0, (
+        "S15 pre: the interrupted runner must terminate"
+    )
+    snap = admission.snapshot()["in_flight_general"]
+    assert snap == 0, (
+        f"S15 pre-mark: the detached interruption must release the admission "
+        f"ticket (no stranded permit); in_flight_general={snap!r}"
+    )
+    row_a = store.op_get(op_a)
+    assert row_a.status == "failed" and row_a.send_state == "", (
+        f"S15 pre-mark: the unmarked interruption must terminalize the row "
+        f"(definitive pre-send refusal); got {row_a.as_dict()!r}"
+    )
+    assert row_a.error_class == statestore.OP_INTERRUPTED, (
+        f"S15 pre-mark: expected the interrupted class; got {row_a.error_class!r}"
+    )
+    resp_r, ctx_r = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "boom-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "s15-pre", "detach": True},
+        lambda **kw: (_ for _ in ()).throw(AssertionError("re-dispatch")),
+        lambda: sem,
+    )
+    assert ctx_r is None and resp_r.get("replayed") is True, (
+        f"S15 pre-mark: the same-key retry must replay the interrupted "
+        f"envelope; got {resp_r!r}"
+    )
+
+    # -- post-mark arm: the real commit lands, THEN the boom ---------------
+    real_commit = saved_commit
+
+    def commit_then_boom(cfg):
+        real_commit(cfg)
+        raise _CommitBoom("post-mark interruption")
+
+    monkeypatch.setattr(_ops, "commit_send_intent", commit_then_boom)
+    resp_b, ctx_b = _dispatch("s15-post")
+    assert ctx_b is None and resp_b.get("op_id"), f"S15 post: {resp_b!r}"
+    op_b = resp_b["op_id"]
+    assert _ops.drain_for_tests(timeout_s=10.0) == 0, (
+        "S15 post: the interrupted runner must terminate"
+    )
+    snap_b = admission.snapshot()["in_flight_general"]
+    assert snap_b == 0, (
+        f"S15 post-mark: the ticket must be released on the marked arm too; "
+        f"in_flight_general={snap_b!r}"
+    )
+    row_b = store.op_get(op_b)
+    assert row_b.status == "failed" and row_b.send_state == "possibly_sent", (
+        f"S15 post-mark: the marked interruption keeps the protected unknown "
+        f"identity (mark retained); got {row_b.as_dict()!r}"
+    )
+    assert row_b.error_class == statestore.OP_UNKNOWN, (
+        f"S15 post-mark: the outer classifier must record unknown; got "
+        f"{row_b.error_class!r}"
+    )
+    resp_s, ctx_s = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "boom-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "s15-post", "detach": True},
+        lambda **kw: (_ for _ in ()).throw(AssertionError("re-dispatch")),
+        lambda: sem,
+    )
+    assert ctx_s is None and resp_s.get("op_id") == op_b, (
+        f"S15 post-mark: the same-key retry must attach to the original "
+        f"unknown identity; got {resp_s!r}"
+    )
