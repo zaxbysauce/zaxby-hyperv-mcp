@@ -457,37 +457,88 @@ def guard_consult(
                 existing = None
         if existing is not None:
             existing = _classify_stale(store, existing, cfg)
-            if existing.params_hmac and existing.params_hmac != fingerprint:
-                return _conflict_envelope(name, idem_key), None
-            if not existing.params_hmac and fingerprint:
-                # Issue #157 (C8b): a legacy row with a BLANK fingerprint and
-                # different arguments is protected reconciliation — a disclosed
-                # refusal naming the original handle, never a silent reattach,
-                # never a re-dispatch.
-                return errors.enrich_failure({
+            if (
+                existing.status == statestore.OP_WORKING
+                and (existing.runner or "").startswith("sync-")
+                and (getattr(existing, "send_state", "") or "") != "possibly_sent"
+                and not heartbeat_fresh
+            ):
+                # R16-1 (closing review round 16): the R6-exempt class has no
+                # runner thread — its serving request IS its heartbeat (the
+                # inline beat stops at dispatch exit). A LAPSED heartbeat on
+                # an UNMARKED sync- row therefore means the serving request
+                # is gone: its exit-time reconciliation could not write (e.g.
+                # a store-resolution failure during a commit-window
+                # BaseException), and a same-key retry must not attach to the
+                # dead handle until the idempotency TTL retires it. Reconcile
+                # by the durable provenance — unmarked means nothing was
+                # dispatched, the definitive pre-send refusal — terminalize,
+                # free the idempotency slot, and let the retry execute fresh
+                # (re-dispatch cannot duplicate a send). A FRESH heartbeat
+                # keeps the R6 live-attach contract untouched.
+                text = json.dumps({
                     "ok": False,
                     "error": (
-                        f"idempotency_key {idem_key!r} matches a legacy record "
-                        f"(handle {existing.op_id}) whose argument fingerprint "
-                        f"predates fingerprinting; reconciliation is required "
-                        f"before reuse — re-run with a new idempotency_key"
-                    ),
-                    "error_class": "idempotency_conflict",
-                    "reconciliation": True,
-                    "op_id": existing.op_id,
-                }), None
-            if (
-                existing.status == statestore.OP_FAILED
-                and existing.error_class == statestore.OP_UNKNOWN
-            ):
-                # Protected recovery of an unresolved identity (issue #157):
-                # fence the lost executor before answering so its late writes
-                # cannot re-authorize (the replacement demonstrably fences).
+                        "interrupted before the send commit (the serving "
+                        "request died before it could reconcile); nothing "
+                        "was dispatched; the retry proceeds fresh"),
+                    "error_class": statestore.OP_INTERRUPTED,
+                    "note": "reconciled at retry time from the "
+                            "lapsed-heartbeat residue",
+                }, separators=(",", ":"))
                 try:
-                    store.op_fence(existing.op_id)
+                    store.op_transition(
+                        existing.op_id, (statestore.OP_WORKING,),
+                        statestore.OP_FAILED,
+                        error_class=statestore.OP_INTERRUPTED,
+                        result_json=pswindows.redact(text),
+                        result_size=len(text.encode("utf-8")),
+                        updated_at=store.now(),
+                        pre_body_terminal=True,
+                    )
                 except Exception:
                     pass
-            return _replay_response(store, existing), None
+                try:
+                    store.op_release_idem(existing.op_id)
+                except Exception:
+                    pass
+                emit(cfg, "op.failed", existing.op_id, "", agent,
+                     {"error_class": statestore.OP_INTERRUPTED,
+                      "reason": "pre_send_residue_reconciled_at_retry"},
+                     store=store)
+                existing = None
+            if existing is not None:
+                if existing.params_hmac and existing.params_hmac != fingerprint:
+                    return _conflict_envelope(name, idem_key), None
+                if not existing.params_hmac and fingerprint:
+                    # Issue #157 (C8b): a legacy row with a BLANK fingerprint and
+                    # different arguments is protected reconciliation — a disclosed
+                    # refusal naming the original handle, never a silent reattach,
+                    # never a re-dispatch.
+                    return errors.enrich_failure({
+                        "ok": False,
+                        "error": (
+                            f"idempotency_key {idem_key!r} matches a legacy record "
+                            f"(handle {existing.op_id}) whose argument fingerprint "
+                            f"predates fingerprinting; reconciliation is required "
+                            f"before reuse — re-run with a new idempotency_key"
+                        ),
+                        "error_class": "idempotency_conflict",
+                        "reconciliation": True,
+                        "op_id": existing.op_id,
+                    }), None
+                if (
+                    existing.status == statestore.OP_FAILED
+                    and existing.error_class == statestore.OP_UNKNOWN
+                ):
+                    # Protected recovery of an unresolved identity (issue #157):
+                    # fence the lost executor before answering so its late writes
+                    # cannot re-authorize (the replacement demonstrably fences).
+                    try:
+                        store.op_fence(existing.op_id)
+                    except Exception:
+                        pass
+                return _replay_response(store, existing), None
         if detach:
             slots = runner_slots()
             if not slots.acquire(blocking=False):

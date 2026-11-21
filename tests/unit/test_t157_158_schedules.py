@@ -2228,3 +2228,97 @@ def test_inline_reconciliation_store_failure_does_not_mask_interruption(tmp_path
         _ops.commit_send_intent = saved_commit
         _ops.store_for = saved_store_for
         _ops.drain_for_tests(timeout_s=5.0)
+
+
+# ---------------------------------------------------------------------------
+# S17 (impl-review round 16, R16-1): the S16 ghost recovers at retry time —
+# a same-key retry against a lapsed unmarked sync- residue terminalizes it
+# (the definitive pre-send refusal) and proceeds FRESH (nothing was
+# dispatched, so re-dispatch cannot duplicate a send); a FRESH unmarked
+# inline row keeps the R6 live-attach contract.
+# ---------------------------------------------------------------------------
+
+
+def test_lapsed_unmarked_inline_residue_reconciles_at_retry(ops_store, admission_env):
+    """S17: (a) a lapsed unmarked sync- working row (the S16 ghost) — a
+    same-key retry terminalizes it failed/interrupted, frees the idem key,
+    and dispatches a NEW handle (no attach, no replay of the dead row);
+    (b) the same shape with a FRESH heartbeat — the retry attaches live
+    (R6 untouched)."""
+    import hyperv_mcp.operations as _ops
+    from hyperv_mcp import statestore
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    sem = CountingSemaphore(2)
+    now = store.now()
+
+    def _ghost(key: str, heartbeat_at: float) -> str:
+        row = statestore.OpRow(
+            op_id=f"ghost-{key}", tool=OP_TOOL, agent="", vm_name="ghost-vm",
+            status=statestore.OP_WORKING, created_at=now - 400.0,
+            updated_at=now - 400.0, runner="sync-deadbeef",
+            heartbeat_at=heartbeat_at,
+            params_hmac=_ops.arguments_fingerprint(
+                cfg, store,
+                {"vm_name": "ghost-vm", "checkpoint_name": "cp",
+                 "confirm": True, "idempotency_key": key, "detach": True}),
+            idem_key=key, generation=1,
+        )
+        store.op_insert(row)
+        return row.op_id
+
+    # -- (a) lapsed ghost: the retry reconciles + proceeds fresh ------------
+    dead_id = _ghost("s17-dead", now - 400.0)
+    tool = _CountingTool()
+    resp, ctx = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "ghost-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "s17-dead", "detach": True},
+        tool, lambda: sem,
+    )
+    assert ctx is None and isinstance(resp, dict), f"S17a: {resp!r}"
+    fresh_id = resp.get("op_id")
+    assert fresh_id and fresh_id != dead_id, (
+        f"S17a: the retry must dispatch a FRESH handle (never attach to the "
+        f"dead residue); got {resp!r}"
+    )
+    dead_row = store.op_get(dead_id)
+    assert dead_row.status == "failed" and dead_row.send_state == "", (
+        f"S17a: the residue must terminalize as the definitive pre-send "
+        f"refusal; got {dead_row.as_dict()!r}"
+    )
+    assert dead_row.error_class == statestore.OP_INTERRUPTED, (
+        f"S17a: expected the interrupted class; got {dead_row.error_class!r}"
+    )
+    assert dead_row.idem_key == "", (
+        "S17a: the residue's idempotency slot must be freed"
+    )
+    assert _ops.drain_for_tests(timeout_s=10.0) == 0
+    # The fresh dispatch must have run to its own terminal (the counting
+    # tool completes instantly) — the residue reconciliation freed the slot
+    # and the body actually executed.
+    fresh_row = store.op_get(fresh_id)
+    assert fresh_row is not None and fresh_row.status == "completed", (
+        f"S17a: the fresh dispatch must have executed (not attached to the "
+        f"dead residue); got "
+        f"{fresh_row.as_dict() if fresh_row else None!r}"
+    )
+    assert tool.calls == 1, (
+        f"S17a: exactly one real dispatch; got {tool.calls}"
+    )
+
+    # -- (b) fresh inline ghost: the R6 live-attach contract untouched ------
+    live_id = _ghost("s17-live", now)
+    resp2, ctx2 = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "ghost-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "s17-live", "detach": True},
+        tool, lambda: sem,
+    )
+    assert ctx2 is None and isinstance(resp2, dict) and (
+        resp2.get("op_id") == live_id
+    ), (
+        f"S17b: a FRESH unmarked inline row must attach live (R6 untouched); "
+        f"got resp={resp2!r} ctx={ctx2!r}"
+    )
