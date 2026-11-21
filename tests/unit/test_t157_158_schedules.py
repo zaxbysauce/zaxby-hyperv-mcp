@@ -3015,3 +3015,58 @@ def test_tasks_route_legacy_shapes_refuse(ops_store, admission_env):
         f"S24: zero body executions on the refusal shapes; got {tool.calls}"
     )
     assert _ops.drain_for_tests(timeout_s=10.0) == 0
+
+
+# ---------------------------------------------------------------------------
+# S25 (impl-review round 26, R26): a CROSS-ROUTE retry — the S16 ghost (an
+# inline request's pre-send interruption whose reconciliation failed,
+# leaving a working sync- unmarked row) retried through the SHIPPED tasks
+# extension — runs the same provenance-safe fenced recovery: the residue
+# terminalizes interrupted, its key frees, and the tasks route dispatches
+# a fresh handle (never an attach to the dead handle).
+# ---------------------------------------------------------------------------
+
+
+def test_tasks_retry_recovers_inline_residue(ops_store, admission_env):
+    """S25: the S16 ghost shape (working sync- unmarked, heartbeat lapsed,
+    generation >= 1) retried through tasks_extension.intercept_tool_call
+    must NOT return a working task for the dead handle — the shared
+    recovery terminalizes it, frees the key, and dispatches fresh."""
+    import hyperv_mcp.operations as _ops
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    sem = CountingSemaphore(2)
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id="s25-ghost", tool=OP_TOOL, agent="", vm_name="s25-vm",
+        status=statestore.OP_WORKING, created_at=now - 400.0,
+        updated_at=now - 400.0, runner="sync-deadbeef",
+        heartbeat_at=now - 400.0,
+        params_hmac=_ops.arguments_fingerprint(
+            cfg, store,
+            {"vm_name": "s25-vm", "checkpoint_name": "cp", "confirm": True,
+             "idempotency_key": "s25"}),
+        idem_key="s25", generation=1,
+    ))
+    tool = _CountingTool()
+    run_tasks = _tasks_driver(cfg, tool, sem)
+    out = run_tasks(OP_TOOL, {"vm_name": "s25-vm", "checkpoint_name": "cp",
+                              "confirm": True, "idempotency_key": "s25"})
+    # The fresh tasks handle (never the dead ghost's op_id).
+    fresh_id = getattr(out, "task_id", None)
+    assert fresh_id and fresh_id != "s25-ghost", (
+        f"S25: the cross-route retry must dispatch a FRESH handle (never "
+        f"attach to the dead inline residue); got {out!r}"
+    )
+    row = store.op_get("s25-ghost")
+    assert row.status == "failed" and row.error_class == (
+        statestore.OP_INTERRUPTED) and row.idem_key == "", (
+        f"S25: the residue must terminalize interrupted with its slot "
+        f"freed; got {row.as_dict()!r}"
+    )
+    assert row.generation >= 2, (
+        f"S25: the fence must have moved the generation authority; got "
+        f"{row.generation}"
+    )
+    assert _ops.drain_for_tests(timeout_s=10.0) == 0

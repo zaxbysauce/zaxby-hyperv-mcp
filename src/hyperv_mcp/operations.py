@@ -319,6 +319,114 @@ def _legacy_expiry_allowed(existing: statestore.OpRow) -> bool:
     return bool(existing.params_hmac) and int(existing.generation or 0) > 0
 
 
+def _inline_residue_recovery(
+    store: statestore.Store, cfg: Config, existing: statestore.OpRow,
+    agent: str, heartbeat_fresh: bool,
+) -> tuple[statestore.OpRow | None, dict[str, Any] | None]:
+    """The shared R16-1/R17-1/R18-1/R19-2/R22 provenance-safe residue
+    recovery (R26: ONE implementation for the guard route AND the tasks
+    route so the arms cannot drift — the closing-review lane found a
+    cross-route retry attaching to a dead inline residue because the tasks
+    consult lacked the arm). Returns (existing, refusal):
+
+    - (None, None): the residue was FULLY retired (fence confirmed,
+      terminal write confirmed, key release confirmed) — the caller
+      proceeds fresh (re-dispatch cannot duplicate a send: the mark never
+      landed).
+    - (row, refusal): a confirmation step FAILED — the identity is kept
+      exactly as it was and refusal is the disclosed retryable envelope
+      naming the original handle (fail-closed: an unconfirmed fence would
+      reopen the duplicate-dispatch race, an unconfirmed terminalization
+      or release would strand the identity).
+    - (row, None): the row is not a recoverable residue — the caller
+      continues its normal path.
+
+    The predicate mirrors the R16-1/R22b guards: a WORKING unmarked sync-
+    row with a LAPSED heartbeat and a positive generation (a pre-v6 row's
+    empty send_state proves nothing, so generation-less identities stay
+    held for trusted reconciliation)."""
+    if not (
+        existing.status == statestore.OP_WORKING
+        and (existing.runner or "").startswith("sync-")
+        and (getattr(existing, "send_state", "") or "") != "possibly_sent"
+        and not heartbeat_fresh
+        and int(existing.generation or 0) > 0
+    ):
+        return existing, None
+    op_id = existing.op_id
+
+    def _refusal(step: str) -> dict[str, Any]:
+        return errors.enrich_failure({
+            "ok": False,
+            "error": (
+                f"idempotency_key matches a working op (handle {op_id}) "
+                f"whose residue could not be {step}; the identity is kept "
+                f"and no replacement was authorized — retry after the "
+                f"operation resolves"
+            ),
+            "error_class": "transport",
+            "retryable": True,
+            "retry_after_ms": errors.BUSY_RETRY_MS,
+            "op_id": op_id,
+        })
+
+    # R17-1/R18-1: the fence is FAIL-CLOSED — unless the authority move is
+    # CONFIRMED, the identity is NOT retired (a live inline request parked
+    # in admission past heartbeat_ttl_s keeps its generation and
+    # op_mark_send is generation-only, so an unfenced replacement would
+    # duplicate the dispatch).
+    fenced_gen = None
+    try:
+        fenced_gen = store.op_fence(op_id)
+    except Exception:
+        fenced_gen = None
+    if fenced_gen is None:
+        return existing, _refusal("fenced for reconciliation")
+    # R19-2: the terminal write is CONFIRMED before the key release — a
+    # failed transition must not leave the old handle working with no
+    # recovery while a fresh dispatch runs.
+    text = json.dumps({
+        "ok": False,
+        "error": (
+            "interrupted before the send commit (the serving "
+            "request died before it could reconcile); nothing "
+            "was dispatched; the retry proceeds fresh"),
+        "error_class": statestore.OP_INTERRUPTED,
+        "note": "reconciled at retry time from the "
+                "lapsed-heartbeat residue",
+    }, separators=(",", ":"))
+    try:
+        moved = bool(store.op_transition(
+            op_id, (statestore.OP_WORKING,), statestore.OP_FAILED,
+            error_class=statestore.OP_INTERRUPTED,
+            result_json=pswindows.redact(text),
+            result_size=len(text.encode("utf-8")),
+            updated_at=store.now(),
+            pre_body_terminal=True,
+        ))
+    except Exception:
+        moved = False
+    if not moved:
+        return existing, _refusal("terminalized")
+    # R21-2: the key release is CONFIRMED (re-read: the slot must be empty)
+    # — a failed release would strand the terminalized row under its key.
+    release_confirmed = False
+    try:
+        store.op_release_idem(op_id)
+        reread = store.op_get(op_id)
+        release_confirmed = bool(
+            reread is not None and not (reread.idem_key or ""))
+    except Exception:
+        release_confirmed = False
+    if not release_confirmed:
+        return existing, _refusal("released from its idempotency slot")
+    emit(cfg, "op.failed", op_id, "", agent,
+         {"error_class": statestore.OP_INTERRUPTED,
+          "reason": "pre_send_residue_reconciled_at_retry"},
+         store=store)
+    return None, None
+
+
 def _classify_stale(store: statestore.Store, row: statestore.OpRow, cfg: Config) -> statestore.OpRow:
     """Lazily transition a `working` op whose runner heartbeat lapsed past
     `operations.heartbeat_ttl_s` to failed/interrupted (write-through), and
@@ -542,148 +650,16 @@ def guard_consult(
                     "reconciliation": True,
                     "op_id": existing.op_id,
                 }), None
-            if (
-                existing.status == statestore.OP_WORKING
-                and (existing.runner or "").startswith("sync-")
-                and (getattr(existing, "send_state", "") or "") != "possibly_sent"
-                and not heartbeat_fresh
-                and int(existing.generation or 0) > 0
-            ):
-                # R16-1 (closing review round 16): the R6-exempt class has no
-                # runner thread — its serving request IS its heartbeat (the
-                # inline beat stops at dispatch exit). A LAPSED heartbeat on
-                # an UNMARKED sync- row therefore means the serving request
-                # is gone: its exit-time reconciliation could not write (e.g.
-                # a store-resolution failure during a commit-window
-                # BaseException), and a same-key retry must not attach to the
-                # dead handle until the idempotency TTL retires it. Reconcile
-                # by the durable provenance — unmarked means nothing was
-                # dispatched, the definitive pre-send refusal — terminalize,
-                # free the idempotency slot, and let the retry execute fresh
-                # (re-dispatch cannot duplicate a send). A FRESH heartbeat
-                # keeps the R6 live-attach contract untouched.
-                # R22b (impl-review round 23): the generation guard applies to
-                # EVERY provenance-based replacement path — a pre-v6 row's
-                # empty send_state proves nothing (the migration ALTER default
-                # is ''), so a generation-less sync- row stays held (falls
-                # through to the live-attach/replay answer) for trusted
-                # reconciliation, exactly like the recovery arm's guard.
-                # R17-1 (freshness round at ef059d2): FENCE before the
-                # terminal write — a live inline request can still be parked
-                # in admission past heartbeat_ttl_s (reachable with any
-                # valid config where wait_s >= heartbeat_ttl_s), and
-                # op_mark_send is generation-only: without the fence its
-                # commit would succeed and BOTH it and the retry dispatch
-                # (a duplicate dispatch of a destructive tool). The fence
-                # moves the generation authority so the parked original's
-                # commit raises lost send authority. Same guard as the
-                # sibling TTL-expiry arm above.
-                # R18-1 (closing review round 18): the fence is FAIL-CLOSED —
-                # unless the authority move is CONFIRMED (op_fence returns
-                # the bumped generation), the identity is NOT retired, the
-                # idempotency slot is NOT freed, and NO replacement is
-                # authorized: the retry receives a disclosed retryable
-                # refusal naming the original handle. The row keeps its
-                # state (live → its request completes normally; dead → the
-                # R6 TTL retirement). A swallowed fence failure must never
-                # reopen the duplicate-dispatch race.
-                fenced_gen = None
-                try:
-                    fenced_gen = store.op_fence(existing.op_id)
-                except Exception:
-                    fenced_gen = None
-                if fenced_gen is None:
-                    return errors.enrich_failure({
-                        "ok": False,
-                        "error": (
-                            f"idempotency_key {idem_key!r} matches a working op "
-                            f"(handle {existing.op_id}) whose executor could not "
-                            f"be fenced for reconciliation; the identity is kept "
-                            f"and no replacement was authorized — retry after the "
-                            f"operation resolves"
-                        ),
-                        "error_class": "transport",
-                        "retryable": True,
-                        "retry_after_ms": errors.BUSY_RETRY_MS,
-                        "op_id": existing.op_id,
-                    }), None
-                text = json.dumps({
-                    "ok": False,
-                    "error": (
-                        "interrupted before the send commit (the serving "
-                        "request died before it could reconcile); nothing "
-                        "was dispatched; the retry proceeds fresh"),
-                    "error_class": statestore.OP_INTERRUPTED,
-                    "note": "reconciled at retry time from the "
-                            "lapsed-heartbeat residue",
-                }, separators=(",", ":"))
-                # R19-2 (closing review round 19): the terminal write is part
-                # of the identity retirement — CONFIRM it before freeing the
-                # idempotency slot or authorizing the replacement. A failed
-                # transition must NOT leave the old handle working with no
-                # recovery while a fresh dispatch runs: the identity is kept
-                # (the fence already denies the executor's send authority) and
-                # the retry receives the same disclosed retryable refusal; the
-                # next retry re-fences and re-reconciles (recoverable).
-                try:
-                    moved = bool(store.op_transition(
-                        existing.op_id, (statestore.OP_WORKING,),
-                        statestore.OP_FAILED,
-                        error_class=statestore.OP_INTERRUPTED,
-                        result_json=pswindows.redact(text),
-                        result_size=len(text.encode("utf-8")),
-                        updated_at=store.now(),
-                        pre_body_terminal=True,
-                    ))
-                except Exception:
-                    moved = False
-                if not moved:
-                    return errors.enrich_failure({
-                        "ok": False,
-                        "error": (
-                            f"idempotency_key {idem_key!r} matches a working op "
-                            f"(handle {existing.op_id}) whose residue could not "
-                            f"be terminalized; the identity is kept and no "
-                            f"replacement was authorized — retry after the "
-                            f"operation resolves"
-                        ),
-                        "error_class": "transport",
-                        "retryable": True,
-                        "retry_after_ms": errors.BUSY_RETRY_MS,
-                        "op_id": existing.op_id,
-                    }), None
-                # R21-2 (closing review round 21): the key release is part of
-                # the retirement — CONFIRM it (re-read: the idem slot must be
-                # empty) before authorizing the replacement. A failed release
-                # would strand the terminalized row under its key (the UNIQUE
-                # index blocks the replacement insert and the terminal row is
-                # excluded from TTL expiry), so the identity stays and the
-                # retry receives the disclosed retryable refusal; the next
-                # retry recovers through the terminal-interrupted arm below,
-                # which frees the key for the provenance-safe fresh dispatch.
-                release_confirmed = False
-                try:
-                    store.op_release_idem(existing.op_id)
-                    reread = store.op_get(existing.op_id)
-                    release_confirmed = bool(
-                        reread is not None and not (reread.idem_key or ""))
-                except Exception:
-                    release_confirmed = False
-                if not release_confirmed:
-                    return errors.enrich_failure({
-                        "ok": False,
-                        "error": (
-                            f"idempotency_key {idem_key!r} matches a terminal "
-                            f"op (handle {existing.op_id}) whose idempotency "
-                            f"slot could not be released; the identity is kept "
-                            f"and no replacement was authorized — retry after "
-                            f"the operation resolves"
-                        ),
-                        "error_class": "transport",
-                        "retryable": True,
-                        "retry_after_ms": errors.BUSY_RETRY_MS,
-                        "op_id": existing.op_id,
-                    }), None
+            # R16-1/R17-1/R18-1/R19-2/R22 (the shared implementation since
+            # R26): the provenance-safe residue recovery — the guard route
+            # and the tasks route share ONE implementation
+            # (_inline_residue_recovery) so the arms cannot drift. See the
+            # helper's docstring for the fail-closed confirmation chain and
+            # the predicate's provenance guards.
+            existing, residue_refusal = _inline_residue_recovery(
+                store, cfg, existing, agent, heartbeat_fresh)
+            if residue_refusal is not None:
+                return residue_refusal, None
                 emit(cfg, "op.failed", existing.op_id, "", agent,
                      {"error_class": statestore.OP_INTERRUPTED,
                       "reason": "pre_send_residue_reconciled_at_retry"},
@@ -2070,20 +2046,39 @@ def tasks_extension(
                                         "op_id": existing.op_id,
                                     }))
                             else:
-                                if (
-                                    existing.status == statestore.OP_FAILED
-                                    and existing.error_class == statestore.OP_UNKNOWN
-                                ):
-                                    try:
-                                        store.op_fence(existing.op_id)
-                                    except Exception:
-                                        pass
-                                consult_answer = TaskHandleResult(
-                                    task_id=existing.op_id,
-                                    status=existing.status,
-                                    ttl_ms=int(cfg.operations.retention_s) * 1000,
-                                    poll_interval_ms=existing.poll_interval_ms,
-                                )
+                                # R26 (closing-review round 26): the SAME
+                                # provenance-safe residue recovery the guard
+                                # route runs (the shared helper) — a
+                                # cross-route retry on an S16-style dead
+                                # inline residue must not attach to the dead
+                                # working handle until the TTL.
+                                existing, residue_refusal = (
+                                    _inline_residue_recovery(
+                                        store, cfg, existing, agent,
+                                        heartbeat_fresh))
+                                if residue_refusal is not None:
+                                    consult_answer = errors.failure_result(
+                                        residue_refusal)
+                                elif existing is None:
+                                    # Fully retired: proceed fresh (the
+                                    # consult_answer stays None so the
+                                    # fresh-dispatch arm below runs).
+                                    pass
+                                else:
+                                    if (
+                                        existing.status == statestore.OP_FAILED
+                                        and existing.error_class == statestore.OP_UNKNOWN
+                                    ):
+                                        try:
+                                            store.op_fence(existing.op_id)
+                                        except Exception:
+                                            pass
+                                    consult_answer = TaskHandleResult(
+                                        task_id=existing.op_id,
+                                        status=existing.status,
+                                        ttl_ms=int(cfg.operations.retention_s) * 1000,
+                                        poll_interval_ms=existing.poll_interval_ms,
+                                    )
                     if consult_answer is not None:
                         evidencejournal.finish(jtok,
                                                {"task_id": consult_op_id,
