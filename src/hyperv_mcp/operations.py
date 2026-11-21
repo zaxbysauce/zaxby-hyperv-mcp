@@ -1707,10 +1707,13 @@ def tasks_extension(
                     # Issue #157 (impl-review round 4): the re-consult is
                     # KEYED-ONLY (an unkeyed insert has no race winner to
                     # find - op_find_idem with an empty key would match an
-                    # unrelated unkeyed row), and ANY re-consult failure
-                    # falls through to the single release + refusal below
-                    # so the acquired permit is never leaked.
+                    # unrelated unkeyed row). Issue #157 (impl-review round
+                    # 5): the slot ownership flag makes the release
+                    # EXACTLY-ONCE on every path - a journal/response
+                    # construction failure after an inner release falls to
+                    # the degraded refusal WITHOUT a second release.
                     winner = None
+                    slot_released = False
                     if idem_key:
                         try:
                             with store.transaction():
@@ -1723,13 +1726,14 @@ def tasks_extension(
                                 winner = _classify_stale(store, winner, cfg)
                                 if winner.params_hmac and winner.params_hmac != fingerprint:
                                     slots.release()
+                                    slot_released = True
+                                    _cenv2 = _conflict_envelope(params.name, idem_key)
                                     evidencejournal.finish(
-                                        jtok, _conflict_envelope(params.name, idem_key),
-                                        outcome="conflict")
-                                    return errors.failure_result(
-                                        _conflict_envelope(params.name, idem_key))
+                                        jtok, _cenv2, outcome="conflict")
+                                    return errors.failure_result(_cenv2)
                                 if not winner.params_hmac and fingerprint:
                                     slots.release()
+                                    slot_released = True
                                     _renv = errors.enrich_failure({
                                         "ok": False,
                                         "error": (
@@ -1753,23 +1757,28 @@ def tasks_extension(
                                         store.op_fence(winner.op_id)
                                     except Exception:
                                         pass
-                                slots.release()
-                                evidencejournal.finish(
-                                    jtok, {"task_id": winner.op_id, "consulted": True},
-                                    outcome="reattach")
-                                return TaskHandleResult(
+                                _handle = TaskHandleResult(
                                     task_id=winner.op_id,
                                     status=winner.status,
                                     ttl_ms=int(cfg.operations.retention_s) * 1000,
                                     poll_interval_ms=winner.poll_interval_ms,
                                 )
+                                slots.release()
+                                slot_released = True
+                                evidencejournal.finish(
+                                    jtok, {"task_id": winner.op_id, "consulted": True},
+                                    outcome="reattach")
+                                return _handle
                         except Exception:
-                            # Issue #157 (impl-review round 4): a re-consult
-                            # failure falls through to the single release +
-                            # classified refusal below - the permit is never
-                            # leaked by the recovery path itself.
+                            # Issue #157 (impl-review rounds 4-5): a re-consult
+                            # failure falls through to the single exactly-once
+                            # release + classified refusal below - the permit
+                            # is never leaked NOR double-released by the
+                            # recovery path itself.
                             winner = None
-                    slots.release()
+                    if not slot_released:
+                        slots.release()
+                        slot_released = True
                     evidencejournal.finish_if_unowned(jtok, None, outcome="error")
                     env = errors.enrich_failure({
                         "ok": False,
