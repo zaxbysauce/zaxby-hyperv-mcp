@@ -151,14 +151,16 @@ def commit_send_intent(cfg: Config, vm_key: str = "") -> None:
     (fail-closed on fence movement); with no op context this is the unkeyed
     epoch-only commit. A VM key turns the commit into the restore barrier's
     atomic possibly_sent + dirty-epoch pair. Raises before any provider
-    submission when the keyed commit fails."""
+    submission when the commit fails — keyed AND unkeyed alike (the
+    epoch-only barrier of a direct restore is equally mandatory)."""
     op_id = _current_op_id.get("")
     if not op_id:
         if vm_key:
-            try:
-                store_for(cfg).epoch_bump(vm_key)
-            except Exception:
-                pass
+            # Issue #157 fail-closed (impl-review round-2): the unkeyed
+            # restore barrier commits the dirty epoch with NO suppression —
+            # a failed epoch write propagates so the provider submission
+            # (Restore-VMSnapshot) never runs without its durable barrier.
+            store_for(cfg).epoch_bump(vm_key)
         return
     generation = _current_op_generation.get(0)
     try:
