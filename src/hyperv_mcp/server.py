@@ -6298,17 +6298,24 @@ def _harden_tools(mcp: MCPServer) -> None:
                                 name, arguments, operations._busy_envelope(name),
                                 journal_token=jtok,
                             )
+                        # R7-1 (delta impl-review round 7): the gate window is
+                        # owned by try/finally, not the except arm — a
+                        # BaseException inside the commit bypassed both
+                        # release sites and wedged the VM's gate for the
+                        # process lifetime. The runner route already owns its
+                        # window with a finally.
                         try:
-                            operations.commit_send_intent(_cfg())
-                        except Exception as mark_exc:
+                            try:
+                                operations.commit_send_intent(_cfg())
+                            except Exception as mark_exc:
+                                operations.fail_inline(ops_ctx, mark_exc)
+                                return _audited_rejection(
+                                    name, arguments, errors.envelope(mark_exc),
+                                    journal_token=jtok,
+                                )
+                            inline_beat_stop = operations.start_inline_heartbeat(ops_ctx)
+                        finally:
                             operations._send_gate_release(arguments)
-                            operations.fail_inline(ops_ctx, mark_exc)
-                            return _audited_rejection(
-                                name, arguments, errors.envelope(mark_exc),
-                                journal_token=jtok,
-                            )
-                        operations._send_gate_release(arguments)
-                        inline_beat_stop = operations.start_inline_heartbeat(ops_ctx)
                     try:
                         evidencejournal.arm(jtok)
                         result = await _run(arguments, context, convert_result=convert_result, **kwargs)

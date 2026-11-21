@@ -1668,6 +1668,26 @@ def test_inline_route_crash_after_effect_lapses_to_unknown(tmp_path):
         assert calls["restore"] == 1, (
             f"S11b: exactly one provider submission; got {calls['restore']}"
         )
+        # R7-3 hardening: the request-time provenance is terminal BEFORE any
+        # heartbeat aging - whichever route arm completes the row (the fail
+        # arm writes error_class unknown; the ok:false arm records the
+        # envelope's own class), the CONTRACT is identical: terminal failed,
+        # the possibly_sent mark RETAINED, and the stored envelope carries
+        # the vm_outcome unknown disclosure. The aging step below proves the
+        # terminal identity is STABLE across a lapsed read (idempotent).
+        stored = json.loads(row.result_json) if row.result_json else {}
+        terminal_unknown = (
+            row.status == "failed"
+            and (row.error_class == statestore.OP_UNKNOWN
+                 or stored.get("vm_outcome") == "unknown")
+        )
+        assert terminal_unknown, (
+            f"S11b: the post-send crash must terminal-fail at request time "
+            f"with the unknown identity (error_class unknown, or the "
+            f"envelope disclosing vm_outcome unknown); got status="
+            f"{row.status!r} error_class={row.error_class!r} "
+            f"stored={stored!r}"
+        )
         # Age the heartbeat deterministically (the beat timer stopped at
         # dispatch exit) so the read-time classification runs its lapsed arm.
         store._begin()
@@ -1709,4 +1729,99 @@ def test_inline_route_crash_after_effect_lapses_to_unknown(tmp_path):
         )
     finally:
         pswindows.run_ps = saved
+        _ops.drain_for_tests(timeout_s=5.0)
+
+
+# ---------------------------------------------------------------------------
+# S12 (delta impl-review R7-1): a BaseException inside the route-level
+# pre-send commit must NOT wedge the VM's send gate - the finally-owned
+# release runs, the admission ticket stays balanced, the bound op context is
+# unbound, and the lost attempt's identity stays a protected
+# working/possibly_sent unknown until trusted reconciliation.
+# ---------------------------------------------------------------------------
+
+
+class _CommitBoom(BaseException):
+    """A non-Exception BaseException (neither KeyboardInterrupt nor
+    SystemExit, so the runner survives) simulating a host interruption
+    landing inside the pre-send commit window."""
+
+
+def test_inline_route_baseexception_at_commit_releases_gate(tmp_path):
+    """S12: dispatch a keyed-inline restore whose commit_send_intent raises
+    a BaseException; the gate must be FREE afterward (a same-VM acquire
+    succeeds), the admission ticket balanced, the context unbound, and the
+    row must persist working/possibly_sent (the durable unknown identity)."""
+    import asyncio
+
+    import hyperv_mcp.operations as _ops
+    from hyperv_mcp import pswindows
+
+    mod = _boot_server(tmp_path)
+    mcp = mod.get_mcp()
+    saved = pswindows.run_ps
+    saved_commit = _ops.commit_send_intent
+    fired = {"commit": 0}
+
+    def boom_commit(cfg):
+        fired["commit"] += 1
+        raise _CommitBoom("simulated host interruption at commit")
+
+    def host_ok(script, **kwargs):
+        return pswindows.PSResult(stdout="", returncode=0)
+
+    pswindows.run_ps = host_ok
+    _ops.commit_send_intent = boom_commit
+    try:
+        raised = None
+        try:
+            asyncio.run(mcp.call_tool(
+                "hyperv_checkpoint_restore",
+                {"vm_name": "test-vm", "checkpoint_name": "s12", "confirm": True,
+                 "idempotency_key": "s12-boom"},
+            ))
+        except BaseException as exc:
+            raised = exc
+        assert fired["commit"] == 1, (
+            f"S12: the route-level commit must fire exactly once; got "
+            f"{fired['commit']}"
+        )
+        assert isinstance(raised, _CommitBoom), (
+            f"S12: the BaseException must propagate out of the dispatch "
+            f"uncaught; got {raised!r}"
+        )
+        # The gate is free: a same-VM acquire succeeds immediately.
+        assert operations._send_gate_acquire({"vm_name": "test-vm"}) is True, (
+            "S12: the send gate must be released after a BaseException "
+            "inside the commit window (no wedged gate)"
+        )
+        operations._send_gate_release({"vm_name": "test-vm"})
+        # The admission ticket is balanced (no leaked in-flight admission).
+        admission = __import__("hyperv_mcp.admission", fromlist=["x"])
+        inflight = admission.snapshot()["in_flight_general"]
+        assert inflight == 0, (
+            f"S12: the admission ticket must be released on the "
+            f"BaseException path; in_flight={inflight!r}"
+        )
+        # The bound op context is unbound.
+        assert _ops._current_op_id.get("") == "", (
+            "S12: the dispatch-bound op context must be unbound after the "
+            "BaseException path"
+        )
+        # The lost attempt leaves the protected interrupted identity: the
+        # boom fired at the commit's entry, so nothing was ever marked; the
+        # row stays working (protected from prune/consult-expiry) with no
+        # send mark - the durable-interrupted shape, reconcile at read time.
+        store = _ops.store_for(mod.CFG)
+        rows = [r for r in store.op_rows_by_agent("", include_terminal=True)
+                if r.tool == "hyperv_checkpoint_restore"
+                and r.idem_key == "s12-boom"]
+        assert rows and rows[-1].status == "working" and rows[-1].send_state == "", (
+            f"S12: the lost attempt must persist working with no send mark "
+            f"(the protected interrupted identity); "
+            f"got {rows[-1].as_dict() if rows else None}"
+        )
+    finally:
+        pswindows.run_ps = saved
+        _ops.commit_send_intent = saved_commit
         _ops.drain_for_tests(timeout_s=5.0)
