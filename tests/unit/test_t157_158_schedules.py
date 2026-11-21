@@ -3070,3 +3070,57 @@ def test_tasks_retry_recovers_inline_residue(ops_store, admission_env):
         f"{row.generation}"
     )
     assert _ops.drain_for_tests(timeout_s=10.0) == 0
+
+
+# ---------------------------------------------------------------------------
+# S25b (freshness round at c00b7b0, R27): a stranded pre-send key (the
+# S12/S15 terminal-interrupted shape with its key held — excluded from TTL
+# expiry AND pruning) retried through the SHIPPED tasks extension frees
+# the key through the shared stranded-key recovery and dispatches fresh.
+# ---------------------------------------------------------------------------
+
+
+def test_tasks_retry_frees_a_stranded_presend_key(ops_store, admission_env):
+    """S25b: a terminal failed/interrupted unmarked row (generation >= 1)
+    holding its key — the release-failure residue shape — retried through
+    tasks_extension.intercept_tool_call must NOT return an ordinary attach
+    to the failed handle: the shared stranded-key recovery fences, frees
+    the slot, and dispatches fresh."""
+    import hyperv_mcp.operations as _ops
+    from hyperv_mcp import statestore
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    sem = CountingSemaphore(2)
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id="s25b-stranded", tool=OP_TOOL, agent="", vm_name="s25-vm",
+        status=statestore.OP_FAILED,
+        error_class=statestore.OP_INTERRUPTED,
+        created_at=now - 400.0, updated_at=now - 400.0,
+        runner="sync-deadbeef", heartbeat_at=now - 400.0,
+        params_hmac=_ops.arguments_fingerprint(
+            cfg, store,
+            {"vm_name": "s25-vm", "checkpoint_name": "cp", "confirm": True,
+             "idempotency_key": "s25b"}),
+        idem_key="s25b", generation=3,
+        send_state="",
+    ))
+    tool = _CountingTool()
+    run_tasks = _tasks_driver(cfg, tool, sem)
+    out = run_tasks(OP_TOOL, {"vm_name": "s25-vm", "checkpoint_name": "cp",
+                              "confirm": True, "idempotency_key": "s25b"})
+    fresh_id = getattr(out, "task_id", None)
+    assert fresh_id and fresh_id != "s25b-stranded", (
+        f"S25b: the cross-route retry must dispatch a FRESH handle (never "
+        f"attach to the stranded failed handle); got {out!r}"
+    )
+    row = store.op_get("s25b-stranded")
+    assert row.idem_key == "", (
+        f"S25b: the stranded slot must be freed; got {row.as_dict()!r}"
+    )
+    assert row.generation >= 4, (
+        f"S25b: the fence must have moved the generation authority; got "
+        f"{row.generation}"
+    )
+    assert _ops.drain_for_tests(timeout_s=10.0) == 0

@@ -427,6 +427,45 @@ def _inline_residue_recovery(
     return None, None
 
 
+def _stranded_presend_key_recovery(
+    existing: statestore.OpRow | None, store: statestore.Store,
+) -> statestore.OpRow | None:
+    """The shared R21-2/R22 stranded-key recovery (R27: ONE implementation
+    for the guard route AND the tasks route — the freshness lane found a
+    cross-route tasks retry attaching to a stranded terminal identity whose
+    key is stuck permanently, because terminal interrupted rows are
+    excluded from BOTH TTL expiry and ops_prune). A terminal failed/
+    INTERRUPTED UNMARKED row holding a key is the definitive pre-send
+    refusal (nothing was dispatched), so its slot frees for the provenance-
+    safe fresh dispatch. GUARDED (R22): generation > 0 (a pre-v6 row's
+    empty send_state proves nothing) and a FAIL-CLOSED op_fence before the
+    release (a lapsed heartbeat may belong to a LIVE process; an
+    unconfirmed fence keeps the replay answer). A release failure keeps
+    the replay answer — the slot frees on the next retry."""
+    if existing is None:
+        return None
+    if not (
+        existing.status == statestore.OP_FAILED
+        and existing.error_class == statestore.OP_INTERRUPTED
+        and (getattr(existing, "send_state", "") or "") == ""
+        and (existing.idem_key or "")
+        and int(existing.generation or 0) > 0
+    ):
+        return existing
+    fenced_gen = None
+    try:
+        fenced_gen = store.op_fence(existing.op_id)
+    except Exception:
+        fenced_gen = None
+    if fenced_gen is None:
+        return existing  # keep the replay answer (fail-closed)
+    try:
+        store.op_release_idem(existing.op_id)
+        return None
+    except Exception:
+        return existing
+
+
 def _classify_stale(store: statestore.Store, row: statestore.OpRow, cfg: Config) -> statestore.OpRow:
     """Lazily transition a `working` op whose runner heartbeat lapsed past
     `operations.heartbeat_ttl_s` to failed/interrupted (write-through), and
@@ -660,55 +699,7 @@ def guard_consult(
                 store, cfg, existing, agent, heartbeat_fresh)
             if residue_refusal is not None:
                 return residue_refusal, None
-                emit(cfg, "op.failed", existing.op_id, "", agent,
-                     {"error_class": statestore.OP_INTERRUPTED,
-                      "reason": "pre_send_residue_reconciled_at_retry"},
-                     store=store)
-                existing = None
-            if existing is not None and (
-                existing.status == statestore.OP_FAILED
-                and existing.error_class == statestore.OP_INTERRUPTED
-                and (getattr(existing, "send_state", "") or "") == ""
-                and (existing.idem_key or "")
-                and int(existing.generation or 0) > 0
-            ):
-                # R21-2 recovery: a terminal PRE-SEND refusal must not hold
-                # its idempotency slot forever — a failed release after the
-                # confirmed terminalization would otherwise strand the key:
-                # the UNIQUE index blocks the replacement insert and the
-                # terminal row is excluded from TTL expiry. Free the slot and
-                # let the retry execute fresh (re-dispatch cannot duplicate a
-                # send). A release failure here keeps the replay answer — the
-                # slot frees on the next retry.
-                # R22 (freshness round at b1e4bd7, probe-proven): the arm is
-                # GUARDED two ways. (a) generation > 0 — a pre-v6 row's empty
-                # send_state proves nothing (the migration ALTER default is
-                # ''), so a generation-less identity stays held for trusted
-                # reconciliation (AC8); its "unmarked" is unprovable. (b) a
-                # FAIL-CLOSED fence before the release — _classify_stale
-                # terminalizes on the heartbeat alone (a lapsed heartbeat may
-                # belong to a LIVE process: host sleep, a stalled heartbeat
-                # writer, a long admission park), and op_mark_send checks
-                # only the generation, so without the fence a live runner and
-                # the fresh retry could BOTH dispatch (the R17-1 race on the
-                # read-time path). The fence moves the generation authority;
-                # an unconfirmed fence keeps the replay answer. The rows this
-                # arm was written for (the reconcile core's pre-send refusals
-                # and the residue arm's fenced terminalizations) have
-                # executors that already raised or were already fenced.
-                fenced_gen = None
-                try:
-                    fenced_gen = store.op_fence(existing.op_id)
-                except Exception:
-                    fenced_gen = None
-                if fenced_gen is None:
-                    pass  # keep the replay answer (fail-closed)
-                else:
-                    try:
-                        store.op_release_idem(existing.op_id)
-                        existing = None
-                    except Exception:
-                        pass
+            existing = _stranded_presend_key_recovery(existing, store)
             if existing is not None:
                 if (
                     existing.status == statestore.OP_FAILED
@@ -2065,6 +2056,16 @@ def tasks_extension(
                                     # fresh-dispatch arm below runs).
                                     pass
                                 else:
+                                    # R27 (freshness round at c00b7b0): the
+                                    # SAME stranded-key recovery the guard
+                                    # route runs (the shared helper) — a
+                                    # terminal pre-send refusal whose key is
+                                    # stuck (excluded from TTL expiry AND
+                                    # pruning) must free it for the fresh
+                                    # dispatch on either route.
+                                    existing = _stranded_presend_key_recovery(
+                                        existing, store)
+                                if existing is not None:
                                     if (
                                         existing.status == statestore.OP_FAILED
                                         and existing.error_class == statestore.OP_UNKNOWN
