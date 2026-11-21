@@ -2940,3 +2940,78 @@ def test_generation_zero_sync_residue_stays_held(ops_store, admission_env):
         f"S23: no dispatch may be authorized from unprovable provenance; got "
         f"{tool.calls}"
     )
+
+
+# ---------------------------------------------------------------------------
+# S24 (freshness round at 83923b7, R25): the tasks route's consult carries
+# the SAME AC8 legacy guards as the guard route (shared helpers) — the
+# three shapes the freshness probe found leaking there all refuse now.
+# ---------------------------------------------------------------------------
+
+
+def _tasks_legacy_row(store, cfg, *, op_id, fingerprint_args, generation,
+                      params_hmac=None, status=statestore.OP_WORKING,
+                      runner="tasksrunner01", age=400.0, error_class=""):
+    import hyperv_mcp.operations as _ops
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id=op_id, tool=OP_TOOL, agent="", vm_name="t24-vm",
+        status=status, created_at=now - age, updated_at=now - age,
+        runner=runner,
+        heartbeat_at=now - age,
+        params_hmac=(params_hmac if params_hmac is not None else
+                     _ops.arguments_fingerprint(cfg, store, fingerprint_args)),
+        idem_key=fingerprint_args["idempotency_key"], generation=generation,
+        error_class=error_class,
+    ))
+
+
+def test_tasks_route_legacy_shapes_refuse(ops_store, admission_env):
+    """S24: on the SHIPPED tasks route (tasks_extension.intercept_tool_call),
+    all three AC8 legacy shapes the freshness probe caught dispatching or
+    attaching now receive the disclosed reconciliation refusal — (T1) a
+    blank-fingerprint working row past the TTL; (T2) a generation-0 valid-
+    fingerprint unmarked row within the TTL; (T3) a generation-0 unmarked
+    sync- row past the TTL. Zero body executions on every shape."""
+    import hyperv_mcp.operations as _ops
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    sem = CountingSemaphore(2)
+    tool = _CountingTool()
+    run_tasks = _tasks_driver(cfg, tool, sem)
+
+    def _shape(key: str, *, generation: int, params_hmac, runner, age):
+        args_k = {"vm_name": "t24-vm", "checkpoint_name": "cp",
+                  "confirm": True, "idempotency_key": key}
+        _tasks_legacy_row(store, cfg, op_id=f"t24-{key}",
+                          fingerprint_args=args_k, generation=generation,
+                          params_hmac=params_hmac, runner=runner, age=age)
+        out = run_tasks(OP_TOOL, args_k)
+        blob = str(out)
+        assert "reconciliation" in blob, (
+            f"S24 {key}: the legacy shape must refuse with the "
+            f"reconciliation disclosure on the tasks route; got {blob[:300]}"
+        )
+        row = store.op_get(f"t24-{key}")
+        assert row is not None, (
+            f"S24 {key}: the protected identity must not be expiry-deleted"
+        )
+        return row
+
+    # T1: blank fingerprint, working, past the idempotency TTL.
+    row1 = _shape("t24a", generation=1, params_hmac="",
+                  runner="tasksrunner01", age=100000.0)
+    # T2: generation 0, valid fingerprint, unmarked, within the TTL.
+    row2 = _shape("t24b", generation=0, params_hmac=None,
+                  runner="tasksrunner01", age=400.0)
+    # T3: generation 0, valid fingerprint, unmarked sync-, past the TTL.
+    row3 = _shape("t24c", generation=0, params_hmac=None,
+                  runner="sync-deadbeef", age=100000.0)
+    assert all(r.idem_key for r in (row1, row2, row3)), (
+        "S24: every protected identity keeps its key (trusted reconciliation)"
+    )
+    assert tool.calls == 0, (
+        f"S24: zero body executions on the refusal shapes; got {tool.calls}"
+    )
+    assert _ops.drain_for_tests(timeout_s=10.0) == 0

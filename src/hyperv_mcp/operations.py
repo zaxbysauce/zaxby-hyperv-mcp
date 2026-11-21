@@ -288,6 +288,37 @@ def arguments_fingerprint(cfg: Config, store: statestore.Store, arguments: dict)
 # ---------------------------------------------------------------------------
 
 
+def _legacy_protection_reason(
+    existing: statestore.OpRow, fingerprint: str,
+) -> str | None:
+    """The shared AC8 legacy-protection predicate (R25: ONE helper for the
+    guard route and the tasks route so the two consult copies cannot drift
+    — the freshness lane's probe found the tasks route missing every guard
+    the guard route had accumulated). Returns the refusal reason when the
+    row is a legacy identity: a BLANK fingerprint predating fingerprinting,
+    OR the v6 migration's generation=0 default with an empty send_state
+    (whose provenance is unprovable — a pre-v6 row could never carry the
+    mark). A MARKED row is exempt from the generation disjunct: the
+    possibly_sent mark is durable proof the v6 machinery was active, so its
+    provenance is provable regardless of generation (the frozen C4 attach
+    contract)."""
+    if not existing.params_hmac and fingerprint:
+        return "whose argument fingerprint predates fingerprinting"
+    if (int(existing.generation or 0) == 0
+            and (getattr(existing, "send_state", "") or "") != "possibly_sent"):
+        return "which predates executor generationing (generation 0)"
+    return None
+
+
+def _legacy_expiry_allowed(existing: statestore.OpRow) -> bool:
+    """The shared TTL-expiry legacy guard (R25, the predicate half of the
+    AC8 protection): an expired row may only be forgotten when it is BOTH
+    fingerprinted AND generation-stamped — a legacy identity must reach the
+    reconciliation refusal instead of being silently deleted to authorize a
+    fresh dispatch."""
+    return bool(existing.params_hmac) and int(existing.generation or 0) > 0
+
+
 def _classify_stale(store: statestore.Store, row: statestore.OpRow, cfg: Config) -> statestore.OpRow:
     """Lazily transition a `working` op whose runner heartbeat lapsed past
     `operations.heartbeat_ttl_s` to failed/interrupted (write-through), and
@@ -441,8 +472,7 @@ def guard_consult(
                 and not possibly_sent
                 and not heartbeat_fresh
                 and not protected_class
-                and bool(existing.params_hmac)
-                and int(existing.generation or 0) > 0
+                and _legacy_expiry_allowed(existing)
             ):
                 # R19-1 (closing review round 19): a BLANK-fingerprint row is
                 # AC8-protected — "a legacy row with no fingerprint/generation
@@ -485,17 +515,12 @@ def guard_consult(
             # duplicate dispatch) — never silently reconciled and replaced.
             if existing.params_hmac and existing.params_hmac != fingerprint:
                 return _conflict_envelope(name, idem_key), None
-            if (
-                (not existing.params_hmac and fingerprint)
-                or (
-                    int(existing.generation or 0) == 0
-                    and (getattr(existing, "send_state", "") or "")
-                    != "possibly_sent"
-                )
-            ):
-                # Issue #157 (C8b + R24, closing review round 24): a legacy
-                # row — a BLANK fingerprint predating fingerprinting, OR the
-                # v6 migration's generation=0 default (whose empty send_state
+            legacy_reason = _legacy_protection_reason(existing, fingerprint)
+            if legacy_reason is not None:
+                # Issue #157 (C8b + R24, closing review round 24; the shared
+                # _legacy_protection_reason helper since R25): a legacy row —
+                # a BLANK fingerprint predating fingerprinting, OR the v6
+                # migration's generation=0 default (whose empty send_state
                 # proves nothing) — is protected reconciliation: a DISCLOSED
                 # refusal naming the original handle, never a silent reattach
                 # (an ordinary working attach would falsely represent an
@@ -505,11 +530,6 @@ def guard_consult(
                 # active (a pre-v6 row could never carry it), so its
                 # provenance is provable regardless of generation — the C4
                 # frozen attach contract is untouched.
-                legacy_reason = (
-                    "whose argument fingerprint predates fingerprinting"
-                    if not existing.params_hmac
-                    else "which predates executor generationing (generation 0)"
-                )
                 return errors.enrich_failure({
                     "ok": False,
                     "error": (
@@ -2001,7 +2021,16 @@ def tasks_extension(
                             and not possibly_sent
                             and not heartbeat_fresh
                             and not protected_class
+                            and _legacy_expiry_allowed(existing)
                         ):
+                            # R25 (freshness round at 83923b7): the tasks
+                            # route's TTL arm carries the SAME AC8 legacy
+                            # guard as the guard route (the shared
+                            # _legacy_expiry_allowed helper) — the freshness
+                            # probe found this copy missing every guard the
+                            # guard route had accumulated (blank-fp and
+                            # generation-less past-TTL rows dispatched fresh
+                            # here while the guard route refused them).
                             existing = _classify_stale(store, existing, cfg)
                             if existing.status == statestore.OP_WORKING:
                                 try:
@@ -2017,37 +2046,44 @@ def tasks_extension(
                         if existing.params_hmac and existing.params_hmac != fingerprint:
                             consult_answer = errors.failure_result(
                                 _conflict_envelope(params.name, idem_key))
-                        elif not existing.params_hmac and fingerprint:
-                            consult_answer = errors.failure_result(
-                                errors.enrich_failure({
-                                    "ok": False,
-                                    "error": (
-                                        f"idempotency_key {idem_key!r} matches a "
-                                        f"legacy record (handle {existing.op_id}) "
-                                        f"whose argument fingerprint predates "
-                                        f"fingerprinting; reconciliation is "
-                                        f"required before reuse — re-run with a "
-                                        f"new idempotency_key"
-                                    ),
-                                    "error_class": "idempotency_conflict",
-                                    "reconciliation": True,
-                                    "op_id": existing.op_id,
-                                }))
                         else:
-                            if (
-                                existing.status == statestore.OP_FAILED
-                                and existing.error_class == statestore.OP_UNKNOWN
-                            ):
-                                try:
-                                    store.op_fence(existing.op_id)
-                                except Exception:
-                                    pass
-                            consult_answer = TaskHandleResult(
-                                task_id=existing.op_id,
-                                status=existing.status,
-                                ttl_ms=int(cfg.operations.retention_s) * 1000,
-                                poll_interval_ms=existing.poll_interval_ms,
-                            )
+                            legacy_reason = _legacy_protection_reason(
+                                existing, fingerprint)
+                            if legacy_reason is not None:
+                                # R25: the shared AC8 legacy refusal — a
+                                # DISCLOSED reconciliation refusal naming the
+                                # original handle (never an ordinary attach,
+                                # never a fresh dispatch), identical to the
+                                # guard route's shape.
+                                consult_answer = errors.failure_result(
+                                    errors.enrich_failure({
+                                        "ok": False,
+                                        "error": (
+                                            f"idempotency_key {idem_key!r} matches a "
+                                            f"legacy record (handle {existing.op_id}) "
+                                            f"{legacy_reason}; reconciliation is "
+                                            f"required before reuse — re-run with a "
+                                            f"new idempotency_key"
+                                        ),
+                                        "error_class": "idempotency_conflict",
+                                        "reconciliation": True,
+                                        "op_id": existing.op_id,
+                                    }))
+                            else:
+                                if (
+                                    existing.status == statestore.OP_FAILED
+                                    and existing.error_class == statestore.OP_UNKNOWN
+                                ):
+                                    try:
+                                        store.op_fence(existing.op_id)
+                                    except Exception:
+                                        pass
+                                consult_answer = TaskHandleResult(
+                                    task_id=existing.op_id,
+                                    status=existing.status,
+                                    ttl_ms=int(cfg.operations.retention_s) * 1000,
+                                    poll_interval_ms=existing.poll_interval_ms,
+                                )
                     if consult_answer is not None:
                         evidencejournal.finish(jtok,
                                                {"task_id": consult_op_id,
