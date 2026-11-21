@@ -442,6 +442,7 @@ def guard_consult(
                 and not heartbeat_fresh
                 and not protected_class
                 and bool(existing.params_hmac)
+                and int(existing.generation or 0) > 0
             ):
                 # R19-1 (closing review round 19): a BLANK-fingerprint row is
                 # AC8-protected — "a legacy row with no fingerprint/generation
@@ -450,6 +451,15 @@ def guard_consult(
                 # fresh dispatch: such a row falls through to the
                 # reconciliation refusal below instead (it stays until
                 # trusted reconciliation).
+                # R21-1 (closing review round 21): AC8's protection is a
+                # DISJUNCTION — the v6 migration seeds generation=0 for pre-v6
+                # rows that may carry a VALID fingerprint, so generation-less
+                # identities are equally protected from expiry deletion. Such
+                # a row survives to the read-time path: _classify_stale
+                # terminalizes it by provenance (unmarked lapsed = the
+                # definitive pre-send refusal), and the R21-2 recovery below
+                # frees the key for the retry — reconciliation before
+                # replacement, never a silent consume-and-dispatch.
                 existing = _classify_stale(store, existing, cfg)
                 if existing.status == statestore.OP_WORKING:
                     # Still working (a no-runner exempt row): fence it before
@@ -595,15 +605,65 @@ def guard_consult(
                         "retry_after_ms": errors.BUSY_RETRY_MS,
                         "op_id": existing.op_id,
                     }), None
+                # R21-2 (closing review round 21): the key release is part of
+                # the retirement — CONFIRM it (re-read: the idem slot must be
+                # empty) before authorizing the replacement. A failed release
+                # would strand the terminalized row under its key (the UNIQUE
+                # index blocks the replacement insert and the terminal row is
+                # excluded from TTL expiry), so the identity stays and the
+                # retry receives the disclosed retryable refusal; the next
+                # retry recovers through the terminal-interrupted arm below,
+                # which frees the key for the provenance-safe fresh dispatch.
+                release_confirmed = False
                 try:
                     store.op_release_idem(existing.op_id)
+                    reread = store.op_get(existing.op_id)
+                    release_confirmed = bool(
+                        reread is not None and not (reread.idem_key or ""))
                 except Exception:
-                    pass
+                    release_confirmed = False
+                if not release_confirmed:
+                    return errors.enrich_failure({
+                        "ok": False,
+                        "error": (
+                            f"idempotency_key {idem_key!r} matches a terminal "
+                            f"op (handle {existing.op_id}) whose idempotency "
+                            f"slot could not be released; the identity is kept "
+                            f"and no replacement was authorized — retry after "
+                            f"the operation resolves"
+                        ),
+                        "error_class": "transport",
+                        "retryable": True,
+                        "retry_after_ms": errors.BUSY_RETRY_MS,
+                        "op_id": existing.op_id,
+                    }), None
                 emit(cfg, "op.failed", existing.op_id, "", agent,
                      {"error_class": statestore.OP_INTERRUPTED,
                       "reason": "pre_send_residue_reconciled_at_retry"},
                      store=store)
                 existing = None
+            if existing is not None and (
+                existing.status == statestore.OP_FAILED
+                and existing.error_class == statestore.OP_INTERRUPTED
+                and (getattr(existing, "send_state", "") or "") == ""
+                and (existing.idem_key or "")
+            ):
+                # R21-2 recovery: a terminal PRE-SEND refusal (unmarked =
+                # nothing was dispatched; interrupted = the definitive
+                # pre-send terminal) must not hold its idempotency slot
+                # forever — a failed release after the confirmed
+                # terminalization (or the R21-1 generation-less legacy shape
+                # after its provenance terminalization) would otherwise
+                # strand the key: the UNIQUE index blocks the replacement
+                # insert and the terminal row is excluded from TTL expiry.
+                # Free the slot and let the retry execute fresh (re-dispatch
+                # cannot duplicate a send). A release failure here keeps the
+                # replay answer — the slot frees on the next retry.
+                try:
+                    store.op_release_idem(existing.op_id)
+                    existing = None
+                except Exception:
+                    pass
             if existing is not None:
                 if (
                     existing.status == statestore.OP_FAILED

@@ -1826,20 +1826,28 @@ def test_inline_route_baseexception_at_commit_releases_gate(tmp_path):
             f"S12: the reconciled row must carry the interrupted class; "
             f"got {rows[-1].error_class!r}"
         )
-        # The same-key retry replays the interrupted envelope (no ghost
-        # attach, no re-dispatch).
+        # The same-key retry RECOVERS: a terminal pre-send refusal (unmarked
+        # = nothing was dispatched) frees the idempotency slot and the retry
+        # proceeds FRESH — re-dispatch cannot duplicate a send (R21-2). The
+        # reconciled row stays terminal interrupted with its slot freed.
+        tool2 = _CountingTool()
         resp, ctx = _ops.guard_consult(
             mod.CFG, "hyperv_checkpoint_restore",
             {"vm_name": "test-vm", "checkpoint_name": "s12", "confirm": True,
              "idempotency_key": "s12-boom"},
-            lambda **kw: (_ for _ in ()).throw(AssertionError("re-dispatch")),
-            lambda: threading.BoundedSemaphore(2),
+            tool2, lambda: threading.BoundedSemaphore(2),
         )
-        assert ctx is None and isinstance(resp, dict) and resp.get(
-            "replayed") is True, (
-            f"S12: the same-key retry must replay the interrupted envelope "
-            f"without re-dispatch; got resp={resp!r} ctx={ctx!r}"
+        assert ctx is not None and ctx["op_id"] != rows[-1].op_id, (
+            f"S12: the same-key retry must proceed with a FRESH handle (the "
+            f"pre-send refusal frees the slot; R21-2); got resp={resp!r} "
+            f"ctx={ctx!r}"
         )
+        row_after = _ops.store_for(mod.CFG).op_get(rows[-1].op_id)
+        assert row_after.status == "failed" and row_after.idem_key == "", (
+            f"S12: the reconciled row must keep its terminal identity with "
+            f"the slot freed; got {row_after.as_dict()!r}"
+        )
+        assert _ops.drain_for_tests(timeout_s=5.0) == 0
     finally:
         pswindows.run_ps = saved
         _ops.commit_send_intent = saved_commit
@@ -2088,17 +2096,27 @@ def test_detached_commit_baseexception_releases_ticket(
     assert row_a.error_class == statestore.OP_INTERRUPTED, (
         f"S15 pre-mark: expected the interrupted class; got {row_a.error_class!r}"
     )
+    # The same-key retry RECOVERS: the pre-send refusal frees the slot and
+    # the retry proceeds fresh (R21-2); the reconciled row keeps its
+    # terminal identity with the slot freed.
+    tool_r = _CountingTool()
     resp_r, ctx_r = _ops.guard_consult(
         cfg, OP_TOOL,
         {"vm_name": "boom-vm", "checkpoint_name": "cp", "confirm": True,
          "idempotency_key": "s15-pre", "detach": True},
-        lambda **kw: (_ for _ in ()).throw(AssertionError("re-dispatch")),
-        lambda: sem,
+        tool_r, lambda: sem,
     )
-    assert ctx_r is None and resp_r.get("replayed") is True, (
-        f"S15 pre-mark: the same-key retry must replay the interrupted "
-        f"envelope; got {resp_r!r}"
+    assert ctx_r is None and isinstance(resp_r, dict) and resp_r.get(
+        "op_id") and resp_r.get("op_id") != op_a, (
+        f"S15 pre-mark: the same-key retry must proceed with a FRESH handle "
+        f"(the pre-send refusal frees the slot; R21-2); got {resp_r!r}"
     )
+    row_a_after = store.op_get(op_a)
+    assert row_a_after.status == "failed" and row_a_after.idem_key == "", (
+        f"S15 pre-mark: the reconciled row must keep its terminal identity "
+        f"with the slot freed; got {row_a_after.as_dict()!r}"
+    )
+    assert _ops.drain_for_tests(timeout_s=10.0) == 0
 
     # -- post-mark arm: the real commit lands, THEN the boom ---------------
     real_commit = saved_commit
@@ -2657,3 +2675,132 @@ def test_residue_terminal_failure_keeps_identity_and_recovers(
     assert _ops.drain_for_tests(timeout_s=10.0) == 0, (
         "S19b: the recovery runner must terminate before teardown"
     )
+
+
+# ---------------------------------------------------------------------------
+# S21 (impl-review round 21, R21-1/R21-2): (a) a generation-zero legacy
+# identity (the v6 migration shape — valid fingerprint, generation 0) is
+# AC8-protected from expiry deletion and reconciles by provenance before
+# replacement; (b) a key-release failure after the confirmed residue
+# terminalization keeps the identity and RECOVERS on the next retry
+# (the terminal-interrupted slot-freeing arm).
+# ---------------------------------------------------------------------------
+
+
+def test_generation_zero_legacy_row_reconciles_not_expires(ops_store, admission_env):
+    """S21a: a past-TTL working row with a VALID fingerprint but generation 0
+    (the migrated pre-v6 shape) must NOT be expiry-deleted to authorize a
+    fresh dispatch — it terminalizes by provenance (unmarked lapsed =
+    interrupted), the key frees, and the retry proceeds fresh."""
+    import hyperv_mcp.operations as _ops
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id="s21a-legacy", tool=OP_TOOL, agent="", vm_name="s21-vm",
+        status=statestore.OP_WORKING, created_at=now - 100000.0,
+        updated_at=now - 100000.0,
+        runner="detachedrunner01",  # a detached-runner residue (non-sync)
+        heartbeat_at=now - 100000.0,
+        params_hmac=_ops.arguments_fingerprint(
+            cfg, store,
+            {"vm_name": "s21-vm", "checkpoint_name": "cp", "confirm": True,
+             "idempotency_key": "s21a", "detach": True}),
+        idem_key="s21a", generation=0,  # the migrated pre-v6 shape
+    ))
+    tool = _CountingTool()
+    resp, ctx = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "s21-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "s21a", "detach": True},
+        tool, lambda: CountingSemaphore(2),
+    )
+    assert ctx is None and isinstance(resp, dict) and resp.get(
+        "op_id") and resp.get("op_id") != "s21a-legacy", (
+        f"S21a: the retry must proceed fresh after the provenance "
+        f"reconciliation (never a silent expiry-consume); got {resp!r}"
+    )
+    row = store.op_get("s21a-legacy")
+    assert row.status == "failed" and row.error_class == (
+        statestore.OP_INTERRUPTED) and row.idem_key == "", (
+        f"S21a: the legacy row must terminalize interrupted with its slot "
+        f"freed (reconciled, not consumed); got {row.as_dict()!r}"
+    )
+    assert _ops.drain_for_tests(timeout_s=10.0) == 0
+
+
+def test_residue_release_failure_keeps_identity_and_recovers(
+        ops_store, admission_env, monkeypatch):
+    """S21b: when the key release fails after the confirmed residue
+    terminalization, the retry receives the retryable refusal naming the
+    handle; the terminal row keeps its key (the UNIQUE index blocks a
+    replacement and the TTL arm excludes it); the next retry (fault
+    removed) frees the key through the terminal-interrupted recovery arm
+    and proceeds fresh."""
+    import hyperv_mcp.operations as _ops
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id="s21b-ghost", tool=OP_TOOL, agent="", vm_name="s21-vm",
+        status=statestore.OP_WORKING, created_at=now - 400.0,
+        updated_at=now - 400.0, runner="sync-deadbeef",
+        heartbeat_at=now - 400.0,
+        params_hmac=_ops.arguments_fingerprint(
+            cfg, store,
+            {"vm_name": "s21-vm", "checkpoint_name": "cp", "confirm": True,
+             "idempotency_key": "s21b", "detach": True}),
+        idem_key="s21b", generation=1,
+    ))
+    tool = _CountingTool()
+    real_release = store.op_release_idem
+    failing = {"on": True}
+
+    def broken_release(op_id):
+        if failing["on"]:
+            raise RuntimeError("release-only failure (simulated)")
+        return real_release(op_id)
+
+    monkeypatch.setattr(store, "op_release_idem", broken_release)
+    resp, ctx = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "s21-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "s21b", "detach": True},
+        tool, lambda: CountingSemaphore(2),
+    )
+    assert ctx is None and isinstance(resp, dict) and resp.get(
+        "retryable") is True and resp.get("op_id") == "s21b-ghost", (
+        f"S21b: the release-only failure must answer the retryable refusal "
+        f"naming the handle; got {resp!r}"
+    )
+    row = store.op_get("s21b-ghost")
+    assert row.status == "failed" and row.error_class == (
+        statestore.OP_INTERRUPTED) and row.idem_key == "s21b", (
+        f"S21b: the terminalized residue must keep its key (no replacement "
+        f"authorized); got {row.as_dict()!r}"
+    )
+    assert tool.calls == 0, (
+        f"S21b: no fresh dispatch on the failed release; got {tool.calls}"
+    )
+    # The follow-up retry (fault removed) recovers: the terminal-interrupted
+    # arm frees the key and the retry proceeds fresh.
+    monkeypatch.setattr(store, "op_release_idem", real_release)
+    resp2, ctx2 = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "s21-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "s21b", "detach": True},
+        tool, lambda: CountingSemaphore(2),
+    )
+    assert ctx2 is None and isinstance(resp2, dict) and resp2.get(
+        "op_id") and resp2.get("op_id") != "s21b-ghost", (
+        f"S21b recovery: the next retry must free the key and dispatch "
+        f"fresh; got {resp2!r}"
+    )
+    row2 = store.op_get("s21b-ghost")
+    assert row2.idem_key == "", (
+        f"S21b recovery: the stranded slot must be freed; got "
+        f"{row2.as_dict()!r}"
+    )
+    assert _ops.drain_for_tests(timeout_s=10.0) == 0
