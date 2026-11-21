@@ -236,8 +236,9 @@ def test_v2_store_migrates_forward_to_v3_with_all_tables(tmp_path):
     try:
         version = sqlite3.connect(str(db)).execute("PRAGMA user_version").fetchone()[0]
         # Issue #30: SCHEMA_VERSION moved 3 -> 4 (cred_profile/cred_username);
-        # a v2 store migrates all the way to the current version.
-        assert version == statestore.SCHEMA_VERSION == 5, version
+        # issue #157 moved 5 -> 6 (generation/send_state + vm_epochs). A v2
+        # store migrates all the way to the current version.
+        assert version == statestore.SCHEMA_VERSION == 6, version
         names = {
             row[0] for row in sqlite3.connect(str(db)).execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")
@@ -294,9 +295,23 @@ def test_events_and_ops_retention_sweeps(tmp_path):
             op_id="op-old-working", tool="t", agent="a", status=statestore.OP_WORKING,
             created_at=now - 100000, updated_at=now - 100000,
         ))
+        # Issue #157: retention is two-phase — terminal rows past the cutoff
+        # lose their PAYLOAD but keep their identity (a replay inside the
+        # window answers the original handle with result-expired), and the
+        # sweep returns tombstoned + removed.
         removed = store.ops_prune(now - 86400)
         assert removed == 3, removed
         assert store.op_get("op-old-working") is not None, "working rows are never swept"
+        for i in range(3):
+            tomb = store.op_get(f"op-old-{i}")
+            assert tomb is not None, (
+                "issue #157: the identity survives retention as a tombstone"
+            )
+            assert tomb.result_json is None, "the payload is pruned with the tombstone"
+        # A second pass with an advanced replay cutoff deletes the resolved
+        # tombstones (never in the same pass that tombstoned them).
+        removed2 = store.ops_prune(now - 86400, replay_cutoff=now)
+        assert removed2 == 3, removed2
         assert store.op_get("op-old-0") is None
     finally:
         store.close()

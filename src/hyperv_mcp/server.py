@@ -4622,14 +4622,22 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             username: str = "", password: str = "",
             vm_id: str = "",
             lease_id: str = "", fencing_token: int = 0,
+            intended_bindings: list[str] | None = None,
         ) -> dict:
             """Propose (dry run, default) or apply narrow guest access fixes:
-            stale SSH ListenAddress bindings (config backed up first;
-            firewall repair may widen an existing disabled Any-port rule,
-            disclosed in the plan text), starting stopped sshd/WinRM,
-            enabling EXISTING disabled firewall allow rules. Apply requires
-            guest_repair=true AND confirm=true;
-            every applied change is re-verified and reported.
+            stale SSH ListenAddress bindings rewritten to the operator's
+            intended_bindings (config backed up first; never a guessed
+            replacement — absent/invalid/ambiguous intent leaves the rewrite
+            decision_required and not attempted), starting stopped sshd/WinRM,
+            enabling EXISTING disabled firewall allow rules (firewall repair
+            may widen an existing disabled Any-port rule, disclosed in the
+            plan text). Apply requires guest_repair=true AND confirm=true;
+            every applied change is re-verified and reported with separate
+            apply_outcome/observation/postcondition channels.
+            Guest floor (distinct from the console tool family, whose
+            host-console input works from firmware/WinPE with no guest OS
+            running): repair needs a RUNNING guest reachable over
+            PowerShell Direct — it cannot act on a stopped or pre-boot VM.
 
             Args:
                 vm_name: Name of the VM
@@ -4640,6 +4648,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 password: Inline guest password (requires allow_inline_credentials=true)
                 lease_id: Optional lease citation - the lease gate runs before the body
                 fencing_token: The lease's fencing token, with lease_id
+                intended_bindings: Operator intent for stale ListenAddress rewrites -
+                    one address applied to every stale line, or one per line; absent,
+                    invalid, or length-ambiguous intent leaves the rewrite
+                    decision_required (never a guessed replacement)
 
             Returns: {ok, vm_name, applied, plan, changes,
             verification_findings[, backup_path]}.
@@ -4648,6 +4660,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_repair_guest_access", vm_name, "guest_repair",
                 repair.repair_guest_access, _cfg(), vm_name,
                 apply=apply, confirm=confirm, vm_id=vm_id,
+                intended_bindings=intended_bindings,
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
             )
 
@@ -4873,14 +4886,22 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_name: str = "", apply: bool = False, confirm: bool = False,
             vm_id: str = "",
             lease_id: str = "", fencing_token: int = 0,
+            intended_bindings: list[str] | None = None,
         ) -> dict:
             """Propose (dry run, default) or apply narrow guest access fixes:
-            stale SSH ListenAddress bindings (config backed up first;
-            firewall repair may widen an existing disabled Any-port rule,
-            disclosed in the plan text), starting stopped sshd/WinRM,
-            enabling EXISTING disabled firewall allow rules. Apply requires
-            guest_repair=true AND confirm=true;
-            every applied change is re-verified and reported. Credentials
+            stale SSH ListenAddress bindings rewritten to the operator's
+            intended_bindings (config backed up first; never a guessed
+            replacement — absent/invalid/ambiguous intent leaves the rewrite
+            decision_required and not attempted), starting stopped sshd/WinRM,
+            enabling EXISTING disabled firewall allow rules (firewall repair
+            may widen an existing disabled Any-port rule, disclosed in the
+            plan text). Apply requires guest_repair=true AND confirm=true;
+            every applied change is re-verified and reported with separate
+            apply_outcome/observation/postcondition channels.
+            Guest floor (distinct from the console tool family, whose
+            host-console input works from firmware/WinPE with no guest OS
+            running): repair needs a RUNNING guest reachable over
+            PowerShell Direct — it cannot act on a stopped or pre-boot VM. Credentials
             from environment only.
 
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
@@ -4893,12 +4914,17 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
                 lease_id: Optional lease citation - the lease gate runs before the body
                 fencing_token: The lease's fencing token, with lease_id
+                intended_bindings: Operator intent for stale ListenAddress rewrites -
+                    one address applied to every stale line, or one per line; absent,
+                    invalid, or length-ambiguous intent leaves the rewrite
+                    decision_required (never a guessed replacement)
             Returns: {ok, vm_name, applied, plan, changes, verification_findings[, backup_path]}.
             """
             return _run_guest_tool(
                 "hyperv_repair_guest_access", vm_name, "guest_repair",
                 repair.repair_guest_access, _cfg(), vm_name,
                 apply=apply, confirm=confirm, vm_id=vm_id,
+                intended_bindings=intended_bindings,
                 cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
             )
 

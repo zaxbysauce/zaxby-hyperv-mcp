@@ -78,6 +78,7 @@ _REQUIRED_OPS_COLUMNS = {
     "op_id", "agent", "tool", "vm_id", "vm_name", "status", "error_class",
     "created_at", "updated_at", "runner", "heartbeat_at", "cancel_requested",
     "params_hmac", "idem_key", "result_json", "result_size", "poll_interval_ms",
+    "generation", "send_state",
 }
 _REQUIRED_EVENT_COLUMNS = {
     "seq", "ts", "agent", "kind", "ref_id", "vm_id", "data_json",

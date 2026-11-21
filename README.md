@@ -184,7 +184,7 @@ transports (in-process embedders driving `call_tool` directly keep anyio's
 - **Wire-visible fields.** `hyperv_server_info`'s `protocol_version` now
   reports the 2.x `LATEST_PROTOCOL_VERSION` (2026-07-28, was 2025-11-25),
   and the initialize handshake's `serverInfo.version` now reports this
-  package's version (0.23.0 today) instead of
+  package's version (0.24.0 today) instead of
   the SDK's (the release contract, the complete bump-site
   enumeration, and how to read `version`/`git_revision` live in
   [docs/versioning-policy.md](docs/versioning-policy.md)).
@@ -233,6 +233,37 @@ restart-on-failure) and `--uninstall-logon-task` removes it. The task
 definition stores no secrets: set the token variable once for the user
 (`setx HYPERV_MCP_HTTP_TOKEN the-token-value-you-generated` — available from the next logon; PowerShell rejects angle-bracket placeholders, so the line above is literally executable once you substitute your value) and
 the task-spawned controller reads it from the environment.
+
+## 0.24.0 changes
+
+- **Durable operation identity (#157):** the three keyed routes (inline, detached and
+  MCP tasks) mint an executor generation at row creation, store a non-empty execution
+  owner for inline rows, fence replaced executors (a stale generation's terminal
+  writes, heartbeats, and idempotency releases are refused), and commit a durable
+  `possibly_sent` pre-send state under a per-resource send gate before any
+  unacknowledged provider submission. A lost reply after the commit persists an
+  `unknown` outcome that matching retries attach to without re-dispatch; a cancel
+  honored after the commit stays `cancelled` with the uncertain VM-side outcome
+  disclosed. Failure and cancellation arms of `hyperv_checkpoint_restore` invalidate
+  pooled guest sessions or leave the VM's durable epoch dirty, and every pooled
+  borrow/return consults that epoch — a restored VM blocks stale session reuse until
+  the pool's fresh-bind dance proves a clean re-bind. Retention becomes two-phase
+  (payload tombstones keep identity through the replay window; `interrupted` and
+  `unknown` rows are protected until trusted reconciliation).
+- **Action-specific repair outcomes (#158):** `hyperv_repair_guest_access` records
+  apply outcome, observation quality, and action-specific postcondition as separate
+  channels (`apply_outcome` / `observation` / `postcondition` +
+  `postcondition_detail`); a failed apply stays visible even when a later readback is
+  healthy; an unavailable or partial verification yields postcondition `unknown`
+  instead of a clearance; service-running is distinguished from the intended listener
+  binding. ListenAddress rewrites now require explicit operator intent
+  (`intended_bindings`) — an absent or ambiguous intent produces a
+  decision-required diagnostic instead of a guessed `0.0.0.0` rewrite — and the
+  loopback (`::1`) is never proposed for rewrite. WIRE CHANGE: callers that relied on
+  the implicit rewrite must pass `intended_bindings`. Repair/diagnostics require a
+  RUNNING guest reachable over PowerShell Direct — a guest floor distinct from the
+  console family's host-console/firmware prerequisites.
+- Version bump: 0.23.0 -> 0.24.0.
 
 ## 0.23.0 changes
 
@@ -2182,7 +2213,7 @@ Environment-only victim credentials; never elevated.
 | Tool | Parameters | Returns |
 |------|-----------|---------|
 | `hyperv_diagnose_vm_access` | `vm_name` or `vm_id`, `timeout_ms=90000` | `{ok, vm_name, vm, ps_direct, guest, findings[], checked_at}` |
-| `hyperv_repair_guest_access` | `vm_name` or `vm_id`, `apply=false`, `confirm=false` | `{ok, vm_name, applied, plan[], changes[], verification_findings[], backup_path?}` |
+| `hyperv_repair_guest_access` | `vm_name` or `vm_id`, `apply=false`, `confirm=false`, `intended_bindings[]?` | `{ok, vm_name, applied, plan[], changes[], verification_findings[], backup_path?}` |
 
 `hyperv_diagnose_vm_access` is ONE read-only call that reports host VM state,
 guest identity (hostname/OS), current guest IPv4/IPv6 addresses, PowerShell
@@ -2195,13 +2226,29 @@ fault-isolated; one failing probe never aborts the report.
 
 `hyperv_repair_guest_access` dry-runs by default (propose only, read-only).
 With `apply=true` it performs the narrow fixes — stale `ListenAddress` lines
-rewritten to `0.0.0.0` (sshd_config backed up first), stopped sshd/WinRM
-started, EXISTING disabled firewall allow rules enabled — a rule whose port filter matches the target port exactly or is port-Any may be widened (disclosed verbatim in the dry-run plan; no new rules are created). A
+rewritten to the operator-supplied `intended_bindings` (sshd_config backed up
+first; WIRE CHANGE: the rewrite is no longer a hardcoded `0.0.0.0` default —
+an absent, invalid, or length-ambiguous `intended_bindings` leaves the rewrite
+change `not_attempted` with a `decision_required` diagnostic; pass one address
+to apply to every stale line, or one per line, which the plan records per
+line), stopped sshd/WinRM started, EXISTING disabled firewall allow rules
+enabled — a rule whose port filter matches the target port exactly or is
+port-Any may be widened (disclosed verbatim in the dry-run plan; no new rules
+are created). A
 stale address seen only on the runtime listener matches no config line:
 the backup and restart still run with 0 replacements while verification
-reports the binding still present — and re-verifies every action, returning per-change
-`applied`/`verified` results. Apply requires `guest_repair: true` AND
-`confirm=true`.
+reports the binding still present — and re-verifies every action, returning
+per-change `applied`/`verified` results plus the separate
+`apply_outcome` (`applied`/`failed`/`not_attempted`), `observation`
+(`positive`/`negative`/`partial`/`unavailable`) and `postcondition`
+(`satisfied`/`unsatisfied`/`unknown`) channels; `verified` is derived
+(`applied` AND `satisfied` AND `positive`). Apply requires `guest_repair:
+true` AND `confirm=true`.
+
+Guest floor (both tools): they need a RUNNING guest reachable over
+PowerShell Direct — distinct from the console tool family, whose host-console
+keyboard input works from firmware/WinPE with no guest OS running. Neither
+tool can act on a stopped or pre-boot VM.
 
 ### Managed Guest Jobs (0.3.0)
 

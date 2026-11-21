@@ -535,21 +535,35 @@ def checkpoint_restore(
     _require_destructive(cfg, "checkpoint_restore", confirm, f"restore VM '{vm_name or vm_id}' to '{checkpoint_name}'")
     cn = pswindows.ps_name(checkpoint_name)
     ref = vmident.resolve(cfg, vm_name=vm_name, vm_id=vm_id)
+    from . import operations as _operations
+
     with vmlocks.vm_lock(ref.id):
+        # Issue #157 restore barrier: the durable pre-send commit BEFORE the
+        # unacknowledged provider submission — a keyed attempt gets the
+        # atomic generation-validated possibly_sent + dirty-epoch transaction
+        # (fail-closed: a lost fence raises before the leg); a direct,
+        # unkeyed call gets the epoch-only commit. lifecycle NEVER acquires
+        # the send gate (route-layer owned; the canonical order is gate ->
+        # VM lock -> submission); the VM write lock serializes direct calls.
+        _operations.commit_send_intent(cfg, vm_key=ref.id)
         script = f"""
 {guestexec.vm_target_preamble(ref.id)}
 Restore-VMSnapshot -Name {cn} -VM (Get-VM -Id $vmTarget -ErrorAction Stop) -Confirm:$false -ErrorAction Stop
 """
         result = _run(cfg, script, timeout_s=300)
         pswindows.check_result(result, f"hyperv_checkpoint_restore({vm_name or vm_id}, {checkpoint_name})")
+        # Issue #157 (plan round-3 blocker 8): on the ACKNOWLEDGED arm the
+        # session invalidation runs BEFORE the cooperative cancel check — a
+        # cancel landing after the restore committed cannot leave pooled
+        # sessions stale on a restored VM. The dirty epoch stays set (cleared
+        # only by the pool's fresh-bind dance), so a failure or cancel on any
+        # later leg still blocks stale reuse (C6's or-contract).
+        _invalidate_sessions(ref.id, "checkpoint_restore")
         # Issue #24: cooperative cancel check at the leg boundary — a detached
         # call that was cancel-requested while this leg ran stops HERE (the
         # state wait ahead of it is the runner's next cooperative check point)
         # instead of reporting a completed restore (frozen AC7/AC14).
-        from . import operations as _operations
-
         _operations.raise_if_cancelled()
-        _invalidate_sessions(ref.id, "checkpoint_restore")
         # Restoring a checkpoint whose subtree has descendants merges their
         # differencing disks; the VM can stay in transitional states for many
         # minutes (observed: >120s on a 10-deep tree). Wait generously.

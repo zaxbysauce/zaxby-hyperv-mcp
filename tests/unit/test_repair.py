@@ -75,6 +75,10 @@ def test_dry_run_is_default_and_mutates_nothing(monkeypatch):
     # Resolve + the two diagnose legs ran — no mutation script.
     assert len(fake.scripts) == 3
     assert "Restart-Service" not in fake.scripts[2]
+    # C15 no-intent arm: the stale rewrite is decision_required, never a
+    # guessed replacement.
+    rewrite = [p for p in out["plan"] if p["action"] == "rewrite_stale_ssh_bindings"]
+    assert rewrite and rewrite[0].get("decision_required") is True
 
 
 def test_apply_without_confirm_denied_before_mutation(monkeypatch):
@@ -109,7 +113,10 @@ def test_apply_executes_and_verifies_each_action(monkeypatch):
         _ok(_host()), _ok(healthy),                # diagnose 2 (verify)
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
-    out = repair.repair_guest_access(cfg, "test-vm", apply=True, confirm=True, cred=CRED)
+    out = repair.repair_guest_access(
+        cfg, "test-vm", apply=True, confirm=True, cred=CRED,
+        intended_bindings=["0.0.0.0"],  # C15: the rewrite needs explicit intent
+    )
     assert out["applied"] is True
     actions = [c["action"] for c in out["changes"]]
     assert sorted(actions) == [
@@ -117,8 +124,12 @@ def test_apply_executes_and_verifies_each_action(monkeypatch):
     ]
     for change in out["changes"]:
         assert change["applied"] is True
+        assert change["apply_outcome"] == "applied"
         assert change["verified"] is True
         assert change["verify_detail"].endswith("cleared")
+    rewrite = [c for c in out["changes"] if c["action"] == "rewrite_stale_ssh_bindings"][0]
+    assert rewrite["postcondition"] == "satisfied"
+    assert rewrite["observation"] == "positive"
     assert out["backup_path"].endswith(".bak-20260929")
     # One resolution leg, one apply script per item, then a full re-diagnose
     # (2 legs) — the verify pass reuses the resolved GUID, no re-resolve.
@@ -145,16 +156,50 @@ def test_apply_sibling_continues_after_item_error(monkeypatch):
     fake = FakePS([
         _guid_result(),
         _ok(_host()), _ok(broken),
-        pswindows.PSResult(stdout="", returncode=1, stderr="rewrite failed"),  # stale apply fails
         _ok({"service": "sshd", "status": "Running"}),  # start-service sibling succeeds
+        pswindows.PSResult(stdout="", returncode=1, stderr="rewrite failed"),  # stale apply fails
+        _ok(_host()), _ok(healthy),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = repair.repair_guest_access(
+        cfg, "test-vm", apply=True, confirm=True, cred=CRED,
+        intended_bindings=["0.0.0.0"],  # C15: the rewrite needs explicit intent
+    )
+    assert len(out["changes"]) == 2
+    assert out["changes"][0]["action"] == "start_service"
+    assert out["changes"][0]["applied"] is True
+    assert out["changes"][1]["action"] == "rewrite_stale_ssh_bindings"
+    assert out["changes"][1]["applied"] is False
+    assert out["changes"][1]["apply_outcome"] == "failed"
+    assert "rewrite failed" in out["changes"][1]["error"]
+
+
+def test_apply_without_intent_leaves_rewrite_not_attempted(monkeypatch):
+    """C15 no-intent apply arm: without intended_bindings the rewrite change
+    stays not_attempted with the decision-required diagnostic (no mutation
+    script runs for it), while siblings still apply."""
+    cfg = Config(unrestricted=True)
+    broken = _guest(status="Stopped", listen="192.168.50.20")
+    broken["ssh"]["listeners"] = [{"address": "192.168.50.20", "port": 22}]
+    healthy = _guest(status="Running", listen="192.168.50.20")
+    fake = FakePS([
+        _guid_result(),
+        _ok(_host()), _ok(broken),
+        _ok({"service": "sshd", "status": "Running"}),  # only the sibling applies
         _ok(_host()), _ok(healthy),
     ])
     monkeypatch.setattr(pswindows, "run_ps", fake)
     out = repair.repair_guest_access(cfg, "test-vm", apply=True, confirm=True, cred=CRED)
-    assert len(out["changes"]) == 2
-    assert out["changes"][0]["applied"] is False
-    assert "rewrite failed" in out["changes"][0]["error"]
-    assert out["changes"][1]["applied"] is True
+    rewrite = [c for c in out["changes"] if c["action"] == "rewrite_stale_ssh_bindings"]
+    assert len(rewrite) == 1
+    change = rewrite[0]
+    assert change["apply_outcome"] == "not_attempted"
+    assert change["applied"] is False
+    assert change.get("decision_required") is True
+    assert "intent" in change["verify_detail"].lower()
+    assert change["verified"] is False
+    # No rewrite mutation script ran — the only apply leg is Start-Service.
+    assert sum("Copy-Item" in s for s in fake.scripts) == 0
 
 
 def test_healthy_vm_empty_plan(monkeypatch):

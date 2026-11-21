@@ -548,6 +548,9 @@ def test_task_ids_authorized_and_durable(tmp_path, fresh_server, monkeypatch):
     clock = FakeClock()
     mount = ClockStoreMount(monkeypatch, str(tmp_path / "state.db"), clock)
     fake = GatedFakePS(pass_first=0)  # the pre-restart task stays working
+    # Issue #157 (Change-6 migration): the task's runner commits the pre-send
+    # mark before the gated leg, so a restart-lapsed classification is the
+    # lost-reply 'unknown' identity — the AC15 wording below follows it.
     monkeypatch.setattr(pswindows, "run_ps", fake)
     server = mod.get_mcp()
 
@@ -601,11 +604,14 @@ def test_task_ids_authorized_and_durable(tmp_path, fresh_server, monkeypatch):
         resumed = _drive(mod2.get_mcp(), "agent-a", True, resume)
         assert resumed.status == "failed", (
             f"AC15: after the restart the owner must be served the "
-            f"pre-restart task as failed (interrupted); got {resumed.status!r}"
+            f"pre-restart task as failed; got {resumed.status!r}"
         )
-        assert "interrupted" in json.dumps(resumed.model_dump(by_alias=True)).lower(), (
-            f"AC15: the pre-restart task must report failed / interrupted "
-            f"for its owner; got {resumed.model_dump(by_alias=True)}"
+        # Issue #157: the pre-restart runner committed possibly_sent before
+        # its gated leg, so the restart classification is the lost-reply
+        # 'unknown' identity (protected, attachable) — not 'interrupted'.
+        assert "unknown" in json.dumps(resumed.model_dump(by_alias=True)).lower(), (
+            f"AC15: the pre-restart possibly-sent task must report the "
+            f"unknown outcome for its owner; got {resumed.model_dump(by_alias=True)}"
         )
     finally:
         fake.gate.set()

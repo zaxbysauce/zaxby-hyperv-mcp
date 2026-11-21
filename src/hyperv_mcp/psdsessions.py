@@ -88,6 +88,16 @@ class SessionBusy(RuntimeError):
     """
 
 
+class SessionEpochDirty(SessionBusy):
+    """The VM's durable epoch is dirty (a restore committed and the fresh-bind
+    dance has not yet proven a clean re-bind), or the dance failed.
+
+    Distinct from SessionBusy so `guestexec._run_pooled_raw` can RE-RAISE it
+    instead of silently falling back to a per-call session: the dirty-epoch
+    refusal must be disclosed at the tool boundary, never swallowed (issue
+    #157, plan round-2 blocker 10 / round-4 advisory 2)."""
+
+
 class SessionKey(NamedTuple):
     """The pool key: (VM GUID, credential profile, agent id, boot epoch).
 
@@ -216,6 +226,8 @@ class SessionPool:
         idle_ttl_s: float = DEFAULT_IDLE_TTL_S,
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         clock: Callable[[], float] | None = None,
+        epoch_reader: Callable[[str], tuple[int, str]] | None = None,
+        epoch_clear: Callable[[str, int], bool] | None = None,
     ) -> None:
         if not callable(worker_factory):
             raise TypeError("worker_factory must be callable")
@@ -238,6 +250,19 @@ class SessionPool:
         #: invalidation drains these before it scans, so a session opened
         #: concurrently with it is closed by it rather than surviving it.
         self._creating: dict[str, int] = {}
+        #: Issue #157 restore barrier: the borrow/return consults. The reader
+        #: returns a SNAPSHOT (epoch, state) for the VM; the clear is the
+        #: expected-epoch-guarded dirty clear. Both are installed by
+        #: `install_default_pool` (bootstrap is the only wiring point); a pool
+        #: without them consults nothing (unit pools keep their old behavior).
+        self.epoch_reader = epoch_reader
+        self.epoch_clear = epoch_clear
+        #: Per-VM recovery locks for the serialized fresh-bind dance — a
+        #: module-level dict would leak per test pool, so the pool owns its
+        #: own; this lock is the ONLY dance-wide hold (the pool `_mu` takes
+        #: short table/set mutations only and is never held across invalidate,
+        #: drain, spawn, validation, or close).
+        self._epoch_recovery_locks: dict[str, threading.Lock] = {}
         self.invalidated = 0
         self.evicted = 0
         self.reaped = 0
@@ -253,6 +278,99 @@ class SessionPool:
         reaper.start()
 
     # -- acquisition -------------------------------------------------------
+
+    def _recovery_lock(self, guid: str) -> threading.Lock:
+        with self._mu:
+            lock = self._epoch_recovery_locks.get(guid)
+            if lock is None:
+                lock = threading.Lock()
+                self._epoch_recovery_locks[guid] = lock
+            return lock
+
+    def _discard_created(self, key: SessionKey, worker: Any) -> None:
+        """Post-spawn dance failure cleanup (plan round-3 blocker 7): remove
+        and close the just-created worker so no stranded in-use entry wedges
+        the key — the caller received nothing, the pool owns the cleanup."""
+        with self._mu:
+            entry = next(
+                (e for e in self._entries.values() if e.worker is worker), None
+            )
+            if entry is not None:
+                entry.doomed = True
+                self._entries.pop(entry.key, None)
+        try:
+            worker.close()
+        except Exception:
+            pass
+
+    def _epoch_fresh_bind(self, key: SessionKey, cred: Any) -> Any | None:
+        """The serialized fresh-bind dance (issue #157, plan Change 4).
+
+        Returns a worker to hand straight to the caller (the dance's own fresh
+        binding), or None when no dance was needed. The per-VM recovery lock
+        is the ONLY dance-wide hold; `_mu` takes short table/set mutations
+        only (never held across invalidate, drain, spawn, validation, or
+        close). Any failure closes/removes the fresh worker, LEAVES THE EPOCH
+        DIRTY, and raises SessionEpochDirty — the epoch clears only after
+        confirmed invalidation plus a validated fresh binding."""
+        reader = self.epoch_reader
+        if reader is None:
+            return None
+        guid = _norm_guid(key.vm_guid)
+        try:
+            epoch, state = reader(guid)
+        except Exception:
+            return None
+        if state != "dirty":
+            return None
+        with self._recovery_lock(guid):
+            # Re-read after a concurrent dance may have finished.
+            try:
+                epoch, state = reader(guid)
+            except Exception:
+                return None
+            if state != "dirty":
+                return None
+            # Confirmed invalidation + drain (the pool's own discipline; a
+            # lifecycle action bumping the epoch concurrently is safe — the
+            # clear below is expected-epoch guarded, so a stale dance cannot
+            # clear a NEWER dirty epoch).
+            try:
+                self.invalidate_vm(key.vm_guid, "epoch_fresh_bind")
+            except Exception:
+                pass
+            gate = self._gates.setdefault(key, threading.Lock())
+            worker = None
+            try:
+                with gate:
+                    worker = self._create_locked(key, cred)
+            except Exception:
+                worker = None
+            established = (
+                worker is not None
+                and (not hasattr(worker, "is_alive") or worker.is_alive())
+            )
+            if not established:
+                if worker is not None:
+                    self._discard_created(key, worker)
+                raise SessionEpochDirty(
+                    f"vm {guid} epoch is dirty and the fresh-bind worker could "
+                    "not be established; session reuse stays blocked until "
+                    "the next lifecycle action re-binds"
+                )
+            cleared = False
+            if self.epoch_clear is not None:
+                try:
+                    cleared = bool(self.epoch_clear(guid, epoch))
+                except Exception:
+                    cleared = False
+            if not cleared:
+                self._discard_created(key, worker)
+                raise SessionEpochDirty(
+                    f"vm {guid} epoch stayed dirty after the fresh bind "
+                    f"(expected epoch {epoch}); session reuse stays blocked"
+                )
+            return worker
 
     def acquire(
         self,
@@ -278,6 +396,15 @@ class SessionPool:
         case only: every session for this key is checked out.
         """
         key = _as_key(key)
+        # Issue #157 restore barrier: consult the durable epoch BEFORE any
+        # borrow. A dirty snapshot runs the serialized fresh-bind dance
+        # (snapshot -> confirmed invalidation -> fresh worker -> validation ->
+        # expected-epoch clear -> hand out); any dance failure leaves the
+        # epoch dirty and raises SessionEpochDirty. Every later borrow sees
+        # the clean snapshot and proceeds unchanged.
+        handed = self._epoch_fresh_bind(key, cred)
+        if handed is not None:
+            return handed
         deadline = self._clock() + max(0.0, float(wait_s))
         while True:
             stale: list[Any] = []
@@ -533,6 +660,18 @@ class SessionPool:
             if entry.doomed or _worker_is_dead(worker):
                 entry.doomed = True
                 victims = [entry]
+            elif self.epoch_reader is not None:
+                # Issue #157 return-path consult: a session returning to the
+                # pool while its VM's durable epoch is dirty is CLOSED instead
+                # of pooled — the guest may have been restored mid-use.
+                victims = []
+                try:
+                    _epoch, state = self.epoch_reader(entry.key.vm_guid)
+                except Exception:
+                    state = "clean"
+                if state == "dirty":
+                    entry.doomed = True
+                    victims = [entry]
             else:
                 victims = []
         if victims:
@@ -838,10 +977,31 @@ def install_default_pool(cfg: Any) -> SessionPool | None:
         # the host's last slot and starve every per-call leg.
         return None
     previous = DEFAULT
+
+    def _epoch_reader(vm_key: str) -> tuple[int, str]:
+        # Issue #157: late import — bootstrap stays the only wiring point and
+        # psdsessions gains no import cycle with operations/statestore.
+        from . import operations as _ops
+
+        try:
+            return _ops.store_for(cfg).epoch_snapshot(vm_key)
+        except Exception:
+            return (0, "clean")
+
+    def _epoch_clear(vm_key: str, expected_epoch: int) -> bool:
+        from . import operations as _ops
+
+        try:
+            return bool(_ops.store_for(cfg).epoch_clear_dirty(vm_key, expected_epoch))
+        except Exception:
+            return False
+
     pool = SessionPool(
         _default_worker_factory,
         idle_ttl_s=DEFAULT_IDLE_TTL_S,
         max_sessions=cap - 2,
+        epoch_reader=_epoch_reader,
+        epoch_clear=_epoch_clear,
     )
     pool.start_reaper()
     DEFAULT = pool

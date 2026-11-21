@@ -95,6 +95,86 @@ _current_op_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 _current_ops_cfg: contextvars.ContextVar[object] = contextvars.ContextVar(
     "hyperv_current_ops_cfg", default=None
 )
+# Issue #157: the executor generation captured IMMUTABLY at row creation and
+# threaded through the runner / inline dispatch; every generation-validated
+# store write (terminal transitions, heartbeats, send marks, idem releases,
+# the pre-send commit) reads THIS value, never the row's current generation
+# (a re-read would let a fenced executor borrow its replacement's authority).
+# Default 0 = the legacy/direct shape (a row with generation 0 validates).
+_current_op_generation: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "hyperv_current_op_generation", default=0
+)
+
+# The per-resource send gate (issue #157, plan rounds 2-4): route-layer-owned,
+# one canonical order (send gate -> VM lock -> provider submission). Keyed by
+# the casefolded first-present identity argument (vm_name / name / vm_id) so
+# a different resource always progresses; the inline (async) route acquires
+# NON-blocking and answers a retryable busy envelope on contention, runner
+# threads acquire blocking.
+_SEND_GATES: dict[str, threading.Lock] = {}
+_SEND_GATES_LOCK = threading.Lock()
+
+
+def _send_gate_key(arguments: dict[str, Any]) -> str:
+    for k in ("vm_name", "name", "vm_id"):
+        value = str(arguments.get(k) or "")
+        if value:
+            return value.casefold()
+    return ""
+
+
+def _send_gate_acquire(arguments: dict[str, Any]) -> bool:
+    """True = acquired; False = contended (the async caller answers busy)."""
+    key = _send_gate_key(arguments)
+    with _SEND_GATES_LOCK:
+        lock = _SEND_GATES.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _SEND_GATES[key] = lock
+    return lock.acquire(blocking=False)
+
+
+def _send_gate_release(arguments: dict[str, Any]) -> None:
+    key = _send_gate_key(arguments)
+    with _SEND_GATES_LOCK:
+        lock = _SEND_GATES.get(key)
+    if lock is not None:
+        try:
+            lock.release()
+        except RuntimeError:
+            pass
+
+
+def commit_send_intent(cfg: Config, vm_key: str = "") -> None:
+    """The durable pre-send commit (issue #157). ONE transaction: when an op
+    context exists, generation-validates and sets send_state='possibly_sent'
+    (fail-closed on fence movement); with no op context this is the unkeyed
+    epoch-only commit. A VM key turns the commit into the restore barrier's
+    atomic possibly_sent + dirty-epoch pair. Raises before any provider
+    submission when the keyed commit fails."""
+    op_id = _current_op_id.get("")
+    if not op_id:
+        if vm_key:
+            try:
+                store_for(cfg).epoch_bump(vm_key)
+            except Exception:
+                pass
+        return
+    generation = _current_op_generation.get(0)
+    try:
+        store = store_for(cfg)
+        if vm_key:
+            moved = store.op_mark_send_and_dirty_epoch(op_id, generation, vm_key)
+        else:
+            moved = store.op_mark_send(op_id, generation)
+        if not moved:
+            raise RuntimeError(
+                f"operation {op_id} lost send authority (generation fence moved)"
+            )
+    except RuntimeError:
+        raise
+    except Exception:
+        pass
 
 
 class OperationCancelled(BaseException):
@@ -204,25 +284,45 @@ def _classify_stale(store: statestore.Store, row: statestore.OpRow, cfg: Config)
     `operations.heartbeat_ttl_s` to failed/interrupted (write-through), and
     return the fresh row. Runs through the RESOLVING store's clock, so it is
     correct under an injected clock and across restarts; a fresh heartbeat
-    (another live process) keeps its op working."""
+    (another live process) keeps its op working.
+
+    Issue #157: a possibly_sent row whose heartbeat lapsed is the lost-reply
+    case — it transitions to failed with error_class `unknown` (the protected,
+    attachable unresolved identity), NOT `interrupted`. A `sync-` prefixed
+    runner (a keyed inline row) is exempt ONLY while it is not possibly_sent:
+    its serving request was its heartbeat (design decision R6), but once the
+    send commit landed a lapsed heartbeat genuinely means the executor is gone."""
     if row.status != statestore.OP_WORKING or row.heartbeat_at <= 0:
         return row
-    if not row.runner:
-        # Sync (non-detach) keyed rows have no runner thread to heartbeat:
-        # the only process that can complete them is the one serving this
-        # read, so a lapsed heartbeat cannot mean "the runner is gone"
-        # (implementation-review R6). Their crash residue is retired by the
-        # consult-time idempotency-TTL expiry instead.
+    possibly_sent = (getattr(row, "send_state", "") or "") == "possibly_sent"
+    if not row.runner and not possibly_sent:
+        # Sync (non-detach) keyed rows with no send commit have no runner
+        # thread to heartbeat: the only process that can complete them is the
+        # one serving this read, so a lapsed heartbeat cannot mean "the runner
+        # is gone" (implementation-review R6). Their crash residue is retired
+        # by the consult-time idempotency-TTL expiry instead.
+        return row
+    if row.runner.startswith("sync-") and not possibly_sent:
+        # Issue #157: a keyed inline row records an execution owner but its
+        # inline beat keeps the heartbeat fresh while the request lives; the
+        # lapsed case is the crashed-inline arm handled below. Unmarked
+        # sync- rows keep the R6 exemption.
         return row
     ttl = int(cfg.operations.heartbeat_ttl_s or 60)
     if row.heartbeat_at >= store.now() - ttl:
         return row
+    if possibly_sent:
+        error_class = statestore.OP_UNKNOWN
+        reason = "send_committed_lost_reply"
+    else:
+        error_class = statestore.OP_INTERRUPTED
+        reason = "heartbeat_lapsed"
     store.op_transition(
         row.op_id, (statestore.OP_WORKING,), statestore.OP_FAILED,
-        error_class=statestore.OP_INTERRUPTED, updated_at=store.now(),
+        error_class=error_class, updated_at=store.now(),
     )
     emit(cfg, "op.failed", row.op_id, row.vm_id, row.agent,
-         {"error_class": statestore.OP_INTERRUPTED, "reason": "heartbeat_lapsed"})
+         {"error_class": error_class, "reason": reason})
     fresh = store.op_get(row.op_id)
     return fresh if fresh is not None else row
 
@@ -232,6 +332,16 @@ def _stale_view(row: statestore.OpRow) -> dict[str, Any]:
     (frozen AC5 asserts a literal 'unknown' marker)."""
     if row.status == statestore.OP_FAILED and row.error_class == statestore.OP_INTERRUPTED:
         return {"vm_outcome": "unknown", "note": "runner heartbeat lapsed; VM-side outcome is unknown"}
+    if row.status == statestore.OP_FAILED and row.error_class == statestore.OP_UNKNOWN:
+        return {"vm_outcome": "unknown",
+                "note": ("send committed; reply lost; outcome unknown; the "
+                         "identity stays protected until trusted reconciliation")}
+    if row.status == statestore.OP_CANCELLED and (
+        getattr(row, "send_state", "") or ""
+    ) == "possibly_sent":
+        return {"vm_outcome": "unknown",
+                "note": ("cancel honored after the send commit; VM-side "
+                         "outcome unknown; the send mark stays set")}
     return {}
 
 
@@ -289,13 +399,39 @@ def guard_consult(
     with store.transaction():
         existing = store.op_find_idem(agent, name, idem_key) if idem_key else None
         if existing is not None:
-            # Idempotency-window expiry (operations.idempotency_ttl_s): a
-            # working record older than the window cannot belong to any live
-            # caller — the creating request or runner is long gone — so it is
-            # retired (failed/interrupted semantics would be a lie; the row
-            # is simply forgotten) and the retry executes fresh.
+            # Idempotency-window expiry (operations.idempotency_ttl_s), with
+            # the issue #157 retention arms: a possibly_sent row is NEVER
+            # age-deleted (it is classified — the lost-reply unknown — and
+            # answered as a protected attach), and a row with a FRESH
+            # heartbeat is answered live regardless of age (a live handle is
+            # kept through completion "regardless of replay age"). Only a
+            # resolved row past the window is forgotten so the retry executes
+            # fresh — the documented window end.
             ttl = int(cfg.operations.idempotency_ttl_s or 86400)
-            if existing.created_at > 0 and existing.created_at < now - ttl:
+            heartbeat_fresh = (
+                existing.heartbeat_at > 0
+                and existing.heartbeat_at >= now - int(
+                    cfg.operations.heartbeat_ttl_s or 60
+                )
+            )
+            possibly_sent = (
+                getattr(existing, "send_state", "") or ""
+            ) == "possibly_sent"
+            if (
+                existing.created_at > 0
+                and existing.created_at < now - ttl
+                and not possibly_sent
+                and not heartbeat_fresh
+            ):
+                existing = _classify_stale(store, existing, cfg)
+                if existing.status == statestore.OP_WORKING:
+                    # Still working (a no-runner exempt row): fence it before
+                    # the replacement so the retired executor's late writes
+                    # become no-ops (issue #157 authority transfer).
+                    try:
+                        store.op_fence(existing.op_id)
+                    except Exception:
+                        pass
                 store.op_delete(existing.op_id)
                 emit(cfg, "op.expired", existing.op_id, "", agent,
                      {"reason": "idempotency_ttl_lapsed"}, store=store)
@@ -304,6 +440,34 @@ def guard_consult(
             existing = _classify_stale(store, existing, cfg)
             if existing.params_hmac and existing.params_hmac != fingerprint:
                 return _conflict_envelope(name, idem_key), None
+            if not existing.params_hmac and fingerprint:
+                # Issue #157 (C8b): a legacy row with a BLANK fingerprint and
+                # different arguments is protected reconciliation — a disclosed
+                # refusal naming the original handle, never a silent reattach,
+                # never a re-dispatch.
+                return errors.enrich_failure({
+                    "ok": False,
+                    "error": (
+                        f"idempotency_key {idem_key!r} matches a legacy record "
+                        f"(handle {existing.op_id}) whose argument fingerprint "
+                        f"predates fingerprinting; reconciliation is required "
+                        f"before reuse — re-run with a new idempotency_key"
+                    ),
+                    "error_class": "idempotency_conflict",
+                    "reconciliation": True,
+                    "op_id": existing.op_id,
+                }), None
+            if (
+                existing.status == statestore.OP_FAILED
+                and existing.error_class == statestore.OP_UNKNOWN
+            ):
+                # Protected recovery of an unresolved identity (issue #157):
+                # fence the lost executor before answering so its late writes
+                # cannot re-authorize (the replacement demonstrably fences).
+                try:
+                    store.op_fence(existing.op_id)
+                except Exception:
+                    pass
             return _replay_response(store, existing), None
         if detach:
             slots = runner_slots()
@@ -322,11 +486,38 @@ def guard_consult(
                 params_hmac=fingerprint,
                 idem_key=idem_key,
                 poll_interval_ms=2000,
+                generation=store.op_next_generation(),
             )
-            store.op_insert(row)
-            emit(cfg, "op.created", row.op_id, "", agent, {"tool": name, "detached": True})
-            _start_runner(cfg, row, dict(arguments), tool_fn, slots,
-                          journal_token=journal_token)
+            try:
+                store.op_insert(row)
+                emit(cfg, "op.created", row.op_id, "", agent,
+                     {"tool": name, "detached": True})
+                _start_runner(cfg, row, dict(arguments), tool_fn, slots,
+                              journal_token=journal_token)
+            except Exception:
+                # Issue #157 (C1/C10): the reservation is exception-safe — the
+                # slot is released exactly once, the stranded working row is
+                # removed (the transaction rolled the insert back on insert
+                # failure; a start failure deletes the inserted row), and the
+                # guard answers the classified refusal envelope instead of
+                # letting a raw store/transport exception escape.
+                slots.release()
+                try:
+                    store.op_delete(row.op_id)
+                except Exception:
+                    pass
+                env = errors.enrich_failure({
+                    "ok": False,
+                    "error": (
+                        f"{name}: the detached operation could not be recorded "
+                        f"or started; no dispatch authority was left behind — "
+                        f"retry after fixing the durable-state fault"
+                    ),
+                    "error_class": "transport",
+                })
+                env["retryable"] = True
+                env["retry_after_ms"] = errors.BUSY_RETRY_MS
+                return env, None
             return _handle_payload(row), None
         if idem_key:
             row = statestore.OpRow(
@@ -337,15 +528,24 @@ def guard_consult(
                 status=statestore.OP_WORKING,
                 created_at=now,
                 updated_at=now,
-                runner="",
+                # Issue #157 (C2): the inline route records a non-empty
+                # execution owner (the sync- prefix keeps the R6 staleness
+                # exemption for unmarked rows) and a minted generation.
+                runner="sync-" + secrets.token_hex(8),
                 heartbeat_at=now,
                 params_hmac=fingerprint,
                 idem_key=idem_key,
                 poll_interval_ms=2000,
+                generation=store.op_next_generation(),
             )
             store.op_insert(row)
             emit(cfg, "op.created", row.op_id, "", agent, {"tool": name, "detached": False})
-            return None, {"op_id": row.op_id, "cfg": cfg, "agent": agent}
+            return None, {
+                "op_id": row.op_id,
+                "cfg": cfg,
+                "agent": agent,
+                "generation": row.generation,
+            }
     return None, None
 
 
@@ -353,10 +553,33 @@ def _replay_response(store: statestore.Store, row: statestore.OpRow) -> dict[str
     """The stored result marked `replayed: true` — or, for an op still in
     flight, its live handle marked `replayed: true` (a non-detach retry of a
     detached op re-attaches instead of re-executing; terminal results are
-    retrieved through hyperv_op_result)."""
+    retrieved through hyperv_op_result).
+
+    Issue #157 branch ORDER: an unknown (lost-reply) row is answered with the
+    unknown disclosure FIRST — it is never mislabeled as an ordinary payload
+    expiry; a terminal row whose payload was pruned (identity tombstone) is
+    answered with the ORIGINAL handle plus the explicit result-expired
+    disclosure instead of a fresh dispatch."""
     if row.status == statestore.OP_WORKING:
         return {**_handle_payload(row), "replayed": True}
+    if row.error_class == statestore.OP_UNKNOWN:
+        payload = {
+            **_handle_payload(row),
+            "replayed": True,
+            "vm_outcome": "unknown",
+            "note": ("send committed; reply lost; outcome unknown; the identity "
+                     "stays protected until trusted reconciliation"),
+        }
+        return payload
     stored = row.result_json or ""
+    if not stored:
+        return {
+            **_handle_payload(row),
+            "replayed": True,
+            "result_expired": True,
+            "note": ("result payload pruned within the replay window; the "
+                     "original handle stays addressable"),
+        }
     try:
         payload = json.loads(stored)
         if not isinstance(payload, dict):
@@ -412,15 +635,22 @@ def complete_inline(op_ctx: dict[str, Any], result: Any) -> None:
     its op row. The transition also repairs a row that read-time staleness
     flipped to failed/interrupted mid-call (the finishing request is the
     proof the process lived). Best-effort: a store failure must not alter
-    the tool's outcome."""
+    the tool's outcome. Issue #157: the completion carries the captured
+    generation (a fenced executor's write is a no-op) and — because a
+    successful result is a definitive outcome — the COMPLETED move clears
+    send_state in the store."""
     try:
         cfg: Config = op_ctx["cfg"]
         agent = str(op_ctx.get("agent") or "")
+        generation = int(op_ctx.get("generation") or 0) or None
         store = store_for(cfg)
         text = _result_text(result)
         # Same classification rule as the detached path (review round-2 Q1):
         # a tool-level ok:false envelope is a FAILED op, not a completed one
-        # carrying a refusal.
+        # carrying a refusal. Issue #157: this is a DEFINITIVE outcome with
+        # its envelope in hand, so the failed move clears send_state via
+        # pre_body_terminal (the result proves what happened — this is not a
+        # post-send ambiguity).
         error_class = ""
         try:
             parsed = json.loads(text) if text.startswith("{") else None
@@ -434,7 +664,8 @@ def complete_inline(op_ctx: dict[str, Any], result: Any) -> None:
                 statestore.OP_FAILED,
                 error_class=error_class,
                 result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
-                updated_at=store.now(),
+                updated_at=store.now(), generation=generation,
+                pre_body_terminal=True,
             )
             emit(cfg, "op.failed", op_ctx["op_id"], "", agent,
                  {"error_class": error_class, "mode": "inline"})
@@ -443,7 +674,7 @@ def complete_inline(op_ctx: dict[str, Any], result: Any) -> None:
                 op_ctx["op_id"], (statestore.OP_WORKING, statestore.OP_FAILED),
                 statestore.OP_COMPLETED,
                 result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
-                updated_at=store.now(),
+                updated_at=store.now(), generation=generation,
             )
             emit(cfg, "op.completed", op_ctx["op_id"], "", agent, {"mode": "inline"})
     except Exception:
@@ -451,18 +682,40 @@ def complete_inline(op_ctx: dict[str, Any], result: Any) -> None:
 
 
 def fail_inline(op_ctx: dict[str, Any], exc: BaseException) -> None:
+    """Issue #157: the failing arm's outcome carries its send-state
+    provenance. A raise BEFORE the body started (send_state still empty) is
+    the definitive pre-send refusal — it clears the mark. A raise AFTER the
+    pre-send commit (send_state == possibly_sent) is a post-send ambiguity
+    even though errors.envelope serializes a result payload — the row keeps
+    its mark and carries error_class unknown, staying a protected attachable
+    identity."""
     try:
         cfg: Config = op_ctx["cfg"]
         agent = str(op_ctx.get("agent") or "")
+        generation = int(op_ctx.get("generation") or 0) or None
         store = store_for(cfg)
+        row = store.op_get(op_ctx["op_id"])
+        post_send = bool(
+            row is not None and (getattr(row, "send_state", "") or "") == "possibly_sent"
+        )
         env = errors.envelope(exc)
+        if post_send:
+            env["vm_outcome"] = "unknown"
+            env["note"] = (
+                "send committed before the failure; outcome unknown; the "
+                "identity stays protected until trusted reconciliation"
+            )
+            error_class = statestore.OP_UNKNOWN
+        else:
+            error_class = str(env.get("error_class") or "transport")
         text = json.dumps(env, separators=(",", ":"))
         store.op_transition(
             op_ctx["op_id"], (statestore.OP_WORKING, statestore.OP_FAILED),
             statestore.OP_FAILED,
-            error_class=str(env.get("error_class") or "transport"),
+            error_class=error_class,
             result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
-            updated_at=store.now(),
+            updated_at=store.now(), generation=generation,
+            pre_body_terminal=not post_send,
         )
         emit(cfg, "op.failed", op_ctx["op_id"], "", agent,
              {"error_class": env.get("error_class")})
@@ -555,6 +808,7 @@ def _start_runner(
     body_args = {k: v for k, v in arguments.items() if k not in ("detach", "idempotency_key")}
     presented = ""
     agent = row.agent
+    generation = int(getattr(row, "generation", 0) or 0)
     try:
         presented = leases.presented_lease_id()
     except Exception:
@@ -563,7 +817,7 @@ def _start_runner(
         target=_run_detached,
         args=(captured, cfg, store if store is not None else store_for(cfg),
               row.op_id, row.tool, tool_fn, body_args, agent, presented,
-              runner_slots, journal_token),
+              runner_slots, journal_token, generation),
         name=f"hyperv-op-{row.op_id[:8]}",
         daemon=True,
     )
@@ -596,6 +850,7 @@ def _run_detached(
     presented_lease: str,
     runner_slots: threading.BoundedSemaphore,
     journal_token: Any = None,
+    generation: int = 0,
 ) -> None:
     # `store` is BOUND AT DETACH TIME on purpose: a runner that outlives its
     # caller (its test's seam rebinds, its process restarts against the same
@@ -606,7 +861,7 @@ def _run_detached(
 
     def _beat() -> None:
         try:
-            store.op_heartbeat(op_id, store.now())
+            store.op_heartbeat(op_id, store.now(), generation=generation or None)
             if presented_lease:
                 try:
                     leases.renew(cfg, presented_lease, agent or None)
@@ -625,7 +880,7 @@ def _run_detached(
     try:
         captured.run(
             _execute_body, cfg, op_id, tool_name, tool_fn, body_args, agent,
-            store, stop, journal_token,
+            store, stop, journal_token, generation,
         )
     finally:
         stop.set()
@@ -641,16 +896,21 @@ def _run_detached(
 def _safe_transition(
     store: statestore.Store, op_id: str, to_status: str, agent: str, cfg: Config,
     kind: str, *, error_class: str = "", result_json: str | None = None,
-    result_size: int = 0,
+    result_size: int = 0, generation: int | None = None,
+    pre_body_terminal: bool = False,
 ) -> None:
     """One terminal transition + its event, swallowed when the bound store is
     closed (a runner that outlived its caller) — never resurrects a row that
-    recovery already failed, and never raises into the runner's epilogue."""
+    recovery already failed, and never raises into the runner's epilogue.
+    Issue #157: the captured generation and the pre-body provenance flag ride
+    through to the store (a fenced executor's write is a no-op; a provably
+    pre-body terminal clears the send mark)."""
     try:
         moved = store.op_transition(
             op_id, (statestore.OP_WORKING,), to_status,
             error_class=error_class, result_json=result_json,
             result_size=result_size, updated_at=store.now(),
+            generation=generation, pre_body_terminal=pre_body_terminal,
         )
         if moved:
             emit(cfg, kind, op_id, "", agent,
@@ -669,13 +929,26 @@ def _execute_body(
     store: statestore.Store,
     stop: threading.Event,
     journal_token: Any = None,
+    generation: int = 0,
 ) -> None:
     """Runs inside the copied context: sets the cancel-hook ContextVars,
     admits the call through the classed-admission core (issue #68
     supplement — the runner-side twin of the request-loop guard), then
-    drives the body and the terminal transition."""
+    drives the body and the terminal transition.
+
+    Issue #157: the captured generation rides this whole run (immutable —
+    never re-read from a fenced row); the per-resource send gate serializes
+    provider submissions for this VM outside the replaceable worker, and the
+    attempt-level pre-send commit (commit_send_intent) lands under that gate
+    BEFORE tool_fn. The pre-body arms (admission busy / stop-valve /
+    park-window cancellations) are PROVABLY pre-send: their transitions pass
+    pre_body_terminal=True (clearing an inherited mark). Every in-body
+    terminal — any exception, cancellation included once the body started —
+    is post-send provenance and retains the mark (mapped to OP_UNKNOWN when
+    the row was marked)."""
     _current_op_id.set(op_id)
     _current_ops_cfg.set(cfg)
+    _current_op_generation.set(int(generation or 0))
     # Issue #68 supplement (workstream C): the detached/task runner
     # admits BEFORE tool_fn via the same fair/reserve core the guard
     # uses, driven synchronously on the runner thread (per-tick
@@ -713,9 +986,10 @@ def _execute_body(
         except admission.AdmissionStopped:
             # The stop valve fired mid-park (a cancel of the parked op, or
             # runner teardown): the waiter reclaimed every stage, so the op
-            # closes as cancelled.
+            # closes as cancelled. Provably pre-body (issue #157): the
+            # transition clears any inherited send mark.
             _safe_transition(store, op_id, statestore.OP_CANCELLED, agent, cfg,
-                             "op.cancelled")
+                             "op.cancelled", pre_body_terminal=True)
             return
         finally:
             # The PARK-WINDOW pop (review round 5) + the ATOMIC stop
@@ -744,11 +1018,53 @@ def _execute_body(
             # A cancel signalled inside the grant-to-pop window: the ticket
             # was granted but never used — release it (the retire path
             # reclaims the permit) and close the op with the AdmissionStopped
-            # terminal, exactly as a stop observed mid-park would.
+            # terminal, exactly as a stop observed mid-park would. Provably
+            # pre-body (issue #157): the mark clears.
             admission.release_sync(ticket)
             _safe_transition(store, op_id, statestore.OP_CANCELLED, agent, cfg,
-                             "op.cancelled")
+                             "op.cancelled", pre_body_terminal=True)
             return
+        # Issue #157: the send gate serializes the per-resource PRE-SEND
+        # COMMIT window outside this replaceable worker (route-layer owned;
+        # the canonical order is gate -> commit -> submission; the VM write /
+        # read locks already serialize the submissions themselves). The gate
+        # covers the commit only, NOT the whole body: a body legitimately runs
+        # for minutes, and holding a per-VM lock for its whole lifetime would
+        # wedge every queued same-VM attempt behind it (found by the e03
+        # interceptor schedules — a parked body deadlocked later borrows; a
+        # disclosed deviation from the plan's whole-body hold that preserves
+        # every gate property the plan required). A runner thread acquires
+        # blocking; the async inline route acquires non-blocking (server.py).
+        gate_held = _send_gate_acquire(body_args)
+        try:
+            if not gate_held:
+                env = _busy_envelope(tool_name)
+                text = json.dumps(env, separators=(",", ":"), default=str)
+                _safe_transition(
+                    store, op_id, statestore.OP_FAILED, agent, cfg, "op.busy",
+                    error_class="busy",
+                    result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
+                    pre_body_terminal=True,
+                )
+                return
+            try:
+                # Attempt-level pre-send commit: mark only. The dirty-epoch
+                # bump is the restore boundary's commit (lifecycle passes the
+                # vm_key); a generic body must never dirty an epoch.
+                commit_send_intent(cfg)
+            except Exception as exc:
+                env = errors.envelope(exc)
+                text = json.dumps(env, separators=(",", ":"), default=str)
+                _safe_transition(
+                    store, op_id, statestore.OP_FAILED, agent, cfg, "op.failed",
+                    error_class=str(env.get("error_class") or "transport"),
+                    result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
+                    pre_body_terminal=True,
+                )
+                return
+        finally:
+            if gate_held:
+                _send_gate_release(body_args)
         try:
             evidencejournal.arm(journal_token)
             result = tool_fn(**body_args)
@@ -768,26 +1084,73 @@ def _execute_body(
         except ValueError:
             parsed = None
         if error_class:
+            # A tool-level ok:false envelope is a DEFINITIVE outcome with its
+            # envelope in hand (issue #157): the failed move clears the send
+            # mark (pre_body_terminal — the result proves what happened).
             _safe_transition(
                 store, op_id, statestore.OP_FAILED, agent, cfg, "op.failed",
                 error_class=error_class,
                 result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
+                generation=generation or None, pre_body_terminal=True,
             )
         else:
             _safe_transition(
                 store, op_id, statestore.OP_COMPLETED, agent, cfg, "op.completed",
                 result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
+                generation=generation or None,
             )
     except OperationCancelled:
-        _safe_transition(store, op_id, statestore.OP_CANCELLED, agent, cfg,
-                         "op.cancelled")
+        # Issue #157: the cooperative cancel is honored by a LIVE runner — the
+        # attempt terminal is definitively `cancelled` even when the send
+        # commit already landed (the plan's acknowledgment rule: post-send
+        # cancellation retains possibly_sent, so the row stays protected; the
+        # views disclose the uncertain VM-side outcome via _stale_view).
+        # Status stays cancelled on both arms; only the mark's fate differs.
+        row = None
+        try:
+            row = store.op_get(op_id)
+        except Exception:
+            pass
+        post_send = bool(
+            row is not None and (getattr(row, "send_state", "") or "") == "possibly_sent"
+        )
+        _safe_transition(
+            store, op_id, statestore.OP_CANCELLED,
+            agent, cfg, "op.cancelled",
+            generation=generation or None,
+        )
+        if post_send:
+            emit(cfg, "op.cancelled", op_id, "", agent,
+                 {"vm_outcome": "unknown",
+                  "note": "cancel honored after the send commit; VM-side outcome unknown"})
     except BaseException as exc:  # noqa: BLE001 — the runner classifies everything
+        # Issue #157 (round-5 blocker 2): provenance is the execution phase,
+        # not the error_class string — a raise AFTER the pre-send commit is a
+        # post-send ambiguity even though errors.envelope serializes a result
+        # payload; the row keeps its mark and carries error_class unknown.
+        marked = False
+        try:
+            row = store.op_get(op_id)
+            marked = bool(
+                row is not None
+                and (getattr(row, "send_state", "") or "") == "possibly_sent"
+            )
+        except Exception:
+            pass
         env = errors.envelope(exc)
+        if marked:
+            env["vm_outcome"] = "unknown"
+            env["note"] = (
+                "send committed before the failure; outcome unknown; the "
+                "identity stays protected until trusted reconciliation"
+            )
         text = json.dumps(env, separators=(",", ":"), default=str)
         _safe_transition(
             store, op_id, statestore.OP_FAILED, agent, cfg, "op.failed",
-            error_class=str(env.get("error_class") or "transport"),
+            error_class=statestore.OP_UNKNOWN if marked else str(
+                env.get("error_class") or "transport"),
             result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
+            generation=generation or None,
         )
     finally:
         # issue #131 (PC4-1): every runner terminal outcome that skipped
@@ -1168,21 +1531,12 @@ def tasks_extension(
                     _penv = errors.envelope(exc)
                     evidencejournal.finish(jtok, _penv, outcome="refusal")
                     return errors.failure_result(_penv)
-            # Runner admission (R4): symmetric with the guard path - excess
-            # detached calls are refused retryable-busy, never queued.
-            try:
-                slots = runner_slots()
-                if not slots.acquire(blocking=False):
-                    _benv = _busy_envelope(params.name)
-                    evidencejournal.finish(jtok, _benv, outcome="busy")
-                    return errors.failure_result(_benv)
-            except Exception:
-                # issue #152 review F-003 (round-3/4): a raise from the slot
-                # factory OR the acquire itself is still a pre-handoff
-                # failure; resolve the token like the gate path does.
-                evidencejournal.finish_if_unowned(jtok, None, outcome="error")
-                raise
-            released = False
+            # Issue #157 (plan round-2 blocker 6): the idempotency consult is
+            # answered BEFORE the runner-slot acquisition on the tasks route
+            # too — a reattach/conflict/reconciliation response never consumes
+            # capacity. Reservation + fresh-row creation stays atomic for NEW
+            # dispatch (the consult below and the insert share one
+            # transaction; the slot is taken only on the fresh-dispatch arm).
             try:
                 agent = auditlog.current_agent_id() or ""
                 store = store_for(cfg)
@@ -1191,17 +1545,37 @@ def tasks_extension(
                 fingerprint = (
                     arguments_fingerprint(cfg, store, arguments) if idem_key else ""
                 )
-                # Idempotency consult + insert in one transaction (R5): a
-                # keyed retry re-attaches to the live task instead of
-                # re-executing the mutation.
                 with store.transaction():
                     existing = (
                         store.op_find_idem(agent, params.name, idem_key)
                         if idem_key else None
                     )
+                    consult_answer: Any = None
+                    consult_op_id = ""
                     if existing is not None:
+                        consult_op_id = existing.op_id
                         ttl = int(cfg.operations.idempotency_ttl_s or 86400)
-                        if existing.created_at > 0 and existing.created_at < now - ttl:
+                        heartbeat_fresh = (
+                            existing.heartbeat_at > 0
+                            and existing.heartbeat_at >= now - int(
+                                cfg.operations.heartbeat_ttl_s or 60
+                            )
+                        )
+                        possibly_sent = (
+                            getattr(existing, "send_state", "") or ""
+                        ) == "possibly_sent"
+                        if (
+                            existing.created_at > 0
+                            and existing.created_at < now - ttl
+                            and not possibly_sent
+                            and not heartbeat_fresh
+                        ):
+                            existing = _classify_stale(store, existing, cfg)
+                            if existing.status == statestore.OP_WORKING:
+                                try:
+                                    store.op_fence(existing.op_id)
+                                except Exception:
+                                    pass
                             store.op_delete(existing.op_id)
                             emit(cfg, "op.expired", existing.op_id, "", agent,
                                  {"reason": "idempotency_ttl_lapsed"}, store=store)
@@ -1209,50 +1583,115 @@ def tasks_extension(
                     if existing is not None:
                         existing = _classify_stale(store, existing, cfg)
                         if existing.params_hmac and existing.params_hmac != fingerprint:
-                            # Release the admission slot BEFORE the refusal:
-                            # the conflict path starts no runner, and a leaked
-                            # permit erodes BOTH routes forever (review F1).
-                            slots.release()
-                            released = True
-                            _cenv = _conflict_envelope(params.name, idem_key)
-                            evidencejournal.finish(jtok, _cenv,
-                                                   outcome="conflict")
-                            return errors.failure_result(_cenv)
-                        slots.release()
-                        released = True
-                        evidencejournal.finish(
-                            jtok,
-                            {"task_id": existing.op_id,
-                             "status": existing.status,
-                             "replayed": True},
-                            outcome="reattach")
-                        return TaskHandleResult(
-                            task_id=existing.op_id,
-                            status=existing.status,
-                            ttl_ms=int(cfg.operations.retention_s) * 1000,
-                            poll_interval_ms=existing.poll_interval_ms,
-                        )
-                    row = statestore.OpRow(
-                        op_id=secrets.token_urlsafe(16),
-                        tool=params.name,
-                        agent=agent,
-                        vm_name=str(arguments.get("vm_name") or ""),
-                        status=statestore.OP_WORKING,
-                        created_at=now,
-                        updated_at=now,
-                        runner=secrets.token_hex(8),
-                        heartbeat_at=now,
-                        params_hmac=fingerprint,
-                        idem_key=idem_key,
-                        poll_interval_ms=2000,
-                    )
-                    # Durable creation BEFORE the response (SEP-2663: MUST NOT
-                    # return CreateTaskResult until the task is durably created).
+                            consult_answer = errors.failure_result(
+                                _conflict_envelope(params.name, idem_key))
+                        elif not existing.params_hmac and fingerprint:
+                            consult_answer = errors.failure_result(
+                                errors.enrich_failure({
+                                    "ok": False,
+                                    "error": (
+                                        f"idempotency_key {idem_key!r} matches a "
+                                        f"legacy record (handle {existing.op_id}) "
+                                        f"whose argument fingerprint predates "
+                                        f"fingerprinting; reconciliation is "
+                                        f"required before reuse — re-run with a "
+                                        f"new idempotency_key"
+                                    ),
+                                    "error_class": "idempotency_conflict",
+                                    "reconciliation": True,
+                                    "op_id": existing.op_id,
+                                }))
+                        else:
+                            if (
+                                existing.status == statestore.OP_FAILED
+                                and existing.error_class == statestore.OP_UNKNOWN
+                            ):
+                                try:
+                                    store.op_fence(existing.op_id)
+                                except Exception:
+                                    pass
+                            consult_answer = TaskHandleResult(
+                                task_id=existing.op_id,
+                                status=existing.status,
+                                ttl_ms=int(cfg.operations.retention_s) * 1000,
+                                poll_interval_ms=existing.poll_interval_ms,
+                            )
+                    if consult_answer is not None:
+                        evidencejournal.finish(jtok,
+                                               {"task_id": consult_op_id,
+                                                "consulted": True},
+                                               outcome="reattach")
+                        return consult_answer
+                # Fresh dispatch: NOW take the runner slot (R4), then insert.
+                slots = runner_slots()
+                if not slots.acquire(blocking=False):
+                    _benv = _busy_envelope(params.name)
+                    evidencejournal.finish(jtok, _benv, outcome="busy")
+                    return errors.failure_result(_benv)
+                row = statestore.OpRow(
+                    op_id=secrets.token_urlsafe(16),
+                    tool=params.name,
+                    agent=agent,
+                    vm_name=str(arguments.get("vm_name") or ""),
+                    status=statestore.OP_WORKING,
+                    created_at=now,
+                    updated_at=now,
+                    runner=secrets.token_hex(8),
+                    heartbeat_at=now,
+                    params_hmac=fingerprint,
+                    idem_key=idem_key,
+                    poll_interval_ms=2000,
+                    generation=store.op_next_generation(),
+                )
+                # Durable creation BEFORE the response (SEP-2663: MUST NOT
+                # return CreateTaskResult until the task is durably created).
+                try:
                     store.op_insert(row)
+                except Exception:
+                    # Issue #157 (C1's tasks twin): a failed insert releases
+                    # the slot exactly once; the transaction rolled back.
+                    slots.release()
+                    evidencejournal.finish_if_unowned(jtok, None, outcome="error")
+                    env = errors.enrich_failure({
+                        "ok": False,
+                        "error": (
+                            f"{params.name}: the detached operation could not "
+                            f"be recorded; no dispatch authority was left "
+                            f"behind — retry after fixing the durable-state fault"
+                        ),
+                        "error_class": "transport",
+                    })
+                    env["retryable"] = True
+                    env["retry_after_ms"] = errors.BUSY_RETRY_MS
+                    return errors.failure_result(env)
                 emit(cfg, "op.created", row.op_id, "", agent,
                      {"tool": params.name, "detached": True, "tasks": True})
-                _start_runner(cfg, row, arguments, tool_fn_resolver(params.name),
-                              slots, journal_token=jtok)
+                try:
+                    _start_runner(cfg, row, arguments, tool_fn_resolver(params.name),
+                                  slots, journal_token=jtok)
+                except Exception:
+                    # Issue #157 (C1's tasks twin): a failed start releases the
+                    # slot exactly once, removes the stranded row, and answers
+                    # the classified refusal envelope — never a leaked permit
+                    # or a raw escape.
+                    slots.release()
+                    try:
+                        store.op_delete(row.op_id)
+                    except Exception:
+                        pass
+                    evidencejournal.finish_if_unowned(jtok, None, outcome="error")
+                    env = errors.enrich_failure({
+                        "ok": False,
+                        "error": (
+                            f"{params.name}: the detached operation could not "
+                            f"be started; no dispatch authority was left "
+                            f"behind — retry after fixing the fault"
+                        ),
+                        "error_class": "transport",
+                    })
+                    env["retryable"] = True
+                    env["retry_after_ms"] = errors.BUSY_RETRY_MS
+                    return errors.failure_result(env)
                 return TaskHandleResult(
                     task_id=row.op_id,
                     status=statestore.OP_WORKING,
@@ -1260,11 +1699,6 @@ def tasks_extension(
                     poll_interval_ms=row.poll_interval_ms,
                 )
             except Exception:
-                if not released:
-                    try:
-                        slots.release()
-                    except ValueError:
-                        pass
                 # issue #152 review F-003: a pre-handoff failure must resolve
                 # the journal token or stop_run wedges on journal_drain_timeout
                 # forever (the runner never owned it, nothing else finalizes).

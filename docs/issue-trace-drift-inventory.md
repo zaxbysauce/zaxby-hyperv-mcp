@@ -15,14 +15,15 @@ reported below (issue #143).
 | 115-86-71-60-collated | 9 | 9 | 0 | clean |
 | 12-remote-hyperv-host | 7 | 7 | 0 | clean |
 | 125-126-console-accuracy-commit-guard | 11 | 11 | 0 | clean |
-| 128-129-134-gui-drivability | 20 | 20 | 0 | clean |
+| 128-129-134-gui-drivability | 20 | 13 | 7 | exit 1 |
 | 13-stdio-proxy | 10 | 10 | 0 | clean |
 | 135-127-138-gui-electron-drivability | 53 | 53 | 0 | clean |
-| 136-137-uia-element-contract | 27 | 27 | 0 | clean |
+| 136-137-uia-element-contract | 27 | 25 | 2 | exit 1 |
 | 140-126-uia-state-receipt | 44 | 44 | 0 | clean |
 | 143-130-collated | 12 | 12 | 0 | clean |
 | 147-trace-drift-repair | 4 | 4 | 0 | clean |
-| 148-151-153-followup-hygiene-triad | 26 | 26 | 0 | clean |
+| 148-151-153-followup-hygiene-triad | 26 | 23 | 3 | exit 1 |
+| 157-158-durable-identity-repair-outcomes | 36 | 36 | 0 | clean |
 | 163-156-followup-pair | 11 | 11 | 0 | clean |
 | 17-rgb565-native-decode | 12 | 12 | 0 | clean |
 | 18-console-one-ps-process-per-call | 17 | 17 | 0 | clean |
@@ -31,11 +32,11 @@ reported below (issue #143).
 | 21-psdirect-session-reuse | 31 | 31 | 0 | clean |
 | 22-durable-state-store | 15 | 15 | 0 | clean |
 | 23-leases-with-fencing-tokens | 16 | 16 | 0 | clean |
-| 24-durable-operation-handles | 19 | 19 | 0 | clean |
+| 24-durable-operation-handles | 19 | 8 | 11 | exit 1 |
 | 25-f1-console-keyboard-click-origin | 11 | 11 | 0 | clean |
 | 26-checkpoint-type-standard | 11 | 11 | 0 | clean |
 | 27-frame-stable-wait | 14 | 14 | 0 | clean |
-| 29-uia-helper-element-desktop | 19 | 19 | 0 | clean |
+| 29-uia-helper-element-desktop | 19 | 18 | 1 | exit 1 |
 | 30-per-vm-credential-profiles | 30 | 30 | 0 | clean |
 | 31-32-33-94-workstream-g-deployment | 18 | 18 | 0 | clean |
 | 31-79-live-host-confirmation | 7 | 7 | 0 | clean |
@@ -43,13 +44,13 @@ reported below (issue #143).
 | 45-console-direct-wmi | 8 | 8 | 0 | clean |
 | 5-ps51-sanitized-env | 8 | 8 | 0 | clean |
 | 55-108-31-32-33-collated | 14 | 14 | 0 | clean |
-| 59-64-68-70-hardening-wave | 15 | 15 | 0 | clean |
+| 59-64-68-70-hardening-wave | 15 | 13 | 2 | exit 1 |
 | 6-guest-put-get-policy | 13 | 13 | 0 | clean |
 | 63-66-119-collated | 12 | 12 | 0 | clean |
 | 64-68-collated | 11 | 11 | 0 | clean |
 | 67-118-release-vendor-provenance | 10 | 10 | 0 | clean |
 | 7-guest-jobs-truthful-reporting | 13 | 13 | 0 | clean |
-| 74-72-88-cost-latency-accounting | 17 | 17 | 0 | clean |
+| 74-72-88-cost-latency-accounting | 17 | 15 | 2 | exit 1 |
 | 75-76-78-81-83-84-collated | 26 | 26 | 0 | clean |
 | 77-28-console-actor-batched-sequences | 18 | 18 | 0 | clean |
 | 8-vm-guid-identity | 11 | 11 | 0 | clean |
@@ -58,7 +59,7 @@ reported below (issue #143).
 | gpt6sol-guest-access-tools | 22 | 22 | 0 | clean |
 | issue-14-vm-rw-locks | 11 | 11 | 0 | clean |
 | issue-15-ps-cap-cancel | 9 | 9 | 0 | clean |
-| issue-16-tool-concurrency | 13 | 13 | 0 | clean |
+| issue-16-tool-concurrency | 13 | 10 | 3 | exit 1 |
 
 ## Self-referential pairs (excluded from the gate, issue #143)
 
@@ -74,7 +75,61 @@ wave's bookkeeping and is never a gate failure.
 
 ## Drift detail (CHANGED pairs)
 
-None — every gate-relevant frozen pair verifies OK at the current tree.
+### 128-129-134-gui-drivability (exit 1)
+
+- `CHANGED tests/unit/test_gui_playbook_prompt.py 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 e6dedcfd15057c9c6127b7af9e1b849b27a20d70 (C09)`
+- `CHANGED tests/unit/test_gui_playbook_prompt.py 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 e6dedcfd15057c9c6127b7af9e1b849b27a20d70 (C10)`
+- `CHANGED tests/unit/test_gui_playbook_prompt.py 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 e6dedcfd15057c9c6127b7af9e1b849b27a20d70 (C11)`
+- `CHANGED tests/unit/test_gui_playbook_prompt.py 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 e6dedcfd15057c9c6127b7af9e1b849b27a20d70 (C12)`
+- `CHANGED tests/unit/test_gui_playbook_prompt.py 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 e6dedcfd15057c9c6127b7af9e1b849b27a20d70 (C13)`
+- `CHANGED tests/unit/test_gui_playbook_prompt.py 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 e6dedcfd15057c9c6127b7af9e1b849b27a20d70 (C17)`
+- `CHANGED tests/unit/test_gui_playbook_prompt.py 9f880221c98ff1f422dcde4fd3379b4e2dcf0771 e6dedcfd15057c9c6127b7af9e1b849b27a20d70 (C21)`
+
+### 136-137-uia-element-contract (exit 1)
+
+- `CHANGED tests/unit/test_script_parse_new.py ef461e34a7f222677c3a9585367b03692e5de057 34c1022a28191d241e55a32adf5bdb2b045778fe (C7)`
+- `CHANGED tests/unit/test_script_parse_new.py ef461e34a7f222677c3a9585367b03692e5de057 34c1022a28191d241e55a32adf5bdb2b045778fe (C23)`
+
+### 148-151-153-followup-hygiene-triad (exit 1)
+
+- `CHANGED tests/unit/test_relay_kind_persistence.py b1f71567350ad8cf9e2cd6a79d632f0de2e509e9 7a0d3746f091890a8aecd17fdbfbc1d3fefefdf6 (C1)`
+- `CHANGED tests/unit/test_relay_kind_persistence.py b1f71567350ad8cf9e2cd6a79d632f0de2e509e9 7a0d3746f091890a8aecd17fdbfbc1d3fefefdf6 (C2)`
+- `CHANGED tests/unit/test_relay_kind_persistence.py b1f71567350ad8cf9e2cd6a79d632f0de2e509e9 7a0d3746f091890a8aecd17fdbfbc1d3fefefdf6 (C3)`
+
+### 24-durable-operation-handles (exit 1)
+
+- `CHANGED tests/unit/test_e03_operation_store.py 6d4e0a332455c6eddc5628ed551f0b8510bf5159 3028f518d475de94883e9176f9f9fb7b673899ee (C5)`
+- `CHANGED tests/unit/test_e03_operation_store.py 6d4e0a332455c6eddc5628ed551f0b8510bf5159 3028f518d475de94883e9176f9f9fb7b673899ee (C6)`
+- `CHANGED tests/unit/test_e03_operation_store.py 6d4e0a332455c6eddc5628ed551f0b8510bf5159 3028f518d475de94883e9176f9f9fb7b673899ee (C7)`
+- `CHANGED tests/unit/test_e03_operation_store.py 6d4e0a332455c6eddc5628ed551f0b8510bf5159 3028f518d475de94883e9176f9f9fb7b673899ee (C8)`
+- `CHANGED tests/unit/test_e03_operation_store.py 6d4e0a332455c6eddc5628ed551f0b8510bf5159 3028f518d475de94883e9176f9f9fb7b673899ee (C10)`
+- `CHANGED tests/unit/test_e03_operation_store.py 6d4e0a332455c6eddc5628ed551f0b8510bf5159 3028f518d475de94883e9176f9f9fb7b673899ee (C11)`
+- `CHANGED tests/unit/test_e03_operation_store.py 6d4e0a332455c6eddc5628ed551f0b8510bf5159 3028f518d475de94883e9176f9f9fb7b673899ee (C9)`
+- `CHANGED tests/unit/test_e03_tasks_bridge.py 037c9831e450ce46bb847b4b405b8c2f6dd696e9 7809823ac04556cb023bae1a30fcaebe6cf36f32 (C12)`
+- `CHANGED tests/unit/test_e03_tasks_bridge.py 037c9831e450ce46bb847b4b405b8c2f6dd696e9 7809823ac04556cb023bae1a30fcaebe6cf36f32 (C13)`
+- `CHANGED tests/unit/test_e03_tasks_bridge.py 037c9831e450ce46bb847b4b405b8c2f6dd696e9 7809823ac04556cb023bae1a30fcaebe6cf36f32 (C14)`
+- `CHANGED tests/unit/test_e03_tasks_bridge.py 037c9831e450ce46bb847b4b405b8c2f6dd696e9 7809823ac04556cb023bae1a30fcaebe6cf36f32 (C15)`
+
+### 29-uia-helper-element-desktop (exit 1)
+
+- `CHANGED tests/unit/test_script_parse_new.py ef461e34a7f222677c3a9585367b03692e5de057 34c1022a28191d241e55a32adf5bdb2b045778fe (C13)`
+
+### 59-64-68-70-hardening-wave (exit 1)
+
+- `CHANGED tests/unit/test_c01_locks_wiring.py c6a578399a45683e0c7faa6c151b14708297314e 8ab7e3ffa567cf9ccb960cda92e982e98425119b (C02)`
+- `CHANGED tests/unit/test_c01_locks_wiring.py c6a578399a45683e0c7faa6c151b14708297314e 8ab7e3ffa567cf9ccb960cda92e982e98425119b (C03)`
+
+### 74-72-88-cost-latency-accounting (exit 1)
+
+- `CHANGED src/hyperv_mcp/server.py c26d7ea1d88746e7cb2c01728765758a78ce7611 1ef95c7bcb99e8c551545fb30bc83b2511690d28 (C10)`
+- `CHANGED README.md e1a9e82e76cba7423e66bea0c2e2fa04c23270ca f6566334d4ac9242f9d7a6800d6b3e9c1cfa4011 (C10)`
+
+### issue-16-tool-concurrency (exit 1)
+
+- `CHANGED tests/unit/test_c03_sdk_port.py 6f4304b397f2ae04aba3290091d7d99854180d94 d7ea6ae6262a26711c6da6a94dc3fd2a5af98bbc (C7)`
+- `CHANGED tests/unit/test_c03_sdk_port.py 6f4304b397f2ae04aba3290091d7d99854180d94 d7ea6ae6262a26711c6da6a94dc3fd2a5af98bbc (C8)`
+- `CHANGED tests/unit/test_c03_sdk_port.py 6f4304b397f2ae04aba3290091d7d99854180d94 d7ea6ae6262a26711c6da6a94dc3fd2a5af98bbc (C9)`
+
 <!-- regenerated-state-end -->
 
 ## Discovery snapshot (recorded 2026-11-05, base 8bc60cb7196ae128231c25a15881cded26b0afda)
