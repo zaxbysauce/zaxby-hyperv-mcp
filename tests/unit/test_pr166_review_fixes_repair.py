@@ -600,3 +600,79 @@ def test_fb008_distinct_addresses_still_work(tmp_path):
     assert lines == ["ListenAddress 10.0.0.5", "ListenAddress 10.0.0.6"], lines
     payload = json.loads((proc.stdout or "").strip().splitlines()[-1])
     assert payload["replaced"] == 2, payload
+
+
+# ---------------------------------------------------------------------------
+# Wave 4 — FB-007's readback-fields gate in ISOLATION
+# ---------------------------------------------------------------------------
+
+
+def _guest_without_readback_fields(**kw):
+    """A POSITIVE-observation guest whose ssh section lacks the rewrite
+    readback fields (config_listen / listeners absent, not errored) — the
+    sibling absent-section guard in _verify_observation must NOT fire, so
+    only the readback-fields gate can protect."""
+    guest = _guest(**kw)
+    guest["ssh"].pop("config_listen")
+    guest["ssh"].pop("listeners")
+    return guest
+
+
+@pytest.mark.parametrize("with_requested", [True, False])
+def test_fb007_readback_fields_gate_alone(with_requested):
+    """FB-007 wave 4 (b), unit level: a POSITIVE observation whose rewrite
+    readback fields are ABSENT must yield postcondition 'unknown' — the
+    readback can neither satisfy nor refute. The shipped blank-readback pin
+    is also caught by the sibling absent-section guard in _verify_observation,
+    so it does not isolate this gate; this pin does (premise asserted: the
+    observation IS positive). RED under the readback-fields-only mutation;
+    GREEN at head."""
+    report = {"ps_direct": {"available": True},
+              "guest": _guest_without_readback_fields()}
+    assert repair._verify_observation(report) == "positive", (
+        "wave-4 premise: the sibling guard (_verify_observation) must NOT "
+        "fire here, so only the readback-fields gate can protect"
+    )
+    item = {"action": "rewrite_stale_ssh_bindings",
+            "verify_finding": "ssh_stale_binding"}
+    if with_requested:
+        item["intended_bindings"] = ["10.0.0.5"]
+    change = {"applied": True, "verify_detail": ""}
+    repair._evaluate_change(item, change, report, "positive", set())
+    assert change["postcondition"] == "unknown", (
+        f"FB-007 (wave 4): without usable rewrite readback fields the "
+        f"postcondition must be 'unknown' (the readback can neither satisfy "
+        f"nor refute); got {change!r}"
+    )
+    assert change["verified"] is False, change
+
+
+def test_fb007_readback_fields_gate_alone_end_to_end(monkeypatch):
+    """FB-007 wave 4 (b), end to end: a real apply receipt, then a verify
+    leg whose ssh section carries no config_listen / listeners (all probe
+    sections present and clean — a positive observation). The change record
+    must answer postcondition 'unknown', never a verdict from an empty
+    readback. RED under the readback-fields-only mutation; GREEN at head."""
+    cfg = Config(unrestricted=True)
+    fake = FakePS([
+        _guid_result(),
+        _ok(_host()), _ok(_stale_guest()),
+        _ok({"backup": "C:/wave4.bak", "replaced": 1}),
+        _ok(_host()), _ok(_guest_without_readback_fields()),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = repair.repair_guest_access(
+        cfg, "test-vm", apply=True, confirm=True, cred=CRED,
+        intended_bindings=["10.0.0.5"],
+    )
+    change = _rewrite_change(out)
+    assert change["apply_outcome"] == "applied", change
+    assert change["observation"] == "positive", (
+        f"wave-4 premise (the verify leg's sections are all present and "
+        f"clean): got {change!r}"
+    )
+    assert change["postcondition"] == "unknown", (
+        f"FB-007 (wave 4): a readback without the rewrite fields must yield "
+        f"'unknown'; got {change!r}"
+    )
+    assert change["verified"] is False, change

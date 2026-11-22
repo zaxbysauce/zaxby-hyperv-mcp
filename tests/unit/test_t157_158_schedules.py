@@ -1557,7 +1557,11 @@ def test_inline_route_marks_possibly_sent_at_submission(tmp_path):
     """S11a: a keyed-inline checkpoint_restore observed AT the
     Restore-VMSnapshot submission carries send_state='possibly_sent' and the
     dispatch-bound op context - proving the route wiring itself, never a
-    hand-bound context (final critic F1/PA)."""
+    hand-bound context (final critic F1/PA). Wave 4: the attempt is also
+    identified INDEPENDENTLY of the op context (looked up by the dispatch's
+    idempotency key), so a context bound to a DIFFERENT existing attempt
+    fails the pin — the context-named row alone proves only that the context
+    names SOME row."""
     import asyncio
     import json as _json
     import threading as _th
@@ -1580,12 +1584,16 @@ def test_inline_route_marks_possibly_sent_at_submission(tmp_path):
             cfg = mod.CFG
             store = _ops.store_for(cfg)
             row = store.op_get(_ops._current_op_id.get(""))
+            attempt = store.op_find_idem(
+                "", "hyperv_checkpoint_restore", "s11-inline-a")
             reached["payload"] = {
                 "ctx_op_id": _ops._current_op_id.get(""),
                 "ctx_gen": _ops._current_op_generation.get(0),
                 "row_op_id": row.op_id if row else None,
                 "row_send": row.send_state if row else None,
                 "row_status": row.status if row else None,
+                "attempt_op_id": attempt.op_id if attempt else None,
+                "attempt_send": attempt.send_state if attempt else None,
             }
             release.set()
             return pswindows.PSResult(stdout="", returncode=0)
@@ -1617,6 +1625,25 @@ def test_inline_route_marks_possibly_sent_at_submission(tmp_path):
         )
         assert payload["row_status"] == "working", (
             f"S11a: the attempt is live mid-body; got {payload!r}"
+        )
+        # Wave 4 (PR #166 verification transcript): the row above is looked
+        # up BY the context, so ctx_op_id == row_op_id holds for ANY row the
+        # context names. The independent identification — by the dispatch's
+        # own idempotency key — is what discriminates a context bound to a
+        # DIFFERENT existing attempt (a decoy): the context must name THIS
+        # dispatch's attempt.
+        assert payload["attempt_op_id"] is not None, (
+            f"S11a: the dispatch's attempt must be findable by its "
+            f"idempotency key at the provider submission; got {payload!r}"
+        )
+        assert payload["ctx_op_id"] == payload["attempt_op_id"], (
+            f"S11a: the dispatch-bound op context names "
+            f"{payload['ctx_op_id']!r} but THIS dispatch's attempt is "
+            f"{payload['attempt_op_id']!r}; got {payload!r}"
+        )
+        assert payload["attempt_send"] == "possibly_sent", (
+            f"S11a: this dispatch's attempt must carry the send mark AT the "
+            f"provider submission; got {payload!r}"
         )
     finally:
         release.set()
@@ -3449,4 +3476,117 @@ def test_tf008_detach_admission_refusal_is_classified(ops_store, admission_env):
     assert ctx is None and isinstance(resp, dict), f"TF-008: {resp!r}"
     assert resp.get("error_class") in ("transport", "busy"), (
         f"TF-008: the refusal must carry a classified error_class; got {resp}"
+    )
+
+
+def test_tf006_tasks_route_legacy_refusal_is_structured(ops_store):
+    """TF-006 wave 4: the tasks route carries its OWN copy of the legacy
+    protected-reconciliation refusal envelope — the shipped TF-006 pin
+    drives guard_consult only, so neither flag on the tasks-route copy was
+    pinned. The tasks-route legacy refusal must carry reconciliation=True
+    AND error_class='idempotency_conflict'. RED under either tasks-route
+    envelope mutation; GREEN at head."""
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id="tf006t-legacy", tool=OP_TOOL, agent="", vm_name="tf006-vm",
+        status=statestore.OP_FAILED, error_class="",
+        created_at=now - 10.0, updated_at=now - 10.0,
+        runner="v5-migrated", heartbeat_at=now,
+        params_hmac="",  # legacy blank fingerprint
+        idem_key="tf006t", generation=5,
+    ))
+    run = _tasks_driver(cfg, _NoDispatchTool(), CountingSemaphore(2))
+    result = run(OP_TOOL, {
+        "vm_name": "tf006-vm", "checkpoint_name": "cp", "confirm": True,
+        "idempotency_key": "tf006t", "detach": True})
+    payload = _failure_payload(result)
+    assert payload is not None and \
+        payload.get("reconciliation") is True and \
+        payload.get("error_class") == "idempotency_conflict", (
+            f"TF-006 (wave 4): the tasks-route legacy refusal must carry "
+            f"reconciliation=True and error_class='idempotency_conflict'; "
+            f"got {payload!r}"
+        )
+
+
+def test_tf002_change_record_carries_postcondition_on_unobserved_paths(
+        monkeypatch):
+    """TF-002 wave 4 (the negative paths): the shipped TF-002 pin's scenario
+    is a POSITIVELY-observed readback, where _evaluate_change writes the
+    postcondition verdicts — dropping the channel from every UNOBSERVED arm
+    (the init dict, the non-positive-observation arm, the verify-leg
+    exception arm) left it GREEN. A change record produced WITHOUT a
+    positive observation must STILL carry the postcondition channel with a
+    vocabulary value: (a) a verify leg that raises entirely, and (b) a
+    partial observation (a guest probe section errored). RED under the
+    drop-on-unobserved-paths mutation; GREEN at head."""
+    cfg = Config(unrestricted=True)
+
+    def _stale():
+        guest = _guest(listen="192.168.50.20")
+        guest["ssh"]["listeners"] = [{"address": "192.168.50.20", "port": 22}]
+        return guest
+
+    def _rewrite(out):
+        matches = [c for c in out["changes"]
+                   if c["action"] == "rewrite_stale_ssh_bindings"]
+        assert matches, f"expected the rewrite change; got {out['changes']!r}"
+        return matches[0]
+
+    # (a) the verify re-diagnose leg raises: every change keeps the channel
+    # through the phase-level exception arm (observation=unavailable).
+    fake = FakePS([
+        _guid_result(),
+        _ok(_host()), _ok(_stale()),
+        _ok({"backup": "C:/tf002n-a.bak", "replaced": 1}),
+        RuntimeError("verify transport down"),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = repair.repair_guest_access(
+        cfg, "test-vm", apply=True, confirm=True, cred=CRED,
+        intended_bindings=["10.0.0.5"],
+    )
+    change = _rewrite(out)
+    assert change["observation"] == "unavailable", (
+        f"TF-002 (a) premise: the verify leg must be recorded unavailable; "
+        f"got {change!r}"
+    )
+    assert "postcondition" in change, (
+        f"TF-002 (a): a change record with NO observation must still carry "
+        f"the postcondition channel; got {change!r}"
+    )
+    assert change["postcondition"] in ("satisfied", "unsatisfied", "unknown"), (
+        f"TF-002 (a): the postcondition must come from the frozen "
+        f"vocabulary; got {change!r}"
+    )
+
+    # (b) a PARTIAL observation (a guest probe section errored): the
+    # non-positive arm of _evaluate_change keeps the channel.
+    errored = _guest(listen="192.168.50.20")
+    errored["ssh"] = {"error": "probe leg failed"}
+    fake_b = FakePS([
+        _guid_result(),
+        _ok(_host()), _ok(_stale()),
+        _ok({"backup": "C:/tf002n-b.bak", "replaced": 1}),
+        _ok(_host()), _ok(errored),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake_b)
+    out_b = repair.repair_guest_access(
+        cfg, "test-vm", apply=True, confirm=True, cred=CRED,
+        intended_bindings=["10.0.0.5"],
+    )
+    change_b = _rewrite(out_b)
+    assert change_b["observation"] == "partial", (
+        f"TF-002 (b) premise: the errored section must make the observation "
+        f"partial; got {change_b!r}"
+    )
+    assert "postcondition" in change_b, (
+        f"TF-002 (b): a change record with a NON-positive observation must "
+        f"still carry the postcondition channel; got {change_b!r}"
+    )
+    assert change_b["postcondition"] in ("satisfied", "unsatisfied", "unknown"), (
+        f"TF-002 (b): the postcondition must come from the frozen "
+        f"vocabulary; got {change_b!r}"
     )

@@ -28,6 +28,17 @@ FB-006 (HIGH) — the epoch dance is local-only; a second process hands out a
       half of "refuse reuse or return after an epoch mismatch")
     test_fb006_single_pool_dance_still_works                   (acceptance c)
 
+Wave 4 (PR #166 verification transcript): two FB-006 sub-parts the shipped
+pins above do not discriminate are now pinned in their own right —
+
+    test_fb006_create_locked_reuse_branch_consults_the_epoch: the
+      _create_locked REUSE branch's own epoch consult (a gate-racing acquire
+      lands there on an idle entry its fast path never saw).
+    test_fb006_durable_epoch_is_read_before_the_spawn: the read-epoch-
+      BEFORE-spawn ordering (a restore landing mid-spawn must leave the
+      entry bound to the PRE-restore epoch, so a later clean reuse/return
+      retires the pre-restore session instead of re-handing it out).
+
 What is faked: only the pool's worker factory (the _StubFactory pattern from
 test_t157_158_schedules.py) and the store-backed epoch consults. Every store
 is closed in teardown (Windows file-lock teardown hazard) and every pool is
@@ -407,3 +418,104 @@ def test_fb006_single_pool_dance_still_works(store):
         pool.release(reused)
     finally:
         pool.close_all()
+
+
+# ---------------------------------------------------------------------------
+# Wave 4 — the FB-006 sub-parts the shipped pins above do not discriminate
+# ---------------------------------------------------------------------------
+
+
+def test_fb006_create_locked_reuse_branch_consults_the_epoch(store):
+    """FB-006 wave 4: the _create_locked REUSE branch must apply the same
+    durable-epoch guard the acquire fast path applies (a gate-racing acquire
+    lands here on an idle entry its own fast path never saw). Pool A's worker
+    predates a restore that ANOTHER pool re-bound and cleared; driving the
+    reuse branch directly must hand out a FRESH worker and retire the stale
+    one — never the pre-restore worker. RED under the reuse-branch-consult-
+    only mutation (the stale worker is handed straight out); GREEN at head."""
+    cred = _named("Administrator", "wave4-pass", "lab-p")
+    key_a = (VM, psdsessions.credential_profile(cred), AGENT, None)
+    key_b = (VM, "guest:Administrator", "agent-b", None)
+    factory_a = _StubFactory()
+    pool_a = _pool(store, factory_a)
+    factory_b = _StubFactory()
+    pool_b = _pool(store, factory_b)
+    try:
+        pre_bump = pool_a.acquire(key_a, cred=cred)
+        assert store.epoch_snapshot(VM) == (0, "clean")
+        pool_a.release(pre_bump)
+
+        # The restore commits and ANOTHER pool re-binds and clears the epoch.
+        store.epoch_bump(VM)
+        rebound = pool_b.acquire(key_b)
+        assert store.epoch_snapshot(VM) == (1, "clean")
+        pool_b.release(rebound)
+
+        handed = pool_a._create_locked(psdsessions.SessionKey(*key_a), cred)
+        try:
+            assert handed is not pre_bump, (
+                "FB-006 (wave 4): the _create_locked reuse branch handed out "
+                "a PRE-RESTORE worker after another process re-bound and "
+                "cleared the durable epoch"
+            )
+            assert pre_bump.closed, (
+                "FB-006 (wave 4): the stale worker must be retired by the "
+                "reuse branch"
+            )
+            assert factory_a.calls == 2, factory_a.calls
+        finally:
+            pool_a.release(handed)
+    finally:
+        pool_a.close_all()
+        pool_b.close_all()
+
+
+def test_fb006_durable_epoch_is_read_before_the_spawn(store):
+    """FB-006 wave 4: the fresh entry must be bound to an epoch the session
+    can never be NEWER than — the durable epoch is read BEFORE the worker
+    spawns, so a restore landing DURING the spawn leaves the entry bound to
+    the PRE-restore epoch and a later clean reuse/return consult retires the
+    pre-restore session instead of pooling and re-handing it out. RED under
+    the epoch-read-after-spawn mutation (the entry records the post-restore
+    epoch and the pre-restore worker is pooled and re-handed); GREEN at
+    head."""
+    key = (VM, "guest:Administrator", AGENT, None)
+
+    class _MidSpawnRestoreFactory(_StubFactory):
+        def __call__(self, k, script, stdin_b64):
+            self.calls += 1
+            if self.calls == 1:
+                store.epoch_bump(VM)  # the restore lands mid-establishment
+            return _StubWorker(self)
+
+    factory = _MidSpawnRestoreFactory()
+    pool = _pool(store, factory)
+    other = _pool(store, _StubFactory())
+    try:
+        first = pool.acquire(key)
+        assert store.epoch_snapshot(VM) == (1, "dirty"), "wave-4 premise"
+        # Another process's dance re-binds and clears the current epoch.
+        foreign = other.acquire((VM, "guest:Administrator", "agent-b", None))
+        assert store.epoch_snapshot(VM) == (1, "clean"), "wave-4 premise"
+        other.release(foreign)
+
+        entry = pool._entries.get(key)
+        assert entry is not None and entry.durable_epoch == 0, (
+            f"FB-006 (wave 4): the entry must record the PRE-restore epoch "
+            f"(0) — the durable epoch is read BEFORE the spawn; got "
+            f"{getattr(entry, 'durable_epoch', None)!r}"
+        )
+        pool.release(first)
+        assert first.closed, (
+            "FB-006 (wave 4): a session established BEFORE the restore was "
+            "pooled at release although the durable epoch moved"
+        )
+        second = pool.acquire(key)
+        pool.release(second)
+        assert second is not first, (
+            "FB-006 (wave 4): the pre-restore session was handed out again "
+            "after the restore"
+        )
+    finally:
+        pool.close_all()
+        other.close_all()

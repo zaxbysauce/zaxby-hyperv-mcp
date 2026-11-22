@@ -23,6 +23,19 @@ unguarded write landed status=cancelled on the gen-2 row).
   test_fb011_admission_stopped_cancel_obeys_fence      — RED at base
   test_fb011_grant_window_stop_cancel_obeys_fence      — RED at base
 
+FB-011 wave 4 (PR #166 verification transcript, completeness) — two MORE
+pre-body arms of the same function carried NO generation: the send-gate busy
+arm ("op.busy") and the commit_send_intent failure arm ("op.failed"). The
+commit-failure arm is the one a fenced executor actually takes (the commit
+fails precisely because op_mark_send is generation-validated), and its
+unguarded pre_body_terminal write cleared the NEWER executor's send mark.
+Every pre-body write now carries the captured generation in the fail-closed
+form (int(generation or 0) — a real 0, never `or None`). The pins identify
+the attempt by its IDEMPOTENCY KEY (op_find_idem), never by the op context.
+
+  test_fb011_commit_failure_arm_obeys_fence            — RED before the wave-4 fix
+  test_fb011_send_gate_busy_arm_obeys_fence            — RED before the wave-4 fix
+
 FB-012 (HIGH, probe-confirmed) — _classify_stale's read-time terminal write
 had NO generation predicate, so a read path terminalized a row a newer
 executor held (probe: a classifiable WORKING row fenced gen 1 -> 2 was written
@@ -285,6 +298,91 @@ def test_fb011_grant_window_stop_cancel_obeys_fence(
     assert row.status == statestore.OP_WORKING and row.generation == 2, (
         f"FB-011: the grant-to-pop-window stop cancel terminalized a fenced "
         f"row: {row.as_dict()}"
+    )
+
+
+def _fenced_marked_row(store, op_id: str) -> None:
+    """FB-011 wave 4 fixture: a row the captured executor (generation 1) has
+    LOST — fenced to generation 2 — whose NEWER executor has committed its
+    send (send_state='possibly_sent' at generation 2). The row carries
+    idem_key=op_id so the pins can identify the attempt INDEPENDENTLY of the
+    op context (op_find_idem, the same identification a retry's consult
+    uses)."""
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id=op_id, tool=OP_TOOL, agent="", vm_name="fb011-vm",
+        status=statestore.OP_WORKING, created_at=now, updated_at=now,
+        runner="fb011-r", heartbeat_at=now, idem_key=op_id, generation=1,
+    ))
+    assert store.op_fence(op_id) == 2  # authority moved: 1 -> 2
+    assert store.op_mark_send(op_id, 2) is True  # the newer executor sent
+    row = store.op_get(op_id)
+    assert row.generation == 2 and row.send_state == "possibly_sent", (
+        f"FB-011 fixture premise: {row.as_dict()}"
+    )
+
+
+def _row_by_idem(store, op_id: str) -> statestore.OpRow:
+    """Identify the attempt by its IDEMPOTENCY KEY — never by the op context —
+    so a pin cannot be fooled by a row the context happens to name."""
+    found = store.op_find_idem("", OP_TOOL, op_id)
+    assert found is not None, "FB-011: the attempt row must be findable by key"
+    assert found.op_id == op_id, (found.op_id, op_id)
+    return found
+
+
+def test_fb011_commit_failure_arm_obeys_fence(ops_store, admission_env):
+    """FB-011 wave 4 (b): the arm a FENCED executor actually takes — the
+    pre-send commit fails precisely because op_mark_send is
+    generation-validated — so its pre-body failure terminal MUST be refused
+    by the same captured-generation predicate: it must NOT land on the newer
+    executor's row and must NOT clear the newer row's send mark
+    (pre_body_terminal would wipe it). RED before the wave-4 fix: the
+    unguarded write flipped the gen-2 row to failed/busy-envelope with
+    send_state=''. The attempt is identified by its idempotency key."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _fenced_marked_row(store, "fb011c-op")
+    _run_body_isolated(
+        cfg, "fb011c-op", OP_TOOL, _NoDispatchTool(),
+        {"vm_name": "fb011-vm"}, "", store, threading.Event(), generation=1,
+    )
+    row = _row_by_idem(store, "fb011c-op")
+    assert row.status == statestore.OP_WORKING and row.generation == 2 \
+        and row.send_state == "possibly_sent", (
+            f"FB-011 (wave 4): a FENCED executor's commit-failure pre-body "
+            f"write landed on the newer executor's row and cleared its send "
+            f"mark: {row.as_dict()}"
+        )
+
+
+def test_fb011_send_gate_busy_arm_obeys_fence(
+        ops_store, admission_env, monkeypatch):
+    """FB-011 wave 4 (a): the send-gate busy refusal is provably pre-body
+    (the gate is acquired BEFORE the pre-send commit and the body), so its
+    pre_body_terminal write carries the same hazard — a fenced executor's
+    busy terminal must not land on the newer executor's row nor clear its
+    send mark, and its idem release must not free the newer row's key. RED
+    before the wave-4 fix: the unguarded write flipped the gen-2 row to
+    failed with the busy envelope. Identified by idempotency key."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _fenced_marked_row(store, "fb011d-op")
+    monkeypatch.setattr(operations, "_send_gate_acquire",
+                        lambda arguments, blocking=True: False)
+    _run_body_isolated(
+        cfg, "fb011d-op", OP_TOOL, _NoDispatchTool(),
+        {"vm_name": "fb011-vm"}, "", store, threading.Event(), generation=1,
+    )
+    row = _row_by_idem(store, "fb011d-op")
+    assert row.status == statestore.OP_WORKING and row.generation == 2 \
+        and row.send_state == "possibly_sent", (
+            f"FB-011 (wave 4): a FENCED executor's send-gate busy pre-body "
+            f"write landed on the newer executor's row: {row.as_dict()}"
+        )
+    assert row.idem_key == "fb011d-op", (
+        f"FB-011 (wave 4): the fenced executor's busy arm freed the newer "
+        f"executor's idempotency slot: {row.as_dict()}"
     )
 
 
@@ -669,3 +767,187 @@ def test_fb010_reconsult_answers_residue_fence_failure(
         f"FB-010: the refusal must keep the identity exactly as it was: "
         f"{kept.as_dict()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Wave 4 — FB-012's legacy generation-0 fence (the 'Careful' clause's twin)
+# ---------------------------------------------------------------------------
+
+
+def test_fb012_legacy_generation0_write_is_fence_guarded(ops_store):
+    """FB-012 wave 4: the classification write's generation predicate is the
+    FAIL-CLOSED form (a real 0, never `or None`), so even a LEGACY
+    generation-0 row is fenced: a classifiable WORKING possibly_sent row
+    whose stored generation IS 0, fenced to generation 1 before the
+    classification write, must NOT be terminalized by the read-time path.
+    RED under the legacy-generation-0-unguarded mutation (`... or None`);
+    GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id="fb012-gen0", tool=OP_TOOL, agent="", vm_name="fb012-vm",
+        status=statestore.OP_WORKING,
+        created_at=now - 7200.0, updated_at=now - 7200.0,
+        runner="fb012-g0", heartbeat_at=now - 7200.0,
+        send_state="possibly_sent", generation=0, idem_key="fb012g0",
+    ))
+    captured = store.op_get("fb012-gen0")  # the read-time path's row (gen 0)
+    assert captured is not None
+    store.op_fence("fb012-gen0")  # a replacement executor takes authority (0 -> 1)
+
+    operations._classify_stale(store, captured, cfg)
+    row = store.op_get("fb012-gen0")
+    assert row.status == statestore.OP_WORKING and row.generation == 1, (
+        f"FB-012 (wave 4): the read-time classification terminalized a "
+        f"FENCED legacy generation-0 row: {row.as_dict()}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wave 4 — FB-014's four un-pinned call sites (1, 4, 5, 6)
+# ---------------------------------------------------------------------------
+
+
+def _fb014_trace(store, audit_sink, handle: str, error_class: str) -> None:
+    """Assert the durable trace FB-014 promises: one op.refused event naming
+    the ORIGINAL handle in ref_id (carrying the envelope's error_class) and
+    one audit row in the guard route's rejection shape."""
+    events = [
+        e for e in store.events_after("", 0)
+        if e["ref_id"] == handle and e["kind"] == "op.refused"
+    ]
+    assert events, (
+        f"FB-014 (wave 4): the refusal left NO durable op.refused event "
+        f"naming the original handle {handle!r}"
+    )
+    assert error_class in events[-1]["data_json"], events[-1]
+    rows = [
+        r for r in _audit_rows(audit_sink)
+        if r.get("tool") == OP_TOOL and r.get("ok") is False
+        and r.get("error_class") == error_class
+    ]
+    assert rows, (
+        f"FB-014 (wave 4): the refusal wrote no audit row (error_class "
+        f"{error_class!r})"
+    )
+
+
+def test_fb014_consult_fingerprint_conflict_is_traced(ops_store, audit_sink):
+    """FB-014 wave 4, site 1: the ORDINARY tasks consult's fingerprint-
+    conflict refusal (idempotency_fingerprint_conflict) must leave the same
+    durable trace as sites 2/3 (which the shipped pins cover). RED under the
+    site-1-disabled mutation; GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    args = {"vm_name": "fb014-vm", "checkpoint_name": "cp",
+            "idempotency_key": "fb014s1", "detach": True}
+    _seed(store, cfg, op_id="fb014-s1", args=args,
+          params_hmac="a-different-fingerprint")
+    run = _tasks_runner(cfg, _NoDispatchTool(), threading.BoundedSemaphore(2))
+    result = run(OP_TOOL, args)
+    payload = _payload(result)
+    assert payload is not None and \
+        payload.get("error_class") == "idempotency_conflict", (
+            f"FB-014 site-1 setup: expected the fingerprint-conflict "
+            f"refusal; got {result!r}"
+        )
+    _fb014_trace(store, audit_sink, "fb014-s1", "idempotency_conflict")
+
+
+def test_fb014_reconsult_fingerprint_conflict_is_traced(
+        ops_store, audit_sink, monkeypatch):
+    """FB-014 wave 4, site 4: the INSERT-RACE RE-CONSULT's fingerprint-
+    conflict refusal must leave the durable trace. RED under the site-4-
+    disabled mutation; GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    args = {"vm_name": "fb014-vm", "checkpoint_name": "cp",
+            "idempotency_key": "fb014s4", "detach": True}
+    _seed(store, cfg, op_id="fb014-s4", args=args,
+          params_hmac="a-different-fingerprint")
+    blind = _BlindFirstConsultStore(store)
+    monkeypatch.setattr(operations, "store_for",
+                        lambda cfg_, environ=None: blind)
+    run = _tasks_runner(cfg, _NoDispatchTool(), threading.BoundedSemaphore(2))
+    result = run(OP_TOOL, args)
+    assert blind.finds >= 2, (
+        "FB-014 site-4 setup: the call never reached the insert-race "
+        "re-consult"
+    )
+    payload = _payload(result)
+    assert payload is not None and \
+        payload.get("error_class") == "idempotency_conflict", (
+            f"FB-014 site-4 setup: expected the re-consult conflict refusal; "
+            f"got {result!r}"
+        )
+    _fb014_trace(store, audit_sink, "fb014-s4", "idempotency_conflict")
+
+
+def test_fb014_reconsult_legacy_reconciliation_is_traced(
+        ops_store, audit_sink, monkeypatch):
+    """FB-014 wave 4, site 5: the INSERT-RACE RE-CONSULT's legacy
+    reconciliation refusal must leave the durable trace. RED under the
+    site-5-disabled mutation; GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    args = {"vm_name": "fb014-vm", "checkpoint_name": "cp",
+            "idempotency_key": "fb014s5", "detach": True}
+    _seed(store, cfg, op_id="fb014-s5", args=args,
+          runner="v6-migrated", generation=0)
+    blind = _BlindFirstConsultStore(store)
+    monkeypatch.setattr(operations, "store_for",
+                        lambda cfg_, environ=None: blind)
+    run = _tasks_runner(cfg, _NoDispatchTool(), threading.BoundedSemaphore(2))
+    result = run(OP_TOOL, args)
+    assert blind.finds >= 2, (
+        "FB-014 site-5 setup: the call never reached the insert-race "
+        "re-consult"
+    )
+    payload = _payload(result)
+    assert payload is not None and \
+        payload.get("reconciliation") is True and \
+        payload.get("op_id") == "fb014-s5", (
+            f"FB-014 site-5 setup: expected the re-consult reconciliation "
+            f"refusal; got {result!r}"
+        )
+    _fb014_trace(store, audit_sink, "fb014-s5", "idempotency_conflict")
+
+
+def test_fb014_reconsult_residue_fence_failure_is_traced(
+        ops_store, audit_sink, monkeypatch):
+    """FB-014 wave 4, site 6: the INSERT-RACE RE-CONSULT's residue-recovery
+    FENCE failure (the fail-closed retryable refusal) must leave the durable
+    trace. RED under the site-6-disabled mutation; GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    args = {"vm_name": "fb014-vm", "checkpoint_name": "cp",
+            "idempotency_key": "fb014s6", "detach": True}
+    now = store.now()
+    _seed(store, cfg, op_id="fb014-s6", args=args,
+          runner="sync-deadbeef", generation=1,
+          created_at=now - 400.0, updated_at=now - 400.0,
+          heartbeat_at=now - 400.0)  # lapsed sync- residue, unmarked, gen>0
+
+    def _fence_down(op_id):
+        raise RuntimeError("fence transport down")
+
+    monkeypatch.setattr(store, "op_fence", _fence_down)
+    blind = _BlindFirstConsultStore(store)
+    monkeypatch.setattr(operations, "store_for",
+                        lambda cfg_, environ=None: blind)
+    run = _tasks_runner(cfg, _NoDispatchTool(), threading.BoundedSemaphore(2))
+    result = run(OP_TOOL, args)
+    assert blind.finds >= 2, (
+        "FB-014 site-6 setup: the call never reached the insert-race "
+        "re-consult"
+    )
+    payload = _payload(result)
+    assert payload is not None and \
+        payload.get("op_id") == "fb014-s6" and \
+        "fenced" in str(payload.get("error", "")), (
+            f"FB-014 site-6 setup: expected the re-consult residue "
+            f"fence-failure refusal; got {result!r}"
+        )
+    _fb014_trace(store, audit_sink, "fb014-s6", "transport")
+

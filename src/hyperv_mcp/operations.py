@@ -1398,8 +1398,14 @@ def _execute_body(
     provider submissions for this VM outside the replaceable worker, and the
     attempt-level pre-send commit (commit_send_intent) lands under that gate
     BEFORE tool_fn. The pre-body arms (admission busy / stop-valve /
-    park-window cancellations) are PROVABLY pre-send: their transitions pass
-    pre_body_terminal=True (clearing an inherited mark). Every in-body
+    park-window cancellations / the send-gate busy refusal / the pre-send
+    commit failure) are PROVABLY pre-send: their transitions pass
+    pre_body_terminal=True (clearing an inherited mark). FB-011 wave 4:
+    EVERY pre-body write here carries the captured generation in the
+    fail-closed form (`int(generation or 0)` — a real 0, never `or None`),
+    so a fenced executor's pre-body write is refused outright and can
+    neither terminalize a newer executor's row nor clear its send mark.
+    Every in-body
     terminal — any exception, cancellation included once the body started —
     is post-send provenance and retains the mark (mapped to OP_UNKNOWN when
     the row was marked)."""
@@ -1450,8 +1456,11 @@ def _execute_body(
             # every sibling — a fenced executor's cancel must be a no-op on a
             # row whose generation was superseded (latent-hazard guard: no
             # shipped site fences a WORKING detached row mid-park yet).
+            # FB-011 wave 4: the predicate is the FAIL-CLOSED form (a real 0,
+            # never `or None`) so a legacy generation-0 executor whose fence
+            # moved is refused too — every pre-body write below follows it.
             _safe_transition(store, op_id, statestore.OP_CANCELLED, agent, cfg,
-                             "op.cancelled", generation=generation or None,
+                             "op.cancelled", generation=int(generation or 0),
                              pre_body_terminal=True)
             return
         finally:
@@ -1484,10 +1493,12 @@ def _execute_body(
             # terminal, exactly as a stop observed mid-park would. Provably
             # pre-body (issue #157): the mark clears. FB-011 (PR #166
             # review): the captured generation rides this twin transition
-            # too — the same fenced-executor guard as the mid-park arm.
+            # too — the same fenced-executor guard as the mid-park arm
+            # (FB-011 wave 4: fail-closed real-0 form, as every pre-body
+            # write in this function).
             admission.release_sync(ticket)
             _safe_transition(store, op_id, statestore.OP_CANCELLED, agent, cfg,
-                             "op.cancelled", generation=generation or None,
+                             "op.cancelled", generation=int(generation or 0),
                              pre_body_terminal=True)
             return
         # Issue #157: the send gate serializes the per-resource PRE-SEND
@@ -1506,18 +1517,27 @@ def _execute_body(
             if not gate_held:
                 env = _busy_envelope(tool_name)
                 text = json.dumps(env, separators=(",", ":"), default=str)
+                # FB-011 wave 4 (PR #166 review, completeness): this pre-body
+                # busy terminal carries the captured generation in the
+                # fail-closed form — a fenced executor's write must be a no-op
+                # on the newer executor's row and must NEVER clear its send
+                # mark (pre_body_terminal would wipe it), exactly like the
+                # AdmissionStopped arms above.
                 _safe_transition(
                     store, op_id, statestore.OP_FAILED, agent, cfg, "op.busy",
                     error_class="busy",
                     result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
+                    generation=int(generation or 0),
                     pre_body_terminal=True,
                 )
                 # Issue #157 (final critic F2): the busy refusal is RETRYABLE
                 # (PRR-001) — free the (agent, tool, idem_key) slot so a
                 # same-key retry mints a fresh dispatch instead of replaying
-                # this busy envelope for the whole idempotency TTL.
+                # this busy envelope for the whole idempotency TTL. The idem
+                # release carries the same fail-closed generation predicate
+                # (a fenced executor must not free a newer generation's slot).
                 try:
-                    store.op_release_idem(op_id, generation=generation or None)
+                    store.op_release_idem(op_id, generation=int(generation or 0))
                 except Exception:
                     pass
                 admission.release_sync(ticket)
@@ -1530,10 +1550,18 @@ def _execute_body(
             except Exception as exc:
                 env = errors.envelope(exc)
                 text = json.dumps(env, separators=(",", ":"), default=str)
+                # FB-011 wave 4 (PR #166 review, completeness): the arm a
+                # FENCED executor actually takes — commit_send_intent fails
+                # precisely because op_mark_send is generation-validated — so
+                # this pre-body failure terminal MUST carry the captured
+                # generation in the fail-closed form: the write is refused
+                # when the row's generation moved, and a newer executor's
+                # send mark is never cleared by a stale executor's arm.
                 _safe_transition(
                     store, op_id, statestore.OP_FAILED, agent, cfg, "op.failed",
                     error_class=str(env.get("error_class") or "transport"),
                     result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
+                    generation=int(generation or 0),
                     pre_body_terminal=True,
                 )
                 admission.release_sync(ticket)
@@ -1550,7 +1578,7 @@ def _execute_body(
                 # handler (its transition no-ops on an already-terminalized
                 # row — _safe_transition only moves working rows).
                 _reconcile_interrupted_commit_core(
-                    store, cfg, op_id, agent, generation or None, boom)
+                    store, cfg, op_id, agent, int(generation or 0), boom)
                 admission.release_sync(ticket)
                 raise
         finally:
@@ -1683,9 +1711,14 @@ def _admission_refusal(
     into the runner's epilogue."""
     env = errors.envelope(busy)
     text = json.dumps(env, separators=(",", ":"), default=str)
+    # FB-011 wave 4: the runner-side pre-body admission refusal carries the
+    # captured generation in the FAIL-CLOSED form (a real 0, never `or None`)
+    # — a fenced executor's busy terminal and idem release are no-ops on a
+    # row whose generation was superseded, like every pre-body write in
+    # _execute_body.
     _safe_transition(
         store, op_id, statestore.OP_FAILED, agent, cfg, "op.failed",
-        generation=int(generation or 0) or None,
+        generation=int(generation or 0),
         error_class="busy",
         result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
     )
@@ -1698,7 +1731,7 @@ def _admission_refusal(
     # AdmissionStopped arm) deliberately does NOT do this: a cancelled op
     # is terminal and its retry answers from the row (D9's pin).
     try:
-        store.op_release_idem(op_id, generation=int(generation or 0) or None)
+        store.op_release_idem(op_id, generation=int(generation or 0))
     except Exception:
         pass  # best-effort: a store failure degrades to the replayable
         # refusal this closes, never into a runner-crash

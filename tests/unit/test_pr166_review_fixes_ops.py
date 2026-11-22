@@ -32,6 +32,17 @@ allowing a fresh dispatch.
   test_fb003_unresolved_row_not_expired_by_ttl          — acceptance (c)
   test_fb003_live_working_row_past_ttl_still_attaches   — protection kept
 
+Wave 4 (PR #166 verification transcript): two sub-parts the shipped pins
+above do not discriminate are now pinned in their own right —
+
+  test_fb005_startup_pruning_protects_blank_fingerprint_row: the legacy
+      deletion guard filters on BOTH legacy shapes; the shipped legacy
+      pin's row is generation 0 with a NON-blank fingerprint, so only the
+      generation half was pinned.
+  test_fb003_tasks_route_ignores_a_late_heartbeat_on_a_resolved_row: the
+      tasks route carries its OWN copy of the heartbeat_fresh predicate;
+      the shipped FB-003 (b) pin drives guard_consult only.
+
 What is faked: nothing beyond the module's own seams — the store is a real
 temp SQLite database; the "two startups" are two clear_store_cache_for_
 tests() + store_for() first-open sweeps against the same file; the
@@ -44,9 +55,11 @@ drain_for_tests.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -54,6 +67,7 @@ from hyperv_mcp import operations, statestore
 from hyperv_mcp.config import Config
 
 OP_TOOL = "hyperv_checkpoint_create"
+TASKS_ID = "io.modelcontextprotocol/tasks"
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +484,6 @@ def test_fb003_detached_heartbeat_stops_after_body(fb_store, admission_budget):
     cfg = _ops_cfg(heartbeat_ttl_s=3)
     beats = _beat_spy(store)
     body = _GatedBody()
-    now = store.now()
     handle, ctx = operations.guard_consult(
         cfg, OP_TOOL,
         {"vm_name": "test-vm", "checkpoint_name": "fb003",
@@ -635,5 +648,109 @@ def test_fb003_live_working_row_past_ttl_still_attaches(tmp_path, monkeypatch):
                 f"a live row past the TTL must attach with its handle; "
                 f"got resp={resp!r} ctx={ctx!r}"
             )
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# Wave 4 — the sub-parts the shipped pins above did not discriminate
+# ---------------------------------------------------------------------------
+
+
+def test_fb005_startup_pruning_protects_blank_fingerprint_row(startup_db):
+    """FB-005 wave 4: the startup sweep's legacy deletion guard filters on
+    BOTH legacy shapes (a BLANK fingerprint protects exactly like
+    generation 0). The shipped legacy pin's row is generation 0 with a
+    NON-blank fingerprint, so it exercises only the generation half — this
+    pin isolates the blank-fingerprint half: a generation-5 completed row
+    whose params_hmac is the pre-fingerprinting empty string must survive
+    startup pruning past both windows. RED under the blank-fingerprint-half
+    mutation (the row is deleted); GREEN at head."""
+    cfg = _ops_cfg(retention_s=60, idempotency_ttl_s=3600)
+    boot = statestore.open(startup_db)
+    now = boot.now()
+    boot.op_insert(statestore.OpRow(
+        op_id="fb005-blank", tool=OP_TOOL, agent="", vm_name="test-vm",
+        status=statestore.OP_COMPLETED,
+        created_at=now - 7200.0, updated_at=now - 7200.0,
+        runner="v5-migrated", heartbeat_at=now - 7200.0,
+        params_hmac="",  # the pre-fingerprinting legacy shape
+        result_json=None, generation=5, idem_key="fb005-blank",
+    ))
+    boot.close()
+    _startup(cfg)
+    s2 = _startup(cfg)
+    survivor = s2.op_get("fb005-blank")
+    assert survivor is not None, (
+        "FB-005 (wave 4): startup pruning deleted a BLANK-FINGERPRINT "
+        "legacy identity — like a generation-0 row it must reach the "
+        "reconciliation refusal, never be silently forgotten by the sweep"
+    )
+    assert survivor.idem_key == "fb005-blank"
+
+
+def _tasks_runner(cfg: Config, tool, sem):
+    """The shipped tasks extension driven directly (the schedules-file
+    _tasks_driver pattern): gate_fn passes, tool_fn_resolver serves the
+    stand-in, runner_slots is the caller's semaphore."""
+    ext = operations.tasks_extension(
+        cfg,
+        lambda name, arguments: (None, None),
+        lambda name: tool,
+        lambda: sem,
+    )
+    caps = SimpleNamespace(extensions={TASKS_ID: {}})
+    ctx = SimpleNamespace(session=SimpleNamespace(client_capabilities=caps))
+
+    def run(name, arguments):
+        params = SimpleNamespace(name=name, arguments=dict(arguments))
+        return asyncio.run(ext.intercept_tool_call(params, ctx, None))
+
+    return run
+
+
+def test_fb003_tasks_route_ignores_a_late_heartbeat_on_a_resolved_row(
+        tmp_path, monkeypatch):
+    """FB-003 wave 4 (b), tasks route: the TTL consult's heartbeat-freshness
+    predicate has its OWN copy in tasks_extension; the shipped FB-003 (b)
+    pin drives guard_consult only. An expired RESOLVED identity whose
+    heartbeat_at was refreshed by a late beat must be forgotten by the TASKS
+    route too (a fresh dispatch, a new task id), never replayed. RED under
+    the tasks-route-only predicate mutation; GREEN at head."""
+    clock = FakeClock(start=1000.0)
+    db = str(tmp_path / "fb003-tasks-route.db")
+    statestore.open(db).close()
+    store = statestore.Store(db, clock=clock)
+    monkeypatch.setattr(operations, "store_for", lambda cfg, environ=None: store)
+    try:
+        cfg = _ops_cfg(idempotency_ttl_s=100, heartbeat_ttl_s=60)
+        args = {"vm_name": "test-vm", "checkpoint_name": "fb003t",
+                "idempotency_key": "fb003t", "detach": True}
+        clock.now = 2000.0
+        store.op_insert(statestore.OpRow(
+            op_id="fb003t-op", tool=OP_TOOL, agent="", vm_name="test-vm",
+            status=statestore.OP_COMPLETED,
+            created_at=1000.0, updated_at=1990.0, runner="sync-cc",
+            heartbeat_at=1995.0,  # a late beat refreshed a TERMINAL row
+            params_hmac=operations.arguments_fingerprint(cfg, store, args),
+            idem_key="fb003t",
+            result_json='{"ok": true, "status": "created"}',
+            result_size=34, generation=3,
+        ))
+        run = _tasks_runner(cfg, _NoDispatchTool(),
+                            threading.BoundedSemaphore(2))
+        result = run(OP_TOOL, args)
+        try:
+            assert getattr(result, "task_id", None) != "fb003t-op", (
+                f"FB-003 (wave 4): the tasks route replayed an expired "
+                f"RESOLVED identity kept live by its late heartbeat instead "
+                f"of dispatching fresh; got {result!r}"
+            )
+            assert store.op_get("fb003t-op") is None, (
+                "FB-003 (wave 4): the expired resolved identity must be "
+                "forgotten by the tasks route (op.expired)"
+            )
+        finally:
+            operations.drain_for_tests(timeout_s=10.0)
     finally:
         store.close()
