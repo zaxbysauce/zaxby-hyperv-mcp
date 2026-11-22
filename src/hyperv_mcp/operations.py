@@ -2065,7 +2065,17 @@ def tasks_extension(
                                     # dispatch on either route.
                                     existing = _stranded_presend_key_recovery(
                                         existing, store)
-                                if existing is not None:
+                                # R28 (freshness round at a405d9e, probe-
+                                # proven): the attach is GUARDED by the
+                                # refusal — the restructure had let the
+                                # unconditional `if existing is not None`
+                                # overwrite R26's residue refusal with an
+                                # ordinary TaskHandleResult attach (in the
+                                # release-fault case reporting status=
+                                # working for a row that is really failed/
+                                # interrupted — the dead-executor-as-live
+                                # answer R16-1/R24 exist to prevent).
+                                if residue_refusal is None and existing is not None:
                                     if (
                                         existing.status == statestore.OP_FAILED
                                         and existing.error_class == statestore.OP_UNKNOWN

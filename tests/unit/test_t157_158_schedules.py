@@ -3124,3 +3124,99 @@ def test_tasks_retry_frees_a_stranded_presend_key(ops_store, admission_env):
         f"{row.generation}"
     )
     assert _ops.drain_for_tests(timeout_s=10.0) == 0
+
+
+# ---------------------------------------------------------------------------
+# S25c (freshness round at a405d9e, R28): the tasks route's residue
+# refusal is FAIL-CLOSED — a confirmation-step fault (fence, terminal
+# write, or key release) must answer the disclosed retryable refusal
+# naming the handle, never an ordinary TaskHandleResult attach (which in
+# the release-fault case would report status=working for a row that is
+# really failed/interrupted).
+# ---------------------------------------------------------------------------
+
+
+def test_tasks_residue_refusal_survives_confirmation_faults(
+        ops_store, admission_env, monkeypatch):
+    """S25c: an S16-ghost shape retried through the tasks route with each
+    confirmation step faulted in turn (op_fence raises; op_transition
+    returns False; op_release_idem raises) must return the retryable
+    refusal naming the handle — never a TaskHandleResult attach."""
+    import hyperv_mcp.operations as _ops
+    from hyperv_mcp import statestore
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    sem = CountingSemaphore(2)
+    now = store.now()
+    tool = _CountingTool()
+    run_tasks = _tasks_driver(cfg, tool, sem)
+    args = {"vm_name": "s25-vm", "checkpoint_name": "cp", "confirm": True,
+            "idempotency_key": "s25c"}
+
+    def _seed():
+        store.op_insert(statestore.OpRow(
+            op_id="s25c-ghost", tool=OP_TOOL, agent="", vm_name="s25-vm",
+            status=statestore.OP_WORKING, created_at=now - 400.0,
+            updated_at=now - 400.0, runner="sync-deadbeef",
+            heartbeat_at=now - 400.0,
+            params_hmac=_ops.arguments_fingerprint(cfg, store, args),
+            idem_key="s25c", generation=1,
+        ))
+
+    real_fence = store.op_fence
+    real_transition = store.op_transition
+    real_release = store.op_release_idem
+    faults = {"fence": False, "transition": False, "release": False}
+
+    def broken_fence(op_id):
+        if faults["fence"]:
+            raise RuntimeError("fence fault (simulated)")
+        return real_fence(op_id)
+
+    def broken_transition(op_id, from_statuses, to_status, **kwargs):
+        if faults["transition"]:
+            return False
+        return real_transition(op_id, from_statuses, to_status, **kwargs)
+
+    def broken_release(op_id):
+        if faults["release"]:
+            raise RuntimeError("release fault (simulated)")
+        return real_release(op_id)
+
+    monkeypatch.setattr(store, "op_fence", broken_fence)
+    monkeypatch.setattr(store, "op_transition", broken_transition)
+    monkeypatch.setattr(store, "op_release_idem", broken_release)
+    for fault in ("fence", "transition", "release"):
+        _seed()
+        faults[fault] = True
+        try:
+            out = run_tasks(OP_TOOL, args)
+        finally:
+            faults[fault] = False
+        blob = str(out)
+        assert "retryable" in blob and "s25c-ghost" in blob, (
+            f"S25c {fault}: the confirmation fault must answer the retryable "
+            f"refusal naming the handle (never a TaskHandleResult attach); "
+            f"got {blob[:300]}"
+        )
+        assert tool.calls == 0, (
+            f"S25c {fault}: zero body executions on the refusal path; got "
+            f"{tool.calls}"
+        )
+        row = store.op_get("s25c-ghost")
+        assert row is not None, (
+            f"S25c {fault}: the identity must be kept"
+        )
+        store.op_delete("s25c-ghost")
+    monkeypatch.setattr(store, "op_fence", real_fence)
+    monkeypatch.setattr(store, "op_transition", real_transition)
+    monkeypatch.setattr(store, "op_release_idem", real_release)
+    # Control: with no faults the recovery proceeds fresh.
+    _seed()
+    out = run_tasks(OP_TOOL, args)
+    fresh_id = getattr(out, "task_id", None)
+    assert fresh_id and fresh_id != "s25c-ghost", (
+        f"S25c control: the unfaulted retry dispatches fresh; got {out!r}"
+    )
+    assert _ops.drain_for_tests(timeout_s=10.0) == 0
