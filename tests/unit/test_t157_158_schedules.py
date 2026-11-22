@@ -3220,3 +3220,103 @@ def test_tasks_residue_refusal_survives_confirmation_faults(
         f"S25c control: the unfaulted retry dispatches fresh; got {out!r}"
     )
     assert _ops.drain_for_tests(timeout_s=10.0) == 0
+
+
+# ---------------------------------------------------------------------------
+# S29 (impl-review round 29, R29): a past-TTL lapsed DETACHED working row
+# must NOT be expiry-deleted after _classify_stale has just classified it
+# to the protected interrupted identity — the original handle stays
+# addressable on BOTH consult routes, and the retry recovers through the
+# provenance-safe stranded-key arm.
+# ---------------------------------------------------------------------------
+
+
+def _seed_s29_detached_row(store, cfg, op_id, key):
+    import hyperv_mcp.operations as _ops
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id=op_id, tool=OP_TOOL, agent="", vm_name="s29-vm",
+        status=statestore.OP_WORKING, created_at=now - 100000.0,
+        updated_at=now - 100000.0, runner="detachedrunner29",
+        heartbeat_at=now - 100000.0,
+        params_hmac=_ops.arguments_fingerprint(
+            cfg, store,
+            {"vm_name": "s29-vm", "checkpoint_name": "cp", "confirm": True,
+             "idempotency_key": key}),
+        idem_key=key, generation=1,
+    ))
+
+
+def test_past_ttl_detached_row_survives_expiry_classification(ops_store, admission_env):
+    """S29a (guard route): a past-TTL lapsed detached working row is
+    classified to failed/interrupted INSIDE the TTL arm; the arm must
+    preserve it (never delete a newly protected identity), and the retry
+    recovers through the stranded-key arm (key freed, fresh dispatch,
+    handle addressable throughout)."""
+    import hyperv_mcp.operations as _ops
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    sem = CountingSemaphore(2)
+    _seed_s29_detached_row(store, cfg, "s29a-row", "s29a")
+    tool = _CountingTool()
+    resp, ctx = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "s29-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "s29a"},
+        tool, lambda: sem,
+    )
+    # The retry dispatches fresh (an inline ctx — the args carry no
+    # detach); the fresh handle is never the preserved row's op_id.
+    fresh_id = (ctx or {}).get("op_id") or (resp or {}).get("op_id")
+    assert fresh_id and fresh_id != "s29a-row", (
+        f"S29a: the retry must dispatch fresh after the provenance-safe "
+        f"recovery; got resp={resp!r} ctx={ctx!r}"
+    )
+    row = store.op_get("s29a-row")
+    assert row is not None, (
+        "S29a: the original handle must remain ADDRESSABLE (never deleted "
+        "after classification)"
+    )
+    assert row.status == "failed" and row.error_class == (
+        statestore.OP_INTERRUPTED) and row.idem_key == "", (
+        f"S29a: the preserved identity must be terminal interrupted with "
+        f"its slot freed; got {row.as_dict()!r}"
+    )
+    assert row.generation >= 2, (
+        f"S29a: the fence must have moved the generation authority; got "
+        f"{row.generation}"
+    )
+    assert _ops.drain_for_tests(timeout_s=10.0) == 0
+
+
+def test_past_ttl_detached_row_survives_expiry_on_tasks_route(ops_store, admission_env):
+    """S29b (tasks route): the same shape through
+    tasks_extension.intercept_tool_call — the identity is preserved (never
+    deleted after classification), the key frees, and the retry dispatches
+    a fresh handle."""
+    import hyperv_mcp.operations as _ops
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    sem = CountingSemaphore(2)
+    _seed_s29_detached_row(store, cfg, "s29b-row", "s29b")
+    tool = _CountingTool()
+    run_tasks = _tasks_driver(cfg, tool, sem)
+    out = run_tasks(OP_TOOL, {"vm_name": "s29-vm", "checkpoint_name": "cp",
+                              "confirm": True, "idempotency_key": "s29b"})
+    fresh_id = getattr(out, "task_id", None)
+    assert fresh_id and fresh_id != "s29b-row", (
+        f"S29b: the retry must dispatch fresh; got {out!r}"
+    )
+    row = store.op_get("s29b-row")
+    assert row is not None, (
+        "S29b: the original handle must remain ADDRESSABLE on the tasks "
+        "route too"
+    )
+    assert row.status == "failed" and row.error_class == (
+        statestore.OP_INTERRUPTED) and row.idem_key == "", (
+        f"S29b: the preserved identity must be terminal interrupted with "
+        f"its slot freed; got {row.as_dict()!r}"
+    )
+    assert _ops.drain_for_tests(timeout_s=10.0) == 0

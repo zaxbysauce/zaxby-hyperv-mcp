@@ -638,18 +638,32 @@ def guard_consult(
                 # frees the key for the retry — reconciliation before
                 # replacement, never a silent consume-and-dispatch.
                 existing = _classify_stale(store, existing, cfg)
-                if existing.status == statestore.OP_WORKING:
-                    # Still working (a no-runner exempt row): fence it before
-                    # the replacement so the retired executor's late writes
-                    # become no-ops (issue #157 authority transfer).
-                    try:
-                        store.op_fence(existing.op_id)
-                    except Exception:
-                        pass
-                store.op_delete(existing.op_id)
-                emit(cfg, "op.expired", existing.op_id, "", agent,
-                     {"reason": "idempotency_ttl_lapsed"}, store=store)
-                existing = None
+                # R29 (impl-review round 29): protection is RE-EVALUATED
+                # after classification. _classify_stale may have just
+                # transitioned this row to a PROTECTED terminal state
+                # (failed/interrupted for an unmarked detached runner whose
+                # heartbeat lapsed — host sleep, a stalled heartbeat writer)
+                # or left it working (the R6 sync- exemption); deleting it
+                # here consumed a newly protected identity and contradicted
+                # the store's loss-class retention contract ("both are
+                # protected from pruning", statestore OP_INTERRUPTED/UNKNOWN)
+                # and AC8. Only a RESOLVED, non-protected row past the
+                # window (completed, or failed with a non-protected class)
+                # is forgotten; a working row or a newly protected identity
+                # is preserved — it flows to the conflict/legacy checks and
+                # the fenced recovery arms below (which free the key by
+                # provenance before any fresh dispatch).
+                now_protected = existing.error_class in (
+                    statestore.OP_INTERRUPTED, statestore.OP_UNKNOWN
+                )
+                if (
+                    existing.status != statestore.OP_WORKING
+                    and not now_protected
+                ):
+                    store.op_delete(existing.op_id)
+                    emit(cfg, "op.expired", existing.op_id, "", agent,
+                         {"reason": "idempotency_ttl_lapsed"}, store=store)
+                    existing = None
         if existing is not None:
             existing = _classify_stale(store, existing, cfg)
             # R18-2 (closing review round 18): the fingerprint-conflict and
@@ -1999,15 +2013,26 @@ def tasks_extension(
                             # generation-less past-TTL rows dispatched fresh
                             # here while the guard route refused them).
                             existing = _classify_stale(store, existing, cfg)
-                            if existing.status == statestore.OP_WORKING:
-                                try:
-                                    store.op_fence(existing.op_id)
-                                except Exception:
-                                    pass
-                            store.op_delete(existing.op_id)
-                            emit(cfg, "op.expired", existing.op_id, "", agent,
-                                 {"reason": "idempotency_ttl_lapsed"}, store=store)
-                            existing = None
+                            # R29 (impl-review round 29): the SAME
+                            # post-classification protection re-evaluation
+                            # the guard route runs (the shared shape) — only
+                            # a resolved, non-protected row past the window
+                            # is forgotten; a working row or a newly
+                            # classified protected identity is preserved for
+                            # the conflict/legacy checks and the fenced
+                            # recovery arms below.
+                            now_protected = existing.error_class in (
+                                statestore.OP_INTERRUPTED,
+                                statestore.OP_UNKNOWN,
+                            )
+                            if (
+                                existing.status != statestore.OP_WORKING
+                                and not now_protected
+                            ):
+                                store.op_delete(existing.op_id)
+                                emit(cfg, "op.expired", existing.op_id, "", agent,
+                                     {"reason": "idempotency_ttl_lapsed"}, store=store)
+                                existing = None
                     if existing is not None:
                         existing = _classify_stale(store, existing, cfg)
                         if existing.params_hmac and existing.params_hmac != fingerprint:
