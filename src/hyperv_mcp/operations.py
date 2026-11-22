@@ -1657,10 +1657,18 @@ def _execute_body(
         post_send = bool(
             row is not None and (getattr(row, "send_state", "") or "") == "possibly_sent"
         )
+        # FB-011 wave 8 (PR #166): this terminal is ALSO a pre-body write —
+        # the cancelled PRE-CHECK (`_raise_if_cancelled_locked`, before
+        # admission and the send gate) raises OperationCancelled into it — so
+        # it carries the captured generation in the fail-closed form like
+        # every other pre-body write. The fail-open form (`generation or
+        # None`) degraded to "no generation predicate" at captured generation
+        # 0 — the legacy shape — and let a legacy executor's pre-body cancel
+        # terminal land on a newer executor's row.
         _safe_transition(
             store, op_id, statestore.OP_CANCELLED,
             agent, cfg, "op.cancelled",
-            generation=generation or None,
+            generation=int(generation or 0),
         )
         if post_send:
             emit(cfg, "op.cancelled", op_id, "", agent,

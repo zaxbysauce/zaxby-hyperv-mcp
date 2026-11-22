@@ -1414,3 +1414,138 @@ def test_fb011_fenced_inline_busy_emits_no_terminal_event(ops_store):
         f"a terminal event against the newer executor's working handle: "
         f"{_failed_events(store, 'fb011q-op')!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Wave 8 — the campaign-5 findings: the fourteenth fail-open site (the
+# cancelled pre-check's OperationCancelled terminal, reached PRE-BODY) and
+# the wave-7 guards' SUCCESS path (emit-when-moved, the mirror of the
+# wave-7 no-event pins)
+# ---------------------------------------------------------------------------
+
+
+def test_fb011_legacy_gen0_cancelled_precheck_obeys_fence(
+        ops_store, admission_env):
+    """FB-011 wave 8 (the cancelled pre-check's OperationCancelled terminal,
+    fail-open FORM): the pre-check `_raise_if_cancelled_locked` raises for a
+    cancel-requested WORKING row BEFORE admission and the send gate, so the
+    `except OperationCancelled` terminal is a PRE-BODY write. A LEGACY
+    generation-0 executor whose row was fenced 0 -> 1 must NOT be able to
+    terminalize the newer executor's row: the terminal must carry the
+    captured generation as the REAL 0 (the fail-closed form) and be
+    refused. RED under the single-site form mutation at the terminal
+    (`int(generation or 0)` -> `generation or None`: the cancel lands on
+    the newer executor's row and clears its send mark); GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id="fb011r-op", tool=OP_TOOL, agent="", vm_name="fb011-vm",
+        status=statestore.OP_WORKING, created_at=now, updated_at=now,
+        runner="fb011-legacy-c", heartbeat_at=now, idem_key="fb011r-op",
+        params_hmac="", generation=0, cancel_requested=1,
+    ))
+    assert store.op_fence("fb011r-op") == 1  # authority moved: 0 -> 1
+    assert store.op_mark_send("fb011r-op", 1) is True  # the newer executor sent
+    _run_body_isolated(
+        cfg, "fb011r-op", OP_TOOL, _NoDispatchTool(),
+        {"vm_name": "fb011-vm"}, "", store, threading.Event(),
+        generation=0,
+    )
+    row = _row_by_idem(store, "fb011r-op")
+    assert row.status == statestore.OP_WORKING and row.generation == 1 \
+        and row.send_state == "possibly_sent", (
+            f"FB-011 (wave 8): a LEGACY generation-0 executor's PRE-BODY "
+            f"cancel (the cancelled pre-check -> the OperationCancelled "
+            f"terminal) terminalized the newer executor's row (the "
+            f"fail-open form): {row.as_dict()}"
+        )
+    assert not _failed_events(store, "fb011r-op"), (
+        f"FB-011 (wave 8): the refused pre-body cancel published a terminal "
+        f"event against the newer executor's working handle: "
+        f"{_failed_events(store, 'fb011r-op')!r}"
+    )
+
+
+def _unfenced_legacy_row(store, op_id: str) -> None:
+    """The wave-8 fixture: a legacy generation-0 row whose captured
+    generation IS 0 — the executor still OWNS the row, so its transition
+    MOVES (this is the SUCCESS path the wave-7 guards must keep emitting
+    on)."""
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id=op_id, tool=OP_TOOL, agent="", vm_name="fb011-vm",
+        status=statestore.OP_WORKING, created_at=now, updated_at=now,
+        runner="fb011-legacy-o", heartbeat_at=now, idem_key=op_id,
+        params_hmac="", generation=0,
+    ))
+    row = store.op_get(op_id)
+    assert row.generation == 0 and row.send_state == "" \
+        and not row.cancel_requested, f"fixture premise: {row.as_dict()}"
+
+
+def test_fb011_inline_reconcile_emits_terminal_event_when_moved(ops_store):
+    """FB-011 wave 8 (the shared reconciliation core, SUCCESS path): an
+    UNFENCED legacy executor's reconcile transition MOVES, and the terminal
+    event MUST be published — the wave-7 guard separates "unconditional
+    emit" from "emit when moved", and this pin separates "emit when moved"
+    from "never emit". RED under the never-emit mirror mutation
+    (`if moved:` -> `if False:`); GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _unfenced_legacy_row(store, "fb011s-op")
+    operations.reconcile_interrupted_commit(
+        _inline_ctx(cfg, "fb011s-op"),
+        _Wave5BaseException("interrupted inside the pre-send commit window"),
+    )
+    row = _row_by_idem(store, "fb011s-op")
+    assert row.status == statestore.OP_FAILED, (
+        f"FB-011 (wave 8) premise: the unfenced reconcile must terminalize "
+        f"the row it still owns; got {row.as_dict()}"
+    )
+    events = _failed_events(store, "fb011s-op")
+    assert events, (
+        "FB-011 (wave 8): the SUCCESS-path reconcile transition MOVED but "
+        "published NO terminal event — the wave-7 guard must suppress the "
+        "event only on a REFUSED transition, never on a moved one"
+    )
+
+
+def test_fb011_inline_fail_inline_emits_terminal_event_when_moved(ops_store):
+    """FB-011 wave 8 (the inline failure arm, SUCCESS path): an UNFENCED
+    legacy executor's failure transition MOVES and the terminal event MUST
+    be published. RED under the never-emit mirror mutation; GREEN at
+    head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _unfenced_legacy_row(store, "fb011t-op")
+    operations.fail_inline(_inline_ctx(cfg, "fb011t-op"),
+                           RuntimeError("interrupted before the send commit"))
+    row = _row_by_idem(store, "fb011t-op")
+    assert row.status == statestore.OP_FAILED, (
+        f"FB-011 (wave 8) premise: the unfenced failure arm must terminalize "
+        f"the row it still owns; got {row.as_dict()}"
+    )
+    assert _failed_events(store, "fb011t-op"), (
+        "FB-011 (wave 8): the SUCCESS-path failure transition MOVED but "
+        "published NO terminal event"
+    )
+
+
+def test_fb011_inline_busy_emits_terminal_event_when_moved(ops_store):
+    """FB-011 wave 8 (the inline busy terminal, SUCCESS path): an UNFENCED
+    legacy executor's busy transition MOVES and the terminal event MUST be
+    published. RED under the never-emit mirror mutation; GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _unfenced_legacy_row(store, "fb011u-op")
+    operations.busy_inline(_inline_ctx(cfg, "fb011u-op"), OP_TOOL)
+    row = _row_by_idem(store, "fb011u-op")
+    assert row.status == statestore.OP_FAILED, (
+        f"FB-011 (wave 8) premise: the unfenced busy terminal must "
+        f"terminalize the row it still owns; got {row.as_dict()}"
+    )
+    assert _failed_events(store, "fb011u-op"), (
+        "FB-011 (wave 8): the SUCCESS-path busy transition MOVED but "
+        "published NO terminal event"
+    )

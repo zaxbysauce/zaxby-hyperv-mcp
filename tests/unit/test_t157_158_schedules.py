@@ -3709,3 +3709,62 @@ def test_tf002_each_unobserved_arm_is_individually_pinned(monkeypatch):
         f"record the verification failure — its own marker is missing, so a "
         f"mutation that removes the arm cannot be seen: {change_c!r}"
     )
+
+
+def test_tf002_phase_failure_after_evaluation_resets_the_verdict(monkeypatch):
+    """TF-002 wave 8 (campaign-5 finding 3): a verification phase that fails
+    AFTER an item was evaluated must reset that item's verdict — under the
+    arm-C mutant (the except loop's reset writes removed) the item keeps
+    'satisfied' beside observation 'unavailable', a self-contradictory
+    change record. Two changes are driven (a stopped sshd AND a stale
+    binding); the FIRST is evaluated through the real _evaluate_change
+    (positive observation, finding cleared -> satisfied), the SECOND raises
+    inside the evaluation loop, so the phase's guarded except runs over both
+    changes. RED under the arm-C postcondition-write-removal mutation;
+    GREEN at head."""
+    cfg = Config(unrestricted=True)
+    broken = _guest(status="Stopped", listen="192.168.50.20")
+    broken["ssh"]["listeners"] = [{"address": "192.168.50.20", "port": 22}]
+    healthy = _guest(status="Running", listen="10.0.0.5")
+    fake = FakePS([
+        _guid_result(),
+        _ok(_host()), _ok(broken),
+        _ok({"service": "sshd", "status": "Running"}),
+        _ok({"backup": "C:/tf002x.bak", "replaced": 1}),
+        _ok(_host()), _ok(healthy),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+
+    real_evaluate = repair._evaluate_change
+    calls = {"n": 0}
+
+    def _evaluate_then_raise(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("evaluation exploded on the second change")
+        return real_evaluate(*args, **kwargs)
+
+    monkeypatch.setattr(repair, "_evaluate_change", _evaluate_then_raise)
+    out = repair.repair_guest_access(
+        cfg, "test-vm", apply=True, confirm=True, cred=CRED,
+        intended_bindings=["10.0.0.5"],
+    )
+    assert calls["n"] >= 2, (
+        f"TF-002 (wave 8) premise: two changes must have reached the "
+        f"evaluation loop; got {calls['n']} call(s)"
+    )
+    service = [c for c in out["changes"] if c["action"] == "start_service"][0]
+    assert service["observation"] == "unavailable", (
+        f"TF-002 (wave 8): a phase failure must leave observation "
+        f"unavailable on every change; got {service!r}"
+    )
+    assert service["postcondition"] == "unknown", (
+        f"TF-002 (wave 8): the phase failure MUST reset the already-"
+        f"evaluated change's verdict — 'satisfied' beside observation "
+        f"'unavailable' is a self-contradictory change record; got "
+        f"{service!r}"
+    )
+    assert service["verified"] is False, (
+        f"TF-002 (wave 8): a change whose verdict was reset by a phase "
+        f"failure must not stay verified; got {service!r}"
+    )

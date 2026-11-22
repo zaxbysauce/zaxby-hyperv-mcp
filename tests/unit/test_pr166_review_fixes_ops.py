@@ -830,3 +830,78 @@ def test_fb003_teardown_protections_are_each_live(fb_store, monkeypatch):
         f"the callback attempted a heartbeat write after the stop "
         f"({len(beats) - beats_before} attempt(s))"
     )
+
+
+def test_fb003_detached_teardown_protections_are_each_live(
+        fb_store, admission_budget, monkeypatch):
+    """FB-003 wave 8 (campaign-5 finding 2): the DETACHED runner's heartbeat
+    teardown has the same TWO overlapping protections as the inline one —
+    the beat's pre-write stop check and the owner's cancel of the armed
+    timer — and each alone enforces the whole-body invariant, so the
+    whole-invariant pin cannot see a single-site mutation of either. This
+    pin drives the REAL detached runner (guard_consult, detach=True) with a
+    capturing Timer and observes each protection at its own seam:
+      (1) the ARMED timer (the most recently scheduled one) is the one
+          cancelled by the runner's finally;
+      (2) the captured beat callback, invoked after the stop, attempts NO
+          heartbeat write.
+    RED under either single-site mutation (the armed-timer replacement
+    demoted to an append; the pre-write check removed); GREEN at head."""
+    store = fb_store
+    cfg = _ops_cfg(heartbeat_ttl_s=3)
+    beats = _beat_spy(store)
+
+    scheduled: list = []
+
+    class _CapturingTimer(threading.Timer):
+        def __init__(self, interval, function, *args, **kwargs):
+            super().__init__(interval, function, *args, **kwargs)
+            self.cancelled = False
+            scheduled.append(self)
+
+        def cancel(self):
+            self.cancelled = True
+            super().cancel()
+
+    monkeypatch.setattr(operations.threading, "Timer", _CapturingTimer)
+
+    body = _GatedBody()
+    handle, ctx = operations.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "test-vm", "checkpoint_name": "fb003w8",
+         "idempotency_key": "fb003-w8-det", "detach": True},
+        body, lambda: _OneSemaphore(1))
+    assert ctx is None and isinstance(handle, dict) and handle.get("op_id"), (
+        f"expected a detached handle; got {handle!r} {ctx!r}"
+    )
+    op_id = handle["op_id"]
+    _wait_until(
+        lambda: len(scheduled) >= 2,
+        timeout_s=5.0,
+        message="the detached runner never scheduled its replacement timer",
+    )
+    body.gate.set()
+    _wait_until(
+        lambda: op_id not in operations._runners,
+        timeout_s=5.0,
+        message="the detached runner never tore down its beat chain",
+    )
+
+    # (1) the cancel: the ARMED timer (the most recently scheduled one) must
+    # be the one cancelled by the runner's finally.
+    armed = scheduled[-1]
+    assert armed.cancelled, (
+        "FB-003 (wave 8): the detached runner's teardown did NOT cancel "
+        "the ARMED timer (the most recently scheduled one) — a parked "
+        "replacement can fire after the body exits"
+    )
+
+    # (2) the pre-write check: invoking the captured beat callback after the
+    # stop must attempt NO heartbeat write.
+    beats_before = len(beats)
+    armed.function()
+    assert len(beats) == beats_before, (
+        f"FB-003 (wave 8): the detached beat's PRE-WRITE stop check did not "
+        f"hold — the callback attempted a heartbeat write after the stop "
+        f"({len(beats) - beats_before} attempt(s))"
+    )
