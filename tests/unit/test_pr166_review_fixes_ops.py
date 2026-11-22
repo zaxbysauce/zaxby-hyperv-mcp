@@ -374,15 +374,38 @@ def test_fb003_op_heartbeat_refuses_terminal_row(fb_store):
         )
 
 
+def _beat_spy(store):
+    """FB-003 (PR #166 review, wave 3): observe the heartbeat WRITE ATTEMPT,
+    not the stored row. statestore.op_heartbeat independently refuses to
+    freshen a non-working row, so a stored-value assertion is MASKED by the
+    store-level guard — reverting only the active-timer teardown left the
+    row's heartbeat_at unchanged and the old pins GREEN. The spy records the
+    ATTEMPT before the store guard can swallow it, so an orphan replacement
+    timer that fires after the body exited is caught by its CALL, never by
+    the (guard-protected) row."""
+    beats: list[float] = []
+    real_op_heartbeat = store.op_heartbeat
+
+    def _spy(op_id, at, generation=None):
+        beats.append(time.monotonic())
+        return real_op_heartbeat(op_id, at, generation=generation)
+
+    store.op_heartbeat = _spy
+    return beats
+
+
 def test_fb003_inline_heartbeat_stops_with_the_body(fb_store):
     """FB-003 acceptance (a)+(d), inline path: a beat fires mid-body (and
     schedules its replacement timer); the body then completes and the
-    dispatch's finally stops the chain — no further write may land on the
-    terminal row. RED at base: the replacement timer (never cancelled by
-    _stop, which cancels only the FIRST timer) fires once after the body
-    exits and the unconditional UPDATE refreshes the completed row."""
+    dispatch's finally stops the chain — NO further heartbeat write may be
+    ATTEMPTED after the body has exited. RED at base: the beat wrote before
+    any stop check and _stop cancelled only the FIRST timer, so the parked
+    replacement fired once after the body exited and attempted a write on
+    the terminal row (the store guard masked that write's stored value; the
+    spy's discriminating signal is the ATTEMPT itself)."""
     store = fb_store
     cfg = _ops_cfg(heartbeat_ttl_s=3)  # beat interval = max(1.0, 3/3) = 1.0s
+    beats = _beat_spy(store)
     now = store.now()
     store.op_insert(statestore.OpRow(
         op_id="hb-inline", tool=OP_TOOL, agent="", status=statestore.OP_WORKING,
@@ -393,9 +416,15 @@ def test_fb003_inline_heartbeat_stops_with_the_body(fb_store):
     stop = operations.start_inline_heartbeat(op_ctx)
     try:
         _wait_until(
+            lambda: beats,
+            timeout_s=5.0,
+            message="the inline heartbeat never ATTEMPTED a beat mid-body",
+        )
+        # The mid-body beat's call-through freshened the WORKING row.
+        _wait_until(
             lambda: store.op_get("hb-inline").heartbeat_at > now,
             timeout_s=5.0,
-            message="the inline heartbeat never beat mid-body",
+            message="the mid-body beat never freshened the working row",
         )
         # Let the beat thread finish scheduling its replacement timer.
         time.sleep(0.3)
@@ -407,8 +436,19 @@ def test_fb003_inline_heartbeat_stops_with_the_body(fb_store):
     finally:
         stop()
     settled = store.op_get("hb-inline").heartbeat_at
-    # An unstopped replacement (1s interval) would fire twice in 2.5s.
+    # Grace for a beat that was already past the stop check when stop() ran
+    # (it lands within microseconds); base's orphan replacement fires ~1s
+    # after the last beat — well outside this grace.
+    time.sleep(0.2)
+    exit_index = len(beats)
+    # An unstopped replacement (1s interval) would attempt 2 writes in 2.5s.
     time.sleep(2.5)
+    assert len(beats) == exit_index, (
+        f"FB-003: the inline beat ATTEMPTED a heartbeat write after the "
+        f"body exited ({len(beats) - exit_index} post-exit attempt(s)); the "
+        f"store guard masks the stored value, so the ATTEMPT is the defect"
+    )
+    # Additional (masked-safe, non-discriminating) row check.
     row = store.op_get("hb-inline")
     assert row.status == statestore.OP_COMPLETED and \
         row.heartbeat_at == settled, (
@@ -420,11 +460,15 @@ def test_fb003_inline_heartbeat_stops_with_the_body(fb_store):
 def test_fb003_detached_heartbeat_stops_after_body(fb_store, admission_budget):
     """FB-003 acceptance (a)+(d), detached path: a beat fires while the
     runner body is parked; the body then completes and the runner's finally
-    stops the beat chain — no further write may land on the terminal row.
-    RED at base: the finally cancels only the FIRST timer, so the parked
-    beat's replacement fires once after the body exits."""
+    stops the beat chain — NO further heartbeat write may be ATTEMPTED after
+    the body has exited. RED at base: the beat wrote before any stop check
+    and the finally cancelled only the FIRST timer, so the parked beat's
+    replacement fired once after the body exited and attempted a write on
+    the terminal row (masked in the stored value by the store guard; caught
+    here by the spy on the write ATTEMPT)."""
     store = fb_store
     cfg = _ops_cfg(heartbeat_ttl_s=3)
+    beats = _beat_spy(store)
     body = _GatedBody()
     now = store.now()
     handle, ctx = operations.guard_consult(
@@ -439,9 +483,10 @@ def test_fb003_detached_heartbeat_stops_after_body(fb_store, admission_budget):
 
     # A beat must fire while the body is parked mid-flight.
     _wait_until(
-        lambda: store.op_get(op_id).heartbeat_at > now,
+        lambda: beats,
         timeout_s=5.0,
-        message="the detached runner's heartbeat never beat mid-body",
+        message="the detached runner's heartbeat never ATTEMPTED a beat "
+                "mid-body",
     )
     time.sleep(0.3)  # let the beat thread schedule its replacement timer
 
@@ -451,9 +496,28 @@ def test_fb003_detached_heartbeat_stops_after_body(fb_store, admission_budget):
         timeout_s=5.0,
         message="the detached runner never completed its body",
     )
+    # The runner's finally (stop.set + active-timer cancel) runs BEFORE the
+    # _runners deregistration — wait for that deregistration so the exit
+    # point below is provably AFTER the teardown.
+    _wait_until(
+        lambda: op_id not in operations._runners,
+        timeout_s=5.0,
+        message="the detached runner never tore down its beat chain",
+    )
     settled = store.op_get(op_id).heartbeat_at
-    # An unstopped replacement (1s interval) would fire during this window.
+    # Grace for a beat already past the stop check when the finally ran;
+    # base's orphan replacement fires ~1s after the parked beat.
+    time.sleep(0.2)
+    exit_index = len(beats)
+    # An unstopped replacement (1s interval) would attempt a write in 2.5s.
     time.sleep(2.5)
+    assert len(beats) == exit_index, (
+        f"FB-003: the detached runner's beat ATTEMPTED a heartbeat write "
+        f"after the body exited ({len(beats) - exit_index} post-exit "
+        f"attempt(s)); the store guard masks the stored value, so the "
+        f"ATTEMPT is the defect"
+    )
+    # Additional (masked-safe, non-discriminating) row check.
     row = store.op_get(op_id)
     assert row.status == statestore.OP_COMPLETED and \
         row.heartbeat_at == settled, (

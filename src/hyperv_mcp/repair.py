@@ -136,13 +136,46 @@ foreach ($rule in $rules) {{
 # An apply leg that returns without them (a zero-exit, empty-stdout transport
 # parses to {} on the non-pooled path) carries NO action evidence, and the
 # apply-outcome channel must not assert application from nothing. Key
-# PRESENCE is the test — a valid zero-change receipt (replaced=0,
-# enabled_rules=[]) is a receipt, not a missing one.
+# PRESENCE alone is not enough either (wave 3): the VALUES must be usable —
+# {"backup": null, "replaced": null} has every key and certifies nothing —
+# while a valid zero-change receipt (replaced=0, enabled_rules=[]) is a
+# receipt, not a missing one.
 _APPLY_RECEIPT_KEYS: dict[str, tuple[str, ...]] = {
     "rewrite_stale_ssh_bindings": ("backup", "replaced"),
     "start_service": ("service", "status"),
     "enable_existing_firewall_rules": ("port", "enabled_rules"),
 }
+
+
+def _usable_text(value: object) -> bool:
+    """A receipt string that carries evidence: a non-empty string."""
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _usable_count(value: object) -> bool:
+    """A receipt count: an int >= 0 — bool is an int subclass in Python, so
+    True/False (a coerced null/garbage parse) is excluded explicitly."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _receipt_values_usable(action: str, outcome: dict) -> bool:
+    """FB-002 (PR #166 review, wave 3): the action-specific receipt's VALUES
+    must be usable, not merely present. A malformed receipt yields the same
+    disclosed outcome as a missing one; a legitimate zero-change receipt
+    (replaced=0, enabled_rules=[]) stays valid."""
+    if action == "rewrite_stale_ssh_bindings":
+        return _usable_text(outcome.get("backup")) and \
+            _usable_count(outcome.get("replaced"))
+    if action == "start_service":
+        return _usable_text(outcome.get("service")) and \
+            _usable_text(outcome.get("status"))
+    if action == "enable_existing_firewall_rules":
+        port = outcome.get("port")
+        port_ok = _usable_text(port) or (
+            isinstance(port, int) and not isinstance(port, bool)
+        )
+        return port_ok and isinstance(outcome.get("enabled_rules"), list)
+    return True  # unmapped action: key presence (the caller's check) is the contract
 
 
 # -- finding -> action mapping ----------------------------------------------
@@ -525,19 +558,34 @@ def repair_guest_access(
                     cfg, ref.id, item["apply_script"], cred, timeout_ms=90000,
                 )
                 receipt = _APPLY_RECEIPT_KEYS.get(item["action"], ())
-                if not isinstance(outcome, dict) or any(
+                missing = not isinstance(outcome, dict) or any(
                     key not in outcome for key in receipt
-                ):
-                    # FB-002 (PR #166 review): no action-specific receipt —
-                    # the effect is unconfirmed, so the apply-outcome channel
-                    # reports failed instead of asserting application from an
-                    # empty result. The readback below still evaluates the
-                    # observed state independently; it just can never verify
-                    # an unproven apply (verified derives from `applied`).
+                )
+                malformed = (
+                    isinstance(outcome, dict)
+                    and not missing
+                    and not _receipt_values_usable(item["action"], outcome)
+                )
+                if missing or malformed:
+                    # FB-002 (PR #166 review): no USABLE action-specific
+                    # receipt (missing keys, or values that carry no
+                    # evidence — the wave-3 null-values case) — the effect
+                    # is unconfirmed, so the apply-outcome channel reports
+                    # failed instead of asserting application from an empty
+                    # or malformed result. The readback below still
+                    # evaluates the observed state independently; it just
+                    # can never verify an unproven apply (verified derives
+                    # from `applied`).
                     change["apply_outcome"] = "failed"
+                    detail = (
+                        f"the apply leg returned no {item['action']} receipt"
+                        if missing else
+                        f"the {item['action']} receipt is malformed "
+                        "(its values carry no evidence)"
+                    )
                     change["error"] = (
-                        "apply result unavailable; effect unconfirmed: the "
-                        f"apply leg returned no {item['action']} receipt"
+                        "apply result unavailable; effect unconfirmed: "
+                        + detail
                     )
                 else:
                     change["applied"] = True

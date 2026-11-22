@@ -231,6 +231,115 @@ def test_fb002_zero_change_receipt_is_not_missing(monkeypatch):
     assert change["verified"] is False, change
 
 
+def _service_change(out):
+    matches = [c for c in out["changes"] if c["action"] == "start_service"]
+    assert matches, f"expected a start_service change; got {out['changes']!r}"
+    return matches[0]
+
+
+def _firewall_change(out):
+    matches = [c for c in out["changes"]
+               if c["action"] == "enable_existing_firewall_rules"]
+    assert matches, f"expected a firewall change; got {out['changes']!r}"
+    return matches[0]
+
+
+def test_fb002_malformed_receipt_values_are_not_certified(monkeypatch):
+    """FB-002 (PR #166 review, wave 3): the receipt check validated KEYS
+    only, so a malformed receipt ({"backup": null, "replaced": null}) passed
+    and a healthy readback then verified the change — the apply-outcome
+    channel asserted application from a receipt whose values carry no
+    evidence. The action-specific receipt's usable VALUES must be validated
+    while the legitimate zero-change receipt (pinned above) stays valid:
+      (a) rewrite  {"backup": null, "replaced": null}            rejected
+      (d) service  {"service": null, "status": null}             rejected
+          service  {"service": "sshd", "status": "Running"}      valid
+      (e) firewall {"port": null, "enabled_rules": null}         rejected
+    ((b)/(c) and the firewall positive arm are pinned above.)"""
+    cfg = Config(unrestricted=True)
+
+    # (a) rewrite: keys present, values unusable — NOT certified, and a
+    # healthy readback must not rescue it (verified derives from applied).
+    fake = FakePS([
+        _guid_result(),
+        _ok(_host()), _ok(_stale_guest()),
+        _ok({"backup": None, "replaced": None}),  # malformed receipt
+        _ok(_host()), _ok(_guest(listen="10.0.0.5")),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = repair.repair_guest_access(
+        cfg, "test-vm", apply=True, confirm=True, cred=CRED,
+        intended_bindings=["10.0.0.5"],
+    )
+    change = _rewrite_change(out)
+    assert change["apply_outcome"] == "failed", (
+        f"FB-002: a malformed rewrite receipt (null values) must not certify "
+        f"application; got {change!r}"
+    )
+    assert change["applied"] is False, change
+    error = (change.get("error") or "").lower()
+    assert "apply result unavailable" in error and "unconfirmed" in error, (
+        f"FB-002: the malformed receipt must yield the same disclosed "
+        f"unconfirmed outcome as a missing one; got {change!r}"
+    )
+    assert change["verified"] is False, change
+    assert change["postcondition"] == "satisfied", change
+    assert "backup_path" not in out, out
+
+    # (d, negative) start_service: keys present, values unusable.
+    fake = FakePS([
+        _guid_result(),
+        _ok(_host()), _ok(_guest(status="Stopped")),
+        _ok({"service": None, "status": None}),  # malformed receipt
+        _ok(_host()), _ok(_guest(status="Running")),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = repair.repair_guest_access(cfg, "test-vm", apply=True, confirm=True,
+                                     cred=CRED)
+    change = _service_change(out)
+    assert change["apply_outcome"] == "failed" and change["applied"] is False, (
+        f"FB-002: a malformed service receipt (null values) must not certify "
+        f"application; got {change!r}"
+    )
+    assert (change.get("error") or "").lower().find("unconfirmed") >= 0, change
+    assert change["verified"] is False, change
+
+    # (d, positive) start_service: a well-formed receipt still applies and
+    # verifies end to end (the value check must not over-reject).
+    fake = FakePS([
+        _guid_result(),
+        _ok(_host()), _ok(_guest(status="Stopped")),
+        _ok({"service": "sshd", "status": "Running"}),
+        _ok(_host()), _ok(_guest(status="Running")),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = repair.repair_guest_access(cfg, "test-vm", apply=True, confirm=True,
+                                     cred=CRED)
+    change = _service_change(out)
+    assert change["apply_outcome"] == "applied" and change["applied"] is True, (
+        f"FB-002: a well-formed service receipt must still apply; got {change!r}"
+    )
+    assert change["verified"] is True, change
+
+    # (e) firewall: keys present, values unusable.
+    fake = FakePS([
+        _guid_result(),
+        _ok(_host()), _ok(_guest(fw=False)),
+        _ok({"port": None, "enabled_rules": None}),  # malformed receipt
+        _ok(_host()), _ok(_guest(fw=True)),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = repair.repair_guest_access(cfg, "test-vm", apply=True, confirm=True,
+                                     cred=CRED)
+    change = _firewall_change(out)
+    assert change["apply_outcome"] == "failed" and change["applied"] is False, (
+        f"FB-002: a malformed firewall receipt (null values) must not "
+        f"certify application; got {change!r}"
+    )
+    assert (change.get("error") or "").lower().find("unconfirmed") >= 0, change
+    assert change["verified"] is False, change
+
+
 # ---------------------------------------------------------------------------
 # FB-007 — verification certifies only present, requested evidence
 # ---------------------------------------------------------------------------
