@@ -1239,3 +1239,96 @@ def test_fb011_legacy_gen0_baseexception_reconcile_arm_obeys_fence(
         f"reconcile terminalized the newer executor's row (the fail-open "
         f"form): {row.as_dict()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Wave 6 — the INLINE route's pre-body writes (the head-bound mutation
+# transcript reported them still carrying the pre-PR fail-open form; they are
+# the inline twins of the runner sites waves 4/5 already converted)
+# ---------------------------------------------------------------------------
+
+
+def _inline_ctx(cfg, op_id: str, generation: int = 0) -> dict:
+    """The inline route's op-context shape, carrying the CAPTURED generation
+    of the executor that owns the attempt (0 = the legacy shape)."""
+    return {"cfg": cfg, "op_id": op_id, "agent": "", "generation": generation}
+
+
+def test_fb011_legacy_gen0_inline_fail_inline_obeys_fence(ops_store):
+    """FB-011 wave 6 (the inline failure arm, fail-open FORM): the inline
+    route's failure arm is a PRE-BODY write whenever the row is unmarked
+    (pre_body_terminal = not post_send), so a LEGACY generation-0 executor
+    whose row was fenced 0 -> 1 must NOT be able to terminalize the newer
+    executor's row. RED under the single-site form mutation at the inline
+    site (`int(op_ctx.get("generation") or 0) or None` -> the fail-open
+    `or None` dropped: the write lands); GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _fenced_legacy_unmarked_row(store, "fb011k-op")
+    operations.fail_inline(_inline_ctx(cfg, "fb011k-op"),
+                           RuntimeError("interrupted before the send commit"))
+    row = _row_by_idem(store, "fb011k-op")
+    assert row.status == statestore.OP_WORKING and row.generation == 1, (
+        f"FB-011 (wave 6): the INLINE failure arm of a LEGACY generation-0 "
+        f"executor terminalized the newer executor's row (the fail-open "
+        f"form): {row.as_dict()}"
+    )
+
+
+def test_fb011_legacy_gen0_inline_reconcile_obeys_fence(ops_store):
+    """FB-011 wave 6 (the inline reconcile wrapper, fail-open FORM): the
+    inline twin of the runner's BaseException reconcile arm — the inline
+    reconcile terminalizes an UNMARKED row as a definitive pre-send
+    refusal, so it must carry the captured generation as the REAL 0 and be
+    refused. RED under the single-site form mutation at the inline site;
+    GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _fenced_legacy_unmarked_row(store, "fb011l-op")
+    operations.reconcile_interrupted_commit(
+        _inline_ctx(cfg, "fb011l-op"),
+        _Wave5BaseException("interrupted inside the pre-send commit window"),
+    )
+    row = _row_by_idem(store, "fb011l-op")
+    assert row.status == statestore.OP_WORKING and row.generation == 1, (
+        f"FB-011 (wave 6): the INLINE reconcile of a LEGACY generation-0 "
+        f"executor terminalized the newer executor's row (the fail-open "
+        f"form): {row.as_dict()}"
+    )
+
+
+def test_fb011_legacy_gen0_inline_busy_idem_release_obeys_fence(ops_store):
+    """FB-011 wave 6 (the inline busy idempotency release, fail-open FORM):
+    the inline twin of the runner's send-gate busy idem release — a LEGACY
+    generation-0 executor must NOT free the newer executor's idempotency
+    slot (a same-key retry would then dispatch a second time). RED under the
+    single-site form mutation at the inline site; GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _fenced_legacy_unmarked_row(store, "fb011m-op")
+    operations.release_busy_idem(_inline_ctx(cfg, "fb011m-op"))
+    refound = store.op_find_idem("", OP_TOOL, "fb011m-op")
+    assert refound is not None and refound.op_id == "fb011m-op", (
+        f"FB-011 (wave 6): the INLINE busy idempotency release of a LEGACY "
+        f"generation-0 executor freed the newer executor's idempotency slot "
+        f"(the fail-open form) — the attempt is no longer identifiable by "
+        f"its idempotency key: {refound!r}"
+    )
+
+
+def test_fb011_legacy_gen0_inline_busy_terminal_obeys_fence(ops_store):
+    """FB-011 wave 6 (the inline busy terminal, fail-open FORM): the inline
+    twin of the runner's send-gate busy transition — a provably pre-body
+    terminal that CLEARS the send mark, so a LEGACY generation-0 executor
+    must not land it on the newer executor's row. RED under the single-site
+    form mutation at the inline site; GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _fenced_legacy_unmarked_row(store, "fb011n-op")
+    operations.busy_inline(_inline_ctx(cfg, "fb011n-op"), OP_TOOL)
+    row = _row_by_idem(store, "fb011n-op")
+    assert row.status == statestore.OP_WORKING and row.generation == 1, (
+        f"FB-011 (wave 6): the INLINE busy terminal of a LEGACY "
+        f"generation-0 executor landed on the newer executor's row and "
+        f"cleared its send mark (the fail-open form): {row.as_dict()}"
+    )

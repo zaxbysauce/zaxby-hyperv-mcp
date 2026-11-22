@@ -1030,7 +1030,13 @@ def reconcile_interrupted_commit(op_ctx: dict[str, Any], exc: BaseException) -> 
         _reconcile_interrupted_commit_core(
             store_for(op_ctx["cfg"]), op_ctx["cfg"], op_ctx["op_id"],
             str(op_ctx.get("agent") or ""),
-            int(op_ctx.get("generation") or 0) or None, exc)
+            # FB-011 wave 6 (PR #166): the inline route's reconcile
+            # wrapper is a PRE-BODY write (the inline twin of the
+            # runner's BaseException reconcile arm), so it carries the
+            # captured generation in the fail-closed form — the
+            # fail-open `or None` meant "no generation predicate" at
+            # captured generation 0 (the legacy shape).
+            int(op_ctx.get("generation") or 0), exc)
     except Exception:
         pass
 
@@ -1046,7 +1052,10 @@ def fail_inline(op_ctx: dict[str, Any], exc: BaseException) -> None:
     try:
         cfg: Config = op_ctx["cfg"]
         agent = str(op_ctx.get("agent") or "")
-        generation = int(op_ctx.get("generation") or 0) or None
+        # FB-011 wave 6 (PR #166): the inline failure arm is a
+        # PRE-BODY write whenever the row is unmarked
+        # (pre_body_terminal=not post_send) — fail-closed generation.
+        generation = int(op_ctx.get("generation") or 0)
         store = store_for(cfg)
         row = store.op_get(op_ctx["op_id"])
         post_send = bool(
@@ -1090,7 +1099,7 @@ def release_busy_idem(op_ctx: dict[str, Any]) -> None:
     try:
         store_for(op_ctx["cfg"]).op_release_idem(
             op_ctx["op_id"],
-            generation=int(op_ctx.get("generation") or 0) or None,
+            generation=int(op_ctx.get("generation") or 0),
         )
     except Exception:
         pass
@@ -1110,7 +1119,7 @@ def busy_inline(op_ctx: dict[str, Any], name: str) -> None:
             error_class="busy",
             result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
             updated_at=store.now(),
-            generation=int(op_ctx.get("generation") or 0) or None,
+            generation=int(op_ctx.get("generation") or 0),
             pre_body_terminal=True,
         )
         emit(op_ctx["cfg"], "op.failed", op_ctx["op_id"], "",
