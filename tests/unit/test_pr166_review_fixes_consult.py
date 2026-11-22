@@ -36,6 +36,24 @@ the attempt by its IDEMPOTENCY KEY (op_find_idem), never by the op context.
   test_fb011_commit_failure_arm_obeys_fence            — RED before the wave-4 fix
   test_fb011_send_gate_busy_arm_obeys_fence            — RED before the wave-4 fix
 
+FB-011 wave 5 (verification transcript, the honest gap) — the wave-4 pins all
+drive executors with captured generation=1, where the fail-open FORM
+(`generation or None` / `int(generation or 0) or None`) still guards (1 stays
+1). The form only opens at captured generation 0/None — a LEGACY generation-0
+executor (the v6 migration shape) on a row fenced 0 -> 1 — which no shipped
+pin drove. Each wave-5 pin drives exactly that legacy path through every
+pre-body arm (both AdmissionStopped cancels, the send-gate busy terminal AND
+its op_release_idem, the pre-send commit-failure terminal, and the previously
+un-pinned _admission_refusal transition AND its op_release_idem), identifying
+the attempt by its IDEMPOTENCY KEY. RED under the single-site form mutation
+at each named site; GREEN at head.
+
+  test_fb011_legacy_gen0_admission_stopped_cancel_obeys_fence
+  test_fb011_legacy_gen0_grant_window_stop_cancel_obeys_fence
+  test_fb011_legacy_gen0_send_gate_busy_arm_obeys_fence
+  test_fb011_legacy_gen0_commit_failure_arm_obeys_fence
+  test_fb011_legacy_gen0_admission_refusal_obeys_fence
+
 FB-012 (HIGH, probe-confirmed) — _classify_stale's read-time terminal write
 had NO generation predicate, so a read path terminalized a row a newer
 executor held (probe: a classifiable WORKING row fenced gen 1 -> 2 was written
@@ -951,3 +969,273 @@ def test_fb014_reconsult_residue_fence_failure_is_traced(
         )
     _fb014_trace(store, audit_sink, "fb014-s6", "transport")
 
+
+# ---------------------------------------------------------------------------
+# Wave 5 — FB-011's fail-open FORM: the LEGACY generation-0 executor
+# (verification transcript: every shipped pin drives generation=1, where
+# `generation or None` still guards; the form only opens at 0/None)
+# ---------------------------------------------------------------------------
+
+
+def _fenced_legacy_row(store, op_id: str) -> None:
+    """FB-011 wave 5 fixture — the LEGACY twin of _fenced_marked_row: a row in
+    the v6 migration's shape (stored generation IS 0, blank pre-fingerprint
+    params_hmac) whose authority a replacement executor has TAKEN (fence
+    0 -> 1) and whose NEWER executor committed its send (send_state
+    'possibly_sent' at generation 1). The captured executor still holds
+    generation 0 — the ONLY value at which the fail-open FORM
+    (`generation or None` / `int(generation or 0) or None`) degrades to a
+    MISSING predicate (0 -> None = no generation guard) instead of the real
+    0 the fail-closed form writes. The row carries idem_key=op_id so every
+    pin identifies the attempt by its IDEMPOTENCY KEY (op_find_idem), never
+    by the op context."""
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id=op_id, tool=OP_TOOL, agent="", vm_name="fb011-vm",
+        status=statestore.OP_WORKING, created_at=now, updated_at=now,
+        runner="fb011-legacy", heartbeat_at=now, idem_key=op_id,
+        params_hmac="", generation=0,
+    ))
+    assert store.op_fence(op_id) == 1  # authority moved: 0 -> 1 (legacy row)
+    assert store.op_mark_send(op_id, 1) is True  # the newer executor sent
+    row = store.op_get(op_id)
+    assert row.generation == 1 and row.send_state == "possibly_sent", (
+        f"FB-011 fixture premise: {row.as_dict()}"
+    )
+
+
+def test_fb011_legacy_gen0_admission_stopped_cancel_obeys_fence(
+        ops_store, admission_env):
+    """FB-011 wave 5 (mid-park AdmissionStopped arm, fail-open FORM): a LEGACY
+    generation-0 executor whose row was fenced 0 -> 1 (the newer executor
+    already committed its send) hits the mid-park AdmissionStopped arm — the
+    captured generation must ride the cancelled transition as the REAL 0, so
+    the write is refused. RED under the transcript's form mutation at the
+    mid-park site (`generation=int(generation or 0)` -> `generation or None`:
+    0 or None = None = no predicate — the cancel lands on the newer
+    executor's row and clears its send mark); GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _fenced_legacy_row(store, "fb011e-op")
+
+    stop = threading.Event()
+    stop.set()  # admit_sync observes the stop on its first tick -> AdmissionStopped
+    _run_body_isolated(
+        cfg, "fb011e-op", OP_TOOL, _NoDispatchTool(),
+        {"vm_name": "fb011-vm"}, "", store, stop, generation=0,
+    )
+    row = _row_by_idem(store, "fb011e-op")
+    assert row.status == statestore.OP_WORKING and row.generation == 1 \
+        and row.send_state == "possibly_sent", (
+            f"FB-011 (wave 5): a LEGACY generation-0 executor's mid-park "
+            f"AdmissionStopped cancel landed on the newer executor's row "
+            f"(the fail-open form): {row.as_dict()}"
+        )
+
+
+def test_fb011_legacy_gen0_grant_window_stop_cancel_obeys_fence(
+        ops_store, admission_env, monkeypatch):
+    """FB-011 wave 5 (the grant-to-pop-window twin of the AdmissionStopped
+    arm, fail-open FORM): the ticket was granted, the stop signalled inside
+    the grant-to-pop window, and the legacy generation-0 executor's row was
+    fenced 0 -> 1 with the newer executor's send committed — the was_stopped
+    cancelled transition must carry the REAL captured 0 and be refused. RED
+    under the single-site form mutation at the grant-window site
+    (`generation or None`); GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _fenced_legacy_row(store, "fb011f-op")
+
+    stop = threading.Event()
+    ticket = SimpleNamespace(_waiter=None, _ctx_token=None)
+
+    def _fake_admit_sync(*args, **kwargs):
+        # Grant, then the cancel lands before the park-window pop observes it.
+        stop.set()
+        return ticket
+
+    monkeypatch.setattr(admission, "admit_sync", _fake_admit_sync)
+    _run_body_isolated(
+        cfg, "fb011f-op", OP_TOOL, _NoDispatchTool(),
+        {"vm_name": "fb011-vm"}, "", store, stop, generation=0,
+    )
+    row = _row_by_idem(store, "fb011f-op")
+    assert row.status == statestore.OP_WORKING and row.generation == 1 \
+        and row.send_state == "possibly_sent", (
+            f"FB-011 (wave 5): the grant-to-pop-window stop cancel of a "
+            f"LEGACY generation-0 executor landed on the newer executor's "
+            f"row (the fail-open form): {row.as_dict()}"
+        )
+
+
+def test_fb011_legacy_gen0_send_gate_busy_arm_obeys_fence(
+        ops_store, admission_env, monkeypatch):
+    """FB-011 wave 5 (send-gate busy arm, fail-open FORM — the transition AND
+    its op_release_idem): a LEGACY generation-0 executor on a row fenced
+    0 -> 1 whose newer executor committed its send fails the send-gate
+    acquisition — its busy terminal and its idem release must both carry the
+    REAL captured 0 and be refused: the write must not land on (nor clear the
+    send mark of) the newer executor's row, and the release must not free the
+    newer row's idempotency slot. RED under the single-site form mutation at
+    EITHER the busy-transition site or the op_release_idem site of this arm
+    (`generation or None` — the transition mutation flips the row to the busy
+    envelope, the release mutation frees the key while the row stays
+    working); GREEN at head. Identified by idempotency key."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _fenced_legacy_row(store, "fb011g-op")
+    monkeypatch.setattr(operations, "_send_gate_acquire",
+                        lambda arguments, blocking=True: False)
+    _run_body_isolated(
+        cfg, "fb011g-op", OP_TOOL, _NoDispatchTool(),
+        {"vm_name": "fb011-vm"}, "", store, threading.Event(), generation=0,
+    )
+    refound = store.op_find_idem("", OP_TOOL, "fb011g-op")
+    assert refound is not None and refound.op_id == "fb011g-op", (
+        "FB-011 (wave 5): the LEGACY executor's busy-arm idem release freed "
+        "the newer executor's idempotency slot (the fail-open form) — the "
+        "attempt is no longer identifiable by its idempotency key"
+    )
+    row = _row_by_idem(store, "fb011g-op")
+    assert row.status == statestore.OP_WORKING and row.generation == 1 \
+        and row.send_state == "possibly_sent", (
+            f"FB-011 (wave 5): a LEGACY generation-0 executor's send-gate "
+            f"busy pre-body write landed on the newer executor's row (the "
+            f"fail-open form): {row.as_dict()}"
+        )
+
+
+def test_fb011_legacy_gen0_commit_failure_arm_obeys_fence(
+        ops_store, admission_env):
+    """FB-011 wave 5 (pre-send commit-failure arm, fail-open FORM): the arm a
+    fenced executor actually takes — commit_send_intent fails precisely
+    because op_mark_send is generation-validated — driven by a LEGACY
+    generation-0 executor on a row fenced 0 -> 1 whose newer executor
+    committed its send: the failure terminal must carry the REAL captured 0
+    and be refused (it must not land on the newer executor's row nor clear
+    its send mark). RED under the transcript's form mutation at the
+    commit-failure site (`generation or None`); GREEN at head. This is the
+    in-repo form of the verification transcript's out-of-repo probe
+    (fb011-failopen-ornone-commit-failure), identified by idempotency key."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _fenced_legacy_row(store, "fb011h-op")
+    _run_body_isolated(
+        cfg, "fb011h-op", OP_TOOL, _NoDispatchTool(),
+        {"vm_name": "fb011-vm"}, "", store, threading.Event(), generation=0,
+    )
+    row = _row_by_idem(store, "fb011h-op")
+    assert row.status == statestore.OP_WORKING and row.generation == 1 \
+        and row.send_state == "possibly_sent", (
+            f"FB-011 (wave 5): a LEGACY generation-0 executor's "
+            f"commit-failure pre-body write landed on the newer executor's "
+            f"row and cleared its send mark (the fail-open form): "
+            f"{row.as_dict()}"
+        )
+
+
+def test_fb011_legacy_gen0_admission_refusal_obeys_fence(
+        ops_store, admission_env, monkeypatch):
+    """FB-011 wave 5 (the _admission_refusal arm — previously covered by NO
+    pin — its busy transition AND its op_release_idem, fail-open FORM): a
+    LEGACY generation-0 executor on a row fenced 0 -> 1 whose newer executor
+    committed its send is refused by the admission park — the runner-side
+    _admission_refusal terminal and its idem release must both carry the REAL
+    captured 0 and be refused: the busy terminal must not land on the newer
+    executor's row, and the release must not free its idempotency slot. RED
+    under the transcript's form mutation at EITHER _admission_refusal site
+    (`int(generation or 0)` -> `int(generation or 0) or None` — the transition
+    mutation flips the row to the busy envelope, the op_release_idem
+    mutation frees the key while the row stays working); GREEN at head. This
+    is the in-repo form of the transcript's out-of-repo probe
+    (fb011-m5-admission-refusal-failopen-legacy0), identified by idempotency
+    key."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _fenced_legacy_row(store, "fb011i-op")
+
+    def _busy_park(*args, **kwargs):
+        raise admission.AdmissionBusy(250.0)
+
+    monkeypatch.setattr(admission, "admit_sync", _busy_park)
+    _run_body_isolated(
+        cfg, "fb011i-op", OP_TOOL, _NoDispatchTool(),
+        {"vm_name": "fb011-vm"}, "", store, threading.Event(), generation=0,
+    )
+    refound = store.op_find_idem("", OP_TOOL, "fb011i-op")
+    assert refound is not None and refound.op_id == "fb011i-op", (
+        "FB-011 (wave 5): the LEGACY executor's _admission_refusal idem "
+        "release freed the newer executor's idempotency slot (the fail-open "
+        "form) — the attempt is no longer identifiable by its idempotency key"
+    )
+    row = _row_by_idem(store, "fb011i-op")
+    assert row.status == statestore.OP_WORKING and row.generation == 1 \
+        and row.send_state == "possibly_sent", (
+            f"FB-011 (wave 5): a LEGACY generation-0 executor's "
+            f"_admission_refusal busy terminal landed on the newer "
+            f"executor's row (the fail-open form): {row.as_dict()}"
+        )
+
+
+class _Wave5BaseException(BaseException):
+    """FB-011 wave 5: a BaseException that is NOT an Exception, so the commit
+    window's `except Exception` arm does not take it and the BaseException
+    reconcile arm does."""
+
+
+def _fenced_legacy_unmarked_row(store, op_id: str) -> None:
+    """FB-011 wave 5 fixture: the UNMARKED twin of _fenced_legacy_row — a
+    legacy generation-0 row whose authority a replacement executor has taken
+    (fence 0 -> 1) but whose send mark is EMPTY (nothing was dispatched).
+    The BaseException reconcile arm reconciles UNMARKED rows only (a marked
+    row keeps its protected unknown identity and is left alone), so this is
+    the only shape that reaches its transition."""
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id=op_id, tool=OP_TOOL, agent="", vm_name="fb011-vm",
+        status=statestore.OP_WORKING, created_at=now, updated_at=now,
+        runner="fb011-legacy-u", heartbeat_at=now, idem_key=op_id,
+        params_hmac="", generation=0,
+    ))
+    assert store.op_fence(op_id) == 1  # authority moved: 0 -> 1 (legacy row)
+    row = store.op_get(op_id)
+    assert row.generation == 1 and row.send_state == "", (
+        f"FB-011 wave 5 fixture premise: {row.as_dict()}"
+    )
+
+
+def test_fb011_legacy_gen0_baseexception_reconcile_arm_obeys_fence(
+        ops_store, admission_env, monkeypatch):
+    """FB-011 wave 5 (the BaseException reconcile arm, fail-open FORM): a
+    BaseException escaping the pre-send commit window reaches the reconcile
+    arm, which terminalizes the UNMARKED row as a definitive pre-send
+    refusal. A LEGACY generation-0 executor whose row was fenced 0 -> 1 must
+    NOT be able to terminalize the newer executor's row: the reconcile core
+    must receive the captured generation as the REAL 0 (the fail-closed
+    form), so its generation-validated transition is refused. RED under the
+    single-site form mutation at the reconcile call site
+    (`int(generation or 0)` -> `generation or None`: 0 or None = None = no
+    predicate, and the reconcile lands on the newer executor's row); GREEN
+    at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _fenced_legacy_unmarked_row(store, "fb011j-op")
+
+    def _boom(_cfg):
+        raise _Wave5BaseException(
+            "interrupted inside the pre-send commit window")
+
+    monkeypatch.setattr(operations, "commit_send_intent", _boom)
+    # The outer BaseException handler CLASSIFIES the interruption (it does
+    # not re-raise it), so the observable is the ROW, not the escape.
+    _run_body_isolated(
+        cfg, "fb011j-op", OP_TOOL, _NoDispatchTool(),
+        {"vm_name": "fb011-vm"}, "", store, threading.Event(),
+        generation=0,
+    )
+    row = _row_by_idem(store, "fb011j-op")
+    assert row.status == statestore.OP_WORKING and row.generation == 1, (
+        f"FB-011 (wave 5): a LEGACY generation-0 executor's BaseException "
+        f"reconcile terminalized the newer executor's row (the fail-open "
+        f"form): {row.as_dict()}"
+    )

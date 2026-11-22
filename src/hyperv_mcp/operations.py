@@ -1669,7 +1669,17 @@ def _execute_body(
             error_class=statestore.OP_UNKNOWN if marked else str(
                 env.get("error_class") or "transport"),
             result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
-            generation=generation or None,
+            # FB-011 wave 5: this outer terminal is ALSO a pre-body write
+            # whenever the exception escaped the pre-send commit window (the
+            # reconcile arm re-raises it), so it carries the captured
+            # generation in the fail-closed form like every other pre-body
+            # write. The fail-open form (`generation or None`) degraded to
+            # "no generation predicate" at captured generation 0 — the legacy
+            # shape — and let a legacy executor's terminal land on a newer
+            # executor's row. Behaviour-neutral for every captured generation
+            # >= 1 (the only shape the current code produces: rows are minted
+            # with op_next_generation), fail-closed at 0.
+            generation=int(generation or 0),
         )
     finally:
         # issue #131 (PC4-1): every runner terminal outcome that skipped
