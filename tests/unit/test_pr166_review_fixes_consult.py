@@ -1332,3 +1332,85 @@ def test_fb011_legacy_gen0_inline_busy_terminal_obeys_fence(ops_store):
         f"generation-0 executor landed on the newer executor's row and "
         f"cleared its send mark (the fail-open form): {row.as_dict()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Wave 7 — a REFUSED transition must not emit a terminal event (the
+# verification reviewer's finding against the wave-6 head)
+# ---------------------------------------------------------------------------
+
+
+def _failed_events(store, op_id: str) -> list:
+    return [e for e in store.events_after("", 0)
+            if e["ref_id"] == op_id and e["kind"] == "op.failed"]
+
+
+def test_fb011_fenced_inline_reconcile_emits_no_terminal_event(ops_store):
+    """FB-011 wave 7 (the shared reconciliation core): a LEGACY
+    generation-0 executor's inline reconcile is REFUSED by the generation
+    fence (the wave-6 change) — and a refused transition must NOT publish a
+    terminal event: the event would otherwise report a failure against the
+    newer executor's still-working handle. RED under the single-site
+    mutation (the unconditional emit); GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _fenced_legacy_unmarked_row(store, "fb011o-op")
+    operations.reconcile_interrupted_commit(
+        _inline_ctx(cfg, "fb011o-op"),
+        _Wave5BaseException("interrupted inside the pre-send commit window"),
+    )
+    row = _row_by_idem(store, "fb011o-op")
+    assert row.status == statestore.OP_WORKING and row.generation == 1, (
+        f"FB-011 (wave 7): the inline reconcile terminalized the newer "
+        f"executor's row: {row.as_dict()}"
+    )
+    assert not _failed_events(store, "fb011o-op"), (
+        f"FB-011 (wave 7): the REFUSED inline reconcile still published a "
+        f"terminal event against the newer executor's working handle: "
+        f"{_failed_events(store, 'fb011o-op')!r}"
+    )
+
+
+def test_fb011_fenced_inline_fail_inline_emits_no_terminal_event(ops_store):
+    """FB-011 wave 7 (the inline failure arm): a LEGACY generation-0
+    executor's inline failure arm is REFUSED by the generation fence, and
+    must not publish a terminal event against the newer executor's
+    still-working handle. RED under the single-site mutation (the
+    unconditional emit); GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _fenced_legacy_unmarked_row(store, "fb011p-op")
+    operations.fail_inline(_inline_ctx(cfg, "fb011p-op"),
+                           RuntimeError("interrupted before the send commit"))
+    row = _row_by_idem(store, "fb011p-op")
+    assert row.status == statestore.OP_WORKING and row.generation == 1, (
+        f"FB-011 (wave 7): the inline failure arm terminalized the newer "
+        f"executor's row: {row.as_dict()}"
+    )
+    assert not _failed_events(store, "fb011p-op"), (
+        f"FB-011 (wave 7): the REFUSED inline failure arm still published a "
+        f"terminal event against the newer executor's working handle: "
+        f"{_failed_events(store, 'fb011p-op')!r}"
+    )
+
+
+def test_fb011_fenced_inline_busy_emits_no_terminal_event(ops_store):
+    """FB-011 wave 7 (the inline busy terminal): a LEGACY generation-0
+    executor's inline busy terminal is REFUSED by the generation fence, and
+    must not publish a terminal event against the newer executor's
+    still-working handle. RED under the single-site mutation (the
+    unconditional emit); GREEN at head."""
+    store = ops_store
+    cfg = Config(unrestricted=True)
+    _fenced_legacy_unmarked_row(store, "fb011q-op")
+    operations.busy_inline(_inline_ctx(cfg, "fb011q-op"), OP_TOOL)
+    row = _row_by_idem(store, "fb011q-op")
+    assert row.status == statestore.OP_WORKING and row.generation == 1, (
+        f"FB-011 (wave 7): the inline busy terminal terminalized the newer "
+        f"executor's row: {row.as_dict()}"
+    )
+    assert not _failed_events(store, "fb011q-op"), (
+        f"FB-011 (wave 7): the REFUSED inline busy terminal still published "
+        f"a terminal event against the newer executor's working handle: "
+        f"{_failed_events(store, 'fb011q-op')!r}"
+    )

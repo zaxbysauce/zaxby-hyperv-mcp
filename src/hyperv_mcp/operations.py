@@ -1007,7 +1007,7 @@ def _reconcile_interrupted_commit_core(
         env = errors.envelope(exc)
         env["note"] = "interrupted before the send commit; nothing was dispatched"
         text = json.dumps(env, separators=(",", ":"))
-        store.op_transition(
+        moved = store.op_transition(
             op_id, (statestore.OP_WORKING,), statestore.OP_FAILED,
             error_class=statestore.OP_INTERRUPTED,
             result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
@@ -1015,8 +1015,15 @@ def _reconcile_interrupted_commit_core(
             generation=generation,
             pre_body_terminal=True,
         )
-        emit(cfg, "op.failed", op_id, "", agent,
-             {"error_class": statestore.OP_INTERRUPTED})
+        # FB-011 wave 7 (PR #166): the terminal event follows the TRANSITION
+        # — a transition REFUSED by the generation fence (a fenced
+        # executor's write) must not publish a false terminal event against
+        # the newer executor's working handle. The runner's _safe_transition
+        # has always emitted only when the row MOVED; the inline path now
+        # matches it.
+        if moved:
+            emit(cfg, "op.failed", op_id, "", agent,
+                 {"error_class": statestore.OP_INTERRUPTED})
     except Exception:
         pass
 
@@ -1072,7 +1079,7 @@ def fail_inline(op_ctx: dict[str, Any], exc: BaseException) -> None:
         else:
             error_class = str(env.get("error_class") or "transport")
         text = json.dumps(env, separators=(",", ":"))
-        store.op_transition(
+        moved = store.op_transition(
             op_ctx["op_id"], (statestore.OP_WORKING, statestore.OP_FAILED),
             statestore.OP_FAILED,
             error_class=error_class,
@@ -1080,8 +1087,12 @@ def fail_inline(op_ctx: dict[str, Any], exc: BaseException) -> None:
             updated_at=store.now(), generation=generation,
             pre_body_terminal=not post_send,
         )
-        emit(cfg, "op.failed", op_ctx["op_id"], "", agent,
-             {"error_class": env.get("error_class")})
+        # FB-011 wave 7 (PR #166): emit only when the transition MOVED — a
+        # fenced executor's refused write must not publish a false terminal
+        # event against the newer executor's working handle.
+        if moved:
+            emit(cfg, "op.failed", op_ctx["op_id"], "", agent,
+                 {"error_class": env.get("error_class")})
     except Exception:
         pass
 
@@ -1114,7 +1125,7 @@ def busy_inline(op_ctx: dict[str, Any], name: str) -> None:
         store = store_for(op_ctx["cfg"])
         env = _busy_envelope(name)
         text = json.dumps(env, separators=(",", ":"), default=str)
-        store.op_transition(
+        moved = store.op_transition(
             op_ctx["op_id"], (statestore.OP_WORKING,), statestore.OP_FAILED,
             error_class="busy",
             result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
@@ -1122,9 +1133,13 @@ def busy_inline(op_ctx: dict[str, Any], name: str) -> None:
             generation=int(op_ctx.get("generation") or 0),
             pre_body_terminal=True,
         )
-        emit(op_ctx["cfg"], "op.failed", op_ctx["op_id"], "",
-             str(op_ctx.get("agent") or ""),
-             {"error_class": "busy", "mode": "inline"})
+        # FB-011 wave 7 (PR #166): emit only when the transition MOVED — a
+        # fenced executor's refused write must not publish a false terminal
+        # event against the newer executor's working handle.
+        if moved:
+            emit(op_ctx["cfg"], "op.failed", op_ctx["op_id"], "",
+                 str(op_ctx.get("agent") or ""),
+                 {"error_class": "busy", "mode": "inline"})
     except Exception:
         pass
 

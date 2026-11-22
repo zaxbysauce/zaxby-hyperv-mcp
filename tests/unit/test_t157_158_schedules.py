@@ -3590,3 +3590,122 @@ def test_tf002_change_record_carries_postcondition_on_unobserved_paths(
         f"TF-002 (b): the postcondition must come from the frozen "
         f"vocabulary; got {change_b!r}"
     )
+
+
+def test_tf002_each_unobserved_arm_is_individually_pinned(monkeypatch):
+    """TF-002 wave 7: the three UNOBSERVED arms write the SAME postcondition
+    value ("unknown") as the change record's init seed, so a pin that
+    asserts only the channel's presence cannot see an arm's absence — the
+    seed masks it. Each arm writes its OWN marker; this pin asserts each
+    marker, so a single-site mutation of ANY arm is RED on its own
+    assertion:
+      arm A — the non-positive observation arm: the verify detail must name
+        the observation;
+      arm B — the readback-fields-unusable arm: the postcondition detail
+        must carry readback_fields_usable=False;
+      arm C — the verify-leg exception arm: the verify detail must name the
+        verification failure.
+    """
+    cfg = Config(unrestricted=True)
+
+    def _stale():
+        guest = _guest(listen="192.168.50.20")
+        guest["ssh"]["listeners"] = [{"address": "192.168.50.20", "port": 22}]
+        return guest
+
+    def _rewrite(out):
+        matches = [c for c in out["changes"]
+                   if c["action"] == "rewrite_stale_ssh_bindings"]
+        assert matches, f"expected the rewrite change; got {out['changes']!r}"
+        return matches[0]
+
+    # --- arm A: the non-positive observation arm ---------------------------
+    errored = _guest(listen="192.168.50.20")
+    errored["ssh"] = {"error": "probe leg failed"}
+    fake_a = FakePS([
+        _guid_result(),
+        _ok(_host()), _ok(_stale()),
+        _ok({"backup": "C:/tf002w-a.bak", "replaced": 1}),
+        _ok(_host()), _ok(errored),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake_a)
+    out_a = repair.repair_guest_access(
+        cfg, "test-vm", apply=True, confirm=True, cred=CRED,
+        intended_bindings=["10.0.0.5"],
+    )
+    change_a = _rewrite(out_a)
+    assert change_a["observation"] == "partial", (
+        f"TF-002 (wave 7, arm A) premise: the errored section must make the "
+        f"observation partial; got {change_a!r}"
+    )
+    assert "verification observation partial" in change_a["verify_detail"], (
+        f"TF-002 (wave 7, arm A): the non-positive observation arm did not "
+        f"record WHICH observation it saw — its own marker is missing, so a "
+        f"mutation that removes the arm cannot be seen: {change_a!r}"
+    )
+
+    # --- arm B: the readback-fields-unusable arm ---------------------------
+    unreadable = _guest(listen="192.168.50.20")
+    unreadable["ssh"] = {"config_listen": None, "listeners": None}
+    fake_b = FakePS([
+        _guid_result(),
+        _ok(_host()), _ok(_stale()),
+        _ok({"backup": "C:/tf002w-b.bak", "replaced": 1}),
+        _ok(_host()), _ok(unreadable),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake_b)
+    out_b = repair.repair_guest_access(
+        cfg, "test-vm", apply=True, confirm=True, cred=CRED,
+        intended_bindings=["10.0.0.5"],
+    )
+    change_b = _rewrite(out_b)
+    assert change_b["postcondition"] == "unknown", (
+        f"TF-002 (wave 7, arm B) premise: an unusable readback must yield "
+        f"unknown; got {change_b!r}"
+    )
+    detail = change_b.get("postcondition_detail")
+    assert isinstance(detail, dict) and \
+        detail.get("readback_fields_usable") is False, (
+        f"TF-002 (wave 7, arm B): the readback-fields arm did not record "
+        f"THAT the readback fields were unusable — its own marker is "
+        f"missing, so a mutation that removes the arm cannot be seen: "
+        f"{change_b!r}"
+    )
+
+    # --- arm C: the verify-leg exception arm -------------------------------
+    # The arm is reached when the VERIFY LEG ITSELF raises (the whole
+    # verification phase is guarded) — no shipped guest scenario reaches it,
+    # so the leg is made to raise at its own seam.
+    fake_c = FakePS([
+        _guid_result(),
+        _ok(_host()), _ok(_stale()),
+        _ok({"backup": "C:/tf002w-c.bak", "replaced": 1}),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake_c)
+
+    # The PLAN phase also diagnoses; only the VERIFY leg must raise (the
+    # verification phase is the guarded one).
+    real_diagnose = diagnostics.diagnose_report
+    calls = {"n": 0}
+
+    def _raising_diagnose(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("verify transport down")
+        return real_diagnose(*args, **kwargs)
+
+    monkeypatch.setattr(diagnostics, "diagnose_report", _raising_diagnose)
+    out_c = repair.repair_guest_access(
+        cfg, "test-vm", apply=True, confirm=True, cred=CRED,
+        intended_bindings=["10.0.0.5"],
+    )
+    change_c = _rewrite(out_c)
+    assert change_c["observation"] == "unavailable", (
+        f"TF-002 (wave 7, arm C) premise: the raised verify leg must be "
+        f"recorded unavailable; got {change_c!r}"
+    )
+    assert "verification unavailable" in change_c["verify_detail"], (
+        f"TF-002 (wave 7, arm C): the verify-leg exception arm did not "
+        f"record the verification failure — its own marker is missing, so a "
+        f"mutation that removes the arm cannot be seen: {change_c!r}"
+    )

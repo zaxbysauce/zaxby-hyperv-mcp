@@ -754,3 +754,79 @@ def test_fb003_tasks_route_ignores_a_late_heartbeat_on_a_resolved_row(
             operations.drain_for_tests(timeout_s=10.0)
     finally:
         store.close()
+
+
+def test_fb003_teardown_protections_are_each_live(fb_store, monkeypatch):
+    """FB-003 wave 7: the teardown's TWO protections are each individually
+    observable, so a single-site mutation of EITHER one is RED on its own
+    assertion.
+
+    (1) the owner's cancel of the ACTIVE timer: the most recently
+    scheduled timer — the one actually armed — must be the one cancelled.
+    The single-site mutation is `active[0] = t` becoming `active.append(t)`:
+    the armed timer stays the FIRST one, the cancel misses the replacement,
+    and the base's orphan replacement fires after the body exits.
+    (2) the beat's PRE-WRITE stop check: invoking the captured beat
+    callback AFTER the stop must attempt NO heartbeat write. The
+    single-site mutation is the removal of the check — with it gone the
+    callback writes, and only the store's status guard hides it.
+
+    Both assertions are RED under their own single-site mutation; the
+    whole-invariant pin stays GREEN under either (each protection alone
+    enforces the invariant), which is exactly why they are equivalent
+    mutants rather than dead code."""
+    store = fb_store
+    cfg = _ops_cfg(heartbeat_ttl_s=3)  # beat interval = max(1.0, 3/3) = 1.0s
+    beats = _beat_spy(store)
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id="hb-both", tool=OP_TOOL, agent="", status=statestore.OP_WORKING,
+        created_at=now, updated_at=now, runner="sync-bb",
+        heartbeat_at=now, generation=7,
+    ))
+
+    # Capture every timer the heartbeat chain schedules, and whether each was
+    # cancelled — the two seams this pin observes.
+    scheduled: list = []
+
+    class _CapturingTimer(threading.Timer):
+        def __init__(self, interval, function, *args, **kwargs):
+            super().__init__(interval, function, *args, **kwargs)
+            self.cancelled = False
+            scheduled.append(self)
+
+        def cancel(self):
+            self.cancelled = True
+            super().cancel()
+
+    monkeypatch.setattr(operations.threading, "Timer", _CapturingTimer)
+
+    op_ctx = {"cfg": cfg, "op_id": "hb-both", "agent": "", "generation": 7}
+    stop = operations.start_inline_heartbeat(op_ctx)
+    try:
+        _wait_until(
+            lambda: len(scheduled) >= 2,
+            timeout_s=5.0,
+            message="the inline heartbeat never scheduled its replacement timer",
+        )
+    finally:
+        stop()
+
+    # (1) the cancel: the ARMED timer (the most recently scheduled one) must
+    # be the one cancelled.
+    armed = scheduled[-1]
+    assert armed.cancelled, (
+        "FB-003 (wave 7): the teardown did NOT cancel the ARMED timer "
+        "(the most recently scheduled one) — a parked replacement can fire "
+        "after the body exits"
+    )
+
+    # (2) the pre-write check: invoking the captured callback after the stop
+    # must attempt NO write.
+    beats_before = len(beats)
+    armed.function()  # the beat callback, invoked directly after the stop
+    assert len(beats) == beats_before, (
+        f"FB-003 (wave 7): the beat's PRE-WRITE stop check did not hold — "
+        f"the callback attempted a heartbeat write after the stop "
+        f"({len(beats) - beats_before} attempt(s))"
+    )
