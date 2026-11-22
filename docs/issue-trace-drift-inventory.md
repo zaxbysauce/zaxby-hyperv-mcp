@@ -122,7 +122,7 @@ wave's bookkeeping and is never a gate failure.
 ### 74-72-88-cost-latency-accounting (exit 1)
 
 - `CHANGED src/hyperv_mcp/server.py c26d7ea1d88746e7cb2c01728765758a78ce7611 a2379844d5c3c51194d8d265e4a936175f5cbddb (C10)`
-- `CHANGED README.md e1a9e82e76cba7423e66bea0c2e2fa04c23270ca f6566334d4ac9242f9d7a6800d6b3e9c1cfa4011 (C10)`
+- `CHANGED README.md e1a9e82e76cba7423e66bea0c2e2fa04c23270ca f9f631bfb6609063076f17e5171b798aa730be99 (C10)`
 
 ### issue-16-tool-concurrency (exit 1)
 
