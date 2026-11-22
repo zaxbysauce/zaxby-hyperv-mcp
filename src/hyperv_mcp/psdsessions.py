@@ -184,10 +184,10 @@ class _Entry:
     """One pooled session: its worker, its checkout state and its idle clock."""
 
     __slots__ = ("key", "worker", "in_use", "last_used", "doomed", "open_ms",
-                 "cred_fp")
+                 "cred_fp", "durable_epoch")
 
     def __init__(self, key: SessionKey, worker: Any, open_ms: int | None = None,
-                 cred_fp: str = "") -> None:
+                 cred_fp: str = "", durable_epoch: int | None = None) -> None:
         self.key = key
         self.worker = worker
         self.in_use = False
@@ -202,6 +202,13 @@ class _Entry:
         # differs, restoring the pre-#30 rotation guarantee for named
         # profiles.
         self.cred_fp = cred_fp
+        # PR #166 review FB-006: the durable epoch this session was
+        # ESTABLISHED under, read before the spawn that opened it. The
+        # reuse/return consults compare against it, so a worker cached before
+        # a restore is never handed out (or pooled) after another process has
+        # re-bound and cleared the current epoch. ``None`` only on pools
+        # without an epoch consult.
+        self.durable_epoch = durable_epoch
         #: Milliseconds spent spawning this worker and establishing its session.
         #: Reported once, on the call that opened it, and never again.
         self.open_ms = open_ms
@@ -261,7 +268,10 @@ class SessionPool:
         #: module-level dict would leak per test pool, so the pool owns its
         #: own; this lock is the ONLY dance-wide hold (the pool `_mu` takes
         #: short table/set mutations only and is never held across invalidate,
-        #: drain, spawn, validation, or close).
+        #: drain, spawn, validation, or close). The lock ACQUISITION is
+        #: bounded by the caller's wait budget (PR #166 review FB-013): a
+        #: holder stuck inside its dance refuses later same-VM borrows with
+        #: the busy shape instead of wedging them indefinitely.
         self._epoch_recovery_locks: dict[str, threading.Lock] = {}
         self.invalidated = 0
         self.evicted = 0
@@ -303,7 +313,9 @@ class SessionPool:
         except Exception:
             pass
 
-    def _epoch_fresh_bind(self, key: SessionKey, cred: Any) -> Any | None:
+    def _epoch_fresh_bind(
+        self, key: SessionKey, cred: Any, wait_s: float = 0.0
+    ) -> Any | None:
         """The serialized fresh-bind dance (issue #157, plan Change 4).
 
         Returns a worker to hand straight to the caller (the dance's own fresh
@@ -312,7 +324,15 @@ class SessionPool:
         only (never held across invalidate, drain, spawn, validation, or
         close). Any failure closes/removes the fresh worker, LEAVES THE EPOCH
         DIRTY, and raises SessionEpochDirty — the epoch clears only after
-        confirmed invalidation plus a validated fresh binding."""
+        confirmed invalidation plus a validated fresh binding.
+
+        PR #166 review FB-013: the recovery-lock ACQUISITION is bounded by
+        the caller's own wait budget (the same bound acquire() honours). A
+        holder stuck inside its dance must refuse later same-VM borrows with
+        the pool's busy shape within that budget — an unbounded lock wait
+        here would hang every later borrower of the VM indefinitely, past
+        any wait_s they passed. The refusal is per-call: once the stuck
+        holder ends, the next borrow may rebind."""
         reader = self.epoch_reader
         if reader is None:
             return None
@@ -329,7 +349,15 @@ class SessionPool:
             ) from exc
         if state != "dirty":
             return None
-        with self._recovery_lock(guid):
+        lock = self._recovery_lock(guid)
+        budget = max(0.0, float(wait_s))
+        if not lock.acquire(timeout=budget):
+            raise SessionBusy(
+                f"a fresh-bind dance for vm {guid} is already in progress "
+                f"(another borrower holds the recovery lock); waited "
+                f"{budget:g}s"
+            )
+        try:
             # Re-read after a concurrent dance may have finished.
             try:
                 epoch, state = reader(guid)
@@ -387,6 +415,8 @@ class SessionPool:
                     f"(expected epoch {epoch}); session reuse stays blocked"
                 )
             return worker
+        finally:
+            lock.release()
 
     def acquire(
         self,
@@ -417,13 +447,16 @@ class SessionPool:
         # (snapshot -> confirmed invalidation -> fresh worker -> validation ->
         # expected-epoch clear -> hand out); any dance failure leaves the
         # epoch dirty and raises SessionEpochDirty. Every later borrow sees
-        # the clean snapshot and proceeds unchanged.
-        handed = self._epoch_fresh_bind(key, cred)
+        # the clean snapshot and proceeds unchanged. The dance's recovery-lock
+        # wait shares this caller's wait_s budget (FB-013), so a stuck dance
+        # holder refuses within the budget instead of hanging the borrow.
+        handed = self._epoch_fresh_bind(key, cred, wait_s)
         if handed is not None:
             return handed
         deadline = self._clock() + max(0.0, float(wait_s))
         while True:
             stale: list[Any] = []
+            epoch_refusal: SessionEpochDirty | None = None
             with self._mu:
                 if self._closed:
                     raise SessionBusy("the session pool is closed")
@@ -441,9 +474,54 @@ class SessionPool:
                         entry.doomed = True
                         stale.append(entry)
                     else:
-                        entry.in_use = True
-                        entry.last_used = self._clock()
-                        return entry.worker
+                        # PR #166 review FB-006: consult the durable epoch on
+                        # the REUSE path. The dance above only runs while the
+                        # durable state is dirty; when ANOTHER process has
+                        # already re-bound and cleared the current epoch, only
+                        # the entry's recorded establishment epoch can tell a
+                        # pre-restore worker from a valid one. A mismatch
+                        # RETIRES the stale worker and refuses this borrow
+                        # (transient: the next borrow opens a fresh one).
+                        reader = self.epoch_reader
+                        if reader is None:
+                            entry.in_use = True
+                            entry.last_used = self._clock()
+                            return entry.worker
+                        guid = _norm_guid(key.vm_guid)
+                        try:
+                            cur_epoch, cur_state = reader(guid)
+                        except Exception as exc:
+                            epoch_refusal = SessionEpochDirty(
+                                f"vm {guid} epoch state is unreadable ({exc}); "
+                                "session reuse stays blocked until the epoch "
+                                "is readable again"
+                            )
+                        else:
+                            if cur_state != "clean":
+                                epoch_refusal = SessionEpochDirty(
+                                    f"vm {guid} epoch turned dirty before the "
+                                    "borrow; the next borrow re-runs the "
+                                    "fresh-bind dance"
+                                )
+                            elif (
+                                entry.durable_epoch is None
+                                or cur_epoch != entry.durable_epoch
+                            ):
+                                del self._entries[key]
+                                entry.doomed = True
+                                stale.append(entry)
+                                epoch_refusal = SessionEpochDirty(
+                                    f"vm {guid} durable epoch moved to "
+                                    f"{cur_epoch} past the epoch "
+                                    f"{entry.durable_epoch} this session was "
+                                    "established under; the stale session was "
+                                    "retired and the next borrow opens a fresh "
+                                    "one"
+                                )
+                            else:
+                                entry.in_use = True
+                                entry.last_used = self._clock()
+                                return entry.worker
                 # Only take the create path when nothing is closing this VM's
                 # sessions: see `_invalidating`. After a PRR-004 retirement the
                 # entry is absent, so the create gate fires and
@@ -462,6 +540,10 @@ class SessionPool:
                         entry.worker.close()
                     except Exception:
                         pass
+            if epoch_refusal is not None:
+                # Raised only after the retired workers above are closed, so
+                # the refusal never strands an open stale session.
+                raise epoch_refusal
             if gate is not None:
                 # A failure to CREATE is fatal for this call, not a reason to
                 # wait: retrying it would burn the whole bounded wait on a spawn
@@ -469,11 +551,6 @@ class SessionPool:
                 # correct response.
                 with gate:
                     worker = self._create_locked(key, cred)
-                    if worker is not None and cred is not None:
-                        with self._mu:
-                            held = self._entries.get(key)
-                            if held is not None and held.worker is worker:
-                                held.cred_fp = _cred_fp(cred)
                     if worker is not None:
                         # A close for this VM may have landed while the factory
                         # ran. Re-check under the lock so a session the pool has
@@ -515,15 +592,84 @@ class SessionPool:
                     if entry is not None and not entry.doomed:
                         if entry.in_use:
                             return None
-                        entry.in_use = True
-                        entry.last_used = self._clock()
-                        return entry.worker
+                        # PR #166 review FB-001: this branch can also hand out
+                        # a PRE-EXISTING idle worker (the fresh-bind dance
+                        # calls here after its invalidation, and a gate-racing
+                        # acquire can land on an entry its own fast path never
+                        # saw), so the named-profile rotation guard the fast
+                        # path applies must hold here too: RETIRE on a
+                        # fingerprint mismatch instead of handing the stored
+                        # worker out. The create below opens the replacement.
+                        if (
+                            cred is not None
+                            and entry.cred_fp
+                            and entry.cred_fp != _cred_fp(cred)
+                        ):
+                            entry.doomed = True
+                            victims.append(entry)
+                        else:
+                            # PR #166 review FB-006: same defense for the
+                            # durable epoch — a clean-but-different epoch
+                            # means the stored worker predates a restore that
+                            # another process already re-bound and cleared.
+                            # A dirty/unreadable snapshot raises (the next
+                            # borrow re-dances); it is never handed out here.
+                            if self.epoch_reader is not None:
+                                try:
+                                    cur_epoch, cur_state = self.epoch_reader(
+                                        _norm_guid(key.vm_guid)
+                                    )
+                                except Exception as exc:
+                                    raise SessionEpochDirty(
+                                        f"vm {_norm_guid(key.vm_guid)} epoch "
+                                        f"state is unreadable ({exc}); session "
+                                        "reuse stays blocked until the epoch "
+                                        "is readable again"
+                                    ) from exc
+                                if cur_state != "clean":
+                                    raise SessionEpochDirty(
+                                        f"vm {_norm_guid(key.vm_guid)} epoch "
+                                        "turned dirty before the borrow; the "
+                                        "next borrow re-runs the fresh-bind "
+                                        "dance"
+                                    )
+                                if (
+                                    entry.durable_epoch is not None
+                                    and cur_epoch != entry.durable_epoch
+                                ):
+                                    entry.doomed = True
+                                    victims.append(entry)
+                                else:
+                                    entry.in_use = True
+                                    entry.last_used = self._clock()
+                                    return entry.worker
+                            else:
+                                entry.in_use = True
+                                entry.last_used = self._clock()
+                                return entry.worker
                     victims += self._retire_victims(key)
                     victims += self._stale_epoch_victims(key)
                     victims += self._capacity_victims()
                     script, stdin_b64 = establishment_script(key, cred)
-                    opened_at = self._clock()
                     guid = _norm_guid(key.vm_guid)
+                    # PR #166 review FB-006: read the durable epoch BEFORE the
+                    # spawn, so the fresh entry is bound to an epoch the
+                    # session can never be NEWER than — a bump landing between
+                    # this read and the insert only ever leaves the recorded
+                    # epoch OLDER than the durable one, which the reuse
+                    # consult retires; reading after the spawn could instead
+                    # record a post-restore epoch for a pre-restore session.
+                    durable_epoch: int | None = None
+                    if self.epoch_reader is not None:
+                        try:
+                            durable_epoch, _state = self.epoch_reader(guid)
+                        except Exception as exc:
+                            raise SessionEpochDirty(
+                                f"vm {guid} epoch state is unreadable ({exc}); "
+                                "a fresh session cannot be bound to the "
+                                "durable epoch"
+                            ) from exc
+                    opened_at = self._clock()
                     self._creating[guid] = self._creating.get(guid, 0) + 1
             except BaseException:
                 # `_capacity_victims` raises when the pool is full and every
@@ -573,7 +719,17 @@ class SessionPool:
                         f"the session pool reached its cap of {self.max_sessions} "
                         f"while opening a session"
                     )
-                fresh = _Entry(key, worker, open_ms)
+                # PR #166 review FB-001: the establishment credential's
+                # fingerprint is recorded at INSERTION — on EVERY creation
+                # path (the ordinary acquire gate and the fresh-bind dance
+                # both land here) — and never overwritten on reuse.
+                fresh = _Entry(
+                    key,
+                    worker,
+                    open_ms,
+                    cred_fp=_cred_fp(cred) if cred is not None else "",
+                    durable_epoch=durable_epoch,
+                )
                 fresh.in_use = True
                 fresh.last_used = self._clock()
                 self._entries[key] = fresh
@@ -677,15 +833,23 @@ class SessionPool:
                 entry.doomed = True
                 victims = [entry]
             elif self.epoch_reader is not None:
-                # Issue #157 return-path consult: a session returning to the
-                # pool while its VM's durable epoch is dirty is CLOSED instead
-                # of pooled — the guest may have been restored mid-use.
+                # Issue #157 return-path consult + PR #166 review FB-006: a
+                # session returning while its VM's durable epoch is dirty — OR
+                # while it sits at a DIFFERENT epoch than the one the session
+                # was established under (another process already re-bound and
+                # cleared the current epoch) — is CLOSED instead of pooled:
+                # the guest may have been restored mid-use either way.
                 victims = []
+                cur_epoch: int | None = None
                 try:
-                    _epoch, state = self.epoch_reader(entry.key.vm_guid)
+                    cur_epoch, state = self.epoch_reader(entry.key.vm_guid)
                 except Exception:
                     state = "dirty"
-                if state == "dirty":
+                if state == "dirty" or (
+                    cur_epoch is not None
+                    and entry.durable_epoch is not None
+                    and cur_epoch != entry.durable_epoch
+                ):
                     entry.doomed = True
                     victims = [entry]
             else:

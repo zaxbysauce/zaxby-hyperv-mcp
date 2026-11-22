@@ -504,12 +504,22 @@ def _classify_stale(store: statestore.Store, row: statestore.OpRow, cfg: Config)
     else:
         error_class = statestore.OP_INTERRUPTED
         reason = "heartbeat_lapsed"
-    store.op_transition(
+    # FB-012 (PR #166 review): the classification terminal write carries the
+    # row's CAPTURED generation, so a read-time path can never terminalize a
+    # row a newer executor holds (the fence moved authority between the read
+    # and this write) — the exact authority inversion the fence exists to
+    # prevent. A row whose generation still MATCHES keeps classifying (the
+    # ordinary lapsed-detached path, including a legacy generation-0 row
+    # whose stored value IS 0), and the op.failed event fires only when the
+    # transition landed (one event per transition, the AC9 append unit).
+    moved = bool(store.op_transition(
         row.op_id, (statestore.OP_WORKING,), statestore.OP_FAILED,
         error_class=error_class, updated_at=store.now(),
-    )
-    emit(cfg, "op.failed", row.op_id, row.vm_id, row.agent,
-         {"error_class": error_class, "reason": reason})
+        generation=int(row.generation or 0),
+    ))
+    if moved:
+        emit(cfg, "op.failed", row.op_id, row.vm_id, row.agent,
+             {"error_class": error_class, "reason": reason})
     fresh = store.op_get(row.op_id)
     return fresh if fresh is not None else row
 
@@ -601,8 +611,16 @@ def guard_consult(
             # resolved row past the window is forgotten so the retry executes
             # fresh — the documented window end.
             ttl = int(cfg.operations.idempotency_ttl_s or 86400)
+            # FB-003 (PR #166 review): heartbeat freshness keeps only a
+            # WORKING row live ("a live handle is kept through completion
+            # regardless of replay age"); a RESOLVED row's heartbeat_at is
+            # IGNORED here — a late beat from a timer that outlived its body
+            # must not make an expired resolved identity replay instead of
+            # allowing a fresh dispatch. Unresolved rows keep their
+            # protections through possibly_sent / protected_class below.
             heartbeat_fresh = (
-                existing.heartbeat_at > 0
+                existing.status == statestore.OP_WORKING
+                and existing.heartbeat_at > 0
                 and existing.heartbeat_at >= now - int(
                     cfg.operations.heartbeat_ttl_s or 60
                 )
@@ -1108,7 +1126,13 @@ def start_inline_heartbeat(op_ctx: dict[str, Any]) -> Callable[[], None]:
     inline body lifetime so a LIVE inline call past the heartbeat TTL is
     never classified unknown, while a CRASHED inline body (timer dead with
     the mark set) lapses into the unknown reconciliation identity. Returns
-    the stop callable; the dispatch's finally MUST call it."""
+    the stop callable; the dispatch's finally MUST call it.
+
+    FB-003 (PR #166 review): the beat checks the stop flag BEFORE writing
+    and `_stop` cancels the ACTIVE (most recently scheduled) timer, not just
+    the first — a replacement timer scheduled by the last beat can no longer
+    fire once after the body's finally stops the chain (statestore.
+    op_heartbeat's status='working' predicate is the store-level backstop)."""
     cfg: Config = op_ctx["cfg"]
     op_id = str(op_ctx["op_id"])
     generation = int(op_ctx.get("generation") or 0)
@@ -1116,27 +1140,41 @@ def start_inline_heartbeat(op_ctx: dict[str, Any]) -> Callable[[], None]:
     # outlives its caller writes to the row's own store, never re-resolves.
     store = store_for(cfg)
     stop = threading.Event()
+    timer_mu = threading.Lock()
+    interval = max(1.0, int(cfg.operations.heartbeat_ttl_s or 60) / 3.0)
+    # The ACTIVE timer: the first timer while the body starts, then each
+    # beat's replacement. Held under timer_mu so _stop always cancels the
+    # timer that is actually armed (FB-003).
+    active: list[threading.Timer] = []
 
     def _beat() -> None:
+        # FB-003: a beat that lost the stop race writes nothing — the body
+        # may already have terminal-written its row.
+        if stop.is_set():
+            return
         try:
             store.op_heartbeat(op_id, store.now(), generation=generation or None)
         except Exception:
             pass  # a missed beat is retried on the next interval
         if not stop.is_set():
-            t = threading.Timer(
-                max(1.0, int(cfg.operations.heartbeat_ttl_s or 60) / 3.0), _beat)
+            t = threading.Timer(interval, _beat)
             t.daemon = True
-            t.start()
+            with timer_mu:
+                if stop.is_set():
+                    return
+                active[0] = t
+                t.start()
 
-    first = threading.Timer(
-        max(1.0, int(cfg.operations.heartbeat_ttl_s or 60) / 3.0), _beat)
+    first = threading.Timer(interval, _beat)
     first.daemon = True
-    first.start()
+    active.append(first)
 
     def _stop() -> None:
         stop.set()
-        first.cancel()
+        with timer_mu:
+            active[0].cancel()
 
+    first.start()
     return _stop
 
 
@@ -1259,8 +1297,20 @@ def _run_detached(
     # never re-resolve into whatever store is currently mounted. Writes to a
     # closed store fail and are swallowed by the transition helpers.
     stop = threading.Event()
+    # FB-003 (PR #166 review): the beat checks the stop flag BEFORE writing
+    # and the finally cancels the ACTIVE (most recently scheduled) timer, not
+    # just the first — a replacement timer scheduled by a mid-flight beat can
+    # no longer fire once after the body exits (op_heartbeat's status=
+    # 'working' predicate is the store-level backstop).
+    timer_mu = threading.Lock()
+    interval = max(1.0, int(cfg.operations.heartbeat_ttl_s or 60) / 3.0)
+    active: list[threading.Timer] = []
 
     def _beat() -> None:
+        # FB-003: a beat that lost the stop race writes nothing — the body
+        # may already have terminal-written its row.
+        if stop.is_set():
+            return
         try:
             store.op_heartbeat(op_id, store.now(), generation=generation or None)
             if presented_lease:
@@ -1271,12 +1321,17 @@ def _run_detached(
         except Exception:
             pass  # a missed beat is retried on the next interval
         if not stop.is_set():
-            timer = threading.Timer(max(1.0, int(cfg.operations.heartbeat_ttl_s or 60) / 3.0), _beat)
+            timer = threading.Timer(interval, _beat)
             timer.daemon = True
-            timer.start()
+            with timer_mu:
+                if stop.is_set():
+                    return
+                active[0] = timer
+                timer.start()
 
-    beat_timer = threading.Timer(max(1.0, int(cfg.operations.heartbeat_ttl_s or 60) / 3.0), _beat)
+    beat_timer = threading.Timer(interval, _beat)
     beat_timer.daemon = True
+    active.append(beat_timer)
     beat_timer.start()
     try:
         captured.run(
@@ -1285,7 +1340,8 @@ def _run_detached(
         )
     finally:
         stop.set()
-        beat_timer.cancel()
+        with timer_mu:
+            active[0].cancel()
         with _runners_lock:
             _runners.pop(op_id, None)
         try:
@@ -1389,9 +1445,14 @@ def _execute_body(
             # The stop valve fired mid-park (a cancel of the parked op, or
             # runner teardown): the waiter reclaimed every stage, so the op
             # closes as cancelled. Provably pre-body (issue #157): the
-            # transition clears any inherited send mark.
+            # transition clears any inherited send mark. FB-011 (PR #166
+            # review): the captured generation rides the transition like
+            # every sibling — a fenced executor's cancel must be a no-op on a
+            # row whose generation was superseded (latent-hazard guard: no
+            # shipped site fences a WORKING detached row mid-park yet).
             _safe_transition(store, op_id, statestore.OP_CANCELLED, agent, cfg,
-                             "op.cancelled", pre_body_terminal=True)
+                             "op.cancelled", generation=generation or None,
+                             pre_body_terminal=True)
             return
         finally:
             # The PARK-WINDOW pop (review round 5) + the ATOMIC stop
@@ -1421,10 +1482,13 @@ def _execute_body(
             # was granted but never used — release it (the retire path
             # reclaims the permit) and close the op with the AdmissionStopped
             # terminal, exactly as a stop observed mid-park would. Provably
-            # pre-body (issue #157): the mark clears.
+            # pre-body (issue #157): the mark clears. FB-011 (PR #166
+            # review): the captured generation rides this twin transition
+            # too — the same fenced-executor guard as the mid-park arm.
             admission.release_sync(ticket)
             _safe_transition(store, op_id, statestore.OP_CANCELLED, agent, cfg,
-                             "op.cancelled", pre_body_terminal=True)
+                             "op.cancelled", generation=generation or None,
+                             pre_body_terminal=True)
             return
         # Issue #157: the send gate serializes the per-resource PRE-SEND
         # COMMIT window outside this replaceable worker (route-layer owned;
@@ -1892,6 +1956,39 @@ def _build_task_models() -> tuple[Any, Any, Any, Any, Any]:
     return TaskHandleResult, TaskParams, TaskViewResult, MCPError, INVALID_PARAMS
 
 
+def _tasks_refusal_trace(
+    cfg: Config, store: statestore.Store, agent: str, tool_name: str,
+    arguments: dict[str, Any], env: dict[str, Any], op_id: str, reason: str,
+) -> None:
+    """FB-014 (PR #166 review): the tasks route bypasses the server guard, so
+    its consult refusals reached NO audit row (the guard route's equivalents
+    are audited through server.py's _audited_rejection) and no event row.
+    This gives every tasks-route consult refusal the SAME durable trace the
+    guard route records: one audit row in the _audited_rejection shape
+    (ok=false carrying the envelope's error_class, tool and vm_name), plus
+    one ops event naming the ORIGINAL handle in ref_id so an operator can
+    correlate the refusal to the identity that caused it. The event kind
+    extends the existing op.<verb> family (the repo's kinds are all state
+    transitions; a consult refusal moves no state, so it gets its own word).
+    Best-effort on the audit sink — a broken sink must not turn a refusal
+    into a raw exception (the _audited_rejection contract)."""
+    try:
+        auditlog.log_operation(
+            tool=tool_name,
+            vm_name=str((arguments or {}).get("vm_name") or ""),
+            category="",
+            ok=False,
+            error_class=str(env.get("error_class") or ""),
+            agent_id=agent or None,
+        )
+    except Exception:
+        pass
+    emit(cfg, "op.refused", op_id, "", agent,
+         {"tool": tool_name,
+          "error_class": str(env.get("error_class") or ""),
+          "reason": reason}, store=store)
+
+
 def tasks_extension(
     cfg: Config,
     gate_fn: Callable[[str, dict], tuple[dict[str, Any] | None, Any]],
@@ -1984,8 +2081,15 @@ def tasks_extension(
                     if existing is not None:
                         consult_op_id = existing.op_id
                         ttl = int(cfg.operations.idempotency_ttl_s or 86400)
+                        # FB-003 (PR #166 review): the SAME status-scoped
+                        # freshness the guard route applies — heartbeat
+                        # freshness keeps only a WORKING row live; a RESOLVED
+                        # row's heartbeat_at is ignored (a late beat must not
+                        # replay an expired resolved identity). The two
+                        # consult copies cannot be allowed to drift.
                         heartbeat_fresh = (
-                            existing.heartbeat_at > 0
+                            existing.status == statestore.OP_WORKING
+                            and existing.heartbeat_at > 0
                             and existing.heartbeat_at >= now - int(
                                 cfg.operations.heartbeat_ttl_s or 60
                             )
@@ -2036,8 +2140,17 @@ def tasks_extension(
                     if existing is not None:
                         existing = _classify_stale(store, existing, cfg)
                         if existing.params_hmac and existing.params_hmac != fingerprint:
-                            consult_answer = errors.failure_result(
-                                _conflict_envelope(params.name, idem_key))
+                            # FB-014 (PR #166 review): the tasks route
+                            # bypasses the server guard, so every consult
+                            # refusal below carries its OWN durable trace
+                            # (the guard route's equivalents are audited
+                            # through server.py's _audited_rejection).
+                            _cenv = _conflict_envelope(params.name, idem_key)
+                            _tasks_refusal_trace(
+                                cfg, store, agent, params.name, arguments,
+                                _cenv, existing.op_id,
+                                "idempotency_fingerprint_conflict")
+                            consult_answer = errors.failure_result(_cenv)
                         else:
                             legacy_reason = _legacy_protection_reason(
                                 existing, fingerprint)
@@ -2047,20 +2160,24 @@ def tasks_extension(
                                 # original handle (never an ordinary attach,
                                 # never a fresh dispatch), identical to the
                                 # guard route's shape.
-                                consult_answer = errors.failure_result(
-                                    errors.enrich_failure({
-                                        "ok": False,
-                                        "error": (
-                                            f"idempotency_key {idem_key!r} matches a "
-                                            f"legacy record (handle {existing.op_id}) "
-                                            f"{legacy_reason}; reconciliation is "
-                                            f"required before reuse — re-run with a "
-                                            f"new idempotency_key"
-                                        ),
-                                        "error_class": "idempotency_conflict",
-                                        "reconciliation": True,
-                                        "op_id": existing.op_id,
-                                    }))
+                                _renv = errors.enrich_failure({
+                                    "ok": False,
+                                    "error": (
+                                        f"idempotency_key {idem_key!r} matches a "
+                                        f"legacy record (handle {existing.op_id}) "
+                                        f"{legacy_reason}; reconciliation is "
+                                        f"required before reuse — re-run with a "
+                                        f"new idempotency_key"
+                                    ),
+                                    "error_class": "idempotency_conflict",
+                                    "reconciliation": True,
+                                    "op_id": existing.op_id,
+                                })
+                                _tasks_refusal_trace(
+                                    cfg, store, agent, params.name, arguments,
+                                    _renv, existing.op_id,
+                                    "legacy_identity_reconciliation")
+                                consult_answer = errors.failure_result(_renv)
                             else:
                                 # R26 (closing-review round 26): the SAME
                                 # provenance-safe residue recovery the guard
@@ -2073,6 +2190,11 @@ def tasks_extension(
                                         store, cfg, existing, agent,
                                         heartbeat_fresh))
                                 if residue_refusal is not None:
+                                    _tasks_refusal_trace(
+                                        cfg, store, agent, params.name,
+                                        arguments, residue_refusal,
+                                        str(residue_refusal.get("op_id") or ""),
+                                        "pre_send_residue_recovery")
                                     consult_answer = errors.failure_result(
                                         residue_refusal)
                                 elif existing is None:
@@ -2186,6 +2308,7 @@ def tasks_extension(
                     # the degraded refusal WITHOUT a second release.
                     winner = None
                     slot_released = False
+                    retired = False
                     if idem_key:
                         try:
                             with store.transaction():
@@ -2200,10 +2323,27 @@ def tasks_extension(
                                     slots.release()
                                     slot_released = True
                                     _cenv2 = _conflict_envelope(params.name, idem_key)
+                                    _tasks_refusal_trace(
+                                        cfg, store, agent, params.name,
+                                        arguments, _cenv2, winner.op_id,
+                                        "idempotency_fingerprint_conflict")
                                     evidencejournal.finish(
                                         jtok, _cenv2, outcome="conflict")
                                     return errors.failure_result(_cenv2)
-                                if not winner.params_hmac and fingerprint:
+                                # FB-010 (PR #166 review, probe-proven): the
+                                # re-consult runs the SAME shared guards the
+                                # ordinary consult applies, in the same
+                                # order — the old copy checked only a
+                                # fingerprint mismatch and a blank
+                                # fingerprint, so it attached a LIVE handle
+                                # to a legacy generation-0 identity the
+                                # ordinary consult refuses (the AC8
+                                # reconciliation refusal) and attached to a
+                                # stranded terminal failed/interrupted
+                                # key-holder instead of freeing its key.
+                                legacy_reason = _legacy_protection_reason(
+                                    winner, fingerprint)
+                                if legacy_reason is not None:
                                     slots.release()
                                     slot_released = True
                                     _renv = errors.enrich_failure({
@@ -2211,36 +2351,86 @@ def tasks_extension(
                                         "error": (
                                             f"idempotency_key {idem_key!r} matches a "
                                             f"legacy record (handle {winner.op_id}) "
-                                            f"whose argument fingerprint predates "
-                                            f"fingerprinting; reconciliation is "
-                                            f"required before reuse"
+                                            f"{legacy_reason}; reconciliation is "
+                                            f"required before reuse — re-run with a "
+                                            f"new idempotency_key"
                                         ),
                                         "error_class": "idempotency_conflict",
                                         "reconciliation": True,
                                         "op_id": winner.op_id,
                                     })
+                                    _tasks_refusal_trace(
+                                        cfg, store, agent, params.name,
+                                        arguments, _renv, winner.op_id,
+                                        "legacy_identity_reconciliation")
                                     evidencejournal.finish(jtok, _renv, outcome="conflict")
                                     return errors.failure_result(_renv)
-                                if (
-                                    winner.status == statestore.OP_FAILED
-                                    and winner.error_class == statestore.OP_UNKNOWN
-                                ):
-                                    try:
-                                        store.op_fence(winner.op_id)
-                                    except Exception:
-                                        pass
-                                _handle = TaskHandleResult(
-                                    task_id=winner.op_id,
-                                    status=winner.status,
-                                    ttl_ms=int(cfg.operations.retention_s) * 1000,
-                                    poll_interval_ms=winner.poll_interval_ms,
+                                # FB-010: the same status-scoped freshness the
+                                # consult computes (FB-003's shape) feeds the
+                                # shared residue recovery for the winner.
+                                winner_fresh = (
+                                    winner.status == statestore.OP_WORKING
+                                    and winner.heartbeat_at > 0
+                                    and winner.heartbeat_at >= now - int(
+                                        cfg.operations.heartbeat_ttl_s or 60
+                                    )
                                 )
-                                slots.release()
-                                slot_released = True
-                                evidencejournal.finish(
-                                    jtok, {"task_id": winner.op_id, "consulted": True},
-                                    outcome="reattach")
-                                return _handle
+                                winner, residue_refusal = (
+                                    _inline_residue_recovery(
+                                        store, cfg, winner, agent, winner_fresh))
+                                if residue_refusal is not None:
+                                    slots.release()
+                                    slot_released = True
+                                    _tasks_refusal_trace(
+                                        cfg, store, agent, params.name,
+                                        arguments, residue_refusal,
+                                        str(residue_refusal.get("op_id") or ""),
+                                        "pre_send_residue_recovery")
+                                    evidencejournal.finish(
+                                        jtok, residue_refusal, outcome="refusal")
+                                    return errors.failure_result(residue_refusal)
+                                if winner is not None:
+                                    # FB-010: the shared stranded-key
+                                    # recovery — a terminal pre-send refusal
+                                    # whose key is stuck frees it for the
+                                    # fresh dispatch, exactly as the ordinary
+                                    # consult does.
+                                    winner = _stranded_presend_key_recovery(
+                                        winner, store)
+                                if winner is not None:
+                                    if (
+                                        winner.status == statestore.OP_FAILED
+                                        and winner.error_class == statestore.OP_UNKNOWN
+                                    ):
+                                        try:
+                                            store.op_fence(winner.op_id)
+                                        except Exception:
+                                            pass
+                                    _handle = TaskHandleResult(
+                                        task_id=winner.op_id,
+                                        status=winner.status,
+                                        ttl_ms=int(cfg.operations.retention_s) * 1000,
+                                        poll_interval_ms=winner.poll_interval_ms,
+                                    )
+                                    slots.release()
+                                    slot_released = True
+                                    evidencejournal.finish(
+                                        jtok, {"task_id": winner.op_id, "consulted": True},
+                                        outcome="reattach")
+                                    return _handle
+                                # FB-010: the shared recovery retired the
+                                # winner AND freed the (agent, tool,
+                                # idem_key) slot — the fresh dispatch
+                                # proceeds with THIS row. Retry the insert
+                                # ONCE; the freed slot admits it unless yet
+                                # another concurrent insert won (then the
+                                # classified retryable refusal below is the
+                                # honest answer).
+                                try:
+                                    store.op_insert(row)
+                                    retired = True
+                                except Exception:
+                                    retired = False
                         except Exception:
                             # Issue #157 (impl-review rounds 4-5): a re-consult
                             # failure falls through to the single exactly-once
@@ -2248,22 +2438,23 @@ def tasks_extension(
                             # is never leaked NOR double-released by the
                             # recovery path itself.
                             winner = None
-                    if not slot_released:
-                        slots.release()
-                        slot_released = True
-                    evidencejournal.finish_if_unowned(jtok, None, outcome="error")
-                    env = errors.enrich_failure({
-                        "ok": False,
-                        "error": (
-                            f"{params.name}: the detached operation could not "
-                            f"be recorded; no dispatch authority was left "
-                            f"behind — retry after fixing the durable-state fault"
-                        ),
-                        "error_class": "transport",
-                    })
-                    env["retryable"] = True
-                    env["retry_after_ms"] = errors.BUSY_RETRY_MS
-                    return errors.failure_result(env)
+                    if not retired:
+                        if not slot_released:
+                            slots.release()
+                            slot_released = True
+                        evidencejournal.finish_if_unowned(jtok, None, outcome="error")
+                        env = errors.enrich_failure({
+                            "ok": False,
+                            "error": (
+                                f"{params.name}: the detached operation could not "
+                                f"be recorded; no dispatch authority was left "
+                                f"behind — retry after fixing the durable-state fault"
+                            ),
+                            "error_class": "transport",
+                        })
+                        env["retryable"] = True
+                        env["retry_after_ms"] = errors.BUSY_RETRY_MS
+                        return errors.failure_result(env)
                 emit(cfg, "op.created", row.op_id, "", agent,
                      {"tool": params.name, "detached": True, "tasks": True})
                 try:

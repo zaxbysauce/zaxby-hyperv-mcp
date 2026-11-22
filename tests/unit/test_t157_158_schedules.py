@@ -1583,6 +1583,7 @@ def test_inline_route_marks_possibly_sent_at_submission(tmp_path):
             reached["payload"] = {
                 "ctx_op_id": _ops._current_op_id.get(""),
                 "ctx_gen": _ops._current_op_generation.get(0),
+                "row_op_id": row.op_id if row else None,
                 "row_send": row.send_state if row else None,
                 "row_status": row.status if row else None,
             }
@@ -1595,7 +1596,7 @@ def test_inline_route_marks_possibly_sent_at_submission(tmp_path):
 
     pswindows.run_ps = dispatcher
     try:
-        handle = asyncio.run(mcp.call_tool(
+        asyncio.run(mcp.call_tool(
             "hyperv_checkpoint_restore",
             {"vm_name": "test-vm", "checkpoint_name": "s11a", "confirm": True,
              "idempotency_key": "s11-inline-a"},
@@ -1606,13 +1607,14 @@ def test_inline_route_marks_possibly_sent_at_submission(tmp_path):
             f"S11a: the keyed-inline restore must carry possibly_sent AT the "
             f"provider submission (route wiring); got {payload!r}"
         )
-        handle_id = handle.get("op_id") if isinstance(handle, dict) else getattr(
-            handle, "op_id", None)
-        if handle_id:
-            assert payload["ctx_op_id"] == handle_id, (
-                f"S11a: the dispatch-bound op context must name the attempt; "
-                f"got {payload!r}"
-            )
+        # TF-005 (PR #166 review): the handle-shape conditional was DEAD
+        # CODE (the SDK handle never carries op_id), so a route that bound
+        # the wrong attempt context passed. The attempt is identified by the
+        # ROW the provider leg read, so the assertion is unconditional.
+        assert payload["ctx_op_id"] == payload["row_op_id"], (
+            f"S11a: the dispatch-bound op context must name the attempt the "
+            f"provider leg read; got {payload!r}"
+        )
         assert payload["row_status"] == "working", (
             f"S11a: the attempt is live mid-body; got {payload!r}"
         )
@@ -1970,10 +1972,15 @@ def test_rewrite_verification_unknown_binding_blocks_certification(monkeypatch):
                                  {"address": "fe80::1", "port": 22}]
 
     def fake_apply_verify(diag_guest, readback_guest):
+        # The apply leg must return a REAL receipt: the review wave's
+        # FB-002 fix makes an empty apply result an UNCONFIRMED outcome
+        # (apply_outcome=failed, effect unconfirmed) - a receipt is what
+        # makes the apply leg's own claim meaningful. S14's subject is the
+        # fe80/unknown READBACK certification, which this leaves untouched.
         fake = FakePS([
             _guid_result(),
             _ok(_host()), _ok(diag_guest),
-            pswindows.PSResult(stdout="", returncode=0),
+            _ok({"backup": "C:/s14.bak", "replaced": 1}),
             _ok(_host()), _ok(readback_guest),
         ])
         monkeypatch.setattr(pswindows, "run_ps", fake)
@@ -3320,3 +3327,126 @@ def test_past_ttl_detached_row_survives_expiry_on_tasks_route(ops_store, admissi
         f"its slot freed; got {row.as_dict()!r}"
     )
     assert _ops.drain_for_tests(timeout_s=10.0) == 0
+
+
+# ---------------------------------------------------------------------------
+# S26 (PR #166 swarm-pr-review assertion-strength findings, CONFIRMED by
+# mutation probe): the frozen acceptance file is manifest-pinned and left
+# byte-identical (its anchor receipt is published on both issues), so the
+# strengthened assertions live here as NON-FROZEN behavioural pins over the
+# same behaviour.
+# ---------------------------------------------------------------------------
+
+
+def test_tf003_absent_intent_sets_the_structured_decision_flag(monkeypatch):
+    """TF-003: the absent/ambiguous operator-intent arm must set the
+    STRUCTURED decision_required flag — the frozen C15 arm matched only
+    prose, so a rewrite whose text mentioned intent but lacked the gate
+    passed the frozen suite."""
+    cfg = Config(unrestricted=True)
+    stale = _guest(listen="192.168.50.20")
+    stale["ssh"]["listeners"] = [{"address": "192.168.50.20", "port": 22}]
+    fake = FakePS([_guid_result(), _ok(_host()), _ok(stale)])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = repair.repair_guest_access(
+        cfg, "test-vm", apply=False, confirm=False, cred=CRED,
+    )
+    items = [c for c in out["plan"]
+             if c["action"] == "rewrite_stale_ssh_bindings"]
+    assert items, f"TF-003: the stale binding must produce a plan item: {out}"
+    change = items[0]
+    assert change.get("decision_required") is True, (
+        f"TF-003: the absent-intent arm must set decision_required=True; got "
+        f"{change}"
+    )
+    assert "apply_script" not in change and "applied" not in change, (
+        f"TF-003: an ambiguous intent must not carry an apply script or an "
+        f"applied claim; got {change}"
+    )
+
+
+def test_tf002_repair_change_always_carries_a_typed_postcondition(monkeypatch):
+    """TF-002: the change record must ALWAYS carry a postcondition key with a
+    vocabulary value {satisfied, unsatisfied, unknown} — the frozen C12 arm
+    tolerated None, so dropping the channel entirely passed."""
+    cfg = Config(unrestricted=True)
+    stale = _guest(listen="192.168.50.20")
+    stale["ssh"]["listeners"] = [{"address": "192.168.50.20", "port": 22}]
+    healthy = _guest(listen="10.0.0.5")
+    fake = FakePS([
+        _guid_result(),
+        _ok(_host()), _ok(stale),
+        _ok({"backup": "C:/tf002.bak", "replaced": 1}),
+        _ok(_host()), _ok(healthy),
+    ])
+    monkeypatch.setattr(pswindows, "run_ps", fake)
+    out = repair.repair_guest_access(
+        cfg, "test-vm", apply=True, confirm=True, cred=CRED,
+        intended_bindings=["10.0.0.5"],
+    )
+    change = [c for c in out["changes"]
+              if c["action"] == "rewrite_stale_ssh_bindings"][0]
+    assert "postcondition" in change, (
+        f"TF-002: the change record must carry the postcondition channel; "
+        f"got {change}"
+    )
+    assert change["postcondition"] in ("satisfied", "unsatisfied", "unknown"), (
+        f"TF-002: the postcondition must come from the frozen vocabulary; got "
+        f"{change}"
+    )
+
+
+def test_tf006_legacy_refusal_is_structured(ops_store):
+    """TF-006: the legacy protected-reconciliation refusal must set
+    reconciliation=True AND error_class='idempotency_conflict' — the frozen
+    C8b arm matched only ok-is-False plus a keyword in the message."""
+    import hyperv_mcp.operations as _ops
+
+    cfg = Config(unrestricted=True)
+    store = ops_store
+    now = store.now()
+    store.op_insert(statestore.OpRow(
+        op_id="tf006-legacy", tool=OP_TOOL, agent="", vm_name="tf006-vm",
+        status=statestore.OP_WORKING, created_at=now - 10.0,
+        updated_at=now - 10.0, runner="runner-tf006",
+        heartbeat_at=now, params_hmac="",  # legacy blank fingerprint
+        idem_key="tf006", generation=1,
+    ))
+    resp, ctx = _ops.guard_consult(
+        cfg, OP_TOOL,
+        {"vm_name": "tf006-vm", "checkpoint_name": "cp", "confirm": True,
+         "idempotency_key": "tf006", "detach": True},
+        _CountingTool(), lambda: CountingSemaphore(1),
+    )
+    assert ctx is None and isinstance(resp, dict), f"TF-006: {resp!r}"
+    assert resp.get("reconciliation") is True, (
+        f"TF-006: the legacy refusal must carry reconciliation=True; got {resp}"
+    )
+    assert resp.get("error_class") == "idempotency_conflict", (
+        f"TF-006: the legacy refusal must carry the idempotency_conflict "
+        f"class; got {resp}"
+    )
+
+
+def test_tf008_detach_admission_refusal_is_classified(ops_store, admission_env):
+    """TF-008: the detach admission-refusal envelope must carry a CLASSIFIED
+    error_class — the frozen C1 arm asserted only truthiness, so an arbitrary
+    class passed."""
+    import hyperv_mcp.operations as _ops
+
+    cfg = Config(unrestricted=True)
+    sem = CountingSemaphore(1)
+    assert sem.acquire() is True, "TF-008: the only permit must be held"
+    try:
+        resp, ctx = _ops.guard_consult(
+            cfg, OP_TOOL,
+            {"vm_name": "tf008-vm", "checkpoint_name": "cp", "confirm": True,
+             "idempotency_key": "tf008", "detach": True},
+            _CountingTool(), lambda: sem,
+        )
+    finally:
+        sem.release()
+    assert ctx is None and isinstance(resp, dict), f"TF-008: {resp!r}"
+    assert resp.get("error_class") in ("transport", "busy"), (
+        f"TF-008: the refusal must carry a classified error_class; got {resp}"
+    )

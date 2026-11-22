@@ -53,25 +53,44 @@ _SSHD_CFG = "C:\\ProgramData\\ssh\\sshd_config"
 def _apply_stale_binding_script(stale: list[str], intended: list[str]) -> str:
     """Rewrite script driven by the OPERATOR-SUPPLIED intended bindings
     (issue #158 C15): each stale ListenAddress line maps to its intended
-    replacement — the hardcoded 0.0.0.0 default is retired."""
-    entries = "; ".join(
-        f"{pswindows.ps_quote(s)} = {pswindows.ps_quote(r)}"
+    replacement — the hardcoded 0.0.0.0 default is retired.
+
+    FB-008 (PR #166 review): replacements bind to config-line OCCURRENCES,
+    never to a hash keyed by the OLD address — two stale lines sharing one
+    address each receive their own per-line replacement, and an
+    address-keyed $map cannot even represent that (Windows PowerShell 5.1
+    parse-rejects duplicate keys in a hash literal). $pairs is a list of
+    single-entry hashtables consumed in order, one per matching
+    occurrence."""
+    pairs = "; ".join(
+        f"@{{{pswindows.ps_quote(s)} = {pswindows.ps_quote(r)}}}"
         for s, r in zip(stale, intended, strict=True)
     )
     return f"""
 $sshdCfg = '{_SSHD_CFG}'
-$map = @{{ {entries} }}
+$pairs = @({pairs})
 $backup = $sshdCfg + '.bak-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
 Copy-Item -LiteralPath $sshdCfg -Destination $backup -Force
 $lines = [System.IO.File]::ReadAllLines($sshdCfg)
+$queues = @{{}}
+foreach ($p in $pairs) {{
+    foreach ($k in $p.Keys) {{
+        if (-not $queues.ContainsKey($k)) {{
+            $queues[$k] = New-Object System.Collections.Generic.List[string]
+        }}
+        $queues[$k].Add($p[$k])
+    }}
+}}
 $out = New-Object System.Collections.Generic.List[string]
 $replaced = 0
 foreach ($ln in $lines) {{
     $t = $ln.Trim()
     if ($t -match '^(?i)ListenAddress\\s+(.+)$') {{
         $addr = $Matches[1].Trim()
-        if ($map.ContainsKey($addr)) {{
-            $out.Add('ListenAddress ' + $map[$addr])
+        if ($queues.ContainsKey($addr) -and $queues[$addr].Count -gt 0) {{
+            $new = $queues[$addr][0]
+            $queues[$addr].RemoveAt(0)
+            $out.Add('ListenAddress ' + $new)
             $replaced++
             continue
         }}
@@ -111,6 +130,19 @@ foreach ($rule in $rules) {{
 }}
 [PSCustomObject]@{{ port = $port; enabled_rules = $enabled }} | ConvertTo-Json -Compress
 """.strip()
+
+
+# FB-002 (PR #166 review): the receipt keys each apply script's JSON emits.
+# An apply leg that returns without them (a zero-exit, empty-stdout transport
+# parses to {} on the non-pooled path) carries NO action evidence, and the
+# apply-outcome channel must not assert application from nothing. Key
+# PRESENCE is the test — a valid zero-change receipt (replaced=0,
+# enabled_rules=[]) is a receipt, not a missing one.
+_APPLY_RECEIPT_KEYS: dict[str, tuple[str, ...]] = {
+    "rewrite_stale_ssh_bindings": ("backup", "replaced"),
+    "start_service": ("service", "status"),
+    "enable_existing_firewall_rules": ("port", "enabled_rules"),
+}
 
 
 # -- finding -> action mapping ----------------------------------------------
@@ -261,12 +293,20 @@ def _verify_observation(report: dict) -> str:
     observation at all. partial: the guest answered but a probe section or
     an address-family enumeration errored, so facts derived from it cannot
     certify a postcondition. positive: every section observed cleanly.
+
+    FB-007 (PR #166 review): a section the probe never DELIVERED is absent
+    evidence, not clean evidence — a blank readback (a zero-exit, empty
+    stdout probe parses to {}) must gate exactly like an errored section
+    and can never certify a postcondition.
     """
     if not (report.get("ps_direct") or {}).get("available"):
         return "unavailable"
     guest = report.get("guest") or {}
     for name in ("identity", "ip_addresses", "ssh", "winrm", "firewall"):
-        if (guest.get(name) or {}).get("error"):
+        section = guest.get(name)
+        if not isinstance(section, dict):
+            return "partial"
+        if section.get("error"):
             return "partial"
     ip_section = guest.get("ip_addresses") or {}
     if ip_section.get("ipv4_error") or ip_section.get("ipv6_error"):
@@ -322,11 +362,23 @@ def _evaluate_change(
         satisfied = cleared and detail["service_status"] == "Running"
     elif action == "rewrite_stale_ssh_bindings":
         ssh = guest.get("ssh") or {}
-        observed = [
-            str(a) for a in (ssh.get("config_listen") or [])
-        ] + [
-            str(listener.get("address", ""))
-            for listener in (ssh.get("listeners") or [])
+        config_listen = ssh.get("config_listen")
+        listeners = ssh.get("listeners")
+        if not isinstance(config_listen, list) or not isinstance(listeners, list):
+            # FB-007 (PR #166 review): the action-specific readback fields
+            # must be PRESENT and usable before any certification — a
+            # readback without them can neither satisfy nor refute.
+            detail["readback_fields_usable"] = False
+            change["postcondition_detail"] = detail
+            change["postcondition"] = "unknown"
+            change["verified"] = False
+            if not change["verify_detail"]:
+                change["verify_detail"] = (
+                    "rewrite readback fields unavailable: postcondition unknown"
+                )
+            return
+        observed = [str(a) for a in config_listen] + [
+            str(listener.get("address", "")) for listener in listeners
         ]
         still_stale = []
         uncertain = []
@@ -342,10 +394,26 @@ def _evaluate_change(
                 # be certified. An unknown relevant binding prevents
                 # positive certification entirely.
                 uncertain.append(addr)
+        # FB-007 (PR #166 review): verify the REQUESTED replacement against
+        # the OBSERVED config — a readback carrying only a DIFFERENT healthy
+        # binding is definitive negative evidence for the requested rewrite,
+        # not a satisfaction of it. Listener evidence is reported separately.
+        requested = [str(b) for b in (item.get("intended_bindings") or [])]
+        seen_config = {str(a).strip().lower() for a in config_listen}
+        missing_requested = [
+            b for b in requested if str(b).strip().lower() not in seen_config
+        ]
         detail["stale_bindings_remaining"] = still_stale
         detail["unverified_bindings"] = uncertain
-        detail["config_listen"] = [str(a) for a in (ssh.get("config_listen") or [])]
-        satisfied = cleared and not still_stale and not uncertain
+        detail["config_listen"] = [str(a) for a in config_listen]
+        detail["requested_bindings"] = requested
+        detail["requested_bindings_missing"] = missing_requested
+        detail["listener_bindings"] = [
+            str(listener.get("address", "")) for listener in listeners
+        ]
+        satisfied = (
+            cleared and not still_stale and not uncertain and not missing_requested
+        )
         uncertified = bool(uncertain)
         stale_remaining = bool(still_stale)
     elif action == "enable_existing_firewall_rules":
@@ -456,11 +524,28 @@ def repair_guest_access(
                 outcome = run_guest_inner(
                     cfg, ref.id, item["apply_script"], cred, timeout_ms=90000,
                 )
-                change["applied"] = True
-                change["apply_outcome"] = "applied"
-                change["outcome"] = outcome
-                if item["action"] == "rewrite_stale_ssh_bindings":
-                    backup_path = str(outcome.get("backup", ""))
+                receipt = _APPLY_RECEIPT_KEYS.get(item["action"], ())
+                if not isinstance(outcome, dict) or any(
+                    key not in outcome for key in receipt
+                ):
+                    # FB-002 (PR #166 review): no action-specific receipt —
+                    # the effect is unconfirmed, so the apply-outcome channel
+                    # reports failed instead of asserting application from an
+                    # empty result. The readback below still evaluates the
+                    # observed state independently; it just can never verify
+                    # an unproven apply (verified derives from `applied`).
+                    change["apply_outcome"] = "failed"
+                    change["error"] = (
+                        "apply result unavailable; effect unconfirmed: the "
+                        f"apply leg returned no {item['action']} receipt"
+                    )
+                else:
+                    change["applied"] = True
+                    change["apply_outcome"] = "applied"
+                    if item["action"] == "rewrite_stale_ssh_bindings":
+                        backup_path = str(outcome.get("backup", ""))
+                if isinstance(outcome, dict):
+                    change["outcome"] = outcome
             except Exception as exc:
                 from . import errors  # late import: errors pulls the policy tree
                 change["apply_outcome"] = "failed"

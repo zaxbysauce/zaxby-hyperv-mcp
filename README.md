@@ -1188,11 +1188,16 @@ Lifecycle after a restart:
   credential error rather than silently substituting whatever credentials the
   environment now holds.
 
-The schema is versioned with `PRAGMA user_version` (this release sets 4; a
+The schema is versioned with `PRAGMA user_version` (this release sets 6; a
 v1 database written by 0.4.x gains the lease tables automatically on first
-open, and a v2 database written by 0.5.x gains the `ops`/`events`/`meta`
-tables the same way — every migration is additive and transactional) and
-migrations only go forward. A database written by a newer build is refused rather than silently
+open, a v2 database written by 0.5.x gains the `ops`/`events`/`meta`
+tables, a v3 database gains the credential-metadata columns, a v4 database
+gains the relay-kind column, and a v5 database gains the operation
+generation/send-state columns plus the `vm_epochs` table — every migration
+is additive and transactional) and
+migrations only go forward. Rolling the BINARY back does not roll the
+DATABASE back: a v5 binary refuses a database this release has migrated to
+v6. A database written by a newer build is refused rather than silently
 corrupted; conversely, an OLDER binary refuses any config file that contains
 the `leases` key OR any `destructive` key it does not know (e.g. the #112 `vm_remove`/`offline_harvest` switches) (unknown config key) — remove the key or upgrade the binary.
 

@@ -1341,24 +1341,31 @@ class Store:
 
     def op_heartbeat(
         self, op_id: str, at: float, generation: int | None = None
-    ) -> None:
-        """Freshen the heartbeat. `generation` (issue #157): when given, the
-        UPDATE requires the row's generation to match, so a fenced (replaced)
-        executor cannot keep a dead row alive."""
+    ) -> bool:
+        """Freshen the heartbeat; returns whether a WORKING row was freshened.
+        `generation` (issue #157): when given, the UPDATE requires the row's
+        generation to match, so a fenced (replaced) executor cannot keep a
+        dead row alive. FB-003 (PR #166 review): the UPDATE also requires
+        status='working' — a beat from a timer that outlived its body (the
+        scheduled replacement firing after the terminal write) must never
+        refresh a TERMINAL row, whose fresh heartbeat would make the consult
+        treat an expired resolved identity as live."""
         with self._lock:
             self._begin()
             try:
                 gen_sql = " AND generation = ?" if generation is not None else ""
                 gen_args: tuple = () if generation is None else (int(generation),)
-                self._connect().execute(
+                cur = self._connect().execute(
                     "UPDATE ops SET heartbeat_at = ?, updated_at = ? "
-                    "WHERE op_id = ?" + gen_sql,
-                    (float(at), float(at), op_id, *gen_args),
+                    "WHERE op_id = ? AND status = ?" + gen_sql,
+                    (float(at), float(at), op_id, OP_WORKING, *gen_args),
                 )
+                moved = cur.rowcount
                 self._commit()
             except BaseException:
                 self._rollback()
                 raise
+        return bool(moved)
 
     def op_delete(self, op_id: str) -> None:
         """Remove one op row (the idempotency-TTL expiry retires its record so
@@ -1404,21 +1411,34 @@ class Store:
                 raise
 
     def ops_prune(
-        self, older_than: float, replay_cutoff: float | None = None
+        self, older_than: float, replay_cutoff: float | None = None,
+        protect_legacy: bool = False,
     ) -> int:
         """Retention (issue #157, two-phase tombstone rewrite): rows past the
         retention cutoff lose their PAYLOAD (result_json=NULL) but keep their
         identity (op_id/fingerprint/idem_key) so a replay inside the window
         still returns the original handle with the result-expired disclosure;
-        already-null-payload rows past `replay_cutoff` (the replay window; the
-        caller passes store.now() - idempotency_ttl_s, default = the retention
-        cutoff) are deleted. Rows with error_class 'interrupted' or 'unknown',
-        or a send_state of 'possibly_sent', are NEVER pruned or payload-nulled
-        (protected reconciliation flag). Rows tombstoned in THIS pass never
-        qualify for second-phase deletion in the same pass. Working rows are
-        never swept here."""
+        already-null-payload rows past `replay_cutoff` (the replay window;
+        FB-003/FB-005 round: store_for's startup sweep passes store.now() -
+        idempotency_ttl_s, INDEPENDENT of the payload cutoff; default = the
+        retention cutoff) are deleted. Rows with error_class 'interrupted' or
+        'unknown', or a send_state of 'possibly_sent', are NEVER pruned or
+        payload-nulled (protected reconciliation flag). Rows tombstoned in
+        THIS pass never qualify for second-phase deletion in the same pass.
+        Working rows are never swept here.
+
+        `protect_legacy` (FB-005, PR #166 review; True on the startup sweep):
+        identity deletion also obeys the consult's AC8 legacy guard — a row
+        whose identity is legacy (a BLANK pre-fingerprint params_hmac OR the
+        v6 migration's generation 0) is never deleted, mirroring operations.
+        _legacy_expiry_allowed, so startup pruning can never consume a
+        protected legacy identity to authorize a duplicate dispatch. Direct
+        retention sweeps keep the plain age-based semantics."""
         if replay_cutoff is None:
             replay_cutoff = older_than
+        legacy_sql = (
+            " AND params_hmac <> '' AND generation > 0" if protect_legacy else ""
+        )
         with self._lock:
             self._begin()
             try:
@@ -1431,7 +1451,7 @@ class Store:
                     "AND status IN ('completed','failed','cancelled') "
                     "AND error_class NOT IN ('interrupted','unknown') "
                     "AND send_state <> 'possibly_sent' "
-                    "AND result_json IS NULL",
+                    "AND result_json IS NULL" + legacy_sql,
                     (float(replay_cutoff), float(older_than)),
                 )
                 stale_ids = [str(r[0]) for r in cur.fetchall()]
@@ -2133,10 +2153,28 @@ def store_for(cfg: Config, environ: dict[str, str] | None = None) -> Store:
         # Issue #24 (implementation-review R8): op/result retention is a real
         # knob — terminal op rows (and their stored payloads) older than
         # operations.retention_s are pruned on the same first-open schedule.
+        # FB-005 (PR #166 review): the payload cutoff and the identity
+        # deletion (replay) cutoff are INDEPENDENT — the replay cutoff is
+        # operations.idempotency_ttl_s, never the retention cutoff. With a
+        # single cutoff, a completed row tombstoned by the FIRST startup was
+        # DELETED by the SECOND while still inside the configured replay
+        # window, so a same-key retry executed the body a second time (the
+        # README promise: payload tombstones keep identity through the replay
+        # window). The sweep also carries the consult's legacy/unresolved
+        # protections (protect_legacy): a generation-0 / blank-fingerprint
+        # legacy identity is never deleted here — it must reach the
+        # reconciliation refusal instead.
         try:
-            store.ops_prune(store.now() - int(
-                getattr(cfg.operations, "retention_s", 86400) or 86400
-            ))
+            sweep_now = store.now()
+            store.ops_prune(
+                sweep_now - int(
+                    getattr(cfg.operations, "retention_s", 86400) or 86400
+                ),
+                replay_cutoff=sweep_now - int(
+                    getattr(cfg.operations, "idempotency_ttl_s", 86400) or 86400
+                ),
+                protect_legacy=True,
+            )
         except Exception:
             pass
     return store
