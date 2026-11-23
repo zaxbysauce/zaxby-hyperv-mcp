@@ -47,7 +47,7 @@ from typing import Any
 
 from .config import Config, default_state_db_path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 BUSY_TIMEOUT_MS = 5000
 
 # Lease scopes (issue #23). `lifecycle` is exclusive against every other
@@ -87,8 +87,15 @@ OP_FAILED = "failed"
 OP_CANCELLED = "cancelled"
 OP_TERMINAL_STATES = (OP_COMPLETED, OP_FAILED, OP_CANCELLED)
 OP_STATUSES = (OP_WORKING, OP_INPUT_REQUIRED, OP_COMPLETED, OP_FAILED, OP_CANCELLED)
-#: error_class recorded when a `working` op's heartbeat lapsed (AC5).
+
+# Issue #157: the durable loss classes. `interrupted` = the runner heartbeat
+# lapsed with no send committed (a restart whose VM-side effect is not known to
+# have been attempted). `unknown` = a possibly_sent attempt whose outcome was
+# lost after the pre-send commit: the row stays a protected, attachable
+# unresolved identity until trusted reconciliation. Both are protected from
+# pruning.
 OP_INTERRUPTED = "interrupted"
+OP_UNKNOWN = "unknown"
 
 # Issue #24 agent sentinel. Ops/events rows store the caller identity as
 # NOT NULL: an unattributed (stdio) caller is the empty string, never SQL
@@ -209,7 +216,9 @@ _SCHEMA_STATEMENTS = (
         idem_key TEXT NOT NULL DEFAULT '',
         result_json TEXT,
         result_size INTEGER NOT NULL DEFAULT 0,
-        poll_interval_ms INTEGER NOT NULL DEFAULT 2000
+        poll_interval_ms INTEGER NOT NULL DEFAULT 2000,
+        generation INTEGER NOT NULL DEFAULT 0,
+        send_state TEXT NOT NULL DEFAULT ''
     )
     """,
     """
@@ -239,6 +248,18 @@ _SCHEMA_STATEMENTS = (
         value TEXT NOT NULL
     )
     """,
+    # Issue #157: the durable per-VM epoch record for the restore barrier.
+    # state is TEXT so any reader (including acceptance probes that scan row
+    # values) can observe 'dirty'/'clean' directly; the clear is expected-epoch
+    # guarded against ABA.
+    """
+    CREATE TABLE IF NOT EXISTS vm_epochs (
+        vm_key TEXT PRIMARY KEY,
+        epoch INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL DEFAULT 'clean',
+        updated_at REAL NOT NULL DEFAULT 0
+    )
+    """,
 )
 
 # Statement positions the forward migrations depend on. Every migration is
@@ -254,9 +275,10 @@ _SCHEMA_PIN_POSITIONS = (
     (7, "ops"),
     (10, "events"),
     (12, "meta"),
+    (13, "vm_epochs"),
 )
 _V1_STATEMENTS = (2, 7)
-_V3_STATEMENTS = (7, 13)
+_V3_STATEMENTS = (7, 14)
 
 # Forward-only migrations, applied inside open()'s single BEGIN IMMEDIATE.
 # Without this branch a store already at user_version 1 would never receive
@@ -282,17 +304,39 @@ _V4_COLUMN_STATEMENTS = (
 _V5_COLUMN_STATEMENTS = (
     "ALTER TABLE relays ADD COLUMN kind TEXT NOT NULL DEFAULT 'http'",
 )
+# -- v6 (issue #157): executor generation + send state on ops, and the
+# vm_epochs table for the restore barrier. The fresh-schema ops CREATE already
+# carries the two columns; this migration is the additive ALTER pair plus the
+# vm_epochs CREATE for stores created at v5 or earlier. vm_epochs is the table
+# this step CREATES, so it is deliberately NOT in required_below for this
+# step (plan-critic round-2 blocker 7).
+_V6_COLUMN_STATEMENTS = (
+    "ALTER TABLE ops ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE ops ADD COLUMN send_state TEXT NOT NULL DEFAULT ''",
+    """
+    CREATE TABLE IF NOT EXISTS vm_epochs (
+        vm_key TEXT PRIMARY KEY,
+        epoch INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL DEFAULT 'clean',
+        updated_at REAL NOT NULL DEFAULT 0
+    )
+    """,
+)
 _MIGRATIONS: dict[int, tuple[str, ...]] = {
     1: _V2_STATEMENTS,
     2: _V3_TABLE_STATEMENTS,
     3: _V4_COLUMN_STATEMENTS,
     4: _V5_COLUMN_STATEMENTS,
+    5: _V6_COLUMN_STATEMENTS,
 }
 
 
 def _tables_present(con: sqlite3.Connection) -> bool:
     """Whether the current schema's tables all exist."""
-    for table in ("jobs", "relays", "leases", "fence_counters", "ops", "events", "meta"):
+    for table in (
+        "jobs", "relays", "leases", "fence_counters", "ops", "events", "meta",
+        "vm_epochs",
+    ):
         present = con.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
         ).fetchone()
@@ -351,6 +395,12 @@ def _migrate_to(con: sqlite3.Connection, found: int) -> None:
             raise StateStoreError(
                 "state store migration pin broken: the v4->v5 migration must be "
                 "exactly the v5 statement (the relays kind ALTER)"
+            )
+        if _MIGRATIONS[5] != _V6_COLUMN_STATEMENTS or not _MIGRATIONS[5]:
+            raise StateStoreError(
+                "state store migration pin broken: the v5->v6 migration must be "
+                "exactly the v6 statements (ops generation/send_state ALTERs + "
+                "the vm_epochs CREATE)"
             )
         # The migration is additive CREATE ... IF NOT EXISTS, so it must not
         # paper over a schema that is missing the versions BELOW it: a store
@@ -654,6 +704,11 @@ class OpRow:
     result_json: str | None = None
     result_size: int = 0
     poll_interval_ms: int = 2000
+    # Issue #157: executor generation (fencing authority, minted per row) and
+    # the durable pre-send state ('' | 'possibly_sent'). Column names carry no
+    # guardrail-forbidden fragment.
+    generation: int = 0
+    send_state: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -674,6 +729,8 @@ class OpRow:
             "result_json": self.result_json,
             "result_size": self.result_size,
             "poll_interval_ms": self.poll_interval_ms,
+            "generation": self.generation,
+            "send_state": self.send_state,
         }
 
 
@@ -696,13 +753,16 @@ def _row_to_op(values: tuple) -> OpRow:
         result_json=None if values[14] is None else str(values[14]),
         result_size=int(values[15] or 0),
         poll_interval_ms=int(values[16] or 2000),
+        generation=int(values[17] or 0),
+        send_state=str(values[18] or ""),
     )
 
 
 _OPS_COLUMNS = (
     "op_id, agent, tool, vm_id, vm_name, status, error_class, created_at, "
     "updated_at, runner, heartbeat_at, cancel_requested, params_hmac, "
-    "idem_key, result_json, result_size, poll_interval_ms"
+    "idem_key, result_json, result_size, poll_interval_ms, generation, "
+    "send_state"
 )
 
 
@@ -1157,13 +1217,14 @@ class Store:
                 try:
                     self._connect().execute(
                         "INSERT INTO ops (" + _OPS_COLUMNS + ") "
-                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             row.op_id, row.agent, row.tool, row.vm_id, row.vm_name,
                             row.status, row.error_class, row.created_at,
                             row.updated_at, row.runner, row.heartbeat_at,
                             row.cancel_requested, row.params_hmac, row.idem_key,
                             row.result_json, row.result_size, row.poll_interval_ms,
+                            row.generation, row.send_state,
                         ),
                     )
                 except sqlite3.IntegrityError as exc:
@@ -1237,19 +1298,39 @@ class Store:
         result_json: str | None = None,
         result_size: int = 0,
         updated_at: float,
+        generation: int | None = None,
+        pre_body_terminal: bool = False,
     ) -> bool:
         """Status move guarded on the current state; False when the row is no
-        longer in `from_statuses` (a lost race against cancel/recovery)."""
+        longer in `from_statuses` (a lost race against cancel/recovery).
+
+        `generation` (issue #157): when given, the UPDATE also requires the
+        row's executor generation to equal it, so a stale executor cannot
+        terminal-write over a newer generation's authority.
+
+        Send-state acknowledgment (issue #157, the ONE phase-based rule): a
+        transition carrying `pre_body_terminal=True` (an operations-layer arm
+        that provably precedes any body execution — admission-busy refusal,
+        AdmissionStopped, park-window/stop-valve cancellation) clears
+        `send_state`; a COMPLETED move clears it too. Every other terminal
+        originating inside the body RETAINS `send_state` — a post-send failure
+        or cancellation stays a protected unresolved identity (the OP_UNKNOWN
+        mapping happens in operations.py's epilogues and _classify_stale)."""
         placeholders = ",".join("?" for _ in from_statuses)
+        set_send = ", send_state = ''" if (
+            to_status == OP_COMPLETED or pre_body_terminal
+        ) else ""
         with self._lock:
             self._begin()
             try:
+                gen_sql = " AND generation = ?" if generation is not None else ""
+                gen_args: tuple = () if generation is None else (int(generation),)
                 cur = self._connect().execute(
                     "UPDATE ops SET status = ?, error_class = ?, result_json = ?, "
-                    "result_size = ?, updated_at = ? "
-                    f"WHERE op_id = ? AND status IN ({placeholders})",
+                    "result_size = ?, updated_at = ?" + set_send +
+                    f" WHERE op_id = ? AND status IN ({placeholders})" + gen_sql,
                     (to_status, error_class, result_json, int(result_size),
-                     float(updated_at), op_id, *from_statuses),
+                     float(updated_at), op_id, *from_statuses, *gen_args),
                 )
                 moved = cur.rowcount
                 self._commit()
@@ -1258,18 +1339,33 @@ class Store:
                 raise
         return bool(moved)
 
-    def op_heartbeat(self, op_id: str, at: float) -> None:
+    def op_heartbeat(
+        self, op_id: str, at: float, generation: int | None = None
+    ) -> bool:
+        """Freshen the heartbeat; returns whether a WORKING row was freshened.
+        `generation` (issue #157): when given, the UPDATE requires the row's
+        generation to match, so a fenced (replaced) executor cannot keep a
+        dead row alive. FB-003 (PR #166 review): the UPDATE also requires
+        status='working' — a beat from a timer that outlived its body (the
+        scheduled replacement firing after the terminal write) must never
+        refresh a TERMINAL row, whose fresh heartbeat would make the consult
+        treat an expired resolved identity as live."""
         with self._lock:
             self._begin()
             try:
-                self._connect().execute(
-                    "UPDATE ops SET heartbeat_at = ?, updated_at = ? WHERE op_id = ?",
-                    (float(at), float(at), op_id),
+                gen_sql = " AND generation = ?" if generation is not None else ""
+                gen_args: tuple = () if generation is None else (int(generation),)
+                cur = self._connect().execute(
+                    "UPDATE ops SET heartbeat_at = ?, updated_at = ? "
+                    "WHERE op_id = ? AND status = ?" + gen_sql,
+                    (float(at), float(at), op_id, OP_WORKING, *gen_args),
                 )
+                moved = cur.rowcount
                 self._commit()
             except BaseException:
                 self._rollback()
                 raise
+        return bool(moved)
 
     def op_delete(self, op_id: str) -> None:
         """Remove one op row (the idempotency-TTL expiry retires its record so
@@ -1283,7 +1379,9 @@ class Store:
                 self._rollback()
                 raise
 
-    def op_release_idem(self, op_id: str) -> None:
+    def op_release_idem(
+        self, op_id: str, generation: int | None = None
+    ) -> None:
         """Clear one op row's idem_key WITHOUT touching anything else (the
         admission-busy refusal path, PR #123 review PRR-001): a busy refusal
         is RETRYABLE, so after its terminal FAILED write the row frees the
@@ -1292,37 +1390,251 @@ class Store:
         executes instead of replaying the refusal for the idempotency TTL.
         The row itself (status, stored envelope) stays for its handle poll;
         every other terminal path (completion, body failure, cancellation)
-        keeps its key and its replay semantics."""
+        keeps its key and its replay semantics.
+
+        `generation` (issue #157, plan round-4 blocker 4): when given, the
+        UPDATE requires the row's generation to match, so a stale executor's
+        busy/cancellation epilogue can never clear a newer generation's
+        idempotency slot and re-open a duplicate dispatch."""
         with self._lock:
             self._begin()
             try:
+                gen_sql = " AND generation = ?" if generation is not None else ""
+                gen_args: tuple = () if generation is None else (int(generation),)
                 self._connect().execute(
-                    "UPDATE ops SET idem_key = '' WHERE op_id = ?", (op_id,)
+                    "UPDATE ops SET idem_key = '' WHERE op_id = ?" + gen_sql,
+                    (op_id, *gen_args),
                 )
                 self._commit()
             except BaseException:
                 self._rollback()
                 raise
 
-    def ops_prune(self, older_than: float) -> int:
-        """Retention: delete TERMINAL op rows (with their result payloads)
-        whose created_at is older than the cutoff. Working rows are never
-        swept here — a live detached op's row is owned by its runner; stale
-        ones are failed at read time and retire on the next retention pass."""
+    def ops_prune(
+        self, older_than: float, replay_cutoff: float | None = None,
+        protect_legacy: bool = False,
+    ) -> int:
+        """Retention (issue #157, two-phase tombstone rewrite): rows past the
+        retention cutoff lose their PAYLOAD (result_json=NULL) but keep their
+        identity (op_id/fingerprint/idem_key) so a replay inside the window
+        still returns the original handle with the result-expired disclosure;
+        already-null-payload rows past `replay_cutoff` (the replay window;
+        FB-003/FB-005 round: store_for's startup sweep passes store.now() -
+        idempotency_ttl_s, INDEPENDENT of the payload cutoff; default = the
+        retention cutoff) are deleted. Rows with error_class 'interrupted' or
+        'unknown', or a send_state of 'possibly_sent', are NEVER pruned or
+        payload-nulled (protected reconciliation flag). Rows tombstoned in
+        THIS pass never qualify for second-phase deletion in the same pass.
+        Working rows are never swept here.
+
+        `protect_legacy` (FB-005, PR #166 review; True on the startup sweep):
+        identity deletion also obeys the consult's AC8 legacy guard — a row
+        whose identity is legacy (a BLANK pre-fingerprint params_hmac OR the
+        v6 migration's generation 0) is never deleted, mirroring operations.
+        _legacy_expiry_allowed, so startup pruning can never consume a
+        protected legacy identity to authorize a duplicate dispatch. Direct
+        retention sweeps keep the plain age-based semantics."""
+        if replay_cutoff is None:
+            replay_cutoff = older_than
+        legacy_sql = (
+            " AND params_hmac <> '' AND generation > 0" if protect_legacy else ""
+        )
         with self._lock:
             self._begin()
             try:
+                # Second phase FIRST on the already-null-payload rows that
+                # existed BEFORE this pass (issue #157: a row tombstoned in
+                # the CURRENT pass never qualifies for deletion in the same
+                # pass — snapshot the deletable ids before any tombstoning).
                 cur = self._connect().execute(
-                    "DELETE FROM ops WHERE created_at < ? AND status IN "
-                    "('completed','failed','cancelled')",
+                    "SELECT op_id FROM ops WHERE created_at < ? AND created_at < ? "
+                    "AND status IN ('completed','failed','cancelled') "
+                    "AND error_class NOT IN ('interrupted','unknown') "
+                    "AND send_state <> 'possibly_sent' "
+                    "AND result_json IS NULL" + legacy_sql,
+                    (float(replay_cutoff), float(older_than)),
+                )
+                stale_ids = [str(r[0]) for r in cur.fetchall()]
+                cur = self._connect().execute(
+                    "UPDATE ops SET result_json = NULL, result_size = 0 "
+                    "WHERE created_at < ? AND status IN "
+                    "('completed','failed','cancelled') "
+                    "AND error_class NOT IN ('interrupted','unknown') "
+                    "AND send_state <> 'possibly_sent' "
+                    "AND result_json IS NOT NULL",
                     (float(older_than),),
                 )
-                removed = int(cur.rowcount or 0)
+                tombstoned = int(cur.rowcount or 0)
+                removed = 0
+                for op_id in stale_ids:
+                    cur = self._connect().execute(
+                        "DELETE FROM ops WHERE op_id = ?", (op_id,)
+                    )
+                    removed += int(cur.rowcount or 0)
                 self._commit()
             except BaseException:
                 self._rollback()
                 raise
-        return removed
+        return tombstoned + removed
+
+    def op_next_generation(self) -> int:
+        """Mint the next executor generation (issue #157): a meta-keyed
+        monotonic counter bumped transactionally. Every route mints one at
+        row creation; a replacement executor's fence takes a NEW one."""
+        with self._lock:
+            self._begin()
+            try:
+                cur = self._connect().execute(
+                    "INSERT INTO meta (key, value) VALUES ('ops_generation_seq', '1') "
+                    "ON CONFLICT(key) DO UPDATE SET value = "
+                    "CAST(CAST(value AS INTEGER) + 1 AS TEXT)",
+                )
+                del cur
+                cur = self._connect().execute(
+                    "SELECT value FROM meta WHERE key = 'ops_generation_seq'"
+                )
+                row = cur.fetchone()
+                value = int(row[0] or 1) if row is not None else 1
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+        return value
+
+    def op_fence(self, op_id: str) -> int:
+        """Take authority away from a row's current executor (issue #157):
+        bump its generation and return the NEW value. Old-generation heartbeats,
+        terminal writes, and idempotency releases become no-ops."""
+        with self._lock:
+            self._begin()
+            try:
+                cur = self._connect().execute(
+                    "UPDATE ops SET generation = generation + 1, updated_at = ? "
+                    "WHERE op_id = ?",
+                    (self.now(), op_id),
+                )
+                del cur
+                cur = self._connect().execute(
+                    "SELECT generation FROM ops WHERE op_id = ?", (op_id,)
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise StateStoreError(f"op_fence: unknown op_id {op_id!r}")
+                value = int(row[0] or 0)
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+        return value
+
+    def op_mark_send(
+        self, op_id: str, generation: int, sent: str = "possibly_sent"
+    ) -> bool:
+        """The durable pre-send commit (issue #157): ONE transaction validates
+        the row's CURRENT generation equals the caller's (the authority check)
+        and sets send_state. False when the fence moved (fail-closed)."""
+        with self._lock:
+            self._begin()
+            try:
+                cur = self._connect().execute(
+                    "UPDATE ops SET send_state = ?, updated_at = ? "
+                    "WHERE op_id = ? AND generation = ?",
+                    (str(sent), self.now(), op_id, int(generation)),
+                )
+                moved = cur.rowcount
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+        return bool(moved)
+
+    # -- vm_epochs (issue #157 restore barrier) ------------------------------
+
+    def epoch_bump(self, vm_key: str) -> int:
+        """Record a new dirty epoch for the VM (issue #157): epoch+1, state
+        TEXT 'dirty'. Returns the new epoch. The clear is expected-epoch
+        guarded, so a concurrent bump cannot be cleared by a stale dance."""
+        with self._lock:
+            self._begin()
+            try:
+                self._connect().execute(
+                    "INSERT INTO vm_epochs (vm_key, epoch, state, updated_at) "
+                    "VALUES (?, 1, 'dirty', ?) "
+                    "ON CONFLICT(vm_key) DO UPDATE SET "
+                    "epoch = epoch + 1, state = 'dirty', updated_at = ?",
+                    (vm_key, self.now(), self.now()),
+                )
+                cur = self._connect().execute(
+                    "SELECT epoch FROM vm_epochs WHERE vm_key = ?", (vm_key,)
+                )
+                row = cur.fetchone()
+                value = int(row[0] or 1) if row is not None else 1
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+        return value
+
+    def epoch_snapshot(self, vm_key: str) -> tuple[int, str]:
+        """(epoch, state) for the VM; (0, 'clean') when never recorded."""
+        with self._lock:
+            cur = self._connect().execute(
+                "SELECT epoch, state FROM vm_epochs WHERE vm_key = ?", (vm_key,)
+            )
+            row = cur.fetchone()
+        if row is None:
+            return (0, "clean")
+        return (int(row[0] or 0), str(row[1] or "clean"))
+
+    def epoch_clear_dirty(self, vm_key: str, expected_epoch: int) -> bool:
+        """Clear the dirty flag for the CURRENT epoch only (issue #157):
+        ABA-guarded with the expected epoch from the recovery snapshot."""
+        with self._lock:
+            self._begin()
+            try:
+                cur = self._connect().execute(
+                    "UPDATE vm_epochs SET state = 'clean', updated_at = ? "
+                    "WHERE vm_key = ? AND epoch = ? AND state = 'dirty'",
+                    (self.now(), vm_key, int(expected_epoch)),
+                )
+                moved = cur.rowcount
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+        return bool(moved)
+
+    def op_mark_send_and_dirty_epoch(
+        self, op_id: str, generation: int, vm_key: str
+    ) -> bool:
+        """The atomic keyed pre-send commit for restore (issue #157, plan
+        round-2 blocker 4): generation-validated send_state AND the dirty
+        epoch bump in ONE transaction. False when the fence moved (fail-closed
+        — no provider submission may follow)."""
+        with self._lock:
+            self._begin()
+            try:
+                cur = self._connect().execute(
+                    "UPDATE ops SET send_state = 'possibly_sent', updated_at = ? "
+                    "WHERE op_id = ? AND generation = ?",
+                    (self.now(), op_id, int(generation)),
+                )
+                moved = int(cur.rowcount or 0)
+                if not moved:
+                    self._commit()
+                    return False
+                self._connect().execute(
+                    "INSERT INTO vm_epochs (vm_key, epoch, state, updated_at) "
+                    "VALUES (?, 1, 'dirty', ?) "
+                    "ON CONFLICT(vm_key) DO UPDATE SET "
+                    "epoch = epoch + 1, state = 'dirty', updated_at = ?",
+                    (vm_key, self.now(), self.now()),
+                )
+                self._commit()
+            except BaseException:
+                self._rollback()
+                raise
+        return True
 
     def op_request_cancel(self, op_id: str, agent: str, at: float) -> int:
         """Record a cooperative cancel request. Ownership-scoped like every
@@ -1841,10 +2153,28 @@ def store_for(cfg: Config, environ: dict[str, str] | None = None) -> Store:
         # Issue #24 (implementation-review R8): op/result retention is a real
         # knob — terminal op rows (and their stored payloads) older than
         # operations.retention_s are pruned on the same first-open schedule.
+        # FB-005 (PR #166 review): the payload cutoff and the identity
+        # deletion (replay) cutoff are INDEPENDENT — the replay cutoff is
+        # operations.idempotency_ttl_s, never the retention cutoff. With a
+        # single cutoff, a completed row tombstoned by the FIRST startup was
+        # DELETED by the SECOND while still inside the configured replay
+        # window, so a same-key retry executed the body a second time (the
+        # README promise: payload tombstones keep identity through the replay
+        # window). The sweep also carries the consult's legacy/unresolved
+        # protections (protect_legacy): a generation-0 / blank-fingerprint
+        # legacy identity is never deleted here — it must reach the
+        # reconciliation refusal instead.
         try:
-            store.ops_prune(store.now() - int(
-                getattr(cfg.operations, "retention_s", 86400) or 86400
-            ))
+            sweep_now = store.now()
+            store.ops_prune(
+                sweep_now - int(
+                    getattr(cfg.operations, "retention_s", 86400) or 86400
+                ),
+                replay_cutoff=sweep_now - int(
+                    getattr(cfg.operations, "idempotency_ttl_s", 86400) or 86400
+                ),
+                protect_legacy=True,
+            )
         except Exception:
             pass
     return store

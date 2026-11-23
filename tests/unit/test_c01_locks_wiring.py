@@ -445,7 +445,7 @@ def test_swallowed_lock_failure_keeps_busy_class(monkeypatch):
     cfg.destructive.guest_repair = True  # require_destructive gate
     monkeypatch.setattr(repair_module.vmident, "resolve",
                         lambda *a, **k: _NS(id="g-1", name="vm"))
-    monkeypatch.setattr(repair_module, "_plan_items", lambda report: [{
+    monkeypatch.setattr(repair_module, "_plan_items", lambda report, *a, **k: [{
         "action": "start_sshd", "target": "sshd", "before": "stopped",
         "apply_script": "Start-Service sshd", "verify_finding": "f-sshd",
     }])

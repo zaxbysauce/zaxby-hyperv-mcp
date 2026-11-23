@@ -264,7 +264,9 @@ def test_concurrent_first_open_of_v3_store_migrates_cleanly(tmp_path):
     assert not errors, f"concurrent open failed: {errors}"
     version = sqlite3.connect(str(db)).execute(
         "PRAGMA user_version").fetchone()[0]
-    assert version == ss.SCHEMA_VERSION == 5, version
+    # issue #157: SCHEMA_VERSION moved to 6 (ops generation/send_state
+    # + vm_epochs); the concurrent-open migration chain is 3 -> ... -> 6.
+    assert version == ss.SCHEMA_VERSION == 6, version
     statestore.clear_store_cache_for_tests()
 
 

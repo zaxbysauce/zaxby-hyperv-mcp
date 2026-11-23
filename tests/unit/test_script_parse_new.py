@@ -163,7 +163,7 @@ def test_parse_repair_flows(parsed_ps, monkeypatch):
     })
     scripts = _collect_all(
         monkeypatch, repair.repair_guest_access, UNRESTRICTED, "test-vm",
-        apply=True, confirm=True, cred=CRED,
+        apply=True, confirm=True, cred=CRED, intended_bindings=["0.0.0.0"],
         responses=[host, broken, '{"service":"sshd"}', '{"backup":"b","replaced":1}',
                    '{"port":"22","enabled_rules":[]}', host, healthy],
     )

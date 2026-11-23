@@ -104,10 +104,12 @@ def test_schema_v5_migration_adds_the_kind_column(tmp_path):
     The fixture is built with the current store, then put back into the v4
     shape (kind column dropped if the current schema has it, user_version
     stamped 4) — exactly what a 0.20.0 database looks like to 0.21.0 code.
-    RED at base: SCHEMA_VERSION is 4 and _MIGRATIONS has no 4-to-5 entry,
-    so the precondition fails before any fixture work runs.
+    Issue #157 moved SCHEMA_VERSION to 6, so the precondition follows the
+    chain: the 4-to-5 step must still exist and a v4 store migrates forward
+    through v5 to the current version. (The original AC2 gate pinned
+    SCHEMA_VERSION == 5; the Change-6 inventory re-pins it to the chain.)
     """
-    if statestore.SCHEMA_VERSION != 5 or 4 not in statestore._MIGRATIONS:
+    if statestore.SCHEMA_VERSION < 5 or 4 not in statestore._MIGRATIONS:
         raise AssertionError(
             "the migration to version 5 does not exist (SCHEMA_VERSION is "
             f"{statestore.SCHEMA_VERSION} and _MIGRATIONS has no 4 to 5 "
@@ -160,7 +162,7 @@ def test_schema_v5_migration_adds_the_kind_column(tmp_path):
             "SELECT kind FROM relays ORDER BY relay_id")]
     finally:
         con.close()
-    assert version == 5, f"a v4 store must migrate to 5, got {version}"
+    assert version >= 5, f"a v4 store must migrate forward (>= 5, now through v6), got {version}"
     assert "kind" in columns, (
         f"the v4 -> v5 migration must add the relays.kind column; columns: "
         f"{columns}")

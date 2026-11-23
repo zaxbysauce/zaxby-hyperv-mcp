@@ -16,6 +16,7 @@ vm_lock, acquired per leg and never held across a nested leg.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 from datetime import datetime, timezone
@@ -26,8 +27,9 @@ from .credentials import CredentialSet
 from .vmlocks import vm_lock
 
 # Addresses that are valid ListenAddress/target values regardless of the
-# guest's current unicast IPs (wildcards and loopback).
-_UNIVERSAL_ADDRESSES = {"0.0.0.0", "::", "[::]", "*", "0.0.0.0:0"}
+# guest's current unicast IPs (wildcards and loopback, IPv4 and IPv6 —
+# issue #158 C18: '::1' is the IPv6 loopback and is never stale).
+_UNIVERSAL_ADDRESSES = {"0.0.0.0", "::", "[::]", "::1", "*", "0.0.0.0:0"}
 
 
 def _utc_now_iso() -> str:
@@ -109,13 +111,19 @@ Save-Section 'identity' {
     }
 }
 Save-Section 'ip_addresses' {
-    $v4 = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
-        Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' } |
-        ForEach-Object { @{ interface = [string]$_.InterfaceAlias; address = [string]$_.IPAddress; prefix = [int]$_.PrefixLength } })
-    $v6 = @(Get-NetIPAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue |
-        Where-Object { $_.IPAddress -ne '::1' -and $_.IPAddress -notlike 'fe80*' } |
-        ForEach-Object { [string]$_.IPAddress })
-    @{ ipv4 = $v4; ipv6 = $v6 }
+    $v4 = @(); $v4err = ''
+    try {
+        $v4 = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+            Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.254.*' } |
+            ForEach-Object { @{ interface = [string]$_.InterfaceAlias; address = [string]$_.IPAddress; prefix = [int]$_.PrefixLength } })
+    } catch { $v4err = 'IPv4 enumeration failed: ' + $_.Exception.Message }
+    $v6 = @(); $v6err = ''
+    try {
+        $v6 = @(Get-NetIPAddress -AddressFamily IPv6 -ErrorAction Stop |
+            Where-Object { $_.IPAddress -ne '::1' -and $_.IPAddress -notlike 'fe80*' } |
+            ForEach-Object { [string]$_.IPAddress })
+    } catch { $v6err = 'IPv6 enumeration failed: ' + $_.Exception.Message }
+    @{ ipv4 = $v4; ipv6 = $v6; ipv4_error = $v4err; ipv6_error = $v6err }
 }
 Save-Section 'ssh' {
     $out = @{}
@@ -230,6 +238,74 @@ def _addr_host(value: str) -> str:
     return v
 
 
+def classify_bind_address(raw: str, ip_section: dict | None) -> str:
+    """Shared observation-aware address planner (issue #158): ONE normalized
+    staleness heuristic used by BOTH the diagnostics findings engine and
+    repair's plan builder, so the two callers can never disagree.
+
+    Parses with ipaddress.ip_address (IPv4 and IPv6, bracketed forms
+    stripped). Returns one of:
+
+    - "not_stale": loopback/universal/wildcard forms, and unparseable
+      hostnames (a hostname cannot be validated against the observed IP
+      list — never rewritten without explicit operator intent);
+    - "stale": a parsed IP absent from the report's assigned addresses in
+      BOTH families — but ONLY when its own family was successfully
+      enumerated (a section-level or per-family probe error, or a missing
+      family list, means the enumeration is incomplete);
+    - "unknown": the relevant address family was not successfully observed,
+      so no staleness classification is supportable and no rewrite item may
+      be proposed from the incomplete observation.
+    """
+    host = _addr_host(raw)
+    if host.lower() in _UNIVERSAL_ADDRESSES:
+        return "not_stale"
+    bare = host
+    if bare.startswith("[") and bare.endswith("]"):
+        bare = bare[1:-1]
+    try:
+        ip = ipaddress.ip_address(bare)
+    except ValueError:
+        return "not_stale"
+    if ip.is_loopback:
+        return "not_stale"
+    if ip.version == 6 and ip.is_link_local:
+        # Issue #157 (final critic F3 + delta review R7-2/R8): link-local
+        # IPv6 (fe80::/10) is NEVER in the production probe's enumeration
+        # (the probe legitimately drops fe80*), so its assignment can never
+        # be confirmed from this data. It is therefore UNKNOWN, not
+        # not-stale: no rewrite is ever proposed from it (the F3
+        # no-false-flag requirement) and no positive postcondition is ever
+        # certified from a filtered enumeration (the approved plan's
+        # observation rule: the relevant family must be successfully
+        # observed before any staleness classification or positive
+        # verification).
+        return "unknown"
+    section = ip_section or {}
+    if section.get("error"):
+        return "unknown"
+    family = "ipv4" if ip.version == 4 else "ipv6"
+    if section.get(f"{family}_error"):
+        return "unknown"
+    if section.get(family) is None:
+        return "unknown"
+    assigned: set[str] = set()
+    for fam in ("ipv4", "ipv6"):
+        if section.get(f"{fam}_error"):
+            continue  # an errored family contributes no observed addresses
+        for entry in section.get(fam) or []:
+            addr = entry.get("address") if isinstance(entry, dict) else entry
+            if not addr:
+                continue
+            text = str(addr).strip()
+            if text.startswith("[") and text.endswith("]"):
+                text = text[1:-1]
+            assigned.add(text.lower())
+    if bare.lower() in assigned or str(ip).lower() in assigned:
+        return "not_stale"
+    return "stale"
+
+
 def _findings(_vm: dict, guest: dict | None) -> list[dict]:
     out: list[dict] = []
     if guest is None:
@@ -242,22 +318,28 @@ def _findings(_vm: dict, guest: dict | None) -> list[dict]:
 
     ip_section = guest.get("ip_addresses") or {}
     ip_ok = not ip_section.get("error")
+    # Family-level observability (issue #158): the probe records a per-family
+    # error when one family's enumeration failed, so a failed IPv4 or IPv6
+    # probe is a fact the findings engine (and repair's planner, via
+    # classify_bind_address) honor instead of silently treating as empty.
+    v4_err = str(ip_section.get("ipv4_error") or "")
+    v6_err = str(ip_section.get("ipv6_error") or "")
     ipv4: set[str] = set()
     for entry in ip_section.get("ipv4") or []:
         addr = entry.get("address")
         if addr:
             ipv4.add(addr.strip())
-    if ip_ok and not ipv4:
+    if ip_ok and not v4_err and not ipv4:
         out.append({
             "id": "guest_no_ipv4", "severity": "high", "route": "guest",
             "summary": "guest reports no non-loopback IPv4 addresses",
             "detail": "Get-NetIPAddress returned no usable IPv4; networking may be down or unset",
         })
-    elif not ip_ok:
+    elif not ip_ok or v4_err or v6_err:
         out.append({
             "id": "guest_ip_probe_failed", "severity": "medium", "route": "guest",
             "summary": "the guest IP probe failed; binding checks skipped",
-            "detail": ip_section.get("error", ""),
+            "detail": ip_section.get("error") or v4_err or v6_err,
         })
 
     ssh = guest.get("ssh") or {}
@@ -277,25 +359,18 @@ def _findings(_vm: dict, guest: dict | None) -> list[dict]:
             })
         stale: list[str] = []
         for cfg_addr in ssh.get("config_listen") or []:
-            host = _addr_host(str(cfg_addr))
-            if host.lower() in _UNIVERSAL_ADDRESSES or host in ipv4:
-                continue
-            # A hostname (non-IP literal) cannot be validated against the IP list.
-            if any(c.isalpha() for c in host):
-                continue
-            stale.append(str(cfg_addr))
+            if classify_bind_address(str(cfg_addr), ip_section) == "stale":
+                stale.append(str(cfg_addr))
         for listener in ssh.get("listeners") or []:
             raw = str(listener.get("address", ""))
-            laddr = _addr_host(raw)
-            if laddr.lower() in _UNIVERSAL_ADDRESSES or laddr in ipv4:
-                continue
-            if any(c.isalpha() for c in laddr):
-                continue
-            if raw not in stale:
+            if classify_bind_address(raw, ip_section) == "stale" and raw not in stale:
                 stale.append(raw)
-        # Stale-binding validation needs a trustworthy current-IP list; with
-        # the IP probe errored, every non-wildcard binding would falsely
-        # read as stale (Copilot review, COP-1).
+        # Stale-binding validation is observation-aware (issue #158): the
+        # shared planner returns "unknown" when the relevant address family
+        # was not successfully observed, so no stale finding is ever proposed
+        # from incomplete enumeration (the COP-1 suppression, now shared with
+        # repair through classify_bind_address instead of a duplicated
+        # heuristic).
         if stale and ip_ok:
             out.append({
                 "id": "ssh_stale_binding", "severity": "high", "route": "ssh",

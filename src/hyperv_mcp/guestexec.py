@@ -403,6 +403,12 @@ def _run_pooled_raw(
     )
     try:
         worker = pool.acquire(key, wait_s, cred=cred)
+    except psdsessions.SessionEpochDirty:
+        # Issue #157: the dirty-epoch refusal is DISCLOSED at the tool
+        # boundary — never silently converted into a per-call fallback (plan
+        # round-2 blocker 10 / round-4 advisory 2). Both acquire sites and
+        # the outer wrapper re-raise it.
+        raise
     except Exception:
         return None
 
@@ -423,6 +429,8 @@ def _run_pooled_raw(
             pool.discard(worker)
             try:
                 worker = pool.acquire(key, wait_s, cred=cred)
+            except psdsessions.SessionEpochDirty:
+                raise
             except Exception:
                 return None
             try:
@@ -438,6 +446,8 @@ def _run_pooled_raw(
                 pool.discard(worker)
                 return None
         return result
+    except psdsessions.SessionEpochDirty:
+        raise
     except Exception:
         pool.discard(worker)
         return None

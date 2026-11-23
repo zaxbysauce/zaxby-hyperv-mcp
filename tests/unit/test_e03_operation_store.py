@@ -310,9 +310,28 @@ def test_working_op_after_restart_reports_interrupted(tmp_path, fresh_server, mo
             f"AC5: a working op whose runner heartbeat is older than its TTL "
             f"must report failed at reopen; got {json.dumps(staled)[:300]}"
         )
-        assert staled.get("error_class") == "interrupted", (
-            f"AC5: the crash-recovered op must carry error_class "
-            f"'interrupted'; got {staled.get('error_class')!r}"
+        # Issue #157 (Change-6 migration): op A's runner committed the
+        # pre-send mark (possibly_sent) BEFORE the gated action leg, so a
+        # crash there is the lost-reply case — error_class 'unknown', the
+        # protected attachable identity. A row that NEVER committed a send
+        # keeps 'interrupted' (the control arm below).
+        assert staled.get("error_class") == "unknown", (
+            f"AC5 (issue #157): a possibly_sent op crashed past its heartbeat "
+            f"carries error_class 'unknown'; got {staled.get('error_class')!r}"
+        )
+        # Control arm: a seeded row with a runner and a lapsed heartbeat but
+        # NO send commit keeps the interrupted classification.
+        mount.store.op_insert(statestore.OpRow(
+            op_id="ac5-nosend", tool="hyperv_checkpoint_create", agent="agent-a",
+            vm_name="test-vm", status=statestore.OP_WORKING,
+            created_at=clock.now - 10_000.0, updated_at=clock.now - 10_000.0,
+            runner="nosend-runner", heartbeat_at=clock.now - 10_000.0,
+            idem_key="ac5-nosend",
+        ))
+        nosend = _call(mcp, "hyperv_op_status", {"op_id": "ac5-nosend"})
+        assert nosend.get("error_class") == "interrupted", (
+            f"AC5 control: a non-sent lapsed op stays 'interrupted'; got "
+            f"{nosend.get('error_class')!r}"
         )
         assert "unknown" in json.dumps(staled).lower(), (
             f"AC5: the recovered op must note that the VM-side outcome is "

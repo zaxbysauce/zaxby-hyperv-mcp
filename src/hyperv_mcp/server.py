@@ -4622,14 +4622,22 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             username: str = "", password: str = "",
             vm_id: str = "",
             lease_id: str = "", fencing_token: int = 0,
+            intended_bindings: list[str] | None = None,
         ) -> dict:
             """Propose (dry run, default) or apply narrow guest access fixes:
-            stale SSH ListenAddress bindings (config backed up first;
-            firewall repair may widen an existing disabled Any-port rule,
-            disclosed in the plan text), starting stopped sshd/WinRM,
-            enabling EXISTING disabled firewall allow rules. Apply requires
-            guest_repair=true AND confirm=true;
-            every applied change is re-verified and reported.
+            stale SSH ListenAddress bindings rewritten to the operator's
+            intended_bindings (config backed up first; never a guessed
+            replacement — absent/invalid/ambiguous intent leaves the rewrite
+            decision_required and not attempted), starting stopped sshd/WinRM,
+            enabling EXISTING disabled firewall allow rules (firewall repair
+            may widen an existing disabled Any-port rule, disclosed in the
+            plan text). Apply requires guest_repair=true AND confirm=true;
+            every applied change is re-verified and reported with separate
+            apply_outcome/observation/postcondition channels.
+            Guest floor (distinct from the console tool family, whose
+            host-console input works from firmware/WinPE with no guest OS
+            running): repair needs a RUNNING guest reachable over
+            PowerShell Direct — it cannot act on a stopped or pre-boot VM.
 
             Args:
                 vm_name: Name of the VM
@@ -4640,6 +4648,10 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 password: Inline guest password (requires allow_inline_credentials=true)
                 lease_id: Optional lease citation - the lease gate runs before the body
                 fencing_token: The lease's fencing token, with lease_id
+                intended_bindings: Operator intent for stale ListenAddress rewrites -
+                    one address applied to every stale line, or one per line; absent,
+                    invalid, or length-ambiguous intent leaves the rewrite
+                    decision_required (never a guessed replacement)
 
             Returns: {ok, vm_name, applied, plan, changes,
             verification_findings[, backup_path]}.
@@ -4648,6 +4660,7 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 "hyperv_repair_guest_access", vm_name, "guest_repair",
                 repair.repair_guest_access, _cfg(), vm_name,
                 apply=apply, confirm=confirm, vm_id=vm_id,
+                intended_bindings=intended_bindings,
                 cred_factory=lambda: _cred_args(_vm_key(vm_name, vm_id), username, password),
             )
 
@@ -4873,14 +4886,22 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
             vm_name: str = "", apply: bool = False, confirm: bool = False,
             vm_id: str = "",
             lease_id: str = "", fencing_token: int = 0,
+            intended_bindings: list[str] | None = None,
         ) -> dict:
             """Propose (dry run, default) or apply narrow guest access fixes:
-            stale SSH ListenAddress bindings (config backed up first;
-            firewall repair may widen an existing disabled Any-port rule,
-            disclosed in the plan text), starting stopped sshd/WinRM,
-            enabling EXISTING disabled firewall allow rules. Apply requires
-            guest_repair=true AND confirm=true;
-            every applied change is re-verified and reported. Credentials
+            stale SSH ListenAddress bindings rewritten to the operator's
+            intended_bindings (config backed up first; never a guessed
+            replacement — absent/invalid/ambiguous intent leaves the rewrite
+            decision_required and not attempted), starting stopped sshd/WinRM,
+            enabling EXISTING disabled firewall allow rules (firewall repair
+            may widen an existing disabled Any-port rule, disclosed in the
+            plan text). Apply requires guest_repair=true AND confirm=true;
+            every applied change is re-verified and reported with separate
+            apply_outcome/observation/postcondition channels.
+            Guest floor (distinct from the console tool family, whose
+            host-console input works from firmware/WinPE with no guest OS
+            running): repair needs a RUNNING guest reachable over
+            PowerShell Direct — it cannot act on a stopped or pre-boot VM. Credentials
             from environment only.
 
             vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
@@ -4893,12 +4914,17 @@ def _register_tools(cfg: Config, mcp: MCPServer) -> None:
                 vm_id: Optional VM GUID; exactly one of vm_name/vm_id must be given
                 lease_id: Optional lease citation - the lease gate runs before the body
                 fencing_token: The lease's fencing token, with lease_id
+                intended_bindings: Operator intent for stale ListenAddress rewrites -
+                    one address applied to every stale line, or one per line; absent,
+                    invalid, or length-ambiguous intent leaves the rewrite
+                    decision_required (never a guessed replacement)
             Returns: {ok, vm_name, applied, plan, changes, verification_findings[, backup_path]}.
             """
             return _run_guest_tool(
                 "hyperv_repair_guest_access", vm_name, "guest_repair",
                 repair.repair_guest_access, _cfg(), vm_name,
                 apply=apply, confirm=confirm, vm_id=vm_id,
+                intended_bindings=intended_bindings,
                 cred_factory=lambda: credentials.resolve_guest(vm_name=_vm_key(vm_name, vm_id)),
             )
 
@@ -6242,7 +6268,65 @@ def _harden_tools(mcp: MCPServer) -> None:
                     if ops_ctx is not None:
                         operations.fail_inline(ops_ctx, exc)
                     raise
+                # Issue #157 keyed-inline wiring (final critic F1, rounds 2-3):
+                # the inline route performs the SAME durable pre-send sequence
+                # the runner route performs. The WHOLE block lives inside the
+                # body try below so its finally owns the admission release AND
+                # the idempotent context unbind on EVERY path (round-3 blocker:
+                # early returns before the try leaked the bound context). ORDER:
+                # bind the op context first (the route-level commit then takes
+                # the generation-validated keyed path), the gate (NON-blocking:
+                # the async route answers a retryable busy envelope and frees
+                # the idem key per PRR-001), then the attempt-level possibly_sent
+                # mark (no vm_key here - the dirty-epoch work stays at the
+                # in-body effect boundaries, GUID-keyed by lifecycle), then the
+                # generation-fenced heartbeat timer for the body lifetime.
+                inline_beat_stop = None
+                op_ctx_tokens = None
                 try:
+                    if ops_ctx is not None:
+                        op_ctx_tokens = (
+                            operations._current_op_id.set(ops_ctx["op_id"]),
+                            operations._current_ops_cfg.set(ops_ctx["cfg"]),
+                            operations._current_op_generation.set(
+                                int(ops_ctx.get("generation") or 0)),
+                        )
+                        if not operations._send_gate_acquire(arguments):
+                            operations.busy_inline(ops_ctx, name)
+                            operations.release_busy_idem(ops_ctx)
+                            return _audited_rejection(
+                                name, arguments, operations._busy_envelope(name),
+                                journal_token=jtok,
+                            )
+                        # R7-1 (delta impl-review round 7): the gate window is
+                        # owned by try/finally, not the except arm — a
+                        # BaseException inside the commit bypassed both
+                        # release sites and wedged the VM's gate for the
+                        # process lifetime. The runner route already owns its
+                        # window with a finally.
+                        try:
+                            try:
+                                operations.commit_send_intent(_cfg())
+                            except Exception as mark_exc:
+                                operations.fail_inline(ops_ctx, mark_exc)
+                                return _audited_rejection(
+                                    name, arguments, errors.envelope(mark_exc),
+                                    journal_token=jtok,
+                                )
+                            except BaseException as boom:
+                                # R8-1 (delta review round 8): a BaseException
+                                # escaping the commit window reconciles the
+                                # attempt by its durable send provenance
+                                # before propagating - an unmarked row is the
+                                # definitive pre-send refusal (terminal
+                                # interrupted), a marked row keeps the
+                                # protected unknown identity.
+                                operations.reconcile_interrupted_commit(
+                                    ops_ctx, boom)
+                                raise
+                            inline_beat_stop = operations.start_inline_heartbeat(ops_ctx)
+                        finally:
+                            operations._send_gate_release(arguments)
                     try:
                         evidencejournal.arm(jtok)
                         result = await _run(arguments, context, convert_result=convert_result, **kwargs)
@@ -6289,6 +6373,24 @@ def _harden_tools(mcp: MCPServer) -> None:
                             operations.fail_inline(ops_ctx, exc)
                         raise
                 finally:
+                    # Issue #157 keyed-inline: the body-lifetime beat timer
+                    # stops on EVERY exit (a LIVE body kept its heartbeat
+                    # fresh; a crashed body lapses to unknown per contract).
+                    if inline_beat_stop is not None:
+                        inline_beat_stop()
+                    if op_ctx_tokens is not None:
+                        # The tuple is heterogeneous (Token[str]/[object]/[int]);
+                        # reset positionally so mypy sees each exact type, and
+                        # swallow stale-token ValueErrors from earlier arms.
+                        for var, tok in (
+                                (operations._current_op_id, op_ctx_tokens[0]),
+                                (operations._current_ops_cfg, op_ctx_tokens[1]),
+                                (operations._current_op_generation, op_ctx_tokens[2])):
+                            try:
+                                var.reset(tok)  # type: ignore[arg-type]
+                            except ValueError:
+                                pass  # already reset by an earlier exit arm
+                        op_ctx_tokens = None
                     # issue #131 (PC4-1): a terminal outcome that skipped
                     # an explicit finish (park cancellation, body
                     # BaseException re-raise) still journals exactly one
