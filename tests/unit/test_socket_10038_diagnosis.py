@@ -73,13 +73,16 @@ def test_capture_records_the_hvsock_monkeypatch_origin(capture, monkeypatch):
 
 def test_capture_records_the_real_listener_origin(capture):
     """A socket created outside the hvsock.connect path is classified as
-    the real-listener side."""
+    the side the installed connector did NOT produce. The capture records
+    only what it can establish - whether the socket was created while the
+    installed connector was on the stack - so it does not claim a family
+    role it cannot prove."""
     sock = _closed_socket()
     with pytest.raises(OSError):
         sock.recv(64)
     artifacts = _artifacts(capture)
     assert len(artifacts) == 1, f"expected one artifact, got {artifacts}"
-    assert artifacts[0]["handle_origin"] == "real-listener"
+    assert artifacts[0]["handle_origin"] == "not-the-installed-connector"
 
 
 def test_capture_names_the_operation_and_the_owning_leg(capture):
@@ -177,6 +180,62 @@ def test_capture_attributes_a_fixture_failure_to_the_fixture(capture, owning_fix
     assert artifacts[0]["owning_leg"] == "owning_fixture", (
         f"expected the owning fixture, got {artifacts[0]['owning_leg']!r}"
     )
+
+
+@pytest.fixture()
+def thread_starting_fixture():
+    """A FIXTURE that starts a thread whose socket operation fails.
+
+    This is the family's shape: the fixture owns the work, and the failure
+    happens on the thread - whose own stack cannot show the fixture that
+    started it.
+    """
+    errors: list[BaseException] = []
+
+    def worker():
+        sock = _closed_socket()
+        sock.recv(64)
+
+    def guarded():
+        try:
+            worker()
+        except OSError as exc:  # the family's own swallow
+            errors.append(exc)
+
+    thread = threading.Thread(target=guarded)
+    thread.start()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert errors and getattr(errors[0], "winerror", None) == 10038
+    return errors
+
+
+def test_capture_attributes_a_fixture_started_thread_to_the_fixture(
+    capture, thread_starting_fixture
+):
+    """A thread started by a FIXTURE names that fixture, not the test."""
+    artifacts = _artifacts(capture)
+    assert len(artifacts) == 1, f"expected one artifact, got {artifacts}"
+    assert artifacts[0]["owning_leg"] == "thread_starting_fixture", (
+        f"expected the starting fixture, got {artifacts[0]['owning_leg']!r}"
+    )
+    assert artifacts[0]["operation"] == "recv"
+
+
+def test_capture_records_a_10038_raised_by_shutdown(capture):
+    """`shutdown` on a closed socket raises the same 10038 the family sees.
+
+    The family calls shutdown and swallows the error, so without the
+    capture on that operation a real failure of that shape would leave no
+    evidence at all.
+    """
+    sock = _closed_socket()
+    with pytest.raises(OSError):
+        sock.shutdown(socket.SHUT_RDWR)
+    artifacts = _artifacts(capture)
+    assert len(artifacts) == 1, f"expected one artifact, got {artifacts}"
+    assert artifacts[0]["operation"] == "shutdown"
+    assert artifacts[0]["winerror"] == 10038
 
 
 def test_capture_ignores_a_non_10038_oserror(capture):

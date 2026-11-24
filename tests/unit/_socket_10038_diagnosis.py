@@ -45,7 +45,8 @@ from pathlib import Path
 
 DIAG_DIR_ENV = "HYPERV_MCP_10038_DIAG_DIR"
 _WINERROR_10038 = 10038
-_CAPTURED_OPERATIONS = ("recv", "accept", "sendall", "connect")
+# `shutdown` is included because the family calls it on a closed socket and swallows the resulting WinError 10038 - without it, a real failure of that shape produced no artifact at all.
+_CAPTURED_OPERATIONS = ("recv", "accept", "sendall", "connect", "shutdown")
 
 
 def _diagnosis_dir() -> Path:
@@ -112,6 +113,51 @@ def current_leg() -> str | None:
         return _CURRENT_LEG
 
 
+# The leg of the FIXTURE (or test) that was executing when a thread was
+# started, keyed by the thread object. A thread's own stack cannot show it:
+# the frames of the code that STARTED the thread are not on the thread's
+# stack. Filled at Thread.start time while the capture is installed.
+_THREAD_LEGS: dict[int, str] = {}
+
+
+def _current_stack_leg() -> str | None:
+    """The test-module frame that is executing right now (a fixture, usually)."""
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_globals.get("__name__") != __name__:
+            base = os.path.basename(frame.f_code.co_filename)
+            name = frame.f_code.co_name
+            if "test" in base and name and not name.startswith("<"):
+                return name
+        frame = frame.f_back
+    return None
+
+
+def _thread_leg() -> str | None:
+    """The leg recorded for the CURRENT thread, if any."""
+    thread = threading.current_thread()
+    return _THREAD_LEGS.get(id(thread))
+
+
+def _install_thread_leg_recorder(saved: dict) -> None:
+    """Record the starting leg of every thread started while installed."""
+    original_start = threading.Thread.start
+
+    def start_with_leg(self, *args, **kwargs):
+        leg = _current_stack_leg()
+        if leg:
+            _THREAD_LEGS[id(self)] = leg
+        return original_start(self, *args, **kwargs)
+
+    saved["Thread.start"] = original_start
+    threading.Thread.start = start_with_leg
+
+
+def _remove_thread_leg_recorder(saved: dict) -> None:
+    original_start = saved.pop("Thread.start", None)
+    if original_start is not None:
+        threading.Thread.start = original_start
+
 def _owning_leg() -> str:
     """The fixture leg (or test) that was running when the failure raised.
 
@@ -166,17 +212,31 @@ def _owning_leg() -> str:
         # body is on the stack, every frame inside it is a helper the test
         # called, and the TEST owns the failure - naming the helper would
         # not identify which of a 35-test cascade failed.
-        test_index = None
-        for index, name in enumerate(test_frames):
-            if name.startswith("test_"):
-                test_index = index  # the outermost test_ frame
-        if test_index is not None:
-            return test_frames[test_index]
+        # The published pytest leg names the ACTUAL test node. When that
+        # node is on the stack, every test-module frame inside it is a
+        # helper the test called - the test owns the failure, and a helper
+        # whose name happens to start with "test_" must not be named
+        # instead. When the published leg is NOT on the stack, the test
+        # body has not started: this is a FIXTURE's setup, and the
+        # outermost test-module frame is the fixture that owns it (the
+        # frozen oracle's `synthetic_hvsock_leg`).
+        published = current_leg()
+        if published and published in test_frames:
+            return published
         if test_frames:
             return test_frames[-1]
     else:
         # A background thread's stack names the thread's target, not the
         # owning test; the published pytest leg is used instead.
+        # A thread's own stack carries only its frames, so the leg of the
+        # FIXTURE that STARTED the thread is recovered from the registry the
+        # capture fills at Thread.start time. When the thread was not
+        # started under the capture (or nothing was recorded), the running
+        # pytest item is the best available identifier, and the artifact
+        # says which kind of attribution it is.
+        started_by = _thread_leg()
+        if started_by:
+            return started_by
         published = current_leg()
         if published:
             return published
@@ -208,6 +268,7 @@ class SocketDiagnosis:
             socket.socket.__init__ = self._init_factory(saved_init)  # type: ignore[method-assign]
             for name in _CAPTURED_OPERATIONS:
                 setattr(socket.socket, name, self._wrap(name))
+            _install_thread_leg_recorder(self._saved)
 
     def uninstall(self) -> None:
         with self._lock:
@@ -216,8 +277,10 @@ class SocketDiagnosis:
             socket.socket.__init__ = self._saved["__init__"]  # type: ignore[method-assign]
             for name in _CAPTURED_OPERATIONS:
                 setattr(socket.socket, name, self._saved[name])
+            _remove_thread_leg_recorder(self._saved)
             self._saved.clear()
             self._origins.clear()
+            _THREAD_LEGS.clear()
 
     # ---- the socket seams ----
 
@@ -226,9 +289,17 @@ class SocketDiagnosis:
         receives the SOCKET as its first argument."""
 
         def _init(sock, *args, **kwargs) -> None:
-            origin = "real-listener"
+            # The provenance is recorded as what was OBSERVED, not as a
+            # guess about the family's intent: the socket was created while
+            # the INSTALLED connector was on the stack, or it was not. The
+            # "real-listener" label is reserved for a socket the capture
+            # can attribute to the listener's own creation path; anything
+            # else is reported as "not-the-installed-connector", which is
+            # true without claiming the capture knows more than it does.
             if _on_creation_stack(_installed_hvsock_connect()):
                 origin = "hvsock-monkeypatch-side"
+            else:
+                origin = "not-the-installed-connector"
             saved_init(sock, *args, **kwargs)
             with self._lock:
                 self._origins[id(sock)] = origin

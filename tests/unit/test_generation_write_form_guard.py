@@ -360,9 +360,19 @@ def _local_assignments(func):
 
 
 def _annotation_admits_none(annotation):
-    """True for `int | None`, `Optional[...]`, any union containing None."""
+    """True for `int | None`, `Optional[...]`, any union containing None.
+
+    A QUOTED annotation ("int | None") is parsed first: a postponed
+    annotation written by hand is a string literal, and reading only the
+    AST of the literal would miss the None inside it.
+    """
     if annotation is None:
         return False
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        try:
+            annotation = ast.parse(annotation.value, mode="eval").body
+        except SyntaxError:
+            return True  # unparsable: conservative
     for node in ast.walk(annotation):
         if isinstance(node, ast.Constant) and node.value is None:
             return True
