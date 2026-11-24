@@ -202,14 +202,41 @@ def _bound_names(target):
         yield from _bound_names(target.value)
 
 
+def _pattern_names(pattern):
+    """The names a MATCH pattern binds."""
+    if isinstance(pattern, ast.MatchAs):
+        if pattern.name:
+            yield pattern.name
+    elif isinstance(pattern, ast.MatchStar):
+        if pattern.name:
+            yield pattern.name
+    elif isinstance(pattern, ast.MatchMapping):
+        if pattern.rest:
+            yield pattern.rest
+        for value in pattern.patterns:
+            yield from _pattern_names(value)
+    elif isinstance(pattern, ast.MatchSequence):
+        for element in pattern.patterns:
+            yield from _pattern_names(element)
+    elif isinstance(pattern, ast.MatchClass):
+        for element in pattern.patterns:
+            yield from _pattern_names(element)
+        for element in pattern.kwd_patterns:
+            yield from _pattern_names(element)
+    elif isinstance(pattern, ast.MatchOr):
+        for element in pattern.patterns:
+            yield from _pattern_names(element)
+
+
 def _local_assignments(func):
     """name -> the value nodes assigned to it anywhere in `func`.
 
     EVERY binding form is collected, not just `name = value`: a tuple
     target (`generation, = (None,)`), a walrus (`(generation := None)`), a
-    for-target, a with-target and an except-handler name all rebind the
-    name. Missing one of them lets a value reach a write behind the
-    classifier's back — the plan critic's M9 and M10 mutants.
+    for-target, a with-target, an except-handler name and a MATCH pattern
+    capture all rebind the name. Missing one of them lets a value reach a
+    write behind the classifier's back — the plan critic's M9 and M10 mutants
+    and the implementation reviewer's pattern-capture finding.
     """
     env = {}
 
@@ -235,6 +262,12 @@ def _local_assignments(func):
         elif isinstance(node, ast.ExceptHandler) and node.name:
             # `except E as name` binds the name to None.
             env.setdefault(node.name, []).append(ast.Constant(value=None))
+        elif isinstance(node, ast.Match):
+            # A match case's capture patterns bind names to the matched
+            # subject (conservatively: the subject expression).
+            for case in node.cases:
+                for name in _pattern_names(case.pattern):
+                    env.setdefault(name, []).append(node.subject)
     return env
 
 
