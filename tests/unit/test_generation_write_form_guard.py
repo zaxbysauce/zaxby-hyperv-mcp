@@ -191,15 +191,50 @@ def _chain_of(owner, node):
     return chain
 
 
+def _bound_names(target):
+    """The names a binding TARGET rebinds."""
+    if isinstance(target, ast.Name):
+        yield target.id
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for element in target.elts:
+            yield from _bound_names(element)
+    elif isinstance(target, ast.Starred):
+        yield from _bound_names(target.value)
+
+
 def _local_assignments(func):
+    """name -> the value nodes assigned to it anywhere in `func`.
+
+    EVERY binding form is collected, not just `name = value`: a tuple
+    target (`generation, = (None,)`), a walrus (`(generation := None)`), a
+    for-target, a with-target and an except-handler name all rebind the
+    name. Missing one of them lets a value reach a write behind the
+    classifier's back — the plan critic's M9 and M10 mutants.
+    """
     env = {}
+
+    def bind(target, value):
+        for name in _bound_names(target):
+            env.setdefault(name, []).append(value)
+
     for node in ast.walk(func):
         if isinstance(node, ast.Assign):
             for target in node.targets:
-                if isinstance(target, ast.Name):
-                    env.setdefault(target.id, []).append(node.value)
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            env.setdefault(node.target.id, []).append(node.value)
+                bind(target, node.value)
+        elif isinstance(node, ast.AnnAssign):
+            bind(node.target, node.value)
+        elif isinstance(node, ast.NamedExpr):
+            # A walrus rebinds the name inside an expression.
+            bind(node.target, node.value)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            bind(node.target, node.iter)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    bind(item.optional_vars, item.context_expr)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            # `except E as name` binds the name to None.
+            env.setdefault(node.name, []).append(ast.Constant(value=None))
     return env
 
 
