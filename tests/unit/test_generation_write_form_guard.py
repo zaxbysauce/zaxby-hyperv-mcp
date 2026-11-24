@@ -378,6 +378,9 @@ def _annotation_admits_none(annotation):
             return True
         if isinstance(node, ast.Name) and node.id == "Optional":
             return True
+        # `typing.Optional[...]` is an attribute, not a name.
+        if isinstance(node, ast.Attribute) and node.attr == "Optional":
+            return True
     return False
 
 
@@ -391,14 +394,19 @@ def _param_table(func):
             "index": index,
             "kwonly": False,
             "default": _NO_DEFAULT,
-            "admits_none": _annotation_admits_none(arg.annotation),
+            # An UNANNOTATED parameter can receive anything, so it admits
+            # None: a signature that cannot exclude None must not be read
+            # as one that excludes it.
+            "admits_none": (arg.annotation is None
+                            or _annotation_admits_none(arg.annotation)),
         }
     for arg in args.kwonlyargs:
         table[arg.arg] = {
             "index": None,
             "kwonly": True,
             "default": _NO_DEFAULT,
-            "admits_none": _annotation_admits_none(arg.annotation),
+            "admits_none": (arg.annotation is None
+                            or _annotation_admits_none(arg.annotation)),
         }
     # positional defaults align to the TAIL of the positional list;
     # kw_defaults align index-by-index (None = no default at all).
