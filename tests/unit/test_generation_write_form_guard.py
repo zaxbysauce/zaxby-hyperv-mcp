@@ -287,6 +287,12 @@ def _local_assignments(func):
                 continue  # the binding lives in an enclosing scope
             env.setdefault(name, []).append(value)
 
+    def bind_name(name, value):
+        """Bind a NAME directly (a definition's name is a string, not a node)."""
+        if name in declared_elsewhere:
+            return
+        env.setdefault(name, []).append(value)
+
     for node in ast.walk(func):
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -340,6 +346,16 @@ def _local_assignments(func):
             # None-capable.
             bind(node.target, ast.Constant(value=None, lineno=node.lineno,
                                            col_offset=0))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)):
+            # `def generation(): ...` / `class generation: ...` binds the
+            # name in the enclosing scope, so a later definition of that
+            # name REBINDS the local before the writes. The bound value is
+            # a function or class object - never None - but the binding
+            # still shadows the disclosed assignment, so it is collected as
+            # an unknown value (conservatively).
+            bind_name(node.name, ast.Constant(value=None, lineno=node.lineno,
+                                              col_offset=0))
     return env
 
 

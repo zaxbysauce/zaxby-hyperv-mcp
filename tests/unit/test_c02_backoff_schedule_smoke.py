@@ -122,16 +122,18 @@ def test_real_clock_backoff_still_ramps_to_a_ceiling(pool_env, monkeypatch):
         f"the ramp was not observed: {measured}")
 
     # Tolerant: the first sleep is the model's 5 ms, and CI-runner
-    # overhead inflates it, so only an upper bound is asserted.
-    assert measured[0] * 1000 < 35, (
-        f"the first sleep must stay well under 35 ms; got {measured[0] * 1000:.1f} ms")
-    # Tolerant: the ramp roughly doubles (the fixed-cadence mutant's flat
-    # sequence cannot).
-    for index in range(1, min(4, len(measured))):
-        step = measured[index] / measured[index - 1]
-        assert 1.05 <= step <= 3.2, (
-            f"ramp sleep {index} must roughly double (got {step:.2f}x from "
-            f"{[round(s * 1000, 1) for s in measured]})")
+    # overhead inflates it. Only a GENEROUS upper bound is asserted - the
+    # point of this smoke is that the loop sleeps and backs off, not how
+    # precisely it is timed (the exact schedule is asserted by the
+    # virtual-clock test, which has no scheduler in the loop).
+    assert measured[0] * 1000 < 250, (
+        f"the first sleep must stay well under 250 ms; got {measured[0] * 1000:.1f} ms")
+    # NO relative-timing assertion: the ratio between two ADJACENT sleeps is
+    # scheduler-sensitive (issue #167 recorded a 0.69x ratio on a loaded
+    # CI runner for a CORRECT schedule, because the earlier sleep was
+    # delayed more than the next), so a doubling bound here would
+    # reintroduce exactly the flake class this issue removes. The ramp's
+    # shape is asserted on the virtual clock instead.
     # Tolerant: a ceiling-sized sleep is present (the 200 ms ceiling is
     # 3x the fixed 50 ms cadence, so the bound is well clear of jitter).
     assert max(measured) >= 0.15, (
