@@ -233,15 +233,27 @@ def _local_assignments(func):
 
     EVERY binding form is collected, not just `name = value`: a tuple
     target (`generation, = (None,)`), a walrus (`(generation := None)`), a
-    for-target, a with-target, an except-handler name and a MATCH pattern
-    capture all rebind the name. Missing one of them lets a value reach a
-    write behind the classifier's back — the plan critic's M9 and M10 mutants
-    and the implementation reviewer's pattern-capture finding.
+    for-target, a with-target, an except-handler name, an IMPORT binding and
+    a MATCH pattern capture all rebind the name. Missing one of them lets a
+    value reach a write behind the classifier's back — the plan critic's M9
+    and M10 mutants, the implementation reviewer's pattern-capture finding
+    and the plan critic's import and global probes.
+
+    A name declared `global`/`nonlocal` in this function does NOT become a
+    local here: the binding lives in the enclosing scope, so the assignment
+    is not collected as a local binding (the name stays unresolved for this
+    function, which the classifier treats conservatively).
     """
     env = {}
+    declared_elsewhere: set[str] = set()
+    for node in ast.walk(func):
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            declared_elsewhere.update(node.names)
 
     def bind(target, value):
         for name in _bound_names(target):
+            if name in declared_elsewhere:
+                continue  # the binding lives in an enclosing scope
             env.setdefault(name, []).append(value)
 
     for node in ast.walk(func):
@@ -261,13 +273,27 @@ def _local_assignments(func):
                     bind(item.optional_vars, item.context_expr)
         elif isinstance(node, ast.ExceptHandler) and node.name:
             # `except E as name` binds the name to None.
-            env.setdefault(node.name, []).append(ast.Constant(value=None))
+            env.setdefault(node.name, []).append(
+                ast.Constant(value=None, lineno=node.lineno, col_offset=0)
+            )
         elif isinstance(node, ast.Match):
             # A match case's capture patterns bind names to the matched
             # subject (conservatively: the subject expression).
             for case in node.cases:
                 for name in _pattern_names(case.pattern):
+                    if name in declared_elsewhere:
+                        continue
                     env.setdefault(name, []).append(node.subject)
+        elif isinstance(node, ast.ImportFrom):
+            # `from x import generation` binds the name to an imported
+            # value, which is unknown here - conservatively None-capable.
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                if bound in declared_elsewhere:
+                    continue
+                env.setdefault(bound, []).append(
+                    ast.Constant(value=None, lineno=node.lineno, col_offset=0)
+                )
     return env
 
 
@@ -438,6 +464,16 @@ def _classify():
                         binding = ("param", func)
                         break
                 if binding is None:
+                    # The name resolves to NEITHER a local nor a parameter of
+                    # any enclosing function: it is a module-level (or
+                    # otherwise foreign) binding - a `global` declaration,
+                    # a module constant, an import. The conservative reading
+                    # is that it can be None, so the site is classified as
+                    # aliased and the pin demands that it be disclosed.
+                    # Skipping it (the earlier behaviour) let an
+                    # unpredicated bare-generation write through unseen -
+                    # the plan critic's executed global probe.
+                    aliased_sites.append((identity, [line], [lines[line - 1]]))
                     continue
                 if binding[0] == "local":
                     assigned = envs[binding[1]][name]
