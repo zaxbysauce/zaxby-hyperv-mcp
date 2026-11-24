@@ -210,10 +210,18 @@ def test_acquire_backoff_and_release_latency(pool_env, monkeypatch):
                     f"backoff ramp must be 5 ms doubling to the 200 ms "
                     f"ceiling; expected {expected[:count]}, requested {seen}"
                 )
-                clock.permit_one_sleep()
+                # The LAST request of the ramp is deliberately NOT permitted
+                # here: the waiter stays parked INSIDE it until the slot is
+                # released below. Permitting it before the release would
+                # let the worker sweep the STILL-HELD slot and ask for a
+                # ninth backoff - a spurious extra request caused by the
+                # harness ordering, not by a production defect.
+                if count < len(expected):
+                    clock.permit_one_sleep()
 
-            # Release, then permit: the waiter must acquire on the FIRST
-            # sweep after its release, requesting no further sleep at all.
+            # Release, THEN permit: the waiter wakes from its final parked
+            # backoff, sweeps, and finds the slot free, so it acquires on
+            # the FIRST sweep after the release, requesting no further sleep.
             release_virtual = clock.now
             pswindows._release_ps_slot(holder_fd)
             clock.permit_one_sleep()
@@ -247,7 +255,11 @@ def test_acquire_backoff_and_release_latency(pool_env, monkeypatch):
                     f"waiter B must follow the same ramp; expected "
                     f"{b_ramp[:count]}, requested {clock.sleeps[base:]}"
                 )
-                clock.permit_one_sleep()
+                # As with waiter A: the final request stays parked until
+                # the holder is released below, so the worker never sweeps a
+                # still-held slot and asks for an extra backoff.
+                if count < len(b_ramp):
+                    clock.permit_one_sleep()
             release_virtual_b = clock.now
             pswindows._release_ps_slot(results["a"])
             clock.permit_one_sleep()
