@@ -38,7 +38,9 @@ VENDORED_SKILL_DIRS = (
 
 # Canonical file count at the pinned commit (blobs under
 # .opencode/skills/{issue-tracer,swarm-pr-review,swarm-pr-feedback,commit-pr}).
-EXPECTED_ROW_COUNT = 39
+# 39 at d71e5aea; 53 at fbc4bba2 (the issue #167 AC4 re-pin, which carries
+# the canonical skill's advance INCLUDING the two-parent merge_identity arm).
+EXPECTED_ROW_COUNT = 53
 
 # Data-row grammar: <64-hex sha256><exactly two spaces><slash-separated relpath>.
 ROW_RE = re.compile(r"^([0-9a-f]{64}) {2}(\.agents/skills/.+)$")
@@ -111,9 +113,10 @@ def test_manifest_header_pins_canonical_commit_and_repin_procedure():
 
 
 def test_manifest_covers_exactly_39_files():
-    """AC2 pin: the canonical skill tree at the pinned commit has exactly 39
-    files; the manifest must enumerate every one of them — no more, no
-    fewer — so a truncated or padded manifest cannot weaken the oracle."""
+    """AC2 pin: the canonical skill tree at the pinned commit has exactly the
+    expected number of files; the manifest must enumerate every one of them —
+    no more, no fewer — so a truncated or padded manifest cannot weaken the
+    oracle."""
     rows = _parse_manifest()
     assert len(rows) == EXPECTED_ROW_COUNT, (
         f"vendored-skills manifest covers {len(rows)} rows; expected exactly "

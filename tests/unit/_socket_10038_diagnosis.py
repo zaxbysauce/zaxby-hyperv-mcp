@@ -27,8 +27,9 @@ Contract:
   never swallows or masks;
 * a failure that is not winerror 10038 is not captured at all;
 * the artifact writer's own failure never masks the test failure;
-* artifacts are uniquely named, so concurrent tests in a cascade cannot
-  overwrite each other;
+* artifacts are uniquely named for the lifetime of the process - across
+  concurrent writers AND across capture activations - so neither a cascade
+  nor a re-activation can overwrite an earlier artifact;
 * nothing but the operation name, the leg name, the origin classification
   and non-identifying metadata is recorded - no payload, no credentials,
   no guest content, no absolute guest path.
@@ -196,8 +197,14 @@ class SocketDiagnosis:
             leg = _owning_leg()
             directory = _diagnosis_dir()
             directory.mkdir(parents=True, exist_ok=True)
-            name = "socket-10038-{}-{}-{}.json".format(
-                leg.replace("/", "_"), os.getpid(), counter
+            # Name components: leg, pid, the process-wide sequence (the
+            # uniqueness guarantee - never reset by a re-activation, never
+            # shared by concurrent writers), then the per-activation counter
+            # (how many failures THIS activation has recorded). The sequence
+            # alone makes the name unique for the process lifetime; the
+            # counter is kept for readability only.
+            name = "socket-10038-{}-{}-{}-{}.json".format(
+                leg.replace("/", "_"), os.getpid(), _next_process_sequence(), counter
             )
             artifact = {
                 "winerror": _WINERROR_10038,
@@ -216,6 +223,26 @@ class SocketDiagnosis:
             tmp.replace(target)
         except Exception:  # noqa: BLE001 - a writer failure must not mask the test
             return
+
+
+# The uniqueness component of artifact names (issue #167 review follow-up).
+# An INSTANCE counter is not enough: the per-test conftest fixture
+# deactivates the capture after each test and activate() then builds a NEW
+# SocketDiagnosis, so an instance counter restarts at 0 - two tests in the
+# same process failing with the same owning leg would build the SAME
+# filename and tmp.replace(target) would destroy the earlier artifact. This
+# sequence is module-level (a re-activation never resets it) and incremented
+# under its own lock, so concurrent writers get distinct values too.
+_SEQ_LOCK = threading.Lock()
+_PROCESS_SEQ = 0
+
+
+def _next_process_sequence() -> int:
+    """A sequence value unique for the process lifetime, thread-safe."""
+    global _PROCESS_SEQ
+    with _SEQ_LOCK:
+        _PROCESS_SEQ += 1
+        return _PROCESS_SEQ
 
 
 _ACTIVE: SocketDiagnosis | None = None

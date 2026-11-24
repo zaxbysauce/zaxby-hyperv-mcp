@@ -173,3 +173,41 @@ def test_concurrent_failures_do_not_overwrite_each_other(capture):
     assert len(artifacts) == 2, f"expected two artifacts, got {artifacts}"
     names = {path.name for path in capture.glob("*.json")}
     assert len(names) == 2, f"artifact names must be unique: {names}"
+
+
+def test_reactivation_does_not_overwrite_an_earlier_artifact(tmp_path, monkeypatch):
+    """Two activate/deactivate cycles with the SAME owning leg leave two
+    artifacts, and both survive on disk.
+
+    The per-test conftest fixture deactivates the capture after every test,
+    so whatever keeps artifact names unique must outlive ONE activation: a
+    counter that resets with each new activation makes the second failure
+    reuse the first artifact's filename, and tmp.replace(target) silently
+    destroys the earlier evidence."""
+    diag = tmp_path / "diag"
+    monkeypatch.setenv(DIAG_DIR_ENV, str(diag))
+
+    def failing_leg():
+        activate()
+        try:
+            sock = _closed_socket()
+            with pytest.raises(OSError) as excinfo:
+                sock.recv(64)
+            assert getattr(excinfo.value, "winerror", None) == 10038
+        finally:
+            deactivate()
+
+    failing_leg()
+    failing_leg()
+
+    names = {path.name for path in diag.glob("*.json")}
+    assert len(names) == 2, (
+        f"two activations with the same leg must leave two distinct "
+        f"artifacts, got {sorted(names)}"
+    )
+    artifacts = _artifacts(diag)
+    assert len(artifacts) == 2, f"both artifacts must survive on disk: {artifacts}"
+    # Both failures attribute to the SAME leg - distinct filenames, not a
+    # distinct leg, are what keeps the two artifacts apart.
+    assert {a["owning_leg"] for a in artifacts} == {"failing_leg"}
+    assert all(a["winerror"] == 10038 for a in artifacts)

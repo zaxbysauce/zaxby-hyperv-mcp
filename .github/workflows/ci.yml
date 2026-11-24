@@ -68,7 +68,11 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: socket-10038-diagnosis-${{ matrix.python-version }}
+          # upload-artifact@v4 artifacts are immutable and a duplicate name
+          # in the same run is a conflict: a re-run attempt keeps its matrix
+          # value, so the attempt number must be part of the name or attempt
+          # 2 cannot upload what attempt 1 already uploaded.
+          name: socket-10038-diagnosis-${{ matrix.python-version }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/socket-10038-diagnosis
           if-no-files-found: ignore
 

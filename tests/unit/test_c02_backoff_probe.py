@@ -36,7 +36,17 @@ tests/unit/test_c02_backoff_schedule_smoke.py.
   P4  the busy contract survives inside the same probe run: the waiter
       raises PowerShellBusy naming 'saturated', and its permit accounting
       closes cleanly - the failed waiter stranded no slot lock (a fresh
-      acquire succeeds immediately once the holders release).
+      acquire succeeds immediately once the holders release);
+  P5  the 1 ms sleep floor of `min(backoff, max(deadline - now, 0.001))` is
+      REALLY engaged: a 315.5 ms budget leaves a 0.5 ms remainder after the
+      ramp, and the production loop's next request is exactly the 1 ms floor
+      (not the 0.5 ms remainder a floor-less mutant would ask for).
+
+Both legs run under the DIRECT real-sleep prohibition `no_real_sleep()`: a
+spy over the STDLIB `time.sleep` (the module attribute - the production
+loop reaches its clock through `pswindows.time`, which the virtual clock
+replaces), so any code path that bypasses the virtual clock and really
+sleeps fails the test at the offending call site.
 
 Hermetic: no PowerShell spawn, no host, no network (the pool-identity
 fixture pattern from test_c02_pool_identity.py: temp slot dir, config
@@ -50,7 +60,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
-from _c02_virtual_clock import VirtualClock
+from _c02_virtual_clock import VirtualClock, no_real_sleep
 
 from hyperv_mcp import pswindows
 
@@ -60,6 +70,10 @@ _WAIT_S = 3.0
 _FIRST_SLEEP = 0.005
 _CEILING = 0.2
 _SLEEP_FLOOR = 0.001
+# The sub-1 ms floor case: the plain ramp (5+10+20+40+80+160 ms) sums to
+# 0.315 s, so a 0.3155 s budget leaves 0.5 ms of remaining deadline - BELOW
+# the 1 ms sleep floor - at the next sleep request.
+_FLOOR_WAIT_S = 0.3155
 
 
 def _pool_cfg(slot_dir, wait_s: float) -> SimpleNamespace:
@@ -114,6 +128,16 @@ def pool_env(tmp_path, monkeypatch):
 
 
 def test_backoff_attempt_schedule_matches_ceiling_model(pool_env, monkeypatch):
+    """P1..P4 (module docstring), under the DIRECT real-sleep prohibition:
+    the whole probe runs inside `no_real_sleep()`, a spy over the STDLIB
+    `time.sleep` (not `pswindows.time.sleep`, which the virtual clock
+    replaces), so any code path that bypasses the virtual clock and really
+    sleeps fails the test at the offending call site."""
+    with no_real_sleep():
+        _run_backoff_attempt_schedule_probe(pool_env, monkeypatch)
+
+
+def _run_backoff_attempt_schedule_probe(pool_env, monkeypatch):
     """P1..P4 (module docstring): the REQUESTED sweep schedule of a
     saturated cap-2 pool is 5 ms doubling to a 200 ms ceiling with the final
     sleep capped to the deadline, the sweep count follows from that
@@ -315,4 +339,54 @@ def test_backoff_attempt_schedule_matches_ceiling_model(pool_env, monkeypatch):
     assert fresh is not None, (
         "a fresh acquire must succeed once the holders release (the failed "
         "waiter leaked a slot lock)"
+    )
+
+
+def test_sub_ms_deadline_remaining_hits_the_1ms_floor(pool_env, monkeypatch):
+    """The `max(deadline - time.monotonic(), 0.001)` floor is REALLY engaged.
+
+    The shipped backoff expression floors every sleep at 1 ms, but the floor
+    only bites when the remaining deadline drops BELOW 1 ms - no executed
+    case in the schedule probe above drives that (its 3.0 s window ends on a
+    deadline-CAPPED final sleep, not a floored one). This leg drives the
+    PRODUCTION loop itself - not a re-implementation of the formula - with a
+    budget of 0.3155 s: the plain ramp (5+10+20+40+80+160 ms) consumes
+    0.315 s, so the next sleep faces a 0.5 ms remainder and must REQUEST
+    exactly the 1 ms floor. A mutant that dropped the floor requests the
+    0.5 ms remainder instead; a mutant that dropped the cap requests the raw
+    backoff earlier in the ramp and dies on the prefix assertion.
+    """
+    clock = VirtualClock()
+    monkeypatch.setattr(pswindows, "time", clock)
+    monkeypatch.setattr(pswindows, "_config", _pool_cfg(pool_env.dir, _FLOOR_WAIT_S))
+    with no_real_sleep():
+        holders = [pswindows._acquire_ps_slot() for _ in range(_CAP)]
+        assert all(fd is not None for fd in holders), "harness must hold every slot"
+        # The main thread drives the production acquire loop against the
+        # saturated pool: sweep, fail, sleep - until the budget is spent.
+        with pytest.raises(pswindows.PowerShellBusy):
+            pswindows._acquire_ps_slot()
+        for fd in holders:
+            pswindows._release_ps_slot(fd)
+        fresh = pswindows._acquire_ps_slot()
+        assert fresh is not None, "the failed waiter leaked a slot lock"
+        pswindows._release_ps_slot(fresh)
+    requested = clock.sleeps
+    ramp = [_FIRST_SLEEP, 0.01, 0.02, 0.04, 0.08, 0.16]
+    assert requested[:-1] == pytest.approx(ramp), (
+        f"the ramp before the floor case must be the plain doubling ladder; "
+        f"got {requested}"
+    )
+    remainder = _FLOOR_WAIT_S - sum(ramp)
+    assert 0.0 < remainder < _SLEEP_FLOOR, (
+        f"the harness must leave a sub-floor positive remainder; got {remainder}"
+    )
+    assert requested[-1] == pytest.approx(_SLEEP_FLOOR), (
+        f"a remaining deadline of {remainder * 1000:.2f} ms must request the "
+        f"1 ms floor exactly; got {requested[-1]} (requests: {requested})"
+    )
+    assert requested[-1] > remainder, (
+        f"the final request must EXCEED the remaining deadline - the floor "
+        f"engaged rather than the deadline cap; request {requested[-1]}, "
+        f"remainder {remainder}"
     )

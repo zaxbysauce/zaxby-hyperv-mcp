@@ -20,6 +20,10 @@ deployment. These checks pin the wave's new robustness behavior:
         can observe directly.
 
 All legs are hermetic: no real PowerShell, host, network, or secret. The
+W2.2 backoff legs run the production acquire loop against the virtual clock
+(tests/unit/_c02_virtual_clock.py) under the no_real_sleep() prohibition -
+the slot file locking stays REAL, the waiting is event-driven virtual time,
+and a real time.sleep anywhere in the block fails the test outright. The
 RED signature at base is the file itself (pytest exit 4, NEW-SURFACE);
 each behavioral test below FAILS on the pre-fix tree for the named reason.
 """
@@ -27,11 +31,10 @@ each behavioral test below FAILS on the pre-fix tree for the named reason.
 import json
 import re
 import threading
-import time
 from types import SimpleNamespace
 
 import pytest
-from _c02_virtual_clock import VirtualClock
+from _c02_virtual_clock import VirtualClock, no_real_sleep
 
 from hyperv_mcp import errors, pswindows
 
@@ -142,113 +145,168 @@ def test_corrupt_marker_warns_and_repairs(pool_env):
 
 def test_acquire_backoff_and_release_latency(pool_env, monkeypatch):
     """The bounded-wait acquire backs off exponentially (5 ms doubling to a
-    200 ms ceiling, each sleep capped to the remaining deadline) and BOTH
-    real waiters acquire within 250 ms of their release (W2.2)."""
-    real_time = time
+    200 ms ceiling) and BOTH real waiters acquire within one backoff interval
+    (250 ms) of their release (W2.2) - on EVENT-DRIVEN VIRTUAL time, with a
+    direct real-sleep prohibition and no wall-clock measurement anywhere.
 
-    monkeypatch.setattr(pswindows, "_config", _pool_cfg(1, pool_env.dir, wait_s=10.0))
-    sleeps: list[float] = []
+    The production acquire loop runs against a GATED VirtualClock: each
+    backoff request is recorded and virtual time advances by exactly that
+    amount, then the waiter PARKS until the test permits one further sleep,
+    so the requested schedule is observed one sleep at a time with no race.
+    The two waiters still contend for a REAL slot file lock (the production
+    locking is real and stays real); only the WAITING is virtual. The
+    release-to-acquire property is asserted on the virtual clock: only a
+    sleep request can move virtual time, so the virtual gap counts exactly
+    the post-release backoff the waiter needed (zero for a correct release;
+    a mutant that makes the waiter wait several intervals accumulates those
+    durations - and its extra requests - and fails).
+    """
+    clock = VirtualClock()
+    clock.enable_gating()
+    monkeypatch.setattr(pswindows, "time", clock)
+    monkeypatch.setattr(pswindows, "_config",
+                        _pool_cfg(1, pool_env.dir, wait_s=10.0))
 
-    real_sleep = real_time.sleep
-
-    def _recording_sleep(d):
-        sleeps.append(float(d))
-        real_sleep(min(float(d), 0.02))  # cap real waiting in the test
-
-    monkeypatch.setattr(pswindows.time, "sleep", _recording_sleep)
-
-    holder_fd = pswindows._acquire_ps_slot()  # take the only slot
-    assert holder_fd is not None
     results: dict = {}
-    parked = {"n": 0}
-    plock = threading.Lock()
+    acquires: dict = {}
+    failures: dict = {}
     waiters: list[threading.Thread] = []
 
     def _waiter(tag):
-        with plock:
-            parked["n"] += 1
-        results[tag] = pswindows._acquire_ps_slot()
+        try:
+            fd = pswindows._acquire_ps_slot()
+        except BaseException as exc:  # noqa: BLE001 - recorded, asserted below
+            failures[tag] = exc
+        else:
+            results[tag] = fd
+            acquires[tag] = clock.monotonic()
 
-    waiter_a = threading.Thread(target=_waiter, args=("a",), daemon=True)
-    waiters.append(waiter_a)
-    waiter_a.start()
-    while parked["n"] < 1:
-        real_sleep(0.005)
-    real_sleep(0.15)  # let waiter A record ramp + ceiling backoff sleeps
-    # Exact exponential shape: 5 ms doubling through the ramp, then the
-    # 200 ms ceiling constant (a mutant that sleeps 5 ms once and then a
-    # constant 200 ms fails the ramp equality).
-    expected_ramp = [0.005, 0.01, 0.02, 0.04, 0.08, 0.16]
-    assert len(sleeps) > len(expected_ramp), (
-        f"backoff sequence too short to show ramp+ceiling: {sleeps}"
-    )
-    assert sleeps[:len(expected_ramp)] == pytest.approx(expected_ramp), (
-        f"backoff ramp must be 5 ms doubling to 200 ms; got {sleeps}"
-    )
-    tail = sleeps[len(expected_ramp):]
-    assert tail and all(s == pytest.approx(0.2) for s in tail), (
-        f"steady-state sleeps must sit at the 200 ms ceiling; got {sleeps}"
-    )
+    with no_real_sleep():
+        try:
+            holder_fd = pswindows._acquire_ps_slot()  # take the only slot
+            assert holder_fd is not None
 
-    release_wall = real_time.monotonic()
-    pswindows._release_ps_slot(holder_fd)
-    waiter_a.join(timeout=5)
-    assert not waiter_a.is_alive(), "waiter A never acquired after release"
-    a_delay = real_time.monotonic() - release_wall
-    assert a_delay <= 0.25, (
-        f"release-to-acquire must be within one backoff interval (250 ms); got {a_delay:.3f}s"
-    )
-    assert results["a"] is not None
+            waiter_a = threading.Thread(target=_waiter, args=("a",), daemon=True)
+            waiters.append(waiter_a)
+            waiter_a.start()
 
-    # Second waiter: still parked while A held the slot, then acquires
-    # within 250 ms of A's release.
-    waiter_b = threading.Thread(target=_waiter, args=("b",), daemon=True)
-    waiters.append(waiter_b)
-    waiter_b.start()
-    while parked["n"] < 2:
-        real_sleep(0.005)
-    release_wall_b = real_time.monotonic()
-    pswindows._release_ps_slot(results["a"])
-    waiter_b.join(timeout=5)
-    assert not waiter_b.is_alive(), "waiter B never acquired after release"
-    b_delay = real_time.monotonic() - release_wall_b
-    assert b_delay <= 0.25, (
-        f"second release-to-acquire must be within 250 ms; got {b_delay:.3f}s"
-    )
-    pswindows._release_ps_slot(results["b"])
-    # Cleanup barrier: no waiter may outlive the test (a leaked daemon
-    # acquire loop would pollute later counting tests).
-    for w in waiters:
-        w.join(timeout=5)
-        assert not w.is_alive(), f"{w.name} never finished"
+            # Drive the backoff one request at a time: after each permit the
+            # waiter really sweeps, really fails (the slot is really held),
+            # and requests its next backoff sleep, parking again. Exact
+            # exponential shape: 5 ms doubling through the ramp, then the
+            # 200 ms ceiling constant (a mutant that sleeps 5 ms once and
+            # then a constant 200 ms fails the ramp equality).
+            expected = [0.005, 0.01, 0.02, 0.04, 0.08, 0.16, 0.2, 0.2]
+            for count in range(1, len(expected) + 1):
+                assert clock.wait_for_sleeps(count), (
+                    f"waiter A never requested backoff sleep {count}"
+                )
+                seen = clock.sleeps
+                assert len(seen) == count, (
+                    f"the gated waiter must be parked on sleep {count}; "
+                    f"observed {seen}"
+                )
+                assert seen == pytest.approx(expected[:count]), (
+                    f"backoff ramp must be 5 ms doubling to the 200 ms "
+                    f"ceiling; expected {expected[:count]}, requested {seen}"
+                )
+                clock.permit_one_sleep()
+
+            # Release, then permit: the waiter must acquire on the FIRST
+            # sweep after its release, requesting no further sleep at all.
+            release_virtual = clock.now
+            pswindows._release_ps_slot(holder_fd)
+            clock.permit_one_sleep()
+            waiter_a.join(timeout=5)
+            assert not waiter_a.is_alive(), "waiter A never acquired after release"
+            assert "a" not in failures, f"waiter A raised: {failures['a']!r}"
+            assert results.get("a") is not None
+            assert len(clock.sleeps) == len(expected), (
+                f"waiter A needed further backoff sleeps after its release: "
+                f"{clock.sleeps[len(expected):]}"
+            )
+            a_gap = acquires["a"] - release_virtual
+            assert a_gap <= 0.25, (
+                f"release-to-acquire must sit within one backoff interval "
+                f"(250 ms) of VIRTUAL time; got {a_gap:.3f}s"
+            )
+
+            # Second waiter: still parked while A held the slot (following
+            # the same ramp), then acquires within one interval of A's
+            # release.
+            base = len(clock.sleeps)
+            waiter_b = threading.Thread(target=_waiter, args=("b",), daemon=True)
+            waiters.append(waiter_b)
+            waiter_b.start()
+            b_ramp = [0.005, 0.01, 0.02]
+            for count in range(1, len(b_ramp) + 1):
+                assert clock.wait_for_sleeps(base + count), (
+                    f"waiter B never requested backoff sleep {count}"
+                )
+                assert clock.sleeps[base:] == pytest.approx(b_ramp[:count]), (
+                    f"waiter B must follow the same ramp; expected "
+                    f"{b_ramp[:count]}, requested {clock.sleeps[base:]}"
+                )
+                clock.permit_one_sleep()
+            release_virtual_b = clock.now
+            pswindows._release_ps_slot(results["a"])
+            clock.permit_one_sleep()
+            waiter_b.join(timeout=5)
+            assert not waiter_b.is_alive(), "waiter B never acquired after release"
+            assert "b" not in failures, f"waiter B raised: {failures['b']!r}"
+            assert results.get("b") is not None
+            assert len(clock.sleeps) == base + len(b_ramp), (
+                f"waiter B needed further backoff sleeps after its release: "
+                f"{clock.sleeps[base + len(b_ramp):]}"
+            )
+            b_gap = acquires["b"] - release_virtual_b
+            assert b_gap <= 0.25, (
+                f"second release-to-acquire must sit within one backoff "
+                f"interval (250 ms) of VIRTUAL time; got {b_gap:.3f}s"
+            )
+            pswindows._release_ps_slot(results["b"])
+        finally:
+            # Never leave a worker parked on the gate (a failed assertion
+            # above would otherwise leak a blocked daemon into later tests).
+            clock.permit_all_sleeps()
+            clock.disable_gating()
+            for w in waiters:
+                w.join(timeout=5)
+                assert not w.is_alive(), f"{w.name} never finished"
 
 
-def test_short_deadline_overshoot_is_bounded(pool_env):
+def test_short_deadline_overshoot_is_bounded(pool_env, monkeypatch):
     """Each backoff sleep is capped to the remaining deadline: a wait budget
     far below the 200 ms ceiling still raises PowerShellBusy promptly
-    (W2.2 deadline cap; no 200 ms overshoot)."""
-    pswindows._config = _pool_cfg(1, pool_env.dir, wait_s=0.03)
-    requested: list[float] = []
-    original_sleep = time.sleep  # captured BEFORE patching (no-op-restore trap)
-
-    def _recording_sleep(d):
-        requested.append(float(d))
-        original_sleep(min(float(d), 0.01))
-
-    pswindows.time.sleep = _recording_sleep
-    try:
+    (W2.2 deadline cap; no 200 ms overshoot) - on the VIRTUAL clock, so the
+    deadline-cap arithmetic is asserted EXACTLY and no real sleeping is
+    involved: 5 ms + 10 ms + the 15 ms remainder, never a full-ceiling
+    request against a 30 ms budget."""
+    clock = VirtualClock()
+    monkeypatch.setattr(pswindows, "time", clock)
+    monkeypatch.setattr(pswindows, "_config",
+                        _pool_cfg(1, pool_env.dir, wait_s=0.03))
+    with no_real_sleep():
         holder_fd = pswindows._acquire_ps_slot()
-        started = time.monotonic()
+        started = clock.monotonic()
         with pytest.raises(pswindows.PowerShellBusy):
             pswindows._acquire_ps_slot()
-        elapsed = time.monotonic() - started
+        elapsed = clock.monotonic() - started
         pswindows._release_ps_slot(holder_fd)
-    finally:
-        pswindows.time.sleep = original_sleep
-    # No requested sleep may exceed the remaining budget (a full-ceiling
-    # request with a 30 ms budget is the defect this pins).
+    requested = clock.sleeps
+    # The deadline-cap arithmetic, exactly: the third sleep is capped to the
+    # 15 ms REMAINDER of the 30 ms budget instead of the 20 ms backoff (a
+    # full-ceiling request with a 30 ms budget is the defect this pins).
+    assert requested == pytest.approx([0.005, 0.01, 0.015]), (
+        f"requested sleeps must be the ramp capped to the remaining "
+        f"deadline; got {requested}"
+    )
     assert max(requested) <= 0.03 + 1e-9, (
         f"requested sleeps must be capped to the remaining deadline; got {requested}"
+    )
+    assert elapsed == pytest.approx(0.03), (
+        f"a short-deadline wait must cover exactly its budget on the virtual "
+        f"clock; got {elapsed:.4f}s"
     )
     assert elapsed <= 0.03 + 0.1, (
         f"a short-deadline wait must not overshoot by a full ceiling; got {elapsed:.3f}s"
@@ -284,23 +342,25 @@ def test_attempt_count_reduced_under_saturation(pool_env, monkeypatch):
     pswindows._try_lock_slot = _counting_try_lock
     sleeps_seen: list[float] = []
     try:
-        started = clock.monotonic()
-        # The bound method is captured BEFORE the attribute is replaced:
-        # `pswindows.time` IS the clock here, so replacing `sleep` on it and
-        # then calling `clock.sleep` would recurse into the replacement.
-        clock_sleep = clock.sleep
+        with no_real_sleep():
+            started = clock.monotonic()
+            # The bound method is captured BEFORE the attribute is replaced:
+            # `pswindows.time` IS the clock here, so replacing `sleep` on it
+            # and then calling `clock.sleep` would recurse into the
+            # replacement.
+            clock_sleep = clock.sleep
 
-        def _spy_sleep(d):
-            sleeps_seen.append(float(d))
-            clock_sleep(d)
+            def _spy_sleep(d):
+                sleeps_seen.append(float(d))
+                clock_sleep(d)
 
-        pswindows.time.sleep = _spy_sleep
-        try:
-            with pytest.raises(pswindows.PowerShellBusy):
-                pswindows._acquire_ps_slot()
-        finally:
-            pswindows.time.sleep = clock_sleep
-        window = clock.monotonic() - started
+            pswindows.time.sleep = _spy_sleep
+            try:
+                with pytest.raises(pswindows.PowerShellBusy):
+                    pswindows._acquire_ps_slot()
+            finally:
+                pswindows.time.sleep = clock_sleep
+            window = clock.monotonic() - started
     finally:
         pswindows._try_lock_slot = real_try_lock
     print("SLEEPS:", sleeps_seen[:16], "total", len(sleeps_seen))
@@ -326,10 +386,13 @@ def test_attempt_count_reduced_under_saturation(pool_env, monkeypatch):
     )
 
 
-def test_cancellation_tick_and_busy_envelope_preserved(pool_env):
+def test_cancellation_tick_and_busy_envelope_preserved(pool_env, monkeypatch):
     """The acquire loop still observes cancellation each retry tick and the
     saturation contract still raises PowerShellBusy naming the cap (the
-    PR-61 contracts; frozen test_c02_ps_cap.py pins the rest)."""
+    PR-61 contracts; frozen test_c02_ps_cap.py pins the rest) - run on the
+    VIRTUAL clock so the 0.3 s bounded wait costs no real sleeping."""
+    clock = VirtualClock()
+    monkeypatch.setattr(pswindows, "time", clock)
     calls = {"n": 0}
     real_check = pswindows._check_ps_cancellation
 
@@ -344,10 +407,11 @@ def test_cancellation_tick_and_busy_envelope_preserved(pool_env):
     pswindows._config = _pool_cfg(1, pool_env.dir, wait_s=0.3)
     holder_fd = pswindows._acquire_ps_slot()
     try:
-        # wait_s=0.3: long enough for several retry ticks (50 ms fixed at
-        # base, backoff after the fix) so the cancellation-seam pin bites.
-        with pytest.raises(pswindows.PowerShellBusy) as excinfo:
-            pswindows._acquire_ps_slot()
+        # wait_s=0.3 of VIRTUAL time: several retry ticks (backoff after the
+        # fix) so the cancellation-seam pin bites, at no real-clock cost.
+        with no_real_sleep():
+            with pytest.raises(pswindows.PowerShellBusy) as excinfo:
+                pswindows._acquire_ps_slot()
         assert "saturated" in str(excinfo.value)
         assert "1" in str(excinfo.value)
         assert errors.classify(excinfo.value) == "busy"
@@ -371,6 +435,7 @@ def test_marker_publication_arbitration(pool_env, monkeypatch):
     observed: list = []
     errors: list[str] = []
     stop = _th.Event()
+    observed_once = _th.Event()
 
     def _reader():
         while not stop.is_set():
@@ -386,6 +451,8 @@ def test_marker_publication_arbitration(pool_env, monkeypatch):
                 observed.append(json.loads(raw).get("cap"))
             except json.JSONDecodeError as exc:
                 errors.append(f"partial json: {exc}")
+            else:
+                observed_once.set()
 
     reader = _th.Thread(target=_reader, daemon=True)
     reader.start()
@@ -408,9 +475,13 @@ def test_marker_publication_arbitration(pool_env, monkeypatch):
     a.join(timeout=5)
     b.join(timeout=5)
     assert not pub_errors, f"publisher threads failed: {pub_errors}"
-    real_sleep_cap = 0.05
-    import time as _t
-    _t.sleep(real_sleep_cap)
+    # Event-driven drain: the reader signals the instant it has parsed the
+    # published marker (both publishers have joined by now, so the whole
+    # publication race has already been observed). No fixed wall-clock nap;
+    # the timeout is deadlock protection only.
+    assert observed_once.wait(timeout=2.0), (
+        "the concurrent reader never observed the published marker"
+    )
     stop.set()
     reader.join(timeout=2)
 

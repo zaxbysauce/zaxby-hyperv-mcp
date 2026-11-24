@@ -1,44 +1,58 @@
-# vendored-skills.manifest — byte-oracle for .agents/skills (issue #118)
+# vendored-skills.manifest - byte-oracle for .agents/skills (issue #118)
 # canonical_repo: ZaxbyHub/opencode-swarm
-# canonical_commit: d71e5aea9ca45d2b0b7c68c068886a3d4992af48
+# canonical_commit: fbc4bba20695083d51401c2a530bd192c84b884b
 # hash algorithm: sha256 over file bytes with CRLF normalized to LF
-# refresh: 2026-11-07 (re-pin ritual: docs/versioning-policy.md#vendored-repin)
+# refresh: 2026-11-24 (re-pin ritual: docs/versioning-policy.md#vendored-repin)
 476a6840819f47a21601d558f3d0a7a047f0ad1609b0b4dab3bfc6fc23c5c16f  .agents/skills/commit-pr/SKILL.md
-0d8d13b757b227ef7855557c096759e160bb9c4c8592275ad40d7d9c0ef3cc17  .agents/skills/issue-tracer/SKILL.md
-b18b51f80c3fd3ec192b51d35b3666cf9e73bd47adb303ff6788f326051302a6  .agents/skills/issue-tracer/assets/pr-template.md
-89f1fbd41dee42edaa5ec852a88dd366e1276b5c3870adda54b1e9c99be94590  .agents/skills/issue-tracer/references/acceptance-checks.md
+f80ceb221cb15d9128caa083e9df3979245c3651d5cfba6db019f767a839b38b  .agents/skills/issue-tracer/SKILL.md
+810d8534683aba5bc2bf021c2fc94a1e4e6d8b84c799a8695bb100c0118feb92  .agents/skills/issue-tracer/assets/pr-template.md
+abb7d9bceef5b91068958f934ac6f46d90ba047f088ff580f523315f51fee9a7  .agents/skills/issue-tracer/references/acceptance-checks.md
 5da4abe86caedf40f94253e9bbe7cd1ce4efc2b4e83d1b8dfffe5a3a58a19f9f  .agents/skills/issue-tracer/references/critic-gate.md
-9d62ec2e0acd53da4ae5be4f719ab811c02e363f0c423e65ee48d43d3ed13484  .agents/skills/issue-tracer/references/evidence-artifacts.md
-101de903165e1790c6e24ffce6bbbae73dd88ac05db40921c5fe5c78d7753ec4  .agents/skills/issue-tracer/references/full-resolution-contract.md
+568887546272cf9622b79ad2aa2114dd543844b81edf466864f82ce33f8849f2  .agents/skills/issue-tracer/references/evidence-artifacts.md
+044fc1fb1f1013d26612c613e9ac283b949d3eb48b70bf1e60533b62adbc7401  .agents/skills/issue-tracer/references/full-resolution-contract.md
 27eb0f53b0d9057a414243a5092504e10d7c1d8f9f3d7976c5adeaefe31f7eed  .agents/skills/issue-tracer/references/install.md
 52da2bf3b98ace6ded5d02371fb851b208b1788c2aba8e9e4071bcb08459e0b1  .agents/skills/issue-tracer/references/localization-playbook.md
 b39e33a3195863d983df8047fbed021f607f9f327a1bc1358b27bd9426943c8b  .agents/skills/issue-tracer/references/method-provenance.md
-4bd71e963f9f606eb436f014f3ab4b34e679fddcdb37118d3acab3db7288f808  .agents/skills/issue-tracer/references/phase-0-setup.md
-3f4351decf6668a327e23d5a33bc8e561e99712d5cf09a1bc88324da82a4dd1e  .agents/skills/issue-tracer/references/phase-1-intake.md
+0fa96923a69b9618a6e133a7d772d78f8468cae480f49215305ed8f9a3767e7d  .agents/skills/issue-tracer/references/phase-0-setup.md
+7fd837208e7b97cd89306436bdfe117513b5e23b08370c8f6b315197d2157770  .agents/skills/issue-tracer/references/phase-1-intake.md
 f4da91130f15b67dd4127fc63d01177931b9f0ff0db98b8219f39c6bca2ec773  .agents/skills/issue-tracer/references/untrusted-content.md
-dea2e10ff3b56103628f4c6353205606d33ee740852c7077ec46601dcb4302d4  .agents/skills/issue-tracer/scripts/repro-check.sh
+32de1591a37dcfcb8ddf18d6c09299ea9412b48781fbe9d45b5e510c859c7fb2  .agents/skills/issue-tracer/scripts/apply-edit.mjs
+1c18ea72953c2c8cf1eba8b9639844e787d328e2b015860d341025d12441dcfa  .agents/skills/issue-tracer/scripts/check-published-argv.mjs
+6f444a841c43b51d900b1592fb400c1ce710810b854f71eb4b520963bb3ab2a3  .agents/skills/issue-tracer/scripts/check-published-argv.sh
+5d2dd5c01d8fb4d71a81621a1ad7711349dd0acfb65cbbde84ee3aa7870285ea  .agents/skills/issue-tracer/scripts/generate-checkpoint-artifacts.mjs
+9e70d629cf6ac10be96d1c7c5a8587e6d7dbe668d0282e6ea717867bdc60d72c  .agents/skills/issue-tracer/scripts/generate-recurrence-table.sh
+4b05ccff9d20a2d93e695011cf93fa5eb66fe6b1a1a347fda143fb80216f9751  .agents/skills/issue-tracer/scripts/github-api.sh
+cf3afdb9319153aa9e3d42dcef81467e95a0cd6a985718f01c8d32705b906e2a  .agents/skills/issue-tracer/scripts/rebind-identities.mjs
+1e91e93e975c1c3652ed2530149155321125a2ac0a82434a7628dd3d794eb439  .agents/skills/issue-tracer/scripts/rebind-identities.sh
+4267b64507382c6987631f9b9fa9f2a8f4dcc087268e9c03f2a229178b37d43a  .agents/skills/issue-tracer/scripts/repro-check.sh
 f62afe0b92eb038265b7126ea28073424016e93bb6a31fa0a9b4659758a520aa  .agents/skills/issue-tracer/scripts/scan-deferred.sh
-f433bf7218dfc9434fcddda147bdc31f06959d4d858d09bd2118bae56d0d904e  .agents/skills/issue-tracer/scripts/trace-check.sh
+263ebf7879e818bd930fc7dbdf2a1fd19062a8a8c1f5518aaf8235705d72e12d  .agents/skills/issue-tracer/scripts/trace-check.sh
 284331302d8475f1539978fc7b953b0cf90f05369308337f3b95da14a6dbaf15  .agents/skills/issue-tracer/scripts/trace-init.sh
-3c7f7351fda5fbeda826a6066b6bd69800cf0cd7d3cf3f01692730802b708061  .agents/skills/swarm-pr-feedback/SKILL.md
+556a38664b1c5f229d335b5de494e5323c14ead29f685d39e357a095492851d9  .agents/skills/issue-tracer/scripts/verify-native-review.mjs
+45510d72e55945fd9ffa971ada27d7f7d8a9104299e454fd89cc19eab9e9a7e1  .agents/skills/swarm-pr-feedback/SKILL.md
 bdde7095f6ca9f8e1f58794afa36f8765ee79980a6f525b122168227f2e5f7fa  .agents/skills/swarm-pr-feedback/references/bot-claim-verification.md
-8c70de10704efadfb3c0beb498f449543f9dd2011437fedf0426cdf2c37067f2  .agents/skills/swarm-pr-feedback/references/followup-dispositions.md
+88ab1f6086c807d60c633c8b06c7bd004a078820870878b3a60fe6cfb49c7775  .agents/skills/swarm-pr-feedback/references/drive-to-merge.md
+03ade7023b8ce7f8801b13a4fa7fb9145b4e4d455af0f88b0f67dd459040f4f8  .agents/skills/swarm-pr-feedback/references/followup-dispositions.md
 1e771fb1a35547071c597ddb5c1cdb2d56aaac8be4c9d765f956c65db8fce05c  .agents/skills/swarm-pr-feedback/references/gate-evidence-scope.md
-27c0b233d36ffcd1908ac2075c9b26e2d3ddd5c33964c57a7bc6fef69e44c15f  .agents/skills/swarm-pr-feedback/references/intake-surfaces.md
-bf38763cdb6c9aea1e3cddde5762ca6e966e49f9334d6f3d8cfa7ef217c49ae5  .agents/skills/swarm-pr-feedback/references/operational-gotchas.md
+153a2168b2ba6e3efa582fa87932d907e717c9749fd3649b1b7d8a2fca352b45  .agents/skills/swarm-pr-feedback/references/intake-surfaces.md
+24967ce8f192f5f608617d41d1713693ece72f5a3d98c8cefc8f2f86104c41a1  .agents/skills/swarm-pr-feedback/references/operational-gotchas.md
 3a4ee3290e4a98c7cd9e371233346ef82f14a2f15e25b3b27e6717470fd90f97  .agents/skills/swarm-pr-feedback/references/preflight-checkout.md
-6e840465cf3f8c73b8ee28bb42005fd90e190cc389daf3da337a2dd47bf86827  .agents/skills/swarm-pr-review/SKILL.md
+1f1072f2de80e4c8d5725aa263787d854d38affa2303a9c1255984c1c8dfeecf  .agents/skills/swarm-pr-feedback/references/restart-inventory.md
+fe3535ebd7f2ef4cfee77fab361540be27e3c41e2c081786e8a1ccaa38b54fc5  .agents/skills/swarm-pr-review/SKILL.md
 fb84cc43e30007e62e12a15a27bc21823e46bd5ebf7f8f111002f7b29d32fdca  .agents/skills/swarm-pr-review/references/council-mode.md
 fdce4db96abc6e42d813c54eb5125ff7837c39ca6f9d98834c395a8683f541dc  .agents/skills/swarm-pr-review/references/counterbalancing.md
 e2e4f461154b211aaba89fd378380af23d5be50d843da6ac4252845f62fd0fca  .agents/skills/swarm-pr-review/references/explorer-output-format.md
-024bdf8b58c56c216144f55177dacfc936a370f1cbfe8d5e96be45c94ddf2d30  .agents/skills/swarm-pr-review/references/findings-persistence-contract.md
+e2b45e5ce8a82e11fe8f73d4eb1d9141b76df67057cd16199b01d5c68aa761e9  .agents/skills/swarm-pr-review/references/findings-persistence-contract.md
 fa732619396a2eb832f67dd54727256af4d9f87badd2e734170cfd217c2b4a15  .agents/skills/swarm-pr-review/references/findings-persistence-detail.md
+1a97a677d0444388633a70516728677da3e672284151cf07dd1c190f785cfe21  .agents/skills/swarm-pr-review/references/lane-cost-recovery.md
 f69380ba89d2281a53e5dafe4b1cb5c7635156334e78a531ebc4653def147c05  .agents/skills/swarm-pr-review/references/lane-output-recoverability.md
 8e339d21bc2527d0b28ac7f0e52f9e66fa962cd0cea8a61df60b09d17e65b8e1  .agents/skills/swarm-pr-review/references/parallel-work-example.md
 b7c433a21be3750180fae1916285f2181a9903a6b89ed8b7a56b5413cf35e3be  .agents/skills/swarm-pr-review/references/parser-candidate-extraction.md
 9b744f74a241157d4ce6a0b661281dd66c6682a43331020561d3fd598ee51f45  .agents/skills/swarm-pr-review/references/parser-dry-run.md
 108361a7d7d3f95520eda814303aa4a679f8508580d66c90cb40b1d3aafeb9e9  .agents/skills/swarm-pr-review/references/phase0a-intake.md
+4bd28bca5b77d786e515087bb5b886f9b06c41a8e788352301571622c0215fbf  .agents/skills/swarm-pr-review/references/probe-provenance.md
 b3e7e3956d96a6102f71181f5c6e093fa1935a71b468c04fdb5df58ce26035b0  .agents/skills/swarm-pr-review/references/prompt-templates.md
 a257e0fcc5a1d75d38cef366a9f05eb97dfa3ce40de43412e30665dabaa408f9  .agents/skills/swarm-pr-review/references/scope-detection.md
 6aed89570783b533ce9513a46f10531426479d82dae2929702a0474d87641b4d  .agents/skills/swarm-pr-review/references/verdict-settlement-contract.md
 b736033e7c06ed4046b99fa154a2c6ae9133889ff86a909b7628d5d4eb8582cf  .agents/skills/swarm-pr-review/references/writeback-phases.md
+b354011e6858051e2579951972f114239a356971b4aed1614407e9f34ac16963  .agents/skills/swarm-pr-review/scripts/cost-yield-ledger.sh

@@ -1012,7 +1012,14 @@ def _reconcile_interrupted_commit_core(
             error_class=statestore.OP_INTERRUPTED,
             result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
             updated_at=store.now(),
-            generation=generation,
+            # Issue #167 (independent critic's follow-up): the generation
+            # here is the PARAMETER (`generation: int | None`), not a local,
+            # so a keyword-local or alias search cannot see it. Both
+            # in-module callers pass the fail-closed `int(... or 0)` form,
+            # so no None reaches this write today; the write-form guard
+            # pins both facts (admitting, NOT reachable) so a caller that
+            # starts feeding a None-capable value is caught.
+            generation=generation,  # generation-write-form: fail-open-parameter-admits-none
             pre_body_terminal=True,
         )
         # FB-011 wave 7 (PR #166): the terminal event follows the TRANSITION
@@ -1391,7 +1398,13 @@ def _safe_transition(
             op_id, (statestore.OP_WORKING,), to_status,
             error_class=error_class, result_json=result_json,
             result_size=result_size, updated_at=store.now(),
-            generation=generation, pre_body_terminal=pre_body_terminal,
+            # Issue #167 (independent critic's follow-up): the generation
+            # parameter is `int | None = None` - the DEFAULT is None - and
+            # the two disclosed post-body terminals in _execute_body DO
+            # feed it `generation or None`, so None genuinely reaches this
+            # write (the callee side of those two disclosed sites). The
+            # write-form guard pins it in the parameter reachable set.
+            generation=generation, pre_body_terminal=pre_body_terminal,  # generation-write-form: fail-open-parameter
         )
         if moved:
             emit(cfg, kind, op_id, "", agent,
