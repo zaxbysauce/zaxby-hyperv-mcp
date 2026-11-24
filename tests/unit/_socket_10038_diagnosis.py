@@ -126,6 +126,13 @@ def _owning_leg() -> str:
     failure raised by the family's own helper code still attributes to the
     test that drove it. The capture's own frames are skipped.
 
+    On the MAIN THREAD the leg is the OUTERMOST test-module frame, so a
+    failure inside a nested helper names the fixture or test that owns it
+    rather than the helper (the real family's shape is
+    `fake_connect -> socket.create_connection -> connect`). A direct
+    fixture raise - the shape the frozen oracle produces - has exactly one
+    test-module frame, so it is unaffected.
+
     On a BACKGROUND THREAD the stack carries only that thread's own frames,
     so the frame it offers is the thread's target ("worker"), not the test
     that owns the failure. There the published pytest leg is used instead.
@@ -141,16 +148,32 @@ def _owning_leg() -> str:
                                frame.f_code.co_name))
         frame = frame.f_back
     on_main_thread = threading.current_thread() is threading.main_thread()
-    for base, name in candidates:
-        if "test" in base and name and not name.startswith("<"):
-            if on_main_thread:
-                return name
-            # A background thread's stack names the thread's target, not the
-            # owning test; fall through to the published pytest leg.
-            break
-    published = current_leg()
-    if published:
-        return published
+    test_frames = [
+        name
+        for base, name in candidates
+        if "test" in base and name and not name.startswith("<")
+    ]
+    if on_main_thread:
+        # The owning leg is the OUTERMOST test-module frame that is not a
+        # pytest test function: a fixture, or the helper a fixture drove. A
+        # failure inside the real family's nested helper (`fake_connect ->
+        # socket.create_connection -> connect`) then names the fixture that
+        # owns it, not the helper. A pytest TEST function is the fallback
+        # (a direct raise in a test body has only that frame), and a direct
+        # fixture raise - the shape the frozen oracle produces - names the
+        # fixture either way.
+        non_test = [name for name in reversed(test_frames)
+                    if not name.startswith("test_")]
+        if non_test:
+            return non_test[0]
+        if test_frames:
+            return test_frames[-1]
+    else:
+        # A background thread's stack names the thread's target, not the
+        # owning test; the published pytest leg is used instead.
+        published = current_leg()
+        if published:
+            return published
     for _base, name in reversed(candidates):
         if name and not name.startswith("<"):
             return name

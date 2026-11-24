@@ -125,6 +125,30 @@ def test_capture_survives_an_exception_swallowed_by_a_background_thread(capture)
     ), f"expected the owning test, got {artifacts[0]['owning_leg']!r}"
 
 
+def test_capture_attributes_a_nested_helper_to_its_owning_leg(capture):
+    """A failure inside a nested helper names the OUTER leg, not the helper.
+
+    The real family's shape is a fixture or test that installs a
+    `fake_connect` helper, and the helper is where the failing socket call
+    happens. The owning leg is the fixture or test that drove the helper -
+    naming the helper would not identify which of a 35-test cascade failed.
+    """
+    def owning_leg():
+        def nested_helper():
+            sock = _closed_socket()
+            sock.recv(64)
+
+        nested_helper()
+
+    with pytest.raises(OSError):
+        owning_leg()
+    artifacts = _artifacts(capture)
+    assert len(artifacts) == 1, f"expected one artifact, got {artifacts}"
+    assert artifacts[0]["owning_leg"] == "owning_leg", (
+        f"expected the owning leg, got {artifacts[0]['owning_leg']!r}"
+    )
+
+
 def test_capture_ignores_a_non_10038_oserror(capture):
     """A different OSError is not captured, and it is not masked."""
     sock = socket.socket()

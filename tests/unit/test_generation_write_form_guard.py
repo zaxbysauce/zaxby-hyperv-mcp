@@ -484,7 +484,7 @@ def test_the_aliased_capture_carries_its_disclosure_tag():
     untagged = [
         line
         for _identity, alias_lines, texts in aliased_sites
-        for line, text in zip(alias_lines, texts)
+        for line, text in zip(alias_lines, texts, strict=True)
         if _ALIAS_TAG not in text
     ]
     assert not untagged, (
