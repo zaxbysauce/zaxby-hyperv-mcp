@@ -207,6 +207,10 @@ def _pattern_names(pattern):
     if isinstance(pattern, ast.MatchAs):
         if pattern.name:
             yield pattern.name
+        # `case (generation, _) as pair:` binds BOTH the inner name and the
+        # outer one, so the nested pattern is walked too.
+        if pattern.pattern is not None:
+            yield from _pattern_names(pattern.pattern)
     elif isinstance(pattern, ast.MatchStar):
         if pattern.name:
             yield pattern.name
@@ -294,6 +298,21 @@ def _local_assignments(func):
                 env.setdefault(bound, []).append(
                     ast.Constant(value=None, lineno=node.lineno, col_offset=0)
                 )
+        elif isinstance(node, ast.Import):
+            # `import x as generation` binds the name the same way.
+            for alias in node.names:
+                bound = alias.asname
+                if not bound or bound in declared_elsewhere:
+                    continue
+                env.setdefault(bound, []).append(
+                    ast.Constant(value=None, lineno=node.lineno, col_offset=0)
+                )
+        elif isinstance(node, ast.AugAssign):
+            # `generation += x` REBINDS the name through the target's
+            # `__iadd__`, so the result is an unknown value: conservatively
+            # None-capable.
+            bind(node.target, ast.Constant(value=None, lineno=node.lineno,
+                                           col_offset=0))
     return env
 
 

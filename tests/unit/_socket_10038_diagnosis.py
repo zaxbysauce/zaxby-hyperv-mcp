@@ -154,18 +154,24 @@ def _owning_leg() -> str:
         if "test" in base and name and not name.startswith("<")
     ]
     if on_main_thread:
-        # The owning leg is the OUTERMOST test-module frame that is not a
-        # pytest test function: a fixture, or the helper a fixture drove. A
-        # failure inside the real family's nested helper (`fake_connect ->
-        # socket.create_connection -> connect`) then names the fixture that
-        # owns it, not the helper. A pytest TEST function is the fallback
-        # (a direct raise in a test body has only that frame), and a direct
-        # fixture raise - the shape the frozen oracle produces - names the
-        # fixture either way.
-        non_test = [name for name in reversed(test_frames)
-                    if not name.startswith("test_")]
-        if non_test:
-            return non_test[0]
+        # The owning leg is the pytest TEST that was running when one is on
+        # the stack, and otherwise the FIXTURE that owns the call.
+        #
+        # A test body runs AFTER its fixtures, so a fixture's frame is on
+        # the stack only while the fixture itself is executing - in which
+        # case no test function is on the stack either, and the outermost
+        # test-module frame (the fixture) owns the failure. That is the
+        # shape the frozen oracle produces, and the shape the socket
+        # family's fixture-installed `fake_connect` produces. When a test
+        # body is on the stack, every frame inside it is a helper the test
+        # called, and the TEST owns the failure - naming the helper would
+        # not identify which of a 35-test cascade failed.
+        test_index = None
+        for index, name in enumerate(test_frames):
+            if name.startswith("test_"):
+                test_index = index  # the outermost test_ frame
+        if test_index is not None:
+            return test_frames[test_index]
         if test_frames:
             return test_frames[-1]
     else:

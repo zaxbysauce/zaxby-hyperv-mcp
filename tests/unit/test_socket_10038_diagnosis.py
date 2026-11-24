@@ -125,27 +125,57 @@ def test_capture_survives_an_exception_swallowed_by_a_background_thread(capture)
     ), f"expected the owning test, got {artifacts[0]['owning_leg']!r}"
 
 
-def test_capture_attributes_a_nested_helper_to_its_owning_leg(capture):
-    """A failure inside a nested helper names the OUTER leg, not the helper.
+def test_capture_attributes_a_nested_helper_to_the_running_test(capture):
+    """A failure inside a helper the TEST called names the TEST.
 
-    The real family's shape is a fixture or test that installs a
-    `fake_connect` helper, and the helper is where the failing socket call
-    happens. The owning leg is the fixture or test that drove the helper -
-    naming the helper would not identify which of a 35-test cascade failed.
+    A helper is an implementation detail of the test that called it, so
+    naming the helper would not identify which of a 35-test cascade
+    failed. (A failure raised while a FIXTURE runs is a different shape:
+    no test function is on the stack then, and the fixture owns it - the
+    frozen oracle pins that case.)
     """
-    def owning_leg():
-        def nested_helper():
-            sock = _closed_socket()
-            sock.recv(64)
-
-        nested_helper()
+    def nested_helper():
+        sock = _closed_socket()
+        sock.recv(64)
 
     with pytest.raises(OSError):
-        owning_leg()
+        nested_helper()
     artifacts = _artifacts(capture)
     assert len(artifacts) == 1, f"expected one artifact, got {artifacts}"
-    assert artifacts[0]["owning_leg"] == "owning_leg", (
-        f"expected the owning leg, got {artifacts[0]['owning_leg']!r}"
+    assert artifacts[0]["owning_leg"] == (
+        "test_capture_attributes_a_nested_helper_to_the_running_test"
+    ), f"expected the running test, got {artifacts[0]['owning_leg']!r}"
+
+
+@pytest.fixture()
+def owning_fixture():
+    """A fixture whose nested helper fails - the family's fixture shape.
+
+    A fixture executes during SETUP, before the test body, so no test
+    function is on the stack when the failure is captured. The error is
+    swallowed here so the test body can still assert on the artifact (a
+    fixture that raised would make the test ERROR before its body ran).
+    """
+    def nested_helper():
+        sock = _closed_socket()
+        sock.recv(64)
+
+    try:
+        nested_helper()
+    except OSError:
+        pass
+
+
+def test_capture_attributes_a_fixture_failure_to_the_fixture(capture, owning_fixture):
+    """A failure raised while a FIXTURE runs names the fixture.
+
+    The outermost test-module frame is the fixture that owns the failure.
+    The frozen synthetic oracle pins this shape too (`synthetic_hvsock_leg`).
+    """
+    artifacts = _artifacts(capture)
+    assert len(artifacts) == 1, f"expected one artifact, got {artifacts}"
+    assert artifacts[0]["owning_leg"] == "owning_fixture", (
+        f"expected the owning fixture, got {artifacts[0]['owning_leg']!r}"
     )
 
 
@@ -239,6 +269,9 @@ def test_reactivation_does_not_overwrite_an_earlier_artifact(tmp_path, monkeypat
     artifacts = _artifacts(diag)
     assert len(artifacts) == 2, f"both artifacts must survive on disk: {artifacts}"
     # Both failures attribute to the SAME leg - distinct filenames, not a
-    # distinct leg, are what keeps the two artifacts apart.
-    assert {a["owning_leg"] for a in artifacts} == {"failing_leg"}
+    # distinct leg, are what keeps the two artifacts apart. The leg is the
+    # test that was running (the helper is an implementation detail of it).
+    assert {a["owning_leg"] for a in artifacts} == {
+        "test_reactivation_does_not_overwrite_an_earlier_artifact"
+    }
     assert all(a["winerror"] == 10038 for a in artifacts)
