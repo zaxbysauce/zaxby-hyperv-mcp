@@ -118,6 +118,11 @@ _EXPECTED_PARAM_ADMITTING = {
 _EXPECTED_PARAM_REACHABLE = {
     ("_safe_transition", "op_transition", None): 1,
 }
+# The disclosed fail-open FORM of the aliased capture. The set pin fixes WHICH
+# sites are aliased; this pins WHAT each one says, so a rewrite of an
+# already-pinned site's value form cannot pass unnoticed while it keeps its
+# disclosure tag.
+_DISCLOSED_ALIAS_FORM = 'generation = int(op_ctx.get("generation") or 0) or None'
 _EVENT_SUFFIXES = ("OP_FAILED", "OP_COMPLETED", "OP_WORKING", "OP_CANCELLED")
 
 
@@ -429,6 +434,26 @@ def test_the_aliased_capture_carries_its_disclosure_tag():
     untagged = [line for _identity, line, text in aliased_sites if _ALIAS_TAG not in text]
     assert not untagged, (
         f"AC1: aliased fail-open capture missing the '{_ALIAS_TAG}' tag at lines {untagged}"
+    )
+
+
+def test_the_aliased_capture_keeps_its_disclosed_fail_open_form():
+    """The pinned alias keeps the disclosed fail-open FORM.
+
+    The set pin fixes WHICH sites are aliased; this pins what each one SAYS.
+    Without it, rewriting an already-pinned site's value form (e.g. dropping
+    the fail-closed `int(...)` coercion) while keeping its disclosure tag
+    leaves every other assertion passing: the site stays disclosed, but the
+    shape the disclosure describes can change silently. An executed mutant
+    (M6 in the mutation probe) shows exactly that bypass.
+    """
+    _local, aliased_sites, _parameter = _classify()
+    forms = {
+        text.split("#", 1)[0].strip() for _identity, _line, text in aliased_sites
+    }
+    assert forms == {_DISCLOSED_ALIAS_FORM}, (
+        f"AC1: aliased fail-open capture form mismatch: expected exactly "
+        f"{[_DISCLOSED_ALIAS_FORM]!r}, found {sorted(forms)!r}"
     )
 
 
