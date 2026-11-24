@@ -164,6 +164,33 @@ def _can_be_none(node, scopes, seen):
     return True  # unrecognized construct - conservative
 
 
+def _scope_shadowed_names(tree) -> set[str]:
+    """The names a LAMBDA or a COMPREHENSION binds anywhere in the module.
+
+    A lambda parameter and a comprehension iteration variable each create a
+    scope of their own, so a `generation=` write inside one resolves to THAT
+    binding and not to the enclosing function's local. The classifier does
+    not model those scopes, so a name they bind is treated as UNRESOLVED -
+    conservatively, which is the fail-closed direction for a guard.
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Lambda):
+            args = node.args
+            for group in (args.posonlyargs, args.args, args.kwonlyargs):
+                for arg in group:
+                    names.add(arg.arg)
+            if args.vararg:
+                names.add(args.vararg.arg)
+            if args.kwarg:
+                names.add(args.kwarg.arg)
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp,
+                               ast.GeneratorExp)):
+            for generator in node.generators:
+                names.update(_bound_names(generator.target))
+    return names
+
+
 def _owners(tree):
     """Map every node to the innermost function that contains it."""
     owner = {}
@@ -446,6 +473,7 @@ def _classify():
     ]
     envs = {func: _local_assignments(func) for func in functions}
     tables = {func: _param_table(func) for func in functions}
+    shadowed = _scope_shadowed_names(tree)
 
     def scope_of(node):
         """The `_can_be_none` scope chain (innermost first) for `node`."""
@@ -474,6 +502,14 @@ def _classify():
                 local_sites.append((identity, line, lines[line - 1]))
             elif isinstance(keyword.value, ast.Name):
                 name = keyword.value.id
+                if name in shadowed:
+                    # A lambda parameter or a comprehension target binds
+                    # this name in a scope of its own, so the enclosing
+                    # function's local is NOT what reaches the write.
+                    # The scope is not modelled, so the site is treated as
+                    # unresolved - conservatively.
+                    aliased_sites.append((identity, [line], [lines[line - 1]]))
+                    continue
                 binding = None
                 for func in chain:
                     if name in envs[func]:
