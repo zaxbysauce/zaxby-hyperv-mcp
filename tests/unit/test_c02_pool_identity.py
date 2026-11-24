@@ -31,6 +31,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from _c02_virtual_clock import VirtualClock
 
 from hyperv_mcp import errors, pswindows
 
@@ -254,11 +255,19 @@ def test_short_deadline_overshoot_is_bounded(pool_env):
     )
 
 
-def test_attempt_count_reduced_under_saturation(pool_env):
+def test_attempt_count_reduced_under_saturation(pool_env, monkeypatch):
     """Bounded attempt-count probe (issue #64 AC3): over a saturated window
     the exponential backoff performs far fewer lock attempts per waiter than
-    the fixed 50 ms cadence would (measured; the fixed-cadence count for the
-    same window is recorded alongside)."""
+    the fixed 50 ms cadence would (measured; the fixed-cadence count for
+    the same window is recorded alongside).
+
+    The window is measured on a VIRTUAL clock (issue #167 AC2): the pool
+    loop asks to sleep, the clock records the requested duration and
+    advances virtual time, so the attempt count and the window are exact
+    rather than a wall-clock measurement that CI jitter could inflate.
+    """
+    clock = VirtualClock()
+    monkeypatch.setattr(pswindows, "time", clock)
     pswindows._config = _pool_cfg(1, pool_env.dir, wait_s=1.5)
     holder_fd = pswindows._acquire_ps_slot()
     attempts = {"n": 0}
@@ -275,20 +284,23 @@ def test_attempt_count_reduced_under_saturation(pool_env):
     pswindows._try_lock_slot = _counting_try_lock
     sleeps_seen: list[float] = []
     try:
-        started = time.monotonic()
-        real_sleep = time.sleep  # captured BEFORE patching
+        started = clock.monotonic()
+        # The bound method is captured BEFORE the attribute is replaced:
+        # `pswindows.time` IS the clock here, so replacing `sleep` on it and
+        # then calling `clock.sleep` would recurse into the replacement.
+        clock_sleep = clock.sleep
 
         def _spy_sleep(d):
             sleeps_seen.append(float(d))
-            real_sleep(float(d))
+            clock_sleep(d)
 
         pswindows.time.sleep = _spy_sleep
         try:
             with pytest.raises(pswindows.PowerShellBusy):
                 pswindows._acquire_ps_slot()
         finally:
-            pswindows.time.sleep = real_sleep
-        window = time.monotonic() - started
+            pswindows.time.sleep = clock_sleep
+        window = clock.monotonic() - started
     finally:
         pswindows._try_lock_slot = real_try_lock
     print("SLEEPS:", sleeps_seen[:16], "total", len(sleeps_seen))

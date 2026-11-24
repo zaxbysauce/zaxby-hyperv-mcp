@@ -56,7 +56,21 @@ jobs:
         # config as src, so no separate scope is needed.
         run: mypy src/hyperv_mcp scripts
       - name: Unit tests (no Hyper-V)
+        env:
+          # The loopback-socket family captures a WinError 10038 diagnosis
+          # (issue #167 AC3) under this directory. Without a retention step
+          # the artifact dies with the runner, and the CI-only failure the
+          # capture exists for would still leave no evidence.
+          HYPERV_MCP_10038_DIAG_DIR: ${{ runner.temp }}/socket-10038-diagnosis
         run: pytest tests/unit
+
+      - name: Retain the socket-10038 diagnosis (failure only)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: socket-10038-diagnosis-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/socket-10038-diagnosis
+          if-no-files-found: ignore
 
   # The declared dependency FLOOR, exercised. The main matrix installs whatever
   # PyPI serves today, so a floor-vs-latest behavioural divergence is invisible

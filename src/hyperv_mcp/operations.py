@@ -929,7 +929,7 @@ def complete_inline(op_ctx: dict[str, Any], result: Any) -> None:
     try:
         cfg: Config = op_ctx["cfg"]
         agent = str(op_ctx.get("agent") or "")
-        generation = int(op_ctx.get("generation") or 0) or None
+        generation = int(op_ctx.get("generation") or 0) or None  # generation-write-form: fail-open-aliased
         store = store_for(cfg)
         text = _result_text(result)
         # Same classification rule as the detached path (review round-2 Q1):
@@ -1177,7 +1177,7 @@ def start_inline_heartbeat(op_ctx: dict[str, Any]) -> Callable[[], None]:
         if stop.is_set():
             return
         try:
-            store.op_heartbeat(op_id, store.now(), generation=generation or None)
+            store.op_heartbeat(op_id, store.now(), generation=generation or None)  # generation-write-form: fail-open-disclosed
         except Exception:
             pass  # a missed beat is retried on the next interval
         if not stop.is_set():
@@ -1336,7 +1336,7 @@ def _run_detached(
         if stop.is_set():
             return
         try:
-            store.op_heartbeat(op_id, store.now(), generation=generation or None)
+            store.op_heartbeat(op_id, store.now(), generation=generation or None)  # generation-write-form: fail-open-disclosed
             if presented_lease:
                 try:
                     leases.renew(cfg, presented_lease, agent or None)
@@ -1634,13 +1634,13 @@ def _execute_body(
                 store, op_id, statestore.OP_FAILED, agent, cfg, "op.failed",
                 error_class=error_class,
                 result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
-                generation=generation or None,
+                generation=generation or None,  # generation-write-form: fail-open-disclosed
             )
         else:
             _safe_transition(
                 store, op_id, statestore.OP_COMPLETED, agent, cfg, "op.completed",
                 result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
-                generation=generation or None,
+                generation=generation or None,  # generation-write-form: fail-open-disclosed
             )
     except OperationCancelled:
         # Issue #157: the cooperative cancel is honored by a LIVE runner — the
