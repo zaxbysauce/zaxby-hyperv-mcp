@@ -60,7 +60,11 @@ import threading
 from types import SimpleNamespace
 
 import pytest
-from _c02_virtual_clock import VirtualClock, no_real_sleep
+from _c02_virtual_clock import (
+    VirtualClock,
+    assert_no_cached_sleep_references,
+    no_real_sleep,
+)
 
 from hyperv_mcp import pswindows
 
@@ -127,11 +131,29 @@ def pool_env(tmp_path, monkeypatch):
     return SimpleNamespace(dir=slot_dir, logs=logs)
 
 
+def test_no_cached_sleep_reference_on_the_guarded_path():
+    """The `no_real_sleep()` spy's boundary, checked at the seam it covers.
+
+    The spy intercepts sleeps resolved through the `time` module at CALL
+    time. A reference bound to the builtin BEFORE the swap would evade it,
+    because `time.sleep` is a C builtin with nothing underneath to wrap.
+
+    This is a TARGETED regression guard over the guarded path - the
+    production pool module and the two c02 backoff test files - for the two
+    binding FORMS that would produce such a reference:
+    `from time import sleep` and `name = time.sleep`. It is not a proof
+    that no cached reference can exist (an aliased import, `getattr`, or a
+    star import would not be caught), so it is recorded as a bounded check,
+    not as the closure of the gap on its own.
+    """
+    assert_no_cached_sleep_references()
+
+
 def test_backoff_attempt_schedule_matches_ceiling_model(pool_env, monkeypatch):
     """P1..P4 (module docstring), under the DIRECT real-sleep prohibition:
     the whole probe runs inside `no_real_sleep()`, a spy over the STDLIB
     `time.sleep` (not `pswindows.time.sleep`, which the virtual clock
-    replaces), so any code path that bypasses the virtual clock and really
+    replaces), so a code path that bypasses the virtual clock and really
     sleeps fails the test at the offending call site."""
     with no_real_sleep():
         _run_backoff_attempt_schedule_probe(pool_env, monkeypatch)

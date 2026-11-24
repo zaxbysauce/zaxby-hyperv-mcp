@@ -43,8 +43,9 @@ catch, asserted directly instead of through a duration proxy.
 
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from pathlib import Path
 
 # Deadlock protection only (harness side): a sleeper parked on the gate is
 # released after this much REAL time even without a permit, so a broken test
@@ -169,13 +170,28 @@ def no_real_sleep() -> Iterator[list[float]]:
     block (issue #167 AC2: a direct prohibition, not a duration proxy).
 
     The c02 backoff tests replace `pswindows.time` with a VirtualClock, so
-    the production pool loop cannot reach the real `time.sleep`; anything
-    that still calls it inside this block has bypassed the virtual clock and
-    is REALLY sleeping. The spy swaps the `sleep` attribute on the real
-    `time` module (restored on exit, so pytest and unrelated machinery are
-    untouched outside the test body) and raises immediately with the
-    requested duration, keeping the failure at the offending call site. The
-    recorded-call list is yielded for tests that want to inspect it.
+    the production pool loop cannot reach the real `time.sleep` at all: the
+    loop resolves `time.sleep` through the module reference the test
+    replaced. Anything that still calls the real sleep inside this block
+    has bypassed the virtual clock and is REALLY sleeping.
+
+    WHAT THIS SPY DOES AND DOES NOT COVER, stated precisely:
+
+    It covers every sleep resolved through the `time` MODULE AT CALL TIME
+    (`time.sleep(...)`) - the form the production pool loop uses
+    (`pswindows.py` reaches sleep only as `time.sleep(...)`).
+
+    It does NOT cover a reference CACHED BEFORE the swap
+    (`from time import sleep`; `cached = time.sleep`): `time.sleep` is a C
+    builtin, so a name bound to it before the swap still calls the builtin
+    directly and this spy cannot intercept it. `assert_no_cached_sleep_references`
+    below is a TARGETED regression guard over that seam - it checks the two
+    binding forms that would produce such a reference on the guarded path
+    (`from time import sleep` and `name = time.sleep`). It is a bounded
+    check, not a proof: an aliased import (`import time as t`), a
+    `getattr(time, "sleep")`, or a star import would not be caught by it.
+
+    The recorded-call list is yielded for tests that want to inspect it.
     """
     calls: list[float] = []
     real_sleep = time.sleep
@@ -193,3 +209,78 @@ def no_real_sleep() -> Iterator[list[float]]:
         yield calls
     finally:
         time.sleep = real_sleep
+
+
+def assert_no_cached_sleep_references(paths: "Sequence[Path] | None" = None) -> None:
+    """Check the guarded path for a PRE-CACHED reference to the standard
+    library's `time.sleep`.
+
+    `no_real_sleep()` intercepts sleeps resolved through the `time` module at
+    call time. A name bound to the builtin BEFORE the swap (`from time import
+    sleep`, or `cached = time.sleep`) would evade that interception, because
+    `time.sleep` is a C builtin with nothing underneath to wrap.
+
+    This is a TARGETED regression guard over that seam, covering the two
+    binding forms that would produce such a reference: `from time import
+    sleep` and `name = time.sleep`. It is a STATIC assertion about the
+    source, not a runtime observation, and it is BOUNDED - an aliased
+    import (`import time as t`), a `getattr(time, "sleep")`, a tuple
+    unpacking, or a star import would not be caught, so this check must not
+    be cited as a proof that no cached reference can exist.
+
+    The default scope is the production pool module plus the two c02 backoff
+    test files (the paths the guarded tests exercise). This helper's own
+    file is deliberately excluded: its spy binds `real_sleep = time.sleep` to
+    RESTORE the attribute on exit, and that intentional binding is exactly
+    the shape this scan reports.
+    """
+    import ast
+
+    if paths is None:
+        root = Path(__file__).resolve().parents[2]
+        paths = [
+            root / "src" / "hyperv_mcp" / "pswindows.py",
+            root / "tests" / "unit" / "test_c02_backoff_probe.py",
+            root / "tests" / "unit" / "test_c02_pool_identity.py",
+        ]
+        # This helper is deliberately NOT scanned: its own spy binds
+        # `real_sleep = time.sleep` to RESTORE the attribute on exit, and that
+        # intentional binding is exactly the shape the scan reports. The
+        # guarded path is the production pool module and the two c02 test
+        # files - which is where a cached reference could actually reach a
+        # real sleep.
+
+    offenders: list[str] = []
+    for path in paths:
+        if not path.is_file():
+            offenders.append(f"{path}: missing")
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            # `from time import sleep` / `from time import sleep as s`
+            if isinstance(node, ast.ImportFrom) and (node.module or "") == "time":
+                for alias in node.names:
+                    if alias.name == "sleep":
+                        offenders.append(f"{path.name}:{node.lineno}: from time import sleep")
+            # `cached = time.sleep` - ANY target name, not just `sleep`:
+            # the escape works for a name of the caller's choosing.
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                value = node.value
+                if (isinstance(value, ast.Attribute)
+                        and isinstance(value.value, ast.Name)
+                        and value.value.id == "time"
+                        and value.attr == "sleep"):
+                    for target in targets:
+                        if isinstance(target, ast.Name):
+                            offenders.append(
+                                f"{path.name}:{node.lineno}: cached reference to "
+                                f"time.sleep (bound as {target.id!r})")
+
+    assert not offenders, (
+        "a pre-cached reference to the standard library's time.sleep would "
+        "evade the no_real_sleep() spy, which only intercepts sleeps "
+        "resolved through the module at call time: " + "; ".join(offenders)
+    )
+
+

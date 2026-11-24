@@ -34,7 +34,11 @@ import threading
 from types import SimpleNamespace
 
 import pytest
-from _c02_virtual_clock import VirtualClock, no_real_sleep
+from _c02_virtual_clock import (
+    VirtualClock,
+    assert_no_cached_sleep_references,
+    no_real_sleep,
+)
 
 from hyperv_mcp import errors, pswindows
 
@@ -65,6 +69,24 @@ def pool_env(tmp_path, monkeypatch):
                         SimpleNamespace(warned=set(), marker_written=False),
                         raising=False)
     return SimpleNamespace(dir=slot_dir, logs=logs)
+
+
+def test_no_cached_sleep_reference_on_the_guarded_path():
+    """The `no_real_sleep()` spy's boundary, checked at the seam it covers.
+
+    The spy intercepts sleeps resolved through the `time` module at CALL
+    time. A reference bound to the builtin BEFORE the swap would evade it,
+    because `time.sleep` is a C builtin with nothing underneath to wrap.
+
+    This is a TARGETED regression guard over the guarded path - the
+    production pool module and the two c02 backoff test files - for the two
+    binding FORMS that would produce such a reference:
+    `from time import sleep` and `name = time.sleep`. It is not a proof
+    that no cached reference can exist (an aliased import, `getattr`, or a
+    star import would not be caught), so it is recorded as a bounded check,
+    not as the closure of the gap on its own.
+    """
+    assert_no_cached_sleep_references()
 
 
 def test_pool_cap_marker_written_once(pool_env):
@@ -147,7 +169,9 @@ def test_acquire_backoff_and_release_latency(pool_env, monkeypatch):
     """The bounded-wait acquire backs off exponentially (5 ms doubling to a
     200 ms ceiling) and BOTH real waiters acquire within one backoff interval
     (250 ms) of their release (W2.2) - on EVENT-DRIVEN VIRTUAL time, with a
-    direct real-sleep prohibition and no wall-clock measurement anywhere.
+    direct real-sleep prohibition, and no wall-clock MEASUREMENT of the
+    schedule anywhere (the harness's own condition waits use the real clock
+    purely as deadlock protection, never as a measurement).
 
     The production acquire loop runs against a GATED VirtualClock: each
     backoff request is recorded and virtual time advances by exactly that
