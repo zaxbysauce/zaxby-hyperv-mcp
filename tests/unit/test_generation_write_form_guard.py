@@ -377,10 +377,20 @@ def _classify():
                         _can_be_none(value, scope_of(node), {name})
                         for value in assigned
                     ):
-                        alias_line = min(
+                        # EVERY assignment that can feed this write is kept,
+                        # not just the earliest one. Collapsing them onto
+                        # `min(...)` let a LATER reassignment change the
+                        # runtime value while the set, tag and form
+                        # assertions kept inspecting the original line -
+                        # an executed bypass (the plan critic's M8).
+                        alias_lines = sorted({
                             getattr(value, "lineno", line) for value in assigned
-                        )
-                        aliased_sites.append((identity, alias_line, lines[alias_line - 1]))
+                        })
+                        aliased_sites.append((
+                            identity,
+                            alias_lines,
+                            [lines[alias - 1] for alias in alias_lines],
+                        ))
                     continue
                 func = binding[1]
                 entry = tables[func][name]
@@ -429,16 +439,26 @@ def test_aliased_fail_open_writes_are_exactly_the_disclosed_pair():
 
 
 def test_the_aliased_capture_carries_its_disclosure_tag():
-    """The assignment that mints the absent generation is disclosed."""
+    """EVERY assignment that can feed an aliased write is disclosed.
+
+    Not just the first one: a later reassignment of the same local feeds
+    the write just as much, and an undisclosed one would change the
+    runtime value while the set pin kept looking at the original line.
+    """
     _local, aliased_sites, _parameter = _classify()
-    untagged = [line for _identity, line, text in aliased_sites if _ALIAS_TAG not in text]
+    untagged = [
+        line
+        for _identity, alias_lines, texts in aliased_sites
+        for line, text in zip(alias_lines, texts)
+        if _ALIAS_TAG not in text
+    ]
     assert not untagged, (
         f"AC1: aliased fail-open capture missing the '{_ALIAS_TAG}' tag at lines {untagged}"
     )
 
 
 def test_the_aliased_capture_keeps_its_disclosed_fail_open_form():
-    """The pinned alias keeps the disclosed fail-open FORM.
+    """EVERY assignment that can feed an aliased write keeps the disclosed FORM.
 
     The set pin fixes WHICH sites are aliased; this pins what each one SAYS.
     Without it, rewriting an already-pinned site's value form (e.g. dropping
@@ -446,10 +466,16 @@ def test_the_aliased_capture_keeps_its_disclosed_fail_open_form():
     leaves every other assertion passing: the site stays disclosed, but the
     shape the disclosure describes can change silently. An executed mutant
     (M6 in the mutation probe) shows exactly that bypass.
+
+    The same applies to a REASSIGNMENT: an ADDED assignment to the same
+    local (M8) drops the coercion just as effectively, so every assignment
+    is checked, not only the earliest one.
     """
     _local, aliased_sites, _parameter = _classify()
     forms = {
-        text.split("#", 1)[0].strip() for _identity, _line, text in aliased_sites
+        text.split("#", 1)[0].strip()
+        for _identity, _alias_lines, texts in aliased_sites
+        for text in texts
     }
     assert forms == {_DISCLOSED_ALIAS_FORM}, (
         f"AC1: aliased fail-open capture form mismatch: expected exactly "

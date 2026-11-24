@@ -112,7 +112,7 @@ def test_manifest_header_pins_canonical_commit_and_repin_procedure():
     )
 
 
-def test_manifest_covers_exactly_39_files():
+def test_manifest_covers_exactly_the_expected_number_of_files():
     """AC2 pin: the canonical skill tree at the pinned commit has exactly the
     expected number of files; the manifest must enumerate every one of them —
     no more, no fewer — so a truncated or padded manifest cannot weaken the

@@ -282,5 +282,3 @@ def assert_no_cached_sleep_references(paths: "Sequence[Path] | None" = None) -> 
         "evade the no_real_sleep() spy, which only intercepts sleeps "
         "resolved through the module at call time: " + "; ".join(offenders)
     )
-
-

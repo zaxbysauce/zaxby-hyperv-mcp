@@ -326,6 +326,27 @@ _SOCKET_FAMILY_FILES = frozenset({
 
 
 @pytest.fixture(autouse=True)
+def _publish_current_test_leg(request):
+    """Publish the running test's name for the socket capture.
+
+    A capture that happens on a BACKGROUND thread cannot read the owning
+    test from its own stack (the stack carries only the thread's frames, so
+    it names the thread's target - generically "worker"). The published leg
+    is what lets the artifact name the test that owns the failure instead
+    of an uninformative thread target (issue #167 AC3). It is published for
+    EVERY test so the attribution does not depend on whether the capture
+    happens to be installed for the file at hand.
+    """
+    from _socket_10038_diagnosis import set_current_leg
+
+    set_current_leg(request.node.name)
+    try:
+        yield
+    finally:
+        set_current_leg(None)
+
+
+@pytest.fixture(autouse=True)
 def _socket_10038_diagnosis_scoped(request):
     """Activate the operation-time WinError 10038 capture for the socket
     family only, and always remove it again.

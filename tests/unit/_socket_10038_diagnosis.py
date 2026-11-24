@@ -88,6 +88,30 @@ def _on_creation_stack(target) -> bool:
     return False
 
 
+# The pytest leg currently running, published by the conftest so a capture
+# that happens on a BACKGROUND thread can name the test that owns it. A
+# background thread's own stack shows only the thread's frames (its target
+# function, generically named "worker"), which cannot identify one test
+# among a 35-test cascade - so the owning leg comes from the pytest context
+# there, and from the live stack on the main thread, where the fixture or
+# test frame IS on the stack.
+_CURRENT_LEG: str | None = None
+_CURRENT_LEG_LOCK = threading.Lock()
+
+
+def set_current_leg(name: str | None) -> None:
+    """Publish (or clear) the pytest leg currently running."""
+    global _CURRENT_LEG
+    with _CURRENT_LEG_LOCK:
+        _CURRENT_LEG = name
+
+
+def current_leg() -> str | None:
+    """The pytest leg currently running, if one was published."""
+    with _CURRENT_LEG_LOCK:
+        return _CURRENT_LEG
+
+
 def _owning_leg() -> str:
     """The fixture leg (or test) that was running when the failure raised.
 
@@ -101,6 +125,10 @@ def _owning_leg() -> str:
     (the shape the socket family produces) names the fixture there, and a
     failure raised by the family's own helper code still attributes to the
     test that drove it. The capture's own frames are skipped.
+
+    On a BACKGROUND THREAD the stack carries only that thread's own frames,
+    so the frame it offers is the thread's target ("worker"), not the test
+    that owns the failure. There the published pytest leg is used instead.
     """
     frame = sys._getframe(1)
     candidates: list[tuple[str, str]] = []
@@ -112,9 +140,17 @@ def _owning_leg() -> str:
             candidates.append((os.path.basename(frame.f_code.co_filename),
                                frame.f_code.co_name))
         frame = frame.f_back
+    on_main_thread = threading.current_thread() is threading.main_thread()
     for base, name in candidates:
         if "test" in base and name and not name.startswith("<"):
-            return name
+            if on_main_thread:
+                return name
+            # A background thread's stack names the thread's target, not the
+            # owning test; fall through to the published pytest leg.
+            break
+    published = current_leg()
+    if published:
+        return published
     for _base, name in reversed(candidates):
         if name and not name.startswith("<"):
             return name

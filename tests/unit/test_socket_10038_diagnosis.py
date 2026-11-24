@@ -116,6 +116,13 @@ def test_capture_survives_an_exception_swallowed_by_a_background_thread(capture)
     artifacts = _artifacts(capture)
     assert len(artifacts) == 1, f"expected one artifact, got {artifacts}"
     assert artifacts[0]["operation"] == "recv"
+    # The owning leg must name the TEST, not the thread's target: a
+    # background thread's own stack carries only its frames, so a stack-only
+    # attribution says "worker" and cannot identify one test among a
+    # 35-test cascade.
+    assert artifacts[0]["owning_leg"] == (
+        "test_capture_survives_an_exception_swallowed_by_a_background_thread"
+    ), f"expected the owning test, got {artifacts[0]['owning_leg']!r}"
 
 
 def test_capture_ignores_a_non_10038_oserror(capture):
