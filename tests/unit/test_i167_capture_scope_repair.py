@@ -228,3 +228,43 @@ def test_g_a_late_restore_from_an_earlier_activation_is_still_repaired(monkeypat
     assert socket.socket.setsockopt is _PRISTINE_SETSOCKOPT, (
         "the repair did not restore the value the earlier activation "
         "displaced")
+
+
+def test_h_a_nested_displacement_is_unwound(monkeypatch):
+    """A wrapper that displaced an EARLIER capture wrapper is unwound.
+
+    A later activation can install over a wrapper that a late restore put
+    back, so the later wrapper's displaced value is itself a capture
+    wrapper. Restoring one step would leave the earlier wrapper installed,
+    so the repair walks the chain down to the first value the capture does
+    NOT own.
+    """
+    from _socket_10038_diagnosis import activate, deactivate, restore_pristine_socket_methods
+
+    def spy(self, *args, **kwargs):
+        return _PRISTINE_SETSOCKOPT(self, *args, **kwargs)
+
+    # activation A installs, the test saves A's wrapper, A is removed, and
+    # the late restore puts A's wrapper back
+    activate()
+    try:
+        monkeypatch.setattr(socket.socket, "setsockopt", spy)
+    finally:
+        deactivate()
+    monkeypatch.undo()
+
+    # activation B installs OVER A's wrapper, so B displaced A's wrapper
+    activate()
+    try:
+        assert socket.socket.setsockopt is not _PRISTINE_SETSOCKOPT
+        monkeypatch.setattr(socket.socket, "setsockopt", spy)
+    finally:
+        deactivate()
+    monkeypatch.undo()
+
+    assert socket.socket.setsockopt is not _PRISTINE_SETSOCKOPT, (
+        "the late restore must put the newer wrapper back")
+    assert restore_pristine_socket_methods() == 1, (
+        "the repair must unwind the nested displacement")
+    assert socket.socket.setsockopt is _PRISTINE_SETSOCKOPT, (
+        "the repair left an EARLIER capture wrapper installed")

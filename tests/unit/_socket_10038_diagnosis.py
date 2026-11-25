@@ -111,11 +111,33 @@ def _register_owned_wrapper(name: str, wrapper, displaced) -> None:
 
 
 def _owned_displaced(name: str, value):
-    """The value the installed wrapper displaced, or None when the value is
-    not a wrapper the capture installed."""
-    for owned_name, owned_wrapper, displaced in _OWNED_WRAPPERS.values():
-        if owned_name == name and owned_wrapper is value:
-            return displaced
+    """The value to restore for an installed capture wrapper.
+
+    The chain is UNWOUND: a wrapper may itself have displaced an EARLIER
+    capture wrapper (a later activation installed over a wrapper that a
+    late restore had put back), so the value to restore is the first value
+    in the chain that the capture does NOT own. Restoring only one step
+    would leave the earlier wrapper installed (the round-5 implementation
+    reviewer's finding).
+
+    None is returned when the installed value is not a wrapper the capture
+    installed, or when the chain is cyclic.
+    """
+    entry = _OWNED_WRAPPERS.get(id(value))
+    if entry is None or entry[1] is not value or entry[0] != name:
+        return None
+    current = entry[2]
+    seen = {id(value)}
+    while current is not None:
+        inner = _OWNED_WRAPPERS.get(id(current))
+        if inner is None or inner[1] is not current:
+            # Not a wrapper the capture installed: this is the value to
+            # restore.
+            return current
+        if id(current) in seen:
+            return None
+        seen.add(id(current))
+        current = inner[2]
     return None
 
 def _diagnosis_dir() -> Path:
@@ -486,11 +508,16 @@ class SocketDiagnosis:
             # reviewer's finding).
             if getattr(socket.socket, "__init__", None) is self._wrappers.get(
                     "__init__"):
-                socket.socket.__init__ = self._saved.get(
-                    "__init__", _ORIGINAL_SOCKET_INIT)  # type: ignore[method-assign]
-            for name, original in _ORIGINAL_SOCKET_METHODS.items():
-                if getattr(socket.socket, name, None) is self._wrappers.get(name):
-                    setattr(socket.socket, name, self._saved.get(name, original))
+                target = _owned_displaced(
+                    "__init__", getattr(socket.socket, "__init__", None))
+                if target is not None:
+                    socket.socket.__init__ = target  # type: ignore[method-assign]
+            for name in _ORIGINAL_SOCKET_METHODS:
+                current = getattr(socket.socket, name, None)
+                if current is self._wrappers.get(name):
+                    target = _owned_displaced(name, current)
+                    if target is not None:
+                        setattr(socket.socket, name, target)
             _remove_thread_leg_recorder(self._saved)
             self._saved.clear()
             # The origin and listener-step registries are MODULE-level
