@@ -107,6 +107,14 @@ def _is_capture_wrapper(value) -> bool:
     """Whether the value is a wrapper this capture installed."""
     return getattr(value, _CAPTURE_WRAPPER_MARKER, False) is True
 
+
+# What the capture DISPLACED when it installed: the values that were in
+# place BEFORE its wrappers. A patch that a longer-lived fixture owns is in
+# here, and both the capture's removal and the teardown repair restore it -
+# so the capture neither bypasses nor destroys a patch it did not make
+# (the round-5 implementation reviewer's finding).
+_DISPLACED: dict[str, object] = {}
+
 def _diagnosis_dir() -> Path:
     """Where artifacts are written: the configured directory, else a temp one."""
     configured = os.environ.get(DIAG_DIR_ENV)
@@ -259,10 +267,13 @@ def _thread_leg() -> str | None:
 
 def _install_thread_leg_recorder(saved: dict) -> None:
     """Record the starting leg of every thread started while installed."""
-    # The PRISTINE `Thread.start`, not whatever is installed right now: a
-    # wrapper left behind by a late restore would otherwise be captured as
-    # the original and restored forever.
-    original_start = _ORIGINAL_THREAD_START
+    # What is in place RIGHT NOW is what the recorder delegates to and what
+    # its removal restores: a patch a longer-lived fixture owns must survive
+    # the capture's lifecycle. A wrapper left behind by a late restore is
+    # not that - it is the capture's own, and the capture's own removal
+    # restores the value it displaced.
+    original_start = getattr(threading.Thread, "start", _ORIGINAL_THREAD_START)
+    _DISPLACED["Thread.start"] = original_start
 
     def start_with_leg(self, *args, **kwargs):
         # The REGISTERED owner of the current thread takes PRECEDENCE over
@@ -427,10 +438,20 @@ class SocketDiagnosis:
             # direct installation invisible to the guard above (the
             # round-22 implementation reviewer's finding).
             _INSTALLED_BY = self
-            self._saved["__init__"] = _ORIGINAL_SOCKET_INIT
+            # What the capture DISPLACES is what is in place RIGHT NOW, not
+            # the import-time value: a fixture that outlives a single test
+            # may own a patch of its own, and the capture must neither
+            # bypass it (its wrapper delegates to it) nor destroy it (its
+            # removal restores it) - the round-5 implementation reviewer's
+            # finding.
+            self._saved["__init__"] = getattr(
+                socket.socket, "__init__", _ORIGINAL_SOCKET_INIT)
             for name, original in _ORIGINAL_SOCKET_METHODS.items():
-                self._saved[name] = original
-            socket.socket.__init__ = self._init_factory(_ORIGINAL_SOCKET_INIT)  # type: ignore[method-assign]
+                self._saved[name] = getattr(socket.socket, name, original)
+            _DISPLACED.clear()
+            _DISPLACED.update(self._saved)
+            socket.socket.__init__ = self._init_factory(
+                self._saved["__init__"])  # type: ignore[method-assign]
             for name in _CAPTURED_OPERATIONS:
                 setattr(socket.socket, name, self._wrap(name))
             _install_thread_leg_recorder(self._saved)
@@ -442,9 +463,11 @@ class SocketDiagnosis:
                 return
             if _INSTALLED_BY is self:
                 _INSTALLED_BY = None
-            socket.socket.__init__ = _ORIGINAL_SOCKET_INIT  # type: ignore[method-assign]
+            socket.socket.__init__ = self._saved.get(
+                "__init__", _ORIGINAL_SOCKET_INIT)  # type: ignore[method-assign]
             for name, original in _ORIGINAL_SOCKET_METHODS.items():
-                setattr(socket.socket, name, original)
+                setattr(socket.socket, name,
+                        self._saved.get(name, original))
             _remove_thread_leg_recorder(self._saved)
             self._saved.clear()
             # The origin and listener-step registries are MODULE-level
@@ -534,7 +557,12 @@ class SocketDiagnosis:
         return _init
 
     def _wrap(self, operation: str):
-        original = _ORIGINAL_SOCKET_METHODS[operation]
+        # The wrapper delegates to what was in place when the capture
+        # installed - the import-time method, or a patch a longer-lived
+        # fixture owns - so the capture observes the operation without
+        # bypassing anyone else's substitution.
+        original = self._saved.get(operation,
+                                   _ORIGINAL_SOCKET_METHODS[operation])
 
         def _operation(sock, *args, **kwargs):
             try:
@@ -709,13 +737,15 @@ def restore_pristine_socket_methods() -> int:
         return 0
     restored = 0
     if _is_capture_wrapper(getattr(socket.socket, "__init__", None)):
-        socket.socket.__init__ = _ORIGINAL_SOCKET_INIT  # type: ignore[method-assign]
+        socket.socket.__init__ = _DISPLACED.get(  # type: ignore[method-assign]
+            "__init__", _ORIGINAL_SOCKET_INIT)
         restored += 1
     for name, original in _ORIGINAL_SOCKET_METHODS.items():
         if _is_capture_wrapper(getattr(socket.socket, name, None)):
-            setattr(socket.socket, name, original)
+            setattr(socket.socket, name, _DISPLACED.get(name, original))
             restored += 1
     if _is_capture_wrapper(getattr(threading.Thread, "start", None)):
-        threading.Thread.start = _ORIGINAL_THREAD_START
+        threading.Thread.start = _DISPLACED.get(
+            "Thread.start", _ORIGINAL_THREAD_START)
         restored += 1
     return restored

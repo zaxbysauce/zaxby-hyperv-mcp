@@ -86,3 +86,48 @@ def test_c_a_patch_that_is_not_the_capture_survives_the_repair():
             "the repair replaced a patch that is not the capture's")
     finally:
         socket.socket.setsockopt = _PRISTINE_SETSOCKOPT
+
+
+def test_d_a_longer_lived_patch_survives_the_capture_lifecycle():
+    """A patch the capture did not make survives its WHOLE lifecycle.
+
+    A fixture that outlives a single test may own a patch of its own. The
+    capture must neither BYPASS it (its wrapper delegates to the method
+    that was in place when it installed) nor DESTROY it (its removal
+    restores that method, not the import-time one) - and the teardown
+    repair must not touch it either.
+    """
+    from _socket_10038_diagnosis import activate, deactivate, restore_pristine_socket_methods
+
+    calls: list[str] = []
+
+    def sentinel(self, *args, **kwargs):
+        calls.append("sentinel")
+        return _PRISTINE_SETSOCKOPT(self, *args, **kwargs)
+
+    socket.socket.setsockopt = sentinel
+    try:
+        activate()
+        try:
+            assert socket.socket.setsockopt is not sentinel, (
+                "the capture installed its own wrapper")
+            sock = socket.socket()
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            except OSError:
+                pass
+            finally:
+                sock.close()
+            assert calls, (
+                "the capture's wrapper bypassed the patch that was in place "
+                "before it installed")
+        finally:
+            deactivate()
+        assert socket.socket.setsockopt is sentinel, (
+            "the capture's removal destroyed a patch it did not make")
+        assert restore_pristine_socket_methods() == 0, (
+            "the repair must not touch a patch the capture did not make")
+        assert socket.socket.setsockopt is sentinel, (
+            "the repair replaced a patch the capture did not make")
+    finally:
+        socket.socket.setsockopt = _PRISTINE_SETSOCKOPT
