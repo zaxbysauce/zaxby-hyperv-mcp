@@ -800,6 +800,17 @@ def _spread_generation_value(node):
         return None
     found = None
     for key, value in zip(node.keys, node.values, strict=True):
+        if key is None:
+            # An UNPACKING overrides every earlier key of the same name, so
+            # a literal "generation" that comes BEFORE it is not the value
+            # that reaches the write - the effective feed is UNRESOLVED and
+            # FAILS CLOSED (the plan critic's executed probe:
+            # `**{"generation": int(generation or 0), **later}` with
+            # `later = {"generation": None}` reached the write with None
+            # while the literal was certified closed).
+            if found is not None:
+                return None
+            continue
         if isinstance(key, ast.Constant) and key.value == "generation":
             # The LAST duplicate wins in a dict literal, so the last
             # matching value is the one that reaches the write.
