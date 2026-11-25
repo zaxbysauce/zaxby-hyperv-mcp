@@ -277,9 +277,27 @@ def _local_assignments(func):
     """
     env = {}
     declared_elsewhere: set[str] = set()
-    for node in ast.walk(func):
+    # The function's OWN declarations only: an unrestricted walk would also
+    # collect a NESTED function's `nonlocal x`, and suppressing the outer
+    # function's binding of `x` on that basis would let a nested rebinding
+    # slip past the census.
+    for node in ast.iter_child_nodes(func):
         if isinstance(node, (ast.Global, ast.Nonlocal)):
             declared_elsewhere.update(node.names)
+    # A nested function that declares `nonlocal x` (or `global x`) rebinds
+    # the name in THIS scope, so this scope's binding of it is no longer
+    # the only one - an unknown value is added for it.
+    for node in ast.walk(func):
+        if node is func:
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for statement in node.body:
+                if isinstance(statement, (ast.Global, ast.Nonlocal)):
+                    for name in statement.names:
+                        env.setdefault(name, []).append(
+                            ast.Constant(value=None, lineno=statement.lineno,
+                                          col_offset=0)
+                        )
 
     def bind(target, value):
         for name in _bound_names(target):
@@ -363,6 +381,14 @@ def _local_assignments(func):
     return env
 
 
+
+# The annotation names the analysis can certify as NOT admitting None. Every
+# other name is treated as admitting None (see `_annotation_admits_none`).
+_CLOSED_ANNOTATION_NAMES = frozenset({
+    "int", "float", "bool", "str", "bytes", "object", "Any",
+})
+
+
 def _annotation_admits_none(annotation):
     """True for `int | None`, `Optional[...]`, any union containing None.
 
@@ -381,6 +407,12 @@ def _annotation_admits_none(annotation):
         if isinstance(node, ast.Constant) and node.value is None:
             return True
         if isinstance(node, ast.Name) and node.id == "Optional":
+            return True
+        # An annotation NAME the analysis cannot resolve (a module-level type
+        # ALIAS such as `OptionalGeneration = int | None`, or any custom
+        # alias) is treated as admitting None: a guard that skips what it
+        # cannot resolve has a hole.
+        if isinstance(node, ast.Name) and node.id not in _CLOSED_ANNOTATION_NAMES:
             return True
         # `typing.Optional[...]` is an attribute, not a name.
         if isinstance(node, ast.Attribute) and node.attr == "Optional":
@@ -483,6 +515,19 @@ def _reachable_with_none(tree, scope_of, func, param_name, entry):
     """
     called = set()
     for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == func.name
+        ):
+            # An ATTRIBUTE-style call of the tracked function (through a
+            # module object, a class attribute, a `sys.modules[...]` lookup)
+            # is not a bare name, so it must be resolved conservatively: the
+            # site is treated as REACHABLE rather than skipped.
+            called.add(id(node.func))
+            if _call_binds_none(node, scope_of, param_name, entry):
+                return True
+            continue
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)

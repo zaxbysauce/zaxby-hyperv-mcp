@@ -72,17 +72,31 @@ def test_capture_records_the_hvsock_monkeypatch_origin(capture, monkeypatch):
 
 
 def test_capture_records_the_real_listener_origin(capture):
-    """A socket created outside the hvsock.connect path is classified as
-    the side the installed connector did NOT produce. The capture records
-    only what it can establish - whether the socket was created while the
-    installed connector was on the stack - so it does not claim a family
-    role it cannot prove."""
+    """A socket that is BOUND and LISTENED on is positively the listener's.
+
+    The capture observes the listener's own creation path rather than
+    inferring it from "the installed connector did not make this socket" -
+    a negative observation does not establish who did.
+    """
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.close()
+    with pytest.raises(OSError):
+        listener.recv(64)
+    artifacts = _artifacts(capture)
+    assert len(artifacts) == 1, f"expected one artifact, got {artifacts}"
+    assert artifacts[0]["handle_origin"] == "real-listener"
+
+
+def test_capture_records_unknown_origin_when_neither_is_established(capture):
+    """A socket that is neither connector-made nor a listener stays unknown."""
     sock = _closed_socket()
     with pytest.raises(OSError):
         sock.recv(64)
     artifacts = _artifacts(capture)
     assert len(artifacts) == 1, f"expected one artifact, got {artifacts}"
-    assert artifacts[0]["handle_origin"] == "not-the-installed-connector"
+    assert artifacts[0]["handle_origin"] == "unknown"
 
 
 def test_capture_names_the_operation_and_the_owning_leg(capture):

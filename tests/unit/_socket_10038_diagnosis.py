@@ -53,11 +53,28 @@ _WINERROR_10038 = 10038
 # every handle-touching operation of `socket.socket`; `close` and `detach`
 # are deliberately absent (they do not use the handle).
 _CAPTURED_OPERATIONS = (
-    "accept", "bind", "connect", "getpeername", "getsockname", "getsockopt",
-    "listen", "recv", "recvfrom", "send", "sendall", "sendto", "setsockopt",
+    "accept", "bind", "connect", "dup", "getpeername", "getsockname",
+    "getsockopt", "listen", "recv", "recv_into", "recvfrom", "recvfrom_into",
+    "send", "sendall", "sendto", "setblocking", "settimeout", "setsockopt",
     "shutdown",
 )
 
+
+# The operations that put a socket on the LISTENER's own creation path. A
+# socket that is bound AND listened on is positively the listener's - the
+# capture observes that rather than inferring it from "the connector did
+# not make it".
+_LISTENER_OPERATIONS = ("bind", "listen")
+
+# The PRISTINE socket methods, captured once at import. Every wrapper calls
+# these and every uninstall restores these, so activating the capture twice
+# (or overlapping two instances) can never leave a wrapper calling another
+# wrapper, and can never leave a stale wrapper installed.
+_ORIGINAL_SOCKET_INIT = socket.socket.__init__
+_ORIGINAL_SOCKET_METHODS = {
+    name: getattr(socket.socket, name)
+    for name in _CAPTURED_OPERATIONS + _LISTENER_OPERATIONS
+}
 
 def _diagnosis_dir() -> Path:
     """Where artifacts are written: the configured directory, else a temp one."""
@@ -161,6 +178,11 @@ def _install_thread_leg_recorder(saved: dict) -> None:
 
     def start_with_leg(self, *args, **kwargs):
         leg = _current_stack_leg()
+        if not leg:
+            # A thread started by ANOTHER thread inherits the parent
+            # thread's registered leg - the parent worker's own function
+            # name is no more identifying than "worker".
+            leg = _thread_leg()
         if leg:
             _THREAD_LEGS[id(self)] = leg
         return original_start(self, *args, **kwargs)
@@ -277,22 +299,23 @@ class SocketDiagnosis:
         with self._lock:
             if self._saved:
                 return
-            saved_init = socket.socket.__init__
-            self._saved["__init__"] = saved_init
-            for name in _CAPTURED_OPERATIONS:
-                self._saved[name] = getattr(socket.socket, name)
-            socket.socket.__init__ = self._init_factory(saved_init)  # type: ignore[method-assign]
+            self._saved["__init__"] = _ORIGINAL_SOCKET_INIT
+            for name, original in _ORIGINAL_SOCKET_METHODS.items():
+                self._saved[name] = original
+            socket.socket.__init__ = self._init_factory(_ORIGINAL_SOCKET_INIT)  # type: ignore[method-assign]
             for name in _CAPTURED_OPERATIONS:
                 setattr(socket.socket, name, self._wrap(name))
+            for name in _LISTENER_OPERATIONS:
+                setattr(socket.socket, name, self._wrap_listener_op(name))
             _install_thread_leg_recorder(self._saved)
 
     def uninstall(self) -> None:
         with self._lock:
             if not self._saved:
                 return
-            socket.socket.__init__ = self._saved["__init__"]  # type: ignore[method-assign]
-            for name in _CAPTURED_OPERATIONS:
-                setattr(socket.socket, name, self._saved[name])
+            socket.socket.__init__ = _ORIGINAL_SOCKET_INIT  # type: ignore[method-assign]
+            for name, original in _ORIGINAL_SOCKET_METHODS.items():
+                setattr(socket.socket, name, original)
             _remove_thread_leg_recorder(self._saved)
             self._saved.clear()
             self._origins.clear()
@@ -300,28 +323,53 @@ class SocketDiagnosis:
 
     # ---- the socket seams ----
 
+    def _note_listener(self, sock) -> None:
+        """Promote a socket to listener provenance once it is bound AND
+        listened on - the listener's own creation path, observed."""
+        with self._lock:
+            if self._origins.get(id(sock)) == "unknown":
+                self._origins[id(sock)] = "real-listener"
+
     def _init_factory(self, saved_init):
         """A plain function (not a bound method): as a class attribute it
         receives the SOCKET as its first argument."""
 
         def _init(sock, *args, **kwargs) -> None:
             # The provenance is recorded as what was OBSERVED, not as a
-            # guess about the family's intent: the socket was created while
-            # the INSTALLED connector was on the stack, or it was not. The
-            # "real-listener" label is reserved for a socket the capture
-            # can attribute to the listener's own creation path; anything
-            # else is reported as "not-the-installed-connector", which is
-            # true without claiming the capture knows more than it does.
+            # guess about the family's intent:
+            #   * created while the INSTALLED connector was on the stack ->
+            #     "hvsock-monkeypatch-side";
+            #   * otherwise the socket starts as UNKNOWN, and it is
+            #     PROMOTED to "real-listener" if the capture later sees it
+            #     BOUND and LISTENED on - which is the listener's own
+            #     creation path, and is observable rather than inferred.
+            # A socket that is neither stays "unknown": a negative
+            # observation (the connector did not make it) does not
+            # establish that the listener did.
             if _on_creation_stack(_installed_hvsock_connect()):
                 origin = "hvsock-monkeypatch-side"
             else:
-                origin = "not-the-installed-connector"
+                origin = "unknown"
             saved_init(sock, *args, **kwargs)
             with self._lock:
                 self._origins[id(sock)] = origin
 
         _init.__name__ = "__init__"
         return _init
+
+    def _wrap_listener_op(self, operation: str):
+        """Wrap `bind`/`listen` so a socket that reaches the listener's own
+        creation path is PROVEN to be the listener's, not assumed to be."""
+
+        original = _ORIGINAL_SOCKET_METHODS[operation]
+
+        def wrapper(sock, *args, **kwargs):
+            result = original(sock, *args, **kwargs)
+            self._note_listener(sock)
+            return result
+
+        wrapper.__name__ = operation
+        return wrapper
 
     def _wrap(self, operation: str):
         original = self._saved[operation]

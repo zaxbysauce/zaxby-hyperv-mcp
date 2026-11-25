@@ -73,8 +73,10 @@ def test_real_clock_backoff_still_ramps_to_a_ceiling(pool_env, monkeypatch):
     records a 0.69x adjacent-sleep ratio on a loaded runner for a
     CORRECT schedule). The intervals are observed and printed.
     """
-    holders = [pswindows._acquire_ps_slot() for _ in range(_CAP)]
+    holders: list[int] = []
     try:
+        for _ in range(_CAP):
+            holders.append(pswindows._acquire_ps_slot())
         assert all(fd is not None for fd in holders), "harness must hold every slot"
         payload = json.loads((pool_env.dir / _META_NAME).read_text(encoding="utf-8"))
         assert payload.get("cap") == _CAP, f"pool.meta must record cap {_CAP}: {payload}"
@@ -111,6 +113,12 @@ def test_real_clock_backoff_still_ramps_to_a_ceiling(pool_env, monkeypatch):
 
         waiter = threading.Thread(target=_waiter, daemon=True)
         waiter.start()
+        # DEADLOCK PROTECTION, not a scheduler-independent claim: the waiter
+        # must terminate on its own inside a generous real-time budget. A
+        # worker starved for the whole budget would fail this even with a
+        # correct implementation, so the bound is deliberately wide - the
+        # exact schedule is asserted by the virtual-clock test, which has no
+        # scheduler in its loop.
         waiter.join(timeout=30)
         assert not waiter.is_alive(), "the bounded wait must terminate on its own"
         assert isinstance(outcome.get("error"), pswindows.PowerShellBusy), (
@@ -146,4 +154,10 @@ def test_real_clock_backoff_still_ramps_to_a_ceiling(pool_env, monkeypatch):
         "a fresh acquire must succeed once the holders release (the failed "
         "waiter leaked a slot lock)"
     )
+    # The fresh acquisition is a slot too: it is released here, on every
+    # path this test can take.
+    try:
+        assert math.isfinite(measured[0]), "the measured sleep must be finite"
+    finally:
+        pswindows._release_ps_slot(fresh)
     assert math.isfinite(measured[0]), "the measured sleep must be finite"
