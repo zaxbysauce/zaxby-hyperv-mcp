@@ -193,3 +193,38 @@ def test_f_a_wrapper_around_the_capture_wrapper_is_not_the_capture_s():
             "the repair replaced a wrapper it does not own")
     finally:
         socket.socket.setsockopt = _PRISTINE_SETSOCKOPT
+
+
+def test_g_a_late_restore_from_an_earlier_activation_is_still_repaired(monkeypatch):
+    """A wrapper saved by an EARLIER activation is still the capture's own.
+
+    The capture can be deactivated and activated again while a test's
+    `monkeypatch` still holds the first activation's wrapper. The late
+    restore then puts THAT wrapper back, and the repair has to recognise
+    it - a registry that remembers only the latest wrapper per name would
+    leave it installed for the rest of the session.
+    """
+    from _socket_10038_diagnosis import activate, deactivate, restore_pristine_socket_methods
+
+    def spy(self, *args, **kwargs):
+        return _PRISTINE_SETSOCKOPT(self, *args, **kwargs)
+
+    activate()
+    try:
+        # the substitution SAVES the first activation's wrapper
+        monkeypatch.setattr(socket.socket, "setsockopt", spy)
+    finally:
+        deactivate()
+    activate()
+    try:
+        pass
+    finally:
+        deactivate()
+    monkeypatch.undo()
+    assert socket.socket.setsockopt is not _PRISTINE_SETSOCKOPT, (
+        "the late restore must put the first activation's wrapper back")
+    assert restore_pristine_socket_methods() == 1, (
+        "the repair must recognise the earlier activation's wrapper")
+    assert socket.socket.setsockopt is _PRISTINE_SETSOCKOPT, (
+        "the repair did not restore the value the earlier activation "
+        "displaced")

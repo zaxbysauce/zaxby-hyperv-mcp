@@ -89,28 +89,34 @@ _ORIGINAL_SOCKET_METHODS = {
 # that a previous activation (or a late restore) left behind.
 _ORIGINAL_THREAD_START = threading.Thread.start
 
-# The capture's OWN wrappers, by name. Ownership is decided by IDENTITY:
-# a wrapper built around the capture's wrapper with `functools.wraps` (or
-# any other attribute-copying construct) is NOT the capture's own, and a
-# copyable marker would let it be mistaken for one (the round-5
-# implementation reviewer's finding). The entries outlive the capture's
-# removal, so a wrapper that a late restore puts back is still recognised
-# as the capture's own.
-_OWNED_WRAPPERS: dict[str, object] = {}
+# Every wrapper the capture has installed, with the value IT displaced.
+#
+# Ownership is decided by IDENTITY: a wrapper built around the capture's
+# wrapper with `functools.wraps` (or any other attribute-copying
+# construct) is NOT the capture's own, and a copyable marker would let it
+# be mistaken for one (the round-5 implementation reviewer's finding).
+#
+# The registry keeps EVERY wrapper, not the latest one per name: a
+# `monkeypatch` can save the wrapper of an EARLIER activation and restore
+# it after a later activation has replaced the per-name entry, and the
+# repair still has to recognise it (the round-5 implementation reviewer's
+# finding). The key is the wrapper's id and the registry holds the wrapper
+# itself, so the id cannot be reused while the entry lives.
+_OWNED_WRAPPERS: dict[int, tuple[str, object, object]] = {}
 
 
-def _is_owned_wrapper(name: str, value) -> bool:
-    """Whether the value IS the wrapper the capture installed for that name."""
-    owned = _OWNED_WRAPPERS.get(name)
-    return owned is not None and value is owned
+def _register_owned_wrapper(name: str, wrapper, displaced) -> None:
+    """Remember a wrapper the capture installed, and what it displaced."""
+    _OWNED_WRAPPERS[id(wrapper)] = (name, wrapper, displaced)
 
 
-# What the capture DISPLACED when it installed: the values that were in
-# place BEFORE its wrappers. A patch that a longer-lived fixture owns is in
-# here, and both the capture's removal and the teardown repair restore it -
-# so the capture neither bypasses nor destroys a patch it did not make
-# (the round-5 implementation reviewer's finding).
-_DISPLACED: dict[str, object] = {}
+def _owned_displaced(name: str, value):
+    """The value the installed wrapper displaced, or None when the value is
+    not a wrapper the capture installed."""
+    for owned_name, owned_wrapper, displaced in _OWNED_WRAPPERS.values():
+        if owned_name == name and owned_wrapper is value:
+            return displaced
+    return None
 
 def _diagnosis_dir() -> Path:
     """Where artifacts are written: the configured directory, else a temp one."""
@@ -270,7 +276,6 @@ def _install_thread_leg_recorder(saved: dict) -> None:
     # not that - it is the capture's own, and the capture's own removal
     # restores the value it displaced.
     original_start = getattr(threading.Thread, "start", _ORIGINAL_THREAD_START)
-    _DISPLACED["Thread.start"] = original_start
 
     def start_with_leg(self, *args, **kwargs):
         # The REGISTERED owner of the current thread takes PRECEDENCE over
@@ -284,8 +289,9 @@ def _install_thread_leg_recorder(saved: dict) -> None:
         return original_start(self, *args, **kwargs)
 
     saved["Thread.start"] = original_start
-    _OWNED_WRAPPERS["Thread.start"] = start_with_leg
+    saved["_owned_thread_start"] = start_with_leg
     threading.Thread.start = start_with_leg
+    _register_owned_wrapper("Thread.start", start_with_leg, original_start)
 
 
 def _remove_thread_leg_recorder(saved: dict) -> None:
@@ -295,7 +301,8 @@ def _remove_thread_leg_recorder(saved: dict) -> None:
     # Only a `Thread.start` that STILL holds the recorder's own wrapper is
     # restored: a patch another party installed while the capture was active
     # is not the capture's to replace.
-    if _is_owned_wrapper("Thread.start", getattr(threading.Thread, "start", None)):
+    if getattr(threading.Thread, "start", None) is saved.get(
+            "_owned_thread_start"):
         threading.Thread.start = original_start
 
 def _owning_leg() -> str:
@@ -416,6 +423,9 @@ class SocketDiagnosis:
         # inherit another socket's observed bind/listen steps - an
         # attribution presented as an observation (the round-15 finding).
         self._saved: dict[str, object] = {}
+        # The wrappers THIS activation installed, so its removal can tell
+        # its own wrapper from another party's patch.
+        self._wrappers: dict[str, object] = {}
 
     # ---- lifecycle ----
 
@@ -450,15 +460,16 @@ class SocketDiagnosis:
                 socket.socket, "__init__", _ORIGINAL_SOCKET_INIT)
             for name, original in _ORIGINAL_SOCKET_METHODS.items():
                 self._saved[name] = getattr(socket.socket, name, original)
-            _DISPLACED.clear()
-            _DISPLACED.update(self._saved)
             socket.socket.__init__ = self._init_factory(
                 self._saved["__init__"])  # type: ignore[method-assign]
-            _OWNED_WRAPPERS["__init__"] = socket.socket.__init__
+            self._wrappers["__init__"] = socket.socket.__init__
+            _register_owned_wrapper("__init__", socket.socket.__init__,
+                                    self._saved["__init__"])
             for name in _CAPTURED_OPERATIONS:
                 wrapper = self._wrap(name)
                 setattr(socket.socket, name, wrapper)
-                _OWNED_WRAPPERS[name] = wrapper
+                self._wrappers[name] = wrapper
+                _register_owned_wrapper(name, wrapper, self._saved[name])
             _install_thread_leg_recorder(self._saved)
 
     def uninstall(self) -> None:
@@ -473,12 +484,12 @@ class SocketDiagnosis:
             # capture was active is not the capture's to replace, and it must
             # survive the capture's removal (the round-5 implementation
             # reviewer's finding).
-            if _is_owned_wrapper(
-                    "__init__", getattr(socket.socket, "__init__", None)):
+            if getattr(socket.socket, "__init__", None) is self._wrappers.get(
+                    "__init__"):
                 socket.socket.__init__ = self._saved.get(
                     "__init__", _ORIGINAL_SOCKET_INIT)  # type: ignore[method-assign]
             for name, original in _ORIGINAL_SOCKET_METHODS.items():
-                if _is_owned_wrapper(name, getattr(socket.socket, name, None)):
+                if getattr(socket.socket, name, None) is self._wrappers.get(name):
                     setattr(socket.socket, name, self._saved.get(name, original))
             _remove_thread_leg_recorder(self._saved)
             self._saved.clear()
@@ -737,25 +748,29 @@ def restore_pristine_socket_methods() -> int:
 
     The repair is a NO-OP while the capture is installed: then the capture
     owns the patches and its own removal restores them. It restores ONLY a
-    wrapper this capture installed (each one carries the capture's marker):
-    a patch that belongs to a fixture outliving one test is not the
-    capture's and must survive. The number of restored attributes is
-    returned, so a caller can assert that the repair ran and how much it
-    repaired.
+    wrapper this capture installed - ownership is decided by IDENTITY, and
+    the value restored is the one THAT wrapper displaced: a patch that
+    belongs to a fixture outliving one test is not the capture's and must
+    survive, and a wrapper from an EARLIER activation is still recognised.
+    The number of restored attributes is returned, so a caller can assert
+    that the repair ran and how much it repaired.
     """
     if _INSTALLED_BY is not None:
         return 0
     restored = 0
-    if _is_owned_wrapper("__init__", getattr(socket.socket, "__init__", None)):
-        socket.socket.__init__ = _DISPLACED.get(  # type: ignore[method-assign]
-            "__init__", _ORIGINAL_SOCKET_INIT)
+    displaced = _owned_displaced(
+        "__init__", getattr(socket.socket, "__init__", None))
+    if displaced is not None:
+        socket.socket.__init__ = displaced  # type: ignore[method-assign]
         restored += 1
-    for name, original in _ORIGINAL_SOCKET_METHODS.items():
-        if _is_owned_wrapper(name, getattr(socket.socket, name, None)):
-            setattr(socket.socket, name, _DISPLACED.get(name, original))
+    for name in _ORIGINAL_SOCKET_METHODS:
+        displaced = _owned_displaced(name, getattr(socket.socket, name, None))
+        if displaced is not None:
+            setattr(socket.socket, name, displaced)
             restored += 1
-    if _is_owned_wrapper("Thread.start", getattr(threading.Thread, "start", None)):
-        threading.Thread.start = _DISPLACED.get(
-            "Thread.start", _ORIGINAL_THREAD_START)
+    displaced = _owned_displaced(
+        "Thread.start", getattr(threading.Thread, "start", None))
+    if displaced is not None:
+        threading.Thread.start = displaced
         restored += 1
     return restored
