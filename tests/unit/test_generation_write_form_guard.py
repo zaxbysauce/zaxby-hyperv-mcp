@@ -161,7 +161,17 @@ def _can_be_none(node, scopes, seen):
     if isinstance(node, ast.Constant):
         return node.value is None
     if isinstance(node, ast.BoolOp):
-        # `a or b` / `a and b` evaluate to one of the operands.
+        if isinstance(node.op, ast.Or):
+            # In an `or` chain the RESULT is the last operand that is
+            # truthy, and a falsy operand moves on: `None or 0` is 0 and
+            # `x or None or 0` is 0. The chain can yield None only
+            # through its LAST operand - the `any` rule certified a
+            # closed expression as None-capable, which let a disclosed
+            # fail-open site be rewritten closed while the pin still
+            # passed (the round-21 plan gate's executed probe).
+            return _can_be_none(node.values[-1], scopes, seen)
+        # In an `and` chain a truthy operand ends the chain, so ANY
+        # operand that can be None can reach the result.
         return any(_can_be_none(value, scopes, seen) for value in node.values)
     if isinstance(node, ast.IfExp):
         return _can_be_none(node.orelse, scopes, seen) or _can_be_none(node.body, scopes, seen)
@@ -730,7 +740,7 @@ def _spread_generation_value(node):
     if not isinstance(node, ast.Dict):
         return None
     found = None
-    for key, value in zip(node.keys, node.values):
+    for key, value in zip(node.keys, node.values, strict=True):
         if isinstance(key, ast.Constant) and key.value == "generation":
             # The LAST duplicate wins in a dict literal, so the last
             # matching value is the one that reaches the write.

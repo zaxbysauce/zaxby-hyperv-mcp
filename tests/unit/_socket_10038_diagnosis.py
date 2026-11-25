@@ -300,19 +300,35 @@ def _owning_leg() -> str:
     return "unknown"
 
 
+# The observed origins and the listener steps, keyed by the socket's id.
+#
+# They are MODULE-level so they survive the public activation
+# lifecycle: `deactivate()` drops the active instance and the next
+# `activate()` builds a new one, so an instance-level registry would
+# lose a still-live socket's observed provenance at every boundary (the
+# round-21 implementation reviewer's finding). The entries hold WEAK
+# references, so a collected socket's entry dies with it and a
+# recycled id can never inherit it.
+_ORIGINS: dict[int, tuple["weakref.ref[object]", str]] = {}
+_LISTENER_STEPS: dict[int, tuple["weakref.ref[object]", set[str]]] = {}
+
+
 class SocketDiagnosis:
     """Installs the operation-time capture for the socket test family."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._counter = 0
-        # The entries carry the SOCKET ITSELF, not just its id: an id can
-        # be reused after a socket is collected, and a reused id would let
-        # a new socket inherit another socket's observed bind/listen steps
-        # - an attribution presented as an observation (the round-15
-        # implementation reviewer's finding).
-        self._origins: dict[int, tuple[weakref.ref[object], str]] = {}
-        self._listener_steps: dict[int, tuple[weakref.ref[object], set[str]]] = {}
+        # The origin and listener-step registries are MODULE-level, so
+        # they survive the public activation lifecycle: `deactivate()`
+        # drops the active instance and the next `activate()` builds a
+        # new one, so an instance-level registry would lose a live
+        # socket's observed provenance at every boundary (the round-21
+        # implementation reviewer's finding). The entries carry the
+        # SOCKET ITSELF, not just its id: an id can be reused after a
+        # socket is collected, and a reused id would let a new socket
+        # inherit another socket's observed bind/listen steps - an
+        # attribution presented as an observation (the round-15 finding).
         self._saved: dict[str, object] = {}
 
     # ---- lifecycle ----
@@ -338,11 +354,10 @@ class SocketDiagnosis:
                 setattr(socket.socket, name, original)
             _remove_thread_leg_recorder(self._saved)
             self._saved.clear()
-            # The ORIGIN registry is NOT cleared: a socket whose identity
-            # has not changed keeps the provenance it was observed with
-            # across an activation boundary (the plan gate's probe). The
-            # entries are WEAK references, so a collected socket's entry
-            # dies with it and a recycled id can never inherit it.
+            # The origin and listener-step registries are MODULE-level
+            # (see `_ORIGINS`), so they are NOT cleared here: a socket
+            # whose identity has not changed keeps the provenance it was
+            # observed with across an activation boundary.
             # The THREAD registry is NOT cleared: a thread started under
             # one activation and released after another keeps the
             # STARTER's leg, which is the truth. Clearing it would make
@@ -356,13 +371,13 @@ class SocketDiagnosis:
     def _inherit_origin(self, source, accepted) -> None:
         """Carry an observed origin across the accept seam."""
         with self._lock:
-            entry = self._origins.get(id(source))
+            entry = _ORIGINS.get(id(source))
             if entry is None:
                 return
             owner, origin = entry
             if owner() is not source or not origin or origin == "unknown":
                 return
-            self._origins[id(accepted)] = (weakref.ref(accepted), origin)
+            _ORIGINS[id(accepted)] = (weakref.ref(accepted), origin)
 
     def _note_listener_step(self, sock, operation: str) -> None:
         """Record that a socket reached one half of the listener's own
@@ -373,7 +388,7 @@ class SocketDiagnosis:
         socket is the listener's.
         """
         with self._lock:
-            entry = self._listener_steps.get(id(sock))
+            entry = _LISTENER_STEPS.get(id(sock))
             if entry is None or entry[0]() is not sock:
                 # A different socket that happens to carry the same id:
                 # its steps start empty, never the previous one's.
@@ -381,9 +396,9 @@ class SocketDiagnosis:
             else:
                 steps = entry[1]
             steps.add(operation)
-            self._listener_steps[id(sock)] = (weakref.ref(sock), steps)
+            _LISTENER_STEPS[id(sock)] = (weakref.ref(sock), steps)
             if "bind" in steps and "listen" in steps:
-                self._origins[id(sock)] = (weakref.ref(sock), "real-listener")
+                _ORIGINS[id(sock)] = (weakref.ref(sock), "real-listener")
 
     def _init_factory(self, saved_init):
         """A plain function (not a bound method): as a class attribute it
@@ -409,7 +424,7 @@ class SocketDiagnosis:
             # constructor that FAILS is recorded against the origin its
             # creation stack already showed, not against "unknown".
             with self._lock:
-                self._origins[id(sock)] = (weakref.ref(sock), origin)
+                _ORIGINS[id(sock)] = (weakref.ref(sock), origin)
             try:
                 saved_init(sock, *args, **kwargs)
             except OSError as exc:
@@ -464,7 +479,7 @@ class SocketDiagnosis:
             with self._lock:
                 self._counter += 1
                 counter = self._counter
-                entry = self._origins.get(id(sock))
+                entry = _ORIGINS.get(id(sock))
                 origin = "unknown"
                 if entry is not None and entry[0]() is sock:
                     origin = entry[1]
