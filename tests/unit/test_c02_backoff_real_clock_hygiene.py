@@ -157,12 +157,18 @@ def test_the_real_clock_path_terminates_and_releases_its_slots(pool_env, monkeyp
         # wall-clock deadline depends on how much time the runner leaves. The
         # intervals are OBSERVED and REPORTED; the exact schedule is asserted
         # by the virtual-clock test, which has no scheduler in its loop.
-        if not measured:
-            pytest.skip("the ramp was not observed on this host (scheduler delay)")
+        # The OBSERVATION is what is waived when the ramp was not observed -
+        # NOT the hygiene check below, which runs on every path.
 
     finally:
         for fd in holders:
             pswindows._release_ps_slot(fd)
+    # The SLOT-RELEASE check runs whatever the scheduler did: the fresh
+    # acquisition must succeed once the holders release, which is exactly
+    # the property that a failed waiter leaked a slot lock would break.
+    # It must not sit behind the timing observation's waiver (the round-15
+    # implementation reviewer's finding: the old `pytest.skip` on the
+    # no-ramp path skipped this check too).
     fresh = pswindows._acquire_ps_slot()
     assert fresh is not None, (
         "a fresh acquire must succeed once the holders release (the failed "
@@ -171,7 +177,15 @@ def test_the_real_clock_path_terminates_and_releases_its_slots(pool_env, monkeyp
     # The fresh acquisition is a slot too: it is released here, on every
     # path this test can take.
     try:
-        assert math.isfinite(measured[0]), "the measured sleep must be finite"
+        if measured:
+            assert math.isfinite(measured[0]), "the measured sleep must be finite"
     finally:
         pswindows._release_ps_slot(fresh)
-    assert math.isfinite(measured[0]), "the measured sleep must be finite"
+    if not measured:
+        # The timing OBSERVATION is unavailable on this host; the hygiene
+        # properties above were asserted and passed. The test reports the
+        # waiver rather than skipping, so a skip never hides a failed
+        # slot-release check.
+        print("REAL-CLOCK OBSERVATION WAIVED: the ramp was not observed on "
+              "this host (scheduler delay); the schedule is asserted by the "
+              "virtual-clock test")

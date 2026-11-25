@@ -109,6 +109,7 @@ is not on the reviewed closed list is reported, not assumed closed.
 """
 
 import ast
+import re
 from pathlib import Path
 
 _OPERATIONS = (
@@ -361,6 +362,21 @@ def _local_assignments(func):
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 bind(target, node.value)
+            # A dynamic EXEC of a LITERAL source rebinds the names that
+            # source mentions, in the executing scope. A static walk can
+            # see that, so it is collected like any other binding form
+            # rather than left to the declared boundary.
+            for dynamic_name in _exec_rebound_names(node.value):
+                bind_name(dynamic_name, ast.Constant(value=None,
+                                                      lineno=node.lineno,
+                                                      col_offset=0))
+        elif isinstance(node, ast.Expr):
+            # The same dynamic rebinding as a STATEMENT (`exec("generation
+            # = None")`), which is the shape it takes in practice.
+            for dynamic_name in _exec_rebound_names(node.value):
+                bind_name(dynamic_name, ast.Constant(value=None,
+                                                      lineno=node.lineno,
+                                                      col_offset=0))
         elif isinstance(node, ast.AnnAssign):
             bind(node.target, node.value)
         elif isinstance(node, ast.NamedExpr):
@@ -623,19 +639,46 @@ def _direct_form_is_closed(node) -> bool:
     return False
 
 
-def _reads_its_own_name(values, name) -> bool:
-    """True when an assignment only READS the name it binds.
+def _reads_only_its_own_name(values, name) -> bool:
+    """True when EVERY assignment of the name only READS the name.
 
     `generation = generation` does not rebind the name with a new value:
     it copies the enclosing binding into the local. When that enclosing
     binding is a PARAMETER, the value that reaches the write is the
     CALLER's value - so the site belongs in the parameter class, not in
     the local class, and the local must not shadow the parameter.
+
+    EVERY assignment must be a self-read for that to hold: a local that
+    reads itself once and is later assigned something else (`generation =
+    generation` followed by `generation = None`) takes that OTHER value,
+    so the local must be assessed on its own - and the other assignment
+    must not be hidden behind the parameter's (possibly closed)
+    annotation (the round-15 implementation reviewer's finding).
     """
+    if not values:
+        return False
     for value in values:
-        if isinstance(value, ast.Name) and value.id == name:
-            return True
-    return False
+        if not (isinstance(value, ast.Name) and value.id == name):
+            return False
+    return True
+
+
+def _exec_rebound_names(node) -> list[str]:
+    """The names a dynamic EXEC can rebind, when its source is a literal.
+
+    `exec("generation = None")` rebinds the name in the EXECUTING scope,
+    so a static walk CAN see it: the literal's source names it. A
+    computed source (`exec(source)`) names nothing a walk can resolve -
+    that is the census's remaining declared boundary.
+    """
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+        return []
+    if node.func.id != "exec" or not node.args:
+        return []
+    source = node.args[0]
+    if not (isinstance(source, ast.Constant) and isinstance(source.value, str)):
+        return []
+    return sorted(set(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", source.value)))
 
 
 def _classify():
@@ -722,7 +765,7 @@ def _classify():
                         # parameter-self-assignment probe).
                         if (
                             name in tables[func]
-                            and _reads_its_own_name(envs[func][name], name)
+                            and _reads_only_its_own_name(envs[func][name], name)
                         ):
                             binding = ("param", func)
                             break

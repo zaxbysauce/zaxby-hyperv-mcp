@@ -144,7 +144,12 @@ def current_leg() -> str | None:
 # started, keyed by the thread object. A thread's own stack cannot show it:
 # the frames of the code that STARTED the thread are not on the thread's
 # stack. Filled at Thread.start time while the capture is installed.
-_THREAD_LEGS: dict[int, str] = {}
+#
+# The entry carries the THREAD ITSELF, not just its id: an id can be
+# reused after a thread is collected, and a reused id would hand a new
+# thread another thread's leg - an attribution presented as an
+# observation (the round-15 implementation reviewer's finding).
+_THREAD_LEGS: dict[int, tuple[object, str]] = {}
 
 
 def _current_stack_leg() -> str | None:
@@ -167,9 +172,17 @@ def _current_stack_leg() -> str | None:
 
 
 def _thread_leg() -> str | None:
-    """The leg recorded for the CURRENT thread, if any."""
+    """The leg recorded for the CURRENT thread, if any.
+
+    The recorded entry names the thread it was recorded FOR: an id that
+    has since been reused by a different thread does not carry over.
+    """
     thread = threading.current_thread()
-    return _THREAD_LEGS.get(id(thread))
+    entry = _THREAD_LEGS.get(id(thread))
+    if entry is None:
+        return None
+    owner, leg = entry
+    return leg if owner is thread else None
 
 
 def _install_thread_leg_recorder(saved: dict) -> None:
@@ -184,7 +197,7 @@ def _install_thread_leg_recorder(saved: dict) -> None:
         # registered owner is the fixture or test that started the chain.
         leg = _thread_leg() or _current_stack_leg()
         if leg:
-            _THREAD_LEGS[id(self)] = leg
+            _THREAD_LEGS[id(self)] = (self, leg)
         return original_start(self, *args, **kwargs)
 
     saved["Thread.start"] = original_start
@@ -290,8 +303,13 @@ class SocketDiagnosis:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._counter = 0
-        self._origins: dict[int, str] = {}
-        self._listener_steps: dict[int, set[str]] = {}
+        # The entries carry the SOCKET ITSELF, not just its id: an id can
+        # be reused after a socket is collected, and a reused id would let
+        # a new socket inherit another socket's observed bind/listen steps
+        # - an attribution presented as an observation (the round-15
+        # implementation reviewer's finding).
+        self._origins: dict[int, tuple[object, str]] = {}
+        self._listener_steps: dict[int, tuple[object, set[str]]] = {}
         self._saved: dict[str, object] = {}
 
     # ---- lifecycle ----
@@ -326,9 +344,13 @@ class SocketDiagnosis:
     def _inherit_origin(self, source, accepted) -> None:
         """Carry an observed origin across the accept seam."""
         with self._lock:
-            origin = self._origins.get(id(source))
-            if origin and origin != "unknown":
-                self._origins[id(accepted)] = origin
+            entry = self._origins.get(id(source))
+            if entry is None:
+                return
+            owner, origin = entry
+            if owner is not source or not origin or origin == "unknown":
+                return
+            self._origins[id(accepted)] = (accepted, origin)
 
     def _note_listener_step(self, sock, operation: str) -> None:
         """Record that a socket reached one half of the listener's own
@@ -339,10 +361,17 @@ class SocketDiagnosis:
         socket is the listener's.
         """
         with self._lock:
-            steps = self._listener_steps.setdefault(id(sock), set())
+            entry = self._listener_steps.get(id(sock))
+            if entry is None or entry[0] is not sock:
+                # A different socket that happens to carry the same id:
+                # its steps start empty, never the previous one's.
+                steps: set[str] = set()
+            else:
+                steps = entry[1]
             steps.add(operation)
+            self._listener_steps[id(sock)] = (sock, steps)
             if "bind" in steps and "listen" in steps:
-                self._origins[id(sock)] = "real-listener"
+                self._origins[id(sock)] = (sock, "real-listener")
 
     def _init_factory(self, saved_init):
         """A plain function (not a bound method): as a class attribute it
@@ -366,7 +395,7 @@ class SocketDiagnosis:
                 origin = "unknown"
             saved_init(sock, *args, **kwargs)
             with self._lock:
-                self._origins[id(sock)] = origin
+                self._origins[id(sock)] = (sock, origin)
 
         _init.__name__ = "__init__"
         return _init
@@ -406,7 +435,10 @@ class SocketDiagnosis:
             with self._lock:
                 self._counter += 1
                 counter = self._counter
-                origin = self._origins.get(id(sock), "unknown")
+                entry = self._origins.get(id(sock))
+                origin = "unknown"
+                if entry is not None and entry[0] is sock:
+                    origin = entry[1]
             leg = _owning_leg()
             directory = _diagnosis_dir()
             directory.mkdir(parents=True, exist_ok=True)
