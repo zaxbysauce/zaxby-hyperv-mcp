@@ -121,16 +121,22 @@ _THREAD_LEGS: dict[int, str] = {}
 
 
 def _current_stack_leg() -> str | None:
-    """The test-module frame that is executing right now (a fixture, usually)."""
+    """The OUTERMOST test-module frame that is executing right now.
+
+    The outermost one is the owner: a fixture that called a helper which
+    started the thread must be recorded as the FIXTURE, not the helper, and
+    a test body that called a helper must be recorded as the TEST.
+    """
     frame = sys._getframe(1)
+    found: str | None = None
     while frame is not None:
         if frame.f_globals.get("__name__") != __name__:
             base = os.path.basename(frame.f_code.co_filename)
             name = frame.f_code.co_name
             if "test" in base and name and not name.startswith("<"):
-                return name
+                found = name
         frame = frame.f_back
-    return None
+    return found
 
 
 def _thread_leg() -> str | None:
