@@ -475,12 +475,17 @@ _CLOSED_ANNOTATION_NAMES = frozenset({
 })
 
 
-def _annotation_admits_none(annotation):
+def _annotation_admits_none(annotation, shadowed=frozenset()):
     """True for `int | None`, `Optional[...]`, any union containing None.
 
     A QUOTED annotation ("int | None") is parsed first: a postponed
     annotation written by hand is a string literal, and reading only the
     AST of the literal would miss the None inside it.
+
+    A CLOSED annotation name is closed only while it still resolves to
+    the BUILTIN: a rebound `str` (`str = type(None)`) makes a
+    `str`-annotated parameter admit None, so the spelling alone is not
+    enough (the plan gate's executed probe).
     """
     if annotation is None:
         return False
@@ -498,7 +503,13 @@ def _annotation_admits_none(annotation):
         # ALIAS such as `OptionalGeneration = int | None`, or any custom
         # alias) is treated as admitting None: a guard that skips what it
         # cannot resolve has a hole.
-        if isinstance(node, ast.Name) and node.id not in _CLOSED_ANNOTATION_NAMES:
+        if isinstance(node, ast.Name):
+            if node.id in _CLOSED_ANNOTATION_NAMES:
+                if node.id in shadowed:
+                    # A REBOUND name: the annotation no longer excludes
+                    # None.
+                    return True
+                continue
             return True
         # `typing.Optional[...]` is an attribute, not a name.
         if isinstance(node, ast.Attribute) and node.attr == "Optional":
@@ -511,10 +522,16 @@ def _annotation_admits_none(annotation):
     return False
 
 
-def _param_table(func):
-    """param name -> {index, kwonly, default, admits_none} for one function."""
+def _param_table(func, annotation_shadow=frozenset()):
+    """param name -> {index, kwonly, default, admits_none} for one function.
+
+    `annotation_shadow` is the set of names the ENCLOSING scopes rebind:
+    an annotation is evaluated where the function is DEFINED, so the
+    function's own locals do not shadow it.
+    """
     args = func.args
     table = {}
+    shadowed = set(annotation_shadow)
     positional = list(getattr(args, "posonlyargs", [])) + list(args.args)
     for index, arg in enumerate(positional):
         table[arg.arg] = {
@@ -525,7 +542,7 @@ def _param_table(func):
             # None: a signature that cannot exclude None must not be read
             # as one that excludes it.
             "admits_none": (arg.annotation is None
-                            or _annotation_admits_none(arg.annotation)),
+                            or _annotation_admits_none(arg.annotation, shadowed)),
         }
     for arg in args.kwonlyargs:
         table[arg.arg] = {
@@ -533,7 +550,7 @@ def _param_table(func):
             "kwonly": True,
             "default": _NO_DEFAULT,
             "admits_none": (arg.annotation is None
-                            or _annotation_admits_none(arg.annotation)),
+                            or _annotation_admits_none(arg.annotation, shadowed)),
         }
     # positional defaults align to the TAIL of the positional list;
     # kw_defaults align index-by-index (None = no default at all).
@@ -598,12 +615,17 @@ def _call_binds_none(call, scope_of, param_name, entry):
     return True
 
 
-def _reachable_with_none(tree, scope_of, func, param_name, entry):
+def _reachable_with_none(tree, scope_of, func, param_name, entry,
+                         unknown_is_reachable=True):
     """True when any in-module call of `func` can bind None to the parameter.
 
     Direct calls are resolved by positional index OR keyword. A bare
     reference to the function (its name passed around as a value, so the
-    binding site is unknowable from this module) is None-capable.
+    binding site is unknowable from this module) is None-capable - for
+    an ADMITTING signature. `unknown_is_reachable` is False for a CLOSED
+    signature, where an unknowable binding is not reported: the codebase's
+    own contract excludes None there, and only a DEFINITE None feed is a
+    real fail-open (the plan gate's probe).
     """
     called = set()
     for node in ast.walk(tree):
@@ -630,7 +652,8 @@ def _reachable_with_none(tree, scope_of, func, param_name, entry):
                 return True
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id == func.name and id(node) not in called:
-            return True
+            if unknown_is_reachable:
+                return True
     return False
 
 
@@ -654,6 +677,15 @@ _CLOSED_DIRECT_CALLS = frozenset({"int", "float", "bool"})
 # The coercion names whose call result can never be None - as long as the
 # name still resolves to the BUILTIN.
 _COERCION_NAMES = ("int", "float", "bool")
+
+# Every name the analysis certifies CLOSED: the coercions (a call cannot
+# return None) and the closed annotation names. A REBINDING of any of them
+# - at module level or in the analysed scope - removes the certification,
+# so the shadow census must cover all of them (the plan gate's `str =
+# type(None)` probe).
+_CERTIFIED_CLOSED_NAMES = frozenset({
+    "int", "float", "bool", "str", "bytes",
+})
 _CLOSED_DIRECT_EXACT = frozenset({"store.op_next_generation()"})
 
 
@@ -668,6 +700,49 @@ def _direct_form_is_closed(node, shadowed=frozenset()) -> bool:
             return node.func.id not in shadowed
         return ast.unparse(node) in _CLOSED_DIRECT_EXACT
     return False
+
+
+
+def _spread_generation_value(node):
+    """The generation value carried by a `**` SPREAD, if any.
+
+    `**{"generation": generation or None}` reaches the receiving write
+    with the same keyword the named form would - but the keyword is not
+    named in the call, so the named-keyword scan skips it. A COMPUTED
+    spread (`**body_args`) carries keys that are not statically visible;
+    that form is the census's remaining declared boundary.
+    """
+    if not isinstance(node, ast.Dict):
+        return None
+    for key, value in zip(node.keys, node.values):
+        if isinstance(key, ast.Constant) and key.value == "generation":
+            return value
+    return None
+
+
+def _comment_text(line: str) -> str:
+    """The COMMENT part of a source line.
+
+    The disclosure tag must be a COMMENT: a string literal that happens
+    to contain the tag text satisfied the same-line scan, so a site could
+    lose its disclosure comment and keep the text.
+    """
+    quote = None
+    index = 0
+    while index < len(line):
+        character = line[index]
+        if quote is not None:
+            if character == "\\":
+                index += 2
+                continue
+            if character == quote:
+                quote = None
+        elif character in ("'", '"'):
+            quote = character
+        elif character == "#":
+            return line[index:]
+        index += 1
+    return ""
 
 
 def _reads_only_its_own_name(values, name) -> bool:
@@ -745,26 +820,67 @@ def _has_computed_exec(func) -> bool:
 
 
 
+def _statement_bindings(node) -> set[str]:
+    """The names a single statement binds."""
+    names: set[str] = set()
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            names |= set(_bound_names(target))
+    elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+        names |= set(_bound_names(node.target))
+    elif isinstance(node, (ast.For, ast.AsyncFor)):
+        names |= set(_bound_names(node.target))
+    elif isinstance(node, (ast.With, ast.AsyncWith)):
+        for item in node.items:
+            if item.optional_vars is not None:
+                names |= set(_bound_names(item.optional_vars))
+    elif isinstance(node, ast.ExceptHandler) and node.name:
+        names.add(node.name)
+    elif isinstance(node, ast.Match):
+        for case in node.cases:
+            for name in _pattern_names(case.pattern):
+                names.add(name)
+    elif isinstance(node, ast.Import):
+        for alias in node.names:
+            names.add(alias.asname or alias.name.split(".", 1)[0])
+    elif isinstance(node, ast.ImportFrom):
+        for alias in node.names:
+            names.add(alias.asname or alias.name)
+    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        names.add(node.name)
+    return names
+
+
+def _module_scope_nodes(tree):
+    """The module's OWN scope: its body and the compound statements in it.
+
+    A nested function's or class's body is a scope of its own, so it is
+    NOT walked: a local `int` in another function does not shadow the
+    module's name, and treating it as shadowed would report the closed
+    sites as fail-open.
+    """
+    stack = list(tree.body)
+    while stack:
+        node = stack.pop(0)
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
 def _module_shadowed_coercions(tree) -> set[str]:
     """The coercion names the MODULE rebinds.
 
-    A module-level `int = ...` shadows the builtin for the whole module,
-    so every `int(...)` in it calls something else - which can return
-    None.
+    A module-level `int = ...` - or an IMPORT that binds `int`, or a
+    binding nested in a module-level compound statement - shadows the
+    builtin for the whole module, so every `int(...)` in it calls
+    something else, which can return None.
     """
     shadowed: set[str] = set()
-    for node in tree.body:
-        targets: list = []
-        if isinstance(node, ast.Assign):
-            targets = list(node.targets)
-        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-            targets = [node.target]
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            targets = [ast.Name(id=node.name, ctx=ast.Store())]
-        for target in targets:
-            for name in _bound_names(target):
-                if name in _COERCION_NAMES:
-                    shadowed.add(name)
+    for node in _module_scope_nodes(tree):
+        for name in _statement_bindings(node):
+            if name in _CERTIFIED_CLOSED_NAMES:
+                shadowed.add(name)
     return shadowed
 
 
@@ -774,8 +890,8 @@ def _function_shadowed_coercions(func, env, table) -> set[str]:
     A local or a parameter named `int` shadows the builtin for that
     function, so its `int(...)` calls are calls to something else.
     """
-    shadowed = {name for name in env if name in _COERCION_NAMES}
-    shadowed |= {name for name in table if name in _COERCION_NAMES}
+    shadowed = {name for name in env if name in _CERTIFIED_CLOSED_NAMES}
+    shadowed |= {name for name in table if name in _CERTIFIED_CLOSED_NAMES}
     return shadowed
 
 
@@ -799,10 +915,35 @@ def _classify():
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
     envs = {func: _local_assignments(func) for func in functions}
-    tables = {func: _param_table(func) for func in functions}
+    module_shadowed = _module_shadowed_coercions(tree)
+
+    def _param_names(func) -> set[str]:
+        """The names a function's SIGNATURE binds."""
+        args = func.args
+        names: set[str] = set()
+        for group in (getattr(args, "posonlyargs", []), args.args, args.kwonlyargs):
+            names |= {arg.arg for arg in group}
+        return names
+
+    def _annotation_shadow(func) -> set[str]:
+        """The certified-closed names the ENCLOSING scopes rebind."""
+        names = set(module_shadowed)
+        for outer in _chain_of(owner, func)[:-1]:
+            names |= {
+                name for name in envs[outer] if name in _CERTIFIED_CLOSED_NAMES
+            }
+            names |= {
+                name for name in _param_names(outer)
+                if name in _CERTIFIED_CLOSED_NAMES
+            }
+        return names
+
+    tables = {
+        func: _param_table(func, _annotation_shadow(func))
+        for func in functions
+    }
     shadowed = _scope_shadowed_names(tree)
 
-    module_shadowed = _module_shadowed_coercions(tree)
     shadowed_by_func = {
         func: module_shadowed | _function_shadowed_coercions(
             func, envs[func], tables[func]
@@ -829,7 +970,20 @@ def _classify():
         if not isinstance(node, ast.Call):
             continue
         for keyword in node.keywords:
-            if keyword.arg != "generation":
+            if keyword.arg is None:
+                # A `**` SPREAD can carry the generation keyword:
+                # `**{"generation": generation or None}` reaches the
+                # receiving write with the same keyword the named form
+                # would, and the keyword is not NAMED in the call - so
+                # the named-keyword scan skipped it and the value
+                # reached the write unpredicated (the plan gate's
+                # executed probe).
+                value = _spread_generation_value(keyword.value)
+                if value is None:
+                    continue
+            elif keyword.arg == "generation":
+                value = keyword.value
+            else:
                 continue
             chain = _chain_of(owner, node)
             identity = (
@@ -837,10 +991,17 @@ def _classify():
                 _method_of(node),
                 _event_of(node),
             )
-            line = getattr(keyword.value, "lineno", node.lineno)
-            if isinstance(keyword.value, ast.BoolOp):
-                local_sites.append((identity, line, lines[line - 1]))
-            elif not isinstance(keyword.value, ast.Name):
+            line = getattr(value, "lineno", node.lineno)
+            if isinstance(value, ast.BoolOp):
+                # The fail-open FORM is a boolean-or that can yield None.
+                # A different boolean expression (`generation or 0`) is
+                # fail-CLOSED, and counting it as a fail-open site would
+                # let a disclosed site be rewritten into a closed one
+                # while the pin still passed (the plan gate's executed
+                # probe).
+                if _can_be_none(value, scope_of(node), set()):
+                    local_sites.append((identity, line, lines[line - 1]))
+            elif not isinstance(value, ast.Name):
                 # A DIRECT EXPRESSION form (a call, a conditional
                 # expression) is not the boolean-or write form AC1 pins,
                 # but it still feeds the write - so it is checked against
@@ -854,10 +1015,16 @@ def _classify():
                 coercion_shadowed = set()
                 for func in chain:
                     coercion_shadowed |= shadowed_by_func[func]
-                if not _direct_form_is_closed(keyword.value, coercion_shadowed):
+                # A lambda parameter or a comprehension target binds the
+                # name in a scope of its own, so a coercion call through
+                # it is not the builtin.
+                coercion_shadowed |= {
+                    name for name in shadowed if name in _COERCION_NAMES
+                }
+                if not _direct_form_is_closed(value, coercion_shadowed):
                     direct_sites.append((identity, line, lines[line - 1]))
             else:
-                name = keyword.value.id
+                name = value.id
                 if name in shadowed:
                     # A lambda parameter or a comprehension target binds
                     # this name in a scope of its own, so the enclosing
@@ -901,8 +1068,14 @@ def _classify():
                     continue
                 if binding[0] == "local":
                     assigned = envs[binding[1]][name]
+                    # The value is analysed in the scope where the
+                    # ASSIGNMENT is evaluated - not the scope of the
+                    # write. A name assigned in an outer scope and
+                    # read in an inner one resolves against the INNER
+                    # scope's bindings, which is the wrong lexical
+                    # scope (the plan gate's executed probe).
                     if any(
-                        _can_be_none(value, scope_of(node), {name})
+                        _can_be_none(value, scope_of(value), {name})
                         for value in assigned
                     ):
                         # EVERY assignment that can feed this write is kept,
@@ -922,10 +1095,17 @@ def _classify():
                     continue
                 func = binding[1]
                 entry = tables[func][name]
-                if not entry["admits_none"]:
+                reachable = _reachable_with_none(
+                    tree, scope_of, func, name, entry,
+                    unknown_is_reachable=entry["admits_none"],
+                )
+                if not entry["admits_none"] and not reachable:
+                    # A closed signature that no caller feeds None with
+                    # is a contract, not a fail-open feed.
                     continue
-                reachable = _reachable_with_none(tree, scope_of, func, name, entry)
-                parameter_sites.append((identity, line, lines[line - 1], reachable))
+                parameter_sites.append(
+                    (identity, line, lines[line - 1], entry["admits_none"], reachable)
+                )
     return local_sites, aliased_sites, parameter_sites, direct_sites
 
 
@@ -950,7 +1130,11 @@ def test_keyword_local_fail_open_sites_are_exactly_the_four_disclosed():
 def test_every_fail_open_site_carries_the_disclosure_tag():
     """Each keyword-local fail-open site carries the same-line disclosure tag."""
     local_sites, _aliased, _parameter, _direct = _classify()
-    untagged = [line for _identity, line, text in local_sites if _LOCAL_TAG not in text]
+    untagged = [
+        line
+        for _identity, line, text in local_sites
+        if _LOCAL_TAG not in _comment_text(text)
+    ]
     assert not untagged, (
         f"AC1: fail-open write sites missing the '{_LOCAL_TAG}' tag at lines {untagged}"
     )
@@ -978,7 +1162,7 @@ def test_the_aliased_capture_carries_its_disclosure_tag():
         line
         for _identity, alias_lines, texts in aliased_sites
         for line, text in zip(alias_lines, texts, strict=True)
-        if _ALIAS_TAG not in text
+        if _ALIAS_TAG not in _comment_text(text)
     ]
     assert not untagged, (
         f"AC1: aliased fail-open capture missing the '{_ALIAS_TAG}' tag at lines {untagged}"
@@ -1060,7 +1244,7 @@ def test_the_direct_form_closure_rule_certifies_only_the_reviewed_forms():
 def test_parameter_admitting_sites_are_exactly_the_two_disclosed():
     """The parameter pass-through ADMITTING set equals the two disclosed identities."""
     _local, _aliased, parameter_sites, _direct = _classify()
-    counts = _identity_counts(parameter_sites)
+    counts = _identity_counts([site for site in parameter_sites if site[3]])
     assert counts == _EXPECTED_PARAM_ADMITTING, (
         f"AC1: parameter pass-through admitting sites mismatch: expected exactly "
         f"{sorted(_EXPECTED_PARAM_ADMITTING)}, found {sorted(counts)} - a write whose "
@@ -1077,7 +1261,7 @@ def test_parameter_reachable_sites_are_exactly_the_disclosed_one():
     identity assertion fires.
     """
     _local, _aliased, parameter_sites, _direct = _classify()
-    reachable = [site for site in parameter_sites if site[3]]
+    reachable = [site for site in parameter_sites if site[4]]
     counts = _identity_counts(reachable)
     assert counts == _EXPECTED_PARAM_REACHABLE, (
         f"AC1: parameter pass-through sites REACHABLE with None mismatch: expected "
@@ -1090,10 +1274,13 @@ def test_reachable_parameter_sites_carry_the_parameter_tag():
     """Each None-reachable parameter site carries the strong disclosure tag."""
     _local, _aliased, parameter_sites, _direct = _classify()
     untagged = [
-        line for _identity, line, text, reachable in parameter_sites
+        line for _identity, line, text, _admits, reachable in parameter_sites
         # the admits tag CONTAINS the strong tag as a prefix, so a line
         # carrying only the weaker tag must be rejected explicitly
-        if reachable and (_PARAM_TAG not in text or _PARAM_ADMITS_TAG in text)
+        if reachable and (
+            _PARAM_TAG not in _comment_text(text)
+            or _PARAM_ADMITS_TAG in _comment_text(text)
+        )
     ]
     assert not untagged, (
         f"AC1: reachable parameter pass-through sites missing the "
@@ -1105,8 +1292,8 @@ def test_admitting_but_unreachable_parameter_sites_carry_the_admits_tag():
     """Admitting-but-currently-closed parameter sites carry the weaker tag."""
     _local, _aliased, parameter_sites, _direct = _classify()
     untagged = [
-        line for _identity, line, text, reachable in parameter_sites
-        if not reachable and _PARAM_ADMITS_TAG not in text
+        line for _identity, line, text, admits, reachable in parameter_sites
+        if not reachable and _PARAM_ADMITS_TAG not in _comment_text(text)
     ]
     assert not untagged, (
         f"AC1: admitting-but-unreachable parameter pass-through sites missing the "

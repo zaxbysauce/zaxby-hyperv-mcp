@@ -52,12 +52,14 @@ _WINERROR_10038 = 10038
 # several of them inside exception-swallowing cleanup paths - so a real
 # failure of any of those shapes must leave an artifact. The census is
 # every handle-touching operation of `socket.socket`; `close` and `detach`
-# are deliberately absent (they do not use the handle).
+# `close` IS captured: on Windows a close on a handle another thread has
+# invalidated raises the same WinError 10038, and the family closes
+# handles it does not exclusively own.
 _CAPTURED_OPERATIONS = (
-    "accept", "bind", "connect", "dup", "getpeername", "getsockname",
-    "getsockopt", "listen", "recv", "recv_into", "recvfrom", "recvfrom_into",
-    "send", "sendall", "sendto", "setblocking", "settimeout", "setsockopt",
-    "shutdown",
+    "accept", "bind", "close", "connect", "dup", "getpeername",
+    "getsockname", "getsockopt", "listen", "recv", "recv_into", "recvfrom",
+    "recvfrom_into", "send", "sendall", "sendto", "setblocking", "settimeout",
+    "setsockopt", "shutdown",
 )
 
 
@@ -338,7 +340,13 @@ class SocketDiagnosis:
             self._saved.clear()
             self._origins.clear()
             self._listener_steps.clear()
-            _THREAD_LEGS.clear()
+            # The THREAD registry is NOT cleared: a thread started under
+            # one activation and released after another keeps the
+            # STARTER's leg, which is the truth. Clearing it would make
+            # the fallback name the CURRENT test - an attribution
+            # presented as an observation (the plan gate's cross-
+            # activation probe). The entries are weak references, so a
+            # dead thread's entry dies with it.
 
     # ---- the socket seams ----
 
@@ -394,7 +402,16 @@ class SocketDiagnosis:
                 origin = "hvsock-monkeypatch-side"
             else:
                 origin = "unknown"
-            saved_init(sock, *args, **kwargs)
+            try:
+                saved_init(sock, *args, **kwargs)
+            except OSError as exc:
+                # `socket.socket(fileno=...)` with an invalid handle raises
+                # the SAME WinError 10038, and the family uses exactly
+                # that seam - so the constructor's failure is observed
+                # here, not swallowed by the wrapper.
+                if getattr(exc, "winerror", None) == _WINERROR_10038:
+                    self._record("__init__", exc, sock)
+                raise
             with self._lock:
                 self._origins[id(sock)] = (weakref.ref(sock), origin)
 
@@ -413,6 +430,11 @@ class SocketDiagnosis:
                 raise
             if operation in ("bind", "listen"):
                 self._note_listener_step(sock, operation)
+            if operation == "dup" and isinstance(result, socket.socket):
+                # `dup` hands the SAME handle to a NEW socket object, so
+                # the duplicate carries the origin it was duplicated from
+                # - the same handoff the accept seam performs.
+                self._inherit_origin(sock, result)
             if operation == "accept" and isinstance(result, tuple):
                 # `accept` returns a (connection, address) PAIR, so the
                 # accepted socket is the pair's first element. The ACCEPTED
