@@ -380,13 +380,20 @@ def pytest_runtest_teardown(item, nextitem):
     rest of the unit suite never sees a patched socket class (issue #167
     AC3, the round-23 plan gate's executed probe).
 
+    The repair runs in a `finally` path: when a finalizer RAISES, the
+    exception is thrown at the yield point, and a repair placed after it
+    would be skipped - exactly on the error path where a leaked wrapper
+    matters most. The original exception is preserved.
+
     The repair is a no-op when nothing leaked, and a no-op while the capture
     is installed (the capture then owns the patches).
     """
-    result = yield
-    from _socket_10038_diagnosis import restore_pristine_socket_methods
+    try:
+        result = yield
+    finally:
+        from _socket_10038_diagnosis import restore_pristine_socket_methods
 
-    restore_pristine_socket_methods()
+        restore_pristine_socket_methods()
     return result
 
 

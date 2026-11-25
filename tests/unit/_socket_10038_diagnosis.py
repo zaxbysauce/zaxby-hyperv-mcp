@@ -322,10 +322,15 @@ def _remove_thread_leg_recorder(saved: dict) -> None:
         return
     # Only a `Thread.start` that STILL holds the recorder's own wrapper is
     # restored: a patch another party installed while the capture was active
-    # is not the capture's to replace.
-    if getattr(threading.Thread, "start", None) is saved.get(
-            "_owned_thread_start"):
-        threading.Thread.start = original_start
+    # is not the capture's to replace. The restored value is the UNWOUND one
+    # - the first value in the displacement chain that the capture does not
+    # own - so a nested displacement (a later activation installed over a
+    # wrapper a late restore put back) leaves no capture wrapper behind.
+    current = getattr(threading.Thread, "start", None)
+    if current is saved.get("_owned_thread_start"):
+        target = _owned_displaced("Thread.start", current)
+        if target is not None:
+            threading.Thread.start = target
 
 def _owning_leg() -> str:
     """The fixture leg (or test) that was running when the failure raised.

@@ -268,3 +268,74 @@ def test_h_a_nested_displacement_is_unwound(monkeypatch):
         "the repair must unwind the nested displacement")
     assert socket.socket.setsockopt is _PRISTINE_SETSOCKOPT, (
         "the repair left an EARLIER capture wrapper installed")
+
+
+def test_i_a_nested_thread_displacement_is_unwound(monkeypatch):
+    """The same unwinding applies to `Thread.start`.
+
+    The capture's thread-leg recorder patches `Thread.start` too, so a
+    nested displacement there would leave a capture wrapper installed for
+    the rest of the session - and a wrapper that still records legs.
+    """
+    from _socket_10038_diagnosis import activate, deactivate
+
+    def spy(self, *args, **kwargs):
+        return _PRISTINE_THREAD_START(self, *args, **kwargs)
+
+    activate()
+    try:
+        # the substitution SAVES the first activation's thread wrapper
+        monkeypatch.setattr(threading.Thread, "start", spy)
+    finally:
+        deactivate()
+    monkeypatch.undo()
+
+    activate()
+    try:
+        assert threading.Thread.start is not _PRISTINE_THREAD_START
+    finally:
+        deactivate()
+    assert threading.Thread.start is _PRISTINE_THREAD_START, (
+        "the capture's removal left an earlier capture wrapper installed on "
+        "Thread.start")
+
+
+def test_j_the_repair_runs_even_when_a_finalizer_raises():
+    """The repair must run on the ERROR path too.
+
+    When a finalizer raises, the exception is thrown at the hook's yield
+    point - so a repair placed after the yield would be skipped, exactly
+    where a leaked wrapper matters most. The hook is driven directly here:
+    it is driven with a raised exception, and the repair must still have
+    run.
+    """
+    import importlib.util
+    import pathlib
+
+    from _socket_10038_diagnosis import activate, deactivate
+
+    activate()
+    try:
+        wrapper = socket.socket.setsockopt
+    finally:
+        deactivate()
+    # the late restore: the capture's wrapper is back
+    socket.socket.setsockopt = wrapper
+    assert socket.socket.setsockopt is not _PRISTINE_SETSOCKOPT
+
+    conftest_path = pathlib.Path(__file__).with_name("conftest.py")
+    spec = importlib.util.spec_from_file_location("i167_scope_conftest",
+                                                  conftest_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    generator = module.pytest_runtest_teardown(None, None)
+    next(generator)
+    try:
+        generator.throw(RuntimeError("the teardown failed"))
+    except RuntimeError:
+        pass
+    repaired = socket.socket.setsockopt is _PRISTINE_SETSOCKOPT
+    socket.socket.setsockopt = _PRISTINE_SETSOCKOPT
+    assert repaired, (
+        "the repair must run even when a finalizer raises: the wrapper the "
+        "failing finalizer restored would otherwise stay installed")
