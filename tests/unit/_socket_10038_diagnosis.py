@@ -30,6 +30,10 @@ Contract:
 * artifacts are uniquely named for the lifetime of the process - across
   concurrent writers AND across capture activations - so neither a cascade
   nor a re-activation can overwrite an earlier artifact;
+* installing while ANOTHER instance is installed is REFUSED: the socket
+  methods and `Thread.start` are process-global, so two overlapping
+  instances could uninstall each other's patches. A re-activation of the
+  SAME instance is fine (it never wraps a wrapper);
 * nothing but the operation name, the leg name, the origin classification
   and non-identifying metadata is recorded - no payload, no credentials,
   no guest content, no absolute guest path.
@@ -337,6 +341,17 @@ class SocketDiagnosis:
         with self._lock:
             if self._saved:
                 return
+            if _INSTALLED_BY is not None and _INSTALLED_BY is not self:
+                # The socket methods and `Thread.start` are PROCESS-GLOBAL,
+                # so two overlapping instances would uninstall each
+                # other's patches. The non-overlap is enforced here
+                # rather than left to the caller (the round-22
+                # implementation reviewer's finding).
+                raise RuntimeError(
+                    "the socket diagnosis capture is already installed by "
+                    "another instance; overlapping instances cannot "
+                    "coordinate the process-global patches"
+                )
             self._saved["__init__"] = _ORIGINAL_SOCKET_INIT
             for name, original in _ORIGINAL_SOCKET_METHODS.items():
                 self._saved[name] = original
@@ -346,9 +361,12 @@ class SocketDiagnosis:
             _install_thread_leg_recorder(self._saved)
 
     def uninstall(self) -> None:
+        global _INSTALLED_BY
         with self._lock:
             if not self._saved:
                 return
+            if _INSTALLED_BY is self:
+                _INSTALLED_BY = None
             socket.socket.__init__ = _ORIGINAL_SOCKET_INIT  # type: ignore[method-assign]
             for name, original in _ORIGINAL_SOCKET_METHODS.items():
                 setattr(socket.socket, name, original)
@@ -561,15 +579,19 @@ def _next_process_sequence() -> int:
         return _PROCESS_SEQ
 
 
+# The instance that currently owns the process-global patches.
+_INSTALLED_BY: "SocketDiagnosis | None" = None
+
 _ACTIVE: SocketDiagnosis | None = None
 
 
 def activate() -> SocketDiagnosis:
     """Install the capture (idempotent) and return the active instance."""
-    global _ACTIVE
+    global _ACTIVE, _INSTALLED_BY
     if _ACTIVE is None:
         _ACTIVE = SocketDiagnosis()
     _ACTIVE.install()
+    _INSTALLED_BY = _ACTIVE
     return _ACTIVE
 
 
