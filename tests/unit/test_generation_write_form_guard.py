@@ -1093,6 +1093,10 @@ def _classify():
             _event_of(node),
         )
         contract = store_contracts.get(_method_of(node))
+        # Every generation feed of this call, classified by the same rules:
+        # the POSITIONAL one (when the store's signature places it) and the
+        # KEYWORD ones.
+        feeds = []
         if _is_store_write(node) and contract is not None and contract[1]:
             # A POSITIONAL generation feed is invisible to the keyword
             # scan. The store's own signature says where the argument
@@ -1103,7 +1107,15 @@ def _classify():
             position = contract[0]
             if position is not None and position < len(node.args):
                 value = node.args[position]
-                if not isinstance(value, ast.Name):
+                if isinstance(value, ast.Name):
+                    # A bare NAME is resolved by name, so it is classified
+                    # by the SAME rules as a keyword feed - a None-capable
+                    # local or parameter passed POSITIONALLY used to escape
+                    # the census entirely, because the classification ran
+                    # only for the keyword feeds (the round-12
+                    # implementation reviewer's finding).
+                    feeds.append(value)
+                else:
                     at = getattr(value, "lineno", node.lineno)
                     direct_sites.append((identity, at, lines[at - 1]))
             for argument in node.args:
@@ -1133,10 +1145,14 @@ def _classify():
                             (identity, node.lineno, lines[node.lineno - 1])
                         )
                     continue
+                # The spread carries a NAMED generation value: it is
+                # classified like any other feed.
+                feeds.append(value)
             elif keyword.arg == "generation":
-                value = keyword.value
+                feeds.append(keyword.value)
             else:
                 continue
+        for value in feeds:
             chain = _chain_of(owner, node)
             identity = (
                 chain[-1].name if chain else "<module>",
