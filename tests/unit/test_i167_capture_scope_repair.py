@@ -46,8 +46,10 @@ def test_a_a_late_restore_puts_the_capture_wrapper_back(monkeypatch):
     finally:
         deactivate()
 
-    assert socket.socket.setsockopt is _PRISTINE_SETSOCKOPT, (
-        "the capture's own removal must restore the pristine method")
+    # The capture's removal leaves the TEST's own patch in place: the
+    # capture restores only what still holds its own wrapper.
+    assert socket.socket.setsockopt is spy, (
+        "the capture's removal replaced a patch it did not make")
     monkeypatch.undo()
     assert socket.socket.setsockopt is not _PRISTINE_SETSOCKOPT, (
         "the late restore must put the capture's wrapper back - that is the "
@@ -129,5 +131,65 @@ def test_d_a_longer_lived_patch_survives_the_capture_lifecycle():
             "the repair must not touch a patch the capture did not make")
         assert socket.socket.setsockopt is sentinel, (
             "the repair replaced a patch the capture did not make")
+    finally:
+        socket.socket.setsockopt = _PRISTINE_SETSOCKOPT
+
+
+def test_e_a_patch_installed_while_the_capture_is_active_survives_it():
+    """A patch that appears DURING the capture's life is not the capture's.
+
+    The capture restores only what still holds its own wrapper, so a patch
+    another party installs while the capture is active survives the
+    capture's removal - the capture did not make it and must not destroy
+    it.
+    """
+    from _socket_10038_diagnosis import activate, deactivate
+
+    def late(self, *args, **kwargs):
+        return _PRISTINE_SETSOCKOPT(self, *args, **kwargs)
+
+    activate()
+    try:
+        socket.socket.setsockopt = late
+    finally:
+        deactivate()
+    try:
+        assert socket.socket.setsockopt is late, (
+            "the capture's removal replaced a patch that was installed while "
+            "it was active")
+    finally:
+        socket.socket.setsockopt = _PRISTINE_SETSOCKOPT
+
+
+def test_f_a_wrapper_around_the_capture_wrapper_is_not_the_capture_s():
+    """Ownership is decided by IDENTITY, not by a copyable marker.
+
+    `functools.wraps` copies a function's attributes, so a wrapper built
+    around the capture's wrapper would carry any marker the capture set on
+    it. Such a wrapper belongs to the other party, and neither the
+    capture's removal nor the repair may replace it.
+    """
+    import functools
+
+    from _socket_10038_diagnosis import activate, deactivate, restore_pristine_socket_methods
+
+    activate()
+    try:
+        capture_wrapper = socket.socket.setsockopt
+
+        @functools.wraps(capture_wrapper)
+        def around(*args, **kwargs):
+            return capture_wrapper(*args, **kwargs)
+
+        socket.socket.setsockopt = around
+    finally:
+        deactivate()
+    try:
+        assert socket.socket.setsockopt is around, (
+            "the capture's removal replaced a wrapper that is not its own")
+        assert restore_pristine_socket_methods() == 0, (
+            "the repair counted a wrapper it does not own")
+        assert socket.socket.setsockopt is around, (
+            "the repair replaced a wrapper it does not own")
     finally:
         socket.socket.setsockopt = _PRISTINE_SETSOCKOPT
