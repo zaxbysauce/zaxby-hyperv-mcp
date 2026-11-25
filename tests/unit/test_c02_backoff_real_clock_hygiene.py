@@ -163,24 +163,29 @@ def test_the_real_clock_path_terminates_and_releases_its_slots(pool_env, monkeyp
     finally:
         for fd in holders:
             pswindows._release_ps_slot(fd)
-    # The SLOT-RELEASE check runs whatever the scheduler did: the fresh
-    # acquisition must succeed once the holders release, which is exactly
-    # the property that a failed waiter leaked a slot lock would break.
-    # It must not sit behind the timing observation's waiver (the round-15
-    # implementation reviewer's finding: the old `pytest.skip` on the
-    # no-ramp path skipped this check too).
-    fresh = pswindows._acquire_ps_slot()
-    assert fresh is not None, (
-        "a fresh acquire must succeed once the holders release (the failed "
-        "waiter leaked a slot lock)"
-    )
-    # The fresh acquisition is a slot too: it is released here, on every
-    # path this test can take.
+    # The SLOT-RELEASE check runs whatever the scheduler did, and it
+    # reacquires the WHOLE configured capacity: with a capacity of two,
+    # ONE leaked slot can coexist with one free slot, so a single fresh
+    # acquisition would succeed while the pool is still partially
+    # leaked (the round-16 implementation reviewer's finding). It must
+    # not sit behind the timing observation's waiver either (the round-15
+    # finding: the old `pytest.skip` on the no-ramp path skipped this
+    # check too).
+    reacquired: list[int] = []
     try:
+        for _ in range(_CAP):
+            reacquired.append(pswindows._acquire_ps_slot())
+        assert all(fd is not None for fd in reacquired), (
+            f"every one of the {_CAP} slots must be reacquirable once the "
+            f"holders release (the failed waiter leaked a slot lock): "
+            f"{reacquired}"
+        )
         if measured:
             assert math.isfinite(measured[0]), "the measured sleep must be finite"
     finally:
-        pswindows._release_ps_slot(fresh)
+        for fd in reacquired:
+            if fd is not None:
+                pswindows._release_ps_slot(fd)
     if not measured:
         # The timing OBSERVATION is unavailable on this host; the hygiene
         # properties above were asserted and passed. The test reports the

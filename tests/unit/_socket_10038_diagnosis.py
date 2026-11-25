@@ -41,6 +41,7 @@ import socket
 import sys
 import threading
 import time
+import weakref
 from pathlib import Path
 
 DIAG_DIR_ENV = "HYPERV_MCP_10038_DIAG_DIR"
@@ -149,7 +150,7 @@ def current_leg() -> str | None:
 # reused after a thread is collected, and a reused id would hand a new
 # thread another thread's leg - an attribution presented as an
 # observation (the round-15 implementation reviewer's finding).
-_THREAD_LEGS: dict[int, tuple[object, str]] = {}
+_THREAD_LEGS: dict[int, tuple["weakref.ref[object]", str]] = {}
 
 
 def _current_stack_leg() -> str | None:
@@ -182,7 +183,7 @@ def _thread_leg() -> str | None:
     if entry is None:
         return None
     owner, leg = entry
-    return leg if owner is thread else None
+    return leg if owner() is thread else None
 
 
 def _install_thread_leg_recorder(saved: dict) -> None:
@@ -197,7 +198,7 @@ def _install_thread_leg_recorder(saved: dict) -> None:
         # registered owner is the fixture or test that started the chain.
         leg = _thread_leg() or _current_stack_leg()
         if leg:
-            _THREAD_LEGS[id(self)] = (self, leg)
+            _THREAD_LEGS[id(self)] = (weakref.ref(self), leg)
         return original_start(self, *args, **kwargs)
 
     saved["Thread.start"] = original_start
@@ -308,8 +309,8 @@ class SocketDiagnosis:
         # a new socket inherit another socket's observed bind/listen steps
         # - an attribution presented as an observation (the round-15
         # implementation reviewer's finding).
-        self._origins: dict[int, tuple[object, str]] = {}
-        self._listener_steps: dict[int, tuple[object, set[str]]] = {}
+        self._origins: dict[int, tuple[weakref.ref[object], str]] = {}
+        self._listener_steps: dict[int, tuple[weakref.ref[object], set[str]]] = {}
         self._saved: dict[str, object] = {}
 
     # ---- lifecycle ----
@@ -348,9 +349,9 @@ class SocketDiagnosis:
             if entry is None:
                 return
             owner, origin = entry
-            if owner is not source or not origin or origin == "unknown":
+            if owner() is not source or not origin or origin == "unknown":
                 return
-            self._origins[id(accepted)] = (accepted, origin)
+            self._origins[id(accepted)] = (weakref.ref(accepted), origin)
 
     def _note_listener_step(self, sock, operation: str) -> None:
         """Record that a socket reached one half of the listener's own
@@ -362,16 +363,16 @@ class SocketDiagnosis:
         """
         with self._lock:
             entry = self._listener_steps.get(id(sock))
-            if entry is None or entry[0] is not sock:
+            if entry is None or entry[0]() is not sock:
                 # A different socket that happens to carry the same id:
                 # its steps start empty, never the previous one's.
                 steps: set[str] = set()
             else:
                 steps = entry[1]
             steps.add(operation)
-            self._listener_steps[id(sock)] = (sock, steps)
+            self._listener_steps[id(sock)] = (weakref.ref(sock), steps)
             if "bind" in steps and "listen" in steps:
-                self._origins[id(sock)] = (sock, "real-listener")
+                self._origins[id(sock)] = (weakref.ref(sock), "real-listener")
 
     def _init_factory(self, saved_init):
         """A plain function (not a bound method): as a class attribute it
@@ -395,7 +396,7 @@ class SocketDiagnosis:
                 origin = "unknown"
             saved_init(sock, *args, **kwargs)
             with self._lock:
-                self._origins[id(sock)] = (sock, origin)
+                self._origins[id(sock)] = (weakref.ref(sock), origin)
 
         _init.__name__ = "__init__"
         return _init
@@ -437,7 +438,7 @@ class SocketDiagnosis:
                 counter = self._counter
                 entry = self._origins.get(id(sock))
                 origin = "unknown"
-                if entry is not None and entry[0] is sock:
+                if entry is not None and entry[0]() is sock:
                     origin = entry[1]
             leg = _owning_leg()
             directory = _diagnosis_dir()
@@ -448,9 +449,7 @@ class SocketDiagnosis:
             # (how many failures THIS activation has recorded). The sequence
             # alone makes the name unique for the process lifetime; the
             # counter is kept for readability only.
-            name = "socket-10038-{}-{}-{}-{}.json".format(
-                leg.replace("/", "_"), os.getpid(), _next_process_sequence(), counter
-            )
+            name = f"socket-10038-{_safe_component(leg)}-{os.getpid()}-{_next_process_sequence()}-{counter}.json"
             artifact = {
                 "winerror": _WINERROR_10038,
                 "error": str(exc),
@@ -480,6 +479,23 @@ class SocketDiagnosis:
 # under its own lock, so concurrent writers get distinct values too.
 _SEQ_LOCK = threading.Lock()
 _PROCESS_SEQ = 0
+
+
+def _safe_component(text: str) -> str:
+    """A WINDOWS-SAFE file name component.
+
+    The leg name is a pytest node name, and a PARAMETERIZED node name can
+    contain characters Windows forbids in a file name (`<`, `>`, `:`, `"`,
+    `|`, `?`, `*`). Only `/` was sanitized before, so the artifact write
+    could fail - and the writer's failure is swallowed, so the diagnosis
+    was LOST exactly when it was needed. Every character outside the
+    safe set becomes `_`; the ORIGINAL leg stays in the artifact's
+    content, so the attribution is not degraded by the file name.
+    """
+    return "".join(
+        character if (character.isalnum() or character in "._-") else "_"
+        for character in text
+    )
 
 
 def _next_process_sequence() -> int:

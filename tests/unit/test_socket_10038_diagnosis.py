@@ -12,8 +12,15 @@ import os
 import socket
 import threading
 
+import _socket_10038_diagnosis
 import pytest
-from _socket_10038_diagnosis import DIAG_DIR_ENV, activate, deactivate
+from _socket_10038_diagnosis import (
+    DIAG_DIR_ENV,
+    _safe_component,
+    activate,
+    deactivate,
+    set_current_leg,
+)
 
 from hyperv_mcp import hvsock
 
@@ -415,3 +422,58 @@ def test_reactivation_does_not_overwrite_an_earlier_artifact(tmp_path, monkeypat
         "test_reactivation_does_not_overwrite_an_earlier_artifact"
     }
     assert all(a["winerror"] == 10038 for a in artifacts)
+
+
+def test_an_unsafe_leg_name_still_produces_an_artifact(capture):
+    """A leg name with Windows-forbidden characters must still be captured.
+
+    The leg is a pytest node name, and a PARAMETERIZED node name can
+    contain `<`, `>`, `:`, `"`, `|`, `?` or `*` - none of which Windows
+    accepts in a file name. The artifact's name is sanitized COMPLETELY
+    (the writer's own failure is swallowed, so an unsanitized name
+    would lose the diagnosis), while the ORIGINAL leg stays in the
+    artifact's content.
+    """
+    unsafe_leg = "test_leg[a:b]"
+    set_current_leg(unsafe_leg)
+    try:
+        outcome: dict = {}
+
+        def _worker():
+            sock = _closed_socket()
+            try:
+                sock.recv(64)
+            except OSError as exc:  # noqa: BLE001 - recorded, asserted below
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+        # Take the PUBLISHED-leg path deliberately: a background thread
+        # with no REGISTERED leg is attributed to the published pytest
+        # node - and a PARAMETERIZED node name ("test_x[a:b]") is exactly
+        # the string that carries Windows-forbidden characters.
+        _socket_10038_diagnosis._THREAD_LEGS.clear()
+        worker.join(timeout=30)
+    finally:
+        set_current_leg(None)
+    artifacts = _artifacts(capture)
+    assert len(artifacts) == 1, f"expected one artifact, got {artifacts}"
+    assert artifacts[0]["owning_leg"] == unsafe_leg, (
+        f"the original leg must survive the file-name sanitization, got "
+        f"{artifacts[0]['owning_leg']!r}"
+    )
+    names = [path.name for path in capture.glob("*.json")]
+    assert names, "the artifact file must exist"
+    for name in names:
+        assert _safe_component(name) == name, (
+            f"the artifact file name must be Windows-safe, got {name!r}"
+        )
+
+
+def test_the_artifact_name_component_replaces_every_forbidden_character():
+    """The sanitizer covers the whole Windows-forbidden set."""
+    assert _safe_component("test_leg[a:b]") == "test_leg_a_b_"
+    for character in '<>:"' + chr(92) + '|?*':
+        assert _safe_component(f"leg{character}x") == "leg_x", (
+            f"{character!r} must be replaced in the file-name component"
+        )

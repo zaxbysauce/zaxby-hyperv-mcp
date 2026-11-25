@@ -358,6 +358,7 @@ def _local_assignments(func):
             return
         env.setdefault(name, []).append(value)
 
+    dynamic_scope = False
     for node in ast.walk(func):
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -370,6 +371,8 @@ def _local_assignments(func):
                 bind_name(dynamic_name, ast.Constant(value=None,
                                                       lineno=node.lineno,
                                                       col_offset=0))
+            if _is_computed_exec(node.value):
+                dynamic_scope = True
         elif isinstance(node, ast.Expr):
             # The same dynamic rebinding as a STATEMENT (`exec("generation
             # = None")`), which is the shape it takes in practice.
@@ -377,6 +380,8 @@ def _local_assignments(func):
                 bind_name(dynamic_name, ast.Constant(value=None,
                                                       lineno=node.lineno,
                                                       col_offset=0))
+            if _is_computed_exec(node.value):
+                dynamic_scope = True
         elif isinstance(node, ast.AnnAssign):
             bind(node.target, node.value)
         elif isinstance(node, ast.NamedExpr):
@@ -440,6 +445,13 @@ def _local_assignments(func):
             # an unknown value (conservatively).
             bind_name(node.name, ast.Constant(value=None, lineno=node.lineno,
                                               col_offset=0))
+    if dynamic_scope:
+        # An EXEC of a COMPUTED source can touch ANY name in this scope,
+        # so every name it binds is UNRESOLVED: the value that reaches a
+        # write cannot be established by a walk, and the guard reports it
+        # (the fail-closed direction).
+        for name in list(env):
+            env[name].append(ast.Constant(value=None, lineno=0, col_offset=0))
     return env
 
 
@@ -530,6 +542,12 @@ def _param_table(func):
         if entry["default"] is not _NO_DEFAULT and _can_be_none(
             entry["default"], [], set()
         ):
+            entry["admits_none"] = True
+    if _has_computed_exec(func):
+        # An EXEC of a COMPUTED source can rebind a PARAMETER too, so no
+        # parameter's value can be established by a walk: every one of
+        # them admits None.
+        for entry in table.values():
             entry["admits_none"] = True
     return table
 
@@ -664,12 +682,11 @@ def _reads_only_its_own_name(values, name) -> bool:
 
 
 def _exec_rebound_names(node) -> list[str]:
-    """The names a dynamic EXEC can rebind, when its source is a literal.
+    """The names a dynamic EXEC of a LITERAL source can rebind.
 
-    `exec("generation = None")` rebinds the name in the EXECUTING scope,
-    so a static walk CAN see it: the literal's source names it. A
-    computed source (`exec(source)`) names nothing a walk can resolve -
-    that is the census's remaining declared boundary.
+    `exec("generation = None")` names the names that source touches, so
+    a static walk CAN see them and collects them like any other binding
+    form.
     """
     if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
         return []
@@ -679,6 +696,39 @@ def _exec_rebound_names(node) -> list[str]:
     if not (isinstance(source, ast.Constant) and isinstance(source.value, str)):
         return []
     return sorted(set(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", source.value)))
+
+
+def _is_computed_exec(node) -> bool:
+    """True for an EXEC whose source is not a literal.
+
+    A computed source names nothing a walk can resolve, and it can touch
+    ANY name in the scope - so the census treats every name in that scope
+    as UNRESOLVED (conservatively, the fail-closed direction) rather
+    than leaving a hole.
+
+    The runtime observation behind this rule is recorded in the mutation
+    transcript: on CPython 3.11 a function's local is NOT rebound by an
+    `exec` (the executed code writes a locals snapshot), so the pure-
+    Python forms of this class are closed by the runtime as well. The
+    census does not rely on that: it reports what it cannot resolve.
+    """
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+        return False
+    if node.func.id != "exec" or not node.args:
+        return False
+    source = node.args[0]
+    return not (isinstance(source, ast.Constant)
+                and isinstance(source.value, str))
+
+
+def _has_computed_exec(func) -> bool:
+    """True when the function contains an EXEC of a computed source."""
+    for node in ast.walk(func):
+        if isinstance(node, ast.Expr) and _is_computed_exec(node.value):
+            return True
+        if isinstance(node, ast.Assign) and _is_computed_exec(node.value):
+            return True
+    return False
 
 
 def _classify():
