@@ -588,7 +588,17 @@ def _classify():
             line = getattr(keyword.value, "lineno", node.lineno)
             if isinstance(keyword.value, ast.BoolOp):
                 local_sites.append((identity, line, lines[line - 1]))
-            elif isinstance(keyword.value, ast.Name):
+            elif not isinstance(keyword.value, ast.Name):
+                # A direct expression form other than a boolean-or
+                # expression or a bare NAME is NOT classified by this guard.
+                # Classifying it conservatively was tried and is WRONG for
+                # this source: the only such forms in the shipped code are
+                # `store.op_next_generation()`, whose contract is a POSITIVE
+                # counter, so classifying them would report two closed
+                # sites as fail-open. The class is a DECLARED boundary
+                # (mutant M33 is recorded as a SURVIVOR), not a silent gap.
+                pass
+            else:
                 name = keyword.value.id
                 if name in shadowed:
                     # A lambda parameter or a comprehension target binds

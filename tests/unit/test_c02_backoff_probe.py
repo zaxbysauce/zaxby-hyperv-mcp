@@ -354,14 +354,19 @@ def _run_backoff_attempt_schedule_probe(pool_env, monkeypatch):
     )
 
     # P4b — snapshot-clean: the failed waiter stranded no slot lock. Release
-    # both holders; a fresh acquire must succeed immediately.
+    # both holders; a fresh acquire must succeed immediately. The fresh
+    # acquisition is a slot too, so it is released on every path.
     for fd in holders:
         pswindows._release_ps_slot(fd)
     fresh = pswindows._acquire_ps_slot()
-    assert fresh is not None, (
-        "a fresh acquire must succeed once the holders release (the failed "
-        "waiter leaked a slot lock)"
-    )
+    try:
+        assert fresh is not None, (
+            "a fresh acquire must succeed once the holders release (the failed "
+            "waiter leaked a slot lock)"
+        )
+    finally:
+        if fresh is not None:
+            pswindows._release_ps_slot(fresh)
 
 
 def test_sub_ms_deadline_remaining_hits_the_1ms_floor(pool_env, monkeypatch):

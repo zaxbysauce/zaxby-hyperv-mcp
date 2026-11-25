@@ -177,12 +177,12 @@ def _install_thread_leg_recorder(saved: dict) -> None:
     original_start = threading.Thread.start
 
     def start_with_leg(self, *args, **kwargs):
-        leg = _current_stack_leg()
-        if not leg:
-            # A thread started by ANOTHER thread inherits the parent
-            # thread's registered leg - the parent worker's own function
-            # name is no more identifying than "worker".
-            leg = _thread_leg()
+        # The REGISTERED owner of the current thread takes PRECEDENCE over
+        # an incidental frame on the current stack: a worker defined in a
+        # test file supplies its own test-module frame, and that worker's
+        # function name is no more identifying than "worker" - the
+        # registered owner is the fixture or test that started the chain.
+        leg = _thread_leg() or _current_stack_leg()
         if leg:
             _THREAD_LEGS[id(self)] = leg
         return original_start(self, *args, **kwargs)
@@ -291,6 +291,7 @@ class SocketDiagnosis:
         self._lock = threading.Lock()
         self._counter = 0
         self._origins: dict[int, str] = {}
+        self._listener_steps: dict[int, set[str]] = {}
         self._saved: dict[str, object] = {}
 
     # ---- lifecycle ----
@@ -305,8 +306,6 @@ class SocketDiagnosis:
             socket.socket.__init__ = self._init_factory(_ORIGINAL_SOCKET_INIT)  # type: ignore[method-assign]
             for name in _CAPTURED_OPERATIONS:
                 setattr(socket.socket, name, self._wrap(name))
-            for name in _LISTENER_OPERATIONS:
-                setattr(socket.socket, name, self._wrap_listener_op(name))
             _install_thread_leg_recorder(self._saved)
 
     def uninstall(self) -> None:
@@ -319,15 +318,23 @@ class SocketDiagnosis:
             _remove_thread_leg_recorder(self._saved)
             self._saved.clear()
             self._origins.clear()
+            self._listener_steps.clear()
             _THREAD_LEGS.clear()
 
     # ---- the socket seams ----
 
-    def _note_listener(self, sock) -> None:
-        """Promote a socket to listener provenance once it is bound AND
-        listened on - the listener's own creation path, observed."""
+    def _note_listener_step(self, sock, operation: str) -> None:
+        """Record that a socket reached one half of the listener's own
+        creation path.
+
+        The promotion to "real-listener" needs BOTH a successful bind and
+        a successful listen: one half alone does not establish that the
+        socket is the listener's.
+        """
         with self._lock:
-            if self._origins.get(id(sock)) == "unknown":
+            steps = self._listener_steps.setdefault(id(sock), set())
+            steps.add(operation)
+            if "bind" in steps and "listen" in steps:
                 self._origins[id(sock)] = "real-listener"
 
     def _init_factory(self, saved_init):
@@ -357,30 +364,19 @@ class SocketDiagnosis:
         _init.__name__ = "__init__"
         return _init
 
-    def _wrap_listener_op(self, operation: str):
-        """Wrap `bind`/`listen` so a socket that reaches the listener's own
-        creation path is PROVEN to be the listener's, not assumed to be."""
-
-        original = _ORIGINAL_SOCKET_METHODS[operation]
-
-        def wrapper(sock, *args, **kwargs):
-            result = original(sock, *args, **kwargs)
-            self._note_listener(sock)
-            return result
-
-        wrapper.__name__ = operation
-        return wrapper
-
     def _wrap(self, operation: str):
-        original = self._saved[operation]
+        original = _ORIGINAL_SOCKET_METHODS[operation]
 
         def _operation(sock, *args, **kwargs):
             try:
-                return original(sock, *args, **kwargs)
+                result = original(sock, *args, **kwargs)
             except OSError as exc:
                 if getattr(exc, "winerror", None) == _WINERROR_10038:
                     self._record(operation, exc, sock)
                 raise
+            if operation in ("bind", "listen"):
+                self._note_listener_step(sock, operation)
+            return result
 
         _operation.__name__ = operation
         return _operation
