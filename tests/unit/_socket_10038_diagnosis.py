@@ -89,6 +89,24 @@ _ORIGINAL_SOCKET_METHODS = {
 # that a previous activation (or a late restore) left behind.
 _ORIGINAL_THREAD_START = threading.Thread.start
 
+# The marker that identifies a wrapper as THIS capture's. The repair below
+# restores the pristine method ONLY for a wrapper the capture owns: a patch
+# that belongs to a fixture that outlives a single test is not the
+# capture's, and the repair must not stomp it (the round-5 implementation
+# reviewer's finding).
+_CAPTURE_WRAPPER_MARKER = "__hyperv_10038_capture_wrapper__"
+
+
+def _mark_capture_wrapper(wrapper):
+    """Mark a wrapper as belonging to this capture."""
+    setattr(wrapper, _CAPTURE_WRAPPER_MARKER, True)
+    return wrapper
+
+
+def _is_capture_wrapper(value) -> bool:
+    """Whether the value is a wrapper this capture installed."""
+    return getattr(value, _CAPTURE_WRAPPER_MARKER, False) is True
+
 def _diagnosis_dir() -> Path:
     """Where artifacts are written: the configured directory, else a temp one."""
     configured = os.environ.get(DIAG_DIR_ENV)
@@ -258,6 +276,7 @@ def _install_thread_leg_recorder(saved: dict) -> None:
         return original_start(self, *args, **kwargs)
 
     saved["Thread.start"] = original_start
+    _mark_capture_wrapper(start_with_leg)
     threading.Thread.start = start_with_leg
 
 
@@ -511,6 +530,7 @@ class SocketDiagnosis:
                 raise
 
         _init.__name__ = "__init__"
+        _mark_capture_wrapper(_init)
         return _init
 
     def _wrap(self, operation: str):
@@ -543,6 +563,7 @@ class SocketDiagnosis:
             return result
 
         _operation.__name__ = operation
+        _mark_capture_wrapper(_operation)
         return _operation
 
     # ---- the artifact ----
@@ -677,21 +698,24 @@ def restore_pristine_socket_methods() -> int:
     probe).
 
     The repair is a NO-OP while the capture is installed: then the capture
-    owns the patches and its own removal restores them. The number of
-    restored attributes is returned, so a caller can assert that the repair
-    ran and how much it repaired.
+    owns the patches and its own removal restores them. It restores ONLY a
+    wrapper this capture installed (each one carries the capture's marker):
+    a patch that belongs to a fixture outliving one test is not the
+    capture's and must survive. The number of restored attributes is
+    returned, so a caller can assert that the repair ran and how much it
+    repaired.
     """
     if _INSTALLED_BY is not None:
         return 0
     restored = 0
-    if getattr(socket.socket, "__init__", None) is not _ORIGINAL_SOCKET_INIT:
+    if _is_capture_wrapper(getattr(socket.socket, "__init__", None)):
         socket.socket.__init__ = _ORIGINAL_SOCKET_INIT  # type: ignore[method-assign]
         restored += 1
     for name, original in _ORIGINAL_SOCKET_METHODS.items():
-        if getattr(socket.socket, name, None) is not original:
+        if _is_capture_wrapper(getattr(socket.socket, name, None)):
             setattr(socket.socket, name, original)
             restored += 1
-    if getattr(threading.Thread, "start", None) is not _ORIGINAL_THREAD_START:
+    if _is_capture_wrapper(getattr(threading.Thread, "start", None)):
         threading.Thread.start = _ORIGINAL_THREAD_START
         restored += 1
     return restored

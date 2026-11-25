@@ -62,3 +62,27 @@ def test_b_the_socket_class_is_pristine_after_the_late_restore():
     assert threading.Thread.start is _PRISTINE_THREAD_START, (
         "the capture's thread-leg recorder survived the test that installed "
         "it")
+
+
+def test_c_a_patch_that_is_not_the_capture_survives_the_repair():
+    """The repair restores the CAPTURE's wrappers, not other patches.
+
+    A fixture that outlives a single test may legitimately patch a socket
+    method or `Thread.start`; the repair runs after EVERY test's teardown,
+    so a repair that restored every non-pristine attribute would stomp
+    that patch before the next test could use it. The repair therefore
+    restores only the wrappers this capture installed.
+    """
+    from _socket_10038_diagnosis import restore_pristine_socket_methods
+
+    def sentinel(self, *args, **kwargs):
+        return _PRISTINE_SETSOCKOPT(self, *args, **kwargs)
+
+    socket.socket.setsockopt = sentinel
+    try:
+        assert restore_pristine_socket_methods() == 0, (
+            "the repair must not touch a patch that is not the capture's")
+        assert socket.socket.setsockopt is sentinel, (
+            "the repair replaced a patch that is not the capture's")
+    finally:
+        socket.socket.setsockopt = _PRISTINE_SETSOCKOPT
