@@ -25,7 +25,7 @@ reported below (issue #143).
 | 148-151-153-followup-hygiene-triad | 26 | 23 | 3 | exit 1 |
 | 157-158-durable-identity-repair-outcomes | 36 | 36 | 0 | clean |
 | 163-156-followup-pair | 11 | 11 | 0 | clean |
-| 167-pr166-followup-hygiene | 11 | 11 | 0 | clean |
+| 167-pr166-followup-hygiene | 17 | 17 | 0 | clean |
 | 17-rgb565-native-decode | 12 | 12 | 0 | clean |
 | 18-console-one-ps-process-per-call | 17 | 17 | 0 | clean |
 | 19-screenshot-output-options | 23 | 23 | 0 | clean |
