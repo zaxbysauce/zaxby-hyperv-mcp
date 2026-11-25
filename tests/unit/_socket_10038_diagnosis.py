@@ -338,8 +338,11 @@ class SocketDiagnosis:
                 setattr(socket.socket, name, original)
             _remove_thread_leg_recorder(self._saved)
             self._saved.clear()
-            self._origins.clear()
-            self._listener_steps.clear()
+            # The ORIGIN registry is NOT cleared: a socket whose identity
+            # has not changed keeps the provenance it was observed with
+            # across an activation boundary (the plan gate's probe). The
+            # entries are WEAK references, so a collected socket's entry
+            # dies with it and a recycled id can never inherit it.
             # The THREAD registry is NOT cleared: a thread started under
             # one activation and released after another keeps the
             # STARTER's leg, which is the truth. Clearing it would make
@@ -402,6 +405,11 @@ class SocketDiagnosis:
                 origin = "hvsock-monkeypatch-side"
             else:
                 origin = "unknown"
+            # The origin is recorded BEFORE the constructor runs: a
+            # constructor that FAILS is recorded against the origin its
+            # creation stack already showed, not against "unknown".
+            with self._lock:
+                self._origins[id(sock)] = (weakref.ref(sock), origin)
             try:
                 saved_init(sock, *args, **kwargs)
             except OSError as exc:
@@ -412,8 +420,6 @@ class SocketDiagnosis:
                 if getattr(exc, "winerror", None) == _WINERROR_10038:
                     self._record("__init__", exc, sock)
                 raise
-            with self._lock:
-                self._origins[id(sock)] = (weakref.ref(sock), origin)
 
         _init.__name__ = "__init__"
         return _init

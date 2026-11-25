@@ -109,7 +109,9 @@ is not on the reviewed closed list is reported, not assumed closed.
 """
 
 import ast
+import pathlib
 import re
+import tokenize
 from pathlib import Path
 
 _OPERATIONS = (
@@ -703,6 +705,19 @@ def _direct_form_is_closed(node, shadowed=frozenset()) -> bool:
 
 
 
+
+def _is_store_write(node) -> bool:
+    """True when the call writes through the store.
+
+    The store's write methods take the generation as their last
+    argument, and it may be POSITIONAL - so the keyword-only scan would
+    miss a positional fail-open feed.
+    """
+    func = node.func
+    return isinstance(func, ast.Attribute) and func.attr.startswith("op_")
+
+
+
 def _spread_generation_value(node):
     """The generation value carried by a `**` SPREAD, if any.
 
@@ -714,18 +729,42 @@ def _spread_generation_value(node):
     """
     if not isinstance(node, ast.Dict):
         return None
+    found = None
     for key, value in zip(node.keys, node.values):
         if isinstance(key, ast.Constant) and key.value == "generation":
-            return value
-    return None
+            # The LAST duplicate wins in a dict literal, so the last
+            # matching value is the one that reaches the write.
+            found = value
+    return found
+
+
+def _comment_tokens(path: pathlib.Path) -> dict[int, str]:
+    """The real COMMENT tokens of a source file, keyed by line number.
+
+    The disclosure tag must be in a COMMENT. A line scan cannot tell a
+    comment from a `#` inside a string - and a MULTI-LINE string's
+    content lines look like comments to a line scan. `tokenize` reports
+    the real comments.
+    """
+    comments: dict[int, str] = {}
+    try:
+        with path.open("rb") as handle:
+            for token in tokenize.tokenize(handle.readline):
+                if token.type == tokenize.COMMENT:
+                    comments[token.start[0]] = token.string
+    except (tokenize.TokenError, IndentationError, SyntaxError, OSError):
+        return {}
+    return comments
 
 
 def _comment_text(line: str) -> str:
-    """The COMMENT part of a source line.
+    """The COMMENT part of a source line (fallback scan).
 
     The disclosure tag must be a COMMENT: a string literal that happens
     to contain the tag text satisfied the same-line scan, so a site could
-    lose its disclosure comment and keep the text.
+    lose its disclosure comment and keep the text. The authoritative
+    source is `_comment_tokens`; this fallback is used when the file
+    cannot be tokenized.
     """
     quote = None
     index = 0
@@ -744,6 +783,10 @@ def _comment_text(line: str) -> str:
         index += 1
     return ""
 
+
+# The real COMMENT tokens of the analysed source, by line. The
+# disclosure tag must be in one of them.
+_COMMENTS = _comment_tokens(_OPERATIONS)
 
 def _reads_only_its_own_name(values, name) -> bool:
     """True when EVERY assignment of the name only READS the name.
@@ -840,6 +883,9 @@ def _statement_bindings(node) -> set[str]:
         for case in node.cases:
             for name in _pattern_names(case.pattern):
                 names.add(name)
+    elif isinstance(node, ast.NamedExpr):
+        # A WALRUS binds a name in the enclosing scope.
+        names |= set(_bound_names(node.target))
     elif isinstance(node, ast.Import):
         for alias in node.names:
             names.add(alias.asname or alias.name.split(".", 1)[0])
@@ -908,6 +954,7 @@ def _classify():
     text = _OPERATIONS.read_text(encoding="utf-8")
     tree = ast.parse(text)
     lines = text.split("\n")
+
     owner = _owners(tree)
     functions = [
         node
@@ -969,6 +1016,28 @@ def _classify():
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
+        if _is_store_write(node):
+            # A POSITIONAL generation feed is invisible to the keyword
+            # scan: a store write's third positional argument can carry
+            # the fail-open form (`store.op_heartbeat(op_id, now,
+            # generation or None)`). Every positional argument of a store
+            # write is therefore checked for the fail-open form too.
+            for argument in node.args:
+                if (
+                    isinstance(argument, ast.BoolOp)
+                    and isinstance(argument.op, ast.Or)
+                    and _can_be_none(argument, scope_of(node), set())
+                ):
+                    chain = _chain_of(owner, node)
+                    identity = (
+                        chain[-1].name if chain else "<module>",
+                        _method_of(node),
+                        None,
+                    )
+                    position = getattr(argument, "lineno", node.lineno)
+                    local_sites.append(
+                        (identity, position, lines[position - 1])
+                    )
         for keyword in node.keywords:
             if keyword.arg is None:
                 # A `**` SPREAD can carry the generation keyword:
@@ -992,13 +1061,18 @@ def _classify():
                 _event_of(node),
             )
             line = getattr(value, "lineno", node.lineno)
-            if isinstance(value, ast.BoolOp):
-                # The fail-open FORM is a boolean-or that can yield None.
+            if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.Or):
+                # The fail-open FORM is a boolean-OR that can yield None.
                 # A different boolean expression (`generation or 0`) is
                 # fail-CLOSED, and counting it as a fail-open site would
                 # let a disclosed site be rewritten into a closed one
                 # while the pin still passed (the plan gate's executed
-                # probe).
+                # probe). An `and` form is not the disclosed form
+                # either: it keeps the None-capability and the comment,
+                # so accepting it would let the pinned FORM change
+                # unnoticed (the round-19 reviewer's finding) - it falls
+                # through to the direct-expression class below and is
+                # reported there.
                 if _can_be_none(value, scope_of(node), set()):
                     local_sites.append((identity, line, lines[line - 1]))
             elif not isinstance(value, ast.Name):
@@ -1133,7 +1207,7 @@ def test_every_fail_open_site_carries_the_disclosure_tag():
     untagged = [
         line
         for _identity, line, text in local_sites
-        if _LOCAL_TAG not in _comment_text(text)
+        if _LOCAL_TAG not in _COMMENTS.get(line, "")
     ]
     assert not untagged, (
         f"AC1: fail-open write sites missing the '{_LOCAL_TAG}' tag at lines {untagged}"
@@ -1162,7 +1236,7 @@ def test_the_aliased_capture_carries_its_disclosure_tag():
         line
         for _identity, alias_lines, texts in aliased_sites
         for line, text in zip(alias_lines, texts, strict=True)
-        if _ALIAS_TAG not in _comment_text(text)
+        if _ALIAS_TAG not in _COMMENTS.get(line, "")
     ]
     assert not untagged, (
         f"AC1: aliased fail-open capture missing the '{_ALIAS_TAG}' tag at lines {untagged}"
@@ -1278,8 +1352,8 @@ def test_reachable_parameter_sites_carry_the_parameter_tag():
         # the admits tag CONTAINS the strong tag as a prefix, so a line
         # carrying only the weaker tag must be rejected explicitly
         if reachable and (
-            _PARAM_TAG not in _comment_text(text)
-            or _PARAM_ADMITS_TAG in _comment_text(text)
+            _PARAM_TAG not in _COMMENTS.get(line, "")
+            or _PARAM_ADMITS_TAG in _COMMENTS.get(line, "")
         )
     ]
     assert not untagged, (
@@ -1293,7 +1367,7 @@ def test_admitting_but_unreachable_parameter_sites_carry_the_admits_tag():
     _local, _aliased, parameter_sites, _direct = _classify()
     untagged = [
         line for _identity, line, text, admits, reachable in parameter_sites
-        if not reachable and _PARAM_ADMITS_TAG not in _comment_text(text)
+        if not reachable and _PARAM_ADMITS_TAG not in _COMMENTS.get(line, "")
     ]
     assert not untagged, (
         f"AC1: admitting-but-unreachable parameter pass-through sites missing the "
