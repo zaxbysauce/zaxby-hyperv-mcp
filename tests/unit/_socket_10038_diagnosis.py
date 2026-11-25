@@ -290,7 +290,7 @@ def _thread_leg() -> str | None:
     return leg if owner() is thread else None
 
 
-def _install_thread_leg_recorder(saved: dict) -> None:
+def _install_thread_leg_recorder(saved: dict, owner) -> None:
     """Record the starting leg of every thread started while installed."""
     # What is in place RIGHT NOW is what the recorder delegates to and what
     # its removal restores: a patch a longer-lived fixture owns must survive
@@ -306,7 +306,7 @@ def _install_thread_leg_recorder(saved: dict) -> None:
         # function name is no more identifying than "worker" - the
         # registered owner is the fixture or test that started the chain.
         leg = _thread_leg() or _current_stack_leg()
-        if leg:
+        if leg and owner._active:
             _THREAD_LEGS[id(self)] = (weakref.ref(self), leg)
         return original_start(self, *args, **kwargs)
 
@@ -453,6 +453,12 @@ class SocketDiagnosis:
         # The wrappers THIS activation installed, so its removal can tell
         # its own wrapper from another party's patch.
         self._wrappers: dict[str, object] = {}
+        # Whether this activation is still live. A wrapper that a FOREIGN
+        # patch kept a reference to stays callable after the activation
+        # ends, and it must then be INERT: it delegates without recording a
+        # diagnosis or the listener provenance (the round-9 implementation
+        # reviewer's finding).
+        self._active = False
 
     # ---- lifecycle ----
 
@@ -477,6 +483,7 @@ class SocketDiagnosis:
             # direct installation invisible to the guard above (the
             # round-22 implementation reviewer's finding).
             _INSTALLED_BY = self
+            self._active = True
             # What the capture DISPLACES is what is in place RIGHT NOW, not
             # the import-time value: a fixture that outlives a single test
             # may own a patch of its own, and the capture must neither
@@ -497,7 +504,7 @@ class SocketDiagnosis:
                 setattr(socket.socket, name, wrapper)
                 self._wrappers[name] = wrapper
                 _register_owned_wrapper(name, wrapper, self._saved[name])
-            _install_thread_leg_recorder(self._saved)
+            _install_thread_leg_recorder(self._saved, self)
 
     def uninstall(self) -> None:
         global _INSTALLED_BY
@@ -506,6 +513,10 @@ class SocketDiagnosis:
                 return
             if _INSTALLED_BY is self:
                 _INSTALLED_BY = None
+            # The wrappers this activation installed stay callable (a
+            # foreign patch may hold a reference to one), so they must
+            # become INERT here rather than keep recording.
+            self._active = False
             # Only an attribute that STILL holds the capture's own wrapper is
             # restored: a patch that another party installed WHILE the
             # capture was active is not the capture's to replace, and it must
@@ -576,6 +587,10 @@ class SocketDiagnosis:
         receives the SOCKET as its first argument."""
 
         def _init(sock, *args, **kwargs) -> None:
+            if not self._active:
+                # The activation is over: construct without recording.
+                saved_init(sock, *args, **kwargs)
+                return
             # The provenance is recorded as what was OBSERVED, not as a
             # guess about the family's intent:
             #   * created while the INSTALLED connector was on the stack ->
@@ -619,6 +634,10 @@ class SocketDiagnosis:
                                    _ORIGINAL_SOCKET_METHODS[operation])
 
         def _operation(sock, *args, **kwargs):
+            if not self._active:
+                # The activation is over: delegate without recording. A
+                # foreign patch may still hold a reference to this wrapper.
+                return original(sock, *args, **kwargs)
             try:
                 result = original(sock, *args, **kwargs)
             except OSError as exc:

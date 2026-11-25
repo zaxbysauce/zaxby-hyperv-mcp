@@ -339,3 +339,50 @@ def test_j_the_repair_runs_even_when_a_finalizer_raises():
     assert repaired, (
         "the repair must run even when a finalizer raises: the wrapper the "
         "failing finalizer restored would otherwise stay installed")
+
+
+def test_k_a_retained_foreign_wrapper_cannot_record_after_deactivation(tmp_path,
+                                                                      monkeypatch):
+    """A wrapper a foreign patch kept must be INERT after the activation.
+
+    Preserving the foreign patch also preserves its reference to the
+    capture's wrapper, and that reference stayed operational: a later call
+    through it still recorded a diagnosis artifact (the round-9
+    implementation reviewer's finding). The capture's wrappers now delegate
+    WITHOUT recording once their activation is over.
+    """
+    import functools
+
+    import pytest
+    from _socket_10038_diagnosis import activate, deactivate
+
+    monkeypatch.setenv("HYPERV_MCP_10038_DIAG_DIR", str(tmp_path))
+    activate()
+    try:
+        capture_wrapper = socket.socket.setsockopt
+
+        @functools.wraps(capture_wrapper)
+        def around(*args, **kwargs):
+            return capture_wrapper(*args, **kwargs)
+
+        socket.socket.setsockopt = around
+    finally:
+        deactivate()
+    try:
+        sock = socket.socket()
+        try:
+            sock.close()
+            with pytest.raises(OSError) as excinfo:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            assert getattr(excinfo.value, "winerror", None) == 10038, (
+                "the probe must raise the WinError 10038 the capture observes")
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        assert not list(tmp_path.iterdir()), (
+            "the retained capture wrapper still recorded a diagnosis after "
+            f"its activation ended: {list(tmp_path.iterdir())}")
+    finally:
+        socket.socket.setsockopt = _PRISTINE_SETSOCKOPT
