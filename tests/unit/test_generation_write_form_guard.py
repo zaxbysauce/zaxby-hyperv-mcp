@@ -391,7 +391,11 @@ def _local_assignments(func):
         env.setdefault(name, []).append(value)
 
     dynamic_scope = False
-    for node in ast.walk(func):
+    # The function's OWN scope: a nested function's body has a scope of its
+    # own, and its assignments do NOT bind in the enclosing function. (The
+    # `global`/`nonlocal` declarations are handled separately above, because
+    # they apply to the WHOLE enclosing scope wherever they sit in it.)
+    for node in _own_scope_nodes(func):
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 bind(target, node.value)
@@ -799,6 +803,7 @@ def _spread_generation_value(node):
     if not isinstance(node, ast.Dict):
         return None
     found = None
+    unresolved = False
     for key, value in zip(node.keys, node.values, strict=True):
         if key is None:
             # An UNPACKING overrides every earlier key of the same name, so
@@ -808,13 +813,27 @@ def _spread_generation_value(node):
             # `**{"generation": int(generation or 0), **later}` with
             # `later = {"generation": None}` reached the write with None
             # while the literal was certified closed).
-            if found is not None:
-                return None
+            unresolved = True
             continue
         if isinstance(key, ast.Constant) and key.value == "generation":
             # The LAST duplicate wins in a dict literal, so the last
-            # matching value is the one that reaches the write.
+            # matching value is the one that reaches the write - and an
+            # explicit literal SUPERSEDES an earlier unpacking or computed
+            # key (the entries are processed in order).
             found = value
+            unresolved = False
+            continue
+        if not isinstance(key, ast.Constant):
+            # A COMPUTED key can BE "generation" at runtime, and a later
+            # entry of the same name overrides the earlier one - so the
+            # effective feed is UNRESOLVED and fails closed (the
+            # implementation reviewer's executed probe:
+            # `**{"generation": generation or 0, key: None}` with
+            # `key == "generation"` reached the write with None while the
+            # literal was certified closed).
+            unresolved = True
+    if unresolved:
+        return None
     return found
 
 
