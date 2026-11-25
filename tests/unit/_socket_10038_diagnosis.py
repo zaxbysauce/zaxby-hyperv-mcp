@@ -93,13 +93,48 @@ def _diagnosis_dir() -> Path:
     return Path(tempfile.gettempdir()) / "hyperv-mcp-socket-10038"
 
 
+def _original_hvsock_connect():
+    """The connector the repository ships, captured at IMPORT time.
+
+    It is the reference for the origin label: a socket created while the
+    INSTALLED connector is on the creation stack is the monkeypatch side
+    only when the installed connector is NOT the original one - the
+    original connector is the production path, and labelling it as a
+    monkeypatch would present an OBSERVED substitution as something it
+    is not (the round-22 plan gate's finding).
+
+    The capture happens at IMPORT, before any test can monkeypatch the
+    connector: a lazy capture would read the FAKE as the original.
+    """
+    global _ORIGINAL_CONNECT
+    if _ORIGINAL_CONNECT is not _UNSET:
+        return _ORIGINAL_CONNECT
+    try:
+        from hyperv_mcp import hvsock
+    except Exception:  # noqa: BLE001 - the module may not import in isolation
+        _ORIGINAL_CONNECT = None
+        return None
+    _ORIGINAL_CONNECT = getattr(hvsock, "connect", None)
+    return _ORIGINAL_CONNECT
+
+
 def _installed_hvsock_connect():
-    """The function currently installed at `hvsock.connect`, if any."""
+    """The function currently installed at `hvsock.connect`, if any.
+
+    It is the MONKEYPATCH side only when it differs from the original
+    connector the repository ships.
+    """
     try:
         from hyperv_mcp import hvsock
     except Exception:  # noqa: BLE001 - the module may not import in isolation
         return None
-    return getattr(hvsock, "connect", None)
+    installed = getattr(hvsock, "connect", None)
+    if installed is None:
+        return None
+    if installed is _original_hvsock_connect():
+        # The ORIGINAL connector: the production path, not a substitution.
+        return None
+    return installed
 
 
 def _on_creation_stack(target) -> bool:
@@ -146,6 +181,12 @@ def current_leg() -> str | None:
     with _CURRENT_LEG_LOCK:
         return _CURRENT_LEG
 
+
+# The original connector, captured at IMPORT time (see
+# `_original_hvsock_connect`): a lazy capture would read a test's FAKE as
+# the original.
+_UNSET = object()
+_ORIGINAL_CONNECT: object = _UNSET
 
 # The leg of the FIXTURE (or test) that was executing when a thread was
 # started, keyed by the thread object. A thread's own stack cannot show it:
@@ -338,6 +379,7 @@ class SocketDiagnosis:
     # ---- lifecycle ----
 
     def install(self) -> None:
+        global _INSTALLED_BY
         with self._lock:
             if self._saved:
                 return
@@ -352,6 +394,11 @@ class SocketDiagnosis:
                     "another instance; overlapping instances cannot "
                     "coordinate the process-global patches"
                 )
+            # The ownership is claimed HERE, so a DIRECT installation
+            # takes it too - claiming it only in `activate()` left a
+            # direct installation invisible to the guard above (the
+            # round-22 implementation reviewer's finding).
+            _INSTALLED_BY = self
             self._saved["__init__"] = _ORIGINAL_SOCKET_INIT
             for name, original in _ORIGINAL_SOCKET_METHODS.items():
                 self._saved[name] = original
@@ -578,6 +625,9 @@ def _next_process_sequence() -> int:
         _PROCESS_SEQ += 1
         return _PROCESS_SEQ
 
+
+# Capture the shipped connector NOW, before a test can substitute it.
+_original_hvsock_connect()
 
 # The instance that currently owns the process-global patches.
 _INSTALLED_BY: "SocketDiagnosis | None" = None

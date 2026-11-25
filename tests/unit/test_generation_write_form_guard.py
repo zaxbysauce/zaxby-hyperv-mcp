@@ -117,6 +117,13 @@ from pathlib import Path
 _OPERATIONS = (
     Path(__file__).resolve().parents[2] / "src" / "hyperv_mcp" / "operations.py"
 )
+# The store's own module: its signatures say where the `generation`
+# argument of each write method sits and whether it admits None, which is
+# the only way a POSITIONAL feed can be resolved.
+_STORE = (
+    Path(__file__).resolve().parents[2] / "src" / "hyperv_mcp" / "statestore.py"
+)
+
 _LOCAL_TAG = "generation-write-form: fail-open-disclosed"
 _ALIAS_TAG = "generation-write-form: fail-open-aliased"
 _PARAM_TAG = "generation-write-form: fail-open-parameter"
@@ -169,6 +176,14 @@ def _can_be_none(node, scopes, seen):
             # closed expression as None-capable, which let a disclosed
             # fail-open site be rewritten closed while the pin still
             # passed (the round-21 plan gate's executed probe).
+            #
+            # The chain must also be able to REACH that operand: a
+            # truthy CONSTANT earlier operand ends the chain for good
+            # (`1 or None` is 1, never None) - the round-22 plan gate's
+            # executed probe.
+            for earlier in node.values[:-1]:
+                if isinstance(earlier, ast.Constant) and earlier.value:
+                    return False
             return _can_be_none(node.values[-1], scopes, seen)
         # In an `and` chain a truthy operand ends the chain, so ANY
         # operand that can be None can reach the result.
@@ -716,6 +731,50 @@ def _direct_form_is_closed(node, shadowed=frozenset()) -> bool:
 
 
 
+
+def _store_generation_contracts() -> dict[str, tuple[int | None, bool]]:
+    """The store's `generation` contract, per write method.
+
+    The value is (the positional index, whether the parameter admits
+    None). The index is None for a method whose `generation` is
+    KEYWORD-ONLY - it cannot be fed positionally at all.
+
+    A method whose parameter does NOT admit None certifies a CLOSED
+    feed: `op_mark_send(self, op_id: str, generation: int)` REQUIRES an
+    int, so a None feed raises a TypeError at the call and no write
+    happens. The methods whose parameter admits None (`op_transition`,
+    `op_heartbeat`, `op_release_idem` - all `generation: int | None =
+    None`) treat None as "no generation predicate", which IS a fail-open
+    feed.
+    """
+    contracts: dict[str, tuple[int | None, bool]] = {}
+    try:
+        tree = ast.parse(_STORE.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError):
+        return contracts
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        args = node.args
+        positional = list(getattr(args, "posonlyargs", [])) + list(args.args)
+        for index, arg in enumerate(positional):
+            if arg.arg == "generation":
+                # `self` is not an argument of the call.
+                contracts[node.name] = (
+                    index - 1,
+                    _annotation_admits_none(arg.annotation),
+                )
+                break
+        else:
+            for arg in args.kwonlyargs:
+                if arg.arg == "generation":
+                    contracts[node.name] = (
+                        None,
+                        _annotation_admits_none(arg.annotation),
+                    )
+                    break
+    return contracts
+
 def _is_store_write(node) -> bool:
     """True when the call writes through the store.
 
@@ -1000,6 +1059,7 @@ def _classify():
         for func in functions
     }
     shadowed = _scope_shadowed_names(tree)
+    store_contracts = _store_generation_contracts()
 
     shadowed_by_func = {
         func: module_shadowed | _function_shadowed_coercions(
@@ -1026,27 +1086,32 @@ def _classify():
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        if _is_store_write(node):
+        chain = _chain_of(owner, node)
+        identity = (
+            chain[-1].name if chain else "<module>",
+            _method_of(node),
+            _event_of(node),
+        )
+        contract = store_contracts.get(_method_of(node))
+        if _is_store_write(node) and contract is not None and contract[1]:
             # A POSITIONAL generation feed is invisible to the keyword
-            # scan: a store write's third positional argument can carry
-            # the fail-open form (`store.op_heartbeat(op_id, now,
-            # generation or None)`). Every positional argument of a store
-            # write is therefore checked for the fail-open form too.
+            # scan. The store's own signature says where the argument
+            # sits and whether the parameter admits None at all; when it
+            # does, the positional feed is classified. A value that is
+            # not a plain NAME cannot be resolved by name, so it FAILS
+            # CLOSED and is reported.
+            position = contract[0]
+            if position is not None and position < len(node.args):
+                value = node.args[position]
+                if not isinstance(value, ast.Name):
+                    at = getattr(value, "lineno", node.lineno)
+                    direct_sites.append((identity, at, lines[at - 1]))
             for argument in node.args:
-                if (
-                    isinstance(argument, ast.BoolOp)
-                    and isinstance(argument.op, ast.Or)
-                    and _can_be_none(argument, scope_of(node), set())
-                ):
-                    chain = _chain_of(owner, node)
-                    identity = (
-                        chain[-1].name if chain else "<module>",
-                        _method_of(node),
-                        None,
-                    )
-                    position = getattr(argument, "lineno", node.lineno)
-                    local_sites.append(
-                        (identity, position, lines[position - 1])
+                if isinstance(argument, ast.Starred):
+                    # A STARRED positional shifts every binding, so the
+                    # generation's value is unknowable: it FAILS CLOSED.
+                    direct_sites.append(
+                        (identity, argument.lineno, lines[argument.lineno - 1])
                     )
         for keyword in node.keywords:
             if keyword.arg is None:
@@ -1059,6 +1124,14 @@ def _classify():
                 # executed probe).
                 value = _spread_generation_value(keyword.value)
                 if value is None:
+                    if _is_store_write(node):
+                        # A COMPUTED spread carries keys that are not
+                        # statically visible, so it can supply a None
+                        # generation without entering any site list: it
+                        # FAILS CLOSED and is reported.
+                        direct_sites.append(
+                            (identity, node.lineno, lines[node.lineno - 1])
+                        )
                     continue
             elif keyword.arg == "generation":
                 value = keyword.value
