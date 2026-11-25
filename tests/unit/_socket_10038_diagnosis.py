@@ -481,21 +481,33 @@ _SEQ_LOCK = threading.Lock()
 _PROCESS_SEQ = 0
 
 
+# The maximum length of the artifact's leg component. The full name is
+# bounded because a file system's component limit is: a long
+# PARAMETERIZED node name would otherwise produce a name over the limit,
+# the write would fail, and the writer's failure is swallowed - the
+# diagnosis would be LOST exactly when it was needed. Uniqueness does
+# not come from this component (the pid, the process sequence and the
+# per-activation counter carry it), so truncating it loses nothing.
+_MAX_LEG_COMPONENT = 48
+
+
 def _safe_component(text: str) -> str:
-    """A WINDOWS-SAFE file name component.
+    """A WINDOWS-SAFE, BOUNDED file name component.
 
     The leg name is a pytest node name, and a PARAMETERIZED node name can
     contain characters Windows forbids in a file name (`<`, `>`, `:`, `"`,
     `|`, `?`, `*`). Only `/` was sanitized before, so the artifact write
     could fail - and the writer's failure is swallowed, so the diagnosis
     was LOST exactly when it was needed. Every character outside the
-    safe set becomes `_`; the ORIGINAL leg stays in the artifact's
+    safe set becomes `_`, and the component is truncated to
+    `_MAX_LEG_COMPONENT`; the ORIGINAL leg stays in the artifact's
     content, so the attribution is not degraded by the file name.
     """
-    return "".join(
+    safe = "".join(
         character if (character.isalnum() or character in "._-") else "_"
         for character in text
     )
+    return safe[:_MAX_LEG_COMPONENT]
 
 
 def _next_process_sequence() -> int:

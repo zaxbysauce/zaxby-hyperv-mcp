@@ -164,12 +164,17 @@ def _can_be_none(node, scopes, seen):
     if isinstance(node, ast.IfExp):
         return _can_be_none(node.orelse, scopes, seen) or _can_be_none(node.body, scopes, seen)
     if isinstance(node, ast.Call):
-        # int()/float()/bool(...) never return None. Everything else may:
-        # a `.get(...)` surfaces a stored None with or without a default,
-        # and an arbitrary call's return is unknown to a static walk.
-        return not (
-            isinstance(node.func, ast.Name) and node.func.id in ("int", "float", "bool")
-        )
+        # int()/float()/bool(...) never return None - but only when the
+        # name still resolves to the BUILTIN. A rebound `int` (a local
+        # or a module-level `int = ...`) is a call to something else
+        # that CAN return None, so the spelling is not enough: a
+        # shadowed coercion is classified conservatively (the round-17
+        # implementation reviewer's finding).
+        if isinstance(node.func, ast.Name) and node.func.id in _COERCION_NAMES:
+            return any(
+                node.func.id in scope["shadowed"] for scope in scopes
+            )
+        return True
     if isinstance(node, ast.Name):
         if node.id in seen:
             # A RESOLUTION CYCLE (`generation = generation`) does not
@@ -645,14 +650,22 @@ def _reachable_with_none(tree, scope_of, func, param_name, entry):
 # direction - a new feed cannot enter the tree unnoticed - and it is what
 # turns the class from a hole into a PIN.
 _CLOSED_DIRECT_CALLS = frozenset({"int", "float", "bool"})
+
+# The coercion names whose call result can never be None - as long as the
+# name still resolves to the BUILTIN.
+_COERCION_NAMES = ("int", "float", "bool")
 _CLOSED_DIRECT_EXACT = frozenset({"store.op_next_generation()"})
 
 
-def _direct_form_is_closed(node) -> bool:
-    """True when a direct expression form is a REVIEWED non-None form."""
+def _direct_form_is_closed(node, shadowed=frozenset()) -> bool:
+    """True when a direct expression form is a REVIEWED non-None form.
+
+    A coercion name that is SHADOWED in the scope under analysis is not
+    the builtin, so the form is not closed.
+    """
     if isinstance(node, ast.Call):
         if isinstance(node.func, ast.Name) and node.func.id in _CLOSED_DIRECT_CALLS:
-            return True
+            return node.func.id not in shadowed
         return ast.unparse(node) in _CLOSED_DIRECT_EXACT
     return False
 
@@ -731,6 +744,41 @@ def _has_computed_exec(func) -> bool:
     return False
 
 
+
+def _module_shadowed_coercions(tree) -> set[str]:
+    """The coercion names the MODULE rebinds.
+
+    A module-level `int = ...` shadows the builtin for the whole module,
+    so every `int(...)` in it calls something else - which can return
+    None.
+    """
+    shadowed: set[str] = set()
+    for node in tree.body:
+        targets: list = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets = [node.target]
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            targets = [ast.Name(id=node.name, ctx=ast.Store())]
+        for target in targets:
+            for name in _bound_names(target):
+                if name in _COERCION_NAMES:
+                    shadowed.add(name)
+    return shadowed
+
+
+def _function_shadowed_coercions(func, env, table) -> set[str]:
+    """The coercion names bound in a function's own scope.
+
+    A local or a parameter named `int` shadows the builtin for that
+    function, so its `int(...)` calls are calls to something else.
+    """
+    shadowed = {name for name in env if name in _COERCION_NAMES}
+    shadowed |= {name for name in table if name in _COERCION_NAMES}
+    return shadowed
+
+
 def _classify():
     """Return (local, aliased, parameter, direct) site lists.
 
@@ -754,10 +802,22 @@ def _classify():
     tables = {func: _param_table(func) for func in functions}
     shadowed = _scope_shadowed_names(tree)
 
+    module_shadowed = _module_shadowed_coercions(tree)
+    shadowed_by_func = {
+        func: module_shadowed | _function_shadowed_coercions(
+            func, envs[func], tables[func]
+        )
+        for func in functions
+    }
+
     def scope_of(node):
         """The `_can_be_none` scope chain (innermost first) for `node`."""
         return [
-            {"assignments": envs[func], "params": tables[func]}
+            {
+                "assignments": envs[func],
+                "params": tables[func],
+                "shadowed": shadowed_by_func[func],
+            }
             for func in _chain_of(owner, node)
         ]
 
@@ -791,7 +851,10 @@ def _classify():
                 # shipped tree's forms - the `int(...)` coercions and the
                 # store's positive generation counter - are on the list;
                 # anything else is a new feed that must earn its pin.
-                if not _direct_form_is_closed(keyword.value):
+                coercion_shadowed = set()
+                for func in chain:
+                    coercion_shadowed |= shadowed_by_func[func]
+                if not _direct_form_is_closed(keyword.value, coercion_shadowed):
                     direct_sites.append((identity, line, lines[line - 1]))
             else:
                 name = keyword.value.id

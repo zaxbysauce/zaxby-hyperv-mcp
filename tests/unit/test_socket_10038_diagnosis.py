@@ -438,8 +438,14 @@ def test_an_unsafe_leg_name_still_produces_an_artifact(capture):
     set_current_leg(unsafe_leg)
     try:
         outcome: dict = {}
+        gate = threading.Event()
 
         def _worker():
+            # The worker WAITS for the gate, so it cannot record its
+            # artifact before the setup below is complete: the
+            # published-leg path is taken deterministically, not by
+            # scheduling luck.
+            gate.wait(30)
             sock = _closed_socket()
             try:
                 sock.recv(64)
@@ -453,6 +459,7 @@ def test_an_unsafe_leg_name_still_produces_an_artifact(capture):
         # node - and a PARAMETERIZED node name ("test_x[a:b]") is exactly
         # the string that carries Windows-forbidden characters.
         _socket_10038_diagnosis._THREAD_LEGS.clear()
+        gate.set()
         worker.join(timeout=30)
     finally:
         set_current_leg(None)
@@ -477,3 +484,10 @@ def test_the_artifact_name_component_replaces_every_forbidden_character():
         assert _safe_component(f"leg{character}x") == "leg_x", (
             f"{character!r} must be replaced in the file-name component"
         )
+
+
+def test_the_artifact_name_component_is_bounded():
+    """A long leg name cannot produce a name over the file system limit."""
+    long_leg = "parameterized_case_" + "x" * 400
+    component = _safe_component(long_leg)
+    assert len(component) <= 48, f"the component must be bounded, got {len(component)}"
