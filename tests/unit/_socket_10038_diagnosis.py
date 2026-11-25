@@ -298,6 +298,8 @@ def _install_thread_leg_recorder(saved: dict, owner) -> None:
     # not that - it is the capture's own, and the capture's own removal
     # restores the value it displaced.
     original_start = getattr(threading.Thread, "start", _ORIGINAL_THREAD_START)
+    # The token of THIS installation, captured here (see `_wrap`).
+    token = owner._token
 
     def start_with_leg(self, *args, **kwargs):
         # The REGISTERED owner of the current thread takes PRECEDENCE over
@@ -306,7 +308,7 @@ def _install_thread_leg_recorder(saved: dict, owner) -> None:
         # function name is no more identifying than "worker" - the
         # registered owner is the fixture or test that started the chain.
         leg = _thread_leg() or _current_stack_leg()
-        if leg and owner._active:
+        if leg and _ACTIVE_INSTALLATION is token:
             _THREAD_LEGS[id(self)] = (weakref.ref(self), leg)
         return original_start(self, *args, **kwargs)
 
@@ -457,8 +459,10 @@ class SocketDiagnosis:
         # patch kept a reference to stays callable after the activation
         # ends, and it must then be INERT: it delegates without recording a
         # diagnosis or the listener provenance (the round-9 implementation
-        # reviewer's finding).
-        self._active = False
+        # reviewer's finding). The token is per INSTALLATION, not per
+        # instance, so reinstalling this instance does not revive an earlier
+        # installation's wrappers (the round-10 reviewer's finding).
+        self._token: object | None = None
 
     # ---- lifecycle ----
 
@@ -483,7 +487,9 @@ class SocketDiagnosis:
             # direct installation invisible to the guard above (the
             # round-22 implementation reviewer's finding).
             _INSTALLED_BY = self
-            self._active = True
+            global _ACTIVE_INSTALLATION
+            self._token = object()
+            _ACTIVE_INSTALLATION = self._token
             # What the capture DISPLACES is what is in place RIGHT NOW, not
             # the import-time value: a fixture that outlives a single test
             # may own a patch of its own, and the capture must neither
@@ -516,7 +522,9 @@ class SocketDiagnosis:
             # The wrappers this activation installed stay callable (a
             # foreign patch may hold a reference to one), so they must
             # become INERT here rather than keep recording.
-            self._active = False
+            global _ACTIVE_INSTALLATION
+            if _ACTIVE_INSTALLATION is self._token:
+                _ACTIVE_INSTALLATION = None
             # Only an attribute that STILL holds the capture's own wrapper is
             # restored: a patch that another party installed WHILE the
             # capture was active is not the capture's to replace, and it must
@@ -585,10 +593,13 @@ class SocketDiagnosis:
     def _init_factory(self, saved_init):
         """A plain function (not a bound method): as a class attribute it
         receives the SOCKET as its first argument."""
+        # The token of THIS installation, captured here (see `_wrap`).
+        token = self._token
 
         def _init(sock, *args, **kwargs) -> None:
-            if not self._active:
-                # The activation is over: construct without recording.
+            if _ACTIVE_INSTALLATION is not token:
+                # This installation is over (or a later one replaced it):
+                # construct without recording.
                 saved_init(sock, *args, **kwargs)
                 return
             # The provenance is recorded as what was OBSERVED, not as a
@@ -632,11 +643,17 @@ class SocketDiagnosis:
         # bypassing anyone else's substitution.
         original = self._saved.get(operation,
                                    _ORIGINAL_SOCKET_METHODS[operation])
+        # The token of THIS installation, captured here: the instance's
+        # token is replaced by a later installation of the same instance,
+        # and a wrapper of an earlier installation must not be revived by
+        # it (the round-10 implementation reviewer's finding).
+        token = self._token
 
         def _operation(sock, *args, **kwargs):
-            if not self._active:
-                # The activation is over: delegate without recording. A
-                # foreign patch may still hold a reference to this wrapper.
+            if _ACTIVE_INSTALLATION is not token:
+                # This installation is over (or a later one replaced it):
+                # delegate without recording. A foreign patch may still
+                # hold a reference to this wrapper.
                 return original(sock, *args, **kwargs)
             try:
                 result = original(sock, *args, **kwargs)
@@ -761,6 +778,12 @@ _original_hvsock_connect()
 
 # The instance that currently owns the process-global patches.
 _INSTALLED_BY: "SocketDiagnosis | None" = None
+
+# The token of the CURRENT installation. A wrapper is active only while
+# its own token is the current one, so reinstalling the same instance
+# does not revive the wrappers of an earlier installation (the
+# round-10 implementation reviewer's finding).
+_ACTIVE_INSTALLATION: object | None = None
 
 _ACTIVE: SocketDiagnosis | None = None
 

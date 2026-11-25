@@ -386,3 +386,54 @@ def test_k_a_retained_foreign_wrapper_cannot_record_after_deactivation(tmp_path,
             f"its activation ended: {list(tmp_path.iterdir())}")
     finally:
         socket.socket.setsockopt = _PRISTINE_SETSOCKOPT
+
+
+def test_l_a_reinstalled_instance_does_not_reactivate_an_earlier_wrapper(tmp_path,
+                                                                          monkeypatch):
+    """Reusing the SAME instance must not revive an earlier installation.
+
+    The capture's contract allows a direct `install()`/`uninstall()` reuse
+    of one instance. With a per-INSTANCE active flag, the second
+    installation reactivated the wrappers of the FIRST one - so a wrapper a
+    foreign patch had retained could record again, and could record twice
+    when the call reached both wrappers. The activity is bound to the
+    individual INSTALLATION instead.
+    """
+    import functools
+
+    import pytest
+    from _socket_10038_diagnosis import SocketDiagnosis
+
+    monkeypatch.setenv("HYPERV_MCP_10038_DIAG_DIR", str(tmp_path))
+    diagnosis = SocketDiagnosis()
+    diagnosis.install()
+    try:
+        first_wrapper = socket.socket.setsockopt
+
+        @functools.wraps(first_wrapper)
+        def around(*args, **kwargs):
+            return first_wrapper(*args, **kwargs)
+
+        socket.socket.setsockopt = around
+    finally:
+        diagnosis.uninstall()
+    try:
+        diagnosis.install()
+        sock = socket.socket()
+        try:
+            sock.close()
+            # the RETAINED wrapper belongs to the FIRST installation and
+            # must be inert, even though the instance is installed again
+            with pytest.raises(OSError):
+                around(sock, socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        assert not list(tmp_path.iterdir()), (
+            "the earlier installation's wrapper recorded again after the "
+            f"instance was reinstalled: {list(tmp_path.iterdir())}")
+    finally:
+        diagnosis.uninstall()
+        socket.socket.setsockopt = _PRISTINE_SETSOCKOPT
