@@ -64,8 +64,15 @@ jobs:
           HYPERV_MCP_10038_DIAG_DIR: ${{ runner.temp }}/socket-10038-diagnosis
         run: pytest tests/unit
 
-      - name: Retain the socket-10038 diagnosis (failure only)
-        if: failure()
+      - name: Retain the socket-10038 diagnosis
+        # ALWAYS, not only on failure: the capture exists for a SWALLOWED
+        # WinError 10038 - the socket family catches the error before any
+        # pytest reporting hook can see it, so the job can SUCCEED with a
+        # captured diagnosis. A failure-only retention step would discard
+        # exactly the evidence the capture exists to preserve (the round-7
+        # implementation reviewer's finding). `if-no-files-found: ignore`
+        # permits the run that produced no diagnosis at all.
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           # upload-artifact@v4 artifacts are immutable and a duplicate name
