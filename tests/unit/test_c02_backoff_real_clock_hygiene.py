@@ -1,22 +1,33 @@
-"""Tolerant REAL-clock smoke for the c02 backoff schedule (issue #167 AC2).
+"""REAL-clock HYGIENE smoke for the c02 backoff path (issue #167 AC2).
 
-The schedule itself is asserted EXACTLY, against a virtual clock, in
-test_c02_backoff_probe.py: there the production loop asks to sleep, the
-clock records the requested duration and advances virtual time, and the
-requested schedule is compared byte for byte. That is the deterministic
-contract.
+WHAT THIS FILE PROVES: the real-clock path still terminates on its own,
+still raises the documented busy refusal, and still releases every pool
+slot it took. That is a HYGIENE property, not a schedule property.
 
-This file covers the OTHER half: the REAL clock path still works. It runs
-the same saturated-pool scenario against the real clock and OBSERVES the
-intervals it measures - it asserts NOTHING about their values, their
-number, or their ratios. That is deliberate: on a loaded CI runner a
-correct schedule can produce an adjacent-sleep ratio below 1 (the issue
-records 0.69x, because the earlier sleep was delayed more than the next),
-a first sleep far past the model's 5 ms, and a ramp that never reaches
-the ceiling before its wall-clock deadline expires. Any of those would be
-a false red. So the smoke proves that the real path still sleeps, still
-backs off, and still terminates - the exact schedule is asserted by the
-virtual-clock test, which has no scheduler in its loop.
+THE SCHEDULE CLAIM IS EXPLICITLY WAIVED HERE. The requested schedule
+(5 ms doubling to the 200 ms ceiling) is asserted EXACTLY, against a
+virtual clock, in test_c02_backoff_probe.py: there the production loop
+asks to sleep, the clock records the REQUESTED duration and advances
+virtual time, and the requested schedule is compared byte for byte. That
+is the deterministic contract, and it is the only place the schedule is
+asserted.
+
+A real-clock schedule assertion is what AC2 removes: on a loaded CI
+runner a CORRECT schedule can produce an adjacent-sleep ratio below 1
+(the issue records 0.69x, because the earlier sleep was delayed more
+than the next), a first sleep far past the model's 5 ms, and a ramp that
+never reaches the ceiling before its wall-clock deadline expires. Any of
+those would be a false red. So this file OBSERVES the measured
+intervals, reports them, and asserts NOTHING about their values, their
+number, or their ratios. The intervals are printed for a human reader.
+
+This file used to be named `test_c02_backoff_schedule_smoke.py` and to
+call itself a "realized-schedule smoke", which claimed a coverage its
+assertions did not provide. It is now named and documented for what it
+actually asserts - the hygiene properties above - and the realized-
+schedule coverage is WAIVED, which is the disposition AC2's own scope
+allows ("a tolerant realized-schedule smoke kept separately or explicitly
+waived").
 
 It lives in its own file on purpose: the frozen check C2 measures the
 summed pytest CALL duration of the two c02 files, and a real-clock smoke
@@ -64,14 +75,17 @@ def pool_env(tmp_path, monkeypatch):
     return SimpleNamespace(dir=slot_dir, logs=logs)
 
 
-def test_real_clock_backoff_still_ramps_to_a_ceiling(pool_env, monkeypatch):
-    """The REAL clock path still sleeps, backs off and terminates.
+def test_the_real_clock_path_terminates_and_releases_its_slots(pool_env, monkeypatch):
+    """The REAL clock path terminates, refuses, and leaks no slot.
 
     Nothing about the measured intervals is asserted: the exact schedule
     is pinned by the virtual-clock probe, and every bound that could be
     written against real measurements is scheduler-sensitive (the issue
     records a 0.69x adjacent-sleep ratio on a loaded runner for a
-    CORRECT schedule). The intervals are observed and printed.
+    CORRECT schedule). The intervals are observed and printed. What IS
+    asserted is the hygiene the real path must keep: the waiter
+    terminates on its own, it raises the documented busy refusal, and
+    every slot this test took is released on every path.
     """
     holders: list[int] = []
     try:

@@ -323,6 +323,13 @@ class SocketDiagnosis:
 
     # ---- the socket seams ----
 
+    def _inherit_origin(self, source, accepted) -> None:
+        """Carry an observed origin across the accept seam."""
+        with self._lock:
+            origin = self._origins.get(id(source))
+            if origin and origin != "unknown":
+                self._origins[id(accepted)] = origin
+
     def _note_listener_step(self, sock, operation: str) -> None:
         """Record that a socket reached one half of the listener's own
         creation path.
@@ -376,6 +383,16 @@ class SocketDiagnosis:
                 raise
             if operation in ("bind", "listen"):
                 self._note_listener_step(sock, operation)
+            if operation == "accept" and isinstance(result, tuple):
+                # `accept` returns a (connection, address) PAIR, so the
+                # accepted socket is the pair's first element. The ACCEPTED
+                # socket is on the listener's side of the connection, but it
+                # performs no bind and listen of its own, so it inherits the
+                # listener's observed provenance instead of being recorded
+                # as unknown.
+                accepted = result[0] if result else None
+                if isinstance(accepted, socket.socket):
+                    self._inherit_origin(sock, accepted)
             return result
 
         _operation.__name__ = operation

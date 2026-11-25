@@ -63,6 +63,23 @@ and reordering:
    ``generation-write-form: fail-open-parameter-admits-none`` (so the two
    cases stay distinguishable in the source).
 
+5. RESOLUTION of the classes that are not write forms. Two further
+   classes are pinned so that the guard cannot be widened by a blind
+   spot:
+
+   - the DIRECT EXPRESSION class (a ``generation=`` argument that is a
+     call or a conditional expression rather than a boolean-or
+     expression or a bare name). Every such form must be on the
+     REVIEWED closed list - the ``int(...)`` coercions and the store's
+     positive generation counter - or the guard fails. An unreviewed
+     form is a new feed that must earn its pin.
+   - the ANNOTATION and DECLARATION resolution rules behind the
+     parameter class: a parameter annotated with a name that admits
+     ``None`` (``int | None``, ``Optional[...]``, ``Any``, ``object``,
+     or any unresolved alias) is admitting, and a ``global``/
+     ``nonlocal`` declaration applies to the whole function scope, so
+     one nested inside a conditional block is found too.
+
 Mutation that must kill this check: an untagged fifth fail-open site added
 to ``operations.py`` (the identity set check fires); a fifth site added
 WITH the tag (the identity set check fires - it is not one of the four
@@ -71,7 +88,9 @@ tagged fail-open line replaces it (the identity check fires - the count
 stays at four); the aliased capture re-introduced as a plain
 ``generation or None`` assignment (the alias set check fires); a caller of
 an admitting parameter switched to a ``None``-capable feed such as
-``op_ctx.get("generation")`` (the parameter reachable-set check fires).
+``op_ctx.get("generation")`` (the parameter reachable-set check fires); a
+direct expression feed that is not on the reviewed closed list (the
+unresolved-direct-form check fires).
 
 Note on the reachability of the class: production row constructors mint
 positive generations, but legacy generation zero is an explicitly modelled
@@ -85,7 +104,8 @@ Note on conservatism: ``_can_be_none`` treats an unrecognized construct
 that it cannot actually resolve. The only expressions certified closed
 are ``int(...)``/``float(...)``/``bool(...)`` calls, names resolved to
 non-``None`` locals or non-admitting parameters, and literal non-``None``
-constants.
+constants. The same rule governs the direct expression class: a form that
+is not on the reviewed closed list is reported, not assumed closed.
 """
 
 import ast
@@ -151,7 +171,12 @@ def _can_be_none(node, scopes, seen):
         )
     if isinstance(node, ast.Name):
         if node.id in seen:
-            return False
+            # A RESOLUTION CYCLE (`generation = generation`) does not
+            # resolve to a closed value: the name still holds whatever the
+            # enclosing binding supplied, so it can be None. Certifying a
+            # cycle closed is how a parameter's own value was lost - the
+            # plan critic's executed parameter-self-assignment probe.
+            return True
         for scope in scopes:
             if node.id in scope["assignments"]:
                 return any(
@@ -259,6 +284,27 @@ def _pattern_names(pattern):
             yield from _pattern_names(element)
 
 
+def _own_scope_nodes(func):
+    """Every node in `func`'s OWN scope, in source order.
+
+    A function's own scope is its body and every compound statement
+    nested in it - but NOT a nested function's or class's body, which has a
+    scope of its own. A `global`/`nonlocal` declaration applies to the
+    WHOLE function scope, so it must be found wherever it sits in that
+    scope: searching only the function's immediate children missed the
+    conditional form (`if ...: global generation`), which then let the
+    name be treated as a local (the plan critic's executed probe).
+    """
+    stack = list(getattr(func, "body", []))
+    while stack:
+        node = stack.pop(0)
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef, ast.Lambda)):
+            continue  # a scope of its own
+        stack.extend(ast.iter_child_nodes(node))
+
+
 def _local_assignments(func):
     """name -> the value nodes assigned to it anywhere in `func`.
 
@@ -281,17 +327,17 @@ def _local_assignments(func):
     # collect a NESTED function's `nonlocal x`, and suppressing the outer
     # function's binding of `x` on that basis would let a nested rebinding
     # slip past the census.
-    for node in ast.iter_child_nodes(func):
+    for node in _own_scope_nodes(func):
         if isinstance(node, (ast.Global, ast.Nonlocal)):
             declared_elsewhere.update(node.names)
     # A nested function that declares `nonlocal x` (or `global x`) rebinds
     # the name in THIS scope, so this scope's binding of it is no longer
-    # the only one - an unknown value is added for it.
-    for node in ast.walk(func):
-        if node is func:
-            continue
+    # the only one - an unknown value is added for it. The nested
+    # function's own declarations are searched in ITS own scope, so a
+    # conditional declaration inside it counts too.
+    for node in _own_scope_nodes(func):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for statement in node.body:
+            for statement in _own_scope_nodes(node):
                 if isinstance(statement, (ast.Global, ast.Nonlocal)):
                     for name in statement.names:
                         env.setdefault(name, []).append(
@@ -384,8 +430,15 @@ def _local_assignments(func):
 
 # The annotation names the analysis can certify as NOT admitting None. Every
 # other name is treated as admitting None (see `_annotation_admits_none`).
+#
+# `Any` and `object` are NOT on this list, and that is deliberate: `Any`
+# includes `NoneType`, and `None` is an instance of `object`, so a
+# parameter annotated with either can carry None. Certifying them closed
+# would let a None-capable feed into a parameter site that the reachable
+# set then reports as closed (the plan critic's executed `Any` and
+# `object` probes).
 _CLOSED_ANNOTATION_NAMES = frozenset({
-    "int", "float", "bool", "str", "bytes", "object", "Any",
+    "int", "float", "bool", "str", "bytes",
 })
 
 
@@ -542,13 +595,58 @@ def _reachable_with_none(tree, scope_of, func, param_name, entry):
     return False
 
 
+# The REVIEWED closed forms for a DIRECT EXPRESSION argument. AC1 pins the
+# `generation or None` write form, but a direct expression form still feeds
+# the same write, so the guard must decide whether it can carry None. Two
+# certifications are accepted, and each is explicit:
+#
+#   * `int(...)` (and `float`/`bool`): the coercion RAISES TypeError on a
+#     None argument rather than returning it, so its result is never None;
+#   * `store.op_next_generation()`: the store's own generation counter,
+#     whose contract is a POSITIVE value.
+#
+# Every other direct expression form is UNRESOLVED: the guard never
+# certifies what it cannot resolve, so the site is reported and the guard
+# FAILS until the form is reviewed and pinned here. That is the fail-closed
+# direction - a new feed cannot enter the tree unnoticed - and it is what
+# turns the class from a hole into a PIN.
+_CLOSED_DIRECT_CALLS = frozenset({"int", "float", "bool"})
+_CLOSED_DIRECT_EXACT = frozenset({"store.op_next_generation()"})
+
+
+def _direct_form_is_closed(node) -> bool:
+    """True when a direct expression form is a REVIEWED non-None form."""
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Name) and node.func.id in _CLOSED_DIRECT_CALLS:
+            return True
+        return ast.unparse(node) in _CLOSED_DIRECT_EXACT
+    return False
+
+
+def _reads_its_own_name(values, name) -> bool:
+    """True when an assignment only READS the name it binds.
+
+    `generation = generation` does not rebind the name with a new value:
+    it copies the enclosing binding into the local. When that enclosing
+    binding is a PARAMETER, the value that reaches the write is the
+    CALLER's value - so the site belongs in the parameter class, not in
+    the local class, and the local must not shadow the parameter.
+    """
+    for value in values:
+        if isinstance(value, ast.Name) and value.id == name:
+            return True
+    return False
+
+
 def _classify():
-    """Return (local, aliased, parameter) site lists.
+    """Return (local, aliased, parameter, direct) site lists.
 
     Local and aliased entries are (identity, line, text); parameter entries
     are (identity, line, text, reachable) and cover the ADMITTING parameter
     pass-through sites only (a parameter whose signature cannot carry None
-    is a contract, not a fail-open feed).
+    is a contract, not a fail-open feed); direct entries are
+    (identity, line, text) and cover the direct expression forms that are
+    NOT on the reviewed closed list.
     """
     text = _OPERATIONS.read_text(encoding="utf-8")
     tree = ast.parse(text)
@@ -573,6 +671,7 @@ def _classify():
     local_sites = []
     aliased_sites = []
     parameter_sites = []
+    direct_sites = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -589,15 +688,18 @@ def _classify():
             if isinstance(keyword.value, ast.BoolOp):
                 local_sites.append((identity, line, lines[line - 1]))
             elif not isinstance(keyword.value, ast.Name):
-                # A direct expression form other than a boolean-or
-                # expression or a bare NAME is NOT classified by this guard.
-                # Classifying it conservatively was tried and is WRONG for
-                # this source: the only such forms in the shipped code are
-                # `store.op_next_generation()`, whose contract is a POSITIVE
-                # counter, so classifying them would report two closed
-                # sites as fail-open. The class is a DECLARED boundary
-                # (mutant M33 is recorded as a SURVIVOR), not a silent gap.
-                pass
+                # A DIRECT EXPRESSION form (a call, a conditional
+                # expression) is not the boolean-or write form AC1 pins,
+                # but it still feeds the write - so it is checked against
+                # the REVIEWED closed forms. A form that is not on that
+                # list is UNRESOLVED: the guard never certifies what it
+                # cannot resolve, so the site is reported here and the
+                # guard FAILS until the form is reviewed and pinned. The
+                # shipped tree's forms - the `int(...)` coercions and the
+                # store's positive generation counter - are on the list;
+                # anything else is a new feed that must earn its pin.
+                if not _direct_form_is_closed(keyword.value):
+                    direct_sites.append((identity, line, lines[line - 1]))
             else:
                 name = keyword.value.id
                 if name in shadowed:
@@ -611,6 +713,19 @@ def _classify():
                 binding = None
                 for func in chain:
                     if name in envs[func]:
+                        # A local that only READS its own name
+                        # (`generation = generation`) does not rebind it:
+                        # the value that reaches the write is the
+                        # enclosing binding's, so the PARAMETER table is
+                        # consulted first and the site stays in the
+                        # parameter class (the plan critic's executed
+                        # parameter-self-assignment probe).
+                        if (
+                            name in tables[func]
+                            and _reads_its_own_name(envs[func][name], name)
+                        ):
+                            binding = ("param", func)
+                            break
                         binding = ("local", func)
                         break
                     if name in tables[func]:
@@ -655,7 +770,7 @@ def _classify():
                     continue
                 reachable = _reachable_with_none(tree, scope_of, func, name, entry)
                 parameter_sites.append((identity, line, lines[line - 1], reachable))
-    return local_sites, aliased_sites, parameter_sites
+    return local_sites, aliased_sites, parameter_sites, direct_sites
 
 
 def _identity_counts(sites):
@@ -667,7 +782,7 @@ def _identity_counts(sites):
 
 def test_keyword_local_fail_open_sites_are_exactly_the_four_disclosed():
     """The keyword-local fail-open set equals the four disclosed identities."""
-    local_sites, _aliased, _parameter = _classify()
+    local_sites, _aliased, _parameter, _direct = _classify()
     counts = _identity_counts(local_sites)
     assert counts == _EXPECTED_LOCAL, (
         f"AC1: fail-open write sites mismatch: expected exactly "
@@ -678,7 +793,7 @@ def test_keyword_local_fail_open_sites_are_exactly_the_four_disclosed():
 
 def test_every_fail_open_site_carries_the_disclosure_tag():
     """Each keyword-local fail-open site carries the same-line disclosure tag."""
-    local_sites, _aliased, _parameter = _classify()
+    local_sites, _aliased, _parameter, _direct = _classify()
     untagged = [line for _identity, line, text in local_sites if _LOCAL_TAG not in text]
     assert not untagged, (
         f"AC1: fail-open write sites missing the '{_LOCAL_TAG}' tag at lines {untagged}"
@@ -687,7 +802,7 @@ def test_every_fail_open_site_carries_the_disclosure_tag():
 
 def test_aliased_fail_open_writes_are_exactly_the_disclosed_pair():
     """The aliased fail-open set equals the disclosed captured-generation pair."""
-    _local, aliased_sites, _parameter = _classify()
+    _local, aliased_sites, _parameter, _direct = _classify()
     counts = _identity_counts(aliased_sites)
     assert counts == _EXPECTED_ALIASED, (
         f"AC1: aliased fail-open writes mismatch: expected exactly "
@@ -702,7 +817,7 @@ def test_the_aliased_capture_carries_its_disclosure_tag():
     the write just as much, and an undisclosed one would change the
     runtime value while the set pin kept looking at the original line.
     """
-    _local, aliased_sites, _parameter = _classify()
+    _local, aliased_sites, _parameter, _direct = _classify()
     untagged = [
         line
         for _identity, alias_lines, texts in aliased_sites
@@ -728,7 +843,7 @@ def test_the_aliased_capture_keeps_its_disclosed_fail_open_form():
     local (M8) drops the coercion just as effectively, so every assignment
     is checked, not only the earliest one.
     """
-    _local, aliased_sites, _parameter = _classify()
+    _local, aliased_sites, _parameter, _direct = _classify()
     forms = {
         text.split("#", 1)[0].strip()
         for _identity, _alias_lines, texts in aliased_sites
@@ -740,9 +855,55 @@ def test_the_aliased_capture_keeps_its_disclosed_fail_open_form():
     )
 
 
+def test_no_direct_generation_form_is_unresolved():
+    """Every direct expression feed is on the reviewed closed list.
+
+    A direct expression form (a call, a conditional expression) is not
+    the boolean-or write form AC1 pins, but it feeds the same write. The
+    guard never certifies a form it cannot resolve, so an UNREVIEWED form
+    is reported here and this assertion fires - a new feed must earn its
+    pin instead of arriving unnoticed.
+    """
+    _local, _aliased, _parameter, direct_sites = _classify()
+    assert not direct_sites, (
+        f"AC1: unresolved direct expression generation feed(s) at "
+        f"{[(site[1], site[2].strip()) for site in direct_sites]} - a direct "
+        f"expression form must be reviewed and pinned as a closed form"
+    )
+
+
+def test_the_direct_form_closure_rule_certifies_only_the_reviewed_forms():
+    """The closed-form rule is a pin, not a rubber stamp.
+
+    Without this, a classifier that certified EVERY direct expression
+    form would leave the unresolved set empty and every other assertion
+    passing - the same false green that the direct-form site list is
+    meant to prevent.
+    """
+    for text in (
+        "store.op_next_generation()",
+        "int(row.generation or 0)",
+        "int(op_ctx.get('generation') or 0)",
+    ):
+        node = ast.parse(text, mode="eval").body
+        assert _direct_form_is_closed(node), (
+            f"the closure rule must certify the reviewed form {text!r}"
+        )
+    for text in (
+        "_maybe_none()",
+        "op_ctx.get('generation')",
+        "1 if flag else None",
+        "None",
+    ):
+        node = ast.parse(text, mode="eval").body
+        assert not _direct_form_is_closed(node), (
+            f"the closure rule must NOT certify {text!r} as a closed form"
+        )
+
+
 def test_parameter_admitting_sites_are_exactly_the_two_disclosed():
     """The parameter pass-through ADMITTING set equals the two disclosed identities."""
-    _local, _aliased, parameter_sites = _classify()
+    _local, _aliased, parameter_sites, _direct = _classify()
     counts = _identity_counts(parameter_sites)
     assert counts == _EXPECTED_PARAM_ADMITTING, (
         f"AC1: parameter pass-through admitting sites mismatch: expected exactly "
@@ -759,7 +920,7 @@ def test_parameter_reachable_sites_are_exactly_the_disclosed_one():
     (positional or keyword), the site moves into the reachable set and this
     identity assertion fires.
     """
-    _local, _aliased, parameter_sites = _classify()
+    _local, _aliased, parameter_sites, _direct = _classify()
     reachable = [site for site in parameter_sites if site[3]]
     counts = _identity_counts(reachable)
     assert counts == _EXPECTED_PARAM_REACHABLE, (
@@ -771,7 +932,7 @@ def test_parameter_reachable_sites_are_exactly_the_disclosed_one():
 
 def test_reachable_parameter_sites_carry_the_parameter_tag():
     """Each None-reachable parameter site carries the strong disclosure tag."""
-    _local, _aliased, parameter_sites = _classify()
+    _local, _aliased, parameter_sites, _direct = _classify()
     untagged = [
         line for _identity, line, text, reachable in parameter_sites
         # the admits tag CONTAINS the strong tag as a prefix, so a line
@@ -786,7 +947,7 @@ def test_reachable_parameter_sites_carry_the_parameter_tag():
 
 def test_admitting_but_unreachable_parameter_sites_carry_the_admits_tag():
     """Admitting-but-currently-closed parameter sites carry the weaker tag."""
-    _local, _aliased, parameter_sites = _classify()
+    _local, _aliased, parameter_sites, _direct = _classify()
     untagged = [
         line for _identity, line, text, reachable in parameter_sites
         if not reachable and _PARAM_ADMITS_TAG not in text

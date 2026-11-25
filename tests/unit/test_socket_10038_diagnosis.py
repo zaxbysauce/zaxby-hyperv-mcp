@@ -89,6 +89,32 @@ def test_capture_records_the_real_listener_origin(capture):
     assert artifacts[0]["handle_origin"] == "real-listener"
 
 
+def test_capture_carries_the_listener_origin_across_the_accept_seam(capture):
+    """An ACCEPTED socket inherits the listener's observed provenance.
+
+    The accepted socket never binds or listens itself, so without the
+    inheritance it would be recorded as "unknown" - even though it is on
+    the listener's side of the connection.
+    """
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    client = socket.socket()
+    client.connect(("127.0.0.1", port))
+    accepted, _ = listener.accept()
+    client.close()
+    accepted.close()
+    with pytest.raises(OSError):
+        accepted.recv(64)
+    artifacts = _artifacts(capture)
+    assert len(artifacts) == 1, f"expected one artifact, got {artifacts}"
+    assert artifacts[0]["handle_origin"] == "real-listener", (
+        f"expected the listener's origin, got {artifacts[0]['handle_origin']!r}"
+    )
+    listener.close()
+
+
 def test_capture_records_unknown_origin_when_neither_is_established(capture):
     """A socket that is neither connector-made nor a listener stays unknown."""
     sock = _closed_socket()

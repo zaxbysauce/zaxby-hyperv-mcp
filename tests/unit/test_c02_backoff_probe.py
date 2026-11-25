@@ -23,7 +23,7 @@ the duration the code REQUESTED. The assertions are therefore exact - the
 schedule, the sweep count and the attempt-reduction ratio are all
 deterministic - and no real sleeping or wall-clock harness wait is
 involved. The tolerant real-clock path stays covered separately by
-tests/unit/test_c02_backoff_schedule_smoke.py.
+tests/unit/test_c02_backoff_real_clock_hygiene.py.
 
   P1  the requested sleep sequence IS the schedule: 5 ms doubling to the
       200 ms ceiling, with the final sleep capped to the remaining
