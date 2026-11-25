@@ -83,6 +83,12 @@ _ORIGINAL_SOCKET_METHODS = {
     for name in _CAPTURED_OPERATIONS + _LISTENER_OPERATIONS
 }
 
+# The PRISTINE `Thread.start`, captured once at import, for the same reason
+# as the socket methods above: the thread-leg recorder restores what it
+# saved, and what it saves must be the PRISTINE method, never a wrapper
+# that a previous activation (or a late restore) left behind.
+_ORIGINAL_THREAD_START = threading.Thread.start
+
 def _diagnosis_dir() -> Path:
     """Where artifacts are written: the configured directory, else a temp one."""
     configured = os.environ.get(DIAG_DIR_ENV)
@@ -235,7 +241,10 @@ def _thread_leg() -> str | None:
 
 def _install_thread_leg_recorder(saved: dict) -> None:
     """Record the starting leg of every thread started while installed."""
-    original_start = threading.Thread.start
+    # The PRISTINE `Thread.start`, not whatever is installed right now: a
+    # wrapper left behind by a late restore would otherwise be captured as
+    # the original and restored forever.
+    original_start = _ORIGINAL_THREAD_START
 
     def start_with_leg(self, *args, **kwargs):
         # The REGISTERED owner of the current thread takes PRECEDENCE over
@@ -651,3 +660,38 @@ def deactivate() -> None:
     if _ACTIVE is not None:
         _ACTIVE.uninstall()
         _ACTIVE = None
+
+
+def restore_pristine_socket_methods() -> int:
+    """Force the pristine socket methods and `Thread.start` back.
+
+    The capture's own removal restores them, but a test's `monkeypatch`
+    restores the value it SAVED, and while the capture is installed that
+    value is the CAPTURE'S WRAPPER. pytest finalizes the `monkeypatch`
+    fixture AFTER the capture's teardown, so the undo puts the wrapper back
+    after the capture removed it: the socket class then keeps a capture
+    wrapper for the rest of the session, and the rest of the suite sees a
+    patched socket class that records nothing - the promise the conftest
+    states ("the rest of the unit suite must never see a patched socket
+    class") is broken (issue #167 AC3, the round-23 plan gate's executed
+    probe).
+
+    The repair is a NO-OP while the capture is installed: then the capture
+    owns the patches and its own removal restores them. The number of
+    restored attributes is returned, so a caller can assert that the repair
+    ran and how much it repaired.
+    """
+    if _INSTALLED_BY is not None:
+        return 0
+    restored = 0
+    if getattr(socket.socket, "__init__", None) is not _ORIGINAL_SOCKET_INIT:
+        socket.socket.__init__ = _ORIGINAL_SOCKET_INIT  # type: ignore[method-assign]
+        restored += 1
+    for name, original in _ORIGINAL_SOCKET_METHODS.items():
+        if getattr(socket.socket, name, None) is not original:
+            setattr(socket.socket, name, original)
+            restored += 1
+    if getattr(threading.Thread, "start", None) is not _ORIGINAL_THREAD_START:
+        threading.Thread.start = _ORIGINAL_THREAD_START
+        restored += 1
+    return restored

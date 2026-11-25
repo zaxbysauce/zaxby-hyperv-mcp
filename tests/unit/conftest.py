@@ -368,6 +368,28 @@ def _socket_10038_diagnosis_scoped(request):
         deactivate()
 
 
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    """The capture's removal must be the LAST word on the socket class.
+
+    A test's `monkeypatch` saves the value it FINDS, and while the capture
+    is installed that value is the CAPTURE'S WRAPPER. pytest finalizes the
+    `monkeypatch` fixture AFTER the capture's own teardown, so the undo puts
+    the wrapper back after the capture removed it. This hook runs after
+    every fixture finalizer, so the pristine method is restored last and the
+    rest of the unit suite never sees a patched socket class (issue #167
+    AC3, the round-23 plan gate's executed probe).
+
+    The repair is a no-op when nothing leaked, and a no-op while the capture
+    is installed (the capture then owns the patches).
+    """
+    result = yield
+    from _socket_10038_diagnosis import restore_pristine_socket_methods
+
+    restore_pristine_socket_methods()
+    return result
+
+
 # The synthetic instance of the WinError 10038 failure (issue #167 AC3) is
 # EXPECTED to fail: its fixture raises the 10038 during setup, by design, so
 # the capture can observe it. Without this marker the expected error is
