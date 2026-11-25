@@ -46,7 +46,17 @@ from pathlib import Path
 DIAG_DIR_ENV = "HYPERV_MCP_10038_DIAG_DIR"
 _WINERROR_10038 = 10038
 # `shutdown` is included because the family calls it on a closed socket and swallows the resulting WinError 10038 - without it, a real failure of that shape produced no artifact at all.
-_CAPTURED_OPERATIONS = ("recv", "accept", "sendall", "connect", "shutdown")
+# Every socket operation that touches the handle can raise the same
+# WinError 10038 (WSAENOTSOCK) on a closed socket, and the family calls
+# several of them inside exception-swallowing cleanup paths - so a real
+# failure of any of those shapes must leave an artifact. The census is
+# every handle-touching operation of `socket.socket`; `close` and `detach`
+# are deliberately absent (they do not use the handle).
+_CAPTURED_OPERATIONS = (
+    "accept", "bind", "connect", "getpeername", "getsockname", "getsockopt",
+    "listen", "recv", "recvfrom", "send", "sendall", "sendto", "setsockopt",
+    "shutdown",
+)
 
 
 def _diagnosis_dir() -> Path:

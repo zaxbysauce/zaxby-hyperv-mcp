@@ -332,10 +332,14 @@ def _local_assignments(func):
                     ast.Constant(value=None, lineno=node.lineno, col_offset=0)
                 )
         elif isinstance(node, ast.Import):
-            # `import x as generation` binds the name the same way.
+            # Python's binding rule: `import x as y` binds `y`, `import x`
+            # binds `x`, and `import a.b` binds `a` - the FIRST component.
             for alias in node.names:
-                bound = alias.asname
-                if not bound or bound in declared_elsewhere:
+                if alias.asname:
+                    bound = alias.asname
+                else:
+                    bound = alias.name.split(".", 1)[0]
+                if bound in declared_elsewhere:
                     continue
                 env.setdefault(bound, []).append(
                     ast.Constant(value=None, lineno=node.lineno, col_offset=0)
@@ -380,6 +384,11 @@ def _annotation_admits_none(annotation):
             return True
         # `typing.Optional[...]` is an attribute, not a name.
         if isinstance(node, ast.Attribute) and node.attr == "Optional":
+            return True
+        # `types.NoneType` IS `type(None)`, so it admits None.
+        if isinstance(node, ast.Attribute) and node.attr == "NoneType":
+            return True
+        if isinstance(node, ast.Name) and node.id == "NoneType":
             return True
     return False
 

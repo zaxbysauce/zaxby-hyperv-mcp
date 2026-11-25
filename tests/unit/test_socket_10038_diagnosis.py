@@ -238,6 +238,47 @@ def test_capture_records_a_10038_raised_by_shutdown(capture):
     assert artifacts[0]["winerror"] == 10038
 
 
+@pytest.fixture()
+def helper_started_thread_fixture():
+    """A FIXTURE that calls a HELPER which starts the thread.
+
+    The thread's own stack carries only its frames, and the helper sits
+    between the fixture and the start call - so the owning leg is the
+    fixture, not the helper.
+    """
+    errors: list[BaseException] = []
+
+    def helper_starts_thread():
+        def worker():
+            sock = _closed_socket()
+            sock.recv(64)
+
+        def guarded():
+            try:
+                worker()
+            except OSError as exc:  # the family's own swallow
+                errors.append(exc)
+
+        thread = threading.Thread(target=guarded)
+        thread.start()
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    helper_starts_thread()
+    assert errors and getattr(errors[0], "winerror", None) == 10038
+
+
+def test_capture_attributes_a_helper_started_thread_to_its_fixture(
+    capture, helper_started_thread_fixture
+):
+    """A thread started by a helper a FIXTURE called names the FIXTURE."""
+    artifacts = _artifacts(capture)
+    assert len(artifacts) == 1, f"expected one artifact, got {artifacts}"
+    assert artifacts[0]["owning_leg"] == "helper_started_thread_fixture", (
+        f"expected the owning fixture, got {artifacts[0]['owning_leg']!r}"
+    )
+
+
 def test_capture_ignores_a_non_10038_oserror(capture):
     """A different OSError is not captured, and it is not masked."""
     sock = socket.socket()
