@@ -338,7 +338,42 @@ def _own_scope_nodes(func):
         stack.extend(ast.iter_child_nodes(node))
 
 
-def _local_assignments(func):
+def _parameter_names(func):
+    """Every parameter name of a function (positional, keyword, *args, **kw)."""
+    args = func.args
+    names = {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs}
+    if args.vararg is not None:
+        names.add(args.vararg.arg)
+    if args.kwarg is not None:
+        names.add(args.kwarg.arg)
+    return names
+
+
+def _escaping_names(func):
+    """Names that a function nested at ANY depth below `func` rebinds in
+    `func`'s own scope.
+
+    A nested function's own `global`/`nonlocal` declarations rebind in the
+    enclosing scope. What a DEEPER descendant rebinds passes through the
+    intermediate function only when that function does not bind the name
+    itself (as a parameter or an own-scope binding): an intermediate binding
+    catches the rebinding, and the outer scope's name is untouched.
+    """
+    escaped: set[str] = set()
+    for node in _own_scope_nodes(func):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        declared: set[str] = set()
+        for statement in _own_scope_nodes(node):
+            if isinstance(statement, (ast.Global, ast.Nonlocal)):
+                declared.update(statement.names)
+        own = set(_local_assignments(node, _include_nested=False))
+        own |= _parameter_names(node)
+        escaped |= declared | (_escaping_names(node) - own)
+    return escaped
+
+
+def _local_assignments(func, _include_nested=True):
     """name -> the value nodes assigned to it anywhere in `func`.
 
     EVERY binding form is collected, not just `name = value`: a tuple
@@ -368,15 +403,16 @@ def _local_assignments(func):
     # the only one - an unknown value is added for it. The nested
     # function's own declarations are searched in ITS own scope, so a
     # conditional declaration inside it counts too.
-    for node in _own_scope_nodes(func):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for statement in _own_scope_nodes(node):
-                if isinstance(statement, (ast.Global, ast.Nonlocal)):
-                    for name in statement.names:
-                        env.setdefault(name, []).append(
-                            ast.Constant(value=None, lineno=statement.lineno,
-                                          col_offset=0)
-                        )
+    #
+    # The rebinding may sit at ANY depth below this scope: a `nonlocal x` two
+    # levels down binds in THIS scope too, unless an intermediate function
+    # binds `x` itself (then the intermediate's `x` is the one it rebinds).
+    if _include_nested:
+        for name in sorted(_escaping_names(func)):
+            env.setdefault(name, []).append(
+                ast.Constant(value=None, lineno=getattr(func, "lineno", 0),
+                             col_offset=0)
+            )
 
     def bind(target, value):
         for name in _bound_names(target):

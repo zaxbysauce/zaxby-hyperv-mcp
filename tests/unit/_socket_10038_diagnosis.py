@@ -636,7 +636,7 @@ class SocketDiagnosis:
                 # belongs to no live activation.
                 if (_ACTIVE_INSTALLATION is token
                         and getattr(exc, "winerror", None) == _WINERROR_10038):
-                    self._record("__init__", exc, sock)
+                    self._record("__init__", exc, sock, token)
                 raise
 
         _init.__name__ = "__init__"
@@ -670,7 +670,7 @@ class SocketDiagnosis:
                 # live activation.
                 if (_ACTIVE_INSTALLATION is token
                         and getattr(exc, "winerror", None) == _WINERROR_10038):
-                    self._record(operation, exc, sock)
+                    self._record(operation, exc, sock, token)
                 raise
             if _ACTIVE_INSTALLATION is not token:
                 # The same rule for the provenance updates: they belong to
@@ -700,41 +700,50 @@ class SocketDiagnosis:
 
     # ---- the artifact ----
 
-    def _record(self, operation: str, exc: BaseException, sock) -> None:
-        """Write the diagnosis. Never raises: the test failure must win."""
+    def _record(self, operation: str, exc: BaseException, sock,
+                token: object) -> None:
+        """Write the diagnosis. Never raises: the test failure must win.
+
+        The activation check is made HERE, under the lock uninstall() takes
+        to end the activation, so the check and the commit are one step: a
+        call that passed its wrapper's check and then paused cannot write
+        after the deactivation completed.
+        """
         try:
             with self._lock:
+                if _ACTIVE_INSTALLATION is not token:
+                    return
                 self._counter += 1
                 counter = self._counter
                 entry = _ORIGINS.get(id(sock))
                 origin = "unknown"
                 if entry is not None and entry[0]() is sock:
                     origin = entry[1]
-            leg = _owning_leg()
-            directory = _diagnosis_dir()
-            directory.mkdir(parents=True, exist_ok=True)
-            # Name components: leg, pid, the process-wide sequence (the
-            # uniqueness guarantee - never reset by a re-activation, never
-            # shared by concurrent writers), then the per-activation counter
-            # (how many failures THIS activation has recorded). The sequence
-            # alone makes the name unique for the process lifetime; the
-            # counter is kept for readability only.
-            name = f"socket-10038-{_safe_component(leg)}-{os.getpid()}-{_next_process_sequence()}-{counter}.json"
-            artifact = {
-                "winerror": _WINERROR_10038,
-                "error": str(exc),
-                "operation": operation,
-                "owning_leg": leg,
-                "handle_origin": origin,
-                "pid": os.getpid(),
-                "recorded_at": time.time(),
-                "python": sys.version.split()[0],
-            }
-            target = directory / name
-            tmp = target.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(artifact, indent=2, sort_keys=True),
-                           encoding="utf-8")
-            tmp.replace(target)
+                leg = _owning_leg()
+                directory = _diagnosis_dir()
+                directory.mkdir(parents=True, exist_ok=True)
+                # Name components: leg, pid, the process-wide sequence (the
+                # uniqueness guarantee - never reset by a re-activation, never
+                # shared by concurrent writers), then the per-activation counter
+                # (how many failures THIS activation has recorded). The sequence
+                # alone makes the name unique for the process lifetime; the
+                # counter is kept for readability only.
+                name = f"socket-10038-{_safe_component(leg)}-{os.getpid()}-{_next_process_sequence()}-{counter}.json"
+                artifact = {
+                    "winerror": _WINERROR_10038,
+                    "error": str(exc),
+                    "operation": operation,
+                    "owning_leg": leg,
+                    "handle_origin": origin,
+                    "pid": os.getpid(),
+                    "recorded_at": time.time(),
+                    "python": sys.version.split()[0],
+                }
+                target = directory / name
+                tmp = target.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(artifact, indent=2, sort_keys=True),
+                               encoding="utf-8")
+                tmp.replace(target)
         except Exception:  # noqa: BLE001 - a writer failure must not mask the test
             return
 

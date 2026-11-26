@@ -538,3 +538,94 @@ def _construct_once():
         socket.socket(fileno=1)
     except OSError:
         pass
+
+
+def _pause_between_check_and_commit(monkeypatch):
+    """Make the capture's recording WAIT after the wrapper's token check.
+
+    Returns (reached, release): the wrapper has passed its own activation
+    check and called _record when `reached` is set; _record proceeds when
+    `release` is set. That is exactly the window between the check and the
+    commit.
+    """
+    import threading
+
+    import _socket_10038_diagnosis as capture
+
+    reached = threading.Event()
+    release = threading.Event()
+    instance = capture._ACTIVE
+    original = instance._record
+
+    def paused(*args, **kwargs):
+        reached.set()
+        release.wait(30)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(instance, "_record", paused)
+    return reached, release
+
+
+def test_o_a_call_paused_between_the_check_and_the_commit_records_nothing(
+        tmp_path, monkeypatch):
+    """The activation check and the commit are ONE step.
+
+    A call that passed the wrapper's token check and then paused before the
+    recording must not write after the deactivation completed - the check
+    that counts is the one made under the lock that ends the activation.
+    """
+    import threading
+
+    from _socket_10038_diagnosis import activate, deactivate
+
+    monkeypatch.setenv("HYPERV_MCP_10038_DIAG_DIR", str(tmp_path))
+
+    def failing(self, *args, **kwargs):
+        error = OSError("the socket was invalidated")
+        error.winerror = 10038
+        raise error
+
+    monkeypatch.setattr(socket.socket, "recv", failing)
+    activate()
+    reached, release = _pause_between_check_and_commit(monkeypatch)
+    thread = threading.Thread(target=_recv_once)
+    try:
+        thread.start()
+        assert reached.wait(30), "the wrapper never reached the recording"
+    finally:
+        deactivate()
+        release.set()
+        thread.join(30)
+    assert not list(tmp_path.iterdir()), (
+        "a call that paused between the check and the commit still recorded "
+        f"a diagnosis: {list(tmp_path.iterdir())}")
+
+
+def test_p_a_constructor_paused_between_the_check_and_the_commit_records_nothing(
+        tmp_path, monkeypatch):
+    """The same single-step rule for the CONSTRUCTOR's recording."""
+    import threading
+
+    from _socket_10038_diagnosis import activate, deactivate
+
+    monkeypatch.setenv("HYPERV_MCP_10038_DIAG_DIR", str(tmp_path))
+
+    def failing(self, *args, **kwargs):
+        error = OSError("the socket was invalidated")
+        error.winerror = 10038
+        raise error
+
+    monkeypatch.setattr(socket.socket, "__init__", failing)
+    activate()
+    reached, release = _pause_between_check_and_commit(monkeypatch)
+    thread = threading.Thread(target=_construct_once)
+    try:
+        thread.start()
+        assert reached.wait(30), "the constructor never reached the recording"
+    finally:
+        deactivate()
+        release.set()
+        thread.join(30)
+    assert not list(tmp_path.iterdir()), (
+        "a constructor that paused between the check and the commit still "
+        f"recorded a diagnosis: {list(tmp_path.iterdir())}")
