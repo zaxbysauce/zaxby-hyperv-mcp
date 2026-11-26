@@ -878,14 +878,34 @@ def _store_generation_contracts() -> dict[str, tuple[int | None, bool, bool]]:
             if not isinstance(cls, ast.ClassDef):
                 continue
             for stmt in cls.body:
-                if (isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Name)
+                if isinstance(stmt, ast.Assign):
+                    alias_targets = stmt.targets
+                elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+                    alias_targets = [stmt.target]
+                else:
+                    continue
+                if (isinstance(stmt.value, ast.Name)
                         and stmt.value.id in contracts):
-                    for target in stmt.targets:
+                    for target in alias_targets:
                         if (isinstance(target, ast.Name)
                                 and target.id not in contracts):
                             contracts[target.id] = contracts[stmt.value.id]
                             changed = True
     return contracts
+
+def _helper_callee(node):
+    """The name a call reaches a tracked helper by: `f(...)` or `holder.f(...)`.
+
+    A store `op_*` attribute call is not a helper call (it is classified by the
+    store's own contract).
+    """
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute) and not func.attr.startswith("op_"):
+        return func.attr
+    return None
+
 
 def _is_store_write(node) -> bool:
     """True when the call writes through the store.
@@ -1310,6 +1330,25 @@ def _classify():
                     or any(kw.arg in ("generation", None) for kw in inner.keywords)
                 ):
                     class_scope_writes.add(inner)
+    # A store method that escapes the direct-call census - referenced as a
+    # VALUE (a `partial(store.op_x, ...)` argument, a tuple-unpacking alias, an
+    # alias assignment) or fetched by a LITERAL `getattr` name - FAILS CLOSED.
+    call_funcs = {id(call.func) for call in ast.walk(tree) if isinstance(call, ast.Call)}
+    for ref in ast.walk(tree):
+        escaped = None
+        if (isinstance(ref, ast.Attribute) and ref.attr in store_contracts
+                and id(ref) not in call_funcs):
+            escaped = ref.attr
+        elif (isinstance(ref, ast.Call) and isinstance(ref.func, ast.Name)
+              and ref.func.id == "getattr" and len(ref.args) >= 2
+              and isinstance(ref.args[1], ast.Constant)
+              and isinstance(ref.args[1].value, str)
+              and ref.args[1].value in store_contracts):
+            escaped = ref.args[1].value
+        if escaped is not None:
+            ref_chain = _chain_of(owner, ref)
+            direct_sites.append(((ref_chain[-1].name if ref_chain else "<module>",
+                                  escaped, None), ref.lineno, lines[ref.lineno - 1]))
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -1328,8 +1367,8 @@ def _classify():
         # A positional `*args` spread into a helper whose generation is
         # POSITIONAL may bind it: the spread's contents are unknowable, so the
         # call is UNRESOLVED (the store branch below already fails closed).
-        if (isinstance(node.func, ast.Name) and node.func.id in helper_contracts
-                and helper_contracts[node.func.id][0] is not None
+        if (_helper_callee(node) in helper_contracts
+                and helper_contracts[_helper_callee(node)][0] is not None
                 and any(isinstance(arg, ast.Starred) for arg in node.args)):
             direct_sites.append((identity, node.lineno, lines[node.lineno - 1]))
         # An OMITTED generation binds the callee's DEFAULT: when that default is
@@ -1338,8 +1377,8 @@ def _classify():
         omitted_callee = None
         if _is_store_write(node):
             omitted_callee = store_contracts.get(_method_of(node))
-        elif isinstance(node.func, ast.Name):
-            omitted_callee = helper_contracts.get(node.func.id)
+        else:
+            omitted_callee = helper_contracts.get(_helper_callee(node))
         if omitted_callee is not None and omitted_callee[2]:
             supplied = (
                 any(kw.arg in ("generation", None) for kw in node.keywords)
@@ -1396,8 +1435,7 @@ def _classify():
                 value = _spread_generation_value(keyword.value)
                 if value is None:
                     if _is_store_write(node) or (
-                        isinstance(node.func, ast.Name)
-                        and node.func.id in helper_contracts
+                        _helper_callee(node) in helper_contracts
                     ):
                         # A COMPUTED spread carries keys that are not
                         # statically visible, so it can supply a None
