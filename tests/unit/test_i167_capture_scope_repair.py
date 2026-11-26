@@ -437,3 +437,57 @@ def test_l_a_reinstalled_instance_does_not_reactivate_an_earlier_wrapper(tmp_pat
     finally:
         diagnosis.uninstall()
         socket.socket.setsockopt = _PRISTINE_SETSOCKOPT
+
+
+def test_m_a_call_in_flight_when_the_capture_ends_records_nothing(tmp_path,
+                                                                  monkeypatch):
+    """A call that was ALREADY IN FLIGHT when the capture ended records nothing.
+
+    The wrapper checks its installation BEFORE the call, so a call that
+    blocks inside the socket method and raises the WinError 10038 after the
+    capture was deactivated used to write a diagnosis - outside the
+    activation it belonged to. The recording is bound to the installation
+    that COMMITS it.
+    """
+    import threading
+
+    from _socket_10038_diagnosis import activate, deactivate
+
+    monkeypatch.setenv("HYPERV_MCP_10038_DIAG_DIR", str(tmp_path))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking(self, *args, **kwargs):
+        entered.set()
+        release.wait(30)
+        error = OSError("the socket was invalidated")
+        error.winerror = 10038
+        raise error
+
+    monkeypatch.setattr(socket.socket, "recv", blocking)
+    activate()
+    thread = threading.Thread(target=lambda: _recv_once())
+    try:
+        thread.start()
+        assert entered.wait(30), "the operation did not start"
+    finally:
+        deactivate()
+        release.set()
+        thread.join(30)
+    assert not list(tmp_path.iterdir()), (
+        "an operation that was in flight when the capture ended still recorded "
+        f"a diagnosis: {list(tmp_path.iterdir())}")
+
+
+def _recv_once():
+    """One recv on a fresh socket; the error is expected."""
+    sock = socket.socket()
+    try:
+        sock.recv(1)
+    except OSError:
+        pass
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass

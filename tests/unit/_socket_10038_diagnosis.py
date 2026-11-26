@@ -658,9 +658,18 @@ class SocketDiagnosis:
             try:
                 result = original(sock, *args, **kwargs)
             except OSError as exc:
-                if getattr(exc, "winerror", None) == _WINERROR_10038:
+                # The recording is bound to the installation that COMMITS it:
+                # the call may have been in flight when the activation
+                # ended, and a diagnosis written after that belongs to no
+                # live activation.
+                if (_ACTIVE_INSTALLATION is token
+                        and getattr(exc, "winerror", None) == _WINERROR_10038):
                     self._record(operation, exc, sock)
                 raise
+            if _ACTIVE_INSTALLATION is not token:
+                # The same rule for the provenance updates: they belong to
+                # the activation that is live when they are committed.
+                return result
             if operation in ("bind", "listen"):
                 self._note_listener_step(sock, operation)
             if operation == "dup" and isinstance(result, socket.socket):
