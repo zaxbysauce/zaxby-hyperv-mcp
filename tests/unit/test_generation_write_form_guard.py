@@ -1595,16 +1595,21 @@ def test_no_direct_generation_form_is_unresolved():
     """
     _local, _aliased, _parameter, all_sites = _classify()
     omitted = [site for site in all_sites if len(site) > 3]
-    found = {(site[0], site[2].strip()) for site in omitted}
+    # Each reviewed omission is pinned by identity, exact line AND multiplicity:
+    # the first occurrence is the reviewed one, a second is unresolved.
+    seen: dict[tuple, int] = {}
+    unresolved = []
+    for site in omitted:
+        key = (site[0], site[2].strip())
+        seen[key] = seen.get(key, 0) + 1
+        if (_REVIEWED_OMITTED_GENERATION_SITES.get(site[0]) != site[2].strip()
+                or seen[key] > 1):
+            unresolved.append(site)
     expected = {(key, text) for key, text in _REVIEWED_OMITTED_GENERATION_SITES.items()}
-    assert found >= expected, (
-        f"AC1: a reviewed omitted-generation site is stale: {sorted(expected - found)}"
+    assert expected <= set(seen), (
+        f"AC1: a reviewed omitted-generation site is stale: {sorted(expected - set(seen))}"
     )
-    direct_sites = [
-        site for site in all_sites
-        if not (len(site) > 3
-                and _REVIEWED_OMITTED_GENERATION_SITES.get(site[0]) == site[2].strip())
-    ]
+    direct_sites = [site for site in all_sites if len(site) <= 3] + unresolved
     assert not direct_sites, (
         f"AC1: unresolved direct expression generation feed(s) at "
         f"{[(site[1], site[2].strip()) for site in direct_sites]} - a direct "
