@@ -472,7 +472,7 @@ class SocketDiagnosis:
 
     def install(self) -> None:
         global _INSTALLED_BY
-        with self._lock:
+        with _OWNERSHIP_LOCK, self._lock:
             if self._saved:
                 return
             if _INSTALLED_BY is not None and _INSTALLED_BY is not self:
@@ -518,7 +518,7 @@ class SocketDiagnosis:
 
     def uninstall(self) -> None:
         global _INSTALLED_BY
-        with self._lock:
+        with _OWNERSHIP_LOCK, self._lock:
             if not self._saved:
                 return
             if _INSTALLED_BY is self:
@@ -808,6 +808,12 @@ def _next_process_sequence() -> int:
 
 # Capture the shipped connector NOW, before a test can substitute it.
 _original_hvsock_connect()
+
+# The lock that serializes the ownership of the process-global patches
+# ACROSS instances (each instance's own lock cannot: two threads installing
+# different instances hold different locks). Always taken BEFORE an
+# instance's own lock.
+_OWNERSHIP_LOCK = threading.Lock()
 
 # The instance that currently owns the process-global patches.
 _INSTALLED_BY: "SocketDiagnosis | None" = None

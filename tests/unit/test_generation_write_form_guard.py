@@ -242,6 +242,11 @@ def _scope_shadowed_names(tree) -> set[str]:
                 names.add(args.vararg.arg)
             if args.kwarg:
                 names.add(args.kwarg.arg)
+            # A walrus in the lambda's body (or in a comprehension inside it)
+            # binds in the LAMBDA's scope: its only other binding form.
+            for sub in ast.walk(node.body):
+                if isinstance(sub, ast.NamedExpr):
+                    names.update(_bound_names(sub.target))
         elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp,
                                ast.GeneratorExp)):
             for generator in node.generators:
@@ -784,6 +789,22 @@ def _direct_form_is_closed(node, shadowed=frozenset()) -> bool:
 
 
 
+def _parameter_admits_none(arg, default) -> bool:
+    """Whether a store parameter can be fed None without a call-time error.
+
+    The default is None-capable by construction: nothing in an unannotated
+    parameter says it cannot take None, and a `None` DEFAULT admits it
+    whatever the annotation says (`generation: int = None`). Only an
+    annotated parameter whose annotation does not admit None and whose
+    default is not None certifies a closed feed.
+    """
+    if arg.annotation is None:
+        return True
+    if isinstance(default, ast.Constant) and default.value is None:
+        return True
+    return _annotation_admits_none(arg.annotation)
+
+
 def _store_generation_contracts() -> dict[str, tuple[int | None, bool]]:
     """The store's `generation` contract, per write method.
 
@@ -809,20 +830,24 @@ def _store_generation_contracts() -> dict[str, tuple[int | None, bool]]:
             continue
         args = node.args
         positional = list(getattr(args, "posonlyargs", [])) + list(args.args)
+        # The defaults align with the LAST parameters of the positional list.
+        first_default = len(positional) - len(args.defaults)
         for index, arg in enumerate(positional):
             if arg.arg == "generation":
+                default = (args.defaults[index - first_default]
+                           if index >= first_default else None)
                 # `self` is not an argument of the call.
                 contracts[node.name] = (
                     index - 1,
-                    _annotation_admits_none(arg.annotation),
+                    _parameter_admits_none(arg, default),
                 )
                 break
         else:
-            for arg in args.kwonlyargs:
+            for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
                 if arg.arg == "generation":
                     contracts[node.name] = (
                         None,
-                        _annotation_admits_none(arg.annotation),
+                        _parameter_admits_none(arg, default),
                     )
                     break
     return contracts

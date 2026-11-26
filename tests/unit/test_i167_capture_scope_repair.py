@@ -672,8 +672,6 @@ def _run_paused(action, reached, release):
 def test_q_a_listener_step_paused_before_its_commit_records_nothing(monkeypatch):
     """The listener-step provenance commit is bound to its installation under
     the lock the deactivation takes."""
-    import weakref
-
     import _socket_10038_diagnosis as capture
     from _socket_10038_diagnosis import activate
 
@@ -814,3 +812,71 @@ def test_t_a_thread_leg_commit_is_final_when_the_capture_ends(monkeypatch):
         assert during == after, (
             "the deactivation completed while a thread-leg commit was "
             "pending, and the registry changed after it")
+
+
+def test_u_installation_ownership_is_serialized_across_instances(monkeypatch):
+    """Two instances installing from two threads cannot both pass the
+    ownership check: the check, the claim and the release share ONE lock.
+
+    The first install is held INSIDE the shared lock; the second must not get
+    past it until the first releases, and then it must be refused.
+    """
+    import threading
+
+    import _socket_10038_diagnosis as capture
+
+    capture.deactivate()  # the family fixture's own installation
+    real = capture._OWNERSHIP_LOCK
+    inside = threading.Event()
+    proceed = threading.Event()
+
+    class Gate:
+        def __init__(self):
+            self.entered = 0
+
+        def __enter__(self):
+            real.acquire()
+            self.entered += 1
+            if self.entered == 1:
+                inside.set()
+                proceed.wait(30)
+            return self
+
+        def __exit__(self, *args):
+            real.release()
+
+    gate = Gate()
+    monkeypatch.setattr(capture, "_OWNERSHIP_LOCK", gate)
+    first, second = capture.SocketDiagnosis(), capture.SocketDiagnosis()
+    outcomes = {}
+    done_second = threading.Event()
+
+    def run(name, instance, done=None):
+        try:
+            instance.install()
+            outcomes[name] = "installed"
+        except RuntimeError:
+            outcomes[name] = "refused"
+        if done is not None:
+            done.set()
+
+    t_first = threading.Thread(target=run, args=("first", first))
+    t_second = threading.Thread(target=run, args=("second", second, done_second))
+    try:
+        t_first.start()
+        assert inside.wait(30), "the first install never entered the lock"
+        t_second.start()
+        assert not done_second.wait(0.5), (
+            "the second install got past the ownership lock while the first "
+            "was still inside it")
+    finally:
+        proceed.set()
+        t_first.join(30)
+        t_second.join(30)
+        first.uninstall()
+        second.uninstall()
+    assert outcomes == {"first": "installed", "second": "refused"}, outcomes
+    # install x2 and the first's uninstall (+ the second's no-op uninstall)
+    assert gate.entered >= 3, (
+        "uninstall did not take the shared ownership lock "
+        f"(entered {gate.entered} times)")
