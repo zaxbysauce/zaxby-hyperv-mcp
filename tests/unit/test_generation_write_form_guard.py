@@ -792,43 +792,36 @@ def _direct_form_is_closed(node, shadowed=frozenset()) -> bool:
 
 
 
-def _parameter_admits_none(func, arg, default) -> bool:
+# The two store methods REVIEWED to reject a None generation: each binds
+# `int(generation)` into its UPDATE's parameters, so a None feed raises a
+# TypeError before any SQL runs. The exact reviewed line is pinned.
+_REVIEWED_CLOSED_STORE_METHODS = {
+    "op_mark_send": "(str(sent), self.now(), op_id, int(generation)),",
+    "op_mark_send_and_dirty_epoch": "(self.now(), op_id, int(generation)),",
+}
+
+
+def _parameter_admits_none(func, arg, default, source) -> bool:
     """Whether a None feed into a store parameter is treated as live.
 
-    ALWAYS, unless the callee's BODY proves a None feed raises before any
-    write. An annotation (or a missing default) is not that proof: Python does
-    not enforce annotations, and the method body decides what None means -
-    `op_heartbeat` reads it as "no generation predicate" whatever its
-    signature says (the round-34 plan critic's executed probe: the heartbeat
-    moved while the row generation stayed put). The body proves rejection only
-    when EVERY use of the parameter is the sole argument of `int(...)` and that
-    call sits inside the arguments of an `execute(...)` call: the coercion is
-    then evaluated, and raises a TypeError on None, before the SQL runs.
+    ALWAYS, unless the method is one of the two REVIEWED to coerce the
+    parameter before its write AND that reviewed line is still present exactly
+    once AND the parameter is loaded exactly once in the whole method. An
+    annotation, a default or a heuristic body walk is never the proof: Python
+    does not enforce annotations, the method body decides what None means
+    (`op_heartbeat` reads it as "no generation predicate"), and a static walk
+    cannot see which branch runs.
     """
-    name = arg.arg
-    uses = sum(
+    reviewed = _REVIEWED_CLOSED_STORE_METHODS.get(func.name)
+    if reviewed is None:
+        return True
+    segment = ast.get_source_segment(source, func) or ""
+    loads = sum(
         1 for node in ast.walk(func)
-        if isinstance(node, ast.Name) and node.id == name
+        if isinstance(node, ast.Name) and node.id == arg.arg
         and isinstance(node.ctx, ast.Load)
     )
-    if uses == 0:
-        return True  # an unused parameter proves nothing
-    coerced = 0
-    for call in ast.walk(func):
-        if not (isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Attribute)
-                and call.func.attr == "execute"):
-            continue
-        for argument in list(call.args) + [kw.value for kw in call.keywords]:
-            for inner in ast.walk(argument):
-                if (isinstance(inner, ast.Call)
-                        and isinstance(inner.func, ast.Name)
-                        and inner.func.id == "int"
-                        and len(inner.args) == 1 and not inner.keywords
-                        and isinstance(inner.args[0], ast.Name)
-                        and inner.args[0].id == name):
-                    coerced += 1
-    return coerced != uses
+    return not (segment.count(reviewed) == 1 and loads == 1)
 
 
 def _store_generation_contracts() -> dict[str, tuple[int | None, bool]]:
@@ -845,7 +838,8 @@ def _store_generation_contracts() -> dict[str, tuple[int | None, bool]]:
     """
     contracts: dict[str, tuple[int | None, bool]] = {}
     try:
-        tree = ast.parse(_STORE.read_text(encoding="utf-8"))
+        store_source = _STORE.read_text(encoding="utf-8")
+        tree = ast.parse(store_source)
     except (OSError, SyntaxError):
         return contracts
     for node in ast.walk(tree):
@@ -862,7 +856,7 @@ def _store_generation_contracts() -> dict[str, tuple[int | None, bool]]:
                 # `self` is not an argument of the call.
                 contracts[node.name] = (
                     index - 1,
-                    _parameter_admits_none(node, arg, default),
+                    _parameter_admits_none(node, arg, default, store_source),
                 )
                 break
         else:
@@ -870,7 +864,7 @@ def _store_generation_contracts() -> dict[str, tuple[int | None, bool]]:
                 if arg.arg == "generation":
                     contracts[node.name] = (
                         None,
-                        _parameter_admits_none(node, arg, default),
+                        _parameter_admits_none(node, arg, default, store_source),
                     )
                     break
     return contracts

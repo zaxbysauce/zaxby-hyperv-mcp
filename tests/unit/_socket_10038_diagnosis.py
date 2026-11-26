@@ -813,7 +813,7 @@ _original_hvsock_connect()
 # ACROSS instances (each instance's own lock cannot: two threads installing
 # different instances hold different locks). Always taken BEFORE an
 # instance's own lock.
-_OWNERSHIP_LOCK = threading.Lock()
+_OWNERSHIP_LOCK = threading.RLock()
 
 # The instance that currently owns the process-global patches.
 _INSTALLED_BY: "SocketDiagnosis | None" = None
@@ -830,19 +830,23 @@ _ACTIVE: SocketDiagnosis | None = None
 def activate() -> SocketDiagnosis:
     """Install the capture (idempotent) and return the active instance."""
     global _ACTIVE, _INSTALLED_BY
-    if _ACTIVE is None:
-        _ACTIVE = SocketDiagnosis()
-    _ACTIVE.install()
-    _INSTALLED_BY = _ACTIVE
-    return _ACTIVE
+    # The selection, the installation and the publication of the active
+    # instance are ONE step with respect to every other lifecycle call.
+    with _OWNERSHIP_LOCK:
+        if _ACTIVE is None:
+            _ACTIVE = SocketDiagnosis()
+        _ACTIVE.install()
+        _INSTALLED_BY = _ACTIVE
+        return _ACTIVE
 
 
 def deactivate() -> None:
     """Remove the capture."""
     global _ACTIVE
-    if _ACTIVE is not None:
-        _ACTIVE.uninstall()
-        _ACTIVE = None
+    with _OWNERSHIP_LOCK:
+        if _ACTIVE is not None:
+            _ACTIVE.uninstall()
+            _ACTIVE = None
 
 
 def restore_pristine_socket_methods() -> int:

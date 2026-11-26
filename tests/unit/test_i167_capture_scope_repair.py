@@ -880,3 +880,63 @@ def test_u_installation_ownership_is_serialized_across_instances(monkeypatch):
     assert gate.entered >= 3, (
         "uninstall did not take the shared ownership lock "
         f"(entered {gate.entered} times)")
+
+
+def test_v_competing_public_activations_cannot_orphan_the_installed_capture(
+        monkeypatch):
+    """Two threads calling the PUBLIC activate() cannot leave a patched socket
+    class that deactivate() no longer reaches.
+
+    The first activation is paused while it CONSTRUCTS its instance, before it
+    publishes it. Without a lock around the public selection, the second
+    activation sees no active instance, builds and installs its own, and the
+    first then overwrites the published instance with one whose install is
+    refused - so deactivate() removes the refused instance and the installed
+    one keeps its process-global patches.
+    """
+    import threading
+
+    import _socket_10038_diagnosis as capture
+
+    capture.deactivate()  # the family fixture's own installation
+    real_class = capture.SocketDiagnosis
+    inside = threading.Event()
+    proceed = threading.Event()
+    state = {"first": True}
+
+    class PausingInstance(real_class):
+        def __init__(self):
+            if state["first"]:
+                state["first"] = False
+                inside.set()
+                proceed.wait(30)
+            super().__init__()
+
+    monkeypatch.setattr(capture, "SocketDiagnosis", PausingInstance)
+    finished = threading.Event()
+
+    def activate_quietly(done=None):
+        try:
+            capture.activate()
+        except RuntimeError:
+            pass  # a refused competing installation
+        if done is not None:
+            done.set()
+
+    first = threading.Thread(target=activate_quietly)
+    second = threading.Thread(target=activate_quietly, args=(finished,))
+    try:
+        first.start()
+        assert inside.wait(30), "the first activation never reached its instance"
+        second.start()
+        finished.wait(0.5)  # with the lock the second must still be waiting
+    finally:
+        proceed.set()
+        first.join(30)
+        second.join(30)
+        capture.deactivate()
+    leftovers = [name for name, original in capture._ORIGINAL_SOCKET_METHODS.items()
+                 if getattr(socket.socket, name, None) is not original]
+    assert not leftovers, (
+        "deactivate() left capture wrappers on the socket class after two "
+        f"competing public activations: {leftovers}")
