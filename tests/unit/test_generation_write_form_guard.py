@@ -824,7 +824,7 @@ def _parameter_admits_none(func, arg, default, source) -> bool:
     return not (segment.count(reviewed) == 1 and loads == 1)
 
 
-def _store_generation_contracts() -> dict[str, tuple[int | None, bool]]:
+def _store_generation_contracts() -> dict[str, tuple[int | None, bool, bool]]:
     """The store's `generation` contract, per write method.
 
     The value is (the positional index, whether the parameter admits
@@ -836,7 +836,7 @@ def _store_generation_contracts() -> dict[str, tuple[int | None, bool]]:
     never certifies a feed closed, because annotations are not enforced
     and the body decides what None means.
     """
-    contracts: dict[str, tuple[int | None, bool]] = {}
+    contracts: dict[str, tuple[int | None, bool, bool]] = {}
     try:
         store_source = _STORE.read_text(encoding="utf-8")
         tree = ast.parse(store_source)
@@ -857,6 +857,7 @@ def _store_generation_contracts() -> dict[str, tuple[int | None, bool]]:
                 contracts[node.name] = (
                     index - 1,
                     _parameter_admits_none(node, arg, default, store_source),
+                    _default_is_none(default),
                 )
                 break
         else:
@@ -865,6 +866,7 @@ def _store_generation_contracts() -> dict[str, tuple[int | None, bool]]:
                     contracts[node.name] = (
                         None,
                         _parameter_admits_none(node, arg, default, store_source),
+                        _default_is_none(default),
                     )
                     break
     return contracts
@@ -1130,6 +1132,40 @@ def _function_shadowed_coercions(func, env, table) -> set[str]:
     return shadowed
 
 
+def _default_is_none(default) -> bool:
+    """True when a parameter's DEFAULT is the constant None (no default: False)."""
+    return isinstance(default, ast.Constant) and default.value is None
+
+
+def _helper_generation_contracts(tree) -> dict[str, tuple[int | None, bool, bool]]:
+    """Every function that takes a `generation` parameter is a tracked HELPER.
+
+    The value is (the positional index or None for a keyword-only parameter,
+    True, whether the DEFAULT is None) - the same shape as the store's
+    contracts, so a call to a helper is classified by the same rules,
+    including by OMISSION.
+    """
+    contracts: dict[str, tuple[int | None, bool, bool]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        args = node.args
+        positional = list(args.posonlyargs) + list(args.args)
+        first_default = len(positional) - len(args.defaults)
+        for index, arg in enumerate(positional):
+            if arg.arg == "generation":
+                default = (args.defaults[index - first_default]
+                           if index >= first_default else None)
+                contracts[node.name] = (index, True, _default_is_none(default))
+                break
+        else:
+            for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
+                if arg.arg == "generation":
+                    contracts[node.name] = (None, True, _default_is_none(default))
+                    break
+    return contracts
+
+
 def _classify():
     """Return (local, aliased, parameter, direct) site lists.
 
@@ -1180,6 +1216,7 @@ def _classify():
     }
     shadowed = _scope_shadowed_names(tree)
     store_contracts = _store_generation_contracts()
+    helper_contracts = _helper_generation_contracts(tree)
 
     shadowed_by_func = {
         func: module_shadowed | _function_shadowed_coercions(
@@ -1227,6 +1264,24 @@ def _classify():
         if node in class_scope_writes:
             direct_sites.append((identity, node.lineno, lines[node.lineno - 1]))
             continue
+        # An OMITTED generation binds the callee's DEFAULT: when that default is
+        # None the store reads it as "no generation predicate", a live fail-open
+        # feed with no argument to classify.
+        omitted_callee = None
+        if _is_store_write(node):
+            omitted_callee = store_contracts.get(_method_of(node))
+        elif isinstance(node.func, ast.Name):
+            omitted_callee = helper_contracts.get(node.func.id)
+        if omitted_callee is not None and omitted_callee[2]:
+            supplied = (
+                any(kw.arg in ("generation", None) for kw in node.keywords)
+                or any(isinstance(arg, ast.Starred) for arg in node.args)
+                or (omitted_callee[0] is not None
+                    and omitted_callee[0] < len(node.args))
+            )
+            if not supplied:
+                direct_sites.append(
+                    (identity, node.lineno, lines[node.lineno - 1], "omitted"))
         contract = store_contracts.get(_method_of(node))
         # Every generation feed of this call, classified by the same rules:
         # the POSITIONAL one (when the store's signature places it) and the
@@ -1271,7 +1326,10 @@ def _classify():
                 # executed probe).
                 value = _spread_generation_value(keyword.value)
                 if value is None:
-                    if _is_store_write(node):
+                    if _is_store_write(node) or (
+                        isinstance(node.func, ast.Name)
+                        and node.func.id in helper_contracts
+                    ):
                         # A COMPUTED spread carries keys that are not
                         # statically visible, so it can supply a None
                         # generation without entering any site list: it
@@ -1513,6 +1571,19 @@ def test_the_aliased_capture_keeps_its_disclosed_fail_open_form():
     )
 
 
+# Reviewed OMITTED-generation feeds. A call that omits `generation` binds the
+# callee's None default (no generation predicate). These three run AFTER a
+# fail-closed `op_fence` has moved the row's authority, on a row whose executor
+# was already refused or fenced, so the unconditional write is deliberate. A site
+# is keyed by (function, method, state) and its exact stripped line; an unlisted
+# omission is unresolved and a listed one that no longer exists fails as stale.
+_REVIEWED_OMITTED_GENERATION_SITES = {
+    ("_inline_residue_recovery", "op_transition", "OP_FAILED"): "moved = bool(store.op_transition(",
+    ("_inline_residue_recovery", "op_release_idem", None): "store.op_release_idem(op_id)",
+    ("_stranded_presend_key_recovery", "op_release_idem", None): "store.op_release_idem(existing.op_id)",
+}
+
+
 def test_no_direct_generation_form_is_unresolved():
     """Every direct expression feed is on the reviewed closed list.
 
@@ -1522,7 +1593,18 @@ def test_no_direct_generation_form_is_unresolved():
     is reported here and this assertion fires - a new feed must earn its
     pin instead of arriving unnoticed.
     """
-    _local, _aliased, _parameter, direct_sites = _classify()
+    _local, _aliased, _parameter, all_sites = _classify()
+    omitted = [site for site in all_sites if len(site) > 3]
+    found = {(site[0], site[2].strip()) for site in omitted}
+    expected = {(key, text) for key, text in _REVIEWED_OMITTED_GENERATION_SITES.items()}
+    assert found >= expected, (
+        f"AC1: a reviewed omitted-generation site is stale: {sorted(expected - found)}"
+    )
+    direct_sites = [
+        site for site in all_sites
+        if not (len(site) > 3
+                and _REVIEWED_OMITTED_GENERATION_SITES.get(site[0]) == site[2].strip())
+    ]
     assert not direct_sites, (
         f"AC1: unresolved direct expression generation feed(s) at "
         f"{[(site[1], site[2].strip()) for site in direct_sites]} - a direct "
