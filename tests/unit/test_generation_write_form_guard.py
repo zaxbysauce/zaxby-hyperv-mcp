@@ -850,7 +850,7 @@ def _store_generation_contracts() -> dict[str, tuple[int | None, bool, bool]]:
         # The defaults align with the LAST parameters of the positional list.
         first_default = len(positional) - len(args.defaults)
         for index, arg in enumerate(positional):
-            if arg.arg == "generation":
+            if "generation" in arg.arg.lower():
                 default = (args.defaults[index - first_default]
                            if index >= first_default else None)
                 # `self` is not an argument of the call.
@@ -862,7 +862,7 @@ def _store_generation_contracts() -> dict[str, tuple[int | None, bool, bool]]:
                 break
         else:
             for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
-                if arg.arg == "generation":
+                if "generation" in arg.arg.lower():
                     contracts[node.name] = (
                         None,
                         _parameter_admits_none(node, arg, default, store_source),
@@ -877,7 +877,7 @@ def _store_generation_contracts() -> dict[str, tuple[int | None, bool, bool]]:
         for cls in ast.walk(tree):
             if not isinstance(cls, ast.ClassDef):
                 continue
-            for stmt in cls.body:
+            for stmt in _own_scope_nodes(cls):
                 if isinstance(stmt, ast.Assign):
                     alias_targets = stmt.targets
                 elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
@@ -1223,14 +1223,14 @@ def _helper_generation_contracts(tree) -> dict[str, tuple[int | None, bool, bool
         positional = list(args.posonlyargs) + list(args.args)
         first_default = len(positional) - len(args.defaults)
         for index, arg in enumerate(positional):
-            if arg.arg == "generation":
+            if "generation" in arg.arg.lower():
                 default = (args.defaults[index - first_default]
                            if index >= first_default else None)
                 _merge_helper(contracts, node.name, index, _default_is_none(default))
                 break
         else:
             for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
-                if arg.arg == "generation":
+                if "generation" in arg.arg.lower():
                     _merge_helper(contracts, node.name, None,
                                   _default_is_none(default))
                     break
@@ -1361,12 +1361,10 @@ def _classify():
                 and id(ref) not in call_funcs):
             escaped = ref.attr
         elif (isinstance(ref, ast.Name) and isinstance(ref.ctx, ast.Load)
-              and helper_contracts.get(ref.id, (None, True, False))[2]
-              and id(ref) not in call_funcs):
+              and ref.id in helper_contracts and id(ref) not in call_funcs):
             # a tracked HELPER referenced as a value (`_t = _safe_transition`)
             escaped = ref.id
-        elif (isinstance(ref, ast.Attribute)
-              and helper_contracts.get(ref.attr, (None, True, False))[2]
+        elif (isinstance(ref, ast.Attribute) and ref.attr in helper_contracts
               and id(ref) not in call_funcs):
             escaped = ref.attr
         elif (isinstance(ref, ast.Call) and isinstance(ref.func, ast.Name)
@@ -1378,7 +1376,8 @@ def _classify():
         if escaped is not None:
             ref_chain = _chain_of(owner, ref)
             direct_sites.append(((ref_chain[-1].name if ref_chain else "<module>",
-                                  escaped, None), ref.lineno, lines[ref.lineno - 1]))
+                                  escaped, None), ref.lineno, lines[ref.lineno - 1],
+                                 "reference"))
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -1453,6 +1452,15 @@ def _classify():
                     direct_sites.append(
                         (identity, argument.lineno, lines[argument.lineno - 1])
                     )
+        # An explicit POSITIONAL feed into a tracked HELPER is classified like the
+        # store's: a bare NAME by name, anything else fails closed.
+        helper_contract = (None if _is_store_write(node)
+                           else helper_contracts.get(_helper_callee(node)))
+        if (helper_contract is not None and helper_contract[0] is not None
+                and helper_contract[0] < len(node.args)):
+            helper_value = node.args[helper_contract[0]]
+            if not isinstance(helper_value, ast.Starred):
+                feeds.append(helper_value)
         for keyword in node.keywords:
             if keyword.arg is None:
                 # A `**` SPREAD can carry the generation keyword:
@@ -1718,6 +1726,11 @@ _REVIEWED_OMITTED_GENERATION_SITES = {
     ("_inline_residue_recovery", "op_transition", "OP_FAILED"): "moved = bool(store.op_transition(",
     ("_inline_residue_recovery", "op_release_idem", None): "store.op_release_idem(op_id)",
     ("_stranded_presend_key_recovery", "op_release_idem", None): "store.op_release_idem(existing.op_id)",
+    # reviewed VALUE references to a tracked helper: the runner thread's target
+    # and the body handed to it (a helper whose generation is REQUIRED is passed
+    # on, never called with it omitted)
+    ("_start_runner", "_run_detached", None): "target=_run_detached,",
+    ("_run_detached", "_execute_body", None): "_execute_body, cfg, op_id, tool_name, tool_fn, body_args, agent,",
 }
 
 
