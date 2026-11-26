@@ -872,22 +872,26 @@ def restore_pristine_socket_methods() -> int:
     The number of restored attributes is returned, so a caller can assert
     that the repair ran and how much it repaired.
     """
-    if _INSTALLED_BY is not None:
-        return 0
-    restored = 0
-    displaced = _owned_displaced(
-        "__init__", getattr(socket.socket, "__init__", None))
-    if displaced is not None:
-        socket.socket.__init__ = displaced  # type: ignore[method-assign]
-        restored += 1
-    for name in _ORIGINAL_SOCKET_METHODS:
-        displaced = _owned_displaced(name, getattr(socket.socket, name, None))
+    # Serialized with installation and removal: a capture installed by
+    # another thread between the check and the restorations must not
+    # have its fresh wrappers recognised as owned and replaced.
+    with _OWNERSHIP_LOCK:
+        if _INSTALLED_BY is not None:
+            return 0
+        restored = 0
+        displaced = _owned_displaced(
+            "__init__", getattr(socket.socket, "__init__", None))
         if displaced is not None:
-            setattr(socket.socket, name, displaced)
+            socket.socket.__init__ = displaced  # type: ignore[method-assign]
             restored += 1
-    displaced = _owned_displaced(
-        "Thread.start", getattr(threading.Thread, "start", None))
-    if displaced is not None:
-        threading.Thread.start = displaced
-        restored += 1
-    return restored
+        for name in _ORIGINAL_SOCKET_METHODS:
+            displaced = _owned_displaced(name, getattr(socket.socket, name, None))
+            if displaced is not None:
+                setattr(socket.socket, name, displaced)
+                restored += 1
+        displaced = _owned_displaced(
+            "Thread.start", getattr(threading.Thread, "start", None))
+        if displaced is not None:
+            threading.Thread.start = displaced
+            restored += 1
+        return restored

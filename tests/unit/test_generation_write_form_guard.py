@@ -1209,7 +1209,11 @@ def _classify():
     for cls in ast.walk(tree):
         if isinstance(cls, ast.ClassDef):
             for inner in _own_scope_nodes(cls):
-                if isinstance(inner, ast.Call) and _is_store_write(inner):
+                if isinstance(inner, ast.Call) and (
+                    _is_store_write(inner)
+                    # a tracked HELPER called by Name carries the same feed
+                    or any(kw.arg in ("generation", None) for kw in inner.keywords)
+                ):
                     class_scope_writes.add(inner)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):

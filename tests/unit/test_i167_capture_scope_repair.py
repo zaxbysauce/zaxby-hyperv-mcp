@@ -940,3 +940,37 @@ def test_v_competing_public_activations_cannot_orphan_the_installed_capture(
     assert not leftovers, (
         "deactivate() left capture wrappers on the socket class after two "
         f"competing public activations: {leftovers}")
+
+
+def test_w_the_teardown_repair_is_serialized_with_installation():
+    """The repair's ownership check and restorations run under the SAME lock
+    that serializes installation and removal.
+
+    The lock is held by this thread while the repair runs on another: the repair
+    must WAIT for it, whatever it would have done. Without the lock the repair
+    returns at once and an installation could slip in between its check and its
+    restorations.
+    """
+    import threading
+
+    import _socket_10038_diagnosis as capture
+
+    finished = threading.Event()
+
+    def repair():
+        capture.restore_pristine_socket_methods()
+        finished.set()
+
+    lock = capture._OWNERSHIP_LOCK
+    lock.acquire()
+    worker = threading.Thread(target=repair)
+    try:
+        worker.start()
+        waited = not finished.wait(0.5)
+    finally:
+        lock.release()
+        worker.join(30)
+    assert waited, (
+        "the repair ran while another thread held the ownership lock: it is "
+        "not serialized with installation and removal")
+    assert finished.is_set(), "the repair never completed after the lock was released"
