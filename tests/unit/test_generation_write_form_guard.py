@@ -360,16 +360,28 @@ def _escaping_names(func):
     catches the rebinding, and the outer scope's name is untouched.
     """
     escaped: set[str] = set()
-    for node in _own_scope_nodes(func):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        declared: set[str] = set()
-        for statement in _own_scope_nodes(node):
-            if isinstance(statement, (ast.Global, ast.Nonlocal)):
-                declared.update(statement.names)
-        own = set(_local_assignments(node, _include_nested=False))
-        own |= _parameter_names(node)
-        escaped |= declared | (_escaping_names(node) - own)
+    # A class body is TRANSPARENT here: it is not a binding scope for
+    # `nonlocal`, so the functions below it (and its own declarations) are
+    # descendants of the enclosing function.
+    scopes = [func]
+    while scopes:
+        scope = scopes.pop()
+        for node in _own_scope_nodes(scope):
+            if isinstance(node, ast.ClassDef):
+                for statement in _own_scope_nodes(node):
+                    if isinstance(statement, (ast.Global, ast.Nonlocal)):
+                        escaped.update(statement.names)
+                scopes.append(node)
+                continue
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            declared: set[str] = set()
+            for statement in _own_scope_nodes(node):
+                if isinstance(statement, (ast.Global, ast.Nonlocal)):
+                    declared.update(statement.names)
+            own = set(_local_assignments(node, _include_nested=False))
+            own |= _parameter_names(node)
+            escaped |= declared | (_escaping_names(node) - own)
     return escaped
 
 

@@ -308,8 +308,12 @@ def _install_thread_leg_recorder(saved: dict, owner) -> None:
         # function name is no more identifying than "worker" - the
         # registered owner is the fixture or test that started the chain.
         leg = _thread_leg() or _current_stack_leg()
-        if leg and _ACTIVE_INSTALLATION is token:
-            _THREAD_LEGS[id(self)] = (weakref.ref(self), leg)
+        if leg:
+            # The registration is bound to the installation that COMMITS it,
+            # under the lock the deactivation takes.
+            with owner._lock:
+                if _ACTIVE_INSTALLATION is token:
+                    _THREAD_LEGS[id(self)] = (weakref.ref(self), leg)
         return original_start(self, *args, **kwargs)
 
     saved["Thread.start"] = original_start
@@ -558,9 +562,11 @@ class SocketDiagnosis:
 
     # ---- the socket seams ----
 
-    def _inherit_origin(self, source, accepted) -> None:
+    def _inherit_origin(self, source, accepted, token) -> None:
         """Carry an observed origin across the accept seam."""
         with self._lock:
+            if _ACTIVE_INSTALLATION is not token:
+                return  # the activation ended before this commit
             entry = _ORIGINS.get(id(source))
             if entry is None:
                 return
@@ -569,7 +575,7 @@ class SocketDiagnosis:
                 return
             _ORIGINS[id(accepted)] = (weakref.ref(accepted), origin)
 
-    def _note_listener_step(self, sock, operation: str) -> None:
+    def _note_listener_step(self, sock, operation: str, token) -> None:
         """Record that a socket reached one half of the listener's own
         creation path.
 
@@ -578,6 +584,8 @@ class SocketDiagnosis:
         socket is the listener's.
         """
         with self._lock:
+            if _ACTIVE_INSTALLATION is not token:
+                return  # the activation ended before this commit
             entry = _LISTENER_STEPS.get(id(sock))
             if entry is None or entry[0]() is not sock:
                 # A different socket that happens to carry the same id:
@@ -621,7 +629,8 @@ class SocketDiagnosis:
             # constructor that FAILS is recorded against the origin its
             # creation stack already showed, not against "unknown".
             with self._lock:
-                _ORIGINS[id(sock)] = (weakref.ref(sock), origin)
+                if _ACTIVE_INSTALLATION is token:
+                    _ORIGINS[id(sock)] = (weakref.ref(sock), origin)
             try:
                 saved_init(sock, *args, **kwargs)
             except OSError as exc:
@@ -677,12 +686,12 @@ class SocketDiagnosis:
                 # the activation that is live when they are committed.
                 return result
             if operation in ("bind", "listen"):
-                self._note_listener_step(sock, operation)
+                self._note_listener_step(sock, operation, token)
             if operation == "dup" and isinstance(result, socket.socket):
                 # `dup` hands the SAME handle to a NEW socket object, so
                 # the duplicate carries the origin it was duplicated from
                 # - the same handoff the accept seam performs.
-                self._inherit_origin(sock, result)
+                self._inherit_origin(sock, result, token)
             if operation == "accept" and isinstance(result, tuple):
                 # `accept` returns a (connection, address) PAIR, so the
                 # accepted socket is the pair's first element. The ACCEPTED
@@ -692,7 +701,7 @@ class SocketDiagnosis:
                 # as unknown.
                 accepted = result[0] if result else None
                 if isinstance(accepted, socket.socket):
-                    self._inherit_origin(sock, accepted)
+                    self._inherit_origin(sock, accepted, token)
             return result
 
         _operation.__name__ = operation

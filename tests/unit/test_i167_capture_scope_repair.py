@@ -629,3 +629,188 @@ def test_p_a_constructor_paused_between_the_check_and_the_commit_records_nothing
     assert not list(tmp_path.iterdir()), (
         "a constructor that paused between the check and the commit still "
         f"recorded a diagnosis: {list(tmp_path.iterdir())}")
+
+
+def _pause_at(monkeypatch, owner, attribute):
+    """Make `owner.attribute` WAIT before running, once the wrapper reaches it.
+
+    Returns (reached, release): `reached` is set when the wrapper has passed
+    its own activation check and called the commit function; the commit
+    proceeds when `release` is set - the window between check and commit.
+    """
+    import threading
+
+    reached = threading.Event()
+    release = threading.Event()
+    original = getattr(owner, attribute)
+
+    def paused(*args, **kwargs):
+        reached.set()
+        release.wait(30)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, attribute, paused)
+    return reached, release
+
+
+def _run_paused(action, reached, release):
+    """Run `action` on a thread; deactivate once it reaches the commit."""
+    import threading
+
+    from _socket_10038_diagnosis import deactivate
+
+    thread = threading.Thread(target=action)
+    try:
+        thread.start()
+        assert reached.wait(30), "the wrapper never reached the commit"
+    finally:
+        deactivate()
+        release.set()
+        thread.join(30)
+
+
+def test_q_a_listener_step_paused_before_its_commit_records_nothing(monkeypatch):
+    """The listener-step provenance commit is bound to its installation under
+    the lock the deactivation takes."""
+    import weakref
+
+    import _socket_10038_diagnosis as capture
+    from _socket_10038_diagnosis import activate
+
+    activate()
+    reached, release = _pause_at(monkeypatch, capture._ACTIVE,
+                                 "_note_listener_step")
+    sock = socket.socket()
+    try:
+        _run_paused(lambda: sock.bind(("127.0.0.1", 0)), reached, release)
+        entry = capture._LISTENER_STEPS.get(id(sock))
+        assert entry is None or entry[0]() is not sock, (
+            "a bind that paused between the check and the commit recorded a "
+            "listener step after the capture ended")
+    finally:
+        sock.close()
+
+
+def test_r_an_inherited_origin_paused_before_its_commit_records_nothing(
+        monkeypatch):
+    """The inherited-origin provenance commit is bound the same way."""
+    import weakref
+
+    import _socket_10038_diagnosis as capture
+    from _socket_10038_diagnosis import activate
+
+    activate()
+    source = socket.socket()
+    capture._ORIGINS[id(source)] = (weakref.ref(source),
+                                    "hvsock-monkeypatch-side")
+    reached, release = _pause_at(monkeypatch, capture._ACTIVE,
+                                 "_inherit_origin")
+    duplicated = []
+    try:
+        _run_paused(lambda: duplicated.append(source.dup()), reached, release)
+        for other in duplicated:
+            entry = capture._ORIGINS.get(id(other))
+            assert entry is None or entry[0]() is not other or (
+                entry[1] != "hvsock-monkeypatch-side"), (
+                "a dup that paused between the check and the commit inherited "
+                "an origin after the capture ended")
+    finally:
+        for other in duplicated:
+            other.close()
+        source.close()
+
+
+def test_s_a_constructor_origin_paused_before_its_commit_records_nothing(
+        monkeypatch):
+    """The constructor's origin commit is bound the same way."""
+    import _socket_10038_diagnosis as capture
+    from _socket_10038_diagnosis import activate
+
+    activate()
+    reached, release = _pause_at(monkeypatch, capture, "_on_creation_stack")
+    built = []
+    try:
+        _run_paused(lambda: built.append(socket.socket()), reached, release)
+        for sock in built:
+            entry = capture._ORIGINS.get(id(sock))
+            assert entry is None or entry[0]() is not sock, (
+                "a constructor that paused between the check and the commit "
+                "recorded an origin after the capture ended")
+    finally:
+        for sock in built:
+            sock.close()
+
+
+def _leg_registered(capture, thread):
+    entry = capture._THREAD_LEGS.get(id(thread))
+    return entry is not None and entry[0]() is thread
+
+
+def test_t_a_thread_leg_commit_is_final_when_the_capture_ends(monkeypatch):
+    """A thread-leg registration paused between its check and its commit is
+    final by the time the deactivation completes.
+
+    The deactivation runs on a RAW thread (the capture's own Thread.start
+    wrapper must not be involved) while the registering thread is paused
+    inside the commit. If the deactivation can COMPLETE while the commit is
+    still pending, the registry changes after the capture ended: the state
+    seen right after the deactivation must then equal the final state.
+    """
+    import _thread
+    import threading
+    import weakref as real_weakref
+
+    import _socket_10038_diagnosis as capture
+    from _socket_10038_diagnosis import activate
+
+    activate()
+    go = threading.Event()
+    reached = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    inner = threading.Thread(target=lambda: None)
+
+    class PausedWeakref:
+        """The module's `weakref`, pausing when the thread-leg entry is made."""
+
+        def __getattr__(self, name):
+            return getattr(real_weakref, name)
+
+        def ref(self, *args, **kwargs):
+            if args and args[0] is inner:
+                reached.set()
+                release.wait(30)
+            return real_weakref.ref(*args, **kwargs)
+
+    def worker():
+        go.wait(30)
+        inner.start()
+
+    outer = threading.Thread(target=worker)
+    outer.start()  # before the proxy exists: this start must not pause
+    monkeypatch.setattr(capture, "weakref", PausedWeakref())
+
+    def deactivator():
+        capture.deactivate()
+        finished.set()
+
+    completed = False
+    during = None
+    try:
+        go.set()
+        assert reached.wait(30), "the thread-leg commit was never reached"
+        _thread.start_new_thread(deactivator, ())
+        completed = finished.wait(1.0)
+        during = _leg_registered(capture, inner)
+    finally:
+        release.set()
+        outer.join(30)
+        finished.wait(30)
+        if inner.ident is not None:
+            inner.join(30)
+    after = _leg_registered(capture, inner)
+    assert after, "the thread leg was never recorded: the test is vacuous"
+    if completed:
+        assert during == after, (
+            "the deactivation completed while a thread-leg commit was "
+            "pending, and the registry changed after it")
