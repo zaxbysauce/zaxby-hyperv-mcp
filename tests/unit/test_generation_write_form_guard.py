@@ -869,6 +869,22 @@ def _store_generation_contracts() -> dict[str, tuple[int | None, bool, bool]]:
                         _default_is_none(default),
                     )
                     break
+    # A class-scope ALIAS (`op_heartbeat_alias = op_heartbeat`) is the same
+    # method under a second name: it inherits the contract (chains settle).
+    changed = True
+    while changed:
+        changed = False
+        for cls in ast.walk(tree):
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for stmt in cls.body:
+                if (isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Name)
+                        and stmt.value.id in contracts):
+                    for target in stmt.targets:
+                        if (isinstance(target, ast.Name)
+                                and target.id not in contracts):
+                            contracts[target.id] = contracts[stmt.value.id]
+                            changed = True
     return contracts
 
 def _is_store_write(node) -> bool:
@@ -1133,8 +1149,21 @@ def _function_shadowed_coercions(func, env, table) -> set[str]:
 
 
 def _default_is_none(default) -> bool:
-    """True when a parameter's DEFAULT is the constant None (no default: False)."""
-    return isinstance(default, ast.Constant) and default.value is None
+    """True when a parameter's DEFAULT is (or may be) None; no default: False.
+
+    A constant expression is EVALUATED, so a default that folds to None
+    (`(False or None)`) is None. An expression that cannot be evaluated
+    without names (a name, a call) FAILS CLOSED as None-capable.
+    """
+    if default is None:
+        return False
+    if isinstance(default, ast.Constant):
+        return default.value is None
+    try:
+        code = compile(ast.Expression(default), "<default>", "eval")
+        return eval(code, {"__builtins__": {}}, {}) is None  # noqa: S307
+    except Exception:
+        return True
 
 
 def _helper_generation_contracts(tree) -> dict[str, tuple[int | None, bool, bool]]:
@@ -1156,14 +1185,30 @@ def _helper_generation_contracts(tree) -> dict[str, tuple[int | None, bool, bool
             if arg.arg == "generation":
                 default = (args.defaults[index - first_default]
                            if index >= first_default else None)
-                contracts[node.name] = (index, True, _default_is_none(default))
+                _merge_helper(contracts, node.name, index, _default_is_none(default))
                 break
         else:
             for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
                 if arg.arg == "generation":
-                    contracts[node.name] = (None, True, _default_is_none(default))
+                    _merge_helper(contracts, node.name, None,
+                                  _default_is_none(default))
                     break
     return contracts
+
+
+def _merge_helper(contracts, name, index, default_none) -> None:
+    """Fold a definition into the name-keyed table FAIL-CLOSED.
+
+    The table is keyed by NAME, so an unrelated definition elsewhere with the
+    same name must not certify a call as closed: the default is None when ANY
+    definition's is, and a position the definitions disagree on is unknown.
+    """
+    if name in contracts:
+        old_index, _tracked, old_none = contracts[name]
+        contracts[name] = (old_index if old_index == index else None, True,
+                           old_none or default_none)
+    else:
+        contracts[name] = (index, True, default_none)
 
 
 def _classify():
@@ -1217,6 +1262,19 @@ def _classify():
     shadowed = _scope_shadowed_names(tree)
     store_contracts = _store_generation_contracts()
     helper_contracts = _helper_generation_contracts(tree)
+    # A store method bound to a LOCAL NAME (`beat = store.op_heartbeat`) is
+    # then called by that name: not an attribute call, so it is UNRESOLVED.
+    store_aliases = set()
+    for stmt in ast.walk(tree):
+        if isinstance(stmt, ast.Assign):
+            alias_value, alias_targets = stmt.value, stmt.targets
+        elif isinstance(stmt, (ast.AnnAssign, ast.NamedExpr)) and stmt.value is not None:
+            alias_value, alias_targets = stmt.value, [stmt.target]
+        else:
+            continue
+        if isinstance(alias_value, ast.Attribute) and alias_value.attr.startswith("op_"):
+            store_aliases.update(
+                target.id for target in alias_targets if isinstance(target, ast.Name))
 
     shadowed_by_func = {
         func: module_shadowed | _function_shadowed_coercions(
@@ -1264,6 +1322,16 @@ def _classify():
         if node in class_scope_writes:
             direct_sites.append((identity, node.lineno, lines[node.lineno - 1]))
             continue
+        if isinstance(node.func, ast.Name) and node.func.id in store_aliases:
+            direct_sites.append((identity, node.lineno, lines[node.lineno - 1]))
+            continue
+        # A positional `*args` spread into a helper whose generation is
+        # POSITIONAL may bind it: the spread's contents are unknowable, so the
+        # call is UNRESOLVED (the store branch below already fails closed).
+        if (isinstance(node.func, ast.Name) and node.func.id in helper_contracts
+                and helper_contracts[node.func.id][0] is not None
+                and any(isinstance(arg, ast.Starred) for arg in node.args)):
+            direct_sites.append((identity, node.lineno, lines[node.lineno - 1]))
         # An OMITTED generation binds the callee's DEFAULT: when that default is
         # None the store reads it as "no generation predicate", a live fail-open
         # feed with no argument to classify.
