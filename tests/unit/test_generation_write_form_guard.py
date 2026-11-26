@@ -1203,6 +1203,14 @@ def _classify():
     aliased_sites = []
     parameter_sites = []
     direct_sites = []
+    # A store write in a CLASS BODY resolves its names in the class namespace,
+    # which this walk does not model: it is UNRESOLVED and reported.
+    class_scope_writes = set()
+    for cls in ast.walk(tree):
+        if isinstance(cls, ast.ClassDef):
+            for inner in _own_scope_nodes(cls):
+                if isinstance(inner, ast.Call) and _is_store_write(inner):
+                    class_scope_writes.add(inner)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -1212,6 +1220,9 @@ def _classify():
             _method_of(node),
             _event_of(node),
         )
+        if node in class_scope_writes:
+            direct_sites.append((identity, node.lineno, lines[node.lineno - 1]))
+            continue
         contract = store_contracts.get(_method_of(node))
         # Every generation feed of this call, classified by the same rules:
         # the POSITIONAL one (when the store's signature places it) and the
