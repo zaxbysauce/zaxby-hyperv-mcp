@@ -629,7 +629,13 @@ class SocketDiagnosis:
                 # the SAME WinError 10038, and the family uses exactly
                 # that seam - so the constructor's failure is observed
                 # here, not swallowed by the wrapper.
-                if getattr(exc, "winerror", None) == _WINERROR_10038:
+                #
+                # The recording is bound to the installation that COMMITS
+                # it: the constructor may have been in flight when the
+                # activation ended, and a diagnosis written after that
+                # belongs to no live activation.
+                if (_ACTIVE_INSTALLATION is token
+                        and getattr(exc, "winerror", None) == _WINERROR_10038):
                     self._record("__init__", exc, sock)
                 raise
 

@@ -491,3 +491,50 @@ def _recv_once():
             sock.close()
         except OSError:
             pass
+
+
+def test_n_a_constructor_in_flight_when_the_capture_ends_records_nothing(tmp_path,
+                                                                        monkeypatch):
+    """A CONSTRUCTOR that was already in flight when the capture ended records
+    nothing.
+
+    The operation wrapper got that rule; the constructor had the same
+    check-before-call shape, so a constructor that blocked and raised the
+    WinError 10038 after the deactivation still wrote a diagnosis.
+    """
+    import threading
+
+    from _socket_10038_diagnosis import activate, deactivate
+
+    monkeypatch.setenv("HYPERV_MCP_10038_DIAG_DIR", str(tmp_path))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking(self, *args, **kwargs):
+        entered.set()
+        release.wait(30)
+        error = OSError("the socket was invalidated")
+        error.winerror = 10038
+        raise error
+
+    monkeypatch.setattr(socket.socket, "__init__", blocking)
+    activate()
+    thread = threading.Thread(target=_construct_once)
+    try:
+        thread.start()
+        assert entered.wait(30), "the constructor did not start"
+    finally:
+        deactivate()
+        release.set()
+        thread.join(30)
+    assert not list(tmp_path.iterdir()), (
+        "a constructor that was in flight when the capture ended still "
+        f"recorded a diagnosis: {list(tmp_path.iterdir())}")
+
+
+def _construct_once():
+    """One construction on a fresh socket; the error is expected."""
+    try:
+        socket.socket(fileno=1)
+    except OSError:
+        pass
