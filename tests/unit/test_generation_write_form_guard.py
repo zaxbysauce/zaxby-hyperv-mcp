@@ -1275,7 +1275,8 @@ def _classify():
         if omitted_callee is not None and omitted_callee[2]:
             supplied = (
                 any(kw.arg in ("generation", None) for kw in node.keywords)
-                or any(isinstance(arg, ast.Starred) for arg in node.args)
+                or (omitted_callee[0] is not None
+                    and any(isinstance(arg, ast.Starred) for arg in node.args))
                 or (omitted_callee[0] is not None
                     and omitted_callee[0] < len(node.args))
             )
