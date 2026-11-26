@@ -129,6 +129,9 @@ _ALIAS_TAG = "generation-write-form: fail-open-aliased"
 _PARAM_TAG = "generation-write-form: fail-open-parameter"
 _PARAM_ADMITS_TAG = "generation-write-form: fail-open-parameter-admits-none"
 _NO_DEFAULT = object()
+# The disclosed fail-open FORM of the four keyword-local sites: the tag says
+# the feed may be None, and this says HOW it can be.
+_LOCAL_FORM = "generation=generation or None"
 
 # (enclosing function, called method, transition event) -> number of sites.
 _EXPECTED_LOCAL = {
@@ -789,20 +792,43 @@ def _direct_form_is_closed(node, shadowed=frozenset()) -> bool:
 
 
 
-def _parameter_admits_none(arg, default) -> bool:
-    """Whether a store parameter can be fed None without a call-time error.
+def _parameter_admits_none(func, arg, default) -> bool:
+    """Whether a None feed into a store parameter is treated as live.
 
-    The default is None-capable by construction: nothing in an unannotated
-    parameter says it cannot take None, and a `None` DEFAULT admits it
-    whatever the annotation says (`generation: int = None`). Only an
-    annotated parameter whose annotation does not admit None and whose
-    default is not None certifies a closed feed.
+    ALWAYS, unless the callee's BODY proves a None feed raises before any
+    write. An annotation (or a missing default) is not that proof: Python does
+    not enforce annotations, and the method body decides what None means -
+    `op_heartbeat` reads it as "no generation predicate" whatever its
+    signature says (the round-34 plan critic's executed probe: the heartbeat
+    moved while the row generation stayed put). The body proves rejection only
+    when EVERY use of the parameter is the sole argument of `int(...)` and that
+    call sits inside the arguments of an `execute(...)` call: the coercion is
+    then evaluated, and raises a TypeError on None, before the SQL runs.
     """
-    if arg.annotation is None:
-        return True
-    if isinstance(default, ast.Constant) and default.value is None:
-        return True
-    return _annotation_admits_none(arg.annotation)
+    name = arg.arg
+    uses = sum(
+        1 for node in ast.walk(func)
+        if isinstance(node, ast.Name) and node.id == name
+        and isinstance(node.ctx, ast.Load)
+    )
+    if uses == 0:
+        return True  # an unused parameter proves nothing
+    coerced = 0
+    for call in ast.walk(func):
+        if not (isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "execute"):
+            continue
+        for argument in list(call.args) + [kw.value for kw in call.keywords]:
+            for inner in ast.walk(argument):
+                if (isinstance(inner, ast.Call)
+                        and isinstance(inner.func, ast.Name)
+                        and inner.func.id == "int"
+                        and len(inner.args) == 1 and not inner.keywords
+                        and isinstance(inner.args[0], ast.Name)
+                        and inner.args[0].id == name):
+                    coerced += 1
+    return coerced != uses
 
 
 def _store_generation_contracts() -> dict[str, tuple[int | None, bool]]:
@@ -812,13 +838,10 @@ def _store_generation_contracts() -> dict[str, tuple[int | None, bool]]:
     None). The index is None for a method whose `generation` is
     KEYWORD-ONLY - it cannot be fed positionally at all.
 
-    A method whose parameter does NOT admit None certifies a CLOSED
-    feed: `op_mark_send(self, op_id: str, generation: int)` REQUIRES an
-    int, so a None feed raises a TypeError at the call and no write
-    happens. The methods whose parameter admits None (`op_transition`,
-    `op_heartbeat`, `op_release_idem` - all `generation: int | None =
-    None`) treat None as "no generation predicate", which IS a fail-open
-    feed.
+    The second element is True unless the callee's BODY proves a None feed
+    raises before any write (`_parameter_admits_none`): a type annotation
+    never certifies a feed closed, because annotations are not enforced
+    and the body decides what None means.
     """
     contracts: dict[str, tuple[int | None, bool]] = {}
     try:
@@ -839,7 +862,7 @@ def _store_generation_contracts() -> dict[str, tuple[int | None, bool]]:
                 # `self` is not an argument of the call.
                 contracts[node.name] = (
                     index - 1,
-                    _parameter_admits_none(arg, default),
+                    _parameter_admits_none(node, arg, default),
                 )
                 break
         else:
@@ -847,7 +870,7 @@ def _store_generation_contracts() -> dict[str, tuple[int | None, bool]]:
                 if arg.arg == "generation":
                     contracts[node.name] = (
                         None,
-                        _parameter_admits_none(arg, default),
+                        _parameter_admits_none(node, arg, default),
                     )
                     break
     return contracts
@@ -1411,8 +1434,18 @@ def test_every_fail_open_site_carries_the_disclosure_tag():
         for _identity, line, text in local_sites
         if _LOCAL_TAG not in _COMMENTS.get(line, "")
     ]
-    assert not untagged, (
-        f"AC1: fail-open write sites missing the '{_LOCAL_TAG}' tag at lines {untagged}"
+    # The code part of the site's line (its comment removed) must still say the
+    # disclosed form: pinning WHICH sites exist and THAT they are tagged does
+    # not pin WHAT they say.
+    drifted = [
+        line
+        for _identity, line, text in local_sites
+        if _LOCAL_FORM not in text.split("#", 1)[0]
+    ]
+    assert not untagged and not drifted, (
+        f"AC1: fail-open write sites missing the '{_LOCAL_TAG}' tag at lines "
+        f"{untagged}; drifted from the disclosed form '{_LOCAL_FORM}' at lines "
+        f"{drifted}"
     )
 
 
