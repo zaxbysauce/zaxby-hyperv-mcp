@@ -884,12 +884,18 @@ def _store_generation_contracts() -> dict[str, tuple[int | None, bool, bool]]:
                     alias_targets = [stmt.target]
                 else:
                     continue
-                if (isinstance(stmt.value, ast.Name)
-                        and stmt.value.id in contracts):
-                    for target in alias_targets:
-                        if (isinstance(target, ast.Name)
-                                and target.id not in contracts):
-                            contracts[target.id] = contracts[stmt.value.id]
+                mentioned = next(
+                    (name.id for name in ast.walk(stmt.value)
+                     if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Load)
+                     and name.id in contracts),
+                    None,
+                )
+                if mentioned is None:
+                    continue
+                for target in alias_targets:
+                    for bound in ast.walk(target):
+                        if isinstance(bound, ast.Name) and bound.id not in contracts:
+                            contracts[bound.id] = contracts[mentioned]
                             changed = True
     return contracts
 
@@ -907,15 +913,30 @@ def _helper_callee(node):
     return None
 
 
+_STORE_NAMES: dict[str, frozenset] = {}
+
+
+def _store_method_names() -> frozenset:
+    """Every method the store's own contract table knows (aliases included)."""
+    key = str(_STORE)
+    if key not in _STORE_NAMES:
+        _STORE_NAMES[key] = frozenset(_store_generation_contracts())
+    return _STORE_NAMES[key]
+
+
 def _is_store_write(node) -> bool:
     """True when the call writes through the store.
 
     The store's write methods take the generation as their last
     argument, and it may be POSITIONAL - so the keyword-only scan would
-    miss a positional fail-open feed.
+    miss a positional fail-open feed. A method is a store write by its
+    `op_` prefix OR because the store's own contract table knows it: an
+    alias without the prefix (`refresh_heartbeat = op_heartbeat`) is the
+    same write.
     """
     func = node.func
-    return isinstance(func, ast.Attribute) and func.attr.startswith("op_")
+    return isinstance(func, ast.Attribute) and (
+        func.attr.startswith("op_") or func.attr in _store_method_names())
 
 
 
@@ -1338,6 +1359,15 @@ def _classify():
         escaped = None
         if (isinstance(ref, ast.Attribute) and ref.attr in store_contracts
                 and id(ref) not in call_funcs):
+            escaped = ref.attr
+        elif (isinstance(ref, ast.Name) and isinstance(ref.ctx, ast.Load)
+              and helper_contracts.get(ref.id, (None, True, False))[2]
+              and id(ref) not in call_funcs):
+            # a tracked HELPER referenced as a value (`_t = _safe_transition`)
+            escaped = ref.id
+        elif (isinstance(ref, ast.Attribute)
+              and helper_contracts.get(ref.attr, (None, True, False))[2]
+              and id(ref) not in call_funcs):
             escaped = ref.attr
         elif (isinstance(ref, ast.Call) and isinstance(ref.func, ast.Name)
               and ref.func.id == "getattr" and len(ref.args) >= 2
