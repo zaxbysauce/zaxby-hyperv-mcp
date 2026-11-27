@@ -1,5 +1,6 @@
 """Shared unit-test fixtures. No real Hyper-V is touched."""
 
+import os
 import time
 
 import pytest
@@ -307,3 +308,112 @@ def _agent_isolation_registry_isolated(monkeypatch):
 
     saved = dict(agent_isolation._PROVIDERS)
     monkeypatch.setattr(agent_isolation, "_PROVIDERS", saved)
+
+
+# The socket test family: the files that exercise the loopback listeners.
+# The WinError 10038 capture is installed for these files ONLY (issue #167
+# AC3) - the rest of the unit suite must never see a patched socket class.
+_SOCKET_FAMILY_FILES = frozenset({
+    "test_stream_relay.py",
+    "test_relay.py",
+    "test_cdp_channel.py",
+    "test_e01_relay_latency.py",
+    # The synthetic instance of the WinError 10038 failure (issue #167 AC3):
+    # it is the oracle of the frozen C3 check, so the capture must be active
+    # for it exactly as for the family.
+    "test_i167_10038_capture_synthetic.py",
+})
+
+
+@pytest.fixture(autouse=True)
+def _publish_current_test_leg(request):
+    """Publish the running test's name for the socket capture.
+
+    A capture that happens on a BACKGROUND thread cannot read the owning
+    test from its own stack (the stack carries only the thread's frames, so
+    it names the thread's target - generically "worker"). The published leg
+    is what lets the artifact name the test that owns the failure instead
+    of an uninformative thread target (issue #167 AC3). It is published for
+    EVERY test so the attribution does not depend on whether the capture
+    happens to be installed for the file at hand.
+    """
+    from _socket_10038_diagnosis import set_current_leg
+
+    set_current_leg(request.node.name)
+    try:
+        yield
+    finally:
+        set_current_leg(None)
+
+
+@pytest.fixture(autouse=True)
+def _socket_10038_diagnosis_scoped(request):
+    """Activate the operation-time WinError 10038 capture for the socket
+    family only, and always remove it again.
+
+    The capture observes the socket operation that raises, so the evidence
+    exists before the family's own handlers swallow the exception (issue
+    #167 AC3). It never swallows anything itself.
+    """
+    from _socket_10038_diagnosis import activate, deactivate
+
+    name = os.path.basename(str(request.node.fspath))
+    if name not in _SOCKET_FAMILY_FILES:
+        yield
+        return
+    activate()
+    try:
+        yield
+    finally:
+        deactivate()
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    """The capture's removal must be the LAST word on the socket class.
+
+    A test's `monkeypatch` saves the value it FINDS, and while the capture
+    is installed that value is the CAPTURE'S WRAPPER. pytest finalizes the
+    `monkeypatch` fixture AFTER the capture's own teardown, so the undo puts
+    the wrapper back after the capture removed it. This hook runs after
+    every fixture finalizer, so the pristine method is restored last and the
+    rest of the unit suite never sees a patched socket class (issue #167
+    AC3, the round-23 plan gate's executed probe).
+
+    The repair runs in a `finally` path: when a finalizer RAISES, the
+    exception is thrown at the yield point, and a repair placed after it
+    would be skipped - exactly on the error path where a leaked wrapper
+    matters most. The original exception is preserved.
+
+    The repair is a no-op when nothing leaked, and a no-op while the capture
+    is installed (the capture then owns the patches).
+    """
+    try:
+        result = yield
+    finally:
+        from _socket_10038_diagnosis import restore_pristine_socket_methods
+
+        restore_pristine_socket_methods()
+    return result
+
+
+# The synthetic instance of the WinError 10038 failure (issue #167 AC3) is
+# EXPECTED to fail: its fixture raises the 10038 during setup, by design, so
+# the capture can observe it. Without this marker the expected error is
+# reported as a suite ERROR and the unit run exits non-zero. The marker is
+# applied here rather than in the frozen test file so that file stays
+# byte-identical to its checkpointed blob.
+_SYNTHETIC_10038_ITEM = "test_synthetic_leg_raises_10038"
+
+
+def pytest_collection_modifyitems(config, items):
+    """Mark the synthetic 10038 instance as expected-to-fail."""
+    for item in items:
+        if item.name == _SYNTHETIC_10038_ITEM:
+            item.add_marker(
+                pytest.mark.xfail(
+                    raises=OSError,
+                    reason="the synthetic leg raises WinError 10038 by design",
+                    strict=True,
+                )
+            )

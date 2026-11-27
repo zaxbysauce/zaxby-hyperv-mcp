@@ -56,7 +56,32 @@ jobs:
         # config as src, so no separate scope is needed.
         run: mypy src/hyperv_mcp scripts
       - name: Unit tests (no Hyper-V)
+        env:
+          # The loopback-socket family captures a WinError 10038 diagnosis
+          # (issue #167 AC3) under this directory. Without a retention step
+          # the artifact dies with the runner, and the CI-only failure the
+          # capture exists for would still leave no evidence.
+          HYPERV_MCP_10038_DIAG_DIR: ${{ runner.temp }}/socket-10038-diagnosis
         run: pytest tests/unit
+
+      - name: Retain the socket-10038 diagnosis
+        # ALWAYS, not only on failure: the capture exists for a SWALLOWED
+        # WinError 10038 - the socket family catches the error before any
+        # pytest reporting hook can see it, so the job can SUCCEED with a
+        # captured diagnosis. A failure-only retention step would discard
+        # exactly the evidence the capture exists to preserve (the round-7
+        # implementation reviewer's finding). `if-no-files-found: ignore`
+        # permits the run that produced no diagnosis at all.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # upload-artifact@v4 artifacts are immutable and a duplicate name
+          # in the same run is a conflict: a re-run attempt keeps its matrix
+          # value, so the attempt number must be part of the name or attempt
+          # 2 cannot upload what attempt 1 already uploaded.
+          name: socket-10038-diagnosis-${{ matrix.python-version }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/socket-10038-diagnosis
+          if-no-files-found: ignore
 
   # The declared dependency FLOOR, exercised. The main matrix installs whatever
   # PyPI serves today, so a floor-vs-latest behavioural divergence is invisible

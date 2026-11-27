@@ -929,7 +929,7 @@ def complete_inline(op_ctx: dict[str, Any], result: Any) -> None:
     try:
         cfg: Config = op_ctx["cfg"]
         agent = str(op_ctx.get("agent") or "")
-        generation = int(op_ctx.get("generation") or 0) or None
+        generation = int(op_ctx.get("generation") or 0) or None  # generation-write-form: fail-open-aliased
         store = store_for(cfg)
         text = _result_text(result)
         # Same classification rule as the detached path (review round-2 Q1):
@@ -1012,7 +1012,14 @@ def _reconcile_interrupted_commit_core(
             error_class=statestore.OP_INTERRUPTED,
             result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
             updated_at=store.now(),
-            generation=generation,
+            # Issue #167 (independent critic's follow-up): the generation
+            # here is the PARAMETER (`generation: int | None`), not a local,
+            # so a keyword-local or alias search cannot see it. Both
+            # in-module callers pass the fail-closed `int(... or 0)` form,
+            # so no None reaches this write today; the write-form guard
+            # pins both facts (admitting, NOT reachable) so a caller that
+            # starts feeding a None-capable value is caught.
+            generation=generation,  # generation-write-form: fail-open-parameter-admits-none
             pre_body_terminal=True,
         )
         # FB-011 wave 7 (PR #166): the terminal event follows the TRANSITION
@@ -1177,7 +1184,7 @@ def start_inline_heartbeat(op_ctx: dict[str, Any]) -> Callable[[], None]:
         if stop.is_set():
             return
         try:
-            store.op_heartbeat(op_id, store.now(), generation=generation or None)
+            store.op_heartbeat(op_id, store.now(), generation=generation or None)  # generation-write-form: fail-open-disclosed
         except Exception:
             pass  # a missed beat is retried on the next interval
         if not stop.is_set():
@@ -1336,7 +1343,7 @@ def _run_detached(
         if stop.is_set():
             return
         try:
-            store.op_heartbeat(op_id, store.now(), generation=generation or None)
+            store.op_heartbeat(op_id, store.now(), generation=generation or None)  # generation-write-form: fail-open-disclosed
             if presented_lease:
                 try:
                     leases.renew(cfg, presented_lease, agent or None)
@@ -1391,7 +1398,13 @@ def _safe_transition(
             op_id, (statestore.OP_WORKING,), to_status,
             error_class=error_class, result_json=result_json,
             result_size=result_size, updated_at=store.now(),
-            generation=generation, pre_body_terminal=pre_body_terminal,
+            # Issue #167 (independent critic's follow-up): the generation
+            # parameter is `int | None = None` - the DEFAULT is None - and
+            # the two disclosed post-body terminals in _execute_body DO
+            # feed it `generation or None`, so None genuinely reaches this
+            # write (the callee side of those two disclosed sites). The
+            # write-form guard pins it in the parameter reachable set.
+            generation=generation, pre_body_terminal=pre_body_terminal,  # generation-write-form: fail-open-parameter
         )
         if moved:
             emit(cfg, kind, op_id, "", agent,
@@ -1634,13 +1647,13 @@ def _execute_body(
                 store, op_id, statestore.OP_FAILED, agent, cfg, "op.failed",
                 error_class=error_class,
                 result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
-                generation=generation or None,
+                generation=generation or None,  # generation-write-form: fail-open-disclosed
             )
         else:
             _safe_transition(
                 store, op_id, statestore.OP_COMPLETED, agent, cfg, "op.completed",
                 result_json=pswindows.redact(text), result_size=len(text.encode("utf-8")),
-                generation=generation or None,
+                generation=generation or None,  # generation-write-form: fail-open-disclosed
             )
     except OperationCancelled:
         # Issue #157: the cooperative cancel is honored by a LIVE runner — the
