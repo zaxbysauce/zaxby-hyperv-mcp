@@ -20,8 +20,8 @@ reported below (issue #143).
 | 135-127-138-gui-electron-drivability | 53 | 53 | 0 | clean |
 | 136-137-uia-element-contract | 27 | 25 | 2 | exit 1 |
 | 140-126-uia-state-receipt | 44 | 44 | 0 | clean |
-| 143-130-collated | 12 | 12 | 0 | clean |
-| 147-trace-drift-repair | 4 | 4 | 0 | clean |
+| 143-130-collated | 12 | 9 | 3 | exit 1 |
+| 147-trace-drift-repair | 4 | 3 | 1 | exit 1 |
 | 148-151-153-followup-hygiene-triad | 26 | 23 | 3 | exit 1 |
 | 157-158-durable-identity-repair-outcomes | 36 | 36 | 0 | clean |
 | 163-156-followup-pair | 11 | 11 | 0 | clean |
@@ -90,6 +90,16 @@ wave's bookkeeping and is never a gate failure.
 
 - `CHANGED tests/unit/test_script_parse_new.py ef461e34a7f222677c3a9585367b03692e5de057 34c1022a28191d241e55a32adf5bdb2b045778fe (C7)`
 - `CHANGED tests/unit/test_script_parse_new.py ef461e34a7f222677c3a9585367b03692e5de057 34c1022a28191d241e55a32adf5bdb2b045778fe (C23)`
+
+### 143-130-collated (exit 1)
+
+- `CHANGED tests/unit/test_drift_inventory_selfref.py 298c88585b7f936266f63cef383cd87e97044454 f6b70e192a9cb5fd638a1807936b6484956078c0 (C1)`
+- `CHANGED tests/unit/test_drift_inventory_selfref.py 298c88585b7f936266f63cef383cd87e97044454 f6b70e192a9cb5fd638a1807936b6484956078c0 (C2)`
+- `CHANGED tests/unit/test_drift_inventory_selfref.py 298c88585b7f936266f63cef383cd87e97044454 f6b70e192a9cb5fd638a1807936b6484956078c0 (C3)`
+
+### 147-trace-drift-repair (exit 1)
+
+- `CHANGED tests/unit/test_drift_inventory_selfref.py 298c88585b7f936266f63cef383cd87e97044454 f6b70e192a9cb5fd638a1807936b6484956078c0 (C2)`
 
 ### 148-151-153-followup-hygiene-triad (exit 1)
 

@@ -291,6 +291,11 @@ def test_missing_trace_is_disclosed_and_check_fails(tmp_path):
     shutil.copyfile(vendored,
                     sandbox / ".agents" / "skills" / "issue-tracer" /
                     "scripts" / "repro-check.sh")
+    # the vendored verifier sources a sibling helper; without it the verifier dies
+    # before reading any manifest (the CI fallback path has no user-level copy)
+    shutil.copyfile(vendored.with_name("github-api.sh"),
+                    sandbox / ".agents" / "skills" / "issue-tracer" /
+                    "scripts" / "github-api.sh")
     readme = sandbox / "README.md"
     readme.write_text("# sandbox readme\n", encoding="utf-8", newline="\n")
     data = readme.read_bytes()
@@ -455,6 +460,11 @@ def test_tracked_but_missing_ledger_refuses_regen(tmp_path):
     shutil.copyfile(vendored,
                     sandbox / ".agents" / "skills" / "issue-tracer" /
                     "scripts" / "repro-check.sh")
+    # the vendored verifier sources a sibling helper; without it the verifier dies
+    # before reading any manifest (the CI fallback path has no user-level copy)
+    shutil.copyfile(vendored.with_name("github-api.sh"),
+                    sandbox / ".agents" / "skills" / "issue-tracer" /
+                    "scripts" / "github-api.sh")
     readme = sandbox / "README.md"
     readme.write_text("# sandbox readme\n", encoding="utf-8", newline="\n")
     data = readme.read_bytes()
