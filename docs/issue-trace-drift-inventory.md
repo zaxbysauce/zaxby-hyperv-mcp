@@ -21,7 +21,7 @@ reported below (issue #143).
 | 136-137-uia-element-contract | 27 | 25 | 2 | exit 1 |
 | 140-126-uia-state-receipt | 44 | 44 | 0 | clean |
 | 143-130-collated | 12 | 12 | 0 | clean |
-| 147-trace-drift-repair | 4 | 4 | 0 | clean |
+| 147-trace-drift-repair | 5 | 5 | 0 | clean |
 | 148-151-153-followup-hygiene-triad | 26 | 23 | 3 | exit 1 |
 | 157-158-durable-identity-repair-outcomes | 36 | 36 | 0 | clean |
 | 163-156-followup-pair | 11 | 11 | 0 | clean |
