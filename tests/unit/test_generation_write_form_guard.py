@@ -1356,6 +1356,11 @@ def _classify():
     # VALUE (a `partial(store.op_x, ...)` argument, a tuple-unpacking alias, an
     # alias assignment) or fetched by a LITERAL `getattr` name - FAILS CLOSED.
     call_funcs = {id(call.func) for call in ast.walk(tree) if isinstance(call, ast.Call)}
+    ref_call: dict[int, ast.Call] = {}
+    for enclosing_call in ast.walk(tree):
+        if isinstance(enclosing_call, ast.Call):
+            for inner_node in ast.walk(enclosing_call):
+                ref_call[id(inner_node)] = enclosing_call
     for ref in ast.walk(tree):
         escaped = None
         if (isinstance(ref, ast.Attribute) and ref.attr in store_contracts
@@ -1376,8 +1381,15 @@ def _classify():
             escaped = ref.args[1].value
         if escaped is not None:
             ref_chain = _chain_of(owner, ref)
+            enclosing = ref_call.get(id(ref))
+            # a reviewed helper reference is pinned by the WHOLE enclosing call, so a
+            # change to any argument of the handoff breaks the pin
+            site_text = (ast.unparse(enclosing)
+                         if enclosing is not None and escaped in helper_contracts
+                         and enclosing.func is not ref
+                         else lines[ref.lineno - 1])
             direct_sites.append(((ref_chain[-1].name if ref_chain else "<module>",
-                                  escaped, None), ref.lineno, lines[ref.lineno - 1],
+                                  escaped, None), ref.lineno, site_text,
                                  "reference"))
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -1748,8 +1760,8 @@ _REVIEWED_OMITTED_GENERATION_SITES = {
     # reviewed VALUE references to a tracked helper: the runner thread's target
     # and the body handed to it (a helper whose generation is REQUIRED is passed
     # on, never called with it omitted)
-    ("_start_runner", "_run_detached", None): "target=_run_detached,",
-    ("_run_detached", "_execute_body", None): "_execute_body, cfg, op_id, tool_name, tool_fn, body_args, agent,",
+    ("_start_runner", "_run_detached", None): "threading.Thread(target=_run_detached, args=(captured, cfg, store if store is not None else store_for(cfg), row.op_id, row.tool, tool_fn, body_args, agent, presented, runner_slots, journal_token, generation), name=f'hyperv-op-{row.op_id[:8]}', daemon=True)",
+    ("_run_detached", "_execute_body", None): 'captured.run(_execute_body, cfg, op_id, tool_name, tool_fn, body_args, agent, store, stop, journal_token, generation)',
 }
 
 
