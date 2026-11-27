@@ -1347,6 +1347,7 @@ def _classify():
             for inner in _own_scope_nodes(cls):
                 if isinstance(inner, ast.Call) and (
                     _is_store_write(inner)
+                    or _helper_callee(inner) in helper_contracts
                     # a tracked HELPER called by Name carries the same feed
                     or any(kw.arg in ("generation", None) for kw in inner.keywords)
                 ):
@@ -1388,6 +1389,12 @@ def _classify():
             _event_of(node),
         )
         if node in class_scope_writes:
+            direct_sites.append((identity, node.lineno, lines[node.lineno - 1]))
+            continue
+        if (isinstance(node.func, ast.Attribute)
+                and ((isinstance(node.func.value, ast.Name)
+                      and node.func.value.id == "store") or _is_store_write(node))
+                and node.func.attr not in _REVIEWED_STORE_METHODS):
             direct_sites.append((identity, node.lineno, lines[node.lineno - 1]))
             continue
         if isinstance(node.func, ast.Name) and node.func.id in store_aliases:
@@ -1722,6 +1729,18 @@ def test_the_aliased_capture_keeps_its_disclosed_fail_open_form():
 # was already refused or fenced, so the unconditional write is deliberate. A site
 # is keyed by (function, method, state) and its exact stripped line; an unlisted
 # omission is unresolved and a listed one that no longer exists fails as stale.
+# The store methods the shipped operations.py calls. Every call on the store object
+# must be to one of them: a new wrapper, alias or renamed method is a new NAME, so it
+# is unreviewed whatever its parameters or defaults are, and a new honest store call
+# is added here deliberately.
+_REVIEWED_STORE_METHODS = frozenset({
+    "events_after", "events_oldest", "meta_get", "meta_put", "now", "op_delete",
+    "op_fence", "op_find_idem", "op_get", "op_get_scoped", "op_heartbeat",
+    "op_insert", "op_mark_send", "op_mark_send_and_dirty_epoch",
+    "op_next_generation", "op_release_idem", "op_request_cancel",
+    "op_rows_by_agent", "op_transition", "transaction",
+})
+
 _REVIEWED_OMITTED_GENERATION_SITES = {
     ("_inline_residue_recovery", "op_transition", "OP_FAILED"): "moved = bool(store.op_transition(",
     ("_inline_residue_recovery", "op_release_idem", None): "store.op_release_idem(op_id)",
